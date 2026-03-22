@@ -411,16 +411,31 @@ impl InodeTable {
         )
     }
 
-    /// Remove the inode entry if its refcount reaches zero.
-    fn maybe_remove(&self, key: InodeKey) {
+    /// Remove the exact inode generation once it is truly quiescent.
+    ///
+    /// `n_ref == 0` alone is not sufficient: closed `UnixFile`s and any other
+    /// surviving `Arc<File>` clones can still keep the canonical fd alive. If we
+    /// evict the table entry too early, a concurrent reopen can install a second
+    /// canonical fd generation for the same inode.
+    fn maybe_remove_exact_when_idle(
+        &self,
+        key: InodeKey,
+        inode_info: &Arc<Mutex<InodeInfo>>,
+        file: &Arc<File>,
+    ) {
         let mut map = self.shards[self.shard_idx(key)]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(info) = map.get(&key) {
-            let guard = info
+
+        if let Some(current) = map.get(&key) {
+            if !Arc::ptr_eq(current, inode_info) {
+                return;
+            }
+
+            let guard = current
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard.n_ref == 0 {
+            if guard.n_ref == 0 && Arc::strong_count(file) == 2 {
                 drop(guard);
                 map.remove(&key);
             }
@@ -1566,9 +1581,6 @@ impl VfsFile for UnixFile {
             return Ok(());
         }
 
-        let fd_raw = self.file.as_raw_fd();
-        let arc_strong = Arc::strong_count(&self.file);
-
         // Downgrade to no lock before closing.
         if self.lock_level != LockLevel::None {
             self.unlock(cx, LockLevel::None)?;
@@ -1576,29 +1588,13 @@ impl VfsFile for UnixFile {
         self.release_shm_owner_state(self.delete_on_close)?;
 
         // Decrement refcount.
-        let (n_ref_after, will_remove) = {
+        {
             let mut info = self
                 .inode_info
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             info.n_ref = info.n_ref.saturating_sub(1);
-            (info.n_ref, info.n_ref == 0)
-        };
-
-        if will_remove {
-            warn!(
-                target: "fsqlite::vfs::unix",
-                event = "inode_remove_on_close",
-                fd = fd_raw,
-                arc_strong_count = arc_strong,
-                n_ref_after,
-                path = %self.path.display(),
-                inode_key = ?self.inode_key,
-                "InodeInfo will be removed (n_ref=0) — last handle closing"
-            );
         }
-
-        global_inode_table().maybe_remove(self.inode_key);
 
         if self.delete_on_close {
             drop(fs::remove_file(&self.path));
@@ -2041,11 +2037,16 @@ impl VfsFile for UnixFile {
 
 impl Drop for UnixFile {
     fn drop(&mut self) {
-        if self.closed {
-            return;
+        if !self.closed {
+            let cx = Cx::new();
+            let _ = self.close(&cx);
         }
-        let cx = Cx::new();
-        let _ = self.close(&cx);
+
+        global_inode_table().maybe_remove_exact_when_idle(
+            self.inode_key,
+            &self.inode_info,
+            &self.file,
+        );
     }
 }
 

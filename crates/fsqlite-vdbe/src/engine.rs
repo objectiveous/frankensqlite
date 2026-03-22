@@ -15407,6 +15407,63 @@ mod tests {
     }
 
     #[test]
+    fn test_storage_cursor_delete_write_boundary_invalidates_decode_cache_once() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_metrics_enabled = vdbe_metrics_enabled();
+        reset_vdbe_metrics();
+        set_vdbe_metrics_enabled(true);
+
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(1, vec![SqliteValue::Integer(10)]);
+        table.insert(2, vec![SqliteValue::Integer(20)]);
+
+        let before = vdbe_metrics_snapshot();
+        let (rows, _) = run_write_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+
+            // Prime the cache on the current row, then mutate through the same
+            // cursor and read the successor. The stale row image must not survive
+            // across the write boundary.
+            b.emit_op(Opcode::Column, 0, 0, 1, P4::None, 0);
+            b.emit_op(Opcode::Delete, 0, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Column, 0, 0, 2, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        let after = vdbe_metrics_snapshot();
+
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(20)]]);
+        assert_eq!(
+            after.decode_cache_invalidations_write_total
+                - before.decode_cache_invalidations_write_total,
+            1
+        );
+        assert_eq!(
+            after.decode_cache_invalidations_position_total
+                - before.decode_cache_invalidations_position_total,
+            0
+        );
+        assert_eq!(
+            after.decode_cache_hits_total - before.decode_cache_hits_total,
+            0
+        );
+        assert_eq!(
+            after.decode_cache_misses_total - before.decode_cache_misses_total,
+            2
+        );
+
+        set_vdbe_metrics_enabled(prev_metrics_enabled);
+    }
+
+    #[test]
     fn test_delete_then_prev_then_next_advances_correctly() {
         // Regression: after Delete marks pending_next_after_delete, a
         // subsequent Prev must clear that pending state. Otherwise the next
@@ -16998,6 +17055,69 @@ mod tests {
             1
         );
 
+        set_vdbe_metrics_enabled(prev_metrics_enabled);
+    }
+
+    #[test]
+    fn test_storage_cursor_wide_row_reuse_hits_cache_without_second_parse_into() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_metrics_enabled = vdbe_metrics_enabled();
+        let prev_record_profile_enabled = fsqlite_types::record::record_profile_enabled();
+        reset_vdbe_metrics();
+        set_vdbe_metrics_enabled(true);
+        fsqlite_types::record::reset_record_profile();
+        fsqlite_types::record::set_record_profile_enabled(true);
+
+        let mut db = MemDatabase::new();
+        let root = db.create_table(65);
+        let row = (0_i64..65).map(SqliteValue::Integer).collect::<Vec<_>>();
+        db.get_table_mut(root)
+            .expect("table should exist")
+            .insert(1, row);
+
+        let before_metrics = vdbe_metrics_snapshot();
+        let before_record_profile = fsqlite_types::record::record_profile_snapshot();
+        let rows = run_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(65), 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::Column, 0, 64, 1, P4::None, 0);
+            b.emit_op(Opcode::Column, 0, 64, 2, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 1, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        let after_metrics = vdbe_metrics_snapshot();
+        let after_record_profile = fsqlite_types::record::record_profile_snapshot();
+
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Integer(64), SqliteValue::Integer(64)]]
+        );
+        assert_eq!(
+            after_metrics.decode_cache_hits_total - before_metrics.decode_cache_hits_total,
+            1
+        );
+        assert_eq!(
+            after_metrics.decode_cache_misses_total - before_metrics.decode_cache_misses_total,
+            1
+        );
+        assert_eq!(
+            after_record_profile
+                .callsite_breakdown
+                .vdbe_engine
+                .parse_record_into_calls
+                - before_record_profile
+                    .callsite_breakdown
+                    .vdbe_engine
+                    .parse_record_into_calls,
+            1
+        );
+
+        fsqlite_types::record::set_record_profile_enabled(prev_record_profile_enabled);
         set_vdbe_metrics_enabled(prev_metrics_enabled);
     }
 

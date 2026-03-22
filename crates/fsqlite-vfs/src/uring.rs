@@ -625,7 +625,15 @@ impl IoUringFile {
             }));
             let advanced: usize = match write_result {
                 Ok(Ok(advanced)) => advanced,
-                Ok(Err(err)) => return Err(FrankenError::Io(err)),
+                Ok(Err(err)) => {
+                    if err.raw_os_error() == Some(9) {
+                        eprintln!(
+                            "[bd-zna34] URING_WRITE_EBADF asupersync offset={off} len={}",
+                            chunk_end - total
+                        );
+                    }
+                    return Err(FrankenError::Io(err));
+                }
                 Err(_) => {
                     self.runtime.disable(IO_URING_WRITE_PANICKED_MSG);
                     return Err(FrankenError::Io(io::Error::other(
@@ -1154,7 +1162,10 @@ mod tests {
         let n = file.read(&cx, &mut buf, 0).expect("read should succeed");
         assert_eq!(n, 3);
         assert_eq!(&buf, b"wal");
-        assert!(vfs.is_available(), "skipping io_uring fd should not disable runtime");
+        assert!(
+            vfs.is_available(),
+            "skipping io_uring fd should not disable runtime"
+        );
 
         let snapshot = io_uring_latency_snapshot();
         assert!(

@@ -22,6 +22,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use fsqlite_btree::BtreeCopyProfileSnapshot;
 use fsqlite_core::connection::{
     HotPathProfileSnapshot, ParserHotPathProfileSnapshot, hot_path_profile_enabled,
     hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
@@ -273,6 +275,24 @@ pub struct HotPathRecordDecodeCallsiteBreakdown {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathBtreeCopyKernelProfile {
+    pub local_payload_copy_calls: u64,
+    pub local_payload_copy_bytes: u64,
+    pub owned_payload_materialization_calls: u64,
+    pub owned_payload_materialization_bytes: u64,
+    pub overflow_chain_reassembly_calls: u64,
+    pub overflow_chain_local_bytes: u64,
+    pub overflow_chain_overflow_bytes: u64,
+    pub overflow_page_reads: u64,
+    pub table_leaf_cell_assembly_calls: u64,
+    pub table_leaf_cell_assembly_bytes: u64,
+    pub index_leaf_cell_assembly_calls: u64,
+    pub index_leaf_cell_assembly_bytes: u64,
+    pub interior_cell_rebuild_calls: u64,
+    pub interior_cell_rebuild_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HotPathRowMaterializationProfile {
     pub result_rows_total: u64,
     pub result_values_total: u64,
@@ -387,6 +407,8 @@ pub struct HotPathSubsystemProfilePack {
     pub subsystem_ranking: Vec<HotPathRankingEntry>,
     pub allocator_ranking: Vec<HotPathRankingEntry>,
     pub parser: HotPathParserProfile,
+    pub btree_copy_kernels: HotPathBtreeCopyKernelProfile,
+    pub btree_copy_kernel_targets: Vec<HotPathRankingEntry>,
     pub record_decode: HotPathRecordDecodeProfile,
     pub row_materialization: HotPathRowMaterializationProfile,
     pub mvcc_write: HotPathMvccWriteProfile,
@@ -536,6 +558,8 @@ pub struct HotPathProfileReport {
     pub replay_command: String,
     pub engine_report: EngineRunReport,
     pub parser: HotPathParserProfile,
+    pub btree_copy_kernels: HotPathBtreeCopyKernelProfile,
+    pub btree_copy_kernel_targets: Vec<HotPathRankingEntry>,
     pub record_decode: HotPathRecordDecodeProfile,
     pub row_materialization: HotPathRowMaterializationProfile,
     pub mvcc_write: HotPathMvccWriteProfile,
@@ -738,6 +762,78 @@ fn parser_profile(snapshot: ParserHotPathProfileSnapshot) -> HotPathParserProfil
     }
 }
 
+fn btree_copy_kernel_targets(profile: &HotPathBtreeCopyKernelProfile) -> Vec<HotPathRankingEntry> {
+    let mut entries = vec![
+        HotPathRankingEntry {
+            subsystem: "btree_local_payload_copy".to_owned(),
+            metric_kind: "bytes".to_owned(),
+            metric_value: profile.local_payload_copy_bytes,
+            rationale: format!(
+                "{} local payload copy call(s) copied {} byte(s) into caller scratch without overflow traversal",
+                profile.local_payload_copy_calls, profile.local_payload_copy_bytes
+            ),
+        },
+        HotPathRankingEntry {
+            subsystem: "btree_owned_payload_materialization".to_owned(),
+            metric_kind: "bytes".to_owned(),
+            metric_value: profile.owned_payload_materialization_bytes,
+            rationale: format!(
+                "{} payload materialization call(s) forced {} byte(s) into fresh owned buffers",
+                profile.owned_payload_materialization_calls,
+                profile.owned_payload_materialization_bytes
+            ),
+        },
+        HotPathRankingEntry {
+            subsystem: "btree_overflow_reassembly".to_owned(),
+            metric_kind: "bytes".to_owned(),
+            metric_value: profile
+                .overflow_chain_local_bytes
+                .saturating_add(profile.overflow_chain_overflow_bytes),
+            rationale: format!(
+                "{} overflow reassembly call(s) copied {} local byte(s) + {} overflow byte(s) across {} overflow page read(s)",
+                profile.overflow_chain_reassembly_calls,
+                profile.overflow_chain_local_bytes,
+                profile.overflow_chain_overflow_bytes,
+                profile.overflow_page_reads
+            ),
+        },
+        HotPathRankingEntry {
+            subsystem: "btree_table_leaf_cell_assembly".to_owned(),
+            metric_kind: "bytes".to_owned(),
+            metric_value: profile.table_leaf_cell_assembly_bytes,
+            rationale: format!(
+                "{} table-leaf cell assembly call(s) emitted {} byte(s) before page insert",
+                profile.table_leaf_cell_assembly_calls, profile.table_leaf_cell_assembly_bytes
+            ),
+        },
+        HotPathRankingEntry {
+            subsystem: "btree_index_leaf_cell_assembly".to_owned(),
+            metric_kind: "bytes".to_owned(),
+            metric_value: profile.index_leaf_cell_assembly_bytes,
+            rationale: format!(
+                "{} index-leaf cell assembly call(s) emitted {} byte(s) before page insert",
+                profile.index_leaf_cell_assembly_calls, profile.index_leaf_cell_assembly_bytes
+            ),
+        },
+        HotPathRankingEntry {
+            subsystem: "btree_interior_cell_rebuild".to_owned(),
+            metric_kind: "bytes".to_owned(),
+            metric_value: profile.interior_cell_rebuild_bytes,
+            rationale: format!(
+                "{} interior-cell rebuild call(s) emitted {} byte(s) while replacing separator cells",
+                profile.interior_cell_rebuild_calls, profile.interior_cell_rebuild_bytes
+            ),
+        },
+    ];
+    entries.retain(|entry| entry.metric_value > 0);
+    entries.sort_by(|lhs, rhs| {
+        rhs.metric_value
+            .cmp(&lhs.metric_value)
+            .then_with(|| lhs.subsystem.cmp(&rhs.subsystem))
+    });
+    entries
+}
+
 #[must_use]
 fn record_decode_callsite_counters(
     parse_record_calls: u64,
@@ -819,6 +915,29 @@ fn build_hot_path_profile_report(
 
     let parser = parser_profile(snapshot.parser);
     let parser_sql_bytes = parser.parsed_sql_bytes;
+    let btree_copy_kernels = HotPathBtreeCopyKernelProfile {
+        local_payload_copy_calls: snapshot.btree_copy_kernels.local_payload_copy_calls,
+        local_payload_copy_bytes: snapshot.btree_copy_kernels.local_payload_copy_bytes,
+        owned_payload_materialization_calls: snapshot
+            .btree_copy_kernels
+            .owned_payload_materialization_calls,
+        owned_payload_materialization_bytes: snapshot
+            .btree_copy_kernels
+            .owned_payload_materialization_bytes,
+        overflow_chain_reassembly_calls: snapshot
+            .btree_copy_kernels
+            .overflow_chain_reassembly_calls,
+        overflow_chain_local_bytes: snapshot.btree_copy_kernels.overflow_chain_local_bytes,
+        overflow_chain_overflow_bytes: snapshot.btree_copy_kernels.overflow_chain_overflow_bytes,
+        overflow_page_reads: snapshot.btree_copy_kernels.overflow_page_reads,
+        table_leaf_cell_assembly_calls: snapshot.btree_copy_kernels.table_leaf_cell_assembly_calls,
+        table_leaf_cell_assembly_bytes: snapshot.btree_copy_kernels.table_leaf_cell_assembly_bytes,
+        index_leaf_cell_assembly_calls: snapshot.btree_copy_kernels.index_leaf_cell_assembly_calls,
+        index_leaf_cell_assembly_bytes: snapshot.btree_copy_kernels.index_leaf_cell_assembly_bytes,
+        interior_cell_rebuild_calls: snapshot.btree_copy_kernels.interior_cell_rebuild_calls,
+        interior_cell_rebuild_bytes: snapshot.btree_copy_kernels.interior_cell_rebuild_bytes,
+    };
+    let btree_copy_kernel_targets = btree_copy_kernel_targets(&btree_copy_kernels);
     let record_decode = HotPathRecordDecodeProfile {
         parse_record_calls: snapshot.record_decode.parse_record_calls,
         parse_record_into_calls: snapshot.record_decode.parse_record_into_calls,
@@ -1187,6 +1306,8 @@ fn build_hot_path_profile_report(
         replay_command: config.replay_command.clone(),
         engine_report,
         parser,
+        btree_copy_kernels,
+        btree_copy_kernel_targets,
         record_decode,
         row_materialization,
         mvcc_write,
@@ -1606,6 +1727,31 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
     );
     let _ = writeln!(out);
 
+    let _ = writeln!(out, "## B-Tree Copy Kernel Targets\n");
+    if report.btree_copy_kernel_targets.is_empty() {
+        let _ = writeln!(
+            out,
+            "- No copy-kernel bytes were recorded for this run; decode and cell assembly stayed on borrowed paths."
+        );
+    } else {
+        for (rank, entry) in report.btree_copy_kernel_targets.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "- rank {} {}: {}={} -> {}",
+                rank + 1,
+                entry.subsystem,
+                entry.metric_kind,
+                entry.metric_value,
+                entry.rationale
+            );
+        }
+        let _ = writeln!(
+            out,
+            "- note: this is a bytes-first replacement target list for later kernel work; it isolates owned-buffer and reassembly surfaces rather than claiming an exclusive wall-time partition."
+        );
+    }
+    let _ = writeln!(out);
+
     let _ = writeln!(out, "## Ranked Hotspots\n");
     for entry in &actionable_ranking.named_hotspots {
         let _ = writeln!(
@@ -1765,7 +1911,7 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
     );
     let _ = writeln!(
         out,
-        "- `subsystem_profile.json` — raw execution-subsystem timing and heap profile for this run"
+        "- `subsystem_profile.json` — raw execution-subsystem timing, heap profile, and B-tree copy-kernel target list for this run"
     );
     let _ = writeln!(
         out,
@@ -3190,6 +3336,8 @@ pub fn build_hot_path_subsystem_profile(
         subsystem_ranking: report.subsystem_ranking.clone(),
         allocator_ranking: report.allocator_pressure.ranked_sources.clone(),
         parser: report.parser.clone(),
+        btree_copy_kernels: report.btree_copy_kernels.clone(),
+        btree_copy_kernel_targets: report.btree_copy_kernel_targets.clone(),
         record_decode: report.record_decode.clone(),
         row_materialization: report.row_materialization.clone(),
         mvcc_write: report.mvcc_write.clone(),
@@ -3753,6 +3901,22 @@ mod tests {
             prepared_table_dml_affected_only_runs: 1,
             autoincrement_sequence_fast_path_updates: 1,
             autoincrement_sequence_scan_refreshes: 0,
+            btree_copy_kernels: BtreeCopyProfileSnapshot {
+                local_payload_copy_calls: 2,
+                local_payload_copy_bytes: 96,
+                owned_payload_materialization_calls: 1,
+                owned_payload_materialization_bytes: 48,
+                overflow_chain_reassembly_calls: 1,
+                overflow_chain_local_bytes: 40,
+                overflow_chain_overflow_bytes: 512,
+                overflow_page_reads: 2,
+                table_leaf_cell_assembly_calls: 1,
+                table_leaf_cell_assembly_bytes: 56,
+                index_leaf_cell_assembly_calls: 1,
+                index_leaf_cell_assembly_bytes: 32,
+                interior_cell_rebuild_calls: 1,
+                interior_cell_rebuild_bytes: 44,
+            },
             record_decode: RecordHotPathProfileSnapshot {
                 parse_record_calls: 4,
                 parse_record_into_calls: 2,
@@ -4215,6 +4379,11 @@ mod tests {
             report.record_decode.parse_record_column_calls > 0
                 || report.record_decode.parse_record_into_calls > 0
         );
+        assert!(!report.btree_copy_kernel_targets.is_empty());
+        assert_eq!(
+            report.btree_copy_kernel_targets[0].subsystem,
+            "btree_overflow_reassembly"
+        );
         assert!(report.mvcc_write.page_lock_wait_time_ns_total > 0);
         assert!(report.page_data_motion.normalized_bytes_total > 0);
 
@@ -4325,6 +4494,16 @@ mod tests {
         );
         assert!(!opcode_profile.opcodes.is_empty());
         assert!(!subsystem_profile.subsystem_ranking.is_empty());
+        assert_eq!(
+            subsystem_profile.btree_copy_kernel_targets,
+            report.btree_copy_kernel_targets
+        );
+        assert!(
+            subsystem_profile
+                .btree_copy_kernels
+                .overflow_chain_overflow_bytes
+                > 0
+        );
         assert!(subsystem_profile.mvcc_write.page_lock_waits_total > 0);
         assert!(subsystem_profile.page_data_motion.normalized_bytes_total > 0);
         assert!(!actionable_ranking.baseline_reuse_ledger.is_empty());
@@ -4342,6 +4521,11 @@ mod tests {
                 .take(actionable_ranking.top_opcodes.len())
                 .cloned()
                 .collect::<Vec<_>>()
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("## B-Tree Copy Kernel Targets")
         );
         assert!(
             std::fs::read_to_string(artifact_dir.join("summary.md"))

@@ -363,8 +363,10 @@ mod tests {
     use crate::{BtCursor, BtreeCursorOps, MemPageStore};
     use fsqlite_types::PageNumber;
     use fsqlite_types::cx::Cx;
+    use std::sync::{LazyLock, Mutex};
 
     const TEST_USABLE: u32 = 4096;
+    static COPY_PROFILE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn metrics_snapshot_tracks_operation_buckets() {
@@ -393,6 +395,9 @@ mod tests {
 
     #[test]
     fn copy_profile_tracks_owned_materialization_and_cell_assembly() {
+        let _guard = COPY_PROFILE_TEST_LOCK
+            .lock()
+            .expect("copy-profile test lock");
         reset_btree_metrics();
         reset_btree_copy_profile();
         set_btree_copy_profile_enabled(true);
@@ -401,12 +406,7 @@ mod tests {
         let cx = Cx::new();
         let root = PageNumber::new(2).expect("root page");
         let store = MemPageStore::with_empty_table(root, TEST_USABLE);
-        let mut cursor = BtCursor::new(
-            store,
-            root,
-            TEST_USABLE,
-            true,
-        );
+        let mut cursor = BtCursor::new(store, root, TEST_USABLE, true);
 
         cursor
             .table_insert(&cx, 1, b"copy-kernel-row")
@@ -447,6 +447,9 @@ mod tests {
 
     #[test]
     fn copy_profile_tracks_overflow_reassembly() {
+        let _guard = COPY_PROFILE_TEST_LOCK
+            .lock()
+            .expect("copy-profile test lock");
         reset_btree_copy_profile();
         set_btree_copy_profile_enabled(true);
 
@@ -454,12 +457,7 @@ mod tests {
         let cx = Cx::new();
         let root = PageNumber::new(2).expect("root page");
         let store = MemPageStore::with_empty_table(root, TEST_USABLE);
-        let mut cursor = BtCursor::new(
-            store,
-            root,
-            TEST_USABLE,
-            true,
-        );
+        let mut cursor = BtCursor::new(store, root, TEST_USABLE, true);
         let payload = vec![b'X'; 8_000];
 
         cursor

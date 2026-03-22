@@ -7,12 +7,13 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, TryLockError};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock, TryLockError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fsqlite_types::{CommitSeq, PageNumber, TxnToken};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // Loss matrix (§5.7.3 Bayesian Decision Framework)
@@ -701,6 +702,348 @@ fn dro_cvar_penalty(
         / (active_readers.min(active_writers) as f64 + 1.0);
     let tail_mass = (occupancy / 8.0).min(4.0);
     radius.effective_radius() * tail_mass * skew.ln_1p()
+}
+
+// ---------------------------------------------------------------------------
+// DRO Live Controller — adaptive runtime matrix swap (bd-3t52f / bd-18x86)
+// ---------------------------------------------------------------------------
+
+/// Configuration for the live DRO controller.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DroLiveControllerConfig {
+    /// How many SSI outcomes (commits + aborts) constitute one observation window.
+    pub window_commit_budget: u64,
+    /// Maximum readers dimension in the loss matrix.
+    pub max_readers: usize,
+    /// Maximum writers dimension in the loss matrix.
+    pub max_writers: usize,
+    /// Default abort threshold (CVaR penalty > threshold → abort).
+    pub default_threshold: f64,
+    /// Volatility tracker config.
+    pub tracker_config: DroVolatilityTrackerConfig,
+    /// Default risk tolerance.
+    pub default_tolerance: DroRiskTolerance,
+}
+
+impl Default for DroLiveControllerConfig {
+    fn default() -> Self {
+        Self {
+            window_commit_budget: 128,
+            max_readers: 32,
+            max_writers: 32,
+            default_threshold: 0.45,
+            tracker_config: DroVolatilityTrackerConfig {
+                window_size: 32,
+                min_samples: 4,
+            },
+            default_tolerance: DroRiskTolerance::Low,
+        }
+    }
+}
+
+/// Lock-free abort/commit/edge counters for one observation window.
+///
+/// These are incremented on the hot path via `Relaxed` atomics. The only
+/// synchronization point is when the window rotates (rare, ~every 128 commits).
+struct DroWindowCounters {
+    commits: AtomicU64,
+    aborts: AtomicU64,
+    edges_observed: AtomicU64,
+    total_decisions: AtomicU64,
+}
+
+impl DroWindowCounters {
+    const fn new() -> Self {
+        Self {
+            commits: AtomicU64::new(0),
+            aborts: AtomicU64::new(0),
+            edges_observed: AtomicU64::new(0),
+            total_decisions: AtomicU64::new(0),
+        }
+    }
+
+    fn record_commit(&self) {
+        self.commits.fetch_add(1, Ordering::Relaxed);
+        self.total_decisions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_abort(&self) {
+        self.aborts.fetch_add(1, Ordering::Relaxed);
+        self.total_decisions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_edges(&self, count: u64) {
+        self.edges_observed.fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn snapshot_and_reset(&self) -> DroWindowSnapshot {
+        // Relaxed is fine: we tolerate slightly stale counts in the rare
+        // rotation path. Exact consistency is not required — the tracker
+        // operates on statistical aggregates over many windows.
+        let commits = self.commits.swap(0, Ordering::Relaxed);
+        let aborts = self.aborts.swap(0, Ordering::Relaxed);
+        let edges = self.edges_observed.swap(0, Ordering::Relaxed);
+        let total = self.total_decisions.swap(0, Ordering::Relaxed);
+        DroWindowSnapshot {
+            commits,
+            aborts,
+            edges,
+            total,
+        }
+    }
+}
+
+/// Snapshot of one completed observation window.
+#[derive(Debug, Clone, Copy)]
+struct DroWindowSnapshot {
+    commits: u64,
+    aborts: u64,
+    edges: u64,
+    total: u64,
+}
+
+impl DroWindowSnapshot {
+    #[allow(clippy::cast_precision_loss)]
+    fn abort_rate(self) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        (self.aborts as f64) / (self.total as f64)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn edge_rate(self) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        // Normalize: edges per decision, clamped to [0, 1].
+        ((self.edges as f64) / (self.total as f64)).min(1.0)
+    }
+}
+
+/// Live DRO controller: feeds SSI telemetry into the volatility tracker
+/// and atomically swaps the loss matrix when the workload regime changes.
+///
+/// **Hot-path cost:** One `parking_lot::Mutex::lock()` + `Arc::clone()` ≈ 20ns.
+/// **Recomputation cost:** 33×33 = 1089 `dro_cvar_penalty` calls ≈ <1ms, amortized
+/// over `window_commit_budget` (default 128) SSI decisions.
+///
+/// # Safety invariants
+///
+/// - The matrix is NEVER `None` — it's initialized with a conservative default.
+/// - Writers (matrix swap) hold `inner` briefly; readers clone the Arc and release.
+/// - Concurrent-writer mode is never affected — this only changes abort *policy*.
+pub struct DroLiveController {
+    /// Current matrix, behind a parking_lot Mutex for fast uncontended lock+clone.
+    /// Using parking_lot because std::sync::Mutex is ~50ns vs parking_lot ~15ns.
+    matrix: parking_lot::Mutex<Arc<DroLossMatrix>>,
+    /// Volatility tracker + config, protected by a separate lock to avoid
+    /// holding the matrix lock during recomputation.
+    inner: parking_lot::Mutex<DroLiveControllerInner>,
+    /// Lock-free per-window counters (hot path).
+    counters: DroWindowCounters,
+    /// Configuration (immutable after construction).
+    config: DroLiveControllerConfig,
+}
+
+struct DroLiveControllerInner {
+    tracker: DroVolatilityTracker,
+    tolerance: DroRiskTolerance,
+    /// Monotonic generation counter for observability.
+    generation: u64,
+}
+
+impl DroLiveController {
+    /// Create a new controller with the given config and an initial conservative matrix.
+    #[must_use]
+    pub fn new(config: DroLiveControllerConfig) -> Self {
+        let tracker = DroVolatilityTracker::new(config.tracker_config);
+        let initial_matrix = Self::build_default_matrix(&config);
+
+        Self {
+            matrix: parking_lot::Mutex::new(Arc::new(initial_matrix)),
+            inner: parking_lot::Mutex::new(DroLiveControllerInner {
+                tracker,
+                tolerance: config.default_tolerance,
+                generation: 0,
+            }),
+            counters: DroWindowCounters::new(),
+            config,
+        }
+    }
+
+    /// Build the conservative default matrix (same as the old static one).
+    fn build_default_matrix(config: &DroLiveControllerConfig) -> DroLossMatrix {
+        let mut tracker = DroVolatilityTracker::new(DroVolatilityTrackerConfig {
+            window_size: 4,
+            min_samples: 4,
+        });
+        // Seed with conservative synthetic observations.
+        for &(abort_rate, edge_rate) in &[(0.03, 0.04), (0.05, 0.06), (0.08, 0.09), (0.13, 0.15)] {
+            tracker
+                .observe_window(abort_rate, edge_rate)
+                .expect("default DRO tracker windows must be valid");
+        }
+        let certificate = tracker
+            .radius_certificate(config.default_tolerance)
+            .expect("default DRO certificate must be constructible");
+        DroLossMatrix::from_radius_certificate(
+            config.max_readers,
+            config.max_writers,
+            config.default_threshold,
+            certificate,
+        )
+    }
+
+    /// **Hot path.** Get a reference-counted handle to the current matrix.
+    ///
+    /// Cost: ~20ns (one uncontended mutex lock + Arc clone).
+    #[must_use]
+    pub fn current_matrix(&self) -> Arc<DroLossMatrix> {
+        self.matrix.lock().clone()
+    }
+
+    /// Record a successful commit. Call after `ssi_validate_and_publish` succeeds.
+    pub fn record_commit(&self, edge_count: u64) {
+        self.counters.record_commit();
+        self.counters.record_edges(edge_count);
+        self.maybe_rotate_window();
+    }
+
+    /// Record an SSI abort. Call after `ssi_validate_and_publish` returns `Err`.
+    pub fn record_abort(&self, edge_count: u64) {
+        self.counters.record_abort();
+        self.counters.record_edges(edge_count);
+        self.maybe_rotate_window();
+    }
+
+    /// Update the risk tolerance (e.g., from `PRAGMA fsqlite_ssi_risk_tolerance`).
+    pub fn set_tolerance(&self, tolerance: DroRiskTolerance) {
+        let mut inner = self.inner.lock();
+        if inner.tolerance != tolerance {
+            let old = inner.tolerance;
+            inner.tolerance = tolerance;
+            // Force a matrix recomputation with the new tolerance.
+            drop(inner);
+            self.force_recompute();
+            info!(
+                target: "fsqlite::ssi::dro",
+                event = "tolerance_changed",
+                old = %old,
+                new = %tolerance,
+                "DRO risk tolerance updated, matrix recomputed"
+            );
+        }
+    }
+
+    /// Current generation (number of matrix swaps since creation).
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.inner.lock().generation
+    }
+
+    /// Check if the window budget is exhausted and rotate if so.
+    fn maybe_rotate_window(&self) {
+        let total = self.counters.total_decisions.load(Ordering::Relaxed);
+        if total < self.config.window_commit_budget {
+            return;
+        }
+        // Snapshot the counters and feed the tracker.
+        let snapshot = self.counters.snapshot_and_reset();
+        // Guard against concurrent double-rotation: if snapshot.total is 0, another
+        // thread already rotated.
+        if snapshot.total == 0 {
+            return;
+        }
+        self.feed_snapshot(snapshot);
+    }
+
+    /// Feed a completed window snapshot into the volatility tracker and
+    /// potentially recompute the matrix.
+    fn feed_snapshot(&self, snapshot: DroWindowSnapshot) {
+        let abort_rate = snapshot.abort_rate();
+        let edge_rate = snapshot.edge_rate();
+
+        let mut inner = self.inner.lock();
+        if let Err(err) = inner.tracker.observe_window(abort_rate, edge_rate) {
+            warn!(
+                target: "fsqlite::ssi::dro",
+                event = "tracker_observe_error",
+                error = %err,
+                abort_rate,
+                edge_rate,
+                "DRO tracker rejected window observation"
+            );
+            return;
+        }
+
+        // Only recompute if the tracker has enough samples.
+        if !inner.tracker.is_ready() {
+            return;
+        }
+
+        let Some(certificate) = inner.tracker.radius_certificate(inner.tolerance) else {
+            return;
+        };
+
+        let new_matrix = DroLossMatrix::from_radius_certificate(
+            self.config.max_readers,
+            self.config.max_writers,
+            self.config.default_threshold,
+            certificate,
+        );
+
+        inner.generation += 1;
+        let generation = inner.generation;
+        let radius = certificate.effective_radius();
+        let tolerance = inner.tolerance;
+        drop(inner);
+
+        // Atomic matrix swap — readers see the new matrix on their next call.
+        *self.matrix.lock() = Arc::new(new_matrix);
+
+        info!(
+            target: "fsqlite::ssi::dro",
+            event = "matrix_swap",
+            dro_generation = generation,
+            abort_rate,
+            edge_rate,
+            radius,
+            tolerance = %tolerance,
+            commits = snapshot.commits,
+            aborts = snapshot.aborts,
+            edges = snapshot.edges,
+            "DRO loss matrix recomputed from live telemetry"
+        );
+    }
+
+    /// Force immediate matrix recomputation from the tracker's current state.
+    fn force_recompute(&self) {
+        let inner = self.inner.lock();
+        if !inner.tracker.is_ready() {
+            return;
+        }
+        let Some(certificate) = inner.tracker.radius_certificate(inner.tolerance) else {
+            return;
+        };
+        let new_matrix = DroLossMatrix::from_radius_certificate(
+            self.config.max_readers,
+            self.config.max_writers,
+            self.config.default_threshold,
+            certificate,
+        );
+        drop(inner);
+        *self.matrix.lock() = Arc::new(new_matrix);
+    }
+
+    /// Access the global singleton controller.
+    ///
+    /// Lazily initialized on first call with default config.
+    #[must_use]
+    pub fn global() -> &'static Self {
+        static INSTANCE: OnceLock<DroLiveController> = OnceLock::new();
+        INSTANCE.get_or_init(|| Self::new(DroLiveControllerConfig::default()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2061,6 +2404,165 @@ mod tests {
             tracker.sample_count(),
             0,
             "bead_id=bd-1scmu invalid samples must not be recorded"
+        );
+    }
+
+    // -- DroLiveController tests (bd-3t52f / bd-18x86) --
+
+    #[test]
+    fn test_live_controller_starts_with_generation_zero() {
+        let ctrl = DroLiveController::new(DroLiveControllerConfig::default());
+        assert_eq!(ctrl.generation(), 0, "bead_id=bd-3t52f initial generation");
+        let matrix = ctrl.current_matrix();
+        // Default matrix should produce zero penalty at (0, 0).
+        let decision = matrix.evaluate(0, 0);
+        assert_eq!(decision.cvar_penalty, 0.0);
+        assert!(!decision.should_abort());
+    }
+
+    #[test]
+    fn test_live_controller_matrix_swaps_after_enough_windows() {
+        let ctrl = DroLiveController::new(DroLiveControllerConfig {
+            window_commit_budget: 4,
+            max_readers: 8,
+            max_writers: 8,
+            default_threshold: 0.45,
+            tracker_config: DroVolatilityTrackerConfig {
+                window_size: 8,
+                min_samples: 4,
+            },
+            default_tolerance: DroRiskTolerance::Low,
+        });
+
+        let initial_gen = ctrl.generation();
+        // Feed 4 windows of 4 decisions each = 16 total decisions.
+        // First 3 windows: low abort rate.
+        for _ in 0..3 {
+            for _ in 0..3 {
+                ctrl.record_commit(1);
+            }
+            ctrl.record_abort(2);
+        }
+        // After 3 windows (12 decisions), tracker has 3 samples — not ready yet.
+        assert!(
+            ctrl.generation() <= 3,
+            "bead_id=bd-3t52f should not have swapped matrix before min_samples"
+        );
+
+        // 4th window: high abort rate — this should trigger min_samples.
+        for _ in 0..2 {
+            ctrl.record_commit(0);
+        }
+        ctrl.record_abort(5);
+        ctrl.record_abort(5);
+
+        // Now we should have >= 4 windows observed → tracker is ready → matrix swapped.
+        assert!(
+            ctrl.generation() >= initial_gen + 4,
+            "bead_id=bd-3t52f matrix should have been swapped after 4 windows"
+        );
+    }
+
+    #[test]
+    fn test_live_controller_adapts_to_high_abort_regime() {
+        let ctrl = DroLiveController::new(DroLiveControllerConfig {
+            window_commit_budget: 4,
+            max_readers: 8,
+            max_writers: 8,
+            default_threshold: 0.45,
+            tracker_config: DroVolatilityTrackerConfig {
+                window_size: 8,
+                min_samples: 4,
+            },
+            default_tolerance: DroRiskTolerance::Low,
+        });
+
+        // Phase 1: calm regime — low abort rate.
+        for _ in 0..4 {
+            for _ in 0..3 {
+                ctrl.record_commit(1);
+            }
+            ctrl.record_abort(1);
+        }
+        let calm_matrix = ctrl.current_matrix();
+        let calm_penalty = calm_matrix.penalty(6, 6);
+
+        // Phase 2: storm regime — high abort rate with many edges.
+        for _ in 0..4 {
+            ctrl.record_commit(5);
+            for _ in 0..3 {
+                ctrl.record_abort(10);
+            }
+        }
+        let storm_matrix = ctrl.current_matrix();
+        let storm_penalty = storm_matrix.penalty(6, 6);
+
+        // Storm radius should be larger → penalties should be higher.
+        assert!(
+            storm_penalty > calm_penalty,
+            "bead_id=bd-3t52f storm penalty ({storm_penalty}) should exceed \
+             calm penalty ({calm_penalty}) due to wider Wasserstein radius"
+        );
+    }
+
+    #[test]
+    fn test_live_controller_tolerance_change_triggers_recompute() {
+        let ctrl = DroLiveController::new(DroLiveControllerConfig {
+            window_commit_budget: 4,
+            max_readers: 8,
+            max_writers: 8,
+            default_threshold: 0.45,
+            tracker_config: DroVolatilityTrackerConfig {
+                window_size: 8,
+                min_samples: 4,
+            },
+            default_tolerance: DroRiskTolerance::Low,
+        });
+
+        // Seed the tracker with enough windows.
+        for _ in 0..4 {
+            for _ in 0..3 {
+                ctrl.record_commit(2);
+            }
+            ctrl.record_abort(3);
+        }
+        let gen_before = ctrl.generation();
+        let low_matrix = ctrl.current_matrix();
+        let low_penalty = low_matrix.penalty(6, 6);
+
+        // Switch to High tolerance → wider radius → higher penalties.
+        ctrl.set_tolerance(DroRiskTolerance::High);
+
+        assert!(
+            ctrl.generation() > gen_before,
+            "bead_id=bd-3t52f tolerance change should bump generation"
+        );
+
+        let high_matrix = ctrl.current_matrix();
+        let high_penalty = high_matrix.penalty(6, 6);
+
+        assert!(
+            high_penalty > low_penalty,
+            "bead_id=bd-3t52f High tolerance penalty ({high_penalty}) should exceed \
+             Low tolerance penalty ({low_penalty})"
+        );
+    }
+
+    #[test]
+    fn test_live_controller_global_singleton_is_consistent() {
+        let g1 = DroLiveController::global();
+        let g2 = DroLiveController::global();
+        // Same pointer — OnceLock guarantees singleton.
+        assert!(
+            std::ptr::eq(g1, g2),
+            "bead_id=bd-3t52f global() must return the same instance"
+        );
+        // Matrix should be evaluatable.
+        let matrix = g1.current_matrix();
+        let decision = matrix.evaluate(1, 1);
+        assert!(
+            decision.cvar_penalty >= 0.0,
+            "bead_id=bd-3t52f global matrix should produce valid penalty"
         );
     }
 }

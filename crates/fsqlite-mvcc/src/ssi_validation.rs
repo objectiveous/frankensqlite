@@ -19,9 +19,8 @@ use tracing::{debug, info, warn};
 
 use crate::observability;
 use crate::ssi_abort_policy::{
-    DroHotPathDecision, DroLossMatrix, DroRiskTolerance, DroVolatilityTracker,
-    DroVolatilityTrackerConfig, SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery,
-    SsiDecisionType, SsiEvidenceLedger,
+    DroHotPathDecision, DroLiveController, DroLossMatrix, SsiDecisionCard, SsiDecisionCardDraft,
+    SsiDecisionQuery, SsiDecisionType, SsiEvidenceLedger,
 };
 
 use crate::witness_objects::{
@@ -197,23 +196,11 @@ pub fn set_ssi_evidence_budget_config(config: SsiEvidenceBudgetConfig) -> SsiEvi
     }
 }
 
-fn default_t3_dro_matrix() -> &'static DroLossMatrix {
-    static MATRIX: OnceLock<DroLossMatrix> = OnceLock::new();
-    MATRIX.get_or_init(|| {
-        let mut tracker = DroVolatilityTracker::new(DroVolatilityTrackerConfig {
-            window_size: 4,
-            min_samples: 4,
-        });
-        for (abort_rate, edge_rate) in [(0.03, 0.04), (0.05, 0.06), (0.08, 0.09), (0.13, 0.15)] {
-            tracker
-                .observe_window(abort_rate, edge_rate)
-                .expect("default DRO tracker windows must be valid");
-        }
-        let certificate = tracker
-            .radius_certificate(DroRiskTolerance::Low)
-            .expect("default DRO certificate must be constructible");
-        DroLossMatrix::from_radius_certificate(32, 32, 0.45, certificate)
-    })
+/// Backward-compatible accessor for the default DRO matrix.
+///
+/// Now delegates to the live controller so the matrix adapts at runtime.
+fn default_t3_dro_matrix() -> std::sync::Arc<DroLossMatrix> {
+    DroLiveController::global().current_matrix()
 }
 
 pub(crate) fn evaluate_t3_dro(
@@ -221,7 +208,8 @@ pub(crate) fn evaluate_t3_dro(
     active_readers: usize,
     active_writers: usize,
 ) -> DroHotPathDecision {
-    let decision = default_t3_dro_matrix().evaluate(active_readers, active_writers);
+    let matrix = default_t3_dro_matrix();
+    let decision = matrix.evaluate(active_readers, active_writers);
     info!(
         target: "fsqlite::ssi::dro",
         event = "t3_decision",
@@ -233,9 +221,24 @@ pub(crate) fn evaluate_t3_dro(
         radius = decision.radius,
         tolerance = %decision.tolerance,
         decision = if decision.should_abort() { "abort" } else { "allow" },
-        "dro t3 decision evaluated"
+        generation = DroLiveController::global().generation(),
+        "dro t3 decision evaluated (live controller)"
     );
     decision
+}
+
+/// Record a commit outcome into the live DRO telemetry feed.
+///
+/// Call after `ssi_validate_and_publish` succeeds.
+pub(crate) fn record_dro_commit(edge_count: u64) {
+    DroLiveController::global().record_commit(edge_count);
+}
+
+/// Record an abort outcome into the live DRO telemetry feed.
+///
+/// Call after `ssi_validate_and_publish` returns an SSI abort.
+pub(crate) fn record_dro_abort(edge_count: u64) {
+    DroLiveController::global().record_abort(edge_count);
 }
 
 // ---------------------------------------------------------------------------
@@ -1385,8 +1388,14 @@ fn record_evidence_decision(
 
     if matches!(decision_type, SsiDecisionType::CommitAllowed) {
         FSQLITE_EVIDENCE_RECORDS_TOTAL_COMMIT.fetch_add(1, Ordering::Relaxed);
+        // Feed live DRO telemetry (bd-3t52f / bd-18x86).
+        #[allow(clippy::cast_possible_truncation)]
+        record_dro_commit(edges.len() as u64);
     } else {
         FSQLITE_EVIDENCE_RECORDS_TOTAL_ABORT.fetch_add(1, Ordering::Relaxed);
+        // Feed live DRO telemetry (bd-3t52f / bd-18x86).
+        #[allow(clippy::cast_possible_truncation)]
+        record_dro_abort(edges.len() as u64);
     }
 }
 

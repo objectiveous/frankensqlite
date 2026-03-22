@@ -263,7 +263,16 @@ fn posix_lock(file: &impl AsFd, lock_type: impl Into<i32>, start: u64, len: u64)
             Ok(_) => return Ok(true),
             Err(nix::errno::Errno::EINTR) => {}
             Err(nix::errno::Errno::EACCES | nix::errno::Errno::EAGAIN) => return Ok(false),
-            Err(e) => return Err(FrankenError::Io(e.into())),
+            Err(e) => {
+                if e == nix::errno::Errno::EBADF {
+                    eprintln!(
+                        "[bd-zna34] POSIX_LOCK_EBADF fd={} lock_type={} start={start} len={len}",
+                        file.as_fd().as_raw_fd(),
+                        lock_type_i32
+                    );
+                }
+                return Err(FrankenError::Io(e.into()));
+            }
         }
     }
 }
@@ -1557,6 +1566,9 @@ impl VfsFile for UnixFile {
             return Ok(());
         }
 
+        let fd_raw = self.file.as_raw_fd();
+        let arc_strong = Arc::strong_count(&self.file);
+
         // Downgrade to no lock before closing.
         if self.lock_level != LockLevel::None {
             self.unlock(cx, LockLevel::None)?;
@@ -1564,13 +1576,28 @@ impl VfsFile for UnixFile {
         self.release_shm_owner_state(self.delete_on_close)?;
 
         // Decrement refcount.
-        {
+        let (n_ref_after, will_remove) = {
             let mut info = self
                 .inode_info
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             info.n_ref = info.n_ref.saturating_sub(1);
+            (info.n_ref, info.n_ref == 0)
+        };
+
+        if will_remove {
+            warn!(
+                target: "fsqlite::vfs::unix",
+                event = "inode_remove_on_close",
+                fd = fd_raw,
+                arc_strong_count = arc_strong,
+                n_ref_after,
+                path = %self.path.display(),
+                inode_key = ?self.inode_key,
+                "InodeInfo will be removed (n_ref=0) — last handle closing"
+            );
         }
+
         global_inode_table().maybe_remove(self.inode_key);
 
         if self.delete_on_close {
@@ -1607,21 +1634,40 @@ impl VfsFile for UnixFile {
 
     fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         checkpoint_or_abort(cx)?;
+        if self.closed {
+            eprintln!(
+                "[bd-zna34] WRITE_AFTER_CLOSE fd={} path={} — EBADF likely",
+                self.file.as_raw_fd(),
+                self.path.display()
+            );
+        }
         let mut total = 0_usize;
         while total < buf.len() {
             #[allow(clippy::cast_possible_truncation)]
             let off = offset + total as u64;
-            let n = self
-                .file
-                .write_at(&buf[total..], off)
-                .map_err(FrankenError::Io)?;
-            if n == 0 {
-                return Err(FrankenError::Io(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "unix vfs write_at returned 0",
-                )));
+            match self.file.write_at(&buf[total..], off) {
+                Ok(0) => {
+                    return Err(FrankenError::Io(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "unix vfs write_at returned 0",
+                    )));
+                }
+                Ok(n) => {
+                    total += n;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[bd-zna34] WRITE_FAILED fd={} arc_strong={} closed={} path={} offset={} err={}",
+                        self.file.as_raw_fd(),
+                        Arc::strong_count(&self.file),
+                        self.closed,
+                        self.path.display(),
+                        offset,
+                        e
+                    );
+                    return Err(FrankenError::Io(e));
+                }
             }
-            total += n;
         }
         Ok(())
     }
@@ -1632,12 +1678,29 @@ impl VfsFile for UnixFile {
     }
 
     fn sync(&mut self, _cx: &Cx, flags: SyncFlags) -> Result<()> {
-        if flags.contains(SyncFlags::DATAONLY) {
-            self.file.sync_data().map_err(FrankenError::Io)?;
-        } else {
-            self.file.sync_all().map_err(FrankenError::Io)?;
+        if self.closed {
+            eprintln!(
+                "[bd-zna34] SYNC_AFTER_CLOSE fd={} path={} — EBADF likely",
+                self.file.as_raw_fd(),
+                self.path.display()
+            );
         }
-        Ok(())
+        let result = if flags.contains(SyncFlags::DATAONLY) {
+            self.file.sync_data().map_err(FrankenError::Io)
+        } else {
+            self.file.sync_all().map_err(FrankenError::Io)
+        };
+        if let Err(ref e) = result {
+            eprintln!(
+                "[bd-zna34] SYNC_FAILED fd={} arc_strong={} closed={} path={} err={}",
+                self.file.as_raw_fd(),
+                Arc::strong_count(&self.file),
+                self.closed,
+                self.path.display(),
+                e
+            );
+        }
+        result
     }
 
     fn file_size(&self, _cx: &Cx) -> Result<u64> {
@@ -2213,6 +2276,30 @@ mod tests {
 
         reader_a.close(&cx).unwrap();
         reader_b.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_inode_generation_is_retained_while_stale_fd_clone_survives_close() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("inode_generation_retained.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, b"x", 0).unwrap();
+
+        let inode_key = file.inode_key;
+        let stale_fd_clone = Arc::clone(&file.file);
+        let stale_fd_raw = stale_fd_clone.as_raw_fd();
+
+        file.close(&cx).unwrap();
+        drop(file);
+
+        assert!(
+            global_inode_table().get(inode_key).is_some(),
+            "inode table evicted {inode_key:?} even though stale fd clone {stale_fd_raw} is still alive"
+        );
+
+        drop(stale_fd_clone);
     }
 
     #[test]

@@ -202,6 +202,7 @@ impl PageCache {
             }
             self.pages.insert(page_no, buf);
             self.admits.set(self.admits.get().saturating_add(1));
+            self.eviction.record_admit(page_no);
         }
         // SAFETY (logical): we just ensured the key exists above.
         Ok(self.pages.get(&page_no).expect("just inserted").as_slice())
@@ -286,8 +287,6 @@ impl PageCache {
     ///
     /// Returns `true` if a page was evicted, `false` if the cache was empty.
     pub fn evict_any(&mut self) -> bool {
-        // We pick an arbitrary key to evict. Since we don't track usage,
-        // this is effectively random eviction.
         let key = self.pages.keys().next().copied();
         if let Some(key) = key {
             self.pages.remove(&key);
@@ -381,6 +380,7 @@ const GOLDEN_RATIO_32: u32 = 2_654_435_769;
 #[repr(align(64))]
 struct PageCacheShard {
     pages: std::collections::HashMap<PageNumber, PageBuf, foldhash::fast::FixedState>,
+    eviction: PageCacheEvictionState,
     /// Local hit counter (aggregated on metrics snapshot).
     hits: u64,
     /// Local miss counter.
@@ -393,9 +393,10 @@ struct PageCacheShard {
 
 impl PageCacheShard {
     /// Create a new empty shard.
-    fn new() -> Self {
+    fn new(policy: PageCacheEvictionPolicy) -> Self {
         Self {
             pages: std::collections::HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            eviction: PageCacheEvictionState::new(policy),
             hits: 0,
             misses: 0,
             admits: 0,
@@ -432,6 +433,7 @@ impl PageCacheShard {
     fn get_mut(&mut self, page_no: PageNumber) -> Option<&mut [u8]> {
         if let Some(page) = self.pages.get_mut(&page_no) {
             self.hits = self.hits.saturating_add(1);
+            self.eviction.record_hit(page_no);
             Some(page.as_mut_slice())
         } else {
             self.misses = self.misses.saturating_add(1);
@@ -453,6 +455,7 @@ impl PageCacheShard {
         };
         if admitted_new {
             self.admits = self.admits.saturating_add(1);
+            self.eviction.record_admit(page_no);
         }
         admitted_new
     }
@@ -468,7 +471,7 @@ impl PageCacheShard {
 
     /// Remove an arbitrary page from this shard (for eviction).
     fn remove_any(&mut self) -> Option<PageNumber> {
-        let key = self.pages.keys().next().copied();
+        let key = self.eviction.choose_victim(&self.pages);
         if let Some(k) = key {
             self.pages.remove(&k);
             self.evictions = self.evictions.saturating_add(1);
@@ -490,6 +493,10 @@ impl PageCacheShard {
         self.misses = 0;
         self.admits = 0;
         self.evictions = 0;
+    }
+
+    fn queue_metrics(&self) -> EvictionQueuesSnapshot {
+        self.eviction.queue_metrics(&self.pages)
     }
 }
 
@@ -540,14 +547,31 @@ pub struct ShardedPageCache {
 impl ShardedPageCache {
     /// Create a new sharded page cache with the given page size.
     pub fn new(page_size: PageSize) -> Self {
-        Self::with_pool(PageBufPool::new(page_size, 65_536), page_size)
+        Self::with_eviction_policy(page_size, PageCacheEvictionPolicy::Arbitrary)
+    }
+
+    /// Create a new sharded page cache with an explicit eviction policy.
+    pub fn with_eviction_policy(page_size: PageSize, policy: PageCacheEvictionPolicy) -> Self {
+        Self::with_pool_and_eviction_policy(PageBufPool::new(page_size, 65_536), page_size, policy)
     }
 
     /// Create a new sharded page cache using an existing `PageBufPool`.
     pub fn with_pool(pool: PageBufPool, page_size: PageSize) -> Self {
+        Self::with_pool_and_eviction_policy(pool, page_size, PageCacheEvictionPolicy::Arbitrary)
+    }
+
+    /// Create a new sharded page cache using an existing `PageBufPool` and
+    /// explicit per-shard eviction policy hooks.
+    pub fn with_pool_and_eviction_policy(
+        pool: PageBufPool,
+        page_size: PageSize,
+        policy: PageCacheEvictionPolicy,
+    ) -> Self {
         // Initialize all shards
         let shards: Box<[Mutex<PageCacheShard>; SHARD_COUNT]> =
-            Box::new(std::array::from_fn(|_| Mutex::new(PageCacheShard::new())));
+            Box::new(std::array::from_fn(|_| {
+                Mutex::new(PageCacheShard::new(policy))
+            }));
 
         Self {
             shards,
@@ -648,6 +672,7 @@ impl ShardedPageCache {
         // Check for cache hit first, then update metrics
         if shard.pages.contains_key(&page_no) {
             shard.hits = shard.hits.saturating_add(1);
+            shard.eviction.record_hit(page_no);
             // SAFETY: we just checked contains_key, so unwrap is safe
             let data = shard.pages.get(&page_no).unwrap();
             return Ok(f(data.as_slice()));
@@ -690,6 +715,7 @@ impl ShardedPageCache {
         }
 
         shard.hits = shard.hits.saturating_add(1);
+        shard.eviction.record_hit(page_no);
         // SAFETY: we just checked contains_key, so unwrap is safe
         let buf = shard.pages.get(&page_no).unwrap();
         let offset = page_offset(page_no, self.page_size);
@@ -761,6 +787,11 @@ impl ShardedPageCache {
         let mut total_admits = 0_u64;
         let mut total_evictions = 0_u64;
         let mut total_pages = 0_usize;
+        let mut total_t1_size = 0_usize;
+        let mut total_t2_size = 0_usize;
+        let mut total_b1_size = 0_usize;
+        let mut total_b2_size = 0_usize;
+        let mut total_p_target = 0_usize;
 
         for shard in self.shards.iter() {
             let s = shard.lock();
@@ -769,6 +800,12 @@ impl ShardedPageCache {
             total_admits = total_admits.saturating_add(s.admits);
             total_evictions = total_evictions.saturating_add(s.evictions);
             total_pages += s.len();
+            let queues = s.queue_metrics();
+            total_t1_size = total_t1_size.saturating_add(queues.t1_size);
+            total_t2_size = total_t2_size.saturating_add(queues.t2_size);
+            total_b1_size = total_b1_size.saturating_add(queues.b1_size);
+            total_b2_size = total_b2_size.saturating_add(queues.b2_size);
+            total_p_target = total_p_target.saturating_add(queues.p_target);
         }
 
         PageCacheMetricsSnapshot {
@@ -779,11 +816,11 @@ impl ShardedPageCache {
             cached_pages: total_pages,
             pool_capacity: self.pool.capacity(),
             dirty_ratio_pct: 0,
-            t1_size: total_pages,
-            t2_size: 0,
-            b1_size: 0,
-            b2_size: 0,
-            p_target: total_pages,
+            t1_size: total_t1_size,
+            t2_size: total_t2_size,
+            b1_size: total_b1_size,
+            b2_size: total_b2_size,
+            p_target: total_p_target,
             mvcc_multi_version_pages: 0,
         }
     }
@@ -886,7 +923,9 @@ mod tests {
     use super::*;
     use fsqlite_types::flags::VfsOpenFlags;
     use fsqlite_vfs::{MemoryVfs, Vfs};
+    use std::hint::black_box;
     use std::path::Path;
+    use std::time::{Duration, Instant};
 
     const BEAD_ID: &str = "bd-22n.2";
 
@@ -1593,6 +1632,250 @@ mod tests {
         assert_eq!(reset.misses, 0, "bead_id={BEAD_ID} case=reset_misses");
         assert_eq!(reset.admits, 0, "bead_id={BEAD_ID} case=reset_admits");
         assert_eq!(reset.evictions, 0, "bead_id={BEAD_ID} case=reset_evictions");
+    }
+
+    #[test]
+    fn test_page_cache_s3_fifo_prototype_surfaces_queue_metrics() {
+        let policy =
+            PageCacheEvictionPolicy::S3FifoPrototype(S3FifoConfig::with_limits(8, 2, 2, 1));
+        let mut cache = PageCache::with_eviction_policy(PageSize::DEFAULT, policy);
+
+        let p1 = PageNumber::ONE;
+        let p2 = PageNumber::new(2).unwrap();
+        let p3 = PageNumber::new(3).unwrap();
+        let p4 = PageNumber::new(4).unwrap();
+
+        cache.insert_fresh(p1).unwrap()[0] = 1;
+        cache.insert_fresh(p2).unwrap()[0] = 2;
+        cache.insert_fresh(p3).unwrap()[0] = 3;
+        cache.insert_fresh(p4).unwrap()[0] = 4;
+
+        let _ = cache.get_mut(p1).unwrap();
+        let _ = cache.get_mut(p1).unwrap();
+        let _ = cache.get_mut(p2).unwrap();
+
+        let snapshot = cache.metrics_snapshot();
+        assert_eq!(snapshot.cached_pages, 4);
+        assert_eq!(
+            snapshot.t1_size + snapshot.t2_size,
+            snapshot.cached_pages,
+            "prototype queue reconstruction must account for every resident page"
+        );
+        assert!(
+            snapshot.t2_size > 0,
+            "repeated hits should promote at least one page into the reconstructed MAIN queue"
+        );
+        assert!(
+            snapshot.p_target > 0,
+            "prototype boundary must expose a non-zero small-queue target"
+        );
+    }
+
+    #[test]
+    fn test_page_cache_s3_fifo_prototype_evict_any_keeps_hot_page() {
+        let policy =
+            PageCacheEvictionPolicy::S3FifoPrototype(S3FifoConfig::with_limits(8, 2, 2, 1));
+        let mut cache = PageCache::with_eviction_policy(PageSize::DEFAULT, policy);
+
+        let hot = PageNumber::ONE;
+        let cold_pages = [
+            PageNumber::new(2).unwrap(),
+            PageNumber::new(3).unwrap(),
+            PageNumber::new(4).unwrap(),
+        ];
+
+        cache.insert_fresh(hot).unwrap()[0] = 1;
+        for (idx, page_no) in cold_pages.iter().copied().enumerate() {
+            cache.insert_fresh(page_no).unwrap()[0] = u8::try_from(idx + 2).unwrap();
+        }
+
+        let _ = cache.get_mut(hot).unwrap();
+        let _ = cache.get_mut(hot).unwrap();
+
+        assert!(
+            cache.evict_any(),
+            "prototype policy should still produce a victim"
+        );
+        assert!(
+            cache.contains(hot),
+            "hot page should survive a prototype eviction step"
+        );
+        assert_eq!(cache.len(), 3);
+
+        let cold_survivors = cold_pages
+            .iter()
+            .filter(|page_no| cache.contains(**page_no))
+            .count();
+        assert_eq!(
+            cold_survivors, 2,
+            "exactly one cold page should be selected as the victim"
+        );
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct HotColdEvictionBenchResult {
+        elapsed: Duration,
+        hot_hits: u64,
+        hot_misses: u64,
+        resident_hot_checks: u64,
+        resident_hot_kept: u64,
+        checksum: u64,
+    }
+
+    impl HotColdEvictionBenchResult {
+        fn hot_hit_pct(self) -> f64 {
+            let total = self.hot_hits.saturating_add(self.hot_misses);
+            if total == 0 {
+                0.0
+            } else {
+                (self.hot_hits as f64 * 100.0) / total as f64
+            }
+        }
+
+        fn resident_hot_pct(self) -> f64 {
+            if self.resident_hot_checks == 0 {
+                0.0
+            } else {
+                (self.resident_hot_kept as f64 * 100.0) / self.resident_hot_checks as f64
+            }
+        }
+    }
+
+    fn benchmark_hot_cold_eviction(policy: PageCacheEvictionPolicy) -> HotColdEvictionBenchResult {
+        const CAPACITY: usize = 64;
+        const HOT_SET: usize = 8;
+        const HOT_TOUCHES_PER_ROUND: usize = 6;
+        const COLD_BURST: usize = 16;
+        const ROUNDS: usize = 250;
+
+        let mut cache = PageCache::with_eviction_policy(PageSize::DEFAULT, policy);
+        let hot_pages = [7_u32, 113, 251, 389, 521, 659, 797, 941]
+            .map(|page_no| PageNumber::new(page_no).unwrap());
+        let mut next_cold_page = 10_000_u32;
+        let mut hot_hits = 0_u64;
+        let mut hot_misses = 0_u64;
+        let mut resident_hot_checks = 0_u64;
+        let mut resident_hot_kept = 0_u64;
+        let mut checksum = 0_u64;
+
+        for (idx, page_no) in hot_pages.iter().copied().enumerate() {
+            let page = cache.insert_fresh(page_no).unwrap();
+            page[0] = u8::try_from(idx + 1).unwrap();
+        }
+
+        let started = Instant::now();
+        for round in 0..ROUNDS {
+            for _ in 0..HOT_TOUCHES_PER_ROUND {
+                for (idx, page_no) in hot_pages.iter().copied().enumerate() {
+                    if let Some(page) = cache.get_mut(page_no) {
+                        hot_hits = hot_hits.saturating_add(1);
+                        checksum = checksum.saturating_add(u64::from(page[0]));
+                    } else {
+                        hot_misses = hot_misses.saturating_add(1);
+                        let page = cache.insert_fresh(page_no).unwrap();
+                        page[0] = u8::try_from((idx + round) % 251).unwrap_or(0);
+                        if cache.len() > CAPACITY {
+                            assert!(cache.evict_any(), "hot-page reinsertion must free capacity");
+                        }
+                    }
+                }
+            }
+
+            for burst_idx in 0..COLD_BURST {
+                let page_no = PageNumber::new(next_cold_page).unwrap();
+                next_cold_page = next_cold_page.saturating_add(1);
+                let page = cache.insert_fresh(page_no).unwrap();
+                page[0] = u8::try_from((round + burst_idx) % 251).unwrap_or(0);
+                if cache.len() > CAPACITY {
+                    assert!(cache.evict_any(), "cold-page admission must free capacity");
+                }
+            }
+
+            resident_hot_checks = resident_hot_checks.saturating_add(HOT_SET as u64);
+            resident_hot_kept = resident_hot_kept.saturating_add(
+                hot_pages
+                    .iter()
+                    .filter(|page_no| cache.contains(**page_no))
+                    .count() as u64,
+            );
+        }
+
+        HotColdEvictionBenchResult {
+            elapsed: started.elapsed(),
+            hot_hits,
+            hot_misses,
+            resident_hot_checks,
+            resident_hot_kept,
+            checksum: black_box(checksum),
+        }
+    }
+
+    fn median_duration(samples: &[HotColdEvictionBenchResult]) -> Duration {
+        let mut elapsed_nanos: Vec<u128> = samples
+            .iter()
+            .map(|sample| sample.elapsed.as_nanos())
+            .collect();
+        elapsed_nanos.sort_unstable();
+        let middle = elapsed_nanos[elapsed_nanos.len() / 2];
+        let nanos = u64::try_from(middle).unwrap_or(u64::MAX);
+        Duration::from_nanos(nanos)
+    }
+
+    #[test]
+    #[ignore = "benchmark evidence only"]
+    fn page_cache_hot_cold_eviction_microbench_report() {
+        const SAMPLE_COUNT: usize = 3;
+
+        let _ = benchmark_hot_cold_eviction(PageCacheEvictionPolicy::Arbitrary);
+        let _ = benchmark_hot_cold_eviction(PageCacheEvictionPolicy::S3FifoPrototype(
+            S3FifoConfig::new(64),
+        ));
+
+        let arbitrary_samples: Vec<HotColdEvictionBenchResult> = (0..SAMPLE_COUNT)
+            .map(|_| benchmark_hot_cold_eviction(PageCacheEvictionPolicy::Arbitrary))
+            .collect();
+        let prototype_samples: Vec<HotColdEvictionBenchResult> = (0..SAMPLE_COUNT)
+            .map(|_| {
+                benchmark_hot_cold_eviction(PageCacheEvictionPolicy::S3FifoPrototype(
+                    S3FifoConfig::new(64),
+                ))
+            })
+            .collect();
+
+        let arbitrary = arbitrary_samples[0];
+        let prototype = prototype_samples[0];
+        let arbitrary_median = median_duration(&arbitrary_samples);
+        let prototype_median = median_duration(&prototype_samples);
+
+        println!(
+            "policy=Arbitrary median_ms={:.3} hot_hit_pct={:.2} resident_hot_pct={:.2} checksum={}",
+            arbitrary_median.as_secs_f64() * 1_000.0,
+            arbitrary.hot_hit_pct(),
+            arbitrary.resident_hot_pct(),
+            arbitrary.checksum
+        );
+        println!(
+            "policy=S3FifoPrototype median_ms={:.3} hot_hit_pct={:.2} resident_hot_pct={:.2} checksum={}",
+            prototype_median.as_secs_f64() * 1_000.0,
+            prototype.hot_hit_pct(),
+            prototype.resident_hot_pct(),
+            prototype.checksum
+        );
+        println!(
+            "delta_hot_hit_pct={:.2} delta_resident_hot_pct={:.2} slowdown_x={:.2}",
+            prototype.hot_hit_pct() - arbitrary.hot_hit_pct(),
+            prototype.resident_hot_pct() - arbitrary.resident_hot_pct(),
+            prototype_median.as_secs_f64() / arbitrary_median.as_secs_f64()
+        );
+
+        assert!(
+            prototype.hot_hit_pct() > arbitrary.hot_hit_pct(),
+            "prototype must improve hot hit rate on the focused hot/cold workload"
+        );
+        assert!(
+            prototype.resident_hot_pct() > arbitrary.resident_hot_pct(),
+            "prototype must retain more hot pages across cold bursts"
+        );
     }
 
     // -----------------------------------------------------------------------

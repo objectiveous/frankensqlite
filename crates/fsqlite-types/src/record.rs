@@ -594,14 +594,27 @@ impl RecordDecodeScratch {
     /// `None` when the record is malformed.
     #[must_use]
     pub fn prepare_for_record(&mut self, record: &[u8]) -> Option<bool> {
-        let col_count = parse_record_header_into(record, &mut self.header_offsets)?;
+        let col_count = match parse_record_header_into(record, &mut self.header_offsets) {
+            Some(col_count) => col_count,
+            None => {
+                self.invalidate();
+                return None;
+            }
+        };
         if col_count > 64 {
             self.values.clear();
-            parse_record_into(record, &mut self.values)?;
+            if parse_record_into(record, &mut self.values).is_none() {
+                self.invalidate();
+                return None;
+            }
             self.decoded_mask = u64::MAX;
             Some(true)
         } else {
-            self.values.resize(col_count, SqliteValue::Null);
+            if self.values.len() > col_count {
+                self.values.truncate(col_count);
+            } else if self.values.len() < col_count {
+                self.values.resize(col_count, SqliteValue::Null);
+            }
             self.decoded_mask = 0;
             Some(false)
         }

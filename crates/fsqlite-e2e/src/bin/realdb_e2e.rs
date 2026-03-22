@@ -5138,9 +5138,9 @@ mod tests {
         HOT_PATH_OPCODE_PROFILE_SCHEMA_V1, HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V3,
         HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1, HOT_PATH_PROFILE_SCHEMA_V1,
         HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA_V1, HotPathAllocatorPressure, HotPathArtifactFile,
-        HotPathArtifactManifest, HotPathMvccWriteProfile, HotPathOpcodeProfileEntry,
-        HotPathPageDataMotionProfile, HotPathParserProfile, HotPathProfileReport,
-        HotPathRankingEntry, HotPathRecordDecodeCallsiteBreakdown,
+        HotPathArtifactManifest, HotPathBtreeCopyKernelProfile, HotPathMvccWriteProfile,
+        HotPathOpcodeProfileEntry, HotPathPageDataMotionProfile, HotPathParserProfile,
+        HotPathProfileReport, HotPathRankingEntry, HotPathRecordDecodeCallsiteBreakdown,
         HotPathRecordDecodeCallsiteCounters, HotPathRecordDecodeProfile,
         HotPathRowMaterializationProfile, HotPathTypeProfile, HotPathValueTypeProfile,
     };
@@ -5283,6 +5283,48 @@ mod tests {
                 prepared_cache_misses: 1,
                 compile_time_ns: 10,
             },
+            btree_copy_kernels: HotPathBtreeCopyKernelProfile {
+                local_payload_copy_calls: 2,
+                local_payload_copy_bytes: 96,
+                owned_payload_materialization_calls: 1,
+                owned_payload_materialization_bytes: 48,
+                overflow_chain_reassembly_calls: 1,
+                overflow_chain_local_bytes: 40,
+                overflow_chain_overflow_bytes: 512,
+                overflow_page_reads: 2,
+                table_leaf_cell_assembly_calls: 1,
+                table_leaf_cell_assembly_bytes: 56,
+                index_leaf_cell_assembly_calls: 1,
+                index_leaf_cell_assembly_bytes: 32,
+                interior_cell_rebuild_calls: 1,
+                interior_cell_rebuild_bytes: 44,
+            },
+            btree_copy_kernel_targets: vec![
+                HotPathRankingEntry {
+                    subsystem: "btree_overflow_reassembly".to_owned(),
+                    metric_kind: "bytes".to_owned(),
+                    metric_value: 552,
+                    rationale:
+                        "1 overflow reassembly call copied 40 local bytes + 512 overflow bytes across 2 overflow page reads"
+                            .to_owned(),
+                },
+                HotPathRankingEntry {
+                    subsystem: "btree_local_payload_copy".to_owned(),
+                    metric_kind: "bytes".to_owned(),
+                    metric_value: 96,
+                    rationale:
+                        "2 local payload copy calls copied 96 bytes into caller scratch without overflow traversal"
+                            .to_owned(),
+                },
+                HotPathRankingEntry {
+                    subsystem: "btree_table_leaf_cell_assembly".to_owned(),
+                    metric_kind: "bytes".to_owned(),
+                    metric_value: 56,
+                    rationale:
+                        "1 table-leaf cell assembly call emitted 56 bytes before page insert"
+                            .to_owned(),
+                },
+            ],
             record_decode: HotPathRecordDecodeProfile {
                 parse_record_calls: 1,
                 parse_record_into_calls: 0,
@@ -6082,6 +6124,26 @@ mod tests {
             value["subsystem_profile"]["subsystem_ranking"][0]["subsystem"],
             "record_decode"
         );
+        assert_eq!(
+            value["profile"]["btree_copy_kernels"]["overflow_chain_overflow_bytes"],
+            512
+        );
+        assert_eq!(
+            value["profile"]["btree_copy_kernel_targets"][0]["subsystem"],
+            "btree_overflow_reassembly"
+        );
+        assert_eq!(
+            value["subsystem_profile"]["btree_copy_kernel_targets"][0]["subsystem"],
+            "btree_overflow_reassembly"
+        );
+        assert!(
+            value["summary_markdown"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("## B-Tree Copy Kernel Targets"))
+        );
+        assert!(value["summary_markdown"].as_str().is_some_and(|summary| {
+            summary.contains("btree_overflow_reassembly") && summary.contains("overflow bytes")
+        }));
         assert!(
             value["summary_markdown"]
                 .as_str()

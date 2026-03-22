@@ -1531,6 +1531,11 @@ fn build_page(
     page_size: u32,
     right_child: Option<PageNumber>,
 ) -> Result<Vec<u8>> {
+    if page_size < usable_size {
+        return Err(FrankenError::internal(format!(
+            "build_page: page_size ({page_size}) < usable_size ({usable_size})"
+        )));
+    }
     let full_page_size = page_size as usize;
     let usable = usable_size as usize;
     let mut page = vec![0u8; full_page_size];

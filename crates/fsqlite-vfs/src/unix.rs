@@ -263,16 +263,7 @@ fn posix_lock(file: &impl AsFd, lock_type: impl Into<i32>, start: u64, len: u64)
             Ok(_) => return Ok(true),
             Err(nix::errno::Errno::EINTR) => {}
             Err(nix::errno::Errno::EACCES | nix::errno::Errno::EAGAIN) => return Ok(false),
-            Err(e) => {
-                if e == nix::errno::Errno::EBADF {
-                    eprintln!(
-                        "[bd-zna34] POSIX_LOCK_EBADF fd={} lock_type={} start={start} len={len}",
-                        file.as_fd().as_raw_fd(),
-                        lock_type_i32
-                    );
-                }
-                return Err(FrankenError::Io(e.into()));
-            }
+            Err(e) => return Err(FrankenError::Io(e.into())),
         }
     }
 }
@@ -1630,13 +1621,6 @@ impl VfsFile for UnixFile {
 
     fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         checkpoint_or_abort(cx)?;
-        if self.closed {
-            eprintln!(
-                "[bd-zna34] WRITE_AFTER_CLOSE fd={} path={} — EBADF likely",
-                self.file.as_raw_fd(),
-                self.path.display()
-            );
-        }
         let mut total = 0_usize;
         while total < buf.len() {
             #[allow(clippy::cast_possible_truncation)]
@@ -1651,18 +1635,7 @@ impl VfsFile for UnixFile {
                 Ok(n) => {
                     total += n;
                 }
-                Err(e) => {
-                    eprintln!(
-                        "[bd-zna34] WRITE_FAILED fd={} arc_strong={} closed={} path={} offset={} err={}",
-                        self.file.as_raw_fd(),
-                        Arc::strong_count(&self.file),
-                        self.closed,
-                        self.path.display(),
-                        offset,
-                        e
-                    );
-                    return Err(FrankenError::Io(e));
-                }
+                Err(e) => return Err(FrankenError::Io(e)),
             }
         }
         Ok(())
@@ -1674,29 +1647,11 @@ impl VfsFile for UnixFile {
     }
 
     fn sync(&mut self, _cx: &Cx, flags: SyncFlags) -> Result<()> {
-        if self.closed {
-            eprintln!(
-                "[bd-zna34] SYNC_AFTER_CLOSE fd={} path={} — EBADF likely",
-                self.file.as_raw_fd(),
-                self.path.display()
-            );
-        }
-        let result = if flags.contains(SyncFlags::DATAONLY) {
+        if flags.contains(SyncFlags::DATAONLY) {
             self.file.sync_data().map_err(FrankenError::Io)
         } else {
             self.file.sync_all().map_err(FrankenError::Io)
-        };
-        if let Err(ref e) = result {
-            eprintln!(
-                "[bd-zna34] SYNC_FAILED fd={} arc_strong={} closed={} path={} err={}",
-                self.file.as_raw_fd(),
-                Arc::strong_count(&self.file),
-                self.closed,
-                self.path.display(),
-                e
-            );
         }
-        result
     }
 
     fn file_size(&self, _cx: &Cx) -> Result<u64> {

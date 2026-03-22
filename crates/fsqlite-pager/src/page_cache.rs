@@ -28,7 +28,6 @@ use fsqlite_types::{PageNumber, PageSize};
 use fsqlite_vfs::VfsFile;
 
 use crate::page_buf::{PageBuf, PageBufPool};
-use crate::s3_fifo::S3FifoConfig;
 
 // ---------------------------------------------------------------------------
 // PageCache
@@ -84,109 +83,6 @@ impl PageCacheMetricsSnapshot {
     }
 }
 
-/// Public eviction-policy selector for page-cache experiments.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PageCacheEvictionPolicy {
-    Arbitrary,
-    S3FifoPrototype(S3FifoConfig),
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct EvictionQueuesSnapshot {
-    t1_size: usize,
-    t2_size: usize,
-    b1_size: usize,
-    b2_size: usize,
-    p_target: usize,
-}
-
-#[derive(Debug, Clone)]
-struct PageCacheEvictionState {
-    policy: PageCacheEvictionPolicy,
-    admit_order: std::collections::HashMap<PageNumber, u64, foldhash::fast::FixedState>,
-    access_counts: std::collections::HashMap<PageNumber, u32, foldhash::fast::FixedState>,
-    next_order: u64,
-}
-
-impl PageCacheEvictionState {
-    fn new(policy: PageCacheEvictionPolicy) -> Self {
-        Self {
-            policy,
-            admit_order: std::collections::HashMap::with_hasher(
-                foldhash::fast::FixedState::default(),
-            ),
-            access_counts: std::collections::HashMap::with_hasher(
-                foldhash::fast::FixedState::default(),
-            ),
-            next_order: 0,
-        }
-    }
-
-    fn record_admit(&mut self, page_no: PageNumber) {
-        self.admit_order.entry(page_no).or_insert_with(|| {
-            let order = self.next_order;
-            self.next_order = self.next_order.saturating_add(1);
-            order
-        });
-        self.access_counts.entry(page_no).or_insert(0);
-    }
-
-    fn record_hit(&mut self, page_no: PageNumber) {
-        if let Some(count) = self.access_counts.get_mut(&page_no) {
-            *count = count.saturating_add(1);
-        }
-    }
-
-    fn choose_victim(
-        &self,
-        pages: &std::collections::HashMap<PageNumber, PageBuf, foldhash::fast::FixedState>,
-    ) -> Option<PageNumber> {
-        match self.policy {
-            PageCacheEvictionPolicy::Arbitrary => pages.keys().next().copied(),
-            PageCacheEvictionPolicy::S3FifoPrototype(_) => pages.keys().copied().min_by_key(
-                |page_no| {
-                    let hits = self.access_counts.get(page_no).copied().unwrap_or(0);
-                    let order = self.admit_order.get(page_no).copied().unwrap_or(u64::MAX);
-                    (hits > 0, hits, order)
-                },
-            ),
-        }
-    }
-
-    fn queue_metrics(
-        &self,
-        pages: &std::collections::HashMap<PageNumber, PageBuf, foldhash::fast::FixedState>,
-    ) -> EvictionQueuesSnapshot {
-        match self.policy {
-            PageCacheEvictionPolicy::Arbitrary => EvictionQueuesSnapshot {
-                t1_size: pages.len(),
-                t2_size: 0,
-                b1_size: 0,
-                b2_size: 0,
-                p_target: pages.len(),
-            },
-            PageCacheEvictionPolicy::S3FifoPrototype(config) => {
-                let mut t1_size = 0_usize;
-                let mut t2_size = 0_usize;
-                for page_no in pages.keys() {
-                    if self.access_counts.get(page_no).copied().unwrap_or(0) == 0 {
-                        t1_size = t1_size.saturating_add(1);
-                    } else {
-                        t2_size = t2_size.saturating_add(1);
-                    }
-                }
-                EvictionQueuesSnapshot {
-                    t1_size,
-                    t2_size,
-                    b1_size: 0,
-                    b2_size: 0,
-                    p_target: config.small_capacity().max(1),
-                }
-            }
-        }
-    }
-}
-
 /// Simple page cache: `PageNumber → PageBuf`.
 ///
 /// All buffers are drawn from a shared [`PageBufPool`].  On eviction the
@@ -200,7 +96,6 @@ pub struct PageCache {
     pool: PageBufPool,
     pages: std::collections::HashMap<PageNumber, PageBuf, foldhash::fast::FixedState>,
     page_size: PageSize,
-    eviction: PageCacheEvictionState,
     hits: Cell<u64>,
     misses: Cell<u64>,
     admits: Cell<u64>,
@@ -210,32 +105,15 @@ pub struct PageCache {
 impl PageCache {
     /// Create a new, empty `PageCache` configured for the given `page_size`.
     pub fn new(page_size: PageSize) -> Self {
-        Self::with_eviction_policy(page_size, PageCacheEvictionPolicy::Arbitrary)
-    }
-
-    /// Create a new, empty `PageCache` configured for the given `page_size`
-    /// and explicit eviction policy.
-    pub fn with_eviction_policy(page_size: PageSize, policy: PageCacheEvictionPolicy) -> Self {
-        Self::with_pool_and_eviction_policy(PageBufPool::new(page_size, 65_536), page_size, policy)
+        Self::with_pool(PageBufPool::new(page_size, 65_536), page_size)
     }
 
     /// Create a new `PageCache` using an existing `PageBufPool`.
     pub fn with_pool(pool: PageBufPool, page_size: PageSize) -> Self {
-        Self::with_pool_and_eviction_policy(pool, page_size, PageCacheEvictionPolicy::Arbitrary)
-    }
-
-    /// Create a new `PageCache` using an existing `PageBufPool` and explicit
-    /// eviction policy.
-    pub fn with_pool_and_eviction_policy(
-        pool: PageBufPool,
-        page_size: PageSize,
-        policy: PageCacheEvictionPolicy,
-    ) -> Self {
         Self {
             pool,
             pages: std::collections::HashMap::with_hasher(foldhash::fast::FixedState::default()),
             page_size,
-            eviction: PageCacheEvictionState::new(policy),
             hits: Cell::new(0),
             misses: Cell::new(0),
             admits: Cell::new(0),
@@ -278,7 +156,6 @@ impl PageCache {
     pub fn get_mut(&mut self, page_no: PageNumber) -> Option<&mut [u8]> {
         if let Some(page) = self.pages.get_mut(&page_no) {
             self.hits.set(self.hits.get().saturating_add(1));
-            self.eviction.record_hit(page_no);
             Some(page.as_mut_slice())
         } else {
             self.misses.set(self.misses.get().saturating_add(1));

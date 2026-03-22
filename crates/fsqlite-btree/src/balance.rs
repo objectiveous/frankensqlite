@@ -98,6 +98,7 @@ pub fn balance_deeper<W: PageWriter>(
     writer: &mut W,
     root_page_no: PageNumber,
     usable_size: u32,
+    page_size: u32,
 ) -> Result<PageNumber> {
     let root_data = writer.read_page_data(cx, root_page_no)?;
     let root_offset = header_offset_for_page(root_page_no);
@@ -132,6 +133,7 @@ pub fn balance_deeper<W: PageWriter>(
         root_header.page_type,
         child_offset,
         usable_size,
+        page_size,
         root_header.right_child,
     ) {
         Ok(page) => page,
@@ -147,7 +149,7 @@ pub fn balance_deeper<W: PageWriter>(
     }
 
     // Clear the root page and make it an interior page pointing to the child.
-    let mut new_root = vec![0u8; usable_size as usize];
+    let mut new_root = vec![0u8; page_size as usize];
     let new_root_type = if root_header.page_type.is_table() {
         BtreePageType::InteriorTable
     } else {
@@ -206,6 +208,7 @@ pub fn balance_quick<W: PageWriter>(
     overflow_cell: &[u8],
     overflow_rowid: i64,
     usable_size: u32,
+    page_size: u32,
 ) -> Result<Option<PageNumber>> {
     // Read parent page to check for space.
     let original_parent_data = writer.read_page_data(cx, parent_page_no)?;
@@ -242,7 +245,7 @@ pub fn balance_quick<W: PageWriter>(
 
     // Allocate new sibling page.
     let new_pgno = writer.allocate_page(cx)?;
-    let mut new_page = vec![0u8; usable_size as usize];
+    let mut new_page = vec![0u8; page_size as usize];
     let new_offset = header_offset_for_page(new_pgno);
 
     // Initialize as leaf table page with one cell.
@@ -394,6 +397,7 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
     overflow_cells: &[Vec<u8>],
     overflow_insert_idx: usize,
     usable_size: u32,
+    page_size: u32,
     parent_is_root: bool,
 ) -> Result<BalanceResult> {
     let parent_data = writer.read_page_data(cx, parent_page_no)?;
@@ -634,6 +638,7 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
             page_type,
             page_offset,
             usable_size,
+            page_size,
             right_child,
         ) {
             Ok(page) => page,
@@ -719,6 +724,7 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
         writer,
         parent_page_no,
         usable_size,
+        page_size,
         first_child,
         sibling_count,
         &new_pgnos,
@@ -993,6 +999,7 @@ fn prepare_leaf_table_local_split<W: PageWriter>(
     overflow_cell: &[u8],
     overflow_insert_idx: usize,
     usable_size: u32,
+    page_size: u32,
 ) -> Result<Option<PreparedLeafTableLocalSplit>> {
     let leaf_page = writer.read_page_data(cx, leaf_page_no)?;
     let leaf_offset = header_offset_for_page(leaf_page_no);
@@ -1052,6 +1059,7 @@ fn prepare_leaf_table_local_split<W: PageWriter>(
         BtreePageType::LeafTable,
         leaf_offset,
         usable_size,
+        page_size,
         None,
     ) {
         Ok(page) => page,
@@ -1065,6 +1073,7 @@ fn prepare_leaf_table_local_split<W: PageWriter>(
         BtreePageType::LeafTable,
         header_offset_for_page(new_sibling_pgno),
         usable_size,
+        page_size,
         None,
     ) {
         Ok(page) => page,
@@ -1110,6 +1119,7 @@ pub(crate) fn balance_table_leaf_local_split<W: PageWriter>(
     overflow_cell: &[u8],
     overflow_insert_idx: usize,
     usable_size: u32,
+    page_size: u32,
     parent_is_root: bool,
 ) -> Result<Option<BalanceResult>> {
     if !parent_has_room_for_table_leaf_split(cx, writer, parent_page_no, usable_size)? {
@@ -1123,6 +1133,7 @@ pub(crate) fn balance_table_leaf_local_split<W: PageWriter>(
         overflow_cell,
         overflow_insert_idx,
         usable_size,
+        page_size,
     )?
     else {
         return Ok(None);
@@ -1146,6 +1157,7 @@ pub(crate) fn balance_table_leaf_local_split<W: PageWriter>(
         writer,
         parent_page_no,
         usable_size,
+        page_size,
         child_idx,
         1,
         &prepared.new_pgnos,
@@ -1505,19 +1517,27 @@ fn cell_cost(cell: &GatheredCell) -> Option<usize> {
 
 /// Build a complete B-tree page from a list of cells.
 ///
+/// `page_size` is the full on-disk page size (usable_size + reserved_bytes).
+/// The buffer is allocated at `page_size` so that stock SQLite sees
+/// correctly-sized pages, but cell content grows downward from
+/// `usable_size` as required by the file format.
+///
 /// Returns the raw page data.
 fn build_page(
     cells: &[GatheredCell],
     page_type: BtreePageType,
     header_offset: usize,
     usable_size: u32,
+    page_size: u32,
     right_child: Option<PageNumber>,
 ) -> Result<Vec<u8>> {
-    let page_size = usable_size as usize;
-    let mut page = vec![0u8; page_size];
+    let full_page_size = page_size as usize;
+    let usable = usable_size as usize;
+    let mut page = vec![0u8; full_page_size];
 
-    // Place cells from the end of the page, growing downward.
-    let mut content_offset = page_size;
+    // Place cells from the end of the *usable* area, growing downward.
+    // The reserved region (page[usable..full_page_size]) stays zeroed.
+    let mut content_offset = usable;
     let mut cell_pointers: Vec<u16> = Vec::with_capacity(cells.len());
 
     for cell in cells {
@@ -1525,7 +1545,7 @@ fn build_page(
         let Some(next_offset) = content_offset.checked_sub(cell_len) else {
             return Err(FrankenError::internal(format!(
                 "build_page overflow: page_type={page_type:?} header_offset={header_offset} \
-                 page_size={page_size} content_offset={content_offset} cell_len={cell_len} \
+                 page_size={full_page_size} usable_size={usable} content_offset={content_offset} cell_len={cell_len} \
                  cells={}",
                 cells.len()
             )));
@@ -1542,7 +1562,7 @@ fn build_page(
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
                 "build_page layout overlap: page_type={page_type:?} header_offset={header_offset} \
-                 pointer_end={pointer_array_end} content_offset={content_offset} cells={} usable={page_size}",
+                 pointer_end={pointer_array_end} content_offset={content_offset} cells={} usable={usable}",
                 cells.len()
             ),
         });
@@ -1635,6 +1655,7 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
     writer: &mut W,
     parent_page_no: PageNumber,
     usable_size: u32,
+    page_size: u32,
     first_child: usize,
     old_sibling_count: usize,
     new_pgnos: &[PageNumber],
@@ -1736,6 +1757,7 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
                 writer,
                 parent_page_no,
                 usable_size,
+                page_size,
                 offset,
                 header.page_type,
                 page_data.as_bytes(),
@@ -1753,6 +1775,7 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
             writer,
             parent_page_no,
             usable_size,
+            page_size,
             offset,
             header.page_type,
             &page_data.as_bytes()[..offset],
@@ -1768,6 +1791,7 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
         header.page_type,
         offset,
         usable_size,
+        page_size,
         right_child,
     )?;
 
@@ -1792,7 +1816,14 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
     // "balance-shallower" sub-algorithm in the canonical upstream implementation.
     if parent_is_root && final_cells.is_empty() {
         if let Some(child_pgno) = right_child {
-            balance_shallower(cx, writer, parent_page_no, child_pgno, usable_size)?;
+            balance_shallower(
+                cx,
+                writer,
+                parent_page_no,
+                child_pgno,
+                usable_size,
+                page_size,
+            )?;
         }
     }
 
@@ -1821,6 +1852,7 @@ fn balance_shallower<W: PageWriter>(
     root_page_no: PageNumber,
     child_pgno: PageNumber,
     usable_size: u32,
+    page_size: u32,
 ) -> Result<()> {
     let child_data = writer.read_page_data(cx, child_pgno)?;
     let root_offset = header_offset_for_page(root_page_no);
@@ -1863,6 +1895,7 @@ fn balance_shallower<W: PageWriter>(
         child_header.page_type,
         root_offset,
         usable_size,
+        page_size,
         child_header.right_child,
     )?;
 
@@ -1911,6 +1944,7 @@ fn split_overflowing_root<W: PageWriter>(
     writer: &mut W,
     root_page_no: PageNumber,
     usable_size: u32,
+    page_size: u32,
     root_offset: usize,
     page_type: BtreePageType,
     root_prefix: &[u8],
@@ -2081,6 +2115,7 @@ fn split_overflowing_root<W: PageWriter>(
             page_type,
             child_offset,
             usable_size,
+            page_size,
             Some(right_children[i]),
         ) {
             Ok(page) => page,
@@ -2109,6 +2144,7 @@ fn split_overflowing_root<W: PageWriter>(
         page_type,
         root_offset,
         usable_size,
+        page_size,
         Some(root_right),
     )?;
     if root_offset > 0 {
@@ -2129,6 +2165,7 @@ fn split_overflowing_nonroot_interior_page<W: PageWriter>(
     writer: &mut W,
     page_no: PageNumber,
     usable_size: u32,
+    page_size: u32,
     page_offset: usize,
     page_type: BtreePageType,
     original_page: &[u8],
@@ -2306,6 +2343,7 @@ fn split_overflowing_nonroot_interior_page<W: PageWriter>(
             page_type,
             child_off,
             usable_size,
+            page_size,
             Some(right_children[i]),
         ) {
             Ok(page) => page,
@@ -2592,7 +2630,7 @@ mod tests {
         let root = build_leaf_table(&[(1, b"aaa"), (2, b"bbb"), (3, b"ccc")]);
         store.pages.insert(2, root);
 
-        let child_pgno = balance_deeper(&cx, &mut store, pn(2), USABLE).unwrap();
+        let child_pgno = balance_deeper(&cx, &mut store, pn(2), USABLE, USABLE).unwrap();
 
         // Root should now be an interior page with 0 cells.
         let root_data = store.pages.get(&2).unwrap();
@@ -2625,7 +2663,7 @@ mod tests {
         let root = build_leaf_table(&entries);
         store.pages.insert(3, root);
 
-        let child_pgno = balance_deeper(&cx, &mut store, pn(3), USABLE).unwrap();
+        let child_pgno = balance_deeper(&cx, &mut store, pn(3), USABLE, USABLE).unwrap();
 
         let child_data = store.pages.get(&child_pgno.get()).unwrap();
         let child_header = BtreePageHeader::parse(child_data, 0).unwrap();
@@ -2651,7 +2689,7 @@ mod tests {
         let root = build_interior_table(&[(pn(6), 10), (pn(7), 20)], pn(8));
         store.pages.insert(5, root);
 
-        let child_pgno = balance_deeper(&cx, &mut store, pn(5), USABLE).unwrap();
+        let child_pgno = balance_deeper(&cx, &mut store, pn(5), USABLE, USABLE).unwrap();
 
         // Root should be interior with 0 cells.
         let root_data = store.pages.get(&5).unwrap();
@@ -2692,6 +2730,7 @@ mod tests {
             pn(3),
             &overflow_cell[..pos],
             30,
+            USABLE,
             USABLE,
         )
         .unwrap()
@@ -2745,7 +2784,17 @@ mod tests {
 
         store.pages.insert(3, build_leaf_table(&[(10, b"ten")]));
 
-        let result = balance_quick(&cx, &mut store, pn(2), pn(3), b"overflow", 30, USABLE).unwrap();
+        let result = balance_quick(
+            &cx,
+            &mut store,
+            pn(2),
+            pn(3),
+            b"overflow",
+            30,
+            USABLE,
+            USABLE,
+        )
+        .unwrap();
 
         assert!(
             result.is_none(),
@@ -2779,6 +2828,7 @@ mod tests {
             pn(3),
             &overflow_cell[..pos],
             30,
+            USABLE,
             USABLE,
         )
         .expect_err("injected parent insert failure should propagate");
@@ -2817,6 +2867,7 @@ mod tests {
             &overflow_cell[..pos],
             30,
             USABLE,
+            USABLE,
         )
         .expect_err("injected right-child update failure should propagate");
         assert!(err.to_string().contains("injected write failure"));
@@ -2836,7 +2887,7 @@ mod tests {
         store.inner.pages.insert(2, parent.clone());
 
         let outcome =
-            apply_child_replacement(&cx, &mut store, pn(2), USABLE, 1, 1, &[pn(4)], &[], false)
+            apply_child_replacement(&cx, &mut store, pn(2), USABLE, USABLE, 1, 1, &[pn(4)], &[], false)
                 .expect("no-op replacement should succeed");
 
         assert!(matches!(outcome, BalanceResult::Done));
@@ -2886,6 +2937,7 @@ mod tests {
             pn(4),
             &overflow_cell,
             0,
+            USABLE,
             USABLE,
             true,
         )
@@ -2964,6 +3016,7 @@ mod tests {
             pn(5),
             &overflow_cell,
             0,
+            USABLE,
             USABLE,
             true,
         )
@@ -3109,7 +3162,7 @@ mod tests {
             },
         ];
 
-        let page = build_page(&cells, BtreePageType::LeafTable, 0, USABLE, None)
+        let page = build_page(&cells, BtreePageType::LeafTable, 0, USABLE, USABLE, None)
             .expect("build_page should succeed");
 
         let header = BtreePageHeader::parse(&page, 0).unwrap();
@@ -3140,7 +3193,7 @@ mod tests {
             },
         ];
 
-        let err = build_page(&cells, BtreePageType::LeafTable, 100, USABLE, None)
+        let err = build_page(&cells, BtreePageType::LeafTable, 100, USABLE, USABLE, None)
             .expect_err("page-1 style header offset should reject overlap");
         assert!(err.to_string().contains("layout overlap"));
     }
@@ -3167,7 +3220,8 @@ mod tests {
             .insert(4, build_leaf_table(&[(60, b"sixty"), (70, b"seventy")]));
 
         // Balance around child 0 (left child), no overflow.
-        let outcome = balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, true).unwrap();
+        let outcome =
+            balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, USABLE, true).unwrap();
         assert!(matches!(outcome, BalanceResult::Done));
 
         // All four leaf-table cells fit on one page, so balance_shallower
@@ -3246,7 +3300,8 @@ mod tests {
         store.pages.insert(1, root_page.clone());
         store.pages.insert(2, child_data);
 
-        balance_shallower(&cx, &mut store, pn(1), pn(2), USABLE).expect("balance shallower");
+        balance_shallower(&cx, &mut store, pn(1), pn(2), USABLE, USABLE)
+            .expect("balance shallower");
 
         // Root remains unchanged interior page with right-child pointer.
         let updated_root = store.pages.get(&1).expect("root page exists");
@@ -3297,7 +3352,7 @@ mod tests {
         let original_right = base.pages.get(&4).cloned().unwrap();
 
         let mut store = FailingMemPageStore::new(base, 1);
-        let result = balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, true);
+        let result = balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, USABLE, true);
         assert!(result.is_err(), "injected write failure should surface");
         assert_eq!(store.inner.pages.get(&3), Some(&original_left));
         assert_eq!(store.inner.pages.get(&4), Some(&original_right));
@@ -3319,7 +3374,7 @@ mod tests {
         let original_right = base.pages.get(&4).cloned().unwrap();
 
         let mut store = FailingMemPageStore::new(base, 3);
-        let result = balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, true);
+        let result = balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, USABLE, true);
         assert!(
             result.is_err(),
             "injected root-collapse failure should surface"
@@ -3353,6 +3408,7 @@ mod tests {
             &cx,
             &mut store,
             pn(2),
+            USABLE,
             USABLE,
             0,
             BtreePageType::InteriorTable,

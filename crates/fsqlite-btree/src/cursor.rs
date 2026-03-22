@@ -341,6 +341,11 @@ pub struct BtCursor<P> {
     root_page: PageNumber,
     /// Usable page size (page_size - reserved_bytes).
     usable_size: u32,
+    /// Full page size on disk (usable_size + reserved_bytes).
+    ///
+    /// Pages written to disk must always be this size. Defaults to
+    /// `usable_size` (i.e. reserved_bytes == 0) when not explicitly set.
+    page_size: u32,
     /// Whether this is a table (intkey) or index (blobkey) B-tree.
     is_table: bool,
     /// Per-key descending flags for index cursors.
@@ -412,6 +417,27 @@ impl<P> BtCursor<P> {
     pub fn usable_size(&self) -> u32 {
         self.usable_size
     }
+
+    /// The full on-disk page size (usable_size + reserved_bytes).
+    #[must_use]
+    pub fn page_size(&self) -> u32 {
+        self.page_size
+    }
+
+    /// Set the full on-disk page size when reserved_bytes > 0.
+    ///
+    /// By default `page_size == usable_size` (no reserved bytes). Call this
+    /// after construction when the database header specifies a non-zero
+    /// reserved-byte count so that newly built pages are allocated at the
+    /// correct full page size.
+    pub fn set_page_size(&mut self, page_size: u32) {
+        debug_assert!(
+            page_size >= self.usable_size,
+            "page_size ({page_size}) must be >= usable_size ({})",
+            self.usable_size
+        );
+        self.page_size = page_size;
+    }
 }
 
 impl<P: PageReader> BtCursor<P> {
@@ -434,6 +460,7 @@ impl<P: PageReader> BtCursor<P> {
             pager,
             root_page,
             usable_size,
+            page_size: usable_size,
             is_table,
             index_desc_flags,
             stack: Vec::with_capacity(BTREE_MAX_DEPTH as usize),
@@ -1815,7 +1842,13 @@ impl<P: PageWriter> BtCursor<P> {
 
         if depth == 1 {
             // Leaf is the root — push root down first.
-            balance::balance_deeper(cx, &mut self.pager, self.root_page, self.usable_size)?;
+            balance::balance_deeper(
+                cx,
+                &mut self.pager,
+                self.root_page,
+                self.usable_size,
+                self.page_size,
+            )?;
             self.note_split_event();
             // Root is now an interior page with 1 child at index 0.
             let outcome = balance::balance_nonroot(
@@ -1826,6 +1859,7 @@ impl<P: PageWriter> BtCursor<P> {
                 &[cell_data.to_vec()],
                 insert_idx as usize,
                 self.usable_size,
+                self.page_size,
                 true,
             )?;
             if matches!(outcome, balance::BalanceResult::Split { .. }) {
@@ -1859,6 +1893,7 @@ impl<P: PageWriter> BtCursor<P> {
                             cell_data,
                             rowid,
                             self.usable_size,
+                            self.page_size,
                         ) {
                             Ok(Some(_new_pgno)) => {
                                 self.note_split_event();
@@ -1884,6 +1919,7 @@ impl<P: PageWriter> BtCursor<P> {
                     cell_data,
                     insert_idx as usize,
                     self.usable_size,
+                    self.page_size,
                     parent_is_root,
                 )? {
                     Some(outcome) => {
@@ -1898,6 +1934,7 @@ impl<P: PageWriter> BtCursor<P> {
                         &[cell_data.to_vec()],
                         insert_idx as usize,
                         self.usable_size,
+                        self.page_size,
                         parent_is_root,
                     )?,
                 }
@@ -1910,6 +1947,7 @@ impl<P: PageWriter> BtCursor<P> {
                     &[cell_data.to_vec()],
                     insert_idx as usize,
                     self.usable_size,
+                    self.page_size,
                     parent_is_root,
                 )?
             };
@@ -1940,6 +1978,7 @@ impl<P: PageWriter> BtCursor<P> {
                     &mut self.pager,
                     ancestor_page_no,
                     self.usable_size,
+                    self.page_size,
                     ancestor_child_idx,
                     1, // Replacing a single child page with its split siblings.
                     &new_pgnos,
@@ -1994,6 +2033,7 @@ impl<P: PageWriter> BtCursor<P> {
                 &[],
                 0,
                 self.usable_size,
+                self.page_size,
                 parent_is_root,
             )?;
 
@@ -2023,6 +2063,7 @@ impl<P: PageWriter> BtCursor<P> {
                     &mut self.pager,
                     ancestor_page_no,
                     self.usable_size,
+                    self.page_size,
                     ancestor_child_idx,
                     1, // Replacing a single child page with its split siblings.
                     &new_pgnos,

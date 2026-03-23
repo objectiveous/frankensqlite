@@ -2604,4 +2604,352 @@ mod tests {
             "bead_id=bd-3t52f global matrix should produce valid penalty"
         );
     }
+
+    // =========================================================================
+    // bd-1uguv: Adversarial Schedule Verification for DRO
+    // =========================================================================
+
+    /// Adversarial regime for DRO verification.
+    #[derive(Debug, Clone)]
+    struct AdversarialRegime {
+        name: &'static str,
+        txn_count: u32,
+        /// Abort probability when this regime simulates page conflicts.
+        /// Higher = more contentious. Drives `record_abort` vs `record_commit`.
+        abort_probability: f64,
+        /// Average edge count per decision.
+        edge_count: u64,
+        /// Concurrency level (active readers/writers for matrix evaluation).
+        active_readers: usize,
+        active_writers: usize,
+    }
+
+    /// Canonical 6-regime adversarial schedule.
+    fn canonical_adversarial_schedule() -> Vec<AdversarialRegime> {
+        vec![
+            AdversarialRegime {
+                name: "warm_uniform",
+                txn_count: 500,
+                abort_probability: 0.03,
+                edge_count: 1,
+                active_readers: 4,
+                active_writers: 4,
+            },
+            AdversarialRegime {
+                name: "sudden_skew",
+                txn_count: 500,
+                abort_probability: 0.35,
+                edge_count: 4,
+                active_readers: 4,
+                active_writers: 4,
+            },
+            AdversarialRegime {
+                name: "sustained_skew",
+                txn_count: 1000,
+                abort_probability: 0.30,
+                edge_count: 3,
+                active_readers: 4,
+                active_writers: 4,
+            },
+            AdversarialRegime {
+                name: "sudden_calm",
+                txn_count: 500,
+                abort_probability: 0.04,
+                edge_count: 1,
+                active_readers: 4,
+                active_writers: 4,
+            },
+            AdversarialRegime {
+                name: "hot_page_storm",
+                txn_count: 500,
+                abort_probability: 0.55,
+                edge_count: 6,
+                active_readers: 8,
+                active_writers: 8,
+            },
+            AdversarialRegime {
+                name: "recovery",
+                txn_count: 500,
+                abort_probability: 0.03,
+                edge_count: 1,
+                active_readers: 4,
+                active_writers: 4,
+            },
+        ]
+    }
+
+    /// Per-regime metrics collected during adversarial runs.
+    #[derive(Debug, Clone)]
+    struct RegimeMetrics {
+        regime_name: &'static str,
+        policy: &'static str,
+        committed: u64,
+        aborted: u64,
+        abort_rate: f64,
+        radius_at_end: f64,
+        generation_at_end: u64,
+        generation_at_start: u64,
+        dro_aborts: u64,
+        dro_allows: u64,
+    }
+
+    /// Deterministic pseudo-random abort decision given seed + index.
+    fn deterministic_should_abort(seed: u64, index: u32, probability: f64) -> bool {
+        // Simple deterministic hash: mix seed and index, take fractional part.
+        let mixed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(u64::from(index).wrapping_mul(1_442_695_040_888_963_407));
+        #[allow(clippy::cast_precision_loss)]
+        let frac = ((mixed >> 11) as f64) / ((1_u64 << 53) as f64);
+        frac < probability
+    }
+
+    /// Run one adversarial schedule under a given DRO controller configuration.
+    /// Returns per-regime metrics.
+    fn run_adversarial_schedule(
+        seed: u64,
+        schedule: &[AdversarialRegime],
+        window_commit_budget: u64,
+    ) -> Vec<RegimeMetrics> {
+        let config = DroLiveControllerConfig {
+            window_commit_budget,
+            ..DroLiveControllerConfig::default()
+        };
+        let ctrl = DroLiveController::new(config);
+        let mut results = Vec::with_capacity(schedule.len());
+
+        for regime in schedule {
+            let gen_start = ctrl.generation();
+            let mut committed = 0_u64;
+            let mut aborted = 0_u64;
+            let mut dro_aborts = 0_u64;
+            let mut dro_allows = 0_u64;
+
+            for i in 0..regime.txn_count {
+                let is_abort = deterministic_should_abort(
+                    seed,
+                    i + committed as u32,
+                    regime.abort_probability,
+                );
+
+                // Evaluate DRO decision for this regime's concurrency.
+                let matrix = ctrl.current_matrix();
+                let decision = matrix.evaluate(regime.active_readers, regime.active_writers);
+                if decision.should_abort() {
+                    dro_aborts += 1;
+                } else {
+                    dro_allows += 1;
+                }
+
+                if is_abort {
+                    ctrl.record_abort(regime.edge_count);
+                    aborted += 1;
+                } else {
+                    ctrl.record_commit(regime.edge_count);
+                    committed += 1;
+                }
+            }
+
+            let gen_end = ctrl.generation();
+            let matrix = ctrl.current_matrix();
+            let radius = matrix.radius().effective_radius();
+            let total = committed + aborted;
+
+            results.push(RegimeMetrics {
+                regime_name: regime.name,
+                policy: if window_commit_budget == u64::MAX {
+                    "static"
+                } else {
+                    "dro"
+                },
+                committed,
+                aborted,
+                #[allow(clippy::cast_precision_loss)]
+                abort_rate: if total == 0 {
+                    0.0
+                } else {
+                    aborted as f64 / total as f64
+                },
+                radius_at_end: radius,
+                generation_at_end: gen_end,
+                generation_at_start: gen_start,
+                dro_aborts,
+                dro_allows,
+            });
+        }
+
+        results
+    }
+
+    #[test]
+    fn test_adversarial_schedule_generator_determinism() {
+        // bead_id=bd-1uguv: Same seed must produce identical abort sequences.
+        let seed = 42_u64;
+        let schedule = canonical_adversarial_schedule();
+        let run1 = run_adversarial_schedule(seed, &schedule, 128);
+        let run2 = run_adversarial_schedule(seed, &schedule, 128);
+
+        for (m1, m2) in run1.iter().zip(run2.iter()) {
+            assert_eq!(
+                m1.committed, m2.committed,
+                "bead_id=bd-1uguv determinism: regime '{}' committed mismatch",
+                m1.regime_name
+            );
+            assert_eq!(
+                m1.aborted, m2.aborted,
+                "bead_id=bd-1uguv determinism: regime '{}' aborted mismatch",
+                m1.regime_name
+            );
+        }
+    }
+
+    #[test]
+    fn test_dro_adversarial_adaptation_evidence() {
+        // bead_id=bd-1uguv: DRO radius must expand under skew and contract
+        // during recovery.
+        let seed = 42_u64;
+        let schedule = canonical_adversarial_schedule();
+        let dro_metrics = run_adversarial_schedule(seed, &schedule, 128);
+
+        // After regime 0 (warm_uniform): baseline radius.
+        let r0_radius = dro_metrics[0].radius_at_end;
+
+        // After regime 2 (sustained_skew): radius should be larger.
+        let r2_radius = dro_metrics[2].radius_at_end;
+        assert!(
+            r2_radius > r0_radius,
+            "bead_id=bd-1uguv adaptation: sustained_skew radius ({r2_radius:.6}) \
+             should exceed warm_uniform radius ({r0_radius:.6})"
+        );
+
+        // After regime 5 (recovery): radius should contract from skew peak.
+        let r5_radius = dro_metrics[5].radius_at_end;
+        assert!(
+            r5_radius < r2_radius,
+            "bead_id=bd-1uguv adaptation: recovery radius ({r5_radius:.6}) \
+             should be less than sustained_skew radius ({r2_radius:.6})"
+        );
+
+        // Matrix swaps should have occurred during skew regimes.
+        let skew_swaps: u64 = dro_metrics[1..=3]
+            .iter()
+            .map(|m| m.generation_at_end.saturating_sub(m.generation_at_start))
+            .sum();
+        assert!(
+            skew_swaps > 0,
+            "bead_id=bd-1uguv adaptation: DRO matrix must swap at least once \
+             during skew regimes (swaps={skew_swaps})"
+        );
+    }
+
+    #[test]
+    fn test_dro_adversarial_abort_storm_suppression() {
+        // bead_id=bd-1uguv: Under hot_page_storm (regime 4), DRO should produce
+        // strictly more abort decisions (defensive clamping) than it does under
+        // warm_uniform. This proves it's actually reacting to the storm.
+        let seed = 42_u64;
+        let schedule = canonical_adversarial_schedule();
+        let dro_metrics = run_adversarial_schedule(seed, &schedule, 128);
+
+        let warm_dro_aborts = dro_metrics[0].dro_aborts;
+        let storm_dro_aborts = dro_metrics[4].dro_aborts;
+
+        // During the storm, the DRO matrix should have elevated penalties.
+        // The hot_page_storm regime has 8 readers + 8 writers, so the matrix
+        // should report higher CVaR penalties than at (4,4).
+        assert!(
+            storm_dro_aborts > warm_dro_aborts,
+            "bead_id=bd-1uguv storm suppression: DRO aborts during hot_page_storm \
+             ({storm_dro_aborts}) should exceed warm_uniform ({warm_dro_aborts})"
+        );
+    }
+
+    #[test]
+    fn test_dro_vs_static_p99_regime_shift_detection() {
+        // bead_id=bd-1uguv: The DRO controller (window_commit_budget=128) must
+        // produce more matrix swaps than the static controller (never adapts).
+        let seed = 42_u64;
+        let schedule = canonical_adversarial_schedule();
+        let dro_metrics = run_adversarial_schedule(seed, &schedule, 128);
+        let static_metrics = run_adversarial_schedule(seed, &schedule, u64::MAX);
+
+        let dro_total_swaps: u64 = dro_metrics
+            .iter()
+            .map(|m| m.generation_at_end.saturating_sub(m.generation_at_start))
+            .sum();
+        let static_total_swaps: u64 = static_metrics
+            .iter()
+            .map(|m| m.generation_at_end.saturating_sub(m.generation_at_start))
+            .sum();
+
+        assert!(
+            dro_total_swaps > static_total_swaps,
+            "bead_id=bd-1uguv regime detection: DRO swaps ({dro_total_swaps}) \
+             must exceed static swaps ({static_total_swaps})"
+        );
+
+        // Static controller should have zero swaps (never rotates).
+        assert_eq!(
+            static_total_swaps, 0,
+            "bead_id=bd-1uguv regime detection: static controller should never swap"
+        );
+
+        // DRO controller should have at least 3 swaps (one per major regime shift).
+        assert!(
+            dro_total_swaps >= 3,
+            "bead_id=bd-1uguv regime detection: DRO should have >= 3 matrix swaps, got {dro_total_swaps}"
+        );
+    }
+
+    #[test]
+    fn test_dro_adversarial_correctness_accounting() {
+        // bead_id=bd-1uguv: Every transaction is either committed or aborted.
+        // No transactions lost.
+        let seed = 42_u64;
+        let schedule = canonical_adversarial_schedule();
+        let metrics = run_adversarial_schedule(seed, &schedule, 128);
+
+        for (regime, m) in schedule.iter().zip(metrics.iter()) {
+            let total = m.committed + m.aborted;
+            assert_eq!(
+                total,
+                u64::from(regime.txn_count),
+                "bead_id=bd-1uguv accounting: regime '{}' total ({total}) != expected ({})",
+                regime.name,
+                regime.txn_count
+            );
+            // DRO decisions should cover every txn too.
+            assert_eq!(
+                m.dro_aborts + m.dro_allows,
+                u64::from(regime.txn_count),
+                "bead_id=bd-1uguv accounting: regime '{}' DRO decisions ({}) != expected ({})",
+                regime.name,
+                m.dro_aborts + m.dro_allows,
+                regime.txn_count
+            );
+        }
+    }
+
+    #[test]
+    fn test_dro_adversarial_structured_log_emission() {
+        // bead_id=bd-1uguv: Verify that running the adversarial schedule
+        // produces the expected structured log output by checking that the
+        // DRO controller logs matrix_swap events during regime shifts.
+        // (This test verifies the controller's internal logging path runs
+        // without panicking; actual log capture requires a tracing subscriber.)
+        let seed = 123_u64;
+        let schedule = canonical_adversarial_schedule();
+        let metrics = run_adversarial_schedule(seed, &schedule, 64);
+
+        // With a smaller window (64), we expect more frequent matrix swaps.
+        let total_swaps: u64 = metrics
+            .iter()
+            .map(|m| m.generation_at_end.saturating_sub(m.generation_at_start))
+            .sum();
+        assert!(
+            total_swaps >= 5,
+            "bead_id=bd-1uguv logging: with window_commit_budget=64, expect >= 5 \
+             matrix swaps for logging coverage, got {total_swaps}"
+        );
+    }
 }

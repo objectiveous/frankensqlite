@@ -156,10 +156,16 @@ impl GroupCommitQueue {
                 });
             }
 
-            guard = self
+            // Bounded wait: use wait_timeout to prevent permanent hangs if
+            // the Condvar notification is lost (e.g., flusher panics after
+            // writing but before notifying). The 200ms timeout is long enough
+            // to avoid spurious wakeup overhead but short enough to recover
+            // from genuine notification loss within a reasonable window.
+            let (new_guard, _timeout_result) = self
                 .flush_complete
-                .wait(guard)
+                .wait_timeout(guard, std::time::Duration::from_millis(200))
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard = new_guard;
         }
     }
 }
@@ -1062,6 +1068,7 @@ struct ShardedPublishedPages {
         [RwLock<HashMap<PageNumber, PageData, foldhash::fast::FixedState>>;
             PUBLISHED_PAGES_SHARD_COUNT],
     >,
+    page_count: AtomicUsize,
 }
 
 impl ShardedPublishedPages {
@@ -1070,6 +1077,7 @@ impl ShardedPublishedPages {
             shards: Box::new(std::array::from_fn(|_| {
                 RwLock::new(HashMap::with_hasher(foldhash::fast::FixedState::default()))
             })),
+            page_count: AtomicUsize::new(0),
         }
     }
 
@@ -1091,21 +1099,31 @@ impl ShardedPublishedPages {
     }
 
     /// Insert a page into the appropriate shard.
-    fn insert(&self, page_no: PageNumber, page: PageData) {
+    fn insert(&self, page_no: PageNumber, page: PageData) -> bool {
         let shard_idx = Self::shard_index(page_no);
-        self.shards[shard_idx]
+        let inserted = self.shards[shard_idx]
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(page_no, page);
+            .insert(page_no, page)
+            .is_none();
+        if inserted {
+            self.page_count.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        inserted
     }
 
     /// Remove a page from the appropriate shard.
-    fn remove(&self, page_no: PageNumber) {
+    fn remove(&self, page_no: PageNumber) -> bool {
         let shard_idx = Self::shard_index(page_no);
-        self.shards[shard_idx]
+        let removed = self.shards[shard_idx]
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&page_no);
+            .remove(&page_no)
+            .is_some();
+        if removed {
+            self.page_count.fetch_sub(1, AtomicOrdering::Relaxed);
+        }
+        removed
     }
 
     /// Clear all shards.
@@ -1116,6 +1134,7 @@ impl ShardedPublishedPages {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clear();
         }
+        self.page_count.store(0, AtomicOrdering::Release);
     }
 
     /// Retain pages matching the predicate across all shards.
@@ -1123,12 +1142,16 @@ impl ShardedPublishedPages {
     where
         F: Fn(&PageNumber) -> bool,
     {
+        let mut retained_total = 0_usize;
         for shard in self.shards.iter() {
-            shard
+            let mut shard = shard
                 .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .retain(|page_no, _| f(page_no));
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            shard.retain(|page_no, _| f(page_no));
+            retained_total = retained_total.saturating_add(shard.len());
         }
+        self.page_count
+            .store(retained_total, AtomicOrdering::Release);
     }
 
     /// Insert multiple pages, batching by shard to minimize lock acquisitions.
@@ -1146,6 +1169,7 @@ impl ShardedPublishedPages {
         }
 
         // Insert each batch into its shard
+        let mut total_added = 0_usize;
         for (shard_idx, batch) in shard_batches.into_iter().enumerate() {
             if !batch.is_empty() {
                 let mut shard = self.shards[shard_idx]
@@ -1153,20 +1177,21 @@ impl ShardedPublishedPages {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 shard.reserve(batch.len());
                 for (page_no, page) in batch {
-                    shard.insert(page_no, page);
+                    if shard.insert(page_no, page).is_none() {
+                        total_added = total_added.saturating_add(1);
+                    }
                 }
             }
+        }
+        if total_added > 0 {
+            self.page_count
+                .fetch_add(total_added, AtomicOrdering::Relaxed);
         }
     }
 
     /// Total number of pages across all shards.
     fn len(&self) -> usize {
-        self.shards.iter().fold(0, |sum, shard| {
-            sum + shard
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .len()
-        })
+        self.page_count.load(AtomicOrdering::Acquire)
     }
 }
 
@@ -10064,6 +10089,176 @@ mod tests {
         );
     }
 
+    /// H11 / F11: Suppressed Condvar notification — the flusher completes
+    /// but skips `publish_completed_epoch()`. Waiters must recover via the
+    /// timed wait rather than hanging forever.
+    ///
+    /// Proof obligation: both flusher and waiter threads complete within a
+    /// bounded time. No permanent hang.
+    ///
+    /// Replay: `cargo test -p fsqlite-pager --lib -- test_fault_drop_condvar_notify --nocapture`
+    #[test]
+    fn test_fault_drop_condvar_notify_waiters_recover_via_timeout() {
+        for attempt in 0..32 {
+            crate::fault_hooks::clear();
+
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from(format!("/condvar_notify_drop_{attempt}.db"));
+            let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+            let (backend, _frames, _begin_calls, batch_calls, _sync_calls) =
+                MockWalBackend::new_with_sync_tracking();
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+            pager
+                .set_wal_commit_sync_policy(WalCommitSyncPolicy::PerCommit)
+                .unwrap();
+
+            crate::fault_hooks::arm_drop_condvar_notify(crate::fault_hooks::FaultHookArm::new(
+                "bd-db300.7.2.2-drop-condvar",
+                "DROP-CONDVAR-NOTIFY",
+                "liveness_under_fault",
+            ));
+
+            let inner = Arc::clone(&pager.inner);
+            let wal_backend = Arc::clone(&pager.wal_backend);
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let pool = pager.pool.clone();
+            let start = StdArc::new(std::sync::Barrier::new(3));
+
+            let spawn_commit = |page_number: u32, fill: u8| {
+                let inner = Arc::clone(&inner);
+                let wal_backend = Arc::clone(&wal_backend);
+                let queue = Arc::clone(&queue);
+                let pool = pool.clone();
+                let start = StdArc::clone(&start);
+                std::thread::spawn(move || {
+                    let cx = Cx::new();
+                    let page_no = PageNumber::new(page_number).unwrap();
+                    let page =
+                        StagedPage::from_bytes(&pool, &vec![fill; pool.page_size()]).unwrap();
+                    let mut write_set = HashMap::new();
+                    write_set.insert(page_no, page);
+                    let write_pages_sorted = vec![page_no];
+                    start.wait();
+                    SimpleTransaction::<MemoryVfs>::commit_wal_group_commit(
+                        &cx,
+                        &wal_backend,
+                        &inner,
+                        &write_set,
+                        &write_pages_sorted,
+                        &queue,
+                    )
+                })
+            };
+
+            let writer_a = spawn_commit(2, 0x33);
+            let writer_b = spawn_commit(3, 0x44);
+            let started = Instant::now();
+            start.wait();
+
+            let result_a = writer_a.join().unwrap();
+            let result_b = writer_b.join().unwrap();
+            let elapsed = started.elapsed();
+
+            if *batch_calls.lock().unwrap() != 1 {
+                crate::fault_hooks::clear();
+                continue;
+            }
+
+            // Key proof: both threads completed (no hang), within 2 seconds.
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "bead_id={BEAD_ID} case=condvar_drop_no_hang elapsed={elapsed:?}"
+            );
+
+            // The flusher succeeds (wrote frames, skipped notify).
+            // Waiter recovers via epoch check on timeout — may succeed or fail.
+            let _any_ok = result_a.is_ok() || result_b.is_ok();
+
+            let records = crate::fault_hooks::take_records();
+            assert_eq!(records.len(), 1, "condvar-drop hook should fire once");
+            assert_eq!(records[0].point, "drop_condvar_notify");
+            assert_eq!(records[0].run_id, "bd-db300.7.2.2-drop-condvar");
+            assert!(
+                records[0].detail.contains("completed_epoch="),
+                "record should capture epoch: {}",
+                records[0].detail
+            );
+
+            crate::fault_hooks::clear();
+            return;
+        }
+
+        panic!(
+            "bead_id={BEAD_ID} case=condvar_drop_no_hang could not coalesce in allotted attempts"
+        );
+    }
+
+    /// H4 / F4: Crash during Phase C — after WAL frames are durable and
+    /// commit_seq is updated, but before snapshot publish completes.
+    ///
+    /// Proof obligation: commit returns Err, but WAL frames were written
+    /// (the mock backend recorded them). On a real system, recovery from
+    /// the durable WAL would rebuild correct state.
+    ///
+    /// Replay: `cargo test -p fsqlite-pager --lib -- test_fault_during_phase_c --nocapture`
+    #[test]
+    fn test_fault_during_phase_c_returns_error_and_wal_frames_survive() {
+        crate::fault_hooks::clear();
+
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/fault_phase_c_test.db");
+        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let (backend, frames, _begin_calls, _batch_calls) = MockWalBackend::new();
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        // Arm the Phase C hook.
+        crate::fault_hooks::arm_during_phase_c(crate::fault_hooks::FaultHookArm::new(
+            "bd-db300.7.2.2-phase-c",
+            "PHASE-C-CRASH",
+            "commit_publish_recovery",
+        ));
+
+        // Begin a writer transaction and dirty a page.
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page_bytes = PageSize::DEFAULT.as_usize();
+        txn.write_page(&cx, PageNumber::ONE, &vec![0xCC; page_bytes])
+            .unwrap();
+
+        // Commit should fail — the hook fires after WAL I/O but before publish.
+        let err = txn
+            .commit(&cx)
+            .expect_err("Phase C fault hook should cause commit to fail");
+        assert!(
+            err.to_string().contains("fault_inject:during_phase_c"),
+            "error should identify the Phase C hook: {err}"
+        );
+
+        // WAL frames should have been written (the error is AFTER WAL I/O).
+        let written_frames = frames.lock().unwrap();
+        assert!(
+            !written_frames.is_empty(),
+            "WAL frames should survive — the fault fires after WAL I/O completes"
+        );
+
+        // Verify injection record.
+        let records = crate::fault_hooks::take_records();
+        assert_eq!(records.len(), 1, "exactly one Phase C fault should fire");
+        assert_eq!(records[0].point, "during_phase_c");
+        assert_eq!(records[0].run_id, "bd-db300.7.2.2-phase-c");
+        assert_eq!(records[0].scenario_id, "PHASE-C-CRASH");
+        assert!(
+            records[0].detail.contains("commit_seq="),
+            "record should capture commit_seq: {}",
+            records[0].detail
+        );
+
+        crate::fault_hooks::clear();
+    }
+
     #[test]
     fn test_publish_window_measurement_captures_exclusive_hold_sample() {
         let (cx, mut txn, vfs) =
@@ -13497,6 +13692,144 @@ mod tests {
             pager.published_page_hits(),
             published_hits_before + 1,
             "bead_id={BEAD_ID} case=publication_hit_counter"
+        );
+    }
+
+    #[test]
+    fn test_sharded_published_pages_len_tracks_insert_remove_clear() {
+        let published_pages = ShardedPublishedPages::new();
+        let page_two = PageNumber::new(2).unwrap();
+        let page_three = PageNumber::new(3).unwrap();
+
+        assert_eq!(published_pages.len(), 0);
+        assert!(published_pages.insert(page_two, PageData::from_vec(sample_page(0x22))));
+        assert_eq!(published_pages.len(), 1);
+
+        assert!(!published_pages.insert(page_two, PageData::from_vec(sample_page(0x33))));
+        assert_eq!(
+            published_pages.len(),
+            1,
+            "bead_id=bd-qrss1 case=replacement_must_not_increment_page_count"
+        );
+
+        assert!(published_pages.insert(page_three, PageData::from_vec(sample_page(0x44))));
+        assert_eq!(published_pages.len(), 2);
+
+        assert!(published_pages.remove(page_two));
+        assert_eq!(published_pages.len(), 1);
+        assert!(!published_pages.remove(page_two));
+        assert_eq!(published_pages.len(), 1);
+
+        published_pages.clear();
+        assert_eq!(published_pages.len(), 0);
+    }
+
+    #[test]
+    fn test_sharded_published_pages_insert_batch_and_retain_track_page_count() {
+        let published_pages = ShardedPublishedPages::new();
+        let page_two = PageNumber::new(2).unwrap();
+        let page_sixty_five = PageNumber::new(65).unwrap();
+        let page_one_twenty_nine = PageNumber::new(129).unwrap();
+
+        published_pages.insert_batch([
+            (page_two, PageData::from_vec(sample_page(0x02))),
+            (page_sixty_five, PageData::from_vec(sample_page(0x41))),
+            (page_one_twenty_nine, PageData::from_vec(sample_page(0x81))),
+            (page_two, PageData::from_vec(sample_page(0xFF))),
+        ]);
+
+        assert_eq!(
+            published_pages.len(),
+            3,
+            "bead_id=bd-qrss1 case=batch_insert_counts_only_new_pages"
+        );
+        assert_eq!(
+            published_pages.get(page_two),
+            Some(PageData::from_vec(sample_page(0xFF))),
+            "bead_id=bd-qrss1 case=batch_insert_replaces_existing_page"
+        );
+
+        published_pages.retain(|page_no| page_no.get() >= 65);
+        assert_eq!(
+            published_pages.len(),
+            2,
+            "bead_id=bd-qrss1 case=retain_updates_atomic_page_count"
+        );
+        assert!(published_pages.get(page_two).is_none());
+        assert!(published_pages.get(page_sixty_five).is_some());
+        assert!(published_pages.get(page_one_twenty_nine).is_some());
+    }
+
+    #[test]
+    fn test_published_snapshot_page_set_size_tracks_sharded_page_count() {
+        init_publication_test_tracing();
+        let published = PublishedPagerState::new(4, CommitSeq::new(7), JournalMode::Wal, 0);
+        let cx = Cx::new();
+        let page_two = PageNumber::new(2).unwrap();
+        let page_sixty_five = PageNumber::new(65).unwrap();
+
+        published.publish_insert_single(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(7),
+                db_size: 65,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            page_two,
+            PageData::from_vec(sample_page(0x22)),
+        );
+        published.publish_insert_single(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(8),
+                db_size: 65,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            page_sixty_five,
+            PageData::from_vec(sample_page(0x65)),
+        );
+        assert_eq!(
+            published.snapshot().page_set_size,
+            2,
+            "bead_id=bd-qrss1 case=publication_plane_page_count_after_inserts"
+        );
+
+        published.publish_remove_page(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(9),
+                db_size: 65,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            page_two,
+        );
+        assert_eq!(
+            published.snapshot().page_set_size,
+            1,
+            "bead_id=bd-qrss1 case=publication_plane_page_count_after_remove"
+        );
+
+        published.publish_clear_if(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(10),
+                db_size: 0,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            true,
+        );
+        assert_eq!(
+            published.snapshot().page_set_size,
+            0,
+            "bead_id=bd-qrss1 case=publication_plane_page_count_after_clear"
         );
     }
 

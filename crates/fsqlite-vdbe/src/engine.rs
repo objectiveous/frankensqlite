@@ -1147,7 +1147,9 @@ impl SharedTxnPageIo {
                 return Err(error);
             }
 
-            match write_result.ok_or_else(|| FrankenError::Internal("write result must exist when snapshot is valid".to_owned()))? {
+            match write_result.ok_or_else(|| {
+                FrankenError::Internal("write result must exist when snapshot is valid".to_owned())
+            })? {
                 Ok(()) => {
                     tracing::debug!(
                         txn_id,
@@ -1363,7 +1365,9 @@ impl SharedTxnPageIo {
                 return Err(error);
             }
 
-            match write_result.ok_or_else(|| FrankenError::Internal("write result must exist when snapshot is valid".to_owned()))? {
+            match write_result.ok_or_else(|| {
+                FrankenError::Internal("write result must exist when snapshot is valid".to_owned())
+            })? {
                 Ok(()) => {
                     tracing::debug!(
                         txn_id,
@@ -1735,7 +1739,9 @@ fn track_concurrent_conflict_only_page(
             });
         }
 
-        match track_result.ok_or_else(|| FrankenError::Internal("track result must exist when snapshot is valid".to_owned()))? {
+        match track_result.ok_or_else(|| {
+            FrankenError::Internal("track result must exist when snapshot is valid".to_owned())
+        })? {
             Ok(()) => {
                 add_vdbe_counter_if(
                     metrics_enabled,
@@ -2005,7 +2011,11 @@ impl PageWriter for SharedTxnPageIo {
                         });
                     }
 
-                    match free_result.ok_or_else(|| FrankenError::Internal("free result must exist when snapshot is valid".to_owned()))? {
+                    match free_result.ok_or_else(|| {
+                        FrankenError::Internal(
+                            "free result must exist when snapshot is valid".to_owned(),
+                        )
+                    })? {
                         Ok(()) => {
                             tracing::debug!(
                                 txn_id,
@@ -11302,23 +11312,25 @@ mod tests {
             .collect()
     }
 
-    fn build_storage_index_engine_with_duplicate_prefixes() -> (VdbeEngine, Vec<u8>, Vec<u8>) {
+    fn install_duplicate_prefix_index_fixture(
+        engine: &mut VdbeEngine,
+        cursor_id: i32,
+    ) -> (Vec<u8>, Vec<u8>) {
         let mut db = MemDatabase::new();
         let index_root = db.allocate_root_page();
 
-        let mut engine = VdbeEngine::new(8);
         engine.enable_storage_cursors(true);
         engine.set_database(db);
         engine.set_reject_mem_fallback(false);
 
         assert!(
-            engine.open_storage_cursor(0, index_root, true),
+            engine.open_storage_cursor(cursor_id, index_root, true),
             "index storage cursor should open"
         );
 
         let sc = engine
             .storage_cursors
-            .get_mut(&0)
+            .get_mut(&cursor_id)
             .expect("storage cursor should exist");
         for rowid in 1_i64..=128 {
             let key = encode_record(&[SqliteValue::Integer(7), SqliteValue::Integer(rowid)]);
@@ -11336,7 +11348,67 @@ mod tests {
         let conflict_key = encode_record(&[SqliteValue::Integer(7)]);
         let miss_key = encode_record(&[SqliteValue::Integer(9)]);
 
+        (conflict_key, miss_key)
+    }
+
+    fn build_storage_index_engine_with_duplicate_prefixes() -> (VdbeEngine, Vec<u8>, Vec<u8>) {
+        let mut engine = VdbeEngine::new(8);
+        let (conflict_key, miss_key) = install_duplicate_prefix_index_fixture(&mut engine, 0);
         (engine, conflict_key, miss_key)
+    }
+
+    fn build_no_conflict_opcode_probe_program(
+        conflict_key: Vec<u8>,
+        miss_key: Vec<u8>,
+        malformed_key: Vec<u8>,
+    ) -> crate::VdbeProgram {
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        let r_key = b.alloc_reg();
+        let r_out = b.alloc_reg();
+
+        for (probe_key, expected_insertable) in [
+            (conflict_key, false),
+            (miss_key, true),
+            (malformed_key, true),
+        ] {
+            let no_conflict = b.emit_label();
+            let done = b.emit_label();
+            b.emit_op(Opcode::Blob, 0, r_key, 0, P4::Blob(probe_key), 0);
+            b.emit_jump_to_label(Opcode::NoConflict, 0, r_key, no_conflict, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(no_conflict);
+            b.emit_op(
+                Opcode::Integer,
+                i32::from(expected_insertable),
+                r_out,
+                0,
+                P4::None,
+                0,
+            );
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+        }
+
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        b.finish().expect("program should build")
+    }
+
+    fn execute_program_with_engine(
+        engine: &mut VdbeEngine,
+        program: &crate::VdbeProgram,
+    ) -> Vec<Vec<SqliteValue>> {
+        let outcome = engine.execute(program).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        engine
+            .take_results()
+            .into_iter()
+            .map(|row| row.into_vec())
+            .collect::<Vec<_>>()
     }
 
     fn legacy_storage_cursor_no_conflict_prefix_match(
@@ -13132,9 +13204,82 @@ mod tests {
                 asm.contains("String8"),
                 "should have String8 opcode for literal 'test'"
             );
-            assert!(asm.contains("MakeRecord"), "should have MakeRecord opcode");
+            assert!(
+                asm.contains("Blob"),
+                "should have Blob opcode for preformatted table record"
+            );
+            assert!(
+                !asm.contains("MakeRecord"),
+                "literal-only INSERT should not execute MakeRecord for the table record"
+            );
             assert!(asm.contains("Insert"), "should have Insert opcode");
             assert!(asm.contains("Halt"), "should have Halt opcode");
+        }
+
+        #[test]
+        fn test_codegen_insert_literal_values_skip_make_record_metrics() {
+            let _guard = VDBE_OBSERVABILITY_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev_metrics_enabled = vdbe_metrics_enabled();
+            reset_vdbe_metrics();
+            set_vdbe_metrics_enabled(true);
+
+            let schema = test_schema();
+            let ctx = CodegenContext::default();
+            let stmt = InsertStatement {
+                with: None,
+                or_conflict: None,
+                table: QualifiedName {
+                    schema: None,
+                    name: "t".to_owned(),
+                },
+                alias: None,
+                columns: vec![],
+                source: InsertSource::Values(vec![vec![
+                    Expr::Literal(Literal::Integer(99), span()),
+                    Expr::Literal(Literal::String("test".to_owned()), span()),
+                ]]),
+                upsert: vec![],
+                returning: vec![ResultColumn::Star],
+            };
+
+            let mut b = ProgramBuilder::new();
+            codegen_insert(&mut b, &stmt, &schema, &ctx).expect("codegen should succeed");
+            let prog = b.finish().expect("program should build");
+
+            let mut db = MemDatabase::new();
+            let _root = db.create_table(2);
+            let before = vdbe_metrics_snapshot();
+
+            let mut engine = VdbeEngine::new(prog.register_count());
+            engine.enable_storage_cursors(true);
+            engine.set_database(db);
+            engine.set_reject_mem_fallback(false);
+            let outcome = engine.execute(&prog).expect("execution should succeed");
+            assert_eq!(outcome, ExecOutcome::Done);
+
+            let after = vdbe_metrics_snapshot();
+            let rows: Vec<_> = engine
+                .take_results()
+                .into_iter()
+                .map(|row| row.into_vec())
+                .collect();
+
+            assert_eq!(
+                after.make_record_calls_total - before.make_record_calls_total,
+                0,
+                "preformatted INSERT should skip table-row MakeRecord execution"
+            );
+            assert_eq!(
+                rows,
+                vec![vec![
+                    SqliteValue::Integer(99),
+                    SqliteValue::Text("test".into())
+                ]]
+            );
+
+            set_vdbe_metrics_enabled(prev_metrics_enabled);
         }
 
         /// Verify emit_expr handles arithmetic BinaryOp in INSERT values.
@@ -16368,58 +16513,262 @@ mod tests {
     }
 
     #[test]
-    fn test_no_conflict_opcode_uses_storage_cursor_scratch_probe_path() {
+    fn test_storage_cursor_no_conflict_mixed_boundaries_reduce_allocator_pressure_and_preserve_reset_safety()
+     {
         let _guard = VDBE_OBSERVABILITY_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let (mut engine, conflict_key, miss_key) =
             build_storage_index_engine_with_duplicate_prefixes();
         let malformed_key = vec![0x80];
+        let conflict_target = [SqliteValue::Integer(7)];
+        let miss_target = [SqliteValue::Integer(9)];
+        let iterations = 128usize;
+        let prev_record_profile_enabled = fsqlite_types::record::record_profile_enabled();
 
-        let rows = {
-            let mut b = ProgramBuilder::new();
-            let end = b.emit_label();
-            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let run_legacy = |cursor: &mut StorageCursor| {
+            fsqlite_types::record::reset_record_profile();
+            fsqlite_types::record::set_record_profile_enabled(true);
+            fsqlite_btree::reset_btree_copy_profile();
+            fsqlite_btree::set_btree_copy_profile_enabled(true);
+            let _scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
+            let mut matches = 0usize;
+            for _ in 0..iterations {
+                for (probe, expected) in [
+                    (conflict_key.as_slice(), true),
+                    (miss_key.as_slice(), false),
+                    (malformed_key.as_slice(), false),
+                    (conflict_key.as_slice(), true),
+                ] {
+                    let actual = legacy_storage_cursor_no_conflict_prefix_match(cursor, probe)
+                        .expect("legacy probe should succeed");
+                    assert_eq!(actual, expected);
+                    if actual {
+                        matches += 1;
+                    }
+                }
+            }
+            (
+                matches,
+                fsqlite_types::record::record_profile_snapshot(),
+                fsqlite_btree::btree_copy_profile_snapshot(),
+            )
+        };
 
-            let r_key = b.alloc_reg();
-            let r_out = b.alloc_reg();
+        let run_scratch = |cursor: &mut StorageCursor| {
+            fsqlite_types::record::reset_record_profile();
+            fsqlite_types::record::set_record_profile_enabled(true);
+            fsqlite_btree::reset_btree_copy_profile();
+            fsqlite_btree::set_btree_copy_profile_enabled(true);
+            let _scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
+            let mut matches = 0usize;
+            let mut payload_capacity = None;
+            let mut target_capacity = None;
+            let mut current_capacity = None;
 
-            for (probe_key, expected_insertable) in [
-                (conflict_key, false),
-                (miss_key, true),
-                (malformed_key, true),
-            ] {
-                let no_conflict = b.emit_label();
-                let done = b.emit_label();
-                b.emit_op(Opcode::Blob, 0, r_key, 0, P4::Blob(probe_key), 0);
-                b.emit_jump_to_label(Opcode::NoConflict, 0, r_key, no_conflict, P4::None, 0);
-                b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
-                b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
-                b.resolve_label(no_conflict);
-                b.emit_op(
-                    Opcode::Integer,
-                    i32::from(expected_insertable),
-                    r_out,
-                    0,
-                    P4::None,
-                    0,
-                );
-                b.resolve_label(done);
-                b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            for _ in 0..iterations {
+                for (boundary, probe, expected, expected_target) in [
+                    (
+                        "conflict",
+                        conflict_key.as_slice(),
+                        true,
+                        Some(conflict_target.as_slice()),
+                    ),
+                    (
+                        "miss",
+                        miss_key.as_slice(),
+                        false,
+                        Some(miss_target.as_slice()),
+                    ),
+                    ("malformed", malformed_key.as_slice(), false, None),
+                    (
+                        "recovery",
+                        conflict_key.as_slice(),
+                        true,
+                        Some(conflict_target.as_slice()),
+                    ),
+                ] {
+                    let actual = storage_cursor_no_conflict_prefix_match(0, cursor, probe)
+                        .expect("scratch probe should succeed");
+                    assert_eq!(
+                        actual, expected,
+                        "{boundary} probe should preserve semantics"
+                    );
+                    if actual {
+                        matches += 1;
+                    }
+
+                    match expected_target {
+                        Some(expected_target) => {
+                            assert_eq!(
+                                cursor.target_vals_buf.as_slice(),
+                                expected_target,
+                                "{boundary} probe should refresh target scratch without stale values"
+                            );
+                        }
+                        None => {
+                            assert!(
+                                cursor.target_vals_buf.is_empty(),
+                                "{boundary} probe should clear malformed target scratch"
+                            );
+                        }
+                    }
+
+                    let observed_payload_capacity = cursor.payload_buf.capacity();
+                    if let Some(expected_capacity) = payload_capacity {
+                        assert_eq!(
+                            observed_payload_capacity, expected_capacity,
+                            "{boundary} probe should retain payload scratch capacity"
+                        );
+                    } else if observed_payload_capacity > 0 {
+                        payload_capacity = Some(observed_payload_capacity);
+                    }
+
+                    let observed_target_capacity = cursor.target_vals_buf.capacity();
+                    if let Some(expected_capacity) = target_capacity {
+                        assert_eq!(
+                            observed_target_capacity, expected_capacity,
+                            "{boundary} probe should retain target scratch capacity"
+                        );
+                    } else if observed_target_capacity > 0 {
+                        target_capacity = Some(observed_target_capacity);
+                    }
+
+                    let observed_current_capacity = cursor.cur_vals_buf.capacity();
+                    if let Some(expected_capacity) = current_capacity {
+                        assert_eq!(
+                            observed_current_capacity, expected_capacity,
+                            "{boundary} probe should retain current-entry scratch capacity"
+                        );
+                    } else if observed_current_capacity > 0 {
+                        current_capacity = Some(observed_current_capacity);
+                    }
+                }
             }
 
-            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
-            b.resolve_label(end);
-
-            let program = b.finish().expect("program should build");
-            let outcome = engine.execute(&program).expect("execution should succeed");
-            assert_eq!(outcome, ExecOutcome::Done);
-            engine
-                .take_results()
-                .into_iter()
-                .map(|row| row.into_vec())
-                .collect::<Vec<_>>()
+            (
+                matches,
+                fsqlite_types::record::record_profile_snapshot(),
+                fsqlite_btree::btree_copy_profile_snapshot(),
+                payload_capacity.unwrap_or_else(|| cursor.payload_buf.capacity()),
+                target_capacity.unwrap_or_else(|| cursor.target_vals_buf.capacity()),
+                current_capacity.unwrap_or_else(|| cursor.cur_vals_buf.capacity()),
+            )
         };
+
+        let (legacy_matches, legacy_record_profile, legacy_copy_profile) = {
+            let cursor = engine
+                .storage_cursors
+                .get_mut(&0)
+                .expect("storage cursor should exist");
+            run_legacy(cursor)
+        };
+        let (
+            scratch_matches,
+            scratch_record_profile,
+            scratch_copy_profile,
+            payload_capacity,
+            target_capacity,
+            current_capacity,
+        ) = {
+            let cursor = engine
+                .storage_cursors
+                .get_mut(&0)
+                .expect("storage cursor should exist");
+            run_scratch(cursor)
+        };
+
+        assert_eq!(legacy_matches, iterations * 2);
+        assert_eq!(scratch_matches, iterations * 2);
+        assert_eq!(
+            scratch_record_profile
+                .callsite_breakdown
+                .vdbe_engine
+                .parse_record_calls,
+            0,
+            "mixed-boundary scratch path should avoid parse_record allocations entirely"
+        );
+        assert!(
+            legacy_record_profile
+                .callsite_breakdown
+                .vdbe_engine
+                .parse_record_calls
+                > scratch_record_profile
+                    .callsite_breakdown
+                    .vdbe_engine
+                    .parse_record_calls,
+            "legacy path should incur more parse_record churn under mixed boundaries"
+        );
+        assert_eq!(
+            scratch_copy_profile.owned_payload_materialization_calls, 0,
+            "scratch path should avoid owned payload materialization under mixed boundaries"
+        );
+        assert!(
+            legacy_copy_profile.owned_payload_materialization_calls
+                >= u64::try_from(iterations * 2).unwrap_or(u64::MAX),
+            "legacy path should materialize owned payloads for both found probes per iteration"
+        );
+        assert!(
+            scratch_copy_profile.local_payload_copy_calls
+                >= u64::try_from(iterations * 2).unwrap_or(u64::MAX),
+            "scratch path should reuse caller-owned payload storage on found probes"
+        );
+        assert!(payload_capacity > 0);
+        assert!(target_capacity > 0);
+        assert!(current_capacity > 0);
+
+        eprintln!(
+            concat!(
+                "BD_DB300_4_3_3_RESET_CHURN_JSON=",
+                "{{",
+                "\"bead_id\":\"bd-db300.4.3.3\",",
+                "\"hot_path\":\"storage_cursor_no_conflict_mixed_boundaries\",",
+                "\"iterations\":{},",
+                "\"boundary_sequence\":\"conflict,miss,malformed,recovery\",",
+                "\"legacy\":{{",
+                "\"parse_record_calls\":{},",
+                "\"owned_payload_materialization_calls\":{}",
+                "}},",
+                "\"scratch\":{{",
+                "\"parse_record_calls\":{},",
+                "\"owned_payload_materialization_calls\":{},",
+                "\"local_payload_copy_calls\":{},",
+                "\"payload_capacity\":{},",
+                "\"target_capacity\":{},",
+                "\"current_capacity\":{}",
+                "}}",
+                "}}"
+            ),
+            iterations,
+            legacy_record_profile
+                .callsite_breakdown
+                .vdbe_engine
+                .parse_record_calls,
+            legacy_copy_profile.owned_payload_materialization_calls,
+            scratch_record_profile
+                .callsite_breakdown
+                .vdbe_engine
+                .parse_record_calls,
+            scratch_copy_profile.owned_payload_materialization_calls,
+            scratch_copy_profile.local_payload_copy_calls,
+            payload_capacity,
+            target_capacity,
+            current_capacity,
+        );
+
+        fsqlite_btree::set_btree_copy_profile_enabled(false);
+        fsqlite_types::record::set_record_profile_enabled(prev_record_profile_enabled);
+    }
+
+    #[test]
+    fn test_no_conflict_opcode_uses_storage_cursor_scratch_probe_path() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut engine, conflict_key, miss_key) =
+            build_storage_index_engine_with_duplicate_prefixes();
+        let program = build_no_conflict_opcode_probe_program(conflict_key, miss_key, vec![0x80]);
+        let rows = execute_program_with_engine(&mut engine, &program);
 
         assert_eq!(
             rows,
@@ -16430,6 +16779,54 @@ mod tests {
             ],
             "NoConflict should treat duplicate prefixes as conflicts and malformed probes as insertable"
         );
+    }
+
+    #[test]
+    fn test_no_conflict_opcode_reset_for_reuse_reseeds_clean_scratch_state() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let conflict_key = encode_record(&[SqliteValue::Integer(7)]);
+        let miss_key = encode_record(&[SqliteValue::Integer(9)]);
+        let program = build_no_conflict_opcode_probe_program(
+            conflict_key.clone(),
+            miss_key.clone(),
+            vec![0x80],
+        );
+        let expected_rows = vec![
+            vec![SqliteValue::Integer(0)],
+            vec![SqliteValue::Integer(1)],
+            vec![SqliteValue::Integer(1)],
+        ];
+
+        let mut engine = VdbeEngine::new(program.register_count());
+        let (installed_conflict_key, installed_miss_key) =
+            install_duplicate_prefix_index_fixture(&mut engine, 0);
+        assert_eq!(installed_conflict_key, conflict_key);
+        assert_eq!(installed_miss_key, miss_key);
+
+        let first_rows = execute_program_with_engine(&mut engine, &program);
+        assert_eq!(first_rows, expected_rows);
+
+        let reset_cx = Cx::new();
+        engine.reset_for_reuse(program.register_count(), &reset_cx, PageSize::DEFAULT);
+        assert!(engine.storage_cursors.is_empty());
+        assert!(engine.results().is_empty());
+
+        let (reinstalled_conflict_key, reinstalled_miss_key) =
+            install_duplicate_prefix_index_fixture(&mut engine, 0);
+        assert_eq!(reinstalled_conflict_key, conflict_key);
+        assert_eq!(reinstalled_miss_key, miss_key);
+        let cursor = engine
+            .storage_cursors
+            .get(&0)
+            .expect("storage cursor should be reinstalled");
+        assert!(cursor.payload_buf.is_empty());
+        assert!(cursor.target_vals_buf.is_empty());
+        assert!(cursor.cur_vals_buf.is_empty());
+
+        let second_rows = execute_program_with_engine(&mut engine, &program);
+        assert_eq!(second_rows, expected_rows);
     }
 
     #[test]

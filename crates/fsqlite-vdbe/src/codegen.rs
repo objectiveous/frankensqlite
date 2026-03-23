@@ -6,6 +6,7 @@
 
 use std::cell::RefCell;
 use std::env;
+use std::sync::Arc;
 
 use crate::{Label, ProgramBuilder};
 use fsqlite_ast::{
@@ -16,8 +17,8 @@ use fsqlite_ast::{
     UpsertClause, UpsertTarget,
 };
 use fsqlite_parser::expr::parse_expr as parse_sql_expr;
-use fsqlite_types::StrictColumnType;
 use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4};
+use fsqlite_types::{SqliteValue, StrictColumnType, TypeAffinity};
 
 // ---------------------------------------------------------------------------
 // Thread-local extra aggregate function names for UDF support (bd-2wt.3)
@@ -6890,7 +6891,7 @@ fn codegen_insert_values(
     let rec_reg = b.alloc_reg();
     let concurrent_flag = i32::from(ctx.concurrent_mode);
 
-    for row_values in rows {
+    for (row_index, row_values) in rows.iter().enumerate() {
         if row_values.len() != n_source_cols {
             return Err(CodegenError::Unsupported(
                 "VALUES rows must have the same arity".to_owned(),
@@ -7029,6 +7030,18 @@ fn codegen_insert_values(
 
         // MakeRecord: pack columns into a record.
         let n_cols_i32 = n_cols as i32;
+        let preformatted_record =
+            try_build_preformatted_insert_record(row_values, table, col_mapping);
+        if preformatted_record.is_some() {
+            tracing::debug!(
+                target: "fsqlite_vdbe::insert_preformat",
+                table = %table.name,
+                row_index,
+                explicit_column_mapping = col_mapping.is_some(),
+                column_count = n_cols,
+                "preformatted INSERT record at codegen"
+            );
+        }
 
         // UPSERT DO UPDATE: check-before-insert pattern.
         if let Some(upsert_clause) = upsert {
@@ -7282,13 +7295,13 @@ fn codegen_insert_values(
 
                 // --- No conflict path: normal insert ---
                 b.resolve_label(insert_label);
-                b.emit_op(
-                    Opcode::MakeRecord,
+                emit_table_insert_record(
+                    b,
                     val_regs,
                     n_cols_i32,
                     rec_reg,
-                    P4::Affinity(aff_str),
-                    0,
+                    &aff_str,
+                    preformatted_record.as_deref(),
                 );
                 b.emit_op(
                     Opcode::Insert,
@@ -7307,13 +7320,13 @@ fn codegen_insert_values(
                 b.resolve_label(done_label);
             } else {
                 // DO NOTHING — oe_flag is already OE_IGNORE, just do normal insert.
-                b.emit_op(
-                    Opcode::MakeRecord,
+                emit_table_insert_record(
+                    b,
                     val_regs,
                     n_cols_i32,
                     rec_reg,
-                    P4::Affinity(aff_str),
-                    0,
+                    &aff_str,
+                    preformatted_record.as_deref(),
                 );
                 b.emit_op(
                     Opcode::Insert,
@@ -7330,13 +7343,13 @@ fn codegen_insert_values(
             }
         } else {
             // No upsert — normal insert path.
-            b.emit_op(
-                Opcode::MakeRecord,
+            emit_table_insert_record(
+                b,
                 val_regs,
                 n_cols_i32,
                 rec_reg,
-                P4::Affinity(aff_str),
-                0,
+                &aff_str,
+                preformatted_record.as_deref(),
             );
             b.emit_op(
                 Opcode::Insert,
@@ -7359,6 +7372,107 @@ fn codegen_insert_values(
     }
 
     Ok(())
+}
+
+fn emit_table_insert_record(
+    b: &mut ProgramBuilder,
+    source_regs: i32,
+    column_count: i32,
+    target_reg: i32,
+    affinity: &str,
+    preformatted_record: Option<&[u8]>,
+) {
+    if let Some(record) = preformatted_record {
+        #[allow(clippy::cast_possible_truncation)]
+        b.emit_op(
+            Opcode::Blob,
+            record.len() as i32,
+            target_reg,
+            0,
+            P4::Blob(record.to_vec()),
+            0,
+        );
+    } else {
+        b.emit_op(
+            Opcode::MakeRecord,
+            source_regs,
+            column_count,
+            target_reg,
+            P4::Affinity(affinity.to_owned()),
+            0,
+        );
+    }
+}
+
+/// Build a table-record blob at codegen time for rows whose stored image is
+/// fully determined before execution.
+///
+/// This intentionally stays narrow:
+/// - only literal `VALUES` expressions are admitted
+/// - omitted/default/generated columns fall back to runtime `MakeRecord`
+/// - rowid/IPK storage still uses the runtime key path; the record stores NULL
+///   placeholders for INTEGER PRIMARY KEY aliases just like `MakeRecord`
+/// - CURRENT_* literals stay on the runtime path so the value registers and
+///   record blob cannot drift from separate timestamp materializations
+fn try_build_preformatted_insert_record(
+    row_values: &[Expr],
+    table: &TableSchema,
+    col_mapping: Option<&[Option<usize>]>,
+) -> Option<Vec<u8>> {
+    if table.columns.iter().any(|col| col.generated_expr.is_some()) {
+        return None;
+    }
+
+    let mut stored_values = Vec::with_capacity(table.columns.len());
+    for (table_idx, column) in table.columns.iter().enumerate() {
+        if column.is_ipk {
+            stored_values.push(SqliteValue::Null);
+            continue;
+        }
+
+        let expr = match col_mapping {
+            Some(mapping) => {
+                let source_idx = mapping.get(table_idx)?.as_ref()?;
+                row_values.get(*source_idx)?
+            }
+            None => row_values.get(table_idx)?,
+        };
+        let value = compile_time_insert_value(expr)?;
+        let value = if let Some(strict_type) = column.strict_type {
+            value.validate_strict(strict_type).ok()?
+        } else {
+            value
+        };
+        stored_values.push(value.apply_affinity(type_affinity_for_char(column.affinity)));
+    }
+
+    Some(fsqlite_types::record::serialize_record(&stored_values))
+}
+
+fn compile_time_insert_value(expr: &Expr) -> Option<SqliteValue> {
+    let Expr::Literal(literal, _) = expr else {
+        return None;
+    };
+    Some(match literal {
+        Literal::Integer(value) => SqliteValue::Integer(*value),
+        Literal::Float(value) => SqliteValue::Float(*value),
+        Literal::String(value) => SqliteValue::Text(Arc::from(value.as_str())),
+        Literal::Blob(value) => SqliteValue::Blob(Arc::from(value.as_slice())),
+        Literal::Null => SqliteValue::Null,
+        Literal::True => SqliteValue::Integer(1),
+        Literal::False => SqliteValue::Integer(0),
+        Literal::CurrentTimestamp | Literal::CurrentDate | Literal::CurrentTime => return None,
+    })
+}
+
+fn type_affinity_for_char(ch: char) -> TypeAffinity {
+    match ch {
+        'B' | 'b' => TypeAffinity::Text,
+        'C' | 'c' => TypeAffinity::Numeric,
+        'D' | 'd' => TypeAffinity::Integer,
+        'E' | 'e' => TypeAffinity::Real,
+        _ => TypeAffinity::Blob,
+    }
 }
 
 /// Emit the INSERT loop for `INSERT INTO target SELECT ... FROM source`.
@@ -11476,30 +11590,8 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
             }
             Literal::CurrentTimestamp | Literal::CurrentDate | Literal::CurrentTime => {
-                // Emit current UTC date/time as a string literal.
-                // We compute it at codegen time; for fsqlite's single-pass
-                // compile+execute model this is equivalent to runtime.
-                use std::time::SystemTime;
-                let secs = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                // Convert epoch seconds to yyyy-mm-dd HH:MM:SS (UTC).
-                let days = secs / 86400;
-                let day_secs = secs % 86400;
-                let h = day_secs / 3600;
-                let m = (day_secs % 3600) / 60;
-                let s = day_secs % 60;
-                // Compute year/month/day from days since 1970-01-01.
-                let (y, mo, d) = epoch_days_to_ymd(days);
-                let ts = match *lit {
-                    Literal::CurrentTimestamp => {
-                        format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
-                    }
-                    Literal::CurrentDate => format!("{y:04}-{mo:02}-{d:02}"),
-                    Literal::CurrentTime => format!("{h:02}:{m:02}:{s:02}"),
-                    _ => unreachable!(),
-                };
+                let ts = current_time_literal_text(lit)
+                    .expect("current-time literals should resolve to a string");
                 b.emit_op(Opcode::String8, 0, reg, 0, P4::Str(ts), 0);
             }
             Literal::Null => {
@@ -11853,6 +11945,28 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
         }
     }
+}
+
+fn current_time_literal_text(literal: &Literal) -> Option<String> {
+    use std::time::SystemTime;
+
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = secs / 86400;
+    let day_secs = secs % 86400;
+    let h = day_secs / 3600;
+    let m = (day_secs % 3600) / 60;
+    let s = day_secs % 60;
+    let (y, mo, d) = epoch_days_to_ymd(days);
+
+    Some(match *literal {
+        Literal::CurrentTimestamp => format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}"),
+        Literal::CurrentDate => format!("{y:04}-{mo:02}-{d:02}"),
+        Literal::CurrentTime => format!("{h:02}:{m:02}:{s:02}"),
+        _ => return None,
+    })
 }
 
 /// Emit bytecode for an EXISTS or NOT EXISTS subquery expression.
@@ -13957,6 +14071,35 @@ mod tests {
             prog.ops().iter().any(|op| op.opcode == Opcode::Int64
                 && matches!(op.p4, P4::Int64(value) if value == big)),
             "expected OP_Int64 carrying the full i64 literal in INSERT VALUES codegen"
+        );
+    }
+
+    #[test]
+    fn test_codegen_insert_literal_values_preformats_record_blob() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![
+                Expr::Literal(Literal::Integer(99), Span::ZERO),
+                Expr::Literal(Literal::String("test".to_owned()), Span::ZERO),
+            ]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+
+        assert!(ops.contains(&Opcode::Blob));
+        assert!(
+            !ops.contains(&Opcode::MakeRecord),
+            "literal-only INSERT VALUES should preformat the table record"
         );
     }
 
@@ -18505,6 +18648,41 @@ mod tests {
                 Opcode::Halt,
             ]
         ));
+    }
+
+    #[test]
+    fn test_codegen_insert_values_ipk_literals_preformat_record_blob() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![
+                Expr::Literal(Literal::Integer(7), Span::ZERO),
+                Expr::Literal(Literal::String("payload".to_owned()), Span::ZERO),
+            ]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext {
+            concurrent_mode: false,
+            rowid_alias_col_idx: Some(0),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+
+        assert!(ops.contains(&Opcode::IsNull));
+        assert!(ops.contains(&Opcode::Copy));
+        assert!(ops.contains(&Opcode::Blob));
+        assert!(
+            !ops.contains(&Opcode::MakeRecord),
+            "IPK literal INSERT should still preformat the table record payload"
+        );
     }
 
     /// INSERT VALUES without IPK should still use unconditional NewRowid.

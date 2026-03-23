@@ -66,7 +66,7 @@ use fsqlite_pager::{
 use fsqlite_parser::Parser;
 use fsqlite_parser::lexer::Lexer;
 use fsqlite_planner::{
-    AccessPathKind as PlannerAccessPathKind, IndexInfo as PlannerIndexInfo,
+    AccessPathKind as PlannerAccessPathKind, IndexInfo as PlannerIndexInfo, PlannerFeatureFlags,
     StatsSource as PlannerStatsSource, TableStats as PlannerTableStats, WhereTermKind,
     best_access_path, classify_where_term, decompose_where,
 };
@@ -242,7 +242,12 @@ static FSQLITE_COMPILED_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COMPILED_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PLANNER_DIRECTIVE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PLANNER_DIRECTIVE_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COMPILE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+// bd-6eyrg.1: Fast-path vs slow-path execution counters.
+static FSQLITE_FAST_PATH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_SLOW_PATH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_BACKGROUND_STATUS_CHECKS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_OP_CX_BACKGROUND_GATES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES: AtomicU64 = AtomicU64::new(0);
@@ -253,6 +258,8 @@ static FSQLITE_PAGER_PUBLICATION_REFRESHES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_MEMORY_AUTOCOMMIT_FAST_PATH_BEGINS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_CACHED_READ_SNAPSHOT_REUSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_CACHED_READ_SNAPSHOT_PARKS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_CACHED_WRITE_TXN_REUSES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_CACHED_WRITE_TXN_PARKS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_TABLE_ENGINE_FRESH_ALLOCS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_TABLE_ENGINE_REUSES: AtomicU64 = AtomicU64::new(0);
@@ -285,6 +292,10 @@ pub struct ParserHotPathProfileSnapshot {
     pub prepared_cache_hits: u64,
     pub prepared_cache_misses: u64,
     pub compile_time_ns: u64,
+    /// bd-6eyrg.1: Number of prepared executions that took the fast path.
+    pub fast_path_executions: u64,
+    /// bd-6eyrg.1: Number of prepared executions that took the slow path.
+    pub slow_path_executions: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,6 +311,8 @@ pub struct HotPathProfileSnapshot {
     pub memory_autocommit_fast_path_begins: u64,
     pub cached_read_snapshot_reuses: u64,
     pub cached_read_snapshot_parks: u64,
+    pub cached_write_txn_reuses: u64,
+    pub cached_write_txn_parks: u64,
     pub column_default_evaluation_passes: u64,
     pub prepared_table_engine_fresh_allocs: u64,
     pub prepared_table_engine_reuses: u64,
@@ -346,7 +359,11 @@ pub fn reset_hot_path_profile() {
     FSQLITE_COMPILED_CACHE_MISSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_CACHE_HITS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_CACHE_MISSES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PLANNER_DIRECTIVE_CACHE_HITS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PLANNER_DIRECTIVE_CACHE_MISSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_COMPILE_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_FAST_PATH_EXECUTIONS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_SLOW_PATH_EXECUTIONS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_BACKGROUND_STATUS_CHECKS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_OP_CX_BACKGROUND_GATES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES.store(0, AtomicOrdering::Relaxed);
@@ -357,6 +374,8 @@ pub fn reset_hot_path_profile() {
     FSQLITE_MEMORY_AUTOCOMMIT_FAST_PATH_BEGINS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_CACHED_READ_SNAPSHOT_REUSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_CACHED_READ_SNAPSHOT_PARKS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_CACHED_WRITE_TXN_REUSES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_CACHED_WRITE_TXN_PARKS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_TABLE_ENGINE_FRESH_ALLOCS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_TABLE_ENGINE_REUSES.store(0, AtomicOrdering::Relaxed);
@@ -395,6 +414,8 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
             prepared_cache_hits: FSQLITE_PREPARED_CACHE_HITS.load(AtomicOrdering::Relaxed),
             prepared_cache_misses: FSQLITE_PREPARED_CACHE_MISSES.load(AtomicOrdering::Relaxed),
             compile_time_ns: FSQLITE_COMPILE_TIME_NS.load(AtomicOrdering::Relaxed),
+            fast_path_executions: FSQLITE_FAST_PATH_EXECUTIONS.load(AtomicOrdering::Relaxed),
+            slow_path_executions: FSQLITE_SLOW_PATH_EXECUTIONS.load(AtomicOrdering::Relaxed),
         },
         background_status_checks: FSQLITE_BACKGROUND_STATUS_CHECKS.load(AtomicOrdering::Relaxed),
         op_cx_background_gates: FSQLITE_OP_CX_BACKGROUND_GATES.load(AtomicOrdering::Relaxed),
@@ -413,6 +434,8 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
             .load(AtomicOrdering::Relaxed),
         cached_read_snapshot_parks: FSQLITE_CACHED_READ_SNAPSHOT_PARKS
             .load(AtomicOrdering::Relaxed),
+        cached_write_txn_reuses: FSQLITE_CACHED_WRITE_TXN_REUSES.load(AtomicOrdering::Relaxed),
+        cached_write_txn_parks: FSQLITE_CACHED_WRITE_TXN_PARKS.load(AtomicOrdering::Relaxed),
         column_default_evaluation_passes: FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES
             .load(AtomicOrdering::Relaxed),
         prepared_table_engine_fresh_allocs: FSQLITE_PREPARED_TABLE_ENGINE_FRESH_ALLOCS
@@ -2177,10 +2200,24 @@ impl PreparedStatement<'_> {
         let op_cx = self.conn.op_cx_after_background_status();
         self.ensure_schema_unchanged(&op_cx)?;
         if let Some(statement) = &self.deferred_query_statement {
+            // bd-6eyrg.1: SLOW PATH — deferred query needs full statement dispatch.
+            FSQLITE_SLOW_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+            tracing::debug!(
+                target: "fsqlite.execute_path",
+                path = "slow",
+                reason = "deferred_query_statement",
+            );
             return self
                 .conn
                 .execute_statement_after_background_status(statement.as_ref(), None);
         }
+        // bd-6eyrg.1: FAST PATH — direct program execution or table query.
+        FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+        tracing::debug!(
+            target: "fsqlite.execute_path",
+            path = "fast",
+            reason = if self.db.is_some() { "table_query" } else { "program_execute" },
+        );
         let mut rows = if self.db.is_some() {
             self.execute_table_query(&op_cx, None)?
         } else {
@@ -2218,10 +2255,24 @@ impl PreparedStatement<'_> {
         let op_cx = self.conn.op_cx_after_background_status();
         self.ensure_schema_unchanged(&op_cx)?;
         if let Some(statement) = &self.deferred_query_statement {
+            // bd-6eyrg.1: SLOW PATH — deferred query needs full statement dispatch.
+            FSQLITE_SLOW_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+            tracing::debug!(
+                target: "fsqlite.execute_path",
+                path = "slow",
+                reason = "deferred_query_statement",
+            );
             return self
                 .conn
                 .execute_statement_after_background_status(statement.as_ref(), Some(params));
         }
+        // bd-6eyrg.1: FAST PATH — direct program execution or table query.
+        FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+        tracing::debug!(
+            target: "fsqlite.execute_path",
+            path = "fast",
+            reason = if self.db.is_some() { "table_query" } else { "program_execute" },
+        );
         let mut rows = if self.db.is_some() {
             self.execute_table_query(&op_cx, Some(params))?
         } else {
@@ -2903,6 +2954,13 @@ struct CompiledCacheEntry {
     program: Arc<VdbeProgram>,
 }
 
+#[derive(Clone)]
+struct PlannerDirectiveCacheEntry {
+    sql: String,
+    feature_flags: PlannerFeatureFlags,
+    directive: Option<SelectPlannerDirective>,
+}
+
 /// Schema-scoped execution metadata reused by table-backed VDBE runs.
 ///
 /// This caches only structural data derived from the schema graph. Values that
@@ -3203,6 +3261,10 @@ pub struct Connection {
     /// Connection-local prepared statement template cache keyed by raw SQL.
     /// Avoids rebuilding the prepared wrapper for repeated `prepare()` calls.
     prepared_cache: RefCell<LruCache<u64, Arc<PreparedCacheEntry>>>,
+    /// Connection-local planner-directive cache keyed by canonical SELECT SQL
+    /// and feature flags. This only caches the connection seam that has no
+    /// cracking/runtime hints so planner post-processing remains valid on hits.
+    planner_directive_cache: RefCell<LruCache<u64, Arc<PlannerDirectiveCacheEntry>>>,
     /// Schema-generation-scoped execution metadata cache for table-backed
     /// statements. Avoids rebuilding structural root-page maps on every VDBE
     /// run while leaving dynamic defaults and sqlite_sequence values live.
@@ -3373,6 +3435,7 @@ impl Connection {
             parse_cache_cookie: RefCell::new(0),
             compiled_cache: RefCell::new(LruCache::new(NonZeroUsize::new(128).unwrap())),
             prepared_cache: RefCell::new(LruCache::new(NonZeroUsize::new(128).unwrap())),
+            planner_directive_cache: RefCell::new(LruCache::new(NonZeroUsize::new(128).unwrap())),
             table_execution_metadata_cache: RefCell::new(None),
             attached_schemas: RefCell::new(SchemaRegistry::new()),
             attached_connections: RefCell::new(HashMap::new()),
@@ -3517,6 +3580,7 @@ impl Connection {
             // Compiled bytecode cache (bd-1dp9.6.7.2.2)
             compiled_cache: RefCell::new(LruCache::new(NonZeroUsize::new(128).unwrap())),
             prepared_cache: RefCell::new(LruCache::new(NonZeroUsize::new(128).unwrap())),
+            planner_directive_cache: RefCell::new(LruCache::new(NonZeroUsize::new(128).unwrap())),
             table_execution_metadata_cache: RefCell::new(None),
             // ATTACH/DETACH schema registry (§12.11, bd-7pxb)
             attached_schemas: RefCell::new(SchemaRegistry::new()),
@@ -5472,8 +5536,7 @@ impl Connection {
         let mut registry = FunctionRegistry::clone_from_arc(&self.func_registry.borrow());
         registry.register_aggregate(function);
         *self.func_registry.borrow_mut() = Arc::new(registry);
-        self.compiled_cache.borrow_mut().clear();
-        self.prepared_cache.borrow_mut().clear();
+        self.clear_compilation_reuse_caches();
     }
 
     /// Register a custom window function.
@@ -5498,8 +5561,7 @@ impl Connection {
         let mut registry = FunctionRegistry::clone_from_arc(&self.func_registry.borrow());
         registry.register_window(function);
         *self.func_registry.borrow_mut() = Arc::new(registry);
-        self.compiled_cache.borrow_mut().clear();
-        self.prepared_cache.borrow_mut().clear();
+        self.clear_compilation_reuse_caches();
     }
 
     /// Register a virtual-table module factory under the given name.
@@ -5828,6 +5890,14 @@ impl Connection {
             ));
         }
         if let Some(dispatch) = stmt.precompiled_dml() {
+            // bd-6eyrg.1: FAST PATH — precompiled DML with valid schema.
+            FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+            tracing::debug!(
+                target: "fsqlite.execute_path",
+                path = "fast",
+                kind = %format!("{:?}", dispatch.kind),
+                reason = "precompiled_dml",
+            );
             let op_cx = self.op_cx_after_background_status();
             let prebound_publication =
                 stmt.ensure_schema_unchanged_with_prebound_publication(&op_cx)?;
@@ -5861,7 +5931,6 @@ impl Connection {
         }
         if let Some(dml) = stmt.deferred_dml_statement() {
             let op_cx = self.op_cx_after_background_status();
-            stmt.ensure_schema_unchanged(&op_cx)?;
             let p = if params.is_empty() {
                 None
             } else {
@@ -5871,6 +5940,14 @@ impl Connection {
                 && let Some(fast_path) = stmt.prepared_update_delete_fast_path()
                 && fast_path.supports_direct_dispatch_now(self)
             {
+                // bd-6eyrg.1: FAST PATH — deferred DML can still use direct dispatch.
+                FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+                tracing::debug!(
+                    target: "fsqlite.execute_path",
+                    path = "fast",
+                    kind = %format!("{:?}", fast_path.kind),
+                    reason = "deferred_dml_direct_dispatch",
+                );
                 return self.execute_precompiled_prepared_update_or_delete(
                     &op_cx,
                     stmt,
@@ -5880,6 +5957,14 @@ impl Connection {
                     p,
                 );
             }
+            // bd-6eyrg.1: SLOW PATH — deferred DML requires full dispatch.
+            FSQLITE_SLOW_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+            tracing::debug!(
+                target: "fsqlite.execute_path",
+                path = "slow",
+                reason = "deferred_dml",
+            );
+            stmt.ensure_schema_unchanged(&op_cx)?;
             let rows = self.execute_statement_impl_after_background_status(
                 dml,
                 p,
@@ -5895,7 +5980,7 @@ impl Connection {
                 rows.len()
             })
         } else {
-            // SELECT prepared statement — delegate to query path.
+            // SELECT path delegates to query(), which owns fast/slow accounting.
             Ok(if params.is_empty() {
                 stmt.query()?.len()
             } else {
@@ -6544,8 +6629,7 @@ impl Connection {
         let cached_cookie = *self.parse_cache_cookie.borrow();
         if cached_cookie != current_cookie {
             self.parse_cache.borrow_mut().clear();
-            self.compiled_cache.borrow_mut().clear();
-            self.prepared_cache.borrow_mut().clear();
+            self.clear_compilation_reuse_caches();
             self.table_execution_metadata_cache.borrow_mut().take();
             *self.parse_cache_cookie.borrow_mut() = current_cookie;
             self.log_statement_reuse_event(
@@ -6583,6 +6667,52 @@ impl Connection {
         });
         cache.put(key, Arc::clone(&entry));
         entry
+    }
+
+    fn planner_directive_cache_key(&self, sql: &str, feature_flags: PlannerFeatureFlags) -> u64 {
+        Self::sql_hash(&format!(
+            "{sql}|planner_flags:{}:{}",
+            u8::from(feature_flags.leapfrog_join),
+            u8::from(feature_flags.dpccp_join),
+        ))
+    }
+
+    fn lookup_planner_directive_cache(
+        &self,
+        key: u64,
+        sql: &str,
+        feature_flags: PlannerFeatureFlags,
+    ) -> Option<Arc<PlannerDirectiveCacheEntry>> {
+        let mut cache = self.planner_directive_cache.borrow_mut();
+        let entry = cache.get(&key)?;
+        if entry.sql == sql && entry.feature_flags == feature_flags {
+            Some(Arc::clone(entry))
+        } else {
+            None
+        }
+    }
+
+    fn insert_planner_directive_cache(
+        &self,
+        key: u64,
+        sql: &str,
+        feature_flags: PlannerFeatureFlags,
+        directive: Option<SelectPlannerDirective>,
+    ) -> Arc<PlannerDirectiveCacheEntry> {
+        let mut cache = self.planner_directive_cache.borrow_mut();
+        let entry = Arc::new(PlannerDirectiveCacheEntry {
+            sql: sql.to_owned(),
+            feature_flags,
+            directive,
+        });
+        cache.put(key, Arc::clone(&entry));
+        entry
+    }
+
+    fn clear_compilation_reuse_caches(&self) {
+        self.compiled_cache.borrow_mut().clear();
+        self.prepared_cache.borrow_mut().clear();
+        self.planner_directive_cache.borrow_mut().clear();
     }
 
     fn lookup_prepared_cache(&self, key: u64, sql: &str) -> Option<Arc<PreparedCacheEntry>> {
@@ -6639,7 +6769,23 @@ impl Connection {
         if prepared_removed {
             prepared_cache.pop(&key);
         }
-        if compiled_removed || prepared_removed {
+        drop(prepared_cache);
+
+        let mut planner_cache = self.planner_directive_cache.borrow_mut();
+        let planner_removed = planner_cache.iter().any(|(_, entry)| entry.sql == sql);
+        if planner_removed {
+            planner_cache
+                .iter()
+                .map(|(cache_key, entry)| (*cache_key, entry.sql.clone()))
+                .filter(|(_, cached_sql)| cached_sql == sql)
+                .map(|(cache_key, _)| cache_key)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .for_each(|cache_key| {
+                    planner_cache.pop(&cache_key);
+                });
+        }
+        if compiled_removed || prepared_removed || planner_removed {
             self.log_statement_reuse_event(
                 "compiled",
                 sql,
@@ -11321,6 +11467,9 @@ impl Connection {
             *self.concurrent_txn.borrow_mut() = false;
             *self.concurrent_session_id.borrow_mut() = None;
             self.txn_metrics_mark_started();
+            if hot_path_profile_enabled() {
+                FSQLITE_CACHED_WRITE_TXN_REUSES.fetch_add(1, AtomicOrdering::Relaxed);
+            }
             return Ok(true);
         }
 
@@ -11625,6 +11774,9 @@ impl Connection {
                         // Invalidate read snapshot — it's stale after a write.
                         self.invalidate_cached_read_snapshot(cx);
                         self.advance_commit_clock();
+                        if hot_path_profile_enabled() {
+                            FSQLITE_CACHED_WRITE_TXN_PARKS.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
                         return Ok(());
                     }
                     Ok(false) => {} // Not retained — fall through to normal commit
@@ -14306,7 +14458,9 @@ impl Connection {
             }
 
             self.rewrite_sqlite_stat1_rows_in_txn(cx, txn, &plan.targets, &replacement_rows)
-        })
+        })?;
+        self.planner_directive_cache.borrow_mut().clear();
+        Ok(())
     }
 
     fn execute_reindex(&self, target: Option<&QualifiedName>) -> Result<()> {
@@ -15694,8 +15848,7 @@ impl Connection {
             // stale root_page from a prior materialization.  Clear the
             // compiled cache so the inner query recompiles with the
             // current root_page.
-            self.compiled_cache.borrow_mut().clear();
-            self.prepared_cache.borrow_mut().clear();
+            self.clear_compilation_reuse_caches();
 
             // Route through connection-level interpreted paths that read from
             // MemDatabase rather than the full dispatch chain (which reaches
@@ -20340,11 +20493,45 @@ impl Connection {
         })
     }
 
+    fn planner_select_directive_with_cache(
+        &self,
+        select: &SelectStatement,
+        canonical_sql: &str,
+        feature_flags: PlannerFeatureFlags,
+        schema: &[TableSchema],
+    ) -> Option<SelectPlannerDirective> {
+        // This cache intentionally lives only on the connection seam where
+        // there are no cracking or runtime hints to poison reused directives.
+        self.refresh_parse_cache_if_needed(canonical_sql);
+        let key = self.planner_directive_cache_key(canonical_sql, feature_flags);
+        let profile_enabled = hot_path_profile_enabled();
+        if let Some(entry) = self.lookup_planner_directive_cache(key, canonical_sql, feature_flags)
+        {
+            if profile_enabled {
+                FSQLITE_PLANNER_DIRECTIVE_CACHE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            return entry.directive.clone();
+        }
+        if profile_enabled {
+            FSQLITE_PLANNER_DIRECTIVE_CACHE_MISSES.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        let directive = Self::planner_select_directive(select, schema);
+        self.insert_planner_directive_cache(key, canonical_sql, feature_flags, directive.clone());
+        directive
+    }
+
     /// Compile a table-backed SELECT through the VDBE codegen.
     fn compile_table_select(&self, select: &SelectStatement) -> Result<VdbeProgram> {
-        let schema = self.schema.borrow();
         let canonical_select = canonicalize_select_placeholders(select)?;
-        let planner_select_directive = Self::planner_select_directive(&canonical_select, &schema);
+        let canonical_sql = canonical_select.to_string();
+        let feature_flags = PlannerFeatureFlags::default();
+        let schema = self.schema.borrow();
+        let planner_select_directive = self.planner_select_directive_with_cache(
+            &canonical_select,
+            &canonical_sql,
+            feature_flags,
+            &schema,
+        );
         let mut builder = ProgramBuilder::new();
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),
@@ -24066,8 +24253,7 @@ impl Connection {
             // CTE temp tables have dynamically allocated root pages. Clear
             // the compile cache so that any cached programs referencing old
             // root pages for the same table name are not reused.
-            self.compiled_cache.borrow_mut().clear();
-            self.prepared_cache.borrow_mut().clear();
+            self.clear_compilation_reuse_caches();
             let mut stripped = select.clone();
             stripped.with = None;
             self.execute_statement(&Statement::Select(stripped), params)
@@ -24089,8 +24275,7 @@ impl Connection {
         let mut temp_names = Vec::new();
         let result = (|| -> Result<Vec<Row>> {
             self.materialize_with_clause(delete.with.as_ref(), params, &mut temp_names)?;
-            self.compiled_cache.borrow_mut().clear();
-            self.prepared_cache.borrow_mut().clear();
+            self.clear_compilation_reuse_caches();
             let mut stripped = delete.clone();
             stripped.with = None;
             self.execute_statement(&Statement::Delete(stripped), params)
@@ -24112,8 +24297,7 @@ impl Connection {
         let mut temp_names = Vec::new();
         let result = (|| -> Result<Vec<Row>> {
             self.materialize_with_clause(update.with.as_ref(), params, &mut temp_names)?;
-            self.compiled_cache.borrow_mut().clear();
-            self.prepared_cache.borrow_mut().clear();
+            self.clear_compilation_reuse_caches();
             let mut stripped = update.clone();
             stripped.with = None;
             self.execute_statement(&Statement::Update(stripped), params)
@@ -25756,8 +25940,7 @@ impl Connection {
             .set(self.schema_generation.get().wrapping_add(1));
         // Invalidate parse + compiled caches — schema change may affect resolution/codegen.
         self.parse_cache.borrow_mut().clear();
-        self.compiled_cache.borrow_mut().clear();
-        self.prepared_cache.borrow_mut().clear();
+        self.clear_compilation_reuse_caches();
         self.table_execution_metadata_cache.borrow_mut().take();
         // Invalidate cached snapshots — DDL changed schema.
         let cx_result = self.op_cx();
@@ -25790,6 +25973,11 @@ impl Connection {
     /// Number of entries in the compiled bytecode cache (bd-1dp9.6.7.2.2).
     pub fn compiled_cache_len(&self) -> usize {
         self.compiled_cache.borrow().len()
+    }
+
+    #[cfg(test)]
+    fn planner_directive_cache_len(&self) -> usize {
+        self.planner_directive_cache.borrow().len()
     }
 
     /// Read the current file change counter value.
@@ -69427,6 +69615,74 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_execute_prepared_select_metrics_follow_query_path_only() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_sel_metric (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO prep_sel_metric VALUES (1, 'alpha');")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT val FROM prep_sel_metric WHERE id = ?1")
+            .unwrap();
+
+        reset_hot_path_profile();
+        let row_count = conn
+            .execute_prepared_with_params(&stmt, &[SqliteValue::Integer(1)])
+            .unwrap();
+        assert_eq!(row_count, 1);
+
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.parser.fast_path_executions, 1,
+            "SELECT via execute_prepared should count the query fast path once: {profile:?}"
+        );
+        assert_eq!(
+            profile.parser.slow_path_executions, 0,
+            "SELECT via execute_prepared must not be double-counted as slow: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn test_execute_prepared_deferred_delete_direct_dispatch_counts_as_fast_path() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_del_metric (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO prep_del_metric VALUES (1, 'a'), (2, 'b');")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("DELETE FROM prep_del_metric WHERE id = ?1")
+            .unwrap();
+        assert!(matches!(
+            stmt.dml_dispatch.as_ref(),
+            Some(PreparedDmlDispatch::Deferred(_))
+        ));
+        assert!(
+            stmt.prepared_update_delete_fast_path.is_some(),
+            "simple DELETE should expose direct dispatch fast-path metadata"
+        );
+
+        reset_hot_path_profile();
+        let affected = conn
+            .execute_prepared_with_params(&stmt, &[SqliteValue::Integer(2)])
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.parser.fast_path_executions, 1,
+            "direct-dispatch DELETE should count as a fast-path execution: {profile:?}"
+        );
+        assert_eq!(
+            profile.parser.slow_path_executions, 0,
+            "direct-dispatch DELETE must not be miscounted as slow-path: {profile:?}"
+        );
+    }
+
+    #[test]
     fn test_prepare_insert_with_foreign_keys_uses_deferred_dispatch() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("PRAGMA foreign_keys = ON;").unwrap();
@@ -70594,6 +70850,129 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_memory_autocommit_write_txn_parks_and_reuses() {
+        // bd-aw0b9: verify that consecutive autocommit writes on :memory:
+        // park the write transaction after the first commit and reuse it
+        // for subsequent writes — skipping pager.begin() + Mutex entirely.
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE park_test (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        reset_hot_path_profile();
+
+        // First autocommit write: should take the memory fast-path begin
+        // and park the write txn on commit (commit_and_retain).
+        conn.execute("INSERT INTO park_test VALUES (1, 'first');")
+            .unwrap();
+
+        let p1 = hot_path_profile_snapshot();
+        assert_eq!(
+            p1.memory_autocommit_fast_path_begins, 1,
+            "first write should use memory fast-path begin: {p1:?}"
+        );
+        assert_eq!(
+            p1.cached_write_txn_parks, 1,
+            "first write should park the write txn for reuse: {p1:?}"
+        );
+        assert_eq!(
+            p1.cached_write_txn_reuses, 0,
+            "first write has nothing to reuse: {p1:?}"
+        );
+
+        // Second autocommit write: should reuse the parked write txn
+        // instead of calling pager.begin() again.
+        conn.execute("INSERT INTO park_test VALUES (2, 'second');")
+            .unwrap();
+
+        let p2 = hot_path_profile_snapshot();
+        assert_eq!(
+            p2.cached_write_txn_reuses, 1,
+            "second write should reuse the cached write txn: {p2:?}"
+        );
+        assert_eq!(
+            p2.cached_write_txn_parks, 2,
+            "second write should also park for the next one: {p2:?}"
+        );
+        // The second write should NOT trigger another memory_fast_path_begin
+        // because it reuses the cached write txn (earlier in the function).
+        assert_eq!(
+            p2.memory_autocommit_fast_path_begins, 1,
+            "reuse path should skip the fresh begin path: {p2:?}"
+        );
+
+        // Third write: verify data correctness across reused transactions.
+        conn.execute("INSERT INTO park_test VALUES (3, 'third');")
+            .unwrap();
+        let rows = conn.query("SELECT COUNT(*) FROM park_test;").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Integer(3),
+            "all three rows should be visible after reused write txns"
+        );
+
+        let p3 = hot_path_profile_snapshot();
+        assert_eq!(p3.cached_write_txn_reuses, 2);
+        assert_eq!(p3.cached_write_txn_parks, 3);
+    }
+
+    #[test]
+    fn test_memory_autocommit_write_txn_invalidated_by_ddl() {
+        // bd-aw0b9: verify that DDL (schema change) invalidates the cached
+        // write transaction so the next write gets a fresh begin.
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE ddl_inv (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        reset_hot_path_profile();
+
+        // First write: parks the write txn.
+        conn.execute("INSERT INTO ddl_inv VALUES (1);").unwrap();
+        let p1 = hot_path_profile_snapshot();
+        assert_eq!(p1.cached_write_txn_parks, 1);
+
+        // DDL should invalidate the cached write txn.
+        conn.execute("CREATE TABLE ddl_inv2 (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        // Next write: should NOT reuse (schema cookie changed).
+        conn.execute("INSERT INTO ddl_inv VALUES (2);").unwrap();
+        let p2 = hot_path_profile_snapshot();
+        // The reuse count should still be 0 or at most 1 from the DDL itself;
+        // the INSERT after DDL should take the fresh begin path.
+        // (DDL changes schema_cookie, so cached_write_txn_cookie won't match.)
+        assert!(
+            p2.memory_autocommit_fast_path_begins >= 2,
+            "write after DDL should take fresh begin path, not reuse: {p2:?}"
+        );
+    }
+
+    #[test]
+    fn test_memory_autocommit_write_txn_correctness_across_many_inserts() {
+        // bd-aw0b9: stress test that many consecutive autocommit writes
+        // produce correct results when the write txn is continuously reused.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE stress (id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
+
+        for i in 1..=100 {
+            conn.execute_with_params(
+                "INSERT INTO stress VALUES (?1, ?2);",
+                &[SqliteValue::Integer(i), SqliteValue::Integer(i * 10)],
+            )
+            .unwrap();
+        }
+
+        let rows = conn
+            .query("SELECT COUNT(*), SUM(val) FROM stress;")
+            .unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(100));
+        // SUM(10+20+...+1000) = 10 * SUM(1..100) = 10 * 5050 = 50500
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(50500));
+    }
+
+    #[test]
     fn test_prepared_insert_reuses_table_engine_after_first_execution() {
         let _profile_guard = StatementReuseHotPathProfileGuard::new();
         let conn = Connection::open(":memory:").unwrap();
@@ -71565,6 +71944,24 @@ mod pager_routing_tests {
         });
     }
 
+    #[cfg(test)]
+    fn planner_cache_hits() -> u64 {
+        FSQLITE_PLANNER_DIRECTIVE_CACHE_HITS.load(AtomicOrdering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn planner_cache_misses() -> u64 {
+        FSQLITE_PLANNER_DIRECTIVE_CACHE_MISSES.load(AtomicOrdering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn parse_select_statement(sql: &str) -> SelectStatement {
+        match parse_single_statement(sql).unwrap() {
+            Statement::Select(select) => select,
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_statement_reuse_regression_ad_hoc_hot_path_metrics_and_row_counts() {
         let _profile_guard = StatementReuseHotPathProfileGuard::new();
@@ -72040,6 +72437,223 @@ mod pager_routing_tests {
         // Cache must be invalidated: fresh parse succeeds.
         let rows = conn.query("SELECT v FROM pc5").unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Text("new".into()));
+    }
+
+    // ── bd-6eyrg.2: Planner directive cache tests ────────────────────
+
+    #[test]
+    fn test_planner_directive_cache_hits_on_repeated_compile_table_select() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE plan_hit (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_plan_hit_val ON plan_hit(val);")
+            .unwrap();
+
+        let select = parse_select_statement("SELECT val FROM plan_hit WHERE val = ?1");
+        reset_hot_path_profile();
+
+        let program_a = conn.compile_table_select(&select).unwrap();
+        let program_b = conn.compile_table_select(&select).unwrap();
+
+        assert!(
+            !program_a.ops().is_empty() && !program_b.ops().is_empty(),
+            "compile path should still produce bytecode on cache hits"
+        );
+        assert_eq!(planner_cache_misses(), 1);
+        assert_eq!(planner_cache_hits(), 1);
+        assert_eq!(conn.planner_directive_cache_len(), 1);
+    }
+
+    #[test]
+    fn test_planner_directive_cache_keys_feature_flags() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE plan_flags (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let canonical_select =
+            canonicalize_select_placeholders(&parse_select_statement("SELECT val FROM plan_flags"))
+                .unwrap();
+        let canonical_sql = canonical_select.to_string();
+        let schema = conn.schema.borrow();
+
+        reset_hot_path_profile();
+        let directive_a = conn.planner_select_directive_with_cache(
+            &canonical_select,
+            &canonical_sql,
+            PlannerFeatureFlags::default(),
+            &schema,
+        );
+        let directive_b = conn.planner_select_directive_with_cache(
+            &canonical_select,
+            &canonical_sql,
+            PlannerFeatureFlags::default(),
+            &schema,
+        );
+        let directive_c = conn.planner_select_directive_with_cache(
+            &canonical_select,
+            &canonical_sql,
+            PlannerFeatureFlags {
+                leapfrog_join: true,
+                ..PlannerFeatureFlags::default()
+            },
+            &schema,
+        );
+
+        assert_eq!(directive_a, directive_b);
+        assert_eq!(directive_a, directive_c);
+        assert_eq!(planner_cache_misses(), 2);
+        assert_eq!(planner_cache_hits(), 1);
+        assert_eq!(conn.planner_directive_cache_len(), 2);
+    }
+
+    #[test]
+    fn test_planner_directive_cache_invalidated_by_cross_table_ddl() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE plan_a (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE plan_b (id INTEGER PRIMARY KEY, extra TEXT);")
+            .unwrap();
+
+        let select = parse_select_statement("SELECT val FROM plan_a WHERE id = ?1");
+        conn.compile_table_select(&select).unwrap();
+        assert_eq!(conn.planner_directive_cache_len(), 1);
+
+        conn.execute("ALTER TABLE plan_b ADD COLUMN note TEXT DEFAULT 'x';")
+            .unwrap();
+        assert_eq!(conn.planner_directive_cache_len(), 0);
+    }
+
+    #[test]
+    fn test_planner_directive_cache_rechecks_schema_cookie_before_hit() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE plan_cookie (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let select = parse_select_statement("SELECT val FROM plan_cookie WHERE id = ?1");
+        reset_hot_path_profile();
+        conn.compile_table_select(&select).unwrap();
+        assert_eq!(planner_cache_misses(), 1);
+        assert_eq!(planner_cache_hits(), 0);
+        assert_eq!(conn.planner_directive_cache_len(), 1);
+
+        *conn.schema_cookie.borrow_mut() = conn.schema_cookie().wrapping_add(1);
+        conn.compile_table_select(&select).unwrap();
+
+        assert_eq!(planner_cache_misses(), 2);
+        assert_eq!(planner_cache_hits(), 0);
+        assert_eq!(conn.planner_directive_cache_len(), 1);
+        assert_eq!(*conn.parse_cache_cookie.borrow(), conn.schema_cookie());
+    }
+
+    #[test]
+    fn test_planner_directive_cache_invalidated_by_analyze() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE plan_analyze (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_plan_analyze_val ON plan_analyze(val);")
+            .unwrap();
+        conn.execute("INSERT INTO plan_analyze VALUES (1, 'a'), (2, 'b');")
+            .unwrap();
+        conn.execute("ANALYZE;").unwrap();
+
+        let select = parse_select_statement("SELECT val FROM plan_analyze WHERE val = ?1");
+        conn.compile_table_select(&select).unwrap();
+        assert_eq!(conn.planner_directive_cache_len(), 1);
+
+        conn.execute("ANALYZE plan_analyze;").unwrap();
+        assert_eq!(conn.planner_directive_cache_len(), 0);
+    }
+
+    #[test]
+    fn test_planner_directive_cache_hit_preserves_ipk_upgrade() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE plan_ipk (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let canonical_select = canonicalize_select_placeholders(&parse_select_statement(
+            "SELECT val FROM plan_ipk WHERE id = ?1",
+        ))
+        .unwrap();
+        let canonical_sql = canonical_select.to_string();
+        let schema = conn.schema.borrow();
+
+        reset_hot_path_profile();
+        let first = conn
+            .planner_select_directive_with_cache(
+                &canonical_select,
+                &canonical_sql,
+                PlannerFeatureFlags::default(),
+                &schema,
+            )
+            .unwrap();
+        let second = conn
+            .planner_select_directive_with_cache(
+                &canonical_select,
+                &canonical_sql,
+                PlannerFeatureFlags::default(),
+                &schema,
+            )
+            .unwrap();
+
+        assert_eq!(first.access_kind, PlannerSelectAccessKind::RowidLookup);
+        assert_eq!(second.access_kind, PlannerSelectAccessKind::RowidLookup);
+        assert_eq!(planner_cache_misses(), 1);
+        assert_eq!(planner_cache_hits(), 1);
+    }
+
+    #[test]
+    fn test_planner_directive_cache_does_not_break_dml_paths() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE plan_dml (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let select = parse_select_statement("SELECT val FROM plan_dml WHERE id = ?1");
+        conn.compile_table_select(&select).unwrap();
+        assert_eq!(conn.planner_directive_cache_len(), 1);
+
+        conn.execute_with_params(
+            "INSERT INTO plan_dml (id, val) VALUES (?1, ?2)",
+            &[SqliteValue::Integer(1), SqliteValue::Text("alpha".into())],
+        )
+        .unwrap();
+        conn.execute_with_params(
+            "UPDATE plan_dml SET val = ?1 WHERE id = ?2",
+            &[SqliteValue::Text("beta".into()), SqliteValue::Integer(1)],
+        )
+        .unwrap();
+        conn.execute_with_params(
+            "DELETE FROM plan_dml WHERE id = ?1",
+            &[SqliteValue::Integer(9)],
+        )
+        .unwrap();
+
+        let row = conn
+            .query_row("SELECT val FROM plan_dml WHERE id = 1")
+            .unwrap();
+        assert_eq!(row.values()[0], SqliteValue::Text("beta".into()));
+    }
+
+    #[test]
+    fn test_planner_directive_cache_is_per_connection() {
+        let conn_a = Connection::open(":memory:").unwrap();
+        let conn_b = Connection::open(":memory:").unwrap();
+        for conn in [&conn_a, &conn_b] {
+            conn.execute("CREATE TABLE plan_iso (id INTEGER PRIMARY KEY, val TEXT);")
+                .unwrap();
+        }
+
+        let select = parse_select_statement("SELECT val FROM plan_iso WHERE id = ?1");
+        conn_a.compile_table_select(&select).unwrap();
+        assert_eq!(conn_a.planner_directive_cache_len(), 1);
+        assert_eq!(conn_b.planner_directive_cache_len(), 0);
+
+        conn_b.compile_table_select(&select).unwrap();
+        assert_eq!(conn_a.planner_directive_cache_len(), 1);
+        assert_eq!(conn_b.planner_directive_cache_len(), 1);
     }
 
     // ── bd-1dp9.6.7.2.2: Compiled cache tests ────────────────────────
@@ -77908,6 +78522,174 @@ mod pager_routing_tests {
             panic!(
                 "{} VDBE codegen conformance mismatches found",
                 mismatches.len()
+            );
+        }
+    }
+
+    fn explain_opcodes(conn: &Connection, sql: &str) -> Vec<String> {
+        conn.query(&format!("EXPLAIN {sql}"))
+            .unwrap()
+            .into_iter()
+            .map(|row| match &row.values[1] {
+                SqliteValue::Text(opcode) => opcode.to_string(),
+                other => panic!("expected EXPLAIN opcode text in column 1, got {other:?}"),
+            })
+            .collect()
+    }
+
+    fn sqlite_explain_opcodes(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("EXPLAIN {sql}")).unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn explain_query_plan_details(conn: &Connection, sql: &str) -> Vec<String> {
+        conn.query(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .into_iter()
+            .map(|row| match &row.values[3] {
+                SqliteValue::Text(detail) => detail.to_string(),
+                other => {
+                    panic!("expected EXPLAIN QUERY PLAN detail text in column 3, got {other:?}")
+                }
+            })
+            .collect()
+    }
+
+    fn sqlite_explain_query_plan_details(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn first_opcode_position(opcodes: &[String], target: &str) -> Option<usize> {
+        opcodes.iter().position(|opcode| opcode == target)
+    }
+
+    #[test]
+    fn test_explain_bytecode_fast_paths_match_sqlite_for_rowid_ipk_and_covering_index() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER);",
+            "CREATE INDEX idx_users_age ON users(age);",
+            "INSERT INTO users VALUES (1, 'Alice', 30);",
+            "INSERT INTO users VALUES (2, 'Bob', 25);",
+            "INSERT INTO users VALUES (3, 'Carol', 25);",
+        ];
+        for sql in &setup {
+            fconn.execute(sql).unwrap();
+            rconn.execute_batch(sql).unwrap();
+        }
+
+        let rowid_query = "SELECT name FROM users WHERE rowid = 2";
+        let rowid_eqp = explain_query_plan_details(&fconn, rowid_query);
+        assert_eq!(
+            rowid_eqp,
+            sqlite_explain_query_plan_details(&rconn, rowid_query),
+            "rowid equality EQP diverged from SQLite"
+        );
+        let rowid_ops = explain_opcodes(&fconn, rowid_query);
+        let sqlite_rowid_ops = sqlite_explain_opcodes(&rconn, rowid_query);
+        assert!(
+            rowid_ops.iter().any(|op| op == "SeekRowid"),
+            "rowid equality should emit SeekRowid, got {rowid_ops:?}"
+        );
+        assert!(
+            sqlite_rowid_ops.iter().any(|op| op == "SeekRowid"),
+            "SQLite rowid equality no longer emits SeekRowid, got {sqlite_rowid_ops:?}"
+        );
+        assert!(
+            !rowid_ops.iter().any(|op| op == "Rewind"),
+            "rowid equality should not fall back to a scan loop, got {rowid_ops:?}"
+        );
+
+        let ipk_query = "SELECT name FROM users WHERE id = 2";
+        let ipk_eqp = explain_query_plan_details(&fconn, ipk_query);
+        assert_eq!(
+            ipk_eqp,
+            sqlite_explain_query_plan_details(&rconn, ipk_query),
+            "INTEGER PRIMARY KEY equality EQP diverged from SQLite"
+        );
+        let ipk_ops = explain_opcodes(&fconn, ipk_query);
+        let sqlite_ipk_ops = sqlite_explain_opcodes(&rconn, ipk_query);
+        assert!(
+            ipk_ops.iter().any(|op| op == "SeekRowid"),
+            "INTEGER PRIMARY KEY equality should lower to SeekRowid, got {ipk_ops:?}"
+        );
+        assert!(
+            sqlite_ipk_ops.iter().any(|op| op == "SeekRowid"),
+            "SQLite INTEGER PRIMARY KEY equality no longer emits SeekRowid, got {sqlite_ipk_ops:?}"
+        );
+        assert!(
+            !ipk_ops.iter().any(|op| op == "Rewind"),
+            "INTEGER PRIMARY KEY equality should not scan, got {ipk_ops:?}"
+        );
+
+        let indexed_query = "SELECT name FROM users WHERE age = 25";
+        let indexed_eqp = explain_query_plan_details(&fconn, indexed_query);
+        assert_eq!(
+            indexed_eqp,
+            sqlite_explain_query_plan_details(&rconn, indexed_query),
+            "non-covering indexed equality EQP diverged from SQLite"
+        );
+        let indexed_ops = explain_opcodes(&fconn, indexed_query);
+        assert!(
+            indexed_ops.iter().any(|op| op == "SeekGE"),
+            "non-covering indexed equality should probe the index with SeekGE, got {indexed_ops:?}"
+        );
+        assert!(
+            indexed_ops.iter().any(|op| op == "IdxRowid"),
+            "non-covering indexed equality should read rowids from the index, got {indexed_ops:?}"
+        );
+        assert!(
+            indexed_ops.iter().any(|op| op == "SeekRowid"),
+            "non-covering indexed equality should still seek the table row, got {indexed_ops:?}"
+        );
+        let indexed_seek_ge_pos = first_opcode_position(&indexed_ops, "SeekGE").unwrap();
+        let indexed_idx_rowid_pos = first_opcode_position(&indexed_ops, "IdxRowid").unwrap();
+        let indexed_seek_rowid_pos = first_opcode_position(&indexed_ops, "SeekRowid").unwrap();
+        if let Some(indexed_rewind_pos) = first_opcode_position(&indexed_ops, "Rewind") {
+            assert!(
+                indexed_seek_ge_pos < indexed_rewind_pos,
+                "non-covering indexed equality should choose the seek path before any fallback scan, got {indexed_ops:?}"
+            );
+            assert!(
+                indexed_idx_rowid_pos < indexed_rewind_pos,
+                "non-covering indexed equality should extract rowids before any fallback scan, got {indexed_ops:?}"
+            );
+            assert!(
+                indexed_seek_rowid_pos < indexed_rewind_pos,
+                "non-covering indexed equality should seek the table row before any fallback scan, got {indexed_ops:?}"
+            );
+        }
+
+        let covering_query = "SELECT age FROM users WHERE age = 25";
+        let covering_eqp = explain_query_plan_details(&fconn, covering_query);
+        assert_eq!(
+            covering_eqp,
+            sqlite_explain_query_plan_details(&rconn, covering_query),
+            "covering indexed equality EQP diverged from SQLite"
+        );
+        let covering_ops = explain_opcodes(&fconn, covering_query);
+        assert!(
+            covering_ops.iter().any(|op| op == "SeekGE"),
+            "covering indexed equality should probe the index with SeekGE, got {covering_ops:?}"
+        );
+        assert!(
+            !covering_ops.iter().any(|op| op == "SeekRowid"),
+            "covering indexed equality should not perform a table rowid lookup, got {covering_ops:?}"
+        );
+        let covering_seek_ge_pos = first_opcode_position(&covering_ops, "SeekGE").unwrap();
+        if let Some(covering_rewind_pos) = first_opcode_position(&covering_ops, "Rewind") {
+            assert!(
+                covering_seek_ge_pos < covering_rewind_pos,
+                "covering indexed equality should choose the seek path before any fallback scan, got {covering_ops:?}"
             );
         }
     }

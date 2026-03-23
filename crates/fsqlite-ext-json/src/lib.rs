@@ -1943,6 +1943,9 @@ fn collect_path_value_pairs(
     let mut pairs = Vec::with_capacity((args.len().saturating_sub(start)) / 2);
     let mut idx = start;
     while idx < args.len() {
+        if idx + 1 >= args.len() {
+            break;
+        }
         let path = text_arg(name, args, idx)?.to_owned();
         let value = args[idx + 1].clone();
         pairs.push((path, value));

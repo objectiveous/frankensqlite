@@ -611,7 +611,13 @@ impl TransactionManager {
 
         // For Immediate/Exclusive: acquire serialized writer exclusion at BEGIN.
         if kind == BeginKind::Immediate || kind == BeginKind::Exclusive {
-            self.acquire_serialized_writer_exclusion(txn_id)?;
+            if let Err(e) = self.acquire_serialized_writer_exclusion(txn_id) {
+                // Unregister the snapshot we just registered (snapshot_established
+                // is true for Immediate/Exclusive) to avoid permanently pinning
+                // the GC horizon at this snapshot's high value.
+                self.unregister_active_snapshot(txn_id);
+                return Err(e);
+            }
             txn.serialized_write_lock_held = true;
         }
 

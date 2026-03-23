@@ -931,10 +931,29 @@ fn parse_primary(
                     break;
                 }
                 if t.kind == Fts5QueryTokenKind::Term {
-                    // Check if it's a distance specifier like ",5"
+                    // Handle NEAR(term1 term2, 5) — the tokenizer treats
+                    // `,` as part of a word, so we may see "term2," and
+                    // then "5" as separate tokens, or ",5" as one token.
                     if let Some(stripped) = t.lexeme.strip_prefix(',') {
+                        // Token like ",5" — parse as distance.
                         if let Ok(d) = stripped.parse::<u32>() {
                             distance = d;
+                        }
+                    } else if t.lexeme.ends_with(',') {
+                        // Token like "term2," — strip trailing comma and
+                        // mark that the next numeric token is the distance.
+                        let clean = t.lexeme.trim_end_matches(',');
+                        if !clean.is_empty() {
+                            terms.push(clean.to_owned());
+                        }
+                        // Peek at the next token for the distance number.
+                        if let Some(next) = rest.get(1) {
+                            if next.kind == Fts5QueryTokenKind::Term {
+                                if let Ok(d) = next.lexeme.parse::<u32>() {
+                                    distance = d;
+                                    rest = &rest[1..]; // consume the distance token
+                                }
+                            }
                         }
                     } else {
                         terms.push(t.lexeme.clone());

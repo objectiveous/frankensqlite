@@ -2539,19 +2539,6 @@ where
         )
     }
 
-    /// Publish a new committed-state snapshot (called from commit paths).
-    ///
-    /// Takes the RwLock write-hold (~nanoseconds), swaps the Arc pointer.
-    /// Old snapshot is reclaimed when all readers drop their Arc.
-    pub(crate) fn publish_committed_snapshot_from_inner<F: VfsFile>(&self, inner: &PagerInner<F>) {
-        let new = Arc::new(PagerCommittedSnapshot::from_inner(inner));
-        let mut guard = self
-            .committed_snapshot
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = new;
-    }
-
     /// Number of page reads satisfied directly from the publication plane.
     #[must_use]
     pub fn published_page_hits(&self) -> u64 {
@@ -3544,6 +3531,18 @@ impl<V: Vfs> SimpleTransaction<V> {
     fn publish_committed_state(&self, cx: &Cx, update: PublishedPagerUpdate) {
         // D1-CRITICAL Change 3: Use sharded publish_commit.
         self.published.publish_commit(cx, update, &self.write_set);
+    }
+
+    /// Publish a new committed-state snapshot while the pager inner lock is still held.
+    ///
+    /// The write lock is held only long enough to swap the immutable snapshot Arc.
+    fn publish_committed_snapshot_from_inner(&self, inner: &PagerInner<V::File>) {
+        let snapshot = Arc::new(PagerCommittedSnapshot::from_inner(inner));
+        let mut guard = self
+            .committed_snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = snapshot;
     }
 
     fn drain_committed_cache_pages(&mut self) -> Vec<(PageNumber, PageBuf)> {
@@ -4722,7 +4721,7 @@ where
             // promote the pending freed pages into inner.freelist. This is
             // the deferred half of the Phase A fix — freed pages are only
             // visible to other transactions after the WAL commit is durable.
-            return_pages_to_freelist(&mut inner.freelist, pending_freed.into_iter());
+            return_pages_to_freelist(&mut inner.freelist, pending_freed);
             if self.journal_mode != JournalMode::Wal {
                 inner.db_size = committed_db_size;
             }
@@ -4742,14 +4741,7 @@ where
                 checkpoint_active: inner.checkpoint_active,
             };
             // bd-db300.5.3.3.1: publish immutable snapshot while inner is still held.
-            {
-                let snap = Arc::new(PagerCommittedSnapshot::from_inner(&inner));
-                let mut guard = self
-                    .committed_snapshot
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                *guard = snap;
-            }
+            self.publish_committed_snapshot_from_inner(&inner);
             let preserve_level =
                 retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
             let _ = inner.db_file.unlock(cx, preserve_level);
@@ -4961,7 +4953,7 @@ where
             // For journal mode, update db_size from our computed value.
             // For WAL mode with group commit, the flusher already set inner.db_size
             // to the consolidated max across all batched transactions - don't revert it.
-            return_pages_to_freelist(&mut inner.freelist, pending_freed.into_iter());
+            return_pages_to_freelist(&mut inner.freelist, pending_freed);
             if self.journal_mode != JournalMode::Wal {
                 inner.db_size = committed_db_size;
             }
@@ -4980,14 +4972,7 @@ where
             };
             self.publish_committed_state(cx, publish_update);
             // bd-db300.5.3.3.1: publish immutable snapshot while inner is still held.
-            {
-                let snap = Arc::new(PagerCommittedSnapshot::from_inner(&inner));
-                let mut guard = self
-                    .committed_snapshot
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                *guard = snap;
-            }
+            self.publish_committed_snapshot_from_inner(&inner);
             drop(inner);
 
             // Clear write set for reuse (no allocation — just clears existing maps).

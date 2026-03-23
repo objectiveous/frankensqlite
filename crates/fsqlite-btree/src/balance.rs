@@ -200,6 +200,10 @@ pub fn balance_deeper<W: PageWriter>(
 ///
 /// Returns `Ok(Some(new_page))` if successful, or `Ok(None)` if the
 /// parent page is full and cannot accept the divider cell.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "quick-balance operates on explicit B-tree state rather than an aggregate config"
+)]
 pub fn balance_quick<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,

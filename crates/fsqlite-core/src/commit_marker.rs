@@ -64,6 +64,8 @@ pub enum MarkerError {
         complete_records: u64,
         trailing_bytes: usize,
     },
+    /// marker_id does not match recomputed value (forged or corrupt record).
+    MarkerIdMismatch { commit_seq: u64 },
 }
 
 impl std::fmt::Display for MarkerError {
@@ -104,6 +106,12 @@ impl std::fmt::Display for MarkerError {
                 write!(
                     f,
                     "torn tail: {complete_records} complete records, {trailing_bytes} trailing bytes"
+                )
+            }
+            Self::MarkerIdMismatch { commit_seq } => {
+                write!(
+                    f,
+                    "marker_id verification failed for commit_seq {commit_seq} (forged or corrupt)"
                 )
             }
         }
@@ -422,8 +430,9 @@ pub const fn next_commit_seq_from_file_len(start_commit_seq: u64, file_len: u64)
 // Torn tail handling
 // ---------------------------------------------------------------------------
 
-/// Scan a segment's record region and return the count of valid (checksum-verified)
-/// records from the start.  Stops at the first record that fails xxh3 verification.
+/// Scan a segment's record region and return the count of valid records
+/// from the start.  Stops at the first record that fails xxh3 verification
+/// or marker_id verification (tamper detection).
 ///
 /// `data` must be the record region only (header already stripped).
 #[must_use]
@@ -432,7 +441,11 @@ pub fn valid_record_prefix_count(data: &[u8]) -> u64 {
     let mut offset = 0;
     while offset + COMMIT_MARKER_RECORD_BYTES <= data.len() {
         let record_bytes = &data[offset..offset + COMMIT_MARKER_RECORD_BYTES];
-        if CommitMarkerRecord::decode(record_bytes).is_err() {
+        let Ok(record) = CommitMarkerRecord::decode(record_bytes) else {
+            break;
+        };
+        // Security: also verify marker_id to reject forged records.
+        if !record.verify_marker_id() {
             break;
         }
         count += 1;
@@ -511,6 +524,15 @@ pub fn recover_valid_prefix(segment_data: &[u8]) -> Result<Vec<CommitMarkerRecor
             return Err(MarkerError::CommitSeqMismatch {
                 expected,
                 actual: record.commit_seq,
+            });
+        }
+
+        // Security: reject records with forged marker_id even if xxh3 is consistent.
+        // An attacker can recompute record_xxh3 to match altered fields, but cannot
+        // forge the BLAKE3-based marker_id without knowing the correct inputs.
+        if !record.verify_marker_id() {
+            return Err(MarkerError::MarkerIdMismatch {
+                commit_seq: record.commit_seq,
             });
         }
 

@@ -915,8 +915,16 @@ pub fn bootstrap_native_mode_with_recovery(
 
             let recovered_pointer =
                 recover_root_pointer_from_scan(layout, symbol_auth_enabled, master_key)?;
+
+            // DATA INTEGRITY: validate the recovered root BEFORE persisting it.
+            // Previously, write_root_pointer_atomic was called first, meaning a
+            // bogus candidate would be persisted to disk even if validation failed,
+            // leaving permanent corruption in ecs/root.
+            let state = bootstrap_from_root_pointer(layout, recovered_pointer)?;
+
+            // Only persist the root pointer after full validation succeeds.
             write_root_pointer_atomic(&layout.root_path(), recovered_pointer)?;
-            bootstrap_from_root_pointer(layout, recovered_pointer)
+            Ok(state)
         }
     }
 }

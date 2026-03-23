@@ -1,0 +1,339 @@
+# DB300 Same-Core / SMT / Same-LLC Interference Contract v1.0.0
+#
+# Bead: bd-db300.7.8.1
+# Purpose: define the operator entrypoint, case matrix, structured-log fields,
+# artifact layout, and first harness slice for replayable topology interference
+# verification built on the existing topology bundle and artifact contracts.
+
+[meta]
+schema_version = "1.0.0"
+bead_id = "bd-db300.7.8.1"
+track_id = "bd-db300.7.8"
+generated_at = "2026-03-23"
+contract_owner = "db300-track-g8-topology-interference"
+operator_entrypoint = "scripts/verify_g8_1_same_core_smt_interference.sh"
+topology_bundle_contract_ref = "scripts/verify_bd_db300_1_6_1_topology_bundle.sh"
+artifact_manifest_contract_ref = "crates/fsqlite-e2e/src/fixture_select.rs"
+structured_logging_contract_ref = "db300_structured_logging_contract.toml"
+
+[global_defaults]
+event_schema_id = "fsqlite.db300.topology_interference_event.v1"
+case_matrix_schema_id = "fsqlite.db300.topology_interference_case_matrix.v1"
+artifact_manifest_schema_id = "fsqlite.db300.topology_interference_manifest.v1"
+run_identity_schema_id = "fsqlite.db300.run_identity.v1"
+default_surface_id = "g8_1_topology_interference_suite"
+default_pillar_id = "G8"
+default_primitive_class = "topology_interference_smoke"
+default_placement_profile_id = "recommended_pinned"
+default_hardware_class_id = "linux_x86_64_many_core_numa"
+concurrent_writer_requirement = "Concurrent-writer mode stays ON by default; this suite may pin, classify, or replay topology cases but must not serialize writers or disable MVCC defaults."
+missing_case_policy = "If a topology relation cannot be resolved, publish availability=unavailable with an explicit unavailability_reason instead of inventing a cpu_pair or silently falling back."
+replay_policy = "Every artifact pack must contain rerun_entrypoint.sh plus the exact selector values and topology bundle paths needed to regenerate the same case matrix mechanically."
+mechanical_comparison_policy = "Mechanical comparison is allowed only when case_id, primitive_class, placement_profile_id, hardware_class_id, hardware_signature, cpu_pair_signature, source_revision, and beads_data_hash match."
+first_slice_id = "g8_1_case_resolution_smoke"
+first_slice_goal = "Resolve the same_core_serialized, smt_sibling_pair, and same_llc_diff_core_pair selectors from a real topology bundle and package them with stable logs and replay metadata before measurement loops are added."
+
+[structured_log_common_fields]
+required_fields = [
+  "schema_version",
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "phase",
+  "event_type",
+  "outcome",
+  "timestamp",
+  "message",
+  "surface_id",
+  "pillar_id",
+  "event_family",
+  "claim_id",
+  "evidence_id",
+  "evidence_root",
+  "placement_profile_id",
+  "hardware_class_id",
+  "hardware_signature",
+  "source_revision",
+  "beads_data_hash",
+]
+
+[structured_log_case_fields]
+required_fields = [
+  "case_id",
+  "case_kind",
+  "primitive_class",
+  "cpu_pair",
+  "cpu_pair_signature",
+  "llc_domain",
+  "smt_relationship",
+  "availability",
+]
+
+[structured_log_measurement_fields]
+required_fields = [
+  "throughput",
+  "p50_ns",
+  "p95_ns",
+  "p99_ns",
+  "fairness_score",
+  "wakeups",
+  "migrations",
+  "ownership_events",
+]
+
+[structured_log_failure_fields]
+required_fields = [
+  "first_failure_summary",
+  "first_failure_stage",
+  "first_failure_artifact",
+  "diagnostic_json_pointer",
+  "replay_command",
+]
+
+[provenance]
+required_ids = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "claim_id",
+  "evidence_id",
+  "evidence_root",
+  "artifact_bundle_relpath",
+  "hardware_signature",
+  "source_revision",
+  "beads_data_hash",
+]
+required_selector_bindings = [
+  "RUN_ID",
+  "TRACE_ID",
+  "ARTIFACT_DIR",
+  "PLACEMENT_PROFILE_ID",
+  "HARDWARE_CLASS_ID",
+  "PRIMITIVE_CLASS",
+  "SOURCE_REVISION",
+  "BEADS_HASH",
+]
+
+[mechanical_comparison]
+join_key_fields = [
+  "case_id",
+  "primitive_class",
+  "placement_profile_id",
+  "hardware_class_id",
+  "hardware_signature",
+  "cpu_pair_signature",
+  "source_revision",
+  "beads_data_hash",
+]
+required_match_fields = [
+  "case_id",
+  "primitive_class",
+  "placement_profile_id",
+  "hardware_class_id",
+  "hardware_signature",
+  "cpu_pair_signature",
+  "llc_domain",
+  "smt_relationship",
+]
+ignored_ephemeral_fields = [
+  "timestamp",
+  "elapsed_ms",
+  "message",
+  "artifact_bundle_dir",
+  "artifact_bundle_relpath",
+]
+comparison_status_on_missing_field = "observability_gap"
+comparison_status_on_selector_mismatch = "not_comparable"
+
+[artifact_layout]
+bundle_dir_template = "artifacts/bd-db300.7.8.1/{run_id}"
+required_files = [
+  "manifest.json",
+  "case_matrix.json",
+  "structured_logs.ndjson",
+  "summary.md",
+  "rerun_entrypoint.sh",
+  "topology_bundle/hardware_discovery_bundle.json",
+  "topology_bundle/hardware_discovery_summary.md",
+]
+optional_files = ["first_failure.json", "contract_test.log"]
+required_directories = ["topology_bundle"]
+
+[[event_family]]
+family_id = "topology_case_resolution"
+required_fields = [
+  "schema_version",
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "phase",
+  "event_type",
+  "outcome",
+  "timestamp",
+  "message",
+  "surface_id",
+  "pillar_id",
+  "event_family",
+  "claim_id",
+  "evidence_id",
+  "evidence_root",
+  "placement_profile_id",
+  "hardware_class_id",
+  "hardware_signature",
+  "source_revision",
+  "beads_data_hash",
+  "case_id",
+  "case_kind",
+  "primitive_class",
+  "cpu_pair",
+  "cpu_pair_signature",
+  "llc_domain",
+  "smt_relationship",
+  "availability",
+]
+mechanical_compare_fields = [
+  "case_id",
+  "primitive_class",
+  "cpu_pair_signature",
+  "llc_domain",
+  "smt_relationship",
+  "availability",
+]
+
+[[event_family]]
+family_id = "topology_interference_measurement"
+required_fields = [
+  "schema_version",
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "phase",
+  "event_type",
+  "outcome",
+  "timestamp",
+  "message",
+  "surface_id",
+  "pillar_id",
+  "event_family",
+  "claim_id",
+  "evidence_id",
+  "evidence_root",
+  "placement_profile_id",
+  "hardware_class_id",
+  "hardware_signature",
+  "source_revision",
+  "beads_data_hash",
+  "case_id",
+  "case_kind",
+  "primitive_class",
+  "cpu_pair",
+  "cpu_pair_signature",
+  "llc_domain",
+  "smt_relationship",
+  "availability",
+  "throughput",
+  "p50_ns",
+  "p95_ns",
+  "p99_ns",
+  "fairness_score",
+  "wakeups",
+  "migrations",
+  "ownership_events",
+]
+mechanical_compare_fields = [
+  "case_id",
+  "primitive_class",
+  "cpu_pair_signature",
+  "throughput",
+  "p95_ns",
+  "p99_ns",
+  "fairness_score",
+  "wakeups",
+  "migrations",
+  "ownership_events",
+]
+
+[[event_family]]
+family_id = "verification_bundle_summary"
+required_fields = [
+  "schema_version",
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "phase",
+  "event_type",
+  "outcome",
+  "timestamp",
+  "message",
+  "surface_id",
+  "pillar_id",
+  "event_family",
+  "claim_id",
+  "evidence_id",
+  "evidence_root",
+  "placement_profile_id",
+  "hardware_class_id",
+  "hardware_signature",
+  "source_revision",
+  "beads_data_hash",
+]
+mechanical_compare_fields = [
+  "surface_id",
+  "placement_profile_id",
+  "hardware_class_id",
+  "hardware_signature",
+  "source_revision",
+  "beads_data_hash",
+]
+
+[[case]]
+case_id = "same_core_serialized"
+case_kind = "same_core"
+placement_profile_id = "recommended_pinned"
+primitive_class = "topology_interference_smoke"
+selector_strategy = "bind both probe lanes to the same logical CPU so interference is forced onto one core even without SMT."
+availability_guard = "Requires at least one online CPU in the topology bundle."
+cpu_pair_contract = "cpu_pair[0] == cpu_pair[1]"
+smt_relationship = "same_logical_cpu"
+
+[[case]]
+case_id = "smt_sibling_pair"
+case_kind = "smt_sibling"
+placement_profile_id = "recommended_pinned"
+primitive_class = "topology_interference_smoke"
+selector_strategy = "Choose the first thread_siblings_list entry with at least two distinct logical CPUs."
+availability_guard = "Requires threads_per_core >= 2 and a sibling set with two distinct logical CPUs."
+cpu_pair_contract = "cpu_pair[0] != cpu_pair[1] and both CPUs appear in the same thread_siblings_list entry"
+smt_relationship = "siblings_same_core"
+
+[[case]]
+case_id = "same_llc_diff_core_pair"
+case_kind = "same_llc"
+placement_profile_id = "recommended_pinned"
+primitive_class = "topology_interference_smoke"
+selector_strategy = "Choose the first shared_cpu_list entry that contains two logical CPUs from different sibling sets."
+availability_guard = "Requires one LLC domain with at least two non-sibling logical CPUs."
+cpu_pair_contract = "cpu_pair[0] != cpu_pair[1], both CPUs appear in the same shared_cpu_list entry, and they are not SMT siblings"
+smt_relationship = "not_siblings_same_llc"
+
+[first_slice]
+slice_id = "g8_1_case_resolution_smoke"
+entrypoint = "scripts/verify_g8_1_same_core_smt_interference.sh"
+topology_bundle_dependency = "scripts/verify_bd_db300_1_6_1_topology_bundle.sh"
+contract_test = "cargo test -p fsqlite-harness --test bd_db300_7_8_1_same_core_smt_interference_contract -- --nocapture"
+required_event_families = ["topology_case_resolution", "verification_bundle_summary"]
+required_artifacts = [
+  "manifest.json",
+  "case_matrix.json",
+  "structured_logs.ndjson",
+  "summary.md",
+  "rerun_entrypoint.sh",
+  "topology_bundle/hardware_discovery_bundle.json",
+  "topology_bundle/hardware_discovery_summary.md",
+]
+success_rule = "The operator entrypoint must render all required artifacts, resolve all three case_ids deterministically to available or unavailable, and publish stable selector metadata for replay."

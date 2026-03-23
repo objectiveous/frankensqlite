@@ -125,8 +125,10 @@ pub(crate) fn maybe_inject_during_phase_c(commit_seq: u64, db_size: u32) -> Resu
 /// Arm the dropped-condvar-notify fault hook (F11 / H11).
 ///
 /// When armed, `maybe_inject_drop_condvar_notify()` returns true,
-/// signaling the caller to skip the `publish_completed_epoch()` call.
-/// Waiters must recover via timeout.
+/// signaling the caller to suppress the `Condvar::notify_all()` that normally
+/// follows a successful `publish_completed_epoch()` store.  The completed epoch
+/// is still published; only the wakeup is dropped so waiters must recover via
+/// timeout-based rechecks.
 pub fn arm_drop_condvar_notify(arm: FaultHookArm) {
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()
@@ -136,7 +138,7 @@ pub fn arm_drop_condvar_notify(arm: FaultHookArm) {
 
 /// Check and fire the dropped-condvar-notify hook.
 ///
-/// Returns `true` if the hook fires (caller should skip notify).
+/// Returns `true` if the hook fires (caller should suppress the notify).
 pub(crate) fn maybe_inject_drop_condvar_notify(completed_epoch: u64) -> bool {
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()

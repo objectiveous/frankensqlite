@@ -95,6 +95,14 @@ impl GroupCommitQueue {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.completed_epoch.store(epoch, AtomicOrdering::Release);
+
+        // H11 fault hook: suppress the Condvar notification while still
+        // storing the completed epoch. Waiters must recover via wait_timeout.
+        #[cfg(any(test, feature = "fault-injection"))]
+        if crate::fault_hooks::maybe_inject_drop_condvar_notify(epoch) {
+            return;
+        }
+
         self.flush_complete.notify_all();
     }
 
@@ -3869,17 +3877,7 @@ where
                             (consolidator.epoch(), promoted)
                         };
 
-                        // H11 fault hook: suppress condvar notification.
-                        // Waiters must recover via timed wait.
-                        #[cfg(any(test, feature = "fault-injection"))]
-                        let skip_publish =
-                            crate::fault_hooks::maybe_inject_drop_condvar_notify(completed_epoch);
-                        #[cfg(not(any(test, feature = "fault-injection")))]
-                        let skip_publish = false;
-
-                        if !skip_publish {
-                            queue.publish_completed_epoch(completed_epoch);
-                        }
+                        queue.publish_completed_epoch(completed_epoch);
 
                         if has_promoted {
                             record_initial_metrics = false;
@@ -10089,9 +10087,9 @@ mod tests {
         );
     }
 
-    /// H11 / F11: Suppressed Condvar notification — the flusher completes
-    /// but skips `publish_completed_epoch()`. Waiters must recover via the
-    /// timed wait rather than hanging forever.
+    /// H11 / F11: Suppressed Condvar notification — the flusher still publishes
+    /// the completed epoch, but intentionally skips the wakeup. Waiters must
+    /// recover via the timed wait rather than hanging forever.
     ///
     /// Proof obligation: both flusher and waiter threads complete within a
     /// bounded time. No permanent hang.
@@ -10172,8 +10170,9 @@ mod tests {
                 "bead_id={BEAD_ID} case=condvar_drop_no_hang elapsed={elapsed:?}"
             );
 
-            // The flusher succeeds (wrote frames, skipped notify).
-            // Waiter recovers via epoch check on timeout — may succeed or fail.
+            // The flusher succeeds (wrote frames and published the epoch, but
+            // skipped the Condvar wakeup). Waiter recovers via epoch check on
+            // timeout — may succeed or fail.
             let _any_ok = result_a.is_ok() || result_b.is_ok();
 
             let records = crate::fault_hooks::take_records();

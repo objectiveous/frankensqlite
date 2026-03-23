@@ -64,7 +64,8 @@ const HOT_PATH_INLINE_BUNDLE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_inline_bund
 const HOT_PATH_INLINE_BUNDLE_PREFIX: &str = "HOT_PATH_INLINE_BUNDLE_JSON=";
 const HOT_PATH_COMMAND_PACK_SCHEMA_V2: &str = "fsqlite-e2e.hot_path_command_pack.v2";
 const HOT_PATH_COMMAND_PACK_NAME: &str = "command_pack.json";
-const VERIFY_SUITE_PACKAGE_SCHEMA_V1: &str = "fsqlite-e2e.verify_suite_package.v1";
+const VERIFY_SUITE_PACKAGE_SCHEMA_V2: &str = "fsqlite-e2e.verify_suite_package.v2";
+const VERIFY_SUITE_COUNTEREXAMPLE_SCHEMA_V2: &str = "fsqlite-e2e.verify_suite_counterexample.v2";
 const VERIFY_SUITE_INLINE_BUNDLE_PREFIX: &str = "VERIFY_SUITE_BUNDLE_JSON=";
 const VERIFY_SUITE_PACKAGE_NAME: &str = "suite_package.json";
 const VERIFY_SUITE_SUMMARY_NAME: &str = "suite_summary.md";
@@ -254,6 +255,46 @@ impl VerifySuiteKillSwitchState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum VerifySuiteDivergenceClass {
+    None,
+    DecisionBudgetExceeded,
+    FallbackContractBreach,
+    InvariantViolation,
+    ObservabilityGap,
+    SemanticResultMismatch,
+    StateHashMismatch,
+}
+
+impl VerifySuiteDivergenceClass {
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::DecisionBudgetExceeded => "decision_budget_exceeded",
+            Self::FallbackContractBreach => "fallback_contract_breach",
+            Self::InvariantViolation => "invariant_violation",
+            Self::ObservabilityGap => "observability_gap",
+            Self::SemanticResultMismatch => "semantic_result_mismatch",
+            Self::StateHashMismatch => "state_hash_mismatch",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "none" => Some(Self::None),
+            "decision_budget_exceeded" => Some(Self::DecisionBudgetExceeded),
+            "fallback_contract_breach" => Some(Self::FallbackContractBreach),
+            "invariant_violation" => Some(Self::InvariantViolation),
+            "observability_gap" => Some(Self::ObservabilityGap),
+            "semantic_result_mismatch" => Some(Self::SemanticResultMismatch),
+            "state_hash_mismatch" => Some(Self::StateHashMismatch),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VerifySuitePackage {
     schema_version: String,
@@ -268,6 +309,7 @@ struct VerifySuitePackage {
     shadow_mode: VerifySuiteShadowMode,
     shadow_verdict: VerifySuiteShadowVerdict,
     kill_switch_state: VerifySuiteKillSwitchState,
+    divergence_class: VerifySuiteDivergenceClass,
     db_selector: String,
     workload_selector: String,
     concurrency_selector: String,
@@ -294,6 +336,7 @@ struct VerifySuiteCounterexampleBundle {
     shadow_mode: VerifySuiteShadowMode,
     shadow_verdict: VerifySuiteShadowVerdict,
     kill_switch_state: VerifySuiteKillSwitchState,
+    divergence_class: VerifySuiteDivergenceClass,
     rerun_entrypoint: String,
     focused_rerun_entrypoint: String,
     first_failure_diagnostics: String,
@@ -1674,10 +1717,22 @@ fn default_verify_suite_kill_switch_state(
     }
 }
 
+fn default_verify_suite_divergence_class(
+    shadow_verdict: VerifySuiteShadowVerdict,
+) -> VerifySuiteDivergenceClass {
+    match shadow_verdict {
+        VerifySuiteShadowVerdict::Diverged => VerifySuiteDivergenceClass::SemanticResultMismatch,
+        VerifySuiteShadowVerdict::NotRun
+        | VerifySuiteShadowVerdict::PendingExecution
+        | VerifySuiteShadowVerdict::Clean => VerifySuiteDivergenceClass::None,
+    }
+}
+
 fn validate_verify_suite_shadow_contract(
     shadow_mode: VerifySuiteShadowMode,
     shadow_verdict: VerifySuiteShadowVerdict,
     kill_switch_state: VerifySuiteKillSwitchState,
+    divergence_class: VerifySuiteDivergenceClass,
     counterexample_bundle: Option<&Path>,
 ) -> Result<(), String> {
     if shadow_mode == VerifySuiteShadowMode::Off {
@@ -1690,6 +1745,12 @@ fn validate_verify_suite_shadow_contract(
         if kill_switch_state != VerifySuiteKillSwitchState::Disarmed {
             return Err(
                 "shadow_mode=off requires kill_switch_state=disarmed because no shadow comparator ran"
+                    .to_owned(),
+            );
+        }
+        if divergence_class != VerifySuiteDivergenceClass::None {
+            return Err(
+                "shadow_mode=off requires divergence_class=none because no comparator ran"
                     .to_owned(),
             );
         }
@@ -1711,7 +1772,17 @@ fn validate_verify_suite_shadow_contract(
         if kill_switch_state != VerifySuiteKillSwitchState::Tripped {
             return Err("shadow_verdict=diverged requires kill_switch_state=tripped".to_owned());
         }
+        if divergence_class == VerifySuiteDivergenceClass::None {
+            return Err("shadow_verdict=diverged requires divergence_class != none".to_owned());
+        }
+        if counterexample_bundle.is_none() {
+            return Err("shadow_verdict=diverged requires a counterexample bundle".to_owned());
+        }
         return Ok(());
+    }
+
+    if divergence_class != VerifySuiteDivergenceClass::None {
+        return Err("divergence_class is only valid when shadow_verdict=diverged".to_owned());
     }
 
     if counterexample_bundle.is_some() {
@@ -1858,6 +1929,7 @@ fn build_verify_suite_contract_command(
     shadow_mode: VerifySuiteShadowMode,
     shadow_verdict: VerifySuiteShadowVerdict,
     kill_switch_state: VerifySuiteKillSwitchState,
+    divergence_class: VerifySuiteDivergenceClass,
     db_selector: &str,
     workload_selector: &str,
     concurrency_selector: &str,
@@ -1886,6 +1958,7 @@ fn build_verify_suite_contract_command(
         "--kill-switch-state",
         kill_switch_state.as_str(),
     );
+    push_verify_suite_flag(&mut parts, "--divergence-class", divergence_class.as_str());
     push_verify_suite_flag(&mut parts, "--db", db_selector);
     push_verify_suite_flag(&mut parts, "--workload", workload_selector);
     push_verify_suite_flag(&mut parts, "--concurrency", concurrency_selector);
@@ -1994,6 +2067,11 @@ fn render_verify_suite_summary(package: &VerifySuitePackage) -> String {
     );
     let _ = writeln!(
         out,
+        "- divergence_class: {}",
+        package.divergence_class.as_str()
+    );
+    let _ = writeln!(
+        out,
         "- selectors: {}",
         verify_suite_selector_summary(
             &package.db_selector,
@@ -2082,7 +2160,7 @@ fn write_verify_suite_artifacts(output_dir: &Path, package: &VerifySuitePackage)
                 "shadow divergence captured without a detailed diagnostic".to_owned()
             });
         let bundle = VerifySuiteCounterexampleBundle {
-            schema_version: "fsqlite-e2e.verify_suite_counterexample.v1".to_owned(),
+            schema_version: VERIFY_SUITE_COUNTEREXAMPLE_SCHEMA_V2.to_owned(),
             trace_id: package.trace_id.clone(),
             scenario_id: package.scenario_id.clone(),
             suite_id: package.suite_id.clone(),
@@ -2091,6 +2169,7 @@ fn write_verify_suite_artifacts(output_dir: &Path, package: &VerifySuitePackage)
             shadow_mode: package.shadow_mode,
             shadow_verdict: package.shadow_verdict,
             kill_switch_state: package.kill_switch_state,
+            divergence_class: package.divergence_class,
             rerun_entrypoint: package.rerun_entrypoint.clone(),
             focused_rerun_entrypoint: package.focused_rerun_entrypoint.clone(),
             first_failure_diagnostics: diagnostics,
@@ -4463,6 +4542,7 @@ fn cmd_verify_suite(argv: &[String]) -> i32 {
     let mut shadow_mode = VerifySuiteShadowMode::Off;
     let mut shadow_verdict: Option<VerifySuiteShadowVerdict> = None;
     let mut kill_switch_state: Option<VerifySuiteKillSwitchState> = None;
+    let mut divergence_class: Option<VerifySuiteDivergenceClass> = None;
     let mut db_selector = "all".to_owned();
     let mut workload_selector = "all".to_owned();
     let mut concurrency: Vec<u16> = vec![1, 4, 8];
@@ -4587,6 +4667,20 @@ fn cmd_verify_suite(argv: &[String]) -> i32 {
                 };
                 kill_switch_state = Some(value);
             }
+            "--divergence-class" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!(
+                        "error: --divergence-class requires none|decision_budget_exceeded|fallback_contract_breach|invariant_violation|observability_gap|semantic_result_mismatch|state_hash_mismatch"
+                    );
+                    return 2;
+                }
+                let Some(value) = VerifySuiteDivergenceClass::parse(&argv[i]) else {
+                    eprintln!("error: invalid --divergence-class `{}`", argv[i]);
+                    return 2;
+                };
+                divergence_class = Some(value);
+            }
             "--db" => {
                 i += 1;
                 if i >= argv.len() {
@@ -4655,6 +4749,8 @@ fn cmd_verify_suite(argv: &[String]) -> i32 {
         shadow_verdict.unwrap_or_else(|| default_verify_suite_shadow_verdict(shadow_mode));
     let kill_switch_state = kill_switch_state
         .unwrap_or_else(|| default_verify_suite_kill_switch_state(shadow_mode, shadow_verdict));
+    let divergence_class =
+        divergence_class.unwrap_or_else(|| default_verify_suite_divergence_class(shadow_verdict));
     let output_dir = resolve_path_from_current_dir(output_dir.unwrap_or_else(|| {
         default_verify_suite_output_dir(
             &suite_id,
@@ -4676,6 +4772,7 @@ fn cmd_verify_suite(argv: &[String]) -> i32 {
         shadow_mode,
         shadow_verdict,
         kill_switch_state,
+        divergence_class,
         counterexample_bundle.as_deref(),
     ) {
         eprintln!("error: {error}");
@@ -4723,6 +4820,7 @@ fn cmd_verify_suite(argv: &[String]) -> i32 {
         shadow_mode,
         shadow_verdict,
         kill_switch_state,
+        divergence_class,
         &db_selector,
         &workload_selector,
         &concurrency_selector,
@@ -4766,7 +4864,7 @@ fn cmd_verify_suite(argv: &[String]) -> i32 {
     };
 
     let package = VerifySuitePackage {
-        schema_version: VERIFY_SUITE_PACKAGE_SCHEMA_V1.to_owned(),
+        schema_version: VERIFY_SUITE_PACKAGE_SCHEMA_V2.to_owned(),
         trace_id,
         scenario_id,
         suite_id,
@@ -4778,6 +4876,7 @@ fn cmd_verify_suite(argv: &[String]) -> i32 {
         shadow_mode,
         shadow_verdict,
         kill_switch_state,
+        divergence_class,
         db_selector,
         workload_selector,
         concurrency_selector,
@@ -4840,7 +4939,7 @@ fn cmd_verify_suite(argv: &[String]) -> i32 {
     }
 
     eprintln!(
-        "Verification suite package: suite={} mode={} placement={} depth={} regime={} shadow={} verdict={} kill_switch={} artifact_root={}",
+        "Verification suite package: suite={} mode={} placement={} depth={} regime={} shadow={} verdict={} kill_switch={} divergence={} artifact_root={}",
         package.suite_id,
         package.mode.as_str(),
         package.placement_profile_id,
@@ -4849,6 +4948,7 @@ fn cmd_verify_suite(argv: &[String]) -> i32 {
         package.shadow_mode.as_str(),
         package.shadow_verdict.as_str(),
         package.kill_switch_state.as_str(),
+        package.divergence_class.as_str(),
         package.artifact_root
     );
     eprintln!("  rerun_entrypoint: {}", package.rerun_entrypoint);
@@ -4884,6 +4984,10 @@ OPTIONS:
     --shadow-verdict <V>        not_run | pending_execution | clean | diverged
                                 (default: derived from shadow-mode)
     --kill-switch-state <S>     disarmed | armed | tripped
+                                (default: derived from shadow verdict)
+    --divergence-class <C>      none | decision_budget_exceeded | fallback_contract_breach |
+                                invariant_violation | observability_gap |
+                                semantic_result_mismatch | state_hash_mismatch
                                 (default: derived from shadow verdict)
     --db <SELECTOR>             Fixture selector or comma-separated list (default: all)
     --workload <SELECTOR>       Workload selector or comma-separated list (default: all)
@@ -7894,6 +7998,25 @@ mod tests {
     }
 
     #[test]
+    fn verify_suite_rejects_divergence_class_without_diverged_verdict() {
+        let tempdir = tempfile::tempdir().expect("tempdir should succeed");
+        let output_dir = tempdir.path().join("verify-suite");
+        let args = vec![
+            OsString::from("realdb-e2e"),
+            OsString::from("verify-suite"),
+            OsString::from("--shadow-mode"),
+            OsString::from("forced"),
+            OsString::from("--shadow-verdict"),
+            OsString::from("clean"),
+            OsString::from("--divergence-class"),
+            OsString::from("semantic_result_mismatch"),
+            OsString::from("--output-dir"),
+            output_dir.into_os_string(),
+        ];
+        assert_eq!(run_cli(args), 2);
+    }
+
+    #[test]
     fn verify_suite_writes_operator_friendly_package_artifacts() {
         let tempdir = tempfile::tempdir().expect("tempdir should succeed");
         let output_dir = tempdir.path().join("verify-suite");
@@ -7935,7 +8058,7 @@ mod tests {
             .expect("suite package should be written");
         let package: Value =
             serde_json::from_str(&package_json).expect("suite package should parse");
-        assert_eq!(package["schema_version"], VERIFY_SUITE_PACKAGE_SCHEMA_V1);
+        assert_eq!(package["schema_version"], VERIFY_SUITE_PACKAGE_SCHEMA_V2);
         assert_eq!(package["execution_context"], "ci");
         assert_eq!(package["mode"], "fsqlite_mvcc");
         assert_eq!(package["placement_profile_id"], "recommended_pinned");
@@ -7944,6 +8067,7 @@ mod tests {
         assert_eq!(package["shadow_mode"], "forced");
         assert_eq!(package["shadow_verdict"], "diverged");
         assert_eq!(package["kill_switch_state"], "tripped");
+        assert_eq!(package["divergence_class"], "semantic_result_mismatch");
         assert_eq!(package["pass_fail_signature"], "fail.shadow_divergence");
         assert_eq!(package["retention_class"], "failure_bundle");
         assert!(
@@ -7964,6 +8088,7 @@ mod tests {
             .expect("suite summary should be written");
         assert!(summary.contains("shadow_verdict: diverged"));
         assert!(summary.contains("kill_switch_state: tripped"));
+        assert!(summary.contains("divergence_class: semantic_result_mismatch"));
         assert!(summary.contains("counterexample_bundle:"));
         assert!(summary.contains("rerun_entrypoint:"));
 
@@ -7971,11 +8096,15 @@ mod tests {
             .expect("verify-suite log should be written");
         assert!(log_jsonl.contains("\"shadow_mode\":\"forced\""));
         assert!(log_jsonl.contains("\"kill_switch_state\":\"tripped\""));
+        assert!(log_jsonl.contains("\"divergence_class\":\"semantic_result_mismatch\""));
 
         let counterexample_bundle =
             fs::read_to_string(output_dir.join(VERIFY_SUITE_COUNTEREXAMPLE_NAME))
                 .expect("counterexample bundle should be written");
         assert!(counterexample_bundle.contains("\"shadow_verdict\": \"diverged\""));
+        assert!(
+            counterexample_bundle.contains("\"divergence_class\": \"semantic_result_mismatch\"")
+        );
 
         let rerun_script = fs::read_to_string(output_dir.join(VERIFY_SUITE_RERUN_NAME))
             .expect("rerun script should be written");

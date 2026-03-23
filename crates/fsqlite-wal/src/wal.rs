@@ -1170,6 +1170,16 @@ impl<F: VfsFile> WalFile<F> {
         let header_bytes = new_header.to_bytes()?;
         self.file.write(cx, &header_bytes, 0)?;
 
+        // H9 fault hook: crash after header write, before truncate.
+        // Simulates power loss leaving new salts in the header but old
+        // frames still on disk. Recovery must see the salt mismatch and
+        // discard all old-generation frames.
+        #[cfg(any(test, feature = "fault-injection"))]
+        {
+            let old_fc = self.frame_count;
+            crate::fault_hooks::maybe_inject_crash_header_truncate(old_fc, new_checkpoint_seq)?;
+        }
+
         if truncate_file {
             self.file.truncate(
                 cx,
@@ -1219,6 +1229,7 @@ impl<F: VfsFile> WalFile<F> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::time::Instant;
 
     use fsqlite_types::flags::VfsOpenFlags;
@@ -1227,6 +1238,11 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    /// Serialization guard for fault-injection tests that use global hook state.
+    /// Fault hooks use a process-wide `LazyLock<Mutex<...>>`, so concurrent
+    /// tests that arm/fire/clear hooks would interfere with each other.
+    static FAULT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     const PAGE_SIZE: u32 = 4096;
     const TRACK_C_SCRATCH_BENCH_BEAD_ID: &str = "bd-db300.3.4.3";
@@ -1583,6 +1599,7 @@ mod tests {
 
     #[test]
     fn test_fault_hook_after_wal_append_returns_error_and_records_context() {
+        let _guard = FAULT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         crate::fault_hooks::clear();
 
         let cx = test_cx();
@@ -1876,6 +1893,7 @@ mod tests {
 
     #[test]
     fn test_fault_hook_sync_failure_returns_error_and_records_context() {
+        let _guard = FAULT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         crate::fault_hooks::clear();
 
         let cx = test_cx();
@@ -1918,6 +1936,7 @@ mod tests {
 
     #[test]
     fn test_fault_hook_append_busy_countdown_fires_once_and_preserves_retry_surface() {
+        let _guard = FAULT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         crate::fault_hooks::clear();
 
         let cx = test_cx();
@@ -1974,6 +1993,100 @@ mod tests {
         assert!(
             records[0].detail.contains("submitted_frames=1"),
             "record should preserve append batch context: {}",
+            records[0].detail
+        );
+
+        crate::fault_hooks::clear();
+    }
+
+    /// H9 / F9: Crash between WAL header rewrite (new salts) and truncation.
+    ///
+    /// After injection, the WAL file has:
+    /// - New header with new salts (written and synced)
+    /// - Old frames with OLD salts (not yet truncated)
+    ///
+    /// Recovery (WalFile::open) must see the salt mismatch between header
+    /// and frames, and discard ALL frames. Result: frame_count == 0.
+    ///
+    /// Replay: `cargo test -p fsqlite-wal -- test_fault_crash_between_header_and_truncate --nocapture`
+    #[test]
+    fn test_fault_crash_between_header_and_truncate_recovers_to_zero_frames() {
+        let _guard = FAULT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        crate::fault_hooks::clear();
+
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
+
+        // Append 3 frames with the original salts.
+        for i in 1..=3_u32 {
+            let page = sample_page(i as u8);
+            wal.append_frame(&cx, i, &page, i)
+                .unwrap_or_else(|e| panic!("append frame {i}: {e}"));
+        }
+        wal.sync(&cx, SyncFlags::NORMAL).expect("sync WAL");
+        assert_eq!(wal.frame_count(), 3, "pre-reset: 3 frames");
+
+        let original_salts = wal.generation_identity().salts;
+
+        // Arm the crash-header-truncate hook.
+        crate::fault_hooks::arm_crash_header_truncate(crate::fault_hooks::FaultHookArm::new(
+            "bd-db300.7.2.2-h9",
+            "WAL-CRASH-HEADER-TRUNCATE",
+            "wal_reset_recovery",
+        ));
+
+        // Attempt reset — should fail after writing new header but before truncation.
+        let new_salts = WalSalts {
+            salt1: original_salts.salt1.wrapping_add(1),
+            salt2: original_salts.salt2.wrapping_add(1),
+        };
+        let err = wal
+            .reset(&cx, 1, new_salts, true)
+            .expect_err("fault hook should fire between header write and truncate");
+        assert!(
+            err.to_string()
+                .contains("fault_inject:wal_crash_header_truncate"),
+            "error should identify the hook: {err}"
+        );
+
+        // The WAL is now in a corrupted state:
+        // - Header has new salts (written and synced before hook fired)
+        // - Frames still have old salts (truncation was prevented)
+        // Close the handle without further I/O.
+        wal.close(&cx).expect("close WAL handle");
+
+        // Recovery: re-open the WAL.
+        let recovered_file = open_wal_file(&vfs, &cx);
+        let recovered = WalFile::open(&cx, recovered_file).expect("reopen WAL");
+
+        // Proof obligation: frame_count == 0 because all old frames have
+        // mismatched salts vs the new header.
+        assert_eq!(
+            recovered.frame_count(),
+            0,
+            "recovery must discard all old-salt frames after header rewrite"
+        );
+        assert_eq!(
+            recovered.generation_identity().salts,
+            new_salts,
+            "recovered header must have the new salts"
+        );
+
+        // Verify injection record.
+        let records = crate::fault_hooks::take_records();
+        assert_eq!(records.len(), 1, "exactly one crash hook should fire");
+        assert_eq!(records[0].point, "wal_crash_header_truncate");
+        assert_eq!(records[0].scenario_id, "WAL-CRASH-HEADER-TRUNCATE");
+        assert!(
+            records[0].detail.contains("old_frame_count=3"),
+            "record should capture pre-reset frame count: {}",
+            records[0].detail
+        );
+        assert!(
+            records[0].detail.contains("new_checkpoint_seq=1"),
+            "record should capture checkpoint seq: {}",
             records[0].detail
         );
 

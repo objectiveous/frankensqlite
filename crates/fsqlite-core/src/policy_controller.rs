@@ -6,6 +6,8 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use serde::{Deserialize, Serialize};
+
 use super::{
     DEFAULT_OVERHEAD_PERCENT, INITIAL_REPAIR_POLICY_EPOCH, MAX_OVERHEAD_PERCENT,
     MIN_OVERHEAD_PERCENT, RepairBudget, RepairObjectClass, compute_repair_budget_for_object,
@@ -416,6 +418,188 @@ pub enum PolicyKnob {
     GcCompactionRate,
 }
 
+impl PolicyKnob {
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RedundancyOverheadPercent => "redundancy_overhead_percent",
+            Self::GroupCommitBatch => "group_commit_batch",
+            Self::RetryBackoffMs => "retry_backoff_ms",
+            Self::TxnMaxDurationMs => "txn_max_duration_ms",
+            Self::LeaseDurationMs => "lease_duration_ms",
+            Self::BgCpuMax => "bg_cpu_max",
+            Self::RemoteMaxInFlight => "remote_max_in_flight",
+            Self::CommitEncodeMax => "commit_encode_max",
+            Self::GcCompactionRate => "gc_compaction_rate",
+        }
+    }
+}
+
+const POLICY_ARTIFACT_CONTRACT_SCHEMA_V1: &str = "fsqlite.policy_artifact_contract.v1";
+const POLICY_RUNTIME_SNAPSHOT_SCHEMA_V1: &str = "fsqlite.policy_runtime_snapshot.v1";
+const POLICY_CONTROLLER_ID: &str = "fsqlite.policy_controller.expected_loss.v1";
+const POLICY_CONTROLLER_FAMILY: &str = "expected_loss_guarded_argmin";
+const POLICY_CONTROLLER_VERSION: &str = "1.0.0";
+const POLICY_CONTROLLER_BUDGET_ID: &str = "controller_expected_loss_budget_v1";
+const POLICY_CONTROLLER_SLO_ID: &str = "db300_tail_guardrail_slo_v1";
+const POLICY_CONTROLLER_BASELINE_ID: &str = "manual_pragma_baseline_v1";
+const POLICY_CONTROLLER_FALLBACK_POLICY: &str =
+    "retain_prior_setting_and_emit_fail_closed_decision_record";
+const POLICY_CONTROLLER_SHADOW_CONTRACT_REF: &str =
+    "db300_shadow_oracle_contract.toml#e4_controller_decisions";
+const POLICY_CONTROLLER_PROVENANCE_ROOT: &str = "db300_policy_snapshot_contract.toml";
+const POLICY_CONTROLLER_ARTIFACT_GRAPH_ID: &str = "db300-track-g-controller-artifacts";
+const POLICY_CONTROLLER_EVIDENCE_ROOT: &str = "policy_controller.evidence_ledger";
+const POLICY_CONTROLLER_CALIBRATION: &str = "expected_loss_tables_v1";
+
+/// Progressive rollout posture for controller-bearing fast paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyRolloutStage {
+    Shadow,
+    Canary,
+    Ramp,
+    Default,
+    FallbackOnly,
+}
+
+/// Regime-atlas activation state carried into runtime policy snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyActivationState {
+    UniversalDefault,
+    RegimeGatedDefault,
+    ShadowOnly,
+    OperatorOptIn,
+    Rejected,
+}
+
+/// Execution mode for the controller's decision loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyControlMode {
+    ConservativeBaseline,
+    ExpectedLossGuardedArgmin,
+    ShadowCompare,
+}
+
+/// Shadow-oracle posture for controller decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyShadowMode {
+    Off,
+    Forced,
+    Sampled,
+    ShadowCanary,
+}
+
+/// Kill-switch state surfaced in controller decision records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyKillSwitchState {
+    Disarmed,
+    Armed,
+    Tripped,
+}
+
+/// Divergence / negative-path classification for controller snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyDivergenceClass {
+    None,
+    DecisionBudgetExceeded,
+    FallbackContractBreach,
+    ObservabilityGap,
+    PolicyVersionMismatch,
+    ProvenanceMismatch,
+    StaleSnapshotSchema,
+}
+
+/// Canonical policy-as-data artifact shape for the controller plane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyArtifactContract {
+    pub schema_version: String,
+    pub policy_id: String,
+    pub controller_family: String,
+    pub policy_version: String,
+    pub rollout_stage: PolicyRolloutStage,
+    pub control_mode: PolicyControlMode,
+    pub budget_id: String,
+    pub slo_id: String,
+    pub budget_value: String,
+    pub on_exhaustion_behavior: String,
+    pub conservative_baseline_id: String,
+    pub fallback_policy: String,
+    pub shadow_contract_ref: String,
+    pub comparator_lineage: String,
+    pub shadow_sample_rate: String,
+    pub controller_calibration: String,
+    pub evidence_root: String,
+    pub provenance_root: String,
+    pub artifact_graph_id: String,
+    pub safety_certificate_id: Option<String>,
+}
+
+impl Default for PolicyArtifactContract {
+    fn default() -> Self {
+        Self {
+            schema_version: POLICY_ARTIFACT_CONTRACT_SCHEMA_V1.to_owned(),
+            policy_id: POLICY_CONTROLLER_ID.to_owned(),
+            controller_family: POLICY_CONTROLLER_FAMILY.to_owned(),
+            policy_version: POLICY_CONTROLLER_VERSION.to_owned(),
+            rollout_stage: PolicyRolloutStage::Default,
+            control_mode: PolicyControlMode::ExpectedLossGuardedArgmin,
+            budget_id: POLICY_CONTROLLER_BUDGET_ID.to_owned(),
+            slo_id: POLICY_CONTROLLER_SLO_ID.to_owned(),
+            budget_value: "bounded_expected_loss_delta<=1.0_with_hysteresis".to_owned(),
+            on_exhaustion_behavior: "fallback_to_conservative".to_owned(),
+            conservative_baseline_id: POLICY_CONTROLLER_BASELINE_ID.to_owned(),
+            fallback_policy: POLICY_CONTROLLER_FALLBACK_POLICY.to_owned(),
+            shadow_contract_ref: POLICY_CONTROLLER_SHADOW_CONTRACT_REF.to_owned(),
+            comparator_lineage:
+                "oracle=conservative_baseline candidate=expected_loss_guarded_argmin".to_owned(),
+            shadow_sample_rate: "0%".to_owned(),
+            controller_calibration: POLICY_CONTROLLER_CALIBRATION.to_owned(),
+            evidence_root: POLICY_CONTROLLER_EVIDENCE_ROOT.to_owned(),
+            provenance_root: POLICY_CONTROLLER_PROVENANCE_ROOT.to_owned(),
+            artifact_graph_id: POLICY_CONTROLLER_ARTIFACT_GRAPH_ID.to_owned(),
+            safety_certificate_id: None,
+        }
+    }
+}
+
+/// Runtime decision snapshot tied to the policy-as-data contract.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicyRuntimeSnapshot {
+    pub schema_version: String,
+    pub trace_id: String,
+    pub scenario_id: String,
+    pub policy_id: String,
+    pub controller_family: String,
+    pub policy_version: String,
+    pub rollout_stage: PolicyRolloutStage,
+    pub control_mode: PolicyControlMode,
+    pub activation_regime_id: String,
+    pub activation_state: PolicyActivationState,
+    pub budget_id: String,
+    pub slo_id: String,
+    pub shadow_mode: PolicyShadowMode,
+    pub shadow_sample_rate: String,
+    pub kill_switch_state: PolicyKillSwitchState,
+    pub fallback_active: bool,
+    pub divergence_class: PolicyDivergenceClass,
+    pub decision_count: u64,
+    pub last_action: String,
+    pub expected_loss: Option<f64>,
+    pub counterfactual_action: Option<String>,
+    pub regret_delta: Option<f64>,
+    pub evidence_root: String,
+    pub comparator_lineage: String,
+    pub counterexample_bundle: Option<String>,
+    pub first_failure_diagnostics: Option<String>,
+    pub safety_certificate_id: Option<String>,
+}
+
 /// Candidate action evaluated by expected-loss minimization.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CandidateAction {
@@ -468,6 +652,8 @@ pub struct PolicyEvidenceEntry {
     pub expected_losses: BTreeMap<u64, f64>,
     pub top_evidence: Vec<String>,
     pub regime_id: u64,
+    pub artifact_contract: PolicyArtifactContract,
+    pub runtime_snapshot: PolicyRuntimeSnapshot,
 }
 
 /// Bounded evidence ledger for policy decisions.
@@ -594,6 +780,19 @@ pub enum DecisionReason {
     FallbackTelemetryUnavailable,
 }
 
+impl DecisionReason {
+    #[must_use]
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Applied(_) => "applied",
+            Self::NoAllowedCandidates => "no_allowed_candidates",
+            Self::HysteresisSuppressed => "hysteresis_suppressed",
+            Self::FallbackAutoTuneOff => "fallback_auto_tune_off",
+            Self::FallbackTelemetryUnavailable => "fallback_telemetry_unavailable",
+        }
+    }
+}
+
 /// Result of a policy knob evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyDecisionOutcome {
@@ -613,6 +812,7 @@ pub struct PolicyController {
     last_change_tick: BTreeMap<PolicyKnob, u64>,
     ledger: PolicyEvidenceLedger,
     next_decision_id: u64,
+    policy_contract: PolicyArtifactContract,
 }
 
 impl PolicyController {
@@ -630,6 +830,7 @@ impl PolicyController {
             last_change_tick: BTreeMap::new(),
             ledger: PolicyEvidenceLedger::new(ledger_capacity),
             next_decision_id: 1,
+            policy_contract: PolicyArtifactContract::default(),
         }
     }
 
@@ -641,6 +842,11 @@ impl PolicyController {
     #[must_use]
     pub fn ledger(&self) -> &PolicyEvidenceLedger {
         &self.ledger
+    }
+
+    #[must_use]
+    pub fn policy_contract(&self) -> &PolicyArtifactContract {
+        &self.policy_contract
     }
 
     fn set_knob_value(&mut self, knob: PolicyKnob, value: usize) {
@@ -692,6 +898,264 @@ impl PolicyController {
         None
     }
 
+    #[must_use]
+    fn next_policy_decision_id(&mut self) -> u64 {
+        let decision_id = self.next_decision_id;
+        self.next_decision_id = self.next_decision_id.saturating_add(1);
+        decision_id
+    }
+
+    #[must_use]
+    fn activation_state(
+        &self,
+        auto_tune_enabled: bool,
+        telemetry_available: bool,
+    ) -> PolicyActivationState {
+        if !auto_tune_enabled {
+            PolicyActivationState::OperatorOptIn
+        } else if !telemetry_available {
+            PolicyActivationState::ShadowOnly
+        } else {
+            PolicyActivationState::RegimeGatedDefault
+        }
+    }
+
+    #[must_use]
+    fn control_mode(
+        &self,
+        auto_tune_enabled: bool,
+        telemetry_available: bool,
+    ) -> PolicyControlMode {
+        if !auto_tune_enabled || !telemetry_available {
+            PolicyControlMode::ConservativeBaseline
+        } else {
+            self.policy_contract.control_mode
+        }
+    }
+
+    #[must_use]
+    fn divergence_class(&self, decision_reason: &DecisionReason) -> PolicyDivergenceClass {
+        match decision_reason {
+            DecisionReason::NoAllowedCandidates => PolicyDivergenceClass::DecisionBudgetExceeded,
+            DecisionReason::FallbackTelemetryUnavailable => PolicyDivergenceClass::ObservabilityGap,
+            _ => PolicyDivergenceClass::None,
+        }
+    }
+
+    #[must_use]
+    fn kill_switch_state(&self, decision_reason: &DecisionReason) -> PolicyKillSwitchState {
+        match self.divergence_class(decision_reason) {
+            PolicyDivergenceClass::None => PolicyKillSwitchState::Disarmed,
+            PolicyDivergenceClass::ObservabilityGap
+            | PolicyDivergenceClass::DecisionBudgetExceeded
+            | PolicyDivergenceClass::FallbackContractBreach
+            | PolicyDivergenceClass::PolicyVersionMismatch
+            | PolicyDivergenceClass::ProvenanceMismatch
+            | PolicyDivergenceClass::StaleSnapshotSchema => PolicyKillSwitchState::Armed,
+        }
+    }
+
+    #[must_use]
+    fn fallback_active(&self, decision_reason: &DecisionReason) -> bool {
+        matches!(
+            decision_reason,
+            DecisionReason::NoAllowedCandidates
+                | DecisionReason::FallbackAutoTuneOff
+                | DecisionReason::FallbackTelemetryUnavailable
+        )
+    }
+
+    #[must_use]
+    fn activation_regime_id(signals: PolicySignals) -> String {
+        format!("regime-{}", signals.regime_id)
+    }
+
+    #[must_use]
+    fn candidate_action_label(knob: PolicyKnob, candidate: &CandidateAction) -> String {
+        format!(
+            "{}={} ({})",
+            knob.as_str(),
+            candidate.value,
+            candidate.description
+        )
+    }
+
+    #[must_use]
+    fn chosen_expected_loss(
+        chosen_candidate_id: Option<u64>,
+        expected_losses: &BTreeMap<u64, f64>,
+    ) -> Option<f64> {
+        chosen_candidate_id.and_then(|candidate_id| expected_losses.get(&candidate_id).copied())
+    }
+
+    #[must_use]
+    fn counterexample_bundle_path(
+        decision_id: u64,
+        divergence_class: PolicyDivergenceClass,
+    ) -> Option<String> {
+        if divergence_class == PolicyDivergenceClass::None {
+            None
+        } else {
+            Some(format!(
+                "counterexamples/policy_controller/decision_{decision_id}.json"
+            ))
+        }
+    }
+
+    #[must_use]
+    fn first_failure_diagnostics(
+        decision_reason: &DecisionReason,
+        activation_regime_id: &str,
+    ) -> Option<String> {
+        match decision_reason {
+            DecisionReason::FallbackAutoTuneOff => Some(
+                "policy controller is running in fallback-only mode because auto_tune is disabled"
+                    .to_owned(),
+            ),
+            DecisionReason::FallbackTelemetryUnavailable => Some(format!(
+                "policy telemetry unavailable for {activation_regime_id}; conservative baseline stayed authoritative"
+            )),
+            DecisionReason::NoAllowedCandidates => Some(format!(
+                "all candidate actions were blocked for {activation_regime_id}; conservative baseline stayed authoritative"
+            )),
+            _ => None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_runtime_snapshot(
+        &self,
+        decision_id: u64,
+        knob: PolicyKnob,
+        chosen_setting: usize,
+        chosen_candidate_id: Option<u64>,
+        decision_reason: &DecisionReason,
+        signals: PolicySignals,
+        auto_tune_enabled: bool,
+        telemetry_available: bool,
+        allowed: &[CandidateAction],
+        expected_losses: &BTreeMap<u64, f64>,
+    ) -> PolicyRuntimeSnapshot {
+        let activation_regime_id = Self::activation_regime_id(signals);
+        let divergence_class = self.divergence_class(decision_reason);
+        let counterexample_bundle = Self::counterexample_bundle_path(decision_id, divergence_class);
+        let first_failure_diagnostics =
+            Self::first_failure_diagnostics(decision_reason, &activation_regime_id);
+        let expected_loss = Self::chosen_expected_loss(chosen_candidate_id, expected_losses);
+        let counterfactual_action = match decision_reason {
+            DecisionReason::HysteresisSuppressed => allowed
+                .first()
+                .map(|candidate| Self::candidate_action_label(knob, candidate)),
+            _ => allowed
+                .get(1)
+                .map(|candidate| Self::candidate_action_label(knob, candidate)),
+        };
+        let regret_delta = match (expected_loss, allowed.first()) {
+            (Some(loss), Some(best))
+                if chosen_candidate_id.is_some_and(|candidate_id| candidate_id != best.id) =>
+            {
+                Some(loss - best.expected_loss)
+            }
+            _ => None,
+        };
+        let last_action = match decision_reason {
+            DecisionReason::Applied(_) => format!("apply:{}={chosen_setting}", knob.as_str()),
+            _ => format!("hold:{}={chosen_setting}", knob.as_str()),
+        };
+        let decision_count = u64::try_from(self.ledger.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+
+        PolicyRuntimeSnapshot {
+            schema_version: POLICY_RUNTIME_SNAPSHOT_SCHEMA_V1.to_owned(),
+            trace_id: format!("policy-controller:{}:{decision_id}", knob.as_str()),
+            scenario_id: format!("{}:{activation_regime_id}", knob.as_str()),
+            policy_id: self.policy_contract.policy_id.clone(),
+            controller_family: self.policy_contract.controller_family.clone(),
+            policy_version: self.policy_contract.policy_version.clone(),
+            rollout_stage: if self.fallback_active(decision_reason) {
+                PolicyRolloutStage::FallbackOnly
+            } else {
+                self.policy_contract.rollout_stage
+            },
+            control_mode: self.control_mode(auto_tune_enabled, telemetry_available),
+            activation_regime_id,
+            activation_state: self.activation_state(auto_tune_enabled, telemetry_available),
+            budget_id: self.policy_contract.budget_id.clone(),
+            slo_id: self.policy_contract.slo_id.clone(),
+            shadow_mode: PolicyShadowMode::Off,
+            shadow_sample_rate: self.policy_contract.shadow_sample_rate.clone(),
+            kill_switch_state: self.kill_switch_state(decision_reason),
+            fallback_active: self.fallback_active(decision_reason),
+            divergence_class,
+            decision_count,
+            last_action,
+            expected_loss,
+            counterfactual_action,
+            regret_delta,
+            evidence_root: self.policy_contract.evidence_root.clone(),
+            comparator_lineage: self.policy_contract.comparator_lineage.clone(),
+            counterexample_bundle,
+            first_failure_diagnostics,
+            safety_certificate_id: self.policy_contract.safety_certificate_id.clone(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_decision(
+        &mut self,
+        decision_id: u64,
+        knob: PolicyKnob,
+        prior_setting: usize,
+        chosen_candidate_id: Option<u64>,
+        chosen_setting: usize,
+        candidates: Vec<CandidateEvaluation>,
+        expected_losses: BTreeMap<u64, f64>,
+        mut top_evidence: Vec<String>,
+        signals: PolicySignals,
+        decision_reason: DecisionReason,
+        auto_tune_enabled: bool,
+        telemetry_available: bool,
+        allowed: &[CandidateAction],
+    ) -> PolicyDecisionOutcome {
+        top_evidence.push(format!("decision_reason={}", decision_reason.as_str()));
+        top_evidence.sort();
+        let runtime_snapshot = self.build_runtime_snapshot(
+            decision_id,
+            knob,
+            chosen_setting,
+            chosen_candidate_id,
+            &decision_reason,
+            signals,
+            auto_tune_enabled,
+            telemetry_available,
+            allowed,
+            &expected_losses,
+        );
+        let entry = PolicyEvidenceEntry {
+            decision_id,
+            knob,
+            prior_setting,
+            chosen_candidate_id,
+            chosen_setting,
+            candidates,
+            expected_losses,
+            top_evidence,
+            regime_id: signals.regime_id,
+            artifact_contract: self.policy_contract.clone(),
+            runtime_snapshot,
+        };
+        self.ledger.record(entry);
+
+        PolicyDecisionOutcome {
+            knob,
+            prior_setting,
+            applied_setting: chosen_setting,
+            changed: chosen_setting != prior_setting,
+            reason: decision_reason,
+        }
+    }
+
     /// Evaluate a knob update with expected-loss minimization and guardrails.
     pub fn evaluate_knob(
         &mut self,
@@ -702,23 +1166,40 @@ impl PolicyController {
         telemetry_available: bool,
         tick: u64,
     ) -> PolicyDecisionOutcome {
+        let decision_id = self.next_policy_decision_id();
         if !self.config.auto_tune {
-            return PolicyDecisionOutcome {
+            return self.record_decision(
+                decision_id,
                 knob,
                 prior_setting,
-                applied_setting: prior_setting,
-                changed: false,
-                reason: DecisionReason::FallbackAutoTuneOff,
-            };
+                None,
+                prior_setting,
+                Vec::new(),
+                BTreeMap::new(),
+                vec!["auto_tune_disabled".to_owned()],
+                signals,
+                DecisionReason::FallbackAutoTuneOff,
+                false,
+                telemetry_available,
+                &[],
+            );
         }
         if !telemetry_available {
-            return PolicyDecisionOutcome {
+            return self.record_decision(
+                decision_id,
                 knob,
                 prior_setting,
-                applied_setting: prior_setting,
-                changed: false,
-                reason: DecisionReason::FallbackTelemetryUnavailable,
-            };
+                None,
+                prior_setting,
+                Vec::new(),
+                BTreeMap::new(),
+                vec!["telemetry_unavailable".to_owned()],
+                signals,
+                DecisionReason::FallbackTelemetryUnavailable,
+                true,
+                false,
+                &[],
+            );
         }
 
         let hard_cap = self.config.hard_cap_for_knob(knob);
@@ -787,27 +1268,23 @@ impl PolicyController {
             self.set_knob_value(knob, chosen_setting);
         }
 
-        let entry = PolicyEvidenceEntry {
-            decision_id: self.next_decision_id,
+        let outcome = self.record_decision(
+            decision_id,
             knob,
             prior_setting,
             chosen_candidate_id,
             chosen_setting,
-            candidates: evals,
+            evals,
             expected_losses,
             top_evidence,
-            regime_id: signals.regime_id,
-        };
-        self.next_decision_id = self.next_decision_id.saturating_add(1);
-        self.ledger.record(entry);
-
-        PolicyDecisionOutcome {
-            knob,
-            prior_setting,
-            applied_setting: chosen_setting,
-            changed,
-            reason: decision_reason,
-        }
+            signals,
+            decision_reason,
+            true,
+            true,
+            &allowed,
+        );
+        debug_assert_eq!(outcome.changed, changed);
+        outcome
     }
 }
 
@@ -821,6 +1298,43 @@ mod tests {
             CandidateAction::new(2, 6, 9.0, "reduce"),
             CandidateAction::new(3, 14, 11.0, "increase"),
         ]
+    }
+
+    fn sample_policy_artifact_contract() -> PolicyArtifactContract {
+        PolicyArtifactContract::default()
+    }
+
+    fn sample_runtime_snapshot(decision_id: u64) -> PolicyRuntimeSnapshot {
+        PolicyRuntimeSnapshot {
+            schema_version: POLICY_RUNTIME_SNAPSHOT_SCHEMA_V1.to_owned(),
+            trace_id: format!("policy-controller:bg_cpu_max:{decision_id}"),
+            scenario_id: "bg_cpu_max:regime-0".to_owned(),
+            policy_id: POLICY_CONTROLLER_ID.to_owned(),
+            controller_family: POLICY_CONTROLLER_FAMILY.to_owned(),
+            policy_version: POLICY_CONTROLLER_VERSION.to_owned(),
+            rollout_stage: PolicyRolloutStage::Default,
+            control_mode: PolicyControlMode::ExpectedLossGuardedArgmin,
+            activation_regime_id: "regime-0".to_owned(),
+            activation_state: PolicyActivationState::RegimeGatedDefault,
+            budget_id: POLICY_CONTROLLER_BUDGET_ID.to_owned(),
+            slo_id: POLICY_CONTROLLER_SLO_ID.to_owned(),
+            shadow_mode: PolicyShadowMode::Off,
+            shadow_sample_rate: "0%".to_owned(),
+            kill_switch_state: PolicyKillSwitchState::Disarmed,
+            fallback_active: false,
+            divergence_class: PolicyDivergenceClass::None,
+            decision_count: decision_id,
+            last_action: "apply:bg_cpu_max=3".to_owned(),
+            expected_loss: Some(0.5),
+            counterfactual_action: None,
+            regret_delta: None,
+            evidence_root: POLICY_CONTROLLER_EVIDENCE_ROOT.to_owned(),
+            comparator_lineage:
+                "oracle=conservative_baseline candidate=expected_loss_guarded_argmin".to_owned(),
+            counterexample_bundle: None,
+            first_failure_diagnostics: None,
+            safety_certificate_id: None,
+        }
     }
 
     #[test]
@@ -1076,6 +1590,8 @@ mod tests {
             expected_losses: BTreeMap::new(),
             top_evidence: Vec::new(),
             regime_id: 0,
+            artifact_contract: sample_policy_artifact_contract(),
+            runtime_snapshot: sample_runtime_snapshot(1),
         };
         let second = PolicyEvidenceEntry {
             decision_id: 2,
@@ -1087,6 +1603,8 @@ mod tests {
             expected_losses: BTreeMap::new(),
             top_evidence: Vec::new(),
             regime_id: 0,
+            artifact_contract: sample_policy_artifact_contract(),
+            runtime_snapshot: sample_runtime_snapshot(2),
         };
         ledger.record(first);
         ledger.record(second);
@@ -1096,6 +1614,135 @@ mod tests {
             .map(|entry| entry.decision_id)
             .collect::<Vec<_>>();
         assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_runtime_snapshot_records_negative_path_observability_gap() {
+        let config = AutoTunePragmaConfig::default();
+        let mut controller = PolicyController::new(config, 32, 2, 32);
+        let baseline = controller.effective_limits();
+        let out = controller.evaluate_knob(
+            PolicyKnob::BgCpuMax,
+            baseline.bg_cpu_max,
+            &[CandidateAction::new(
+                1,
+                baseline.bg_cpu_max + 1,
+                0.0,
+                "ignored_without_telemetry",
+            )],
+            PolicySignals {
+                symbol_loss_rejects_h0: false,
+                bocpd_regime_shift: false,
+                regime_id: 9,
+            },
+            false,
+            10,
+        );
+        assert_eq!(out.reason, DecisionReason::FallbackTelemetryUnavailable);
+        let entry = controller
+            .ledger()
+            .latest()
+            .expect("telemetry fallback must record a decision");
+        assert_eq!(
+            entry.runtime_snapshot.activation_state,
+            PolicyActivationState::ShadowOnly
+        );
+        assert_eq!(
+            entry.runtime_snapshot.kill_switch_state,
+            PolicyKillSwitchState::Armed
+        );
+        assert_eq!(
+            entry.runtime_snapshot.divergence_class,
+            PolicyDivergenceClass::ObservabilityGap
+        );
+        assert!(entry.runtime_snapshot.fallback_active);
+        assert!(entry.runtime_snapshot.counterexample_bundle.is_some());
+    }
+
+    #[test]
+    fn test_runtime_snapshot_serializes_contract_fields() {
+        let mut controller = PolicyController::new(AutoTunePragmaConfig::default(), 16, 2, 32);
+        let _ = controller.evaluate_knob(
+            PolicyKnob::BgCpuMax,
+            2,
+            &[CandidateAction::new(11, 3, 0.5, "increase")],
+            PolicySignals {
+                symbol_loss_rejects_h0: false,
+                bocpd_regime_shift: true,
+                regime_id: 77,
+            },
+            true,
+            10,
+        );
+        let entry = controller
+            .ledger()
+            .latest()
+            .expect("ledger entry must exist");
+        let snapshot_json =
+            serde_json::to_value(&entry.runtime_snapshot).expect("runtime snapshot must serialize");
+        let artifact_json = serde_json::to_value(&entry.artifact_contract)
+            .expect("artifact contract must serialize");
+
+        for field in [
+            "schema_version",
+            "trace_id",
+            "scenario_id",
+            "policy_id",
+            "controller_family",
+            "policy_version",
+            "rollout_stage",
+            "control_mode",
+            "activation_regime_id",
+            "activation_state",
+            "budget_id",
+            "slo_id",
+            "shadow_mode",
+            "shadow_sample_rate",
+            "kill_switch_state",
+            "fallback_active",
+            "divergence_class",
+            "decision_count",
+            "last_action",
+            "expected_loss",
+            "counterfactual_action",
+            "regret_delta",
+            "evidence_root",
+            "comparator_lineage",
+            "counterexample_bundle",
+            "first_failure_diagnostics",
+        ] {
+            assert!(
+                snapshot_json.get(field).is_some(),
+                "runtime snapshot missing {field}"
+            );
+        }
+
+        for field in [
+            "schema_version",
+            "policy_id",
+            "controller_family",
+            "policy_version",
+            "rollout_stage",
+            "control_mode",
+            "budget_id",
+            "slo_id",
+            "budget_value",
+            "on_exhaustion_behavior",
+            "conservative_baseline_id",
+            "fallback_policy",
+            "shadow_contract_ref",
+            "comparator_lineage",
+            "shadow_sample_rate",
+            "controller_calibration",
+            "evidence_root",
+            "provenance_root",
+            "artifact_graph_id",
+        ] {
+            assert!(
+                artifact_json.get(field).is_some(),
+                "artifact contract missing {field}"
+            );
+        }
     }
 
     #[test]

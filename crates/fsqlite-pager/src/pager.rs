@@ -3844,7 +3844,17 @@ where
                             (consolidator.epoch(), promoted)
                         };
 
-                        queue.publish_completed_epoch(completed_epoch);
+                        // H11 fault hook: suppress condvar notification.
+                        // Waiters must recover via timed wait.
+                        #[cfg(any(test, feature = "fault-injection"))]
+                        let skip_publish =
+                            crate::fault_hooks::maybe_inject_drop_condvar_notify(completed_epoch);
+                        #[cfg(not(any(test, feature = "fault-injection")))]
+                        let skip_publish = false;
+
+                        if !skip_publish {
+                            queue.publish_completed_epoch(completed_epoch);
+                        }
 
                         if has_promoted {
                             record_initial_metrics = false;
@@ -4560,6 +4570,15 @@ where
                 retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
             let _ = inner.db_file.unlock(cx, preserve_level);
             drop(inner);
+
+            // H4 fault hook: crash during Phase C, after commit_seq update
+            // but before snapshot publish. WAL frames are durable, commit_seq
+            // incremented in-memory, but snapshot plane not yet updated.
+            #[cfg(any(test, feature = "fault-injection"))]
+            crate::fault_hooks::maybe_inject_during_phase_c(
+                publish_update.visible_commit_seq.get(),
+                publish_update.db_size,
+            )?;
 
             let t_phase_c1_done = Instant::now();
 

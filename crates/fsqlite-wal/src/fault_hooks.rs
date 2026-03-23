@@ -51,6 +51,7 @@ struct WalFaultHookState {
     after_append: Option<FaultHookArm>,
     sync_failure: Option<FaultHookArm>,
     append_busy: Option<CountdownFaultArm>,
+    crash_header_truncate: Option<FaultHookArm>,
     records: Vec<FaultInjectionRecord>,
 }
 
@@ -179,6 +180,40 @@ fn record_trigger(
         "fault hook fired"
     );
     state.records.push(record);
+}
+
+/// Arm the crash-between-header-and-truncate hook (F9 / H9).
+///
+/// When armed, `maybe_inject_crash_header_truncate()` fires once after
+/// the new WAL header is written but before the file is truncated.
+/// This simulates a crash that leaves new-generation salts in the header
+/// but old-generation frames still on disk.
+pub fn arm_crash_header_truncate(arm: FaultHookArm) {
+    let mut state = WAL_FAULT_HOOK_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.crash_header_truncate = Some(arm);
+}
+
+/// Check and fire the crash-between-header-and-truncate hook.
+///
+/// Called inside `WalFile::reset()` after the new header is written
+/// and synced but before the file is truncated.
+pub(crate) fn maybe_inject_crash_header_truncate(
+    old_frame_count: usize,
+    new_checkpoint_seq: u32,
+) -> Result<()> {
+    let mut state = WAL_FAULT_HOOK_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(arm) = state.crash_header_truncate.take() else {
+        return Ok(());
+    };
+
+    let detail =
+        format!("old_frame_count={old_frame_count} new_checkpoint_seq={new_checkpoint_seq}");
+    record_trigger(&mut state, &arm, "wal_crash_header_truncate", detail);
+    Err(fault_error("wal_crash_header_truncate", &arm))
 }
 
 fn fault_error(point: &str, arm: &FaultHookArm) -> FrankenError {

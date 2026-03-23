@@ -1,0 +1,258 @@
+# DB300 Policy Snapshot / Controller Artifact Contract v1.0.0
+#
+# Bead: bd-db300.7.6.4
+# Purpose: define the shared policy-as-data controller artifact and runtime
+# snapshot contract so controller-bearing levers emit auditable, replayable,
+# fail-closed decision records instead of ad hoc logs.
+
+[meta]
+schema_version = "1.0.0"
+bead_id = "bd-db300.7.6.4"
+track_id = "bd-db300.7.6"
+generated_at = "2026-03-23"
+contract_owner = "db300-track-g-policy-snapshot"
+shadow_oracle_contract_ref = "db300_shadow_oracle_contract.toml"
+regime_atlas_contract_ref = "db300_regime_atlas_contract.toml"
+
+[global_defaults]
+default_rollout_stage = "default"
+default_activation_state = "regime_gated_default"
+default_control_mode = "expected_loss_guarded_argmin"
+concurrent_writer_requirement = "Concurrent-writer mode stays ON by default; no controller artifact, shadow mode, or kill switch may serialize writers or flip MVCC defaults."
+fallback_policy = "Any exhausted budget, observability gap, policy-version mismatch, provenance mismatch, or stale snapshot schema keeps the conservative baseline authoritative and records fallback_active=true."
+negative_path_policy = "policy_version_mismatch, provenance_mismatch, stale_snapshot_schema, and fallback_only operation must surface explicit divergence_class, kill_switch_state, and first_failure_diagnostics fields."
+counterexample_policy = "Any divergence_class other than none requires a replayable counterexample bundle reference and kill-switch state in the runtime snapshot or operator package."
+promotion_rule = "Progressive rollout may only move shadow -> canary -> ramp -> default when the regime atlas and shadow-oracle gates stay green for the claimed surface."
+
+[logging]
+required_fields = [
+  "trace_id",
+  "scenario_id",
+  "policy_id",
+  "decision_id",
+  "rollout_stage",
+  "activation_regime_id",
+  "activation_state",
+  "control_mode",
+  "budget_id",
+  "controller_family",
+  "controller_calibration",
+  "shadow_mode",
+  "shadow_sample_rate",
+  "kill_switch_state",
+  "fallback_active",
+  "divergence_class",
+  "counterexample_bundle",
+  "last_action",
+  "expected_loss",
+  "counterfactual_action",
+  "regret_delta",
+  "evidence_root",
+  "first_failure_diagnostics",
+]
+
+[artifact_contract]
+schema_id = "fsqlite.policy_artifact_contract.v1"
+required_fields = [
+  "schema_version",
+  "policy_id",
+  "controller_family",
+  "policy_version",
+  "rollout_stage",
+  "control_mode",
+  "budget_id",
+  "slo_id",
+  "budget_value",
+  "on_exhaustion_behavior",
+  "conservative_baseline_id",
+  "fallback_policy",
+  "shadow_contract_ref",
+  "comparator_lineage",
+  "shadow_sample_rate",
+  "controller_calibration",
+  "evidence_root",
+  "provenance_root",
+  "artifact_graph_id",
+]
+optional_fields = ["safety_certificate_id"]
+
+[runtime_snapshot]
+schema_id = "fsqlite.policy_runtime_snapshot.v1"
+required_fields = [
+  "schema_version",
+  "trace_id",
+  "scenario_id",
+  "policy_id",
+  "controller_family",
+  "policy_version",
+  "rollout_stage",
+  "control_mode",
+  "activation_regime_id",
+  "activation_state",
+  "budget_id",
+  "slo_id",
+  "shadow_mode",
+  "shadow_sample_rate",
+  "kill_switch_state",
+  "fallback_active",
+  "divergence_class",
+  "decision_count",
+  "last_action",
+  "expected_loss",
+  "counterfactual_action",
+  "regret_delta",
+  "evidence_root",
+  "comparator_lineage",
+  "counterexample_bundle",
+  "first_failure_diagnostics",
+]
+optional_fields = ["safety_certificate_id"]
+
+[counterexample_bundle]
+bundle_schema = "fsqlite.policy_controller.counterexample.v1"
+required_fields = [
+  "decision_id",
+  "policy_id",
+  "divergence_class",
+  "kill_switch_state",
+  "counterexample_bundle",
+  "first_failure_diagnostics",
+  "evidence_root",
+]
+
+[[rollout_stage]]
+stage_id = "shadow"
+description = "The conservative baseline remains authoritative while the candidate controller is evaluated out of band."
+
+[[rollout_stage]]
+stage_id = "canary"
+description = "The candidate controller is exposed only to a narrow slice after shadow gates stay green."
+
+[[rollout_stage]]
+stage_id = "ramp"
+description = "The candidate controller is being widened deliberately with rollback-safe monitoring."
+
+[[rollout_stage]]
+stage_id = "default"
+description = "The candidate controller is the ordinary active default for the claimed regime slice."
+
+[[rollout_stage]]
+stage_id = "fallback_only"
+description = "The conservative baseline is forced because a gate or precondition failed."
+
+[[activation_state]]
+state_id = "universal_default"
+description = "The controller is enabled as the ordinary default across the full measured frontier."
+
+[[activation_state]]
+state_id = "regime_gated_default"
+description = "The controller is default only for the measured regime slice; other cells fall back conservatively."
+
+[[activation_state]]
+state_id = "shadow_only"
+description = "The controller remains non-authoritative because evidence is incomplete or degraded."
+
+[[activation_state]]
+state_id = "operator_opt_in"
+description = "The controller requires explicit opt-in because the evidence surface is not strong enough for automatic enablement."
+
+[[activation_state]]
+state_id = "rejected"
+description = "The controller is unsafe or dominated for the named regime."
+
+[[control_mode]]
+mode_id = "conservative_baseline"
+description = "Hold the prior or baseline setting and emit a fail-closed decision record."
+
+[[control_mode]]
+mode_id = "expected_loss_guarded_argmin"
+description = "Pick the lowest expected-loss candidate inside the bounded safe envelope."
+
+[[control_mode]]
+mode_id = "shadow_compare"
+description = "Execute the candidate beside the oracle path while the conservative baseline stays authoritative."
+
+[[kill_switch_state]]
+state_id = "disarmed"
+description = "No active divergence or gate failure is present."
+
+[[kill_switch_state]]
+state_id = "armed"
+description = "A non-authoritative failure or degraded mode is active and blocks promotion."
+
+[[kill_switch_state]]
+state_id = "tripped"
+description = "A blocker divergence has fired and the candidate path must not become authoritative."
+
+[[divergence_class]]
+divergence_class_id = "decision_budget_exceeded"
+description = "All candidate actions were blocked by budget or guardrail constraints."
+
+[[divergence_class]]
+divergence_class_id = "fallback_contract_breach"
+description = "The runtime entered a fallback mode inconsistent with the declared artifact contract."
+
+[[divergence_class]]
+divergence_class_id = "observability_gap"
+description = "Required telemetry or comparator inputs were absent, so the controller failed closed."
+
+[[divergence_class]]
+divergence_class_id = "policy_version_mismatch"
+description = "The runtime snapshot or decision record was produced by a different policy version than the declared artifact."
+
+[[divergence_class]]
+divergence_class_id = "provenance_mismatch"
+description = "The snapshot could not be tied to the expected artifact graph, evidence root, or lineage."
+
+[[divergence_class]]
+divergence_class_id = "stale_snapshot_schema"
+description = "The runtime snapshot schema does not satisfy the current contract."
+
+[[named_script]]
+script_id = "g6_4_policy_snapshot_contract"
+path = "scripts/verify_bd_db300_7_6_4_policy_snapshot_contract.sh"
+surfaces = ["e4_controller_decisions", "g7_verify_suite_package", "g4_final_decision_record"]
+artifact_outputs = [
+  "policy_runtime_snapshot.json",
+  "policy_artifact_contract.json",
+  "verify_suite/suite_package.json",
+  "verify_suite/counterexamples/shadow_counterexample_bundle.json",
+]
+
+[[consumer_surface]]
+surface_id = "e4_controller_decisions"
+required_fields = [
+  "policy_id",
+  "rollout_stage",
+  "activation_regime_id",
+  "activation_state",
+  "control_mode",
+  "shadow_mode",
+  "kill_switch_state",
+  "divergence_class",
+  "counterexample_bundle",
+]
+
+[[consumer_surface]]
+surface_id = "g7_verify_suite_package"
+required_fields = [
+  "shadow_mode",
+  "shadow_verdict",
+  "kill_switch_state",
+  "divergence_class",
+  "counterexample_bundle",
+]
+
+[[consumer_surface]]
+surface_id = "g4_final_decision_record"
+required_fields = [
+  "policy_id",
+  "decision_id",
+  "rollout_stage",
+  "activation_regime_id",
+  "control_mode",
+  "fallback_active",
+  "divergence_class",
+  "counterexample_bundle",
+  "first_failure_diagnostics",
+]

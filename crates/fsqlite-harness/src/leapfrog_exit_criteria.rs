@@ -37,11 +37,12 @@ const REQUIRED_LOG_FIELDS: [&str; 9] = [
     "responsiveness_regression_ratio_vs_sqlite",
     "topology_reassignments",
 ];
-const REQUIRED_UNIT_TESTS: [&str; 6] = [
+const REQUIRED_UNIT_TESTS: [&str; 7] = [
     "test_bd_db300_7_3_contract_schema_and_links",
     "test_bd_db300_7_3_required_campaign_surface_exists",
     "test_bd_db300_7_3_cell_targets_are_monotone",
     "test_bd_db300_7_3_verification_plan_is_actionable",
+    "test_bd_db300_7_3_operator_report_contract_is_actionable",
     "test_bd_db300_7_3_transferability_rubric_is_actionable",
     "test_bd_db300_7_3_workload_family_thresholds_are_actionable",
 ];
@@ -101,6 +102,31 @@ const REQUIRED_WORKLOADS: [&str; 3] = [
     "hot_page_contention",
     "mixed_read_write",
 ];
+const REQUIRED_OPERATOR_REPORT_CONSUMER_BEAD: &str = "bd-db300.7.4";
+const REQUIRED_OPERATOR_REPORT_SOURCE_BEADS: [&str; 3] =
+    ["bd-db300.7.5.5", "bd-db300.7.5.6", "bd-db300.7.6.4"];
+const REQUIRED_OPERATOR_REPORT_UPSTREAM_CONTRACT_PATHS: [&str; 3] = [
+    "db300_regime_atlas_contract.toml",
+    "db300_shadow_oracle_contract.toml",
+    "db300_policy_snapshot_contract.toml",
+];
+const REQUIRED_OPERATOR_REPORT_FIELDS: [&str; 10] = [
+    "activation_regime_id",
+    "activation_state",
+    "rollout_stage",
+    "safe_by_default_boundary",
+    "shadow_sample_rate",
+    "kill_switch_state",
+    "fallback_state",
+    "rollout_annotation",
+    "fallback_annotation",
+    "user_visibility",
+];
+const REQUIRED_OPERATOR_REPORT_BUNDLE_ARTIFACTS: [&str; 3] = [
+    "artifacts/{bead_id}/{run_id}/manifest.json",
+    "artifacts/{bead_id}/{run_id}/summary.md",
+    "artifacts/{bead_id}/{run_id}/scorecard_thresholds.json",
+];
 
 /// Typed decision record for Track G3 leapfrog claims.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +138,7 @@ pub struct LeapfrogExitCriteria {
     pub transferability_rubric: TransferabilityRubric,
     pub cell_gates: Vec<CellGate>,
     pub workload_families: Vec<WorkloadFamilyThresholdProfile>,
+    pub operator_report_contract: OperatorReportContract,
     pub verification_plan: VerificationPlan,
     pub references: ExitCriteriaReferences,
 }
@@ -243,6 +270,29 @@ pub struct WorkloadFamilyThresholdProfile {
     pub c1_target_direction: String,
     pub c4_target_direction: String,
     pub c8_target_direction: String,
+}
+
+/// Consumer-facing report contract that keeps activation and rollout posture
+/// explicit on final scorecard artifacts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorReportContract {
+    pub consumer_bead_id: String,
+    pub source_contract_beads: Vec<String>,
+    pub upstream_contract_paths: Vec<String>,
+    pub required_bundle_artifacts: Vec<String>,
+    pub required_manifest_fields: Vec<String>,
+    pub required_summary_fields: Vec<String>,
+    pub required_threshold_fields: Vec<String>,
+    pub default_activation_regime_id: String,
+    pub default_activation_state: String,
+    pub default_rollout_stage: String,
+    pub default_shadow_sample_rate: String,
+    pub default_kill_switch_state: String,
+    pub default_fallback_state: String,
+    pub safe_by_default_boundary: String,
+    pub rollout_annotation: String,
+    pub fallback_annotation: String,
+    pub user_visibility: String,
 }
 
 /// Follow-on verification obligations that must remain attached to the gate.
@@ -704,6 +754,104 @@ impl LeapfrogExitCriteria {
                 "workload family coverage mismatch actual={seen_workloads:?} expected={required_workloads:?}"
             ));
         }
+
+        require_eq(
+            "operator_report_contract.consumer_bead_id",
+            &self.operator_report_contract.consumer_bead_id,
+            REQUIRED_OPERATOR_REPORT_CONSUMER_BEAD,
+        )?;
+        validate_exact_string_list(
+            "operator_report_contract.source_contract_beads",
+            &self.operator_report_contract.source_contract_beads,
+            &REQUIRED_OPERATOR_REPORT_SOURCE_BEADS,
+        )?;
+        validate_exact_string_list(
+            "operator_report_contract.upstream_contract_paths",
+            &self.operator_report_contract.upstream_contract_paths,
+            &REQUIRED_OPERATOR_REPORT_UPSTREAM_CONTRACT_PATHS,
+        )?;
+        for path in &self.operator_report_contract.upstream_contract_paths {
+            let candidate = workspace_root.join(path);
+            if !candidate.exists() {
+                return Err(format!(
+                    "operator_report_contract references missing upstream contract path={}",
+                    candidate.display()
+                ));
+            }
+        }
+        validate_exact_string_list(
+            "operator_report_contract.required_bundle_artifacts",
+            &self.operator_report_contract.required_bundle_artifacts,
+            &REQUIRED_OPERATOR_REPORT_BUNDLE_ARTIFACTS,
+        )?;
+        validate_exact_string_list(
+            "operator_report_contract.required_manifest_fields",
+            &self.operator_report_contract.required_manifest_fields,
+            &REQUIRED_OPERATOR_REPORT_FIELDS,
+        )?;
+        validate_exact_string_list(
+            "operator_report_contract.required_summary_fields",
+            &self.operator_report_contract.required_summary_fields,
+            &REQUIRED_OPERATOR_REPORT_FIELDS,
+        )?;
+        validate_exact_string_list(
+            "operator_report_contract.required_threshold_fields",
+            &self.operator_report_contract.required_threshold_fields,
+            &REQUIRED_OPERATOR_REPORT_FIELDS,
+        )?;
+        require_non_empty(
+            "operator_report_contract.default_activation_regime_id",
+            &self.operator_report_contract.default_activation_regime_id,
+        )?;
+        require_eq(
+            "operator_report_contract.default_activation_state",
+            &self.operator_report_contract.default_activation_state,
+            "regime_gated_default",
+        )?;
+        require_eq(
+            "operator_report_contract.default_rollout_stage",
+            &self.operator_report_contract.default_rollout_stage,
+            "default",
+        )?;
+        require_eq(
+            "operator_report_contract.default_shadow_sample_rate",
+            &self.operator_report_contract.default_shadow_sample_rate,
+            "0%",
+        )?;
+        require_eq(
+            "operator_report_contract.default_kill_switch_state",
+            &self.operator_report_contract.default_kill_switch_state,
+            "disarmed",
+        )?;
+        require_eq(
+            "operator_report_contract.default_fallback_state",
+            &self.operator_report_contract.default_fallback_state,
+            "inactive",
+        )?;
+        require_non_empty(
+            "operator_report_contract.safe_by_default_boundary",
+            &self.operator_report_contract.safe_by_default_boundary,
+        )?;
+        require_non_empty(
+            "operator_report_contract.rollout_annotation",
+            &self.operator_report_contract.rollout_annotation,
+        )?;
+        require_non_empty(
+            "operator_report_contract.fallback_annotation",
+            &self.operator_report_contract.fallback_annotation,
+        )?;
+        require_eq(
+            "operator_report_contract.user_visibility",
+            &self.operator_report_contract.user_visibility,
+            "operator_visible_regime_gated_default",
+        )?;
+        for artifact in &self.operator_report_contract.required_bundle_artifacts {
+            if !logging_artifacts.contains(artifact.as_str()) {
+                return Err(format!(
+                    "operator_report_contract.required_bundle_artifacts references non-emitted artifact `{artifact}`"
+                ));
+            }
+        }
         if unit_tests.is_empty() || e2e_scenarios.is_empty() || logging_artifacts.is_empty() {
             return Err(
                 "verification_plan must list unit tests, scenarios, and artifacts".to_owned(),
@@ -1129,6 +1277,20 @@ fn require_hardware_evidence(value: &str) -> Result<(), String> {
     }
 }
 
+fn validate_exact_string_list(
+    label: &str,
+    actual: &[String],
+    expected: &[&str],
+) -> Result<(), String> {
+    let actual_values = actual.iter().map(String::as_str).collect::<Vec<_>>();
+    if actual_values != expected {
+        return Err(format!(
+            "{label} mismatch actual={actual_values:?} expected={expected:?}"
+        ));
+    }
+    Ok(())
+}
+
 fn required_transferability_report_label(classification_id: &str) -> Option<&'static str> {
     match classification_id {
         "transferable" => Some("transferable win"),
@@ -1287,6 +1449,44 @@ mod tests {
                 c4_target_direction: "clear win".to_owned(),
                 c8_target_direction: "headline win".to_owned(),
             }],
+            operator_report_contract: OperatorReportContract {
+                consumer_bead_id: REQUIRED_OPERATOR_REPORT_CONSUMER_BEAD.to_owned(),
+                source_contract_beads: REQUIRED_OPERATOR_REPORT_SOURCE_BEADS
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect(),
+                upstream_contract_paths: REQUIRED_OPERATOR_REPORT_UPSTREAM_CONTRACT_PATHS
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect(),
+                required_bundle_artifacts: REQUIRED_OPERATOR_REPORT_BUNDLE_ARTIFACTS
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect(),
+                required_manifest_fields: REQUIRED_OPERATOR_REPORT_FIELDS
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect(),
+                required_summary_fields: REQUIRED_OPERATOR_REPORT_FIELDS
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect(),
+                required_threshold_fields: REQUIRED_OPERATOR_REPORT_FIELDS
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect(),
+                default_activation_regime_id:
+                    "db300.regime_gated_default.pending_surface_binding".to_owned(),
+                default_activation_state: "regime_gated_default".to_owned(),
+                default_rollout_stage: "default".to_owned(),
+                default_shadow_sample_rate: "0%".to_owned(),
+                default_kill_switch_state: "disarmed".to_owned(),
+                default_fallback_state: "inactive".to_owned(),
+                safe_by_default_boundary: "Only universal_default or regime_gated_default may auto-enable; cells outside the measured regime slice, any armed or tripped kill-switch state, or any blocker divergence must fall back conservatively.".to_owned(),
+                rollout_annotation: "Controller default authority applies only to the measured regime slice; promotion beyond that slice still depends on green regime-atlas and shadow-oracle evidence.".to_owned(),
+                fallback_annotation: "Any out-of-regime cell, divergence_class, provenance gap, or kill-switch escalation keeps the conservative baseline authoritative and operator-visible.".to_owned(),
+                user_visibility: "operator_visible_regime_gated_default".to_owned(),
+            },
             verification_plan: VerificationPlan {
                 unit_tests: vec!["test".to_owned()],
                 e2e_scenarios: vec!["scenario".to_owned()],

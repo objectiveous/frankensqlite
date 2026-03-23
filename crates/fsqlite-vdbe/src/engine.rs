@@ -6685,33 +6685,20 @@ impl VdbeEngine {
                                         cursor.cursor.next(&cursor.cx)?;
                                     }
                                     if !cursor.cursor.eof() {
-                                        cursor.target_vals_buf.clear();
-                                        fsqlite_types::record::parse_record_into(
+                                        decode_storage_cursor_target_index_record_strict(
+                                            cursor,
                                             key_bytes,
-                                            &mut cursor.target_vals_buf,
-                                        )
-                                        .ok_or_else(
-                                            || {
-                                                FrankenError::internal(
-                                                    "SeekGT: malformed seek key record",
-                                                )
-                                            },
+                                            "SeekGT: malformed seek key record",
                                         )?;
                                         loop {
                                             if cursor.cursor.eof() {
                                                 break;
                                             }
-                                            let payload = cursor.cursor.payload(&cursor.cx)?;
-                                            cursor.cur_vals_buf.clear();
-                                            fsqlite_types::record::parse_record_into(
-                                                &payload,
-                                                &mut cursor.cur_vals_buf,
-                                            )
-                                            .ok_or_else(|| {
-                                                FrankenError::internal(
-                                                    "SeekGT: malformed cursor record",
-                                                )
-                                            })?;
+                                            decode_storage_cursor_current_index_record_strict(
+                                                cursor_id,
+                                                cursor,
+                                                "SeekGT: malformed cursor record",
+                                            )?;
                                             let coll =
                                                 coll_arc.lock().unwrap_or_else(|e| e.into_inner());
                                             let cmp = compare_sorter_keys(
@@ -6733,33 +6720,20 @@ impl VdbeEngine {
                                 }
                                 Opcode::SeekLE => {
                                     if !cursor.cursor.eof() {
-                                        cursor.target_vals_buf.clear();
-                                        fsqlite_types::record::parse_record_into(
+                                        decode_storage_cursor_target_index_record_strict(
+                                            cursor,
                                             key_bytes,
-                                            &mut cursor.target_vals_buf,
-                                        )
-                                        .ok_or_else(
-                                            || {
-                                                FrankenError::internal(
-                                                    "SeekLE: malformed seek key record",
-                                                )
-                                            },
+                                            "SeekLE: malformed seek key record",
                                         )?;
                                         loop {
                                             if cursor.cursor.eof() {
                                                 break;
                                             }
-                                            let payload = cursor.cursor.payload(&cursor.cx)?;
-                                            cursor.cur_vals_buf.clear();
-                                            fsqlite_types::record::parse_record_into(
-                                                &payload,
-                                                &mut cursor.cur_vals_buf,
-                                            )
-                                            .ok_or_else(|| {
-                                                FrankenError::internal(
-                                                    "SeekLE: malformed cursor record",
-                                                )
-                                            })?;
+                                            decode_storage_cursor_current_index_record_strict(
+                                                cursor_id,
+                                                cursor,
+                                                "SeekLE: malformed cursor record",
+                                            )?;
                                             let coll =
                                                 coll_arc.lock().unwrap_or_else(|e| e.into_inner());
                                             let cmp = compare_sorter_keys(
@@ -6999,14 +6973,7 @@ impl VdbeEngine {
                     let key_val = self.get_reg(op.p3).clone();
 
                     // NULL short-circuit: NULL != NULL for UNIQUE purposes.
-                    if let SqliteValue::Blob(ref bytes) = key_val {
-                        if let Some(fields) = parse_record(bytes) {
-                            if fields.iter().any(SqliteValue::is_null) {
-                                pc = op.p2 as usize;
-                                continue;
-                            }
-                        }
-                    } else if key_val.is_null() {
+                    if key_val.is_null() {
                         pc = op.p2 as usize;
                         continue;
                     }
@@ -7017,23 +6984,14 @@ impl VdbeEngine {
                     // cursor position.  The index stores (columns, rowid)
                     // but the probe key has only (columns).
                     let conflict = if let SqliteValue::Blob(ref bytes) = key_val {
-                        let probe_fields = parse_record(bytes);
                         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                            cursor.cursor.index_move_to(&cursor.cx, bytes)?;
-                            // Read the entry at the current cursor position.
-                            if let Ok(entry_bytes) = cursor.cursor.payload(&cursor.cx) {
-                                if let (Some(probe), Some(entry)) =
-                                    (&probe_fields, parse_record(&entry_bytes))
-                                {
-                                    let n = probe.len();
-                                    entry.len() >= n && entry[..n] == probe[..]
-                                } else {
-                                    false
-                                }
-                            } else {
-                                // Cursor at EOF — no conflict.
-                                false
+                            if try_decode_storage_cursor_target_index_record(cursor, bytes)
+                                && cursor.target_vals_buf.iter().any(SqliteValue::is_null)
+                            {
+                                pc = op.p2 as usize;
+                                continue;
                             }
+                            storage_cursor_no_conflict_prefix_match(cursor_id, cursor, bytes)?
                         } else {
                             false
                         }
@@ -10435,6 +10393,80 @@ fn compare_collation_for_field(collations: Option<&[String]>, field_idx: usize) 
 /// conflicting entry (which has matching indexed columns but a different
 /// rowid), delete it from the index, and return its rowid so the caller
 /// can delete the old table row.
+fn try_decode_storage_cursor_target_index_record(
+    cursor: &mut StorageCursor,
+    key_bytes: &[u8],
+) -> bool {
+    cursor.target_vals_buf.clear();
+    fsqlite_types::record::parse_record_into(key_bytes, &mut cursor.target_vals_buf).is_some()
+}
+
+fn decode_storage_cursor_target_index_record_strict(
+    cursor: &mut StorageCursor,
+    key_bytes: &[u8],
+    malformed_detail: &'static str,
+) -> Result<()> {
+    try_decode_storage_cursor_target_index_record(cursor, key_bytes)
+        .then_some(())
+        .ok_or_else(|| FrankenError::internal(malformed_detail))
+}
+
+fn try_decode_storage_cursor_current_index_record(
+    cursor_id: i32,
+    cursor: &mut StorageCursor,
+) -> Result<bool> {
+    cursor.payload_buf.clear();
+    cursor
+        .cursor
+        .payload_into(&cursor.cx, &mut cursor.payload_buf)?;
+    cursor.cur_vals_buf.clear();
+    let decoded =
+        fsqlite_types::record::parse_record_into(&cursor.payload_buf, &mut cursor.cur_vals_buf)
+            .is_some();
+    tracing::trace!(
+        cursor_id,
+        decoded,
+        payload_len = cursor.payload_buf.len(),
+        decoded_value_count = cursor.cur_vals_buf.len(),
+        scratch_payload_capacity = cursor.payload_buf.capacity(),
+        scratch_value_capacity = cursor.cur_vals_buf.capacity(),
+        scratch_model = "per_cursor",
+        decode_path = "storage_cursor_index_probe",
+        "decoded storage cursor index probe into reusable scratch"
+    );
+    Ok(decoded)
+}
+
+fn decode_storage_cursor_current_index_record_strict(
+    cursor_id: i32,
+    cursor: &mut StorageCursor,
+    malformed_detail: &'static str,
+) -> Result<()> {
+    try_decode_storage_cursor_current_index_record(cursor_id, cursor)?
+        .then_some(())
+        .ok_or_else(|| FrankenError::internal(malformed_detail))
+}
+
+fn storage_cursor_no_conflict_prefix_match(
+    cursor_id: i32,
+    cursor: &mut StorageCursor,
+    key_bytes: &[u8],
+) -> Result<bool> {
+    if !try_decode_storage_cursor_target_index_record(cursor, key_bytes) {
+        return Ok(false);
+    }
+    cursor.cursor.index_move_to(&cursor.cx, key_bytes)?;
+    if cursor.cursor.eof() {
+        return Ok(false);
+    }
+    if !try_decode_storage_cursor_current_index_record(cursor_id, cursor)? {
+        return Ok(false);
+    }
+    let prefix_len = cursor.target_vals_buf.len();
+    Ok(cursor.cur_vals_buf.len() >= prefix_len
+        && cursor.cur_vals_buf[..prefix_len] == cursor.target_vals_buf[..])
+}
+
 fn find_conflicting_rowid_in_index(
     sc: &mut StorageCursor,
     key_bytes: &[u8],
@@ -10443,12 +10475,14 @@ fn find_conflicting_rowid_in_index(
     // Re-seek to the position where the conflicting entry should be.
     sc.cursor.index_move_to(&sc.cx, key_bytes)?;
 
-    sc.target_vals_buf.clear();
     sc.cur_vals_buf.clear();
 
     // The new key we're trying to insert — parse its prefix for comparison.
-    fsqlite_types::record::parse_record_into(key_bytes, &mut sc.target_vals_buf)
-        .ok_or_else(|| FrankenError::internal("find_conflicting_rowid: malformed new index key"))?;
+    decode_storage_cursor_target_index_record_strict(
+        sc,
+        key_bytes,
+        "find_conflicting_rowid: malformed new index key",
+    )?;
 
     // Check the entry at current position and previous entry for a prefix match.
     for attempt in 0..2 {
@@ -10461,13 +10495,11 @@ fn find_conflicting_rowid_in_index(
             break;
         }
 
-        sc.payload_buf.clear();
-        sc.cursor.payload_into(&sc.cx, &mut sc.payload_buf)?;
-        sc.cur_vals_buf.clear();
-        fsqlite_types::record::parse_record_into(&sc.payload_buf, &mut sc.cur_vals_buf)
-            .ok_or_else(|| {
-                FrankenError::internal("find_conflicting_rowid: malformed index entry record")
-            })?;
+        decode_storage_cursor_current_index_record_strict(
+            -1,
+            sc,
+            "find_conflicting_rowid: malformed index entry record",
+        )?;
 
         // Check if the indexed columns (excluding the trailing rowid) match
         // and none of them are NULL.
@@ -11256,6 +11288,65 @@ mod tests {
             .into_iter()
             .map(|v| v.into_vec())
             .collect()
+    }
+
+    fn build_storage_index_engine_with_duplicate_prefixes() -> (VdbeEngine, Vec<u8>, Vec<u8>) {
+        let mut db = MemDatabase::new();
+        let index_root = db.allocate_root_page();
+
+        let mut engine = VdbeEngine::new(8);
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+
+        assert!(
+            engine.open_storage_cursor(0, index_root, true),
+            "index storage cursor should open"
+        );
+
+        let sc = engine
+            .storage_cursors
+            .get_mut(&0)
+            .expect("storage cursor should exist");
+        for rowid in 1_i64..=128 {
+            let key = encode_record(&[SqliteValue::Integer(7), SqliteValue::Integer(rowid)]);
+            sc.cursor
+                .index_insert(&sc.cx, &key)
+                .expect("duplicate-prefix index key should insert");
+        }
+        sc.cursor
+            .index_insert(
+                &sc.cx,
+                &encode_record(&[SqliteValue::Integer(8), SqliteValue::Integer(999)]),
+            )
+            .expect("next-prefix index key should insert");
+
+        let conflict_key = encode_record(&[SqliteValue::Integer(7)]);
+        let miss_key = encode_record(&[SqliteValue::Integer(9)]);
+
+        (engine, conflict_key, miss_key)
+    }
+
+    fn legacy_storage_cursor_no_conflict_prefix_match(
+        cursor: &mut StorageCursor,
+        key_bytes: &[u8],
+    ) -> Result<bool> {
+        let probe_fields = match parse_record(key_bytes) {
+            Some(fields) => fields,
+            None => return Ok(false),
+        };
+        if probe_fields.iter().any(SqliteValue::is_null) {
+            return Ok(false);
+        }
+        cursor.cursor.index_move_to(&cursor.cx, key_bytes)?;
+        if let Ok(entry_bytes) = cursor.cursor.payload(&cursor.cx) {
+            if let Some(entry_fields) = parse_record(&entry_bytes) {
+                let prefix_len = probe_fields.len();
+                return Ok(entry_fields.len() >= prefix_len
+                    && entry_fields[..prefix_len] == probe_fields[..]);
+            }
+        }
+        Ok(false)
     }
 
     #[test]
@@ -16045,6 +16136,288 @@ mod tests {
         let _txn = engine
             .take_transaction()
             .expect("take_transaction should succeed");
+    }
+
+    #[test]
+    fn test_storage_cursor_no_conflict_scratch_matches_legacy_probe_semantics() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut engine, conflict_key, miss_key) =
+            build_storage_index_engine_with_duplicate_prefixes();
+        let cursor = engine
+            .storage_cursors
+            .get_mut(&0)
+            .expect("storage cursor should exist");
+
+        let legacy_conflict = legacy_storage_cursor_no_conflict_prefix_match(cursor, &conflict_key)
+            .expect("legacy conflict probe should succeed");
+        let scratch_conflict = storage_cursor_no_conflict_prefix_match(0, cursor, &conflict_key)
+            .expect("scratch conflict probe should succeed");
+        assert_eq!(scratch_conflict, legacy_conflict);
+        assert!(scratch_conflict, "duplicate prefix should conflict");
+
+        let legacy_miss = legacy_storage_cursor_no_conflict_prefix_match(cursor, &miss_key)
+            .expect("legacy miss probe should succeed");
+        let scratch_miss = storage_cursor_no_conflict_prefix_match(0, cursor, &miss_key)
+            .expect("scratch miss probe should succeed");
+        assert_eq!(scratch_miss, legacy_miss);
+        assert!(!scratch_miss, "distinct prefix should not conflict");
+
+        let malformed = vec![0x80];
+        let legacy_malformed = legacy_storage_cursor_no_conflict_prefix_match(cursor, &malformed)
+            .expect("legacy malformed probe should not raise");
+        let scratch_malformed = storage_cursor_no_conflict_prefix_match(0, cursor, &malformed)
+            .expect("scratch malformed probe should not raise");
+        assert_eq!(scratch_malformed, legacy_malformed);
+        assert!(
+            !scratch_malformed,
+            "malformed probes should not report conflicts"
+        );
+    }
+
+    #[test]
+    fn test_storage_cursor_no_conflict_reuses_payload_and_value_scratch() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut engine, conflict_key, _) = build_storage_index_engine_with_duplicate_prefixes();
+        let iterations = 256;
+        let prev_record_profile_enabled = fsqlite_types::record::record_profile_enabled();
+
+        let run_legacy = |cursor: &mut StorageCursor| {
+            fsqlite_types::record::reset_record_profile();
+            fsqlite_types::record::set_record_profile_enabled(true);
+            fsqlite_btree::reset_btree_copy_profile();
+            fsqlite_btree::set_btree_copy_profile_enabled(true);
+            let _scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
+            let mut matches = 0usize;
+            for _ in 0..iterations {
+                if legacy_storage_cursor_no_conflict_prefix_match(cursor, &conflict_key)
+                    .expect("legacy probe should succeed")
+                {
+                    matches += 1;
+                }
+            }
+            (
+                matches,
+                fsqlite_types::record::record_profile_snapshot(),
+                fsqlite_btree::btree_copy_profile_snapshot(),
+            )
+        };
+
+        let run_scratch = |cursor: &mut StorageCursor| {
+            fsqlite_types::record::reset_record_profile();
+            fsqlite_types::record::set_record_profile_enabled(true);
+            fsqlite_btree::reset_btree_copy_profile();
+            fsqlite_btree::set_btree_copy_profile_enabled(true);
+            let _scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
+            let mut matches = 0usize;
+            let mut payload_ptr = None;
+            let mut value_ptr = None;
+            for _ in 0..iterations {
+                if storage_cursor_no_conflict_prefix_match(0, cursor, &conflict_key)
+                    .expect("scratch probe should succeed")
+                {
+                    matches += 1;
+                }
+                let payload_buf_ptr = cursor.payload_buf.as_ptr() as usize;
+                let cur_vals_ptr = cursor.cur_vals_buf.as_ptr() as usize;
+                if let Some(expected) = payload_ptr {
+                    assert_eq!(
+                        payload_buf_ptr, expected,
+                        "payload scratch buffer should be reused across probes"
+                    );
+                } else {
+                    payload_ptr = Some(payload_buf_ptr);
+                }
+                if let Some(expected) = value_ptr {
+                    assert_eq!(
+                        cur_vals_ptr, expected,
+                        "value scratch buffer should be reused across probes"
+                    );
+                } else {
+                    value_ptr = Some(cur_vals_ptr);
+                }
+            }
+            (
+                matches,
+                fsqlite_types::record::record_profile_snapshot(),
+                fsqlite_btree::btree_copy_profile_snapshot(),
+            )
+        };
+
+        let (legacy_matches, legacy_record_profile, legacy_copy_profile) = {
+            let cursor = engine
+                .storage_cursors
+                .get_mut(&0)
+                .expect("storage cursor should exist");
+            run_legacy(cursor)
+        };
+        let (scratch_matches, scratch_record_profile, scratch_copy_profile) = {
+            let cursor = engine
+                .storage_cursors
+                .get_mut(&0)
+                .expect("storage cursor should exist");
+            run_scratch(cursor)
+        };
+
+        assert_eq!(legacy_matches, iterations);
+        assert_eq!(scratch_matches, iterations);
+        assert!(
+            legacy_record_profile
+                .callsite_breakdown
+                .vdbe_engine
+                .parse_record_calls
+                >= u64::try_from(iterations * 2).unwrap_or(u64::MAX),
+            "legacy loop should fully parse both probe and entry on every iteration"
+        );
+        assert_eq!(
+            scratch_record_profile
+                .callsite_breakdown
+                .vdbe_engine
+                .parse_record_calls,
+            0,
+            "scratch path should eliminate full parse_record allocations"
+        );
+        assert!(
+            scratch_record_profile
+                .callsite_breakdown
+                .vdbe_engine
+                .parse_record_into_calls
+                >= u64::try_from(iterations * 2).unwrap_or(u64::MAX),
+            "scratch path should decode probe and entry into reusable buffers"
+        );
+        assert!(
+            legacy_copy_profile.owned_payload_materialization_calls
+                >= u64::try_from(iterations).unwrap_or(u64::MAX),
+            "legacy path should materialize an owned payload for every probe"
+        );
+        assert_eq!(
+            scratch_copy_profile.owned_payload_materialization_calls, 0,
+            "scratch path should avoid owned payload materialization"
+        );
+        assert!(
+            scratch_copy_profile.local_payload_copy_calls
+                >= u64::try_from(iterations).unwrap_or(u64::MAX),
+            "scratch path should reuse the caller-owned payload buffer"
+        );
+
+        eprintln!(
+            concat!(
+                "BD_DB300_4_3_2_CHURN_JSON=",
+                "{{",
+                "\"bead_id\":\"bd-db300.4.3.2\",",
+                "\"hot_path\":\"storage_cursor_no_conflict_index_probe\",",
+                "\"iterations\":{},",
+                "\"legacy\":{{",
+                "\"parse_record_calls\":{},",
+                "\"parse_record_into_calls\":{},",
+                "\"owned_payload_materialization_calls\":{},",
+                "\"owned_payload_materialization_bytes\":{},",
+                "\"local_payload_copy_calls\":{}",
+                "}},",
+                "\"scratch\":{{",
+                "\"parse_record_calls\":{},",
+                "\"parse_record_into_calls\":{},",
+                "\"owned_payload_materialization_calls\":{},",
+                "\"owned_payload_materialization_bytes\":{},",
+                "\"local_payload_copy_calls\":{}",
+                "}}",
+                "}}"
+            ),
+            iterations,
+            legacy_record_profile
+                .callsite_breakdown
+                .vdbe_engine
+                .parse_record_calls,
+            legacy_record_profile
+                .callsite_breakdown
+                .vdbe_engine
+                .parse_record_into_calls,
+            legacy_copy_profile.owned_payload_materialization_calls,
+            legacy_copy_profile.owned_payload_materialization_bytes,
+            legacy_copy_profile.local_payload_copy_calls,
+            scratch_record_profile
+                .callsite_breakdown
+                .vdbe_engine
+                .parse_record_calls,
+            scratch_record_profile
+                .callsite_breakdown
+                .vdbe_engine
+                .parse_record_into_calls,
+            scratch_copy_profile.owned_payload_materialization_calls,
+            scratch_copy_profile.owned_payload_materialization_bytes,
+            scratch_copy_profile.local_payload_copy_calls,
+        );
+
+        fsqlite_btree::set_btree_copy_profile_enabled(false);
+        fsqlite_types::record::set_record_profile_enabled(prev_record_profile_enabled);
+    }
+
+    #[test]
+    fn test_no_conflict_opcode_uses_storage_cursor_scratch_probe_path() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut engine, conflict_key, miss_key) =
+            build_storage_index_engine_with_duplicate_prefixes();
+        let malformed_key = vec![0x80];
+
+        let rows = {
+            let mut b = ProgramBuilder::new();
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_key = b.alloc_reg();
+            let r_out = b.alloc_reg();
+
+            for (probe_key, expected_insertable) in [
+                (conflict_key, false),
+                (miss_key, true),
+                (malformed_key, true),
+            ] {
+                let no_conflict = b.emit_label();
+                let done = b.emit_label();
+                b.emit_op(Opcode::Blob, 0, r_key, 0, P4::Blob(probe_key), 0);
+                b.emit_jump_to_label(Opcode::NoConflict, 0, r_key, no_conflict, P4::None, 0);
+                b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+                b.resolve_label(no_conflict);
+                b.emit_op(
+                    Opcode::Integer,
+                    i32::from(expected_insertable),
+                    r_out,
+                    0,
+                    P4::None,
+                    0,
+                );
+                b.resolve_label(done);
+                b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            }
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+
+            let program = b.finish().expect("program should build");
+            let outcome = engine.execute(&program).expect("execution should succeed");
+            assert_eq!(outcome, ExecOutcome::Done);
+            engine
+                .take_results()
+                .into_iter()
+                .map(|row| row.into_vec())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Integer(0)],
+                vec![SqliteValue::Integer(1)],
+                vec![SqliteValue::Integer(1)],
+            ],
+            "NoConflict should treat duplicate prefixes as conflicts and malformed probes as insertable"
+        );
     }
 
     #[test]

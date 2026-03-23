@@ -483,12 +483,73 @@ c1_target_direction = "Prioritize keeping mixed-workload tails and responsivenes
 c4_target_direction = "Require a balanced win that improves throughput without shifting the workload into retry- or wait-dominated behavior."
 c8_target_direction = "Require a durable many-core gain that still reads as usable for mixed traffic rather than a benchmark-only spike."
 
+[operator_report_contract]
+consumer_bead_id = "bd-db300.7.4"
+source_contract_beads = ["bd-db300.7.5.5", "bd-db300.7.5.6", "bd-db300.7.6.4"]
+upstream_contract_paths = [
+  "db300_regime_atlas_contract.toml",
+  "db300_shadow_oracle_contract.toml",
+  "db300_policy_snapshot_contract.toml",
+]
+required_bundle_artifacts = [
+  "artifacts/{bead_id}/{run_id}/manifest.json",
+  "artifacts/{bead_id}/{run_id}/summary.md",
+  "artifacts/{bead_id}/{run_id}/scorecard_thresholds.json",
+]
+required_manifest_fields = [
+  "activation_regime_id",
+  "activation_state",
+  "rollout_stage",
+  "safe_by_default_boundary",
+  "shadow_sample_rate",
+  "kill_switch_state",
+  "fallback_state",
+  "rollout_annotation",
+  "fallback_annotation",
+  "user_visibility",
+]
+required_summary_fields = [
+  "activation_regime_id",
+  "activation_state",
+  "rollout_stage",
+  "safe_by_default_boundary",
+  "shadow_sample_rate",
+  "kill_switch_state",
+  "fallback_state",
+  "rollout_annotation",
+  "fallback_annotation",
+  "user_visibility",
+]
+required_threshold_fields = [
+  "activation_regime_id",
+  "activation_state",
+  "rollout_stage",
+  "safe_by_default_boundary",
+  "shadow_sample_rate",
+  "kill_switch_state",
+  "fallback_state",
+  "rollout_annotation",
+  "fallback_annotation",
+  "user_visibility",
+]
+default_activation_regime_id = "db300.regime_gated_default.pending_surface_binding"
+default_activation_state = "regime_gated_default"
+default_rollout_stage = "default"
+default_shadow_sample_rate = "0%"
+default_kill_switch_state = "disarmed"
+default_fallback_state = "inactive"
+safe_by_default_boundary = "Only universal_default or regime_gated_default may auto-enable; cells outside the measured regime slice, any armed or tripped kill-switch state, or any blocker divergence must fall back conservatively."
+rollout_annotation = "Controller default authority applies only to the measured regime slice; promotion beyond that slice still depends on green regime-atlas and shadow-oracle evidence."
+fallback_annotation = "Any out-of-regime cell, divergence_class, provenance gap, or kill-switch escalation keeps the conservative baseline authoritative and operator-visible."
+user_visibility = "operator_visible_regime_gated_default"
+
 [verification_plan]
 unit_tests = [
   "test_bd_db300_7_3_contract_schema_and_links",
   "test_bd_db300_7_3_required_campaign_surface_exists",
   "test_bd_db300_7_3_cell_targets_are_monotone",
   "test_bd_db300_7_3_verification_plan_is_actionable",
+  "test_bd_db300_7_3_operator_report_contract_is_actionable",
   "test_bd_db300_7_3_transferability_rubric_is_actionable",
   "test_bd_db300_7_3_workload_family_thresholds_are_actionable",
 ]

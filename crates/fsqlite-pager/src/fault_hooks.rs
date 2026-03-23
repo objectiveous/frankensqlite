@@ -42,6 +42,8 @@ pub struct FaultInjectionRecord {
 struct PagerFaultHookState {
     next_trigger_seq: u64,
     after_flush_before_publish: Option<FaultHookArm>,
+    during_phase_c: Option<FaultHookArm>,
+    drop_condvar_notify: Option<FaultHookArm>,
     records: Vec<FaultInjectionRecord>,
 }
 
@@ -89,6 +91,63 @@ pub(crate) fn maybe_inject_after_flush_before_publish(
         "fault_inject:after_flush_before_publish run_id={} scenario_id={} invariant_family={}",
         arm.run_id, arm.scenario_id, arm.invariant_family
     ))))
+}
+
+/// Arm the Phase-C publication fault hook (F4 / H4).
+///
+/// When armed, `maybe_inject_during_phase_c()` fires once inside
+/// `SimpleTransaction::commit()` after commit_seq is updated but before
+/// snapshot publish completes. Simulates crash during metadata publication.
+pub fn arm_during_phase_c(arm: FaultHookArm) {
+    let mut state = PAGER_FAULT_HOOK_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.during_phase_c = Some(arm);
+}
+
+/// Check and fire the Phase-C publication fault hook.
+pub(crate) fn maybe_inject_during_phase_c(commit_seq: u64, db_size: u32) -> Result<()> {
+    let mut state = PAGER_FAULT_HOOK_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(arm) = state.during_phase_c.take() else {
+        return Ok(());
+    };
+
+    let detail = format!("commit_seq={commit_seq} db_size={db_size}");
+    record_trigger(&mut state, &arm, "during_phase_c", detail);
+    Err(FrankenError::Io(std::io::Error::other(format!(
+        "fault_inject:during_phase_c run_id={} scenario_id={} invariant_family={}",
+        arm.run_id, arm.scenario_id, arm.invariant_family
+    ))))
+}
+
+/// Arm the dropped-condvar-notify fault hook (F11 / H11).
+///
+/// When armed, `maybe_inject_drop_condvar_notify()` returns true,
+/// signaling the caller to skip the `publish_completed_epoch()` call.
+/// Waiters must recover via timeout.
+pub fn arm_drop_condvar_notify(arm: FaultHookArm) {
+    let mut state = PAGER_FAULT_HOOK_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.drop_condvar_notify = Some(arm);
+}
+
+/// Check and fire the dropped-condvar-notify hook.
+///
+/// Returns `true` if the hook fires (caller should skip notify).
+pub(crate) fn maybe_inject_drop_condvar_notify(completed_epoch: u64) -> bool {
+    let mut state = PAGER_FAULT_HOOK_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(arm) = state.drop_condvar_notify.take() else {
+        return false;
+    };
+
+    let detail = format!("completed_epoch={completed_epoch}");
+    record_trigger(&mut state, &arm, "drop_condvar_notify", detail);
+    true
 }
 
 fn record_trigger(

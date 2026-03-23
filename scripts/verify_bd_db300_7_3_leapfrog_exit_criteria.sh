@@ -61,6 +61,11 @@ export METRIC_DICTIONARY_JSON
 export TMP_METRIC_DICTIONARY_JSON
 export THRESHOLDS_JSON
 export TMP_THRESHOLDS_JSON
+export RUN_ID
+export TRACE_ID
+export SCENARIO_ID
+export CONTRACT_FILE
+export TEST_FILE
 if ! python3 - <<'PY' > "${TMP_REPORT_JSON}"; then
 import json
 import os
@@ -83,6 +88,7 @@ required_unit_tests = {
     "test_bd_db300_7_3_required_campaign_surface_exists",
     "test_bd_db300_7_3_cell_targets_are_monotone",
     "test_bd_db300_7_3_verification_plan_is_actionable",
+    "test_bd_db300_7_3_operator_report_contract_is_actionable",
     "test_bd_db300_7_3_transferability_rubric_is_actionable",
     "test_bd_db300_7_3_workload_family_thresholds_are_actionable",
 }
@@ -129,6 +135,29 @@ required_hardware_classes = {
     "cross_hardware_class",
 }
 required_downstream_beads = {"bd-db300.7.3", "bd-db300.7.4"}
+required_operator_source_beads = {"bd-db300.7.5.5", "bd-db300.7.5.6", "bd-db300.7.6.4"}
+required_operator_upstream_contracts = [
+    "db300_regime_atlas_contract.toml",
+    "db300_shadow_oracle_contract.toml",
+    "db300_policy_snapshot_contract.toml",
+]
+required_operator_report_fields = [
+    "activation_regime_id",
+    "activation_state",
+    "rollout_stage",
+    "safe_by_default_boundary",
+    "shadow_sample_rate",
+    "kill_switch_state",
+    "fallback_state",
+    "rollout_annotation",
+    "fallback_annotation",
+    "user_visibility",
+]
+required_operator_bundle_artifacts = [
+    "artifacts/{bead_id}/{run_id}/manifest.json",
+    "artifacts/{bead_id}/{run_id}/summary.md",
+    "artifacts/{bead_id}/{run_id}/scorecard_thresholds.json",
+]
 required_report_labels = {
     "transferable": "transferable win",
     "profile_specific_but_useful": "lab-specific win",
@@ -270,6 +299,100 @@ if covered_profiles != required_profiles:
         f"transferability_rubric example profile coverage mismatch expected={sorted(required_profiles)!r} actual={sorted(covered_profiles)!r}"
     )
 
+operator_report = contract.get("operator_report_contract", {})
+if operator_report.get("consumer_bead_id") != "bd-db300.7.4":
+    raise SystemExit(
+        f"operator_report_contract.consumer_bead_id mismatch actual={operator_report.get('consumer_bead_id')!r}"
+    )
+actual_operator_source_beads = set(operator_report.get("source_contract_beads", []))
+if actual_operator_source_beads != required_operator_source_beads:
+    raise SystemExit(
+        f"operator_report_contract.source_contract_beads mismatch expected={sorted(required_operator_source_beads)!r} actual={sorted(actual_operator_source_beads)!r}"
+    )
+actual_operator_paths = operator_report.get("upstream_contract_paths", [])
+if actual_operator_paths != required_operator_upstream_contracts:
+    raise SystemExit(
+        f"operator_report_contract.upstream_contract_paths mismatch expected={required_operator_upstream_contracts!r} actual={actual_operator_paths!r}"
+    )
+for rel_path in actual_operator_paths:
+    if not Path(rel_path).exists():
+        raise SystemExit(f"missing operator upstream contract {rel_path}")
+
+for field_name in (
+    "required_manifest_fields",
+    "required_summary_fields",
+    "required_threshold_fields",
+):
+    actual_fields = operator_report.get(field_name, [])
+    if actual_fields != required_operator_report_fields:
+        raise SystemExit(
+            f"operator_report_contract.{field_name} mismatch expected={required_operator_report_fields!r} actual={actual_fields!r}"
+        )
+
+actual_operator_bundle_artifacts = operator_report.get("required_bundle_artifacts", [])
+if actual_operator_bundle_artifacts != required_operator_bundle_artifacts:
+    raise SystemExit(
+        f"operator_report_contract.required_bundle_artifacts mismatch expected={required_operator_bundle_artifacts!r} actual={actual_operator_bundle_artifacts!r}"
+    )
+missing_operator_artifacts = sorted(set(actual_operator_bundle_artifacts) - artifacts)
+if missing_operator_artifacts:
+    raise SystemExit(
+        f"operator_report_contract.required_bundle_artifacts references non-emitted artifacts {missing_operator_artifacts!r}"
+    )
+
+regime_contract = tomllib.loads(Path(actual_operator_paths[0]).read_text(encoding="utf-8"))
+shadow_contract = tomllib.loads(Path(actual_operator_paths[1]).read_text(encoding="utf-8"))
+policy_contract = tomllib.loads(Path(actual_operator_paths[2]).read_text(encoding="utf-8"))
+if operator_report.get("default_rollout_stage") != policy_contract["global_defaults"]["default_rollout_stage"]:
+    raise SystemExit(
+        "operator_report_contract.default_rollout_stage must match policy snapshot default_rollout_stage"
+    )
+if operator_report.get("default_activation_state") != policy_contract["global_defaults"]["default_activation_state"]:
+    raise SystemExit(
+        "operator_report_contract.default_activation_state must match policy snapshot default_activation_state"
+    )
+if shadow_contract["global_defaults"]["default_shadow_mode"] != "off":
+    raise SystemExit(
+        "shadow oracle default_shadow_mode must stay off for this consumer contract"
+    )
+if operator_report.get("default_shadow_sample_rate") != "0%":
+    raise SystemExit(
+        f"operator_report_contract.default_shadow_sample_rate mismatch actual={operator_report.get('default_shadow_sample_rate')!r}"
+    )
+kill_switch_states = {
+    entry["state_id"] for entry in policy_contract.get("kill_switch_state", [])
+}
+if operator_report.get("default_kill_switch_state") not in kill_switch_states:
+    raise SystemExit(
+        "operator_report_contract.default_kill_switch_state must be declared in policy snapshot kill_switch_state"
+    )
+if operator_report.get("default_fallback_state") != "inactive":
+    raise SystemExit(
+        f"operator_report_contract.default_fallback_state mismatch actual={operator_report.get('default_fallback_state')!r}"
+    )
+if "fallback_state=active" not in regime_contract["global_defaults"]["safe_mode_policy"]:
+    raise SystemExit("regime atlas safe_mode_policy must keep fallback_state=active explicit")
+regime_states = {entry["state_id"] for entry in regime_contract.get("activation_state", [])}
+if not {"universal_default", "regime_gated_default"}.issubset(regime_states):
+    raise SystemExit(
+        "regime atlas must declare universal_default and regime_gated_default activation states"
+    )
+safe_by_default_boundary = operator_report.get("safe_by_default_boundary", "")
+if "universal_default" not in safe_by_default_boundary or "regime_gated_default" not in safe_by_default_boundary:
+    raise SystemExit(
+        "operator_report_contract.safe_by_default_boundary must keep the regime-gated auto-enable boundary explicit"
+    )
+if not operator_report.get("default_activation_regime_id", "").strip():
+    raise SystemExit("operator_report_contract.default_activation_regime_id must not be blank")
+if operator_report.get("user_visibility") != "operator_visible_regime_gated_default":
+    raise SystemExit(
+        f"operator_report_contract.user_visibility mismatch actual={operator_report.get('user_visibility')!r}"
+    )
+if not operator_report.get("rollout_annotation", "").strip():
+    raise SystemExit("operator_report_contract.rollout_annotation must not be blank")
+if not operator_report.get("fallback_annotation", "").strip():
+    raise SystemExit("operator_report_contract.fallback_annotation must not be blank")
+
 metric_dictionary_path = Path(os.environ["TMP_METRIC_DICTIONARY_JSON"])
 metric_dictionary_path.write_text(
     json.dumps(metric_dictionary, indent=2),
@@ -283,6 +406,22 @@ thresholds_path.write_text(
             "cell_gates": contract.get("cell_gates", []),
             "workload_families": contract.get("workload_families", []),
             "required_log_fields": contract["verification_plan"].get("required_log_fields", []),
+            "operator_report": {
+                "consumer_bead_id": operator_report["consumer_bead_id"],
+                "source_contract_beads": operator_report["source_contract_beads"],
+                "upstream_contract_paths": operator_report["upstream_contract_paths"],
+                "required_fields": operator_report["required_threshold_fields"],
+                "activation_regime_id": operator_report["default_activation_regime_id"],
+                "activation_state": operator_report["default_activation_state"],
+                "rollout_stage": operator_report["default_rollout_stage"],
+                "safe_by_default_boundary": operator_report["safe_by_default_boundary"],
+                "shadow_sample_rate": operator_report["default_shadow_sample_rate"],
+                "kill_switch_state": operator_report["default_kill_switch_state"],
+                "fallback_state": operator_report["default_fallback_state"],
+                "rollout_annotation": operator_report["rollout_annotation"],
+                "fallback_annotation": operator_report["fallback_annotation"],
+                "user_visibility": operator_report["user_visibility"],
+            },
         },
         indent=2,
     ),
@@ -300,6 +439,24 @@ summary = {
     "claim_language": contract["scorecard"]["claim_language"],
     "metric_dictionary_path": os.environ["METRIC_DICTIONARY_JSON"],
     "metric_ids": sorted(metric_ids),
+    "source_contract_beads": operator_report["source_contract_beads"],
+    "activation_regime_id": operator_report["default_activation_regime_id"],
+    "activation_state": operator_report["default_activation_state"],
+    "rollout_stage": operator_report["default_rollout_stage"],
+    "safe_by_default_boundary": operator_report["safe_by_default_boundary"],
+    "shadow_sample_rate": operator_report["default_shadow_sample_rate"],
+    "kill_switch_state": operator_report["default_kill_switch_state"],
+    "fallback_state": operator_report["default_fallback_state"],
+    "rollout_annotation": operator_report["rollout_annotation"],
+    "fallback_annotation": operator_report["fallback_annotation"],
+    "user_visibility": operator_report["user_visibility"],
+    "operator_report_contract": {
+        "consumer_bead_id": operator_report["consumer_bead_id"],
+        "upstream_contract_paths": operator_report["upstream_contract_paths"],
+        "required_manifest_fields": operator_report["required_manifest_fields"],
+        "required_summary_fields": operator_report["required_summary_fields"],
+        "required_threshold_fields": operator_report["required_threshold_fields"],
+    },
 }
 print(json.dumps(summary, indent=2))
 PY
@@ -320,18 +477,41 @@ if ! mv "${TMP_THRESHOLDS_JSON}" "${THRESHOLDS_JSON}"; then
 fi
 emit_event "contract_schema" "pass" "pass" "contract schema validated"
 
-cat > "${SUMMARY_MD}" <<EOF
-# ${BEAD_ID} Verification Summary
+export REPORT_JSON
+export SUMMARY_MD
+python3 - <<'PY'
+import json
+import os
+from pathlib import Path
 
-- run_id: \`${RUN_ID}\`
-- trace_id: \`${TRACE_ID}\`
-- scenario_id: \`${SCENARIO_ID}\`
-- contract: \`${CONTRACT_FILE}\`
-- test: \`${TEST_FILE}\`
-- report: \`${REPORT_JSON}\`
-- metric_dictionary: \`${METRIC_DICTIONARY_JSON}\`
-- scorecard_thresholds: \`${THRESHOLDS_JSON}\`
-EOF
+report = json.loads(Path(os.environ["REPORT_JSON"]).read_text(encoding="utf-8"))
+summary_lines = [
+    f"# {report['bead_id']} Verification Summary",
+    "",
+    f"- run_id: `{os.environ['RUN_ID']}`",
+    f"- trace_id: `{os.environ['TRACE_ID']}`",
+    f"- scenario_id: `{os.environ['SCENARIO_ID']}`",
+    f"- contract: `{os.environ['CONTRACT_FILE']}`",
+    f"- test: `{os.environ['TEST_FILE']}`",
+    f"- report: `{os.environ['REPORT_JSON']}`",
+    f"- metric_dictionary: `{os.environ['METRIC_DICTIONARY_JSON']}`",
+    f"- scorecard_thresholds: `{os.environ['THRESHOLDS_JSON']}`",
+    "",
+    "## Operator Report Surface",
+    "",
+    f"- activation_regime_id: `{report['activation_regime_id']}`",
+    f"- activation_state: `{report['activation_state']}`",
+    f"- rollout_stage: `{report['rollout_stage']}`",
+    f"- safe_by_default_boundary: `{report['safe_by_default_boundary']}`",
+    f"- shadow_sample_rate: `{report['shadow_sample_rate']}`",
+    f"- kill_switch_state: `{report['kill_switch_state']}`",
+    f"- fallback_state: `{report['fallback_state']}`",
+    f"- rollout_annotation: `{report['rollout_annotation']}`",
+    f"- fallback_annotation: `{report['fallback_annotation']}`",
+    f"- user_visibility: `{report['user_visibility']}`",
+]
+Path(os.environ["SUMMARY_MD"]).write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+PY
 
 emit_event "cargo_test" "start" "running" "running harness test via rch"
 if ! rch exec -- cargo test --package fsqlite-harness --test bd_db300_7_3_leapfrog_exit_criteria -- --nocapture 2>&1 | tee "${TEST_LOG}"; then

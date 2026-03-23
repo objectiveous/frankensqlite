@@ -4,11 +4,12 @@ use std::path::{Path, PathBuf};
 use fsqlite_harness::leapfrog_exit_criteria::{BEAD_ID, LeapfrogExitCriteria};
 
 const CONTRACT_PATH: &str = "leapfrog_exit_criteria.toml";
-const REQUIRED_TESTS: [&str; 6] = [
+const REQUIRED_TESTS: [&str; 7] = [
     "test_bd_db300_7_3_contract_schema_and_links",
     "test_bd_db300_7_3_required_campaign_surface_exists",
     "test_bd_db300_7_3_cell_targets_are_monotone",
     "test_bd_db300_7_3_verification_plan_is_actionable",
+    "test_bd_db300_7_3_operator_report_contract_is_actionable",
     "test_bd_db300_7_3_transferability_rubric_is_actionable",
     "test_bd_db300_7_3_workload_family_thresholds_are_actionable",
 ];
@@ -51,6 +52,30 @@ const REQUIRED_WORKLOADS: [&str; 3] = [
     "commutative_inserts_disjoint_keys",
     "hot_page_contention",
     "mixed_read_write",
+];
+const REQUIRED_OPERATOR_SOURCE_BEADS: [&str; 3] =
+    ["bd-db300.7.5.5", "bd-db300.7.5.6", "bd-db300.7.6.4"];
+const REQUIRED_OPERATOR_UPSTREAM_CONTRACTS: [&str; 3] = [
+    "db300_regime_atlas_contract.toml",
+    "db300_shadow_oracle_contract.toml",
+    "db300_policy_snapshot_contract.toml",
+];
+const REQUIRED_OPERATOR_REPORT_FIELDS: [&str; 10] = [
+    "activation_regime_id",
+    "activation_state",
+    "rollout_stage",
+    "safe_by_default_boundary",
+    "shadow_sample_rate",
+    "kill_switch_state",
+    "fallback_state",
+    "rollout_annotation",
+    "fallback_annotation",
+    "user_visibility",
+];
+const REQUIRED_OPERATOR_REPORT_BUNDLE_ARTIFACTS: [&str; 3] = [
+    "artifacts/{bead_id}/{run_id}/manifest.json",
+    "artifacts/{bead_id}/{run_id}/summary.md",
+    "artifacts/{bead_id}/{run_id}/scorecard_thresholds.json",
 ];
 
 fn workspace_root() -> Result<PathBuf, String> {
@@ -450,6 +475,149 @@ fn test_bd_db300_7_3_workload_family_thresholds_are_actionable() -> Result<(), S
     {
         return Err(
             "mixed family must protect responsiveness as a must-not-regress metric".to_owned(),
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_bd_db300_7_3_operator_report_contract_is_actionable() -> Result<(), String> {
+    let root = workspace_root()?;
+    let criteria = load_contract()?;
+    let operator_report = &criteria.operator_report_contract;
+
+    if operator_report.consumer_bead_id != "bd-db300.7.4" {
+        return Err(format!(
+            "unexpected operator consumer bead={}",
+            operator_report.consumer_bead_id
+        ));
+    }
+
+    let source_beads = operator_report
+        .source_contract_beads
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if source_beads != REQUIRED_OPERATOR_SOURCE_BEADS {
+        return Err(format!(
+            "operator source beads mismatch actual={source_beads:?} expected={REQUIRED_OPERATOR_SOURCE_BEADS:?}"
+        ));
+    }
+
+    let upstream_contracts = operator_report
+        .upstream_contract_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if upstream_contracts != REQUIRED_OPERATOR_UPSTREAM_CONTRACTS {
+        return Err(format!(
+            "operator upstream contracts mismatch actual={upstream_contracts:?} expected={REQUIRED_OPERATOR_UPSTREAM_CONTRACTS:?}"
+        ));
+    }
+    for contract_path in &operator_report.upstream_contract_paths {
+        let resolved = root.join(contract_path);
+        if !resolved.exists() {
+            return Err(format!(
+                "operator upstream contract missing path={}",
+                resolved.display()
+            ));
+        }
+    }
+
+    let bundle_artifacts = operator_report
+        .required_bundle_artifacts
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if bundle_artifacts != REQUIRED_OPERATOR_REPORT_BUNDLE_ARTIFACTS {
+        return Err(format!(
+            "operator bundle artifact mismatch actual={bundle_artifacts:?} expected={REQUIRED_OPERATOR_REPORT_BUNDLE_ARTIFACTS:?}"
+        ));
+    }
+
+    for (label, actual) in [
+        (
+            "required_manifest_fields",
+            operator_report
+                .required_manifest_fields
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "required_summary_fields",
+            operator_report
+                .required_summary_fields
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "required_threshold_fields",
+            operator_report
+                .required_threshold_fields
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        if actual != REQUIRED_OPERATOR_REPORT_FIELDS {
+            return Err(format!(
+                "{label} mismatch actual={actual:?} expected={REQUIRED_OPERATOR_REPORT_FIELDS:?}"
+            ));
+        }
+    }
+
+    if operator_report
+        .default_activation_regime_id
+        .trim()
+        .is_empty()
+    {
+        return Err("default activation regime id must not be blank".to_owned());
+    }
+    if operator_report.default_activation_state != "regime_gated_default" {
+        return Err(format!(
+            "unexpected default activation state={}",
+            operator_report.default_activation_state
+        ));
+    }
+    if operator_report.default_rollout_stage != "default" {
+        return Err(format!(
+            "unexpected default rollout stage={}",
+            operator_report.default_rollout_stage
+        ));
+    }
+    if operator_report.default_shadow_sample_rate != "0%" {
+        return Err(format!(
+            "unexpected default shadow sample rate={}",
+            operator_report.default_shadow_sample_rate
+        ));
+    }
+    if operator_report.default_kill_switch_state != "disarmed" {
+        return Err(format!(
+            "unexpected default kill switch state={}",
+            operator_report.default_kill_switch_state
+        ));
+    }
+    if operator_report.default_fallback_state != "inactive" {
+        return Err(format!(
+            "unexpected default fallback state={}",
+            operator_report.default_fallback_state
+        ));
+    }
+    if operator_report.user_visibility != "operator_visible_regime_gated_default" {
+        return Err(format!(
+            "unexpected user visibility={}",
+            operator_report.user_visibility
+        ));
+    }
+    if operator_report.safe_by_default_boundary.trim().is_empty()
+        || operator_report.rollout_annotation.trim().is_empty()
+        || operator_report.fallback_annotation.trim().is_empty()
+    {
+        return Err(
+            "operator report contract must keep boundary and annotations explicit".to_owned(),
         );
     }
 

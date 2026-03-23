@@ -727,9 +727,7 @@ impl<'a> Lexer<'a> {
 
         let text = String::from_utf8_lossy(&self.src[start..self.pos]);
         if is_float {
-            let clamp = |v: f64| -> f64 {
-                if v.is_finite() { v } else { f64::MAX }
-            };
+            let clamp = |v: f64| -> f64 { if v.is_finite() { v } else { f64::MAX } };
             match text.parse::<f64>() {
                 Ok(v) => TokenKind::Float(clamp(v)),
                 Err(_) => {

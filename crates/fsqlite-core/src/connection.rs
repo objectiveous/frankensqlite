@@ -14459,7 +14459,7 @@ impl Connection {
 
             self.rewrite_sqlite_stat1_rows_in_txn(cx, txn, &plan.targets, &replacement_rows)
         })?;
-        self.planner_directive_cache.borrow_mut().clear();
+        self.clear_compilation_reuse_caches();
         Ok(())
     }
 
@@ -25973,6 +25973,11 @@ impl Connection {
     /// Number of entries in the compiled bytecode cache (bd-1dp9.6.7.2.2).
     pub fn compiled_cache_len(&self) -> usize {
         self.compiled_cache.borrow().len()
+    }
+
+    #[cfg(test)]
+    fn prepared_cache_len(&self) -> usize {
+        self.prepared_cache.borrow().len()
     }
 
     #[cfg(test)]
@@ -72565,6 +72570,53 @@ mod pager_routing_tests {
 
         conn.execute("ANALYZE plan_analyze;").unwrap();
         assert_eq!(conn.planner_directive_cache_len(), 0);
+    }
+
+    #[test]
+    fn test_analyze_clears_compiled_and_prepared_reuse_caches() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE analyze_reuse (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_analyze_reuse_val ON analyze_reuse(val);")
+            .unwrap();
+        conn.execute("INSERT INTO analyze_reuse VALUES (1, 'a'), (2, 'b');")
+            .unwrap();
+
+        conn.prepare("SELECT val FROM analyze_reuse WHERE val = ?1")
+            .unwrap();
+        let select = parse_select_statement("SELECT val FROM analyze_reuse WHERE val = ?1");
+        conn.compile_table_select(&select).unwrap();
+
+        assert!(
+            conn.prepared_cache_len() > 0,
+            "precondition: prepare() should populate the prepared cache"
+        );
+        assert!(
+            conn.compiled_cache_len() > 0,
+            "precondition: compile_table_select() should populate the compiled cache"
+        );
+        assert!(
+            conn.planner_directive_cache_len() > 0,
+            "precondition: compile_table_select() should populate the directive cache"
+        );
+
+        conn.execute("ANALYZE analyze_reuse;").unwrap();
+
+        assert_eq!(
+            conn.prepared_cache_len(),
+            0,
+            "ANALYZE must clear prepared cache entries that may embed stale stats/plans"
+        );
+        assert_eq!(
+            conn.compiled_cache_len(),
+            0,
+            "ANALYZE must clear compiled bytecode entries that may embed stale stats/plans"
+        );
+        assert_eq!(
+            conn.planner_directive_cache_len(),
+            0,
+            "ANALYZE must still clear planner directive cache entries"
+        );
     }
 
     #[test]

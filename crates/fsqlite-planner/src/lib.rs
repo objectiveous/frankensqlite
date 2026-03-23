@@ -3447,7 +3447,26 @@ fn collect_table_refs(expr: &Expr, out: &mut HashSet<String>) {
                 collect_table_refs(e, out);
             }
         }
-        // Literals, placeholders, subqueries, exists — no column refs to collect.
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+            // Recurse into the subquery's WHERE clause and select list to
+            // find outer table references (correlated subquery columns).
+            if let SelectCore::Select {
+                where_clause,
+                columns,
+                ..
+            } = &subquery.body.select
+            {
+                if let Some(wc) = where_clause {
+                    collect_table_refs(wc, out);
+                }
+                for col in columns {
+                    if let ResultColumn::Expr { expr, .. } = col {
+                        collect_table_refs(expr, out);
+                    }
+                }
+            }
+        }
+        // Literals, placeholders — no column refs to collect.
         _ => {}
     }
 }

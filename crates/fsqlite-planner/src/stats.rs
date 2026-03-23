@@ -269,8 +269,16 @@ impl ColumnStats {
             }
             // For other operators (LIKE, GLOB, NE), use heuristics
             Operator::Ne => {
-                let eq_sel = self.estimate_selectivity(&Operator::Eq, value);
-                non_null_count * (1.0 - eq_sel)
+                // Compute the absolute Eq row estimate inline (not via
+                // estimate_selectivity, which returns a fraction relative to
+                // table_row_count, not non_null_count).
+                let eq_matches = if let Some(hist) = &self.histogram {
+                    hist.estimate_equality_rows(value)
+                } else {
+                    let ndv = self.ndv.max(1) as f64;
+                    non_null_count / ndv
+                };
+                (non_null_count - eq_matches).max(0.0)
             }
             _ => non_null_count * 0.1, // Fallback heuristic
         };

@@ -5671,6 +5671,10 @@ impl Connection {
     /// Prepare SQL into a statement.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>> {
         self.background_status()?;
+        self.prepare_after_background_status(sql)
+    }
+
+    fn prepare_after_background_status(&self, sql: &str) -> Result<PreparedStatement<'_>> {
         let key = Self::sql_hash(sql);
         self.refresh_parse_cache_if_needed(sql);
         if let Some(cached) = self.lookup_prepared_cache(key, sql) {
@@ -5813,6 +5817,10 @@ impl Connection {
             let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
             self.cached_parse_single(sql)?
         };
+        if self.ad_hoc_query_supports_prepared_reuse(statement.as_ref()) {
+            let prepared = self.prepare_after_background_status(sql)?;
+            return self.query_prepared_with_params_after_background_status(&prepared, params);
+        }
         self.execute_statement_after_background_status(statement.as_ref(), Some(params))
     }
 
@@ -5920,6 +5928,10 @@ impl Connection {
             let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
             self.cached_parse_single(sql)?
         };
+        if self.ad_hoc_execute_supports_prepared_reuse(statement.as_ref())? {
+            let prepared = self.prepare_after_background_status(sql)?;
+            return self.execute_prepared_with_params_after_background_status(&prepared, params);
+        }
         let is_dml = matches!(
             statement.as_ref(),
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
@@ -5933,6 +5945,37 @@ impl Connection {
         })
     }
 
+    fn ad_hoc_query_supports_prepared_reuse(&self, statement: &Statement) -> bool {
+        matches!(statement, Statement::Select(_)) && !self.prepared_select_requires_dispatch(statement)
+    }
+
+    fn ad_hoc_execute_supports_prepared_reuse(&self, statement: &Statement) -> Result<bool> {
+        match statement {
+            Statement::Select(_) => Ok(!self.prepared_select_requires_dispatch(statement)),
+            Statement::Insert(insert) => {
+                let is_simple_values = matches!(
+                    &insert.source,
+                    fsqlite_ast::InsertSource::Values(_) | fsqlite_ast::InsertSource::DefaultValues
+                ) || matches!(
+                    &insert.source,
+                    fsqlite_ast::InsertSource::Select(sel)
+                    if matches!(sel.body.select, SelectCore::Values(_))
+                       && sel.body.compounds.is_empty()
+                );
+                Ok(is_simple_values && !self.prepared_insert_requires_deferred_dispatch(insert)?)
+            }
+            Statement::Update(update) => Ok(
+                Self::prepared_update_supports_precompiled_program(update)
+                    && !self.prepared_update_requires_deferred_dispatch(update)?,
+            ),
+            Statement::Delete(delete) => Ok(
+                Self::prepared_delete_supports_precompiled_program(delete)
+                    && !self.prepared_delete_requires_deferred_dispatch(delete)?,
+            ),
+            _ => Ok(false),
+        }
+    }
+
     /// Execute a prepared DML statement (INSERT/UPDATE/DELETE) with no parameters.
     pub fn execute_prepared(&self, stmt: &PreparedStatement<'_>) -> Result<usize> {
         self.execute_prepared_with_params(stmt, &[])
@@ -5944,8 +5987,16 @@ impl Connection {
         stmt: &PreparedStatement<'_>,
         params: &[SqliteValue],
     ) -> Result<usize> {
-        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
         self.background_status()?;
+        self.execute_prepared_with_params_after_background_status(stmt, params)
+    }
+
+    fn execute_prepared_with_params_after_background_status(
+        &self,
+        stmt: &PreparedStatement<'_>,
+        params: &[SqliteValue],
+    ) -> Result<usize> {
+        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
         if !std::ptr::eq(self, stmt.conn) {
             return Err(FrankenError::internal(
                 "prepared statement belongs to a different connection",
@@ -6045,13 +6096,68 @@ impl Connection {
                 rows.len()
             })
         } else {
-            // SELECT path delegates to query(), which owns fast/slow accounting.
-            Ok(if params.is_empty() {
-                stmt.query()?.len()
-            } else {
-                stmt.query_with_params(params)?.len()
-            })
+            Ok(self
+                .query_prepared_with_params_after_background_status(stmt, params)?
+                .len())
         }
+    }
+
+    fn query_prepared_with_params_after_background_status(
+        &self,
+        stmt: &PreparedStatement<'_>,
+        params: &[SqliteValue],
+    ) -> Result<Vec<Row>> {
+        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
+        if !std::ptr::eq(self, stmt.conn) {
+            return Err(FrankenError::internal(
+                "prepared statement belongs to a different connection",
+            ));
+        }
+        if stmt.dml_dispatch.is_some() {
+            return Err(FrankenError::Internal(
+                "DML prepared statements must be executed through \
+                 Connection::execute_prepared() or Connection::execute_prepared_with_params()"
+                    .to_owned(),
+            ));
+        }
+        self.sync_change_tracking_context();
+        let op_cx = self.op_cx_after_background_status();
+        stmt.ensure_schema_unchanged(&op_cx)?;
+        if let Some(statement) = &stmt.deferred_query_statement {
+            FSQLITE_SLOW_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+            tracing::debug!(
+                target: "fsqlite.execute_path",
+                path = "slow",
+                reason = "deferred_query_statement",
+            );
+            return self.execute_statement_after_background_status(statement.as_ref(), Some(params));
+        }
+        FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+        tracing::debug!(
+            target: "fsqlite.execute_path",
+            path = "fast",
+            reason = if stmt.db.is_some() { "table_query" } else { "program_execute" },
+        );
+        let mut rows = if stmt.db.is_some() {
+            stmt.execute_table_query(&op_cx, Some(params))?
+        } else {
+            execute_program_with_postprocess(
+                stmt.program.as_ref(),
+                Some(params),
+                stmt.func_registry.as_ref(),
+                Some(&self.collation_registry),
+                &op_cx,
+                stmt.expression_postprocess.as_ref(),
+                PageSize::new(self.pragma_state.borrow().page_size).unwrap(),
+            )?
+        };
+        if stmt.distinct {
+            dedup_rows(&mut rows);
+        }
+        if let Some(limit_clause) = stmt.post_distinct_limit.as_ref() {
+            apply_limit_clause(&mut rows, limit_clause);
+        }
+        Ok(rows)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -41398,7 +41504,6 @@ mod tests {
         conn.execute("BEGIN").unwrap();
         conn.execute("INSERT INTO t VALUES (9)").unwrap();
 
-        let shared = Arc::clone(&conn._shared_mvcc_state);
         conn._shared_mvcc_state
             .poison("simulated poisoned runtime for close");
 
@@ -70312,8 +70417,11 @@ mod pager_routing_tests {
 
     #[test]
     fn test_prepared_cache_invalidated_by_ddl() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE prep_cache_ddl (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO prep_cache_ddl VALUES (1, 'alpha');")
             .unwrap();
 
         let stmt = conn
@@ -70333,6 +70441,24 @@ mod pager_routing_tests {
         assert!(
             conn.prepared_cache.borrow().is_empty(),
             "DDL must clear the prepared cache"
+        );
+
+        reset_hot_path_profile();
+        let row = conn
+            .query_row_with_params(
+                "SELECT val FROM prep_cache_ddl WHERE id = ?1",
+                &[SqliteValue::Integer(1)],
+            )
+            .unwrap();
+        assert_eq!(row.values()[0], SqliteValue::Text("alpha".into()));
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.parser.prepared_cache_misses, 1,
+            "first ad-hoc execution after DDL should reseed the prepared cache: {profile:?}"
+        );
+        assert!(
+            !conn.prepared_cache.borrow().is_empty(),
+            "ad-hoc execution after DDL should repopulate the prepared cache"
         );
     }
 
@@ -72363,14 +72489,54 @@ mod pager_routing_tests {
             assert_eq!(row.values()[0], SqliteValue::Text(format!("v{id}").into()));
         }
 
+        let update_sql = "UPDATE sr_hot SET val = ?1 WHERE id = ?2";
+        for id in 1_i64..=4 {
+            let affected = conn
+                .execute_with_params(
+                    update_sql,
+                    &[
+                        SqliteValue::Text(format!("u{id}").into()),
+                        SqliteValue::Integer(id),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(affected, 1);
+        }
+        for id in 1_i64..=4 {
+            let row = conn
+                .query_row_with_params(select_sql, &[SqliteValue::Integer(id)])
+                .unwrap();
+            assert_eq!(row.values()[0], SqliteValue::Text(format!("u{id}").into()));
+        }
+
+        let delete_sql = "DELETE FROM sr_hot WHERE id = ?1";
+        for id in 1_i64..=4 {
+            let affected = conn
+                .execute_with_params(delete_sql, &[SqliteValue::Integer(id)])
+                .unwrap();
+            assert_eq!(affected, 1);
+        }
+        let remaining = conn
+            .query_row("SELECT COUNT(*) FROM sr_hot")
+            .unwrap();
+        assert_eq!(remaining.values()[0], SqliteValue::Integer(0));
+
         let profile = hot_path_profile_snapshot();
         assert!(
-            profile.parser.parse_cache_hits >= 4,
+            profile.parser.parse_cache_hits >= 8,
             "expected repeated ad-hoc execution to hit parse cache: {profile:?}"
         );
         assert!(
-            profile.parser.compiled_cache_hits >= 4,
-            "expected repeated ad-hoc execution to hit compiled cache: {profile:?}"
+            profile.parser.prepared_cache_hits >= 12,
+            "expected repeated ad-hoc execution to reuse prepared templates after warmup: {profile:?}"
+        );
+        assert!(
+            profile.parser.rewrite_calls <= 4,
+            "ad-hoc prepared reuse should bound rewrite work to one pass per statement family: {profile:?}"
+        );
+        assert!(
+            profile.parser.compiled_cache_misses <= 5,
+            "ad-hoc prepared reuse should bound compilation work to one miss per statement family, including the final COUNT(*) verification query: {profile:?}"
         );
     }
 
@@ -72422,6 +72588,29 @@ mod pager_routing_tests {
         );
 
         reset_hot_path_profile();
+        for id in 10_i64..=13 {
+            let affected = conn
+                .execute_with_params(
+                    "INSERT INTO bg_status (id, val) VALUES (?1, ?2)",
+                    &[
+                        SqliteValue::Integer(id),
+                        SqliteValue::Text(format!("adhoc{id}").into()),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(affected, 1);
+        }
+        let ad_hoc_insert_profile = hot_path_profile_snapshot();
+        assert_eq!(
+            ad_hoc_insert_profile.statement_dispatch_background_gates, 0,
+            "ad-hoc INSERT should bypass the legacy execute_statement() background-status gate after prepared reuse: {ad_hoc_insert_profile:?}"
+        );
+        assert!(
+            ad_hoc_insert_profile.parser.prepared_cache_hits >= 3,
+            "ad-hoc INSERT should reuse prepared templates after warmup: {ad_hoc_insert_profile:?}"
+        );
+
+        reset_hot_path_profile();
         for id in 1_i64..=4 {
             let row = conn
                 .query_row_with_params(
@@ -72435,6 +72624,53 @@ mod pager_routing_tests {
         assert_eq!(
             ad_hoc_select_profile.statement_dispatch_background_gates, 0,
             "ad-hoc SELECT should bypass the legacy execute_statement() background-status gate: {ad_hoc_select_profile:?}"
+        );
+        assert!(
+            ad_hoc_select_profile.parser.prepared_cache_hits >= 3,
+            "ad-hoc SELECT should reuse prepared templates after warmup: {ad_hoc_select_profile:?}"
+        );
+
+        reset_hot_path_profile();
+        for id in 10_i64..=13 {
+            let affected = conn
+                .execute_with_params(
+                    "UPDATE bg_status SET val = ?1 WHERE id = ?2",
+                    &[
+                        SqliteValue::Text(format!("upd{id}").into()),
+                        SqliteValue::Integer(id),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(affected, 1);
+        }
+        let ad_hoc_update_profile = hot_path_profile_snapshot();
+        assert_eq!(
+            ad_hoc_update_profile.statement_dispatch_background_gates, 0,
+            "ad-hoc UPDATE should bypass the legacy execute_statement() background-status gate after prepared reuse: {ad_hoc_update_profile:?}"
+        );
+        assert!(
+            ad_hoc_update_profile.parser.prepared_cache_hits >= 3,
+            "ad-hoc UPDATE should reuse prepared templates after warmup: {ad_hoc_update_profile:?}"
+        );
+
+        reset_hot_path_profile();
+        for id in 10_i64..=13 {
+            let affected = conn
+                .execute_with_params(
+                    "DELETE FROM bg_status WHERE id = ?1",
+                    &[SqliteValue::Integer(id)],
+                )
+                .unwrap();
+            assert_eq!(affected, 1);
+        }
+        let ad_hoc_delete_profile = hot_path_profile_snapshot();
+        assert_eq!(
+            ad_hoc_delete_profile.statement_dispatch_background_gates, 0,
+            "ad-hoc DELETE should bypass the legacy execute_statement() background-status gate after prepared reuse: {ad_hoc_delete_profile:?}"
+        );
+        assert!(
+            ad_hoc_delete_profile.parser.prepared_cache_hits >= 3,
+            "ad-hoc DELETE should reuse prepared templates after warmup: {ad_hoc_delete_profile:?}"
         );
     }
 

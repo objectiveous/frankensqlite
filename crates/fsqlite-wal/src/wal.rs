@@ -3041,7 +3041,11 @@ mod tests {
         let good_page = sample_page(0x11);
         wal.append_frame(&cx, 1, &good_page, 0)
             .expect("first append");
+        let checksum_before = wal.running_checksum();
         let scratch_cap_before = wal.frame_scratch_capacity();
+        let mut first_frame_before = vec![0u8; wal.frame_size()];
+        wal.read_frame_into(&cx, 0, &mut first_frame_before)
+            .expect("read baseline frame");
 
         // Batch with a bad page size — should fail.
         let bad_page = vec![0xBBu8; PAGE_SIZE as usize + 1];
@@ -3066,9 +3070,21 @@ mod tests {
             1,
             "failed append must not advance frame count"
         );
+        assert_eq!(
+            wal.running_checksum(),
+            checksum_before,
+            "failed append must preserve the running checksum of prior committed frames"
+        );
         assert!(
             wal.frame_scratch_capacity() >= scratch_cap_before,
             "scratch capacity must not shrink after error"
+        );
+        let mut first_frame_after = vec![0u8; wal.frame_size()];
+        wal.read_frame_into(&cx, 0, &mut first_frame_after)
+            .expect("read preserved frame");
+        assert_eq!(
+            first_frame_after, first_frame_before,
+            "failed append must not rewrite previously committed raw frame bytes"
         );
 
         // Recovery: subsequent valid append must succeed.

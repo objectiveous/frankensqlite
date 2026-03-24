@@ -872,7 +872,7 @@ dependencies = [
  "fsqlite-wal",
  "hashbrown 0.14.5",
  "lazy_static",
- "lru 0.12.5",
+ "lru",
  "proptest",
  "regex",
  "rusqlite",
@@ -1343,7 +1343,7 @@ dependencies = [
  "ftui-layout",
  "ftui-render",
  "ftui-style",
- "lru 0.16.3",
+ "lru",
  "ropey",
  "rustc-hash",
  "smallvec",
@@ -1887,15 +1887,6 @@ dependencies = [
  "scoped-tls",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "lru"
-version = "0.12.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
-dependencies = [
- "hashbrown 0.15.5",
 ]
 
 [[package]]

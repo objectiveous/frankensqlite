@@ -13640,7 +13640,18 @@ impl Connection {
         // Try the registered module registry first, then fall back to FTS5.
         let modules = self.vtab_modules.borrow();
         if let Some(factory) = modules.get(&module_key) {
-            let arg_strs: Vec<&str> = create.args.iter().map(String::as_str).collect();
+            // Build the args vector following the SQLite convention:
+            //   args[0] = module name
+            //   args[1] = database name ("main")
+            //   args[2] = table name
+            //   args[3..] = module arguments from the CREATE statement
+            let mut full_args: Vec<String> = vec![
+                create.module.clone(),
+                "main".to_owned(),
+                table_name.clone(),
+            ];
+            full_args.extend(create.args.iter().cloned());
+            let arg_strs: Vec<&str> = full_args.iter().map(String::as_str).collect();
             let cx = self.op_cx()?;
             let instance = factory.create(&cx, &arg_strs)?;
             drop(modules);

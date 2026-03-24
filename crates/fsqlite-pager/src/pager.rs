@@ -14863,4 +14863,137 @@ mod tests {
         );
         println!("END_BD_DB300_2_3_2_REPORT");
     }
+
+    // ── bd-db300.3.8.7: targeted regression tests for lock-scope narrowing ──
+
+    #[test]
+    fn test_read_page_from_wal_backend_uses_shared_lock_when_pinned() {
+        // Verify that read_page_from_wal_backend uses the read (shared)
+        // lock path when supports_pinned_reads() returns true.
+        use crate::traits::WalBackend;
+
+        let wal_backend: SharedWalBackend = new_shared_wal_backend();
+        let cx = Cx::new();
+        let page_no = PageNumber::new(1).unwrap();
+
+        // With no backend installed, read should return an error.
+        let result = read_page_from_wal_backend(&wal_backend, &cx, page_no);
+        assert!(
+            result.is_err(),
+            "bead_id=bd-db300.3.8.7 read_page_from_wal_backend should error without backend"
+        );
+
+        // Install a mock backend that does NOT support pinned reads.
+        let (mock, _frames, _begin, _batch) = MockWalBackend::new();
+        *wal_backend.write().unwrap() = Some(Box::new(mock));
+
+        // Verify it falls back to write-lock path (default read_page).
+        let result = read_page_from_wal_backend(&wal_backend, &cx, page_no);
+        assert!(
+            result.is_ok(),
+            "bead_id=bd-db300.3.8.7 fallback to write-lock read_page should succeed"
+        );
+
+        // The mock returns None for unwritten pages.
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "bead_id=bd-db300.3.8.7 unwritten page should return None"
+        );
+    }
+
+    #[test]
+    fn test_read_page_pinned_error_does_not_fall_back() {
+        // Verify that a REAL error from read_page_pinned propagates
+        // instead of silently falling back to the write-lock path.
+        use crate::traits::WalBackend;
+
+        /// A WAL backend that supports pinned reads but always returns an
+        /// error from read_page_pinned to simulate corruption.
+        struct CorruptPinnedReadBackend;
+
+        impl WalBackend for CorruptPinnedReadBackend {
+            fn begin_transaction(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn append_frame(
+                &mut self,
+                _cx: &Cx,
+                _page_number: u32,
+                _page_data: &[u8],
+                _db_size_if_commit: u32,
+            ) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn read_page(
+                &mut self,
+                _cx: &Cx,
+                _page_number: u32,
+            ) -> fsqlite_error::Result<Option<Vec<u8>>> {
+                // This should NEVER be called if pinned reads are supported
+                // and the pinned read fails with a real error.
+                panic!(
+                    "bead_id=bd-db300.3.8.7 MUST NOT fall back to read_page \
+                     when read_page_pinned returns a real error"
+                );
+            }
+
+            fn read_page_pinned(
+                &self,
+                _cx: &Cx,
+                _page_number: u32,
+            ) -> fsqlite_error::Result<Option<Vec<u8>>> {
+                Err(fsqlite_error::FrankenError::WalCorrupt {
+                    detail: "simulated corruption in pinned read".to_owned(),
+                })
+            }
+
+            fn supports_pinned_reads(&self) -> bool {
+                true
+            }
+
+            fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn frame_count(&self) -> usize {
+                0
+            }
+
+            fn checkpoint(
+                &mut self,
+                _cx: &Cx,
+                _mode: crate::traits::CheckpointMode,
+                _writer: &mut dyn crate::traits::CheckpointPageWriter,
+                _backfilled_frames: u32,
+                _oldest_reader_frame: Option<u32>,
+            ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
+                Ok(crate::traits::CheckpointResult {
+                    total_frames: 0,
+                    frames_backfilled: 0,
+                    completed: true,
+                    wal_was_reset: false,
+                })
+            }
+        }
+
+        let wal_backend: SharedWalBackend = new_shared_wal_backend();
+        *wal_backend.write().unwrap() = Some(Box::new(CorruptPinnedReadBackend));
+
+        let cx = Cx::new();
+        let page_no = PageNumber::new(1).unwrap();
+
+        let result = read_page_from_wal_backend(&wal_backend, &cx, page_no);
+        assert!(
+            result.is_err(),
+            "bead_id=bd-db300.3.8.7 real read_page_pinned error must propagate, not fall back"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err}").contains("corruption"),
+            "bead_id=bd-db300.3.8.7 error should be the corruption error, got: {err}"
+        );
+    }
 }

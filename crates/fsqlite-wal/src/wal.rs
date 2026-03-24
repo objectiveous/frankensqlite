@@ -1019,7 +1019,14 @@ impl<F: VfsFile> WalFile<F> {
 
         let mut frame_scratch = std::mem::take(&mut self.frame_scratch);
         frame_scratch.resize(total_bytes, 0);
+        // bd-db300.3.8.6: Fuse frame assembly + checksum computation into a
+        // single pass, eliminating the intermediate Vec<WalChecksumTransform>
+        // allocation and the redundant second write_wal_frame_salts call that
+        // finalize_prepared_frame_bytes performed.
         let append_result = (|| -> Result<()> {
+            let mut running_checksum = self.running_checksum;
+            let mut last_commit_offset: Option<usize> = None;
+
             for (idx, frame) in frames.iter().enumerate() {
                 if frame.page_data.len() != page_size {
                     return Err(FrankenError::WalCorrupt {
@@ -1035,19 +1042,32 @@ impl<F: VfsFile> WalFile<F> {
                     .ok_or(FrankenError::DatabaseFull)?;
                 let frame_slice = &mut frame_scratch[buf_offset..buf_offset + frame_size];
 
+                // Build the frame: page_number, db_size, salts, page data.
                 frame_slice[..4].copy_from_slice(&frame.page_number.to_be_bytes());
                 frame_slice[4..8].copy_from_slice(&frame.db_size_if_commit.to_be_bytes());
                 write_wal_frame_salts(&mut frame_slice[..WAL_FRAME_HEADER_SIZE], salts)?;
                 frame_slice[WAL_FRAME_HEADER_SIZE..].copy_from_slice(frame.page_data);
+
+                // Compute and write the checksum inline — no transform Vec needed.
+                running_checksum = write_wal_frame_checksum(
+                    frame_slice,
+                    page_size,
+                    running_checksum,
+                    big_endian_checksum,
+                )?;
+
+                if frame.db_size_if_commit != 0 {
+                    last_commit_offset = Some(idx);
+                }
             }
 
-            let frame_transforms = frame_scratch
-                .chunks_exact(frame_size)
-                .map(|frame| {
-                    WalChecksumTransform::for_wal_frame(frame, page_size, big_endian_checksum)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            self.append_prepared_frame_bytes(cx, &mut frame_scratch, &frame_transforms)
+            self.append_finalized_prepared_frame_bytes(
+                cx,
+                &frame_scratch,
+                frames.len(),
+                running_checksum,
+                last_commit_offset,
+            )
         })();
         self.frame_scratch = frame_scratch;
 

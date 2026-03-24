@@ -3891,29 +3891,30 @@ where
                     flush
                 };
 
-                let all_frames: Vec<&FrameSubmission> =
-                    batches.iter().flat_map(|batch| &batch.frames).collect();
-                let frame_refs: Vec<traits::WalFrameRef<'_>> = all_frames
-                    .iter()
-                    .map(|frame| traits::WalFrameRef {
-                        page_number: frame.page_number,
-                        page_data: &frame.page_data,
-                        db_size_if_commit: frame.db_size_if_commit,
-                    })
-                    .collect();
+                // bd-db300.3.8.6: Fused single-pass assembly — build frame_refs
+                // and compute final_db_size in one iteration over batches,
+                // eliminating the intermediate `all_frames` Vec allocation.
+                let batch_count = batches.len();
+                let total_frames: usize = batches.iter().map(|b| b.frames.len()).sum();
+                let mut frame_refs: Vec<traits::WalFrameRef<'_>> =
+                    Vec::with_capacity(total_frames);
+                let mut final_db_size = current_db_size;
+                for batch in &batches {
+                    for frame in &batch.frames {
+                        frame_refs.push(traits::WalFrameRef {
+                            page_number: frame.page_number,
+                            page_data: &frame.page_data,
+                            db_size_if_commit: frame.db_size_if_commit,
+                        });
+                        if frame.db_size_if_commit > final_db_size {
+                            final_db_size = frame.db_size_if_commit;
+                        }
+                    }
+                }
+                let frame_count = frame_refs.len();
 
                 let _prepared_batch =
                     with_wal_backend(wal_backend, |wal| wal.prepare_append_frames(&frame_refs))?;
-
-                let final_db_size = all_frames
-                    .iter()
-                    .map(|frame| frame.db_size_if_commit)
-                    .filter(|&size| size > 0)
-                    .max()
-                    .unwrap_or(current_db_size);
-
-                let batch_count = batches.len();
-                let frame_count = frame_refs.len();
                 GLOBAL_CONSOLIDATION_METRICS.transactions_batched.fetch_add(
                     u64::try_from(batch_count).unwrap_or(u64::MAX),
                     AtomicOrdering::Relaxed,

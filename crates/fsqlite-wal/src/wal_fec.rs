@@ -2168,7 +2168,8 @@ pub fn persist_wal_fec_raptorq_repair_symbols(sidecar_path: &Path, value: u8) ->
             let mut temp_file = std::io::BufWriter::new(fs::File::create(&temp_path)?);
             temp_file.write_all(&header.to_bytes())?;
             std::io::copy(&mut file, &mut temp_file)?;
-            temp_file.flush()?;
+            let inner = temp_file.into_inner().map_err(|e| e.into_error())?;
+            inner.sync_all()?;
             fs::rename(&temp_path, sidecar_path)?;
             Ok(())
         })();

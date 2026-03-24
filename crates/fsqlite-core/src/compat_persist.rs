@@ -753,7 +753,13 @@ fn extract_unique_constraint_indexes_from_sql(sql: &str, table_name: &str) -> Ve
                 key_sort_directions: vec![SortDirection::Asc],
                 where_clause: None,
                 is_unique: true,
-                key_collations: vec![],
+                key_collations: vec![column.constraints.iter().find_map(|constraint| {
+                    if let ColumnConstraintKind::Collate(name) = &constraint.kind {
+                        Some(name.clone())
+                    } else {
+                        None
+                    }
+                })],
             });
             autoindex_ordinal += 1;
         }
@@ -776,10 +782,21 @@ fn extract_unique_constraint_indexes_from_sql(sql: &str, table_name: &str) -> Ve
         {
             continue;
         }
-        let columns = indexed_columns
+        let Some(normalized_terms) = indexed_columns
             .iter()
-            .filter_map(indexed_column_name)
-            .map(str::to_owned)
+            .map(|indexed_column| {
+                Some((
+                    indexed_column_name(indexed_column)?.to_owned(),
+                    indexed_column_collation(indexed_column),
+                ))
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let columns = normalized_terms
+            .iter()
+            .map(|(column_name, _)| column_name.clone())
             .collect::<Vec<_>>();
         if columns.is_empty() {
             continue;
@@ -795,7 +812,10 @@ fn extract_unique_constraint_indexes_from_sql(sql: &str, table_name: &str) -> Ve
                 .collect(),
             where_clause: None,
             is_unique: true,
-            key_collations: vec![],
+            key_collations: normalized_terms
+                .into_iter()
+                .map(|(_, collation)| collation)
+                .collect(),
         });
         autoindex_ordinal += 1;
     }
@@ -1327,6 +1347,23 @@ fn indexed_column_name(indexed_column: &IndexedColumn) -> Option<&str> {
     }
 
     extract(&indexed_column.expr)
+}
+
+fn indexed_column_collation(indexed_column: &IndexedColumn) -> Option<String> {
+    fn extract(expr: &Expr) -> Option<&str> {
+        match expr {
+            Expr::Collate {
+                expr, collation, ..
+            } => extract(expr).or(Some(collation.as_str())),
+            Expr::Column(..) => None,
+            _ => None,
+        }
+    }
+
+    indexed_column
+        .collation
+        .clone()
+        .or_else(|| extract(&indexed_column.expr).map(str::to_owned))
 }
 
 fn hydrate_rowid_alias_value(

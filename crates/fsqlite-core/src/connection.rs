@@ -13318,7 +13318,7 @@ impl Connection {
                             key_sort_directions: vec![SortDirection::Asc],
                             where_clause: None,
                             is_unique: true,
-                            key_collations: vec![],
+                            key_collations: vec![col.collation.clone()],
                         });
                     }
                 }

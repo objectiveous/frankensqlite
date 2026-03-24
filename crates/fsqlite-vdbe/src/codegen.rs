@@ -208,9 +208,7 @@ impl IndexSchema {
     /// Return the collation sequence for the `key_pos`th key term, if any.
     #[must_use]
     pub fn key_term_collation(&self, key_pos: usize) -> Option<&str> {
-        self.key_collations
-            .get(key_pos)
-            .and_then(|c| c.as_deref())
+        self.key_collations.get(key_pos).and_then(|c| c.as_deref())
     }
 
     /// Whether planner / lookup fast paths may safely treat this as a simple
@@ -13360,7 +13358,7 @@ mod tests {
                 key_sort_directions: vec![],
                 where_clause: None,
                 is_unique: false,
-                key_collations: vec![],
+                key_collations: vec![Some("NOCASE".to_owned())],
             }],
             strict: false,
             without_rowid: false,
@@ -14601,6 +14599,7 @@ mod tests {
                     key_sort_directions: vec![],
                     where_clause: None,
                     is_unique: false,
+                    key_collations: vec![],
                 }],
                 strict: false,
                 without_rowid: false,

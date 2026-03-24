@@ -258,6 +258,31 @@ fn with_wal_backend_read<T>(
     f(wal)
 }
 
+enum WalReadLookup {
+    Ready(Option<Vec<u8>>),
+    NeedsWriteFallback,
+}
+
+fn read_page_from_wal_backend(
+    wal_backend: &SharedWalBackend,
+    cx: &Cx,
+    page_no: PageNumber,
+) -> Result<Option<Vec<u8>>> {
+    match with_wal_backend_read(wal_backend, |wal| {
+        if wal.supports_pinned_reads() {
+            wal.read_page_pinned(cx, page_no.get())
+                .map(WalReadLookup::Ready)
+        } else {
+            Ok(WalReadLookup::NeedsWriteFallback)
+        }
+    })? {
+        WalReadLookup::Ready(data) => Ok(data),
+        WalReadLookup::NeedsWriteFallback => {
+            with_wal_backend(wal_backend, |wal| wal.read_page(cx, page_no.get()))
+        }
+    }
+}
+
 /// Write access to WAL backend (append_frames, sync, set_wal_backend).
 fn with_wal_backend<T>(
     wal_backend: &SharedWalBackend,
@@ -438,22 +463,7 @@ impl<F: VfsFile> PagerInner<F> {
         // In WAL mode, check the WAL for the latest version of the page first.
         // bd-db300.3.8.7: try shared-lock path when the backend supports pinned reads.
         if self.journal_mode == JournalMode::Wal {
-            let wal_result = with_wal_backend_read(wal_backend, |wal| {
-                if wal.supports_pinned_reads() {
-                    wal.read_page_pinned(cx, page_no.get())
-                } else {
-                    // Pinned reads not available — signal fallback.
-                    Err(FrankenError::internal("pinned_reads_unavailable"))
-                }
-            });
-            let wal_data = match wal_result {
-                Ok(data) => data,
-                Err(_) => {
-                    // Fallback: take write lock for unpinned read.
-                    with_wal_backend(wal_backend, |wal| wal.read_page(cx, page_no.get()))?
-                }
-            };
-            if let Some(data) = wal_data {
+            if let Some(data) = read_page_from_wal_backend(wal_backend, cx, page_no)? {
                 return Ok(data);
             }
         }
@@ -508,18 +518,7 @@ impl<F: VfsFile> PagerInner<F> {
     ) -> Result<Vec<u8>> {
         // bd-db300.3.8.7: try shared-lock path first for WAL reads.
         if self.journal_mode == JournalMode::Wal {
-            let wal_result = with_wal_backend_read(wal_backend, |wal| {
-                if wal.supports_pinned_reads() {
-                    wal.read_page_pinned(cx, page_no.get())
-                } else {
-                    Err(FrankenError::internal("pinned_reads_unavailable"))
-                }
-            });
-            let wal_data = match wal_result {
-                Ok(data) => data,
-                Err(_) => with_wal_backend(wal_backend, |wal| wal.read_page(cx, page_no.get()))?,
-            };
-            if let Some(data) = wal_data {
+            if let Some(data) = read_page_from_wal_backend(wal_backend, cx, page_no)? {
                 return Ok(data);
             }
         }
@@ -4438,21 +4437,7 @@ where
 
         // WAL mode fast path: try shared-lock read first (bd-db300.3.8.7).
         if self.journal_mode == JournalMode::Wal {
-            let wal_data = match with_wal_backend_read(&self.wal_backend, |wal| {
-                if wal.supports_pinned_reads() {
-                    wal.read_page_pinned(cx, page_no.get())
-                } else {
-                    Err(FrankenError::internal("pinned_reads_unavailable"))
-                }
-            }) {
-                Ok(data) => data,
-                Err(_) => {
-                    // Fallback to write lock for unpinned reads.
-                    with_wal_backend(&self.wal_backend, |wal| wal.read_page(cx, page_no.get()))
-                        .unwrap_or(None)
-                }
-            };
-            if let Some(data) = wal_data {
+            if let Some(data) = read_page_from_wal_backend(&self.wal_backend, cx, page_no)? {
                 let page = PageData::from_vec(data);
                 self.txn_read_cache
                     .borrow_mut()

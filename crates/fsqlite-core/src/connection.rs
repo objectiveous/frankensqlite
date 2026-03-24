@@ -5946,7 +5946,8 @@ impl Connection {
     }
 
     fn ad_hoc_query_supports_prepared_reuse(&self, statement: &Statement) -> bool {
-        matches!(statement, Statement::Select(_)) && !self.prepared_select_requires_dispatch(statement)
+        matches!(statement, Statement::Select(_))
+            && !self.prepared_select_requires_dispatch(statement)
     }
 
     fn ad_hoc_execute_supports_prepared_reuse(&self, statement: &Statement) -> Result<bool> {
@@ -5964,14 +5965,14 @@ impl Connection {
                 );
                 Ok(is_simple_values && !self.prepared_insert_requires_deferred_dispatch(insert)?)
             }
-            Statement::Update(update) => Ok(
-                Self::prepared_update_supports_precompiled_program(update)
-                    && !self.prepared_update_requires_deferred_dispatch(update)?,
-            ),
-            Statement::Delete(delete) => Ok(
-                Self::prepared_delete_supports_precompiled_program(delete)
-                    && !self.prepared_delete_requires_deferred_dispatch(delete)?,
-            ),
+            Statement::Update(update) => {
+                Ok(Self::prepared_update_supports_precompiled_program(update)
+                    && !self.prepared_update_requires_deferred_dispatch(update)?)
+            }
+            Statement::Delete(delete) => {
+                Ok(Self::prepared_delete_supports_precompiled_program(delete)
+                    && !self.prepared_delete_requires_deferred_dispatch(delete)?)
+            }
             _ => Ok(false),
         }
     }
@@ -6130,7 +6131,8 @@ impl Connection {
                 path = "slow",
                 reason = "deferred_query_statement",
             );
-            return self.execute_statement_after_background_status(statement.as_ref(), Some(params));
+            return self
+                .execute_statement_after_background_status(statement.as_ref(), Some(params));
         }
         FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
         tracing::debug!(
@@ -72516,9 +72518,7 @@ mod pager_routing_tests {
                 .unwrap();
             assert_eq!(affected, 1);
         }
-        let remaining = conn
-            .query_row("SELECT COUNT(*) FROM sr_hot")
-            .unwrap();
+        let remaining = conn.query_row("SELECT COUNT(*) FROM sr_hot").unwrap();
         assert_eq!(remaining.values()[0], SqliteValue::Integer(0));
 
         let profile = hot_path_profile_snapshot();

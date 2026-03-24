@@ -31,7 +31,21 @@ BEAD_ID="${BEAD_ID:-bd-db300.1.7.2}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-OUTPUT_DIR="${1:-${PROJECT_ROOT}/artifacts/persistent_phase_pack_${TIMESTAMP}}"
+resolve_output_dir() {
+    local requested_path="$1"
+    local absolute_path="$requested_path"
+    # Criterion benches run from the package directory, so the capture env must be absolute.
+    if [[ "$absolute_path" != /* ]]; then
+        absolute_path="${PROJECT_ROOT}/${absolute_path}"
+    fi
+    mkdir -p "$absolute_path"
+    (
+        cd "$absolute_path"
+        pwd -P
+    )
+}
+
+OUTPUT_DIR="$(resolve_output_dir "${1:-artifacts/persistent_phase_pack_${TIMESTAMP}}")"
 PROVENANCE_DIR="${OUTPUT_DIR}/provenance"
 SCORECARD_JSON="${OUTPUT_DIR}/persistent_scorecard.json"
 MANIFEST_JSON="${OUTPUT_DIR}/persistent_pack_manifest.json"
@@ -49,7 +63,7 @@ TAIL_COLLAPSE_MAX_US="${TAIL_COLLAPSE_MAX_US:-2000000}"
 PHASE_B_COLLAPSE_P99_US="${PHASE_B_COLLAPSE_P99_US:-250000}"
 WAL_APPEND_COLLAPSE_P99_US="${WAL_APPEND_COLLAPSE_P99_US:-250000}"
 
-mkdir -p "$OUTPUT_DIR" "$PROVENANCE_DIR"
+mkdir -p "$PROVENANCE_DIR"
 IFS=',' read -ra THREAD_COUNTS <<< "$THREAD_COUNTS_CSV"
 
 write_environment_provenance() {

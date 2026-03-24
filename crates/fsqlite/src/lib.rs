@@ -21,6 +21,11 @@ pub mod session {
     };
 }
 
+#[cfg(feature = "async-api")]
+pub mod async_api;
+#[cfg(feature = "async-api")]
+pub use async_api::AsyncConnection;
+
 pub mod compat;
 pub mod migrate;
 

@@ -33,6 +33,7 @@ rtree = ["dep:fsqlite-ext-rtree"]
 session = ["dep:fsqlite-ext-session"]
 icu = ["dep:fsqlite-ext-icu"]
 misc = ["dep:fsqlite-ext-misc"]
+async-api = ["fsqlite-types/native"]
 raptorq = []
 mvcc = []
 

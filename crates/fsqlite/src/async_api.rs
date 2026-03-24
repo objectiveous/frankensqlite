@@ -35,7 +35,9 @@
 
 use crate::{Connection, ConnectionEnv, FrankenError, Row, SqliteValue};
 use fsqlite_types::cx::Cx;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 
 // ---------------------------------------------------------------------------
@@ -175,8 +177,8 @@ where
 // Worker thread
 // ---------------------------------------------------------------------------
 
-fn worker_loop(conn: Connection, rx: mpsc::Receiver<Command>) {
-    for cmd in rx {
+fn worker_loop(mut conn: Connection, rx: mpsc::Receiver<Command>) {
+    while let Ok(cmd) = rx.recv() {
         match cmd {
             Command::Query { sql, tx } => {
                 let _ = tx.send(conn.query(&sql));
@@ -209,14 +211,12 @@ fn worker_loop(conn: Connection, rx: mpsc::Receiver<Command>) {
                 let _ = tx.send(conn.rollback_transaction());
             }
             Command::Close { tx } => {
-                // Consume the command receiver so no more commands arrive,
-                // then close the connection.
-                drop(rx);
-                let _ = tx.send(conn.close());
+                // Close the connection explicitly (rolls back any active txn,
+                // runs a passive WAL checkpoint).
+                let _ = tx.send(conn.close_in_place());
                 return;
             }
             Command::Shutdown => {
-                drop(conn);
                 return;
             }
         }
@@ -266,6 +266,11 @@ fn send_err<T>(_: mpsc::SendError<T>) -> FrankenError {
 pub struct AsyncConnection {
     cmd_tx: Option<mpsc::SyncSender<Command>>,
     worker: Option<thread::JoinHandle<()>>,
+    /// Tracks whether the worker thread's connection has an active transaction.
+    /// Updated by `begin_transaction`, `commit_transaction`, and
+    /// `rollback_transaction` to allow `in_transaction()` to be a cheap local
+    /// read without a round-trip to the worker.
+    in_txn: Arc<AtomicBool>,
 }
 
 impl AsyncConnection {
@@ -278,6 +283,51 @@ impl AsyncConnection {
         Caps: fsqlite_types::cx::cap::SubsetOf<fsqlite_types::cx::cap::All>,
     {
         Self::open_with_env(cx, path, ConnectionEnv::default()).await
+    }
+
+    /// Open a database connection without a capability context (convenience).
+    ///
+    /// Equivalent to calling [`Connection::open`] and wrapping the result.
+    /// No cancellation check is performed.
+    pub fn open_sync(path: impl Into<String>) -> Result<Self, FrankenError> {
+        Self::open_sync_with_env(path, ConnectionEnv::default())
+    }
+
+    /// Open a database connection without a capability context, with a custom
+    /// [`ConnectionEnv`].
+    pub fn open_sync_with_env(
+        path: impl Into<String>,
+        env: ConnectionEnv,
+    ) -> Result<Self, FrankenError> {
+        let path = path.into();
+        let (open_tx, open_rx) = mpsc::sync_channel::<Result<(), FrankenError>>(1);
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(32);
+
+        let thread_name = format!("fsqlite-async-worker:{path}");
+        let worker = thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || match Connection::open_with_env(path, env) {
+                Ok(conn) => {
+                    let _ = open_tx.send(Ok(()));
+                    worker_loop(conn, cmd_rx);
+                }
+                Err(e) => {
+                    let _ = open_tx.send(Err(e));
+                }
+            })
+            .map_err(|e| FrankenError::Internal(format!("failed to spawn worker thread: {e}")))?;
+
+        // Block on the open result (sync path, no async executor needed).
+        open_rx
+            .recv()
+            .map_err(|_| {
+                FrankenError::Internal("worker thread terminated during open".to_owned())
+            })?
+            .map(|()| Self {
+                cmd_tx: Some(cmd_tx),
+                worker: Some(worker),
+                in_txn: Arc::new(AtomicBool::new(false)),
+            })
     }
 
     /// Open a database connection with an explicit [`ConnectionEnv`].
@@ -298,17 +348,16 @@ impl AsyncConnection {
         let (open_tx, open_rx) = mpsc::sync_channel::<Result<(), FrankenError>>(1);
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(32);
 
+        let thread_name = format!("fsqlite-async-worker:{path}");
         let worker = thread::Builder::new()
-            .name(format!("fsqlite-async-worker:{}", path))
-            .spawn(move || {
-                match Connection::open_with_env(path, env) {
-                    Ok(conn) => {
-                        let _ = open_tx.send(Ok(()));
-                        worker_loop(conn, cmd_rx);
-                    }
-                    Err(e) => {
-                        let _ = open_tx.send(Err(e));
-                    }
+            .name(thread_name)
+            .spawn(move || match Connection::open_with_env(path, env) {
+                Ok(conn) => {
+                    let _ = open_tx.send(Ok(()));
+                    worker_loop(conn, cmd_rx);
+                }
+                Err(e) => {
+                    let _ = open_tx.send(Err(e));
                 }
             })
             .map_err(|e| FrankenError::Internal(format!("failed to spawn worker thread: {e}")))?;
@@ -320,6 +369,7 @@ impl AsyncConnection {
         Ok(Self {
             cmd_tx: Some(cmd_tx),
             worker: Some(worker),
+            in_txn: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -489,7 +539,11 @@ impl AsyncConnection {
         self.sender()?
             .send(Command::BeginTransaction { tx })
             .map_err(send_err)?;
-        OneshotFuture::new(rx).await?
+        let result: Result<(), FrankenError> = OneshotFuture::new(rx).await?;
+        if result.is_ok() {
+            self.in_txn.store(true, Ordering::Release);
+        }
+        result
     }
 
     /// Commit the active transaction.
@@ -505,7 +559,11 @@ impl AsyncConnection {
         self.sender()?
             .send(Command::CommitTransaction { tx })
             .map_err(send_err)?;
-        OneshotFuture::new(rx).await?
+        let result: Result<(), FrankenError> = OneshotFuture::new(rx).await?;
+        if result.is_ok() {
+            self.in_txn.store(false, Ordering::Release);
+        }
+        result
     }
 
     /// Roll back the active transaction.
@@ -521,7 +579,19 @@ impl AsyncConnection {
         self.sender()?
             .send(Command::RollbackTransaction { tx })
             .map_err(send_err)?;
-        OneshotFuture::new(rx).await?
+        let result: Result<(), FrankenError> = OneshotFuture::new(rx).await?;
+        if result.is_ok() {
+            self.in_txn.store(false, Ordering::Release);
+        }
+        result
+    }
+
+    /// Returns `true` if an explicit transaction is currently active.
+    ///
+    /// This is a cheap local read — no round-trip to the worker thread.
+    #[must_use]
+    pub fn in_transaction(&self) -> bool {
+        self.in_txn.load(Ordering::Acquire)
     }
 
     /// Explicitly close the connection, returning any error from the close operation.

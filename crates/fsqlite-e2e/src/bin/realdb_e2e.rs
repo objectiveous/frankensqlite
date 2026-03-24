@@ -5898,6 +5898,10 @@ fn quote_ident(name: &str) -> String {
 fn cargo_profile_name() -> &'static str {
     if cfg!(debug_assertions) {
         "dev"
+    } else if option_env!("OPT_LEVEL") == Some("3") {
+        // release-perf inherits release but sets opt-level = 3.
+        // Plain release uses opt-level = "z".
+        "release-perf"
     } else {
         "release"
     }

@@ -443,6 +443,59 @@ collector records the declared placement profile but does not enforce remote CPU
 or memory placement on your behalf; those packs are marked as declared-only
 until the operator supplies external placement enforcement.
 
+### Persistent Phase-Attribution Packs
+
+`bd-db300.1.7.2` uses the persistent Criterion harness, not `realdb-e2e bench`.
+The authoritative replay surface is
+`crates/fsqlite-e2e/benches/concurrent_write_persistent_bench.rs`, which
+exposes the `persistent_concurrent_write_8t` and
+`persistent_concurrent_write_16t` groups directly.
+
+When local load is noisy and `rch` is healthy, split the workflow into remote
+compile plus local execution:
+
+```bash
+# 1. Offload only the compile step.
+rch exec -- cargo build --profile release-perf -p fsqlite-e2e --bench concurrent_write_persistent_bench
+
+# 2. Resolve the locally synced bench executable.
+BENCH_BIN="$(find target/release-perf/deps -maxdepth 1 -type f -perm -111 -name 'concurrent_write_persistent_bench-*' | head -n 1)"
+test -n "$BENCH_BIN"
+
+# 3. Execute the measured runs locally on the operator host.
+RUN_ID="bd-db300.1.7.2-$(date -u +%Y%m%dT%H%M%SZ)"
+PACK_ROOT="artifacts/perf/bd-db300.1.7.2/$RUN_ID"
+mkdir -p "$PACK_ROOT"/{8t,16t}
+
+FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR="$PACK_ROOT/8t" \
+  "$BENCH_BIN" persistent_concurrent_write_8t \
+  2>&1 | tee "$PACK_ROOT/8t/bench.log"
+
+FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR="$PACK_ROOT/16t" \
+  "$BENCH_BIN" persistent_concurrent_write_16t \
+  2>&1 | tee "$PACK_ROOT/16t/bench.log"
+```
+
+Do not route this pack through `realdb-e2e bench --threads ...`; that CLI does
+not own the persistent Criterion harness and its contract is comparative matrix
+replay, not the commit-path phase pack.
+
+Replay and comparator contract for authoritative publication:
+
+- Use the same-pack `sqlite3` and `fsqlite_mvcc` rows emitted into each
+  `samples.jsonl` as the direct comparator for that thread regime.
+- Treat `artifacts/perf/2026-03-23-local/persistent_8t.log` and
+  `artifacts/perf/2026-03-23-local/persistent_16t_fsqlite_only.log` as
+  historical references only, not as the comparator of record.
+- Preserve `provenance.json`, `samples.jsonl`, `bench.log`, a pack-level
+  `rerun.sh`, the current commit SHA, the `.beads/issues.jsonl` hash, cargo
+  profile, and the matching hardware-discovery bundle.
+- `samples.jsonl` currently records every completed Criterion batched iteration.
+  That means warmup and measurement iterations are mixed unless the harness or
+  wrapper annotates them explicitly. Do not present the pack as authoritative
+  without either separating those phases or calling out that limitation in the
+  pack summary/manifest.
+
 ### Run Library Benchmarks (Unit Tests)
 
 ```bash

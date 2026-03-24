@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 # bd-db300.1.7.1: Capture authoritative c1 hot-path artifact packs.
 #
-# Captures release-perf artifact packs for the worst low-concurrency cells:
-# - commutative_inserts_disjoint_keys c1 (0.205x — worst)
-# - hot_page_contention c1 (0.633x)
-# - mixed_read_write c1 (3.519x — already winning, included for comparison)
+# Captures release-perf artifact packs for the worst low-concurrency cells
+# across ALL canonical fixtures and workloads.
 #
-# Runs both FrankenSQLite (MVCC + single-writer) and C SQLite as control.
+# Runs C SQLite control, FrankenSQLite MVCC, and FrankenSQLite single-writer
+# at c1 for each fixture, plus per-fixture hot-path profiles for the worst
+# workload (commutative_inserts_disjoint_keys).
 #
 # Usage:
-#   ./scripts/capture_c1_evidence_pack.sh [--output-dir DIR]
+#   ./scripts/capture_c1_evidence_pack.sh [OUTPUT_DIR]
+#
+# Environment overrides:
+#   CARGO_TARGET_DIR  — target directory for the release-perf binary
+#   DB_FIXTURES       — comma-separated fixture list (default: all 3 canonical)
+#   REPEAT            — measurement iterations per cell (default: 3)
 #
 # Requirements:
-#   - Build with: cargo build --profile release-perf -p fsqlite-e2e
-#   - Or: CARGO_TARGET_DIR=/tmp/c1-evidence cargo build --profile release-perf -p fsqlite-e2e
+#   Build first, or let the script build:
+#     CARGO_TARGET_DIR=/tmp/c1-evidence cargo build --profile release-perf -p fsqlite-e2e
 
 set -euo pipefail
 
@@ -27,6 +32,7 @@ mkdir -p "$OUTPUT_DIR"
 cat > "$OUTPUT_DIR/build_metadata.json" << METADATA
 {
   "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "bead": "bd-db300.1.7.1",
   "profile": "release-perf",
   "hostname": "$(hostname)",
   "rustc_version": "$(rustc --version)",
@@ -53,61 +59,76 @@ fi
 # Canonical workloads for c1 evidence.
 WORKLOADS="commutative_inserts_disjoint_keys,hot_page_contention,mixed_read_write"
 CONCURRENCY="1"
-REPEAT="3"
-# Canonical fixtures from beads_benchmark_campaign.v1.json:
-# frankensqlite (~11MB), frankentui (~18MB), frankensearch
-# Use first fixture by default for focused c1 evidence.
-DB_FIXTURE="${DB_FIXTURE:-frankensqlite}"
+REPEAT="${REPEAT:-3}"
+# Canonical fixtures from beads_benchmark_campaign.v1.json.
+# Override with DB_FIXTURES="frankensqlite" for a single-fixture run.
+DB_FIXTURES="${DB_FIXTURES:-frankensqlite,frankentui,frankensearch}"
 
-echo "--- C SQLite control (c1, fixture=$DB_FIXTURE) ---"
-"$BINARY" bench \
-    --db "$DB_FIXTURE" \
-    --preset "$WORKLOADS" \
-    --concurrency "$CONCURRENCY" \
-    --engine sqlite3 \
-    --repeat "$REPEAT" \
-    --output-jsonl "$OUTPUT_DIR/c1_sqlite3.jsonl" \
-    --pretty 2>&1 | tee "$OUTPUT_DIR/c1_sqlite3_stdout.log"
+IFS=',' read -ra FIXTURE_ARRAY <<< "$DB_FIXTURES"
 
-echo ""
-echo "--- FrankenSQLite MVCC (c1, fixture=$DB_FIXTURE) ---"
-"$BINARY" bench \
-    --db "$DB_FIXTURE" \
-    --preset "$WORKLOADS" \
-    --concurrency "$CONCURRENCY" \
-    --engine fsqlite \
-    --mvcc \
-    --repeat "$REPEAT" \
-    --output-jsonl "$OUTPUT_DIR/c1_fsqlite_mvcc.jsonl" \
-    --pretty 2>&1 | tee "$OUTPUT_DIR/c1_fsqlite_mvcc_stdout.log"
+for DB_FIXTURE in "${FIXTURE_ARRAY[@]}"; do
+    echo "====== Fixture: $DB_FIXTURE ======"
 
-echo ""
-echo "--- FrankenSQLite single-writer (c1, fixture=$DB_FIXTURE) ---"
-"$BINARY" bench \
-    --db "$DB_FIXTURE" \
-    --preset "$WORKLOADS" \
-    --concurrency "$CONCURRENCY" \
-    --engine fsqlite \
-    --no-mvcc \
-    --repeat "$REPEAT" \
-    --output-jsonl "$OUTPUT_DIR/c1_fsqlite_single.jsonl" \
-    --pretty 2>&1 | tee "$OUTPUT_DIR/c1_fsqlite_single_stdout.log"
+    echo "--- C SQLite control (c1, fixture=$DB_FIXTURE) ---"
+    "$BINARY" bench \
+        --db "$DB_FIXTURE" \
+        --preset "$WORKLOADS" \
+        --concurrency "$CONCURRENCY" \
+        --engine sqlite3 \
+        --repeat "$REPEAT" \
+        --output-jsonl "$OUTPUT_DIR/c1_${DB_FIXTURE}_sqlite3.jsonl" \
+        --pretty 2>&1 | tee "$OUTPUT_DIR/c1_${DB_FIXTURE}_sqlite3_stdout.log"
 
-echo ""
-echo "--- Hot-path profile (c1, worst cell: commutative_inserts_disjoint_keys) ---"
-"$BINARY" hot-profile \
-    --db "$DB_FIXTURE" \
-    --preset "commutative_inserts_disjoint_keys" \
-    --concurrency 1 \
-    --mvcc \
-    --pretty 2>&1 | tee "$OUTPUT_DIR/c1_hotprofile_commutative.log"
+    echo ""
+    echo "--- FrankenSQLite MVCC (c1, fixture=$DB_FIXTURE) ---"
+    "$BINARY" bench \
+        --db "$DB_FIXTURE" \
+        --preset "$WORKLOADS" \
+        --concurrency "$CONCURRENCY" \
+        --engine fsqlite \
+        --mvcc \
+        --repeat "$REPEAT" \
+        --output-jsonl "$OUTPUT_DIR/c1_${DB_FIXTURE}_fsqlite_mvcc.jsonl" \
+        --pretty 2>&1 | tee "$OUTPUT_DIR/c1_${DB_FIXTURE}_fsqlite_mvcc_stdout.log"
 
-echo ""
+    echo ""
+    echo "--- FrankenSQLite single-writer (c1, fixture=$DB_FIXTURE) ---"
+    "$BINARY" bench \
+        --db "$DB_FIXTURE" \
+        --preset "$WORKLOADS" \
+        --concurrency "$CONCURRENCY" \
+        --engine fsqlite \
+        --no-mvcc \
+        --repeat "$REPEAT" \
+        --output-jsonl "$OUTPUT_DIR/c1_${DB_FIXTURE}_fsqlite_single.jsonl" \
+        --pretty 2>&1 | tee "$OUTPUT_DIR/c1_${DB_FIXTURE}_fsqlite_single_stdout.log"
+
+    echo ""
+
+    # Hot-path profile for worst workload on THIS fixture.
+    HP_DIR="$OUTPUT_DIR/hotprofile_${DB_FIXTURE}_commutative_c1"
+    mkdir -p "$HP_DIR"
+    echo "--- Hot-path profile (c1, commutative_inserts_disjoint_keys, fixture=$DB_FIXTURE) ---"
+    "$BINARY" hot-profile \
+        --db "$DB_FIXTURE" \
+        --preset "commutative_inserts_disjoint_keys" \
+        --concurrency 1 \
+        --mvcc \
+        --output-dir "$HP_DIR" \
+        --pretty 2>&1 | tee "$OUTPUT_DIR/c1_${DB_FIXTURE}_hotprofile_commutative.log"
+
+    echo ""
+done
+
 echo "=== Evidence pack complete: $OUTPUT_DIR ==="
 echo "Files:"
 ls -la "$OUTPUT_DIR/"
 echo ""
-echo "To analyze:"
-echo "  cat $OUTPUT_DIR/c1_sqlite3.jsonl | python3 -m json.tool"
-echo "  cat $OUTPUT_DIR/c1_fsqlite_mvcc.jsonl | python3 -m json.tool"
-echo "  diff $OUTPUT_DIR/c1_sqlite3.jsonl $OUTPUT_DIR/c1_fsqlite_mvcc.jsonl"
+echo "To analyze (example for frankensqlite):"
+echo "  cat $OUTPUT_DIR/c1_frankensqlite_sqlite3.jsonl | python3 -m json.tool"
+echo "  cat $OUTPUT_DIR/c1_frankensqlite_fsqlite_mvcc.jsonl | python3 -m json.tool"
+echo ""
+echo "Hot-path profile artifacts per fixture:"
+for DB_FIXTURE in "${FIXTURE_ARRAY[@]}"; do
+    echo "  $OUTPUT_DIR/hotprofile_${DB_FIXTURE}_commutative_c1/"
+done

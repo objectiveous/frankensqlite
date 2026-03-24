@@ -7533,9 +7533,9 @@ impl Connection {
                 } else if (has_group_by(select)
                     || has_implicit_aggregation(select)
                     || ordered_aggregate)
-                    && (has_joins(select) || has_fallback_from_source(select))
+                    && (has_joins(select) || has_fallback_from_source(select) || self.has_primary_live_vtab_source(select))
                 {
-                    // GROUP BY (or implicit aggregation) + JOIN/non-table source:
+                    // GROUP BY (or implicit aggregation) + JOIN/non-table source/live vtab:
                     // materialize the join as a temp table, then GROUP BY on that.
                     self.log_mem_execution_fallback("select", "group_by_join_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
@@ -26166,7 +26166,9 @@ impl Connection {
             *self.db.borrow_mut() = MemDatabase::new();
             self.schema.borrow_mut().clear();
             self.views.borrow_mut().clear();
-            self.triggers.borrow_mut().clear();
+            // Preserve TEMP triggers even when the database is empty — they are
+            // connection-local and must survive memdb reloads.
+            self.triggers.borrow_mut().retain(|t| t.temporary);
             self.rowid_alias_columns.borrow_mut().clear();
             self.autoincrement_tables.borrow_mut().clear();
             self.sqlite_sequence_cache.borrow_mut().clear();
@@ -26672,6 +26674,17 @@ impl Connection {
         *self.db.borrow_mut() = new_db;
         *self.schema.borrow_mut() = new_schema;
         *self.views.borrow_mut() = new_views;
+        // Preserve TEMP triggers across memdb reloads — they are connection-local
+        // and not persisted to sqlite_master, so they would be lost if we simply
+        // replaced the trigger list with what was loaded from the pager.
+        {
+            let old_triggers = self.triggers.borrow();
+            for trigger in old_triggers.iter() {
+                if trigger.temporary {
+                    new_triggers.push(trigger.clone());
+                }
+            }
+        }
         *self.triggers.borrow_mut() = new_triggers;
         *self.rowid_alias_columns.borrow_mut() = new_alias_map;
         *self.autoincrement_tables.borrow_mut() = new_autoincrement_tables;
@@ -70971,6 +70984,7 @@ mod pager_routing_tests {
 
     #[test]
     fn test_prepared_file_backed_insert_reuses_schema_bound_publication_for_autocommit_begin() {
+        let _serial = super::fsqlite_core_test_serializer();
         let _profile_guard = StatementReuseHotPathProfileGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("prepared_insert_publication_reuse.db");
@@ -71033,6 +71047,7 @@ mod pager_routing_tests {
 
     #[test]
     fn test_prepared_file_backed_single_writer_insert_reuses_schema_bound_publication() {
+        let _serial = super::fsqlite_core_test_serializer();
         let _profile_guard = StatementReuseHotPathProfileGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir
@@ -71252,6 +71267,7 @@ mod pager_routing_tests {
 
     #[test]
     fn test_prepared_insert_reuses_table_engine_after_first_execution() {
+        let _serial = super::fsqlite_core_test_serializer();
         let _profile_guard = StatementReuseHotPathProfileGuard::new();
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE prep_engine_reuse (id INTEGER PRIMARY KEY, val TEXT);")
@@ -71305,6 +71321,7 @@ mod pager_routing_tests {
 
     #[test]
     fn test_prepared_update_reuses_table_engine_after_first_execution() {
+        let _serial = super::fsqlite_core_test_serializer();
         let _profile_guard = StatementReuseHotPathProfileGuard::new();
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE prep_update_engine_reuse (id INTEGER PRIMARY KEY, val TEXT);")
@@ -71357,6 +71374,7 @@ mod pager_routing_tests {
 
     #[test]
     fn test_prepared_delete_reuses_table_engine_after_first_execution() {
+        let _serial = super::fsqlite_core_test_serializer();
         let _profile_guard = StatementReuseHotPathProfileGuard::new();
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE prep_delete_engine_reuse (id INTEGER PRIMARY KEY, val TEXT);")
@@ -71521,6 +71539,7 @@ mod pager_routing_tests {
 
     #[test]
     fn test_prepared_delete_fast_path_rechecks_foreign_key_pragma_dynamically() {
+        let _serial = super::fsqlite_core_test_serializer();
         let _profile_guard = StatementReuseHotPathProfileGuard::new();
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("PRAGMA foreign_keys = OFF;").unwrap();

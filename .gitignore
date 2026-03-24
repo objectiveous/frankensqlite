@@ -242,3 +242,10 @@ tmp_rch_probe/
 __CHANGESET__
 __PATCHSET__
 .codex-target-arc/
+
+# Ephemeral agent-generated scratch files at repo root
+.beads_recovery/
+/C[0-9]*
+/D[0-9]*
+db300_*.toml
+librust_out.rlib

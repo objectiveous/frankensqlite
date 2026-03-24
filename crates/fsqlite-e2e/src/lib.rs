@@ -33,6 +33,7 @@ pub mod methodology;
 pub mod mismatch_artifacts;
 pub mod oplog;
 pub mod perf_runner;
+pub mod persistent_phase_audit;
 pub mod recording;
 pub mod recovery_demo;
 pub mod recovery_runner;

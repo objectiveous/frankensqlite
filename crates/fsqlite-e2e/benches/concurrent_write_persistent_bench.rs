@@ -51,6 +51,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use fsqlite::{FrankenError, SqliteValue};
+use fsqlite_e2e::persistent_phase_audit::{
+    PersistentLatencySummary, PersistentOperationTiming, PersistentOperationWallTimeAudit,
+    PersistentRetryStageCounts, build_measured_commit_sub_buckets, build_operation_wall_time_audit,
+    format_operation_wall_time_audit, percentile, persistent_latency_summary,
+    sleep_with_accounting,
+};
 use fsqlite_wal::ConsolidationMetricsSnapshot;
 use serde::Serialize;
 
@@ -60,8 +66,8 @@ const MAX_TXN_RETRIES: u32 = 100;
 const PERSISTENT_PHASE_CAPTURE_DIR_ENV: &str = "FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR";
 const PERSISTENT_PHASE_CAPTURE_PROVENANCE_SCHEMA_V1: &str =
     "fsqlite-e2e.persistent_phase_capture_provenance.v1";
-const PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V1: &str =
-    "fsqlite-e2e.persistent_phase_capture_sample.v1";
+const PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V2: &str =
+    "fsqlite-e2e.persistent_phase_capture_sample.v2";
 
 // ─── PRAGMA helpers ─────────────────────────────────────────────────────
 
@@ -156,15 +162,6 @@ struct PersistentPhaseCaptureProvenance {
     criterion_emission_scope: &'static str,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
-struct PersistentLatencySummary {
-    sample_count: u64,
-    p50_us: u64,
-    p95_us: u64,
-    p99_us: u64,
-    max_us: u64,
-}
-
 #[derive(Debug, Clone, Serialize)]
 struct PersistentPhaseCaptureSample {
     schema_version: &'static str,
@@ -177,6 +174,7 @@ struct PersistentPhaseCaptureSample {
     rows_per_thread: i64,
     total_rows: u64,
     latency_us: PersistentLatencySummary,
+    operation_wall_time_audit: Option<PersistentOperationWallTimeAudit>,
     phase_metrics: Option<ConsolidationMetricsSnapshot>,
     phase_timing_report: Option<String>,
     flusher_lock_wait_fraction_basis_points: Option<u64>,
@@ -232,20 +230,6 @@ fn ensure_persistent_phase_capture_provenance(output_dir: &Path) -> std::io::Res
     fs::write(provenance_path, payload.as_bytes())
 }
 
-fn duration_micros_u64(duration: Duration) -> u64 {
-    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
-}
-
-fn persistent_latency_summary(sorted: &[Duration]) -> PersistentLatencySummary {
-    PersistentLatencySummary {
-        sample_count: u64::try_from(sorted.len()).unwrap_or(u64::MAX),
-        p50_us: duration_micros_u64(percentile(sorted, 50.0)),
-        p95_us: duration_micros_u64(percentile(sorted, 95.0)),
-        p99_us: duration_micros_u64(percentile(sorted, 99.0)),
-        max_us: duration_micros_u64(sorted.last().copied().unwrap_or(Duration::ZERO)),
-    }
-}
-
 fn unix_timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -296,16 +280,6 @@ fn maybe_write_persistent_phase_capture(sample: &PersistentPhaseCaptureSample) {
     }
 }
 
-/// Compute percentiles from a sorted slice of latencies.
-fn percentile(sorted: &[Duration], pct: f64) -> Duration {
-    if sorted.is_empty() {
-        return Duration::ZERO;
-    }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let idx = ((pct / 100.0) * (sorted.len() - 1) as f64).round() as usize;
-    sorted[idx.min(sorted.len() - 1)]
-}
-
 // ─── C SQLite concurrent writers (file-backed WAL) ──────────────────────
 
 fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, label: &str) {
@@ -341,9 +315,17 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
             },
             |(_tmp, path, retry_count)| {
                 let barrier = Arc::new(Barrier::new(n_threads));
-                let latencies: Arc<Vec<std::sync::Mutex<Vec<Duration>>>> = Arc::new(
+                let operation_timings: Arc<Vec<std::sync::Mutex<Vec<PersistentOperationTiming>>>> =
+                    Arc::new(
                     (0..n_threads)
                         .map(|_| std::sync::Mutex::new(Vec::with_capacity(ROWS_PER_THREAD as usize)))
+                        .collect(),
+                    );
+                let retry_stage_counts: Arc<
+                    Vec<std::sync::Mutex<PersistentRetryStageCounts>>,
+                > = Arc::new(
+                    (0..n_threads)
+                        .map(|_| std::sync::Mutex::new(PersistentRetryStageCounts::default()))
                         .collect(),
                 );
 
@@ -352,7 +334,8 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                         let p = path.clone();
                         let bar = barrier.clone();
                         let retries = retry_count.clone();
-                        let lat = latencies.clone();
+                        let op_timings = operation_timings.clone();
+                        let per_thread_retry_stages = retry_stage_counts.clone();
                         thread::spawn(move || {
                             let conn = rusqlite::Connection::open(&p).unwrap();
                             conn.execute_batch(
@@ -366,47 +349,94 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                             // Each row is its own transaction for realistic commit latency
                             for i in 0..ROWS_PER_THREAD {
                                 let start = Instant::now();
+                                let mut operation_timing = PersistentOperationTiming::default();
                                 let mut begin_retries = 0u32;
                                 loop {
+                                    let begin_start = Instant::now();
                                     match conn.execute_batch("BEGIN IMMEDIATE") {
-                                        Ok(()) => break,
+                                        Ok(()) => {
+                                            operation_timing.begin_retry_handoff +=
+                                                begin_start.elapsed();
+                                            break;
+                                        }
                                         Err(e) => {
+                                            operation_timing.begin_retry_handoff +=
+                                                begin_start.elapsed();
                                             let msg = e.to_string();
                                             if msg.contains("BUSY") || msg.contains("locked") {
                                                 retries.fetch_add(1, Ordering::Relaxed);
                                                 begin_retries += 1;
+                                                {
+                                                    let mut retry_counts =
+                                                        per_thread_retry_stages[tid]
+                                                            .lock()
+                                                            .unwrap();
+                                                    retry_counts.total_retries = retry_counts
+                                                        .total_retries
+                                                        .saturating_add(1);
+                                                    retry_counts.begin_retries = retry_counts
+                                                        .begin_retries
+                                                        .saturating_add(1);
+                                                }
                                                 if begin_retries >= MAX_TXN_RETRIES {
                                                     panic!("BEGIN failed after {MAX_TXN_RETRIES} retries: {e}");
                                                 }
-                                                std::thread::sleep(Duration::from_micros(100));
+                                                sleep_with_accounting(
+                                                    &mut operation_timing,
+                                                    Duration::from_micros(100),
+                                                );
                                             } else {
                                                 panic!("BEGIN failed: {e}");
                                             }
                                         }
                                     }
                                 }
+                                let execute_start = Instant::now();
                                 stmt.execute(rusqlite::params![i]).unwrap();
+                                operation_timing.statement_execute_body += execute_start.elapsed();
                                 let mut commit_retries = 0u32;
                                 loop {
+                                    let commit_start = Instant::now();
                                     match conn.execute_batch("COMMIT") {
-                                        Ok(()) => break,
+                                        Ok(()) => {
+                                            operation_timing.commit_roundtrip +=
+                                                commit_start.elapsed();
+                                            break;
+                                        }
                                         Err(e) => {
+                                            operation_timing.commit_roundtrip +=
+                                                commit_start.elapsed();
                                             let msg = e.to_string();
                                             if msg.contains("BUSY") || msg.contains("locked") {
                                                 retries.fetch_add(1, Ordering::Relaxed);
                                                 commit_retries += 1;
+                                                {
+                                                    let mut retry_counts =
+                                                        per_thread_retry_stages[tid]
+                                                            .lock()
+                                                            .unwrap();
+                                                    retry_counts.total_retries = retry_counts
+                                                        .total_retries
+                                                        .saturating_add(1);
+                                                    retry_counts.commit_retries = retry_counts
+                                                        .commit_retries
+                                                        .saturating_add(1);
+                                                }
                                                 if commit_retries >= MAX_TXN_RETRIES {
                                                     panic!("COMMIT failed after {MAX_TXN_RETRIES} retries: {e}");
                                                 }
-                                                std::thread::sleep(Duration::from_micros(100));
+                                                sleep_with_accounting(
+                                                    &mut operation_timing,
+                                                    Duration::from_micros(100),
+                                                );
                                             } else {
                                                 panic!("COMMIT failed: {e}");
                                             }
                                         }
                                     }
                                 }
-                                let elapsed = start.elapsed();
-                                lat[tid].lock().unwrap().push(elapsed);
+                                operation_timing.wall_time = start.elapsed();
+                                op_timings[tid].lock().unwrap().push(operation_timing);
                             }
                         })
                     })
@@ -418,11 +448,28 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
 
                 // Report metrics
                 let total_retries = retry_count.load(Ordering::Relaxed);
-                let mut all_latencies: Vec<Duration> = latencies
+                let flattened_operation_timings: Vec<PersistentOperationTiming> = operation_timings
                     .iter()
                     .flat_map(|m| m.lock().unwrap().clone())
                     .collect();
+                let retry_stage_counts = retry_stage_counts.iter().fold(
+                    PersistentRetryStageCounts::default(),
+                    |mut acc, counts| {
+                        acc.merge(*counts.lock().unwrap());
+                        acc
+                    },
+                );
+                let mut all_latencies: Vec<Duration> = flattened_operation_timings
+                    .iter()
+                    .map(|timing| timing.wall_time)
+                    .collect();
                 all_latencies.sort();
+                let operation_wall_time_audit =
+                    build_operation_wall_time_audit(
+                        &flattened_operation_timings,
+                        retry_stage_counts,
+                        None,
+                    );
 
                 let p50 = percentile(&all_latencies, 50.0);
                 let p95 = percentile(&all_latencies, 95.0);
@@ -433,8 +480,12 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                     "[C SQLite {n_threads}t] retries={total_retries}, p50={:?}, p95={:?}, p99={:?}, max={:?}",
                     p50, p95, p99, max
                 );
+                eprintln!(
+                    "[C SQLite {n_threads}t wall audit] {}",
+                    format_operation_wall_time_audit(&operation_wall_time_audit)
+                );
                 maybe_write_persistent_phase_capture(&PersistentPhaseCaptureSample {
-                    schema_version: PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V1,
+                    schema_version: PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V2,
                     timestamp_unix_ms: unix_timestamp_ms(),
                     benchmark_group: format!("{label}/csqlite_concurrent_persistent"),
                     engine: "sqlite3",
@@ -444,6 +495,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                     rows_per_thread: ROWS_PER_THREAD,
                     total_rows,
                     latency_us: persistent_latency_summary(&all_latencies),
+                    operation_wall_time_audit: Some(operation_wall_time_audit),
                     phase_metrics: None,
                     phase_timing_report: None,
                     flusher_lock_wait_fraction_basis_points: None,
@@ -473,9 +525,17 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
             },
             |(_tmp, path, conflict_count)| {
                 let barrier = Arc::new(Barrier::new(n_threads));
-                let latencies: Arc<Vec<std::sync::Mutex<Vec<Duration>>>> = Arc::new(
+                let operation_timings: Arc<Vec<std::sync::Mutex<Vec<PersistentOperationTiming>>>> =
+                    Arc::new(
                     (0..n_threads)
                         .map(|_| std::sync::Mutex::new(Vec::with_capacity(ROWS_PER_THREAD as usize)))
+                        .collect(),
+                    );
+                let retry_stage_counts: Arc<
+                    Vec<std::sync::Mutex<PersistentRetryStageCounts>>,
+                > = Arc::new(
+                    (0..n_threads)
+                        .map(|_| std::sync::Mutex::new(PersistentRetryStageCounts::default()))
                         .collect(),
                 );
 
@@ -484,7 +544,8 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                         let p = path.clone();
                         let bar = barrier.clone();
                         let conflicts = conflict_count.clone();
-                        let lat = latencies.clone();
+                        let op_timings = operation_timings.clone();
+                        let per_thread_retry_stages = retry_stage_counts.clone();
                         thread::spawn(move || {
                             let conn = fsqlite::Connection::open(&p).unwrap();
                             apply_session_pragmas_fsqlite(&conn);
@@ -497,25 +558,49 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                 // the SQLite side exactly without cross-thread collisions.
                                 let row_id = i;
                                 let start = Instant::now();
+                                let mut operation_timing = PersistentOperationTiming::default();
                                 let mut retry_count = 0u32;
 
                                 'txn: loop {
                                     // BEGIN CONCURRENT with retry
                                     loop {
+                                        let begin_start = Instant::now();
                                         match conn.execute("BEGIN CONCURRENT") {
-                                            Ok(_) => break,
+                                            Ok(_) => {
+                                                operation_timing.begin_retry_handoff +=
+                                                    begin_start.elapsed();
+                                                break;
+                                            }
                                             Err(e) => {
+                                                operation_timing.begin_retry_handoff +=
+                                                    begin_start.elapsed();
                                                 if is_retryable_fsqlite_error(&e) {
                                                     conflicts.fetch_add(1, Ordering::Relaxed);
                                                     retry_count += 1;
+                                                    {
+                                                        let mut retry_counts =
+                                                            per_thread_retry_stages[tid]
+                                                                .lock()
+                                                                .unwrap();
+                                                        retry_counts.total_retries = retry_counts
+                                                            .total_retries
+                                                            .saturating_add(1);
+                                                        retry_counts.begin_retries = retry_counts
+                                                            .begin_retries
+                                                            .saturating_add(1);
+                                                    }
                                                     if retry_count >= MAX_TXN_RETRIES {
                                                         panic!(
                                                             "BEGIN CONCURRENT failed after {MAX_TXN_RETRIES} retries: {e:?}"
                                                         );
                                                     }
-                                                    std::thread::sleep(Duration::from_micros(
+                                                    let backoff = Duration::from_micros(
                                                         100 * u64::from(retry_count),
-                                                    ));
+                                                    );
+                                                    sleep_with_accounting(
+                                                        &mut operation_timing,
+                                                        backoff,
+                                                    );
                                                 } else {
                                                     panic!("BEGIN CONCURRENT failed: {e:?}");
                                                 }
@@ -524,10 +609,28 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                     }
 
                                     // INSERT
-                                    if let Err(e) = stmt.execute_with_params(&[SqliteValue::Integer(row_id)]) {
+                                    let execute_start = Instant::now();
+                                    if let Err(e) =
+                                        stmt.execute_with_params(&[SqliteValue::Integer(row_id)])
+                                    {
+                                        operation_timing.statement_execute_body +=
+                                            execute_start.elapsed();
                                         if is_duplicate_insert_after_retry(&e) {
                                             // Row already exists (from previous retry that actually committed)
+                                            {
+                                                let mut retry_counts =
+                                                    per_thread_retry_stages[tid]
+                                                        .lock()
+                                                        .unwrap();
+                                                retry_counts.duplicate_after_retry_exits =
+                                                    retry_counts
+                                                        .duplicate_after_retry_exits
+                                                        .saturating_add(1);
+                                            }
+                                            let rollback_start = Instant::now();
                                             let _ = conn.execute("ROLLBACK");
+                                            operation_timing.rollback_cleanup +=
+                                                rollback_start.elapsed();
                                             break 'txn;
                                         }
                                         if is_retryable_fsqlite_error(&e)
@@ -535,35 +638,88 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                         {
                                             // Snapshot conflict — rollback and retry
                                             conflicts.fetch_add(1, Ordering::Relaxed);
+                                            let rollback_start = Instant::now();
                                             let _ = conn.execute("ROLLBACK");
+                                            operation_timing.rollback_cleanup +=
+                                                rollback_start.elapsed();
                                             retry_count += 1;
+                                            {
+                                                let mut retry_counts =
+                                                    per_thread_retry_stages[tid]
+                                                        .lock()
+                                                        .unwrap();
+                                                retry_counts.total_retries = retry_counts
+                                                    .total_retries
+                                                    .saturating_add(1);
+                                                retry_counts.body_retries = retry_counts
+                                                    .body_retries
+                                                    .saturating_add(1);
+                                            }
                                             if retry_count >= MAX_TXN_RETRIES {
                                                 panic!("INSERT failed after {MAX_TXN_RETRIES} retries: {e:?}");
                                             }
-                                            std::thread::sleep(Duration::from_micros(100 * u64::from(retry_count)));
+                                            let backoff =
+                                                Duration::from_micros(100 * u64::from(retry_count));
+                                            sleep_with_accounting(
+                                                &mut operation_timing,
+                                                backoff,
+                                            );
                                             continue 'txn;
                                         }
                                         if is_corruption_error(&e) {
+                                            let rollback_start = Instant::now();
                                             let _ = conn.execute("ROLLBACK");
+                                            operation_timing.rollback_cleanup +=
+                                                rollback_start.elapsed();
                                             panic!("CORRUPTION DETECTED: {e:?}");
                                         }
                                         panic!("INSERT failed: {e:?}");
                                     }
+                                    operation_timing.statement_execute_body +=
+                                        execute_start.elapsed();
 
                                     // COMMIT with retry
+                                    let commit_start = Instant::now();
                                     match conn.execute("COMMIT") {
-                                        Ok(_) => break 'txn,
+                                        Ok(_) => {
+                                            operation_timing.commit_roundtrip +=
+                                                commit_start.elapsed();
+                                            break 'txn;
+                                        }
                                         Err(e) => {
+                                            operation_timing.commit_roundtrip +=
+                                                commit_start.elapsed();
                                             if is_retryable_fsqlite_error(&e)
                                                 || matches!(e, FrankenError::SerializationFailure { .. })
                                             {
                                                 conflicts.fetch_add(1, Ordering::Relaxed);
+                                                let rollback_start = Instant::now();
                                                 let _ = conn.execute("ROLLBACK");
+                                                operation_timing.rollback_cleanup +=
+                                                    rollback_start.elapsed();
                                                 retry_count += 1;
+                                                {
+                                                    let mut retry_counts =
+                                                        per_thread_retry_stages[tid]
+                                                            .lock()
+                                                            .unwrap();
+                                                    retry_counts.total_retries = retry_counts
+                                                        .total_retries
+                                                        .saturating_add(1);
+                                                    retry_counts.commit_retries = retry_counts
+                                                        .commit_retries
+                                                        .saturating_add(1);
+                                                }
                                                 if retry_count >= MAX_TXN_RETRIES {
                                                     panic!("COMMIT failed after {MAX_TXN_RETRIES} retries: {e:?}");
                                                 }
-                                                std::thread::sleep(Duration::from_micros(100 * u64::from(retry_count)));
+                                                let backoff = Duration::from_micros(
+                                                    100 * u64::from(retry_count),
+                                                );
+                                                sleep_with_accounting(
+                                                    &mut operation_timing,
+                                                    backoff,
+                                                );
                                                 // Loop back to BEGIN CONCURRENT
                                             } else {
                                                 panic!("COMMIT failed: {e:?}");
@@ -572,8 +728,8 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                     }
                                 }
 
-                                let elapsed = start.elapsed();
-                                lat[tid].lock().unwrap().push(elapsed);
+                                operation_timing.wall_time = start.elapsed();
+                                op_timings[tid].lock().unwrap().push(operation_timing);
                             }
                         })
                     })
@@ -585,9 +741,20 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
 
                 // Report metrics
                 let total_conflicts = conflict_count.load(Ordering::Relaxed);
-                let mut all_latencies: Vec<Duration> = latencies
+                let flattened_operation_timings: Vec<PersistentOperationTiming> = operation_timings
                     .iter()
                     .flat_map(|m| m.lock().unwrap().clone())
+                    .collect();
+                let retry_stage_counts = retry_stage_counts.iter().fold(
+                    PersistentRetryStageCounts::default(),
+                    |mut acc, counts| {
+                        acc.merge(*counts.lock().unwrap());
+                        acc
+                    },
+                );
+                let mut all_latencies: Vec<Duration> = flattened_operation_timings
+                    .iter()
+                    .map(|timing| timing.wall_time)
                     .collect();
                 all_latencies.sort();
 
@@ -604,8 +771,13 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                 // Print phase timing report from group commit metrics
                 let metrics = fsqlite_wal::GLOBAL_CONSOLIDATION_METRICS.snapshot();
                 let has_phase_metrics = metrics.total_commits() > 0;
-                let phase_timing_report =
-                    has_phase_metrics.then(|| metrics.phase_timing_report());
+                let measured_commit_sub_buckets = build_measured_commit_sub_buckets(&metrics);
+                let operation_wall_time_audit = build_operation_wall_time_audit(
+                    &flattened_operation_timings,
+                    retry_stage_counts,
+                    measured_commit_sub_buckets.clone(),
+                );
+                let phase_timing_report = has_phase_metrics.then(|| metrics.phase_timing_report());
                 if has_phase_metrics {
                     eprintln!(
                         "[FrankenSQLite {n_threads}t wal split] flusher_lock_wait_total={}us, wal_service_total={}us, wal_backend_lock_wait_p99={}us, wal_append_p99={}us, wal_sync_p99={}us, phase_b_p99={}us, lock_topology_limited={}, wakes={{notify:{}, timeout:{}, takeover:{}, failed_epoch:{}, busy_retry:{}}}",
@@ -629,8 +801,12 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                             .unwrap_or("phase timing unavailable")
                     );
                 }
+                eprintln!(
+                    "[FrankenSQLite {n_threads}t wall audit] {}",
+                    format_operation_wall_time_audit(&operation_wall_time_audit)
+                );
                 maybe_write_persistent_phase_capture(&PersistentPhaseCaptureSample {
-                    schema_version: PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V1,
+                    schema_version: PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V2,
                     timestamp_unix_ms: unix_timestamp_ms(),
                     benchmark_group: format!("{label}/frankensqlite_concurrent_persistent"),
                     engine: "fsqlite_mvcc",
@@ -640,6 +816,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                     rows_per_thread: ROWS_PER_THREAD,
                     total_rows,
                     latency_us: persistent_latency_summary(&all_latencies),
+                    operation_wall_time_audit: Some(operation_wall_time_audit),
                     phase_metrics: has_phase_metrics.then_some(metrics.clone()),
                     phase_timing_report,
                     flusher_lock_wait_fraction_basis_points:

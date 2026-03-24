@@ -3674,9 +3674,9 @@ fn run_sqlite3_engine(
         }
     };
     let work_db = work_dir.path().join("work.db");
-    if let Err(e) = fs::copy(&golden_path, &work_db) {
+    if let Err(e) = copy_db_with_sidecars(&golden_path, &work_db) {
         eprintln!(
-            "error: failed to copy {} to {}: {e}",
+            "error: failed to prepare working copy {} -> {}: {e}",
             golden_path.display(),
             work_db.display()
         );
@@ -3713,9 +3713,9 @@ fn run_sqlite3_engine(
                 }
             };
             let work_db = work_dir.path().join("work.db");
-            if let Err(e) = fs::copy(&golden_path, &work_db) {
+            if let Err(e) = copy_db_with_sidecars(&golden_path, &work_db) {
                 eprintln!(
-                    "error: failed to copy {} to {}: {e}",
+                    "error: failed to prepare working copy {} -> {}: {e}",
                     golden_path.display(),
                     work_db.display()
                 );
@@ -3857,9 +3857,9 @@ fn run_fsqlite_engine(args: FsqliteRunArgs<'_>) -> i32 {
                 }
             };
             let work_db = work_dir.path().join("work.db");
-            if let Err(e) = fs::copy(&golden_path, &work_db) {
+            if let Err(e) = copy_db_with_sidecars(&golden_path, &work_db) {
                 eprintln!(
-                    "error: failed to copy {} to {}: {e}",
+                    "error: failed to prepare working copy {} -> {}: {e}",
                     golden_path.display(),
                     work_db.display()
                 );
@@ -6692,9 +6692,12 @@ mod tests {
                 normalized_bytes_total: 128,
             },
             connection_ceremony: HotPathConnectionCeremonyProfile {
+                background_status_time_ns: 0,
                 background_status_checks: 1,
                 op_cx_background_gates: 1,
                 statement_dispatch_background_gates: 0,
+                prepared_lookup_time_ns: 0,
+                prepared_schema_refresh_time_ns: 0,
                 prepared_schema_refreshes: 0,
                 prepared_schema_lightweight_refreshes: 0,
                 prepared_schema_full_reloads: 0,
@@ -6702,6 +6705,12 @@ mod tests {
                 memory_autocommit_fast_path_begins: 1,
                 cached_read_snapshot_reuses: 1,
                 cached_read_snapshot_parks: 0,
+                begin_setup_time_ns: 0,
+                begin_refresh_count: 0,
+                commit_refresh_count: 0,
+                memdb_refresh_count: 0,
+                execute_body_time_ns: 0,
+                finalize_post_publish_time_ns: 0,
                 column_default_evaluation_passes: 0,
                 prepared_table_engine_fresh_allocs: 1,
                 prepared_table_engine_reuses: 2,
@@ -8882,6 +8891,45 @@ mod tests {
 
         backup_sqlite_file(&src, &dst).unwrap();
         sqlite_integrity_check(&dst).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_copy_db_with_sidecars_makes_working_copy_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.db");
+        let dst = dir.path().join("work.db");
+
+        fs::write(&src, b"db").unwrap();
+        fs::write(src.with_extension("db-wal"), b"wal").unwrap();
+        fs::write(src.with_extension("db-shm"), b"shm").unwrap();
+
+        let mut db_perms = fs::metadata(&src).unwrap().permissions();
+        db_perms.set_mode(0o444);
+        fs::set_permissions(&src, db_perms).unwrap();
+
+        let src_wal = src.with_extension("db-wal");
+        let mut wal_perms = fs::metadata(&src_wal).unwrap().permissions();
+        wal_perms.set_mode(0o444);
+        fs::set_permissions(&src_wal, wal_perms).unwrap();
+
+        copy_db_with_sidecars(&src, &dst).unwrap();
+
+        let db_mode = fs::metadata(&dst).unwrap().permissions().mode();
+        let wal_mode = fs::metadata(dst.with_extension("db-wal"))
+            .unwrap()
+            .permissions()
+            .mode();
+        let shm_mode = fs::metadata(dst.with_extension("db-shm"))
+            .unwrap()
+            .permissions()
+            .mode();
+
+        assert_ne!(db_mode & 0o200, 0, "database copy must be owner-writable");
+        assert_ne!(wal_mode & 0o200, 0, "WAL copy must be owner-writable");
+        assert_ne!(shm_mode & 0o200, 0, "SHM copy must be owner-writable");
     }
 
     // ── corpus import end-to-end ─────────────────────────────────────────

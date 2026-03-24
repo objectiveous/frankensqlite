@@ -335,9 +335,12 @@ pub struct HotPathPageDataMotionProfile {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HotPathConnectionCeremonyProfile {
+    pub background_status_time_ns: u64,
     pub background_status_checks: u64,
     pub op_cx_background_gates: u64,
     pub statement_dispatch_background_gates: u64,
+    pub prepared_lookup_time_ns: u64,
+    pub prepared_schema_refresh_time_ns: u64,
     pub prepared_schema_refreshes: u64,
     pub prepared_schema_lightweight_refreshes: u64,
     pub prepared_schema_full_reloads: u64,
@@ -345,6 +348,12 @@ pub struct HotPathConnectionCeremonyProfile {
     pub memory_autocommit_fast_path_begins: u64,
     pub cached_read_snapshot_reuses: u64,
     pub cached_read_snapshot_parks: u64,
+    pub begin_setup_time_ns: u64,
+    pub begin_refresh_count: u64,
+    pub commit_refresh_count: u64,
+    pub memdb_refresh_count: u64,
+    pub execute_body_time_ns: u64,
+    pub finalize_post_publish_time_ns: u64,
     pub column_default_evaluation_passes: u64,
     pub prepared_table_engine_fresh_allocs: u64,
     pub prepared_table_engine_reuses: u64,
@@ -1213,9 +1222,12 @@ fn build_hot_path_profile_report(
         normalized_bytes_total: page_data_normalization_bytes_total,
     };
     let connection_ceremony = HotPathConnectionCeremonyProfile {
+        background_status_time_ns: snapshot.background_status_time_ns,
         background_status_checks: snapshot.background_status_checks,
         op_cx_background_gates: snapshot.op_cx_background_gates,
         statement_dispatch_background_gates: snapshot.statement_dispatch_background_gates,
+        prepared_lookup_time_ns: snapshot.prepared_lookup_time_ns,
+        prepared_schema_refresh_time_ns: snapshot.prepared_schema_refresh_time_ns,
         prepared_schema_refreshes: snapshot.prepared_schema_refreshes,
         prepared_schema_lightweight_refreshes: snapshot.prepared_schema_lightweight_refreshes,
         prepared_schema_full_reloads: snapshot.prepared_schema_full_reloads,
@@ -1223,6 +1235,12 @@ fn build_hot_path_profile_report(
         memory_autocommit_fast_path_begins: snapshot.memory_autocommit_fast_path_begins,
         cached_read_snapshot_reuses: snapshot.cached_read_snapshot_reuses,
         cached_read_snapshot_parks: snapshot.cached_read_snapshot_parks,
+        begin_setup_time_ns: snapshot.begin_setup_time_ns,
+        begin_refresh_count: snapshot.begin_refresh_count,
+        commit_refresh_count: snapshot.commit_refresh_count,
+        memdb_refresh_count: snapshot.memdb_refresh_count,
+        execute_body_time_ns: snapshot.execute_body_time_ns,
+        finalize_post_publish_time_ns: snapshot.finalize_post_publish_time_ns,
         column_default_evaluation_passes: snapshot.column_default_evaluation_passes,
         prepared_table_engine_fresh_allocs: snapshot.prepared_table_engine_fresh_allocs,
         prepared_table_engine_reuses: snapshot.prepared_table_engine_reuses,
@@ -4652,9 +4670,12 @@ mod tests {
                 fast_path_executions: 2,
                 slow_path_executions: 1,
             },
+            background_status_time_ns: 750,
             background_status_checks: 2,
             op_cx_background_gates: 1,
             statement_dispatch_background_gates: 1,
+            prepared_lookup_time_ns: 1_100,
+            prepared_schema_refresh_time_ns: 2_200,
             prepared_schema_refreshes: 1,
             prepared_schema_lightweight_refreshes: 1,
             prepared_schema_full_reloads: 0,
@@ -4662,9 +4683,12 @@ mod tests {
             memory_autocommit_fast_path_begins: 1,
             cached_read_snapshot_reuses: 1,
             cached_read_snapshot_parks: 1,
+            begin_setup_time_ns: 3_300,
             begin_refresh_count: 1,
             commit_refresh_count: 1,
             memdb_refresh_count: 1,
+            execute_body_time_ns: 4_400,
+            finalize_post_publish_time_ns: 1_250,
             cached_write_txn_reuses: 1,
             cached_write_txn_parks: 1,
             column_default_evaluation_passes: 2,
@@ -5168,6 +5192,14 @@ mod tests {
         );
         assert!(report.mvcc_write.page_lock_wait_time_ns_total > 0);
         assert!(report.page_data_motion.normalized_bytes_total > 0);
+        assert_eq!(report.connection_ceremony.background_status_time_ns, 750);
+        assert_eq!(report.connection_ceremony.prepared_lookup_time_ns, 1_100);
+        assert_eq!(report.connection_ceremony.begin_setup_time_ns, 3_300);
+        assert_eq!(report.connection_ceremony.execute_body_time_ns, 4_400);
+        assert_eq!(
+            report.connection_ceremony.finalize_post_publish_time_ns,
+            1_250
+        );
 
         let artifact_dir = tempdir.path().join("artifacts");
         let counter_capture_summary = HotPathCounterCaptureManifestSummary {

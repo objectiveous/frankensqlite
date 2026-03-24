@@ -13,15 +13,52 @@
 //!     --test prepared_hit_rate_proof -- --test-threads=1 --nocapture
 
 use fsqlite_core::connection::{
-    Connection, hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
+    Connection, hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
+    set_hot_path_profile_enabled,
 };
+use fsqlite_error::FrankenError;
+use fsqlite_types::SqliteValue;
+use std::sync::{LazyLock, Mutex, MutexGuard};
+
+static HOT_PATH_PROFILE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn lock_profile_test_mutex() -> MutexGuard<'static, ()> {
+    match HOT_PATH_PROFILE_TEST_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+struct HotPathProfileTestGuard {
+    _lock: MutexGuard<'static, ()>,
+    previous_enabled: bool,
+}
+
+impl HotPathProfileTestGuard {
+    fn new() -> Self {
+        let lock = lock_profile_test_mutex();
+        let previous_enabled = hot_path_profile_enabled();
+        reset_hot_path_profile();
+        set_hot_path_profile_enabled(true);
+        Self {
+            _lock: lock,
+            previous_enabled,
+        }
+    }
+}
+
+impl Drop for HotPathProfileTestGuard {
+    fn drop(&mut self) {
+        reset_hot_path_profile();
+        set_hot_path_profile_enabled(self.previous_enabled);
+    }
+}
 
 /// Simulate the c1 commutative_inserts workload: N prepared INSERTs into
 /// separate tables, autocommit, file-backed WAL.
 #[test]
 fn test_prepared_fast_lane_hit_rate_on_c1_workload() {
-    set_hot_path_profile_enabled(true);
-    reset_hot_path_profile();
+    let _profile_guard = HotPathProfileTestGuard::new();
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let path = tmp.path().to_str().unwrap();
@@ -163,4 +200,102 @@ fn test_prepared_fast_lane_hit_rate_on_c1_workload() {
         "table engine should be reused for all ops: got {}",
         snap.prepared_table_engine_reuses
     );
+}
+
+/// Prove bd-db300.4.5.2 directly: when prepared DML must take the
+/// FullReloadRequired refresh path, the execution should reuse the schema-bound
+/// publication instead of paying a second bind during autocommit begin.
+#[test]
+fn test_prepared_full_reload_reuses_publication_after_cross_connection_ddl() {
+    let _profile_guard = HotPathProfileTestGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("prepared_full_reload_publication_reuse.db");
+    let db = db_path.to_string_lossy().into_owned();
+
+    let conn1 = Connection::open(&db).unwrap();
+    conn1.set_reject_mem_fallback(true);
+    conn1.set_strict_mem_fallback_rejection(true);
+    conn1
+        .execute("CREATE TABLE prep_full_reload_pub (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+
+    let stale_stmt = conn1
+        .prepare("INSERT INTO prep_full_reload_pub (id, val) VALUES (?1, ?2)")
+        .unwrap();
+
+    let conn2 = Connection::open(&db).unwrap();
+    conn2.set_reject_mem_fallback(true);
+    conn2.set_strict_mem_fallback_rejection(true);
+    conn2
+        .execute("CREATE TABLE prep_full_reload_pub_bump (id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    let err = stale_stmt
+        .execute_with_params(&[
+            SqliteValue::Integer(1),
+            SqliteValue::Text("stale".into()),
+        ])
+        .expect_err("cross-connection DDL must invalidate the stale prepared INSERT");
+    assert!(matches!(err, FrankenError::SchemaChanged));
+
+    // Force future stale prepared executions onto the full-reload path while
+    // keeping schema identity stable for the measured window.
+    conn1.set_reject_mem_fallback(false);
+    let stmt = conn1
+        .prepare("INSERT INTO prep_full_reload_pub (id, val) VALUES (?1, ?2)")
+        .unwrap();
+    conn2
+        .execute("INSERT INTO prep_full_reload_pub VALUES (1, 'from_conn2')")
+        .unwrap();
+
+    reset_hot_path_profile();
+    let affected = stmt
+        .execute_with_params(&[
+            SqliteValue::Integer(2),
+            SqliteValue::Text("from_conn1".into()),
+        ])
+        .unwrap();
+    assert_eq!(affected, 1);
+
+    let profile = hot_path_profile_snapshot();
+    eprintln!("=== bd-db300.4.5.2: FullReloadRequired publication-reuse proof ===");
+    eprintln!(
+        "prepared_schema_refreshes={} lightweight={} full_reload={} pager_publication_refreshes={} fast_lane_hits={}",
+        profile.prepared_schema_refreshes,
+        profile.prepared_schema_lightweight_refreshes,
+        profile.prepared_schema_full_reloads,
+        profile.pager_publication_refreshes,
+        profile.prepared_insert_fast_lane_hits
+    );
+    eprintln!("=== END SCORECARD ===");
+
+    assert_eq!(
+        profile.prepared_schema_refreshes, 1,
+        "the measured prepared execute should pay exactly one external schema refresh: {profile:?}"
+    );
+    assert_eq!(
+        profile.prepared_schema_full_reloads, 1,
+        "with eager MemDB hydration enabled, stale prepared DML should take the FullReloadRequired path: {profile:?}"
+    );
+    assert_eq!(
+        profile.prepared_schema_lightweight_refreshes, 0,
+        "the full-reload proof window must not fall back to the lightweight refresh path: {profile:?}"
+    );
+    assert_eq!(
+        profile.pager_publication_refreshes, 1,
+        "the prepared execute should reuse the full-reload publication instead of rebinding during autocommit begin: {profile:?}"
+    );
+    assert_eq!(
+        profile.prepared_insert_fast_lane_hits, 1,
+        "the measured prepared insert should stay on the prepared fast lane after the full reload: {profile:?}"
+    );
+
+    let rows = conn1
+        .query("SELECT id, val FROM prep_full_reload_pub ORDER BY id")
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+    assert_eq!(rows[0].values()[1], SqliteValue::Text("from_conn2".into()));
+    assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+    assert_eq!(rows[1].values()[1], SqliteValue::Text("from_conn1".into()));
 }

@@ -1575,9 +1575,19 @@ pub fn codegen_select(
     let out_col_count = result_column_count(columns, table);
     let out_regs = b.alloc_regs(out_col_count);
 
+    let simple_count_star = is_simple_count_star(columns)
+        && stmt.limit.is_none()
+        && stmt.order_by.is_empty()
+        && distinct == Distinctness::All
+        && group_by.is_empty()
+        && having.is_none()
+        && !has_window_columns(columns)
+        && from_clause.joins.is_empty()
+        && time_travel.is_none();
+
     // Check for aggregate columns FIRST, before rowid/index seek optimizations.
-    // Aggregates like count(*) require a full scan + AggStep/AggFinal path;
-    // the rowid-seek and index-seek paths don't support aggregate functions.
+    // Most aggregates still require a full scan + AggStep/AggFinal path. Plain
+    // COUNT(*) is handled separately below so it can keep a specialized fast path.
     let is_aggregate = has_aggregate_columns(columns);
 
     // Check for rowid-equality WHERE clause (only for non-aggregate queries).
@@ -1586,7 +1596,7 @@ pub fn codegen_select(
     } else {
         extract_rowid_target_expr(where_clause.as_deref(), Some(table), table_alias)
     };
-    let rowid_range = if is_aggregate
+    let rowid_range = if (is_aggregate && !simple_count_star)
         || !stmt.order_by.is_empty()
         || distinct != Distinctness::All
         || !group_by.is_empty()
@@ -1794,7 +1804,20 @@ pub fn codegen_select(
         }
     }
 
-    if let Some(target_expr) = rowid_target {
+    if simple_count_star {
+        codegen_select_count_star(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            where_clause.as_deref(),
+            out_regs,
+            done_label,
+            end_label,
+            rowid_range,
+        )
+    } else if let Some(target_expr) = rowid_target {
         codegen_select_rowid_lookup(
             b,
             cursor,
@@ -2763,6 +2786,145 @@ fn rowid_range_bound_is_seek_safe(expr: &Expr) -> bool {
         } => matches!(expr.as_ref(), Expr::Literal(Literal::Integer(_), _)),
         _ => false,
     }
+}
+
+fn is_simple_count_star(columns: &[ResultColumn]) -> bool {
+    matches!(
+        columns,
+        [ResultColumn::Expr {
+            expr:
+                Expr::FunctionCall {
+                    name,
+                    args: FunctionArgs::Star,
+                    distinct: false,
+                    order_by,
+                    filter: None,
+                    over: None,
+                    ..
+                },
+            ..
+        }] if name.eq_ignore_ascii_case("count") && order_by.is_empty()
+    )
+}
+
+fn codegen_select_count_star(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    where_clause: Option<&Expr>,
+    out_regs: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    rowid_range: Option<RowidRangeTarget<'_>>,
+) -> Result<(), CodegenError> {
+    b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+    b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+
+    if where_clause.is_none() {
+        b.emit_op(Opcode::Count, cursor, out_regs, 0, P4::None, 0);
+        b.resolve_label(done_label);
+        b.emit_op(Opcode::ResultRow, out_regs, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end_label);
+        return Ok(());
+    }
+
+    b.emit_op(Opcode::Integer, 0, out_regs, 0, P4::None, 0);
+
+    let upper_reg = rowid_range.and_then(|range| {
+        range.upper.map(|bound| {
+            let reg = b.alloc_reg();
+            emit_expr(b, bound.expr, reg, None);
+            b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
+            reg
+        })
+    });
+    let upper_comparison = rowid_range.and_then(|range| {
+        range
+            .upper
+            .map(|bound| resolved_rowid_range_comparison(table, table_alias, schema, bound))
+    });
+
+    if let Some(range) = rowid_range {
+        if let Some(bound) = range.lower {
+            let lower_reg = b.alloc_reg();
+            emit_expr(b, bound.expr, lower_reg, None);
+            b.emit_jump_to_label(Opcode::IsNull, lower_reg, 0, done_label, P4::None, 0);
+            let seek_opcode = if bound.inclusive {
+                Opcode::SeekGE
+            } else {
+                Opcode::SeekGT
+            };
+            b.emit_jump_to_label(seek_opcode, cursor, lower_reg, done_label, P4::None, 0);
+        } else {
+            b.emit_jump_to_label(Opcode::Rewind, cursor, 0, done_label, P4::None, 0);
+        }
+    } else {
+        b.emit_jump_to_label(Opcode::Rewind, cursor, 0, done_label, P4::None, 0);
+    }
+
+    let loop_top = b.current_addr();
+    let skip_label = b.emit_label();
+
+    if let Some(range) = rowid_range
+        && let Some(bound) = range.upper
+    {
+        let current_rowid_reg = b.alloc_reg();
+        let stop_opcode = if bound.inclusive {
+            Opcode::Gt
+        } else {
+            Opcode::Ge
+        };
+        b.emit_op(Opcode::Rowid, cursor, current_rowid_reg, 0, P4::None, 0);
+        b.emit_jump_to_label(
+            stop_opcode,
+            upper_reg.expect("upper bound register should exist"),
+            current_rowid_reg,
+            done_label,
+            upper_comparison
+                .as_ref()
+                .map_or(P4::None, |comparison| comparison.collation_p4.clone()),
+            upper_comparison
+                .as_ref()
+                .map_or(0, |comparison| comparison.cmp_p5),
+        );
+    }
+
+    if let Some(where_expr) = where_clause {
+        emit_where_filter(
+            b,
+            where_expr,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            skip_label,
+        );
+    }
+    b.emit_op(Opcode::AddImm, out_regs, 1, 0, P4::None, 0);
+    b.resolve_label(skip_label);
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_body = loop_top as i32;
+    b.emit_op(Opcode::Next, cursor, loop_body, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::ResultRow, out_regs, 1, 0, P4::None, 0);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
 }
 
 fn resolved_rowid_range_comparison(
@@ -11771,6 +11933,10 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                     b.emit_op(Opcode::Integer, i32::from(*not), reg, 0, P4::None, 0);
                     return;
                 }
+                if can_use_once_materialized_in_list(values, operand, ctx) {
+                    emit_once_materialized_in_list(b, operand, values, *not, reg, ctx);
+                    return;
+                }
                 // IN (v1, v2, ...) → chain of equality checks with
                 // three-valued NULL semantics (SQL standard):
                 //   NULL IN (...)            → NULL
@@ -11984,6 +12150,249 @@ fn current_time_literal_text(literal: &Literal) -> Option<String> {
 ///
 /// Pattern: open cursor on subquery table, scan with WHERE filter, set reg to
 /// 1 (found) or 0 (not found). For NOT EXISTS, the result is inverted.
+fn flatten_and_terms<'a>(expr: &'a Expr, terms: &mut Vec<&'a Expr>) {
+    if let Expr::BinaryOp {
+        left,
+        op: fsqlite_ast::BinaryOp::And,
+        right,
+        ..
+    } = expr
+    {
+        flatten_and_terms(left, terms);
+        flatten_and_terms(right, terms);
+    } else {
+        terms.push(expr);
+    }
+}
+
+fn expr_references_scan(expr: &Expr, table: &TableSchema, table_alias: Option<&str>) -> bool {
+    match expr {
+        Expr::Column(_, _) => resolve_column_ref(expr, table, table_alias).is_some(),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_references_scan(left, table, table_alias)
+                || expr_references_scan(right, table, table_alias)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => expr_references_scan(expr, table, table_alias),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_references_scan(expr, table, table_alias)
+                || expr_references_scan(low, table, table_alias)
+                || expr_references_scan(high, table, table_alias)
+        }
+        Expr::In { expr, set, .. } => {
+            expr_references_scan(expr, table, table_alias)
+                || match set {
+                    fsqlite_ast::InSet::List(values) => values
+                        .iter()
+                        .any(|value| expr_references_scan(value, table, table_alias)),
+                    fsqlite_ast::InSet::Table(_) | fsqlite_ast::InSet::Subquery(_) => true,
+                }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_references_scan(expr, table, table_alias)
+                || expr_references_scan(pattern, table, table_alias)
+                || escape
+                    .as_deref()
+                    .is_some_and(|esc| expr_references_scan(esc, table, table_alias))
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|inner| expr_references_scan(inner, table, table_alias))
+                || whens.iter().any(|(when_expr, then_expr)| {
+                    expr_references_scan(when_expr, table, table_alias)
+                        || expr_references_scan(then_expr, table, table_alias)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(|inner| expr_references_scan(inner, table, table_alias))
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            over.is_some()
+                || match args {
+                    FunctionArgs::Star => false,
+                    FunctionArgs::List(values) => values
+                        .iter()
+                        .any(|value| expr_references_scan(value, table, table_alias)),
+                }
+                || order_by
+                    .iter()
+                    .any(|term| expr_references_scan(&term.expr, table, table_alias))
+                || filter
+                    .as_deref()
+                    .is_some_and(|inner| expr_references_scan(inner, table, table_alias))
+        }
+        Expr::Exists { .. } | Expr::Subquery(_, _) => true,
+        _ => false,
+    }
+}
+
+const ONCE_MATERIALIZED_IN_LIST_THRESHOLD: usize = 8;
+
+fn in_list_value_supports_once_materialization(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_, _) | Expr::Placeholder(_, _) => true,
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => in_list_value_supports_once_materialization(inner),
+        _ => false,
+    }
+}
+
+fn can_use_once_materialized_in_list(
+    values: &[Expr],
+    operand: &Expr,
+    ctx: Option<&ScanCtx<'_>>,
+) -> bool {
+    if values.len() < ONCE_MATERIALIZED_IN_LIST_THRESHOLD {
+        return false;
+    }
+    if !values
+        .iter()
+        .all(in_list_value_supports_once_materialization)
+    {
+        return false;
+    }
+    match effective_collation_ctx(operand, ctx) {
+        Some(collation) => collation.eq_ignore_ascii_case("BINARY"),
+        None => true,
+    }
+}
+
+fn emit_once_materialized_in_list(
+    b: &mut ProgramBuilder,
+    operand: &Expr,
+    values: &[Expr],
+    not: bool,
+    reg: i32,
+    ctx: Option<&ScanCtx<'_>>,
+) {
+    let r_operand = b.alloc_temp();
+    emit_expr(b, operand, r_operand, ctx);
+
+    let null_label = b.emit_label();
+    let found_label = b.emit_label();
+    let done_label = b.emit_label();
+    b.emit_jump_to_label(Opcode::IsNull, r_operand, 0, null_label, P4::None, 0);
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let autoindex_cursor = 4096 + b.current_addr() as i32;
+    let r_saw_null = b.alloc_reg();
+    let build_done = b.emit_label();
+    b.emit_jump_to_label(Opcode::Once, 0, 0, build_done, P4::None, 0);
+    b.emit_op(Opcode::Integer, 0, r_saw_null, 0, P4::None, 0);
+    b.emit_op(Opcode::OpenAutoindex, autoindex_cursor, 1, 0, P4::None, 0);
+    let r_value = b.alloc_temp();
+    let r_key = b.alloc_temp();
+    for value_expr in values {
+        emit_expr(b, value_expr, r_value, ctx);
+        let next_value = b.emit_label();
+        let saw_null_label = b.emit_label();
+        b.emit_jump_to_label(Opcode::IsNull, r_value, 0, saw_null_label, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, r_value, 1, r_key, P4::None, 0);
+        b.emit_op(Opcode::IdxInsert, autoindex_cursor, r_key, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, next_value, P4::None, 0);
+        b.resolve_label(saw_null_label);
+        b.emit_op(Opcode::Integer, 1, r_saw_null, 0, P4::None, 0);
+        b.resolve_label(next_value);
+    }
+    b.free_temp(r_key);
+    b.free_temp(r_value);
+    b.resolve_label(build_done);
+
+    let r_probe_key = b.alloc_temp();
+    b.emit_op(Opcode::MakeRecord, r_operand, 1, r_probe_key, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::Found,
+        autoindex_cursor,
+        r_probe_key,
+        found_label,
+        P4::None,
+        0,
+    );
+    b.free_temp(r_probe_key);
+
+    b.emit_jump_to_label(Opcode::If, r_saw_null, 0, null_label, P4::None, 0);
+    b.emit_op(Opcode::Integer, i32::from(not), reg, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+    b.resolve_label(found_label);
+    b.emit_op(Opcode::Integer, i32::from(!not), reg, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+    b.resolve_label(null_label);
+    b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+    b.resolve_label(done_label);
+    b.free_temp(r_operand);
+}
+
+fn extract_exists_rowid_probe<'a>(
+    where_expr: &'a Expr,
+    table: &'a TableSchema,
+    table_alias: Option<&'a str>,
+) -> Option<(&'a Expr, Vec<&'a Expr>)> {
+    let mut terms = Vec::new();
+    flatten_and_terms(where_expr, &mut terms);
+
+    let mut probe_expr = None;
+    let mut residual_terms = Vec::new();
+    for term in terms {
+        if let Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::Eq,
+            right,
+            ..
+        } = term
+        {
+            let left_rowid = matches!(
+                resolve_column_ref(left, table, table_alias),
+                Some(SortKeySource::Rowid)
+            );
+            let right_rowid = matches!(
+                resolve_column_ref(right, table, table_alias),
+                Some(SortKeySource::Rowid)
+            );
+            if left_rowid
+                && !expr_references_scan(right, table, table_alias)
+                && probe_expr.is_none()
+            {
+                probe_expr = Some(right.as_ref());
+                continue;
+            }
+            if right_rowid
+                && !expr_references_scan(left, table, table_alias)
+                && probe_expr.is_none()
+            {
+                probe_expr = Some(left.as_ref());
+                continue;
+            }
+        }
+        residual_terms.push(term);
+    }
+
+    probe_expr.map(|probe| (probe, residual_terms))
+}
+
 #[allow(clippy::too_many_lines)]
 fn emit_exists_subquery(
     b: &mut ProgramBuilder,
@@ -12035,7 +12444,6 @@ fn emit_exists_subquery(
 
     // Use cursor offset far from the main scan cursors.
     let sub_cursor = outer_ctx.cursor + 128;
-    let found_label = b.emit_label();
     let done_label = b.emit_label();
 
     // Default result: 0 (not found) for EXISTS, 1 for NOT EXISTS.
@@ -12053,12 +12461,6 @@ fn emit_exists_subquery(
         0,
     );
 
-    let rewind_addr = b.current_addr();
-    b.emit_jump_to_label(Opcode::Rewind, sub_cursor, 0, done_label, P4::None, 0);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let loop_body = (rewind_addr + 1) as i32;
-
-    // Build scan context for the subquery table so correlated WHERE refs resolve.
     let sub_ctx = ScanCtx {
         cursor: sub_cursor,
         table,
@@ -12067,6 +12469,42 @@ fn emit_exists_subquery(
         register_base: None,
         secondary: None,
     };
+
+    if let Some(where_expr) = where_clause
+        && let Some((probe_expr, residual_terms)) =
+            extract_exists_rowid_probe(where_expr, table, sub_alias)
+    {
+        let probe_reg = b.alloc_temp();
+        emit_expr_with_fallback(b, probe_expr, probe_reg, &sub_ctx, Some(outer_ctx));
+        b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, done_label, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            sub_cursor,
+            probe_reg,
+            done_label,
+            P4::None,
+            0,
+        );
+        b.free_temp(probe_reg);
+
+        for residual_term in residual_terms {
+            let residual_reg = b.alloc_temp();
+            emit_expr_with_fallback(b, residual_term, residual_reg, &sub_ctx, Some(outer_ctx));
+            b.emit_jump_to_label(Opcode::IfNot, residual_reg, 1, done_label, P4::None, 0);
+            b.free_temp(residual_reg);
+        }
+
+        let found_val = i32::from(!not);
+        b.emit_op(Opcode::Integer, found_val, reg, 0, P4::None, 0);
+        b.resolve_label(done_label);
+        b.emit_op(Opcode::Close, sub_cursor, 0, 0, P4::None, 0);
+        return;
+    }
+
+    let rewind_addr = b.current_addr();
+    b.emit_jump_to_label(Opcode::Rewind, sub_cursor, 0, done_label, P4::None, 0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_body = (rewind_addr + 1) as i32;
 
     // Apply WHERE filter if present.
     if let Some(where_expr) = where_clause {
@@ -12079,14 +12517,14 @@ fn emit_exists_subquery(
         // Row matches WHERE — found.
         let found_val = i32::from(!not);
         b.emit_op(Opcode::Integer, found_val, reg, 0, P4::None, 0);
-        b.emit_jump_to_label(Opcode::Goto, 0, 0, found_label, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
 
         b.resolve_label(next_label);
     } else {
         // No WHERE — if any row exists, result is found.
         let found_val = i32::from(!not);
         b.emit_op(Opcode::Integer, found_val, reg, 0, P4::None, 0);
-        b.emit_jump_to_label(Opcode::Goto, 0, 0, found_label, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
     }
 
     // Next row.
@@ -12094,8 +12532,6 @@ fn emit_exists_subquery(
 
     // Fall through: no row matched.
     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-
-    b.resolve_label(found_label);
 
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, sub_cursor, 0, 0, P4::None, 0);
@@ -17128,6 +17564,142 @@ mod tests {
         }
     }
 
+    /// Build `SELECT count(*) FROM table WHERE rowid >= low AND rowid < high`.
+    fn agg_count_star_rowid_range(table: &str, low: i64, high: i64) -> SelectStatement {
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::FunctionCall {
+                            name: "count".to_owned(),
+                            args: FunctionArgs::Star,
+                            distinct: false,
+                            order_by: vec![],
+                            filter: None,
+                            over: None,
+                            span: Span::ZERO,
+                        },
+                        alias: None,
+                    }],
+                    from: Some(from_table(table)),
+                    where_clause: Some(Box::new(Expr::BinaryOp {
+                        left: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+                            op: AstBinaryOp::Ge,
+                            right: Box::new(Expr::Literal(Literal::Integer(low), Span::ZERO)),
+                            span: Span::ZERO,
+                        }),
+                        op: AstBinaryOp::And,
+                        right: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+                            op: AstBinaryOp::Lt,
+                            right: Box::new(Expr::Literal(Literal::Integer(high), Span::ZERO)),
+                            span: Span::ZERO,
+                        }),
+                        span: Span::ZERO,
+                    })),
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
+    fn agg_count_star_exists_rowid_probe() -> SelectStatement {
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::FunctionCall {
+                            name: "count".to_owned(),
+                            args: FunctionArgs::Star,
+                            distinct: false,
+                            order_by: vec![],
+                            filter: None,
+                            over: None,
+                            span: Span::ZERO,
+                        },
+                        alias: None,
+                    }],
+                    from: Some(from_table("t")),
+                    where_clause: Some(Box::new(Expr::Exists {
+                        subquery: Box::new(SelectStatement {
+                            with: None,
+                            body: SelectBody {
+                                select: SelectCore::Select {
+                                    distinct: Distinctness::All,
+                                    columns: vec![ResultColumn::Expr {
+                                        expr: Expr::Literal(Literal::Integer(1), Span::ZERO),
+                                        alias: None,
+                                    }],
+                                    from: Some(FromClause {
+                                        source: TableOrSubquery::Table {
+                                            name: QualifiedName::bare("s"),
+                                            alias: Some("s".to_owned()),
+                                            index_hint: None,
+                                            time_travel: None,
+                                        },
+                                        joins: vec![],
+                                    }),
+                                    where_clause: Some(Box::new(Expr::BinaryOp {
+                                        left: Box::new(Expr::BinaryOp {
+                                            left: Box::new(Expr::Column(
+                                                ColumnRef::qualified("s", "rowid"),
+                                                Span::ZERO,
+                                            )),
+                                            op: AstBinaryOp::Eq,
+                                            right: Box::new(Expr::Column(
+                                                ColumnRef::bare("a"),
+                                                Span::ZERO,
+                                            )),
+                                            span: Span::ZERO,
+                                        }),
+                                        op: AstBinaryOp::And,
+                                        right: Box::new(Expr::BinaryOp {
+                                            left: Box::new(Expr::Column(
+                                                ColumnRef::qualified("s", "rowid"),
+                                                Span::ZERO,
+                                            )),
+                                            op: AstBinaryOp::Le,
+                                            right: Box::new(Expr::Literal(
+                                                Literal::Integer(5),
+                                                Span::ZERO,
+                                            )),
+                                            span: Span::ZERO,
+                                        }),
+                                        span: Span::ZERO,
+                                    })),
+                                    group_by: vec![],
+                                    having: None,
+                                    windows: vec![],
+                                },
+                                compounds: vec![],
+                            },
+                            order_by: vec![],
+                            limit: None,
+                        }),
+                        not: false,
+                        span: Span::ZERO,
+                    })),
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
     /// Build `SELECT func(col) FROM table`.
     fn agg_func_col(func: &str, col: &str, table: &str) -> SelectStatement {
         SelectStatement {
@@ -17315,24 +17887,26 @@ mod tests {
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        // Should have: Init, Transaction, Null (accum init), OpenRead,
-        // Rewind, AggStep, Next, AggFinal, ResultRow, Close, Halt.
+        // COUNT(*) now takes the direct Count fast path.
         assert!(has_opcodes(
             &prog,
             &[
                 Opcode::Init,
                 Opcode::Transaction,
-                Opcode::Null,
                 Opcode::OpenRead,
-                Opcode::Rewind,
-                Opcode::AggStep,
-                Opcode::Next,
-                Opcode::AggFinal,
+                Opcode::Count,
                 Opcode::ResultRow,
                 Opcode::Close,
                 Opcode::Halt,
             ]
         ));
+        assert!(
+            !prog
+                .ops()
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::AggStep | Opcode::AggFinal)),
+            "COUNT(*) fast path should bypass aggregate opcodes"
+        );
 
         // ResultRow should cover 1 column.
         let rr = prog
@@ -17341,17 +17915,96 @@ mod tests {
             .find(|op| op.opcode == Opcode::ResultRow)
             .unwrap();
         assert_eq!(rr.p2, 1, "count(*) produces 1 result column");
+    }
 
-        // AggStep should have P4 = FuncName("COUNT").
-        let step = prog
+    #[test]
+    fn test_codegen_select_count_star_rowid_range_uses_counter_loop() {
+        let stmt = agg_count_star_rowid_range("t", 10, 20);
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::SeekGE | Opcode::SeekGT)),
+            "rowid-bounded COUNT(*) should seek into range instead of rewinding from row 0"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::AddImm),
+            "specialized COUNT(*) loop should increment a counter register directly"
+        );
+        assert!(
+            !prog
+                .ops()
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::AggStep | Opcode::AggFinal)),
+            "rowid-bounded COUNT(*) should bypass generic aggregate execution"
+        );
+    }
+
+    #[test]
+    fn test_codegen_exists_subquery_uses_rowid_probe_when_available() {
+        let stmt = agg_count_star_exists_rowid_probe();
+        let schema = test_schema_with_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::SeekRowid),
+            "correlated EXISTS on inner rowid should probe directly with SeekRowid"
+        );
+        let rewind_count = prog
             .ops()
             .iter()
-            .find(|op| op.opcode == Opcode::AggStep)
-            .unwrap();
+            .filter(|op| op.opcode == Opcode::Rewind)
+            .count();
+        assert_eq!(
+            rewind_count, 1,
+            "only the outer scan should rewind when EXISTS lowers to a direct rowid probe"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_large_in_list_uses_once_materialized_autoindex() {
+        let values = (1..=8)
+            .map(|value| Expr::Literal(Literal::Integer(value), Span::ZERO))
+            .collect();
+        let where_expr = Expr::In {
+            expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            set: InSet::List(values),
+            not: false,
+            span: Span::ZERO,
+        };
+        let stmt = simple_select(&["a"], "t", Some(Box::new(where_expr)));
+
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
         assert!(
-            matches!(&step.p4, P4::FuncName(f) if f == "COUNT"),
-            "AggStep P4 should be FuncName(COUNT), got {:?}",
-            step.p4
+            prog.ops().iter().any(|op| op.opcode == Opcode::Once),
+            "large IN lists should materialize their membership set once per statement"
+        );
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::OpenAutoindex),
+            "large IN lists should build an ephemeral autoindex"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::IdxInsert),
+            "large IN lists should populate the ephemeral autoindex"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Found),
+            "large IN lists should probe membership via Found"
         );
     }
 

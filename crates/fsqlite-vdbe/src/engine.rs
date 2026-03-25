@@ -122,6 +122,17 @@ fn duration_ns_saturating(duration: Duration) -> u64 {
 }
 
 #[inline]
+fn transient_mem_root_pgno(root_pgno: PageNumber) -> PageNumber {
+    if root_pgno.get() == 1 {
+        // MemPageStore pages do not include the 100-byte SQLite database
+        // header, so synthetic cursors must avoid page 1.
+        PageNumber::new(2).expect("page 2 must be a valid transient root page")
+    } else {
+        root_pgno
+    }
+}
+
+#[inline]
 fn add_vdbe_counter(counter: &AtomicU64, delta: u64) {
     if FSQLITE_VDBE_METRICS_ENABLED.load(AtomicOrdering::Relaxed) {
         counter.fetch_add(delta, AtomicOrdering::Relaxed);
@@ -4217,6 +4228,11 @@ pub struct VdbeEngine {
     /// Whether `OP_ResultRow` should materialize and retain result rows.
     /// DML-only execution lanes can disable this to avoid row-buffer work.
     collect_result_rows: bool,
+    /// Optional cap on how many `OP_ResultRow` payloads are retained.
+    ///
+    /// Execution still continues to completion; rows past the cap are simply
+    /// discarded while preserving register-clearing semantics.
+    max_collected_result_rows: Option<usize>,
     /// Whether per-statement execution state is already in a fresh baseline.
     ///
     /// `reset_for_reuse()` establishes this for cached engines. The common
@@ -4607,6 +4623,7 @@ impl VdbeEngine {
             bloom_filters: HashMap::new(),
             make_record_buf: Vec::new(),
             collect_result_rows: true,
+            max_collected_result_rows: None,
             statement_state_clean: true,
             statement_cold_state: StatementColdState::empty(),
         }
@@ -4724,6 +4741,7 @@ impl VdbeEngine {
         // program at the start of each run (line ~4903).
         self.make_record_buf.clear();
         self.collect_result_rows = true;
+        self.max_collected_result_rows = None;
         self.statement_state_clean = true;
     }
 
@@ -4742,6 +4760,11 @@ impl VdbeEngine {
     /// Enable or disable `OP_ResultRow` materialization.
     pub fn set_collect_result_rows(&mut self, collect_result_rows: bool) {
         self.collect_result_rows = collect_result_rows;
+    }
+
+    /// Cap how many `OP_ResultRow` payloads are retained in `self.results`.
+    pub fn set_max_collected_result_rows(&mut self, max_collected_result_rows: Option<usize>) {
+        self.max_collected_result_rows = max_collected_result_rows;
     }
 
     /// Returns the time-travel marker for a cursor, if any.
@@ -5753,7 +5776,12 @@ impl VdbeEngine {
                     // discard the row entirely while preserving register-clearing
                     // semantics.
                     let count = usize::try_from(op.p2).unwrap_or(0);
-                    if self.collect_result_rows {
+                    let should_retain_row = self.collect_result_rows
+                        && match self.max_collected_result_rows {
+                            Some(limit) => self.results.len() < limit,
+                            None => true,
+                        };
+                    if should_retain_row {
                         let materialize_start = collect_vdbe_metrics.then(Instant::now);
                         let row = self.take_reg_range(op.p1, count);
                         if collect_vdbe_metrics {
@@ -6349,7 +6377,7 @@ impl VdbeEngine {
                         let rp = db.allocate_root_page();
                         PageNumber::new(rp as u32)
                     } else {
-                        None
+                        PageNumber::new(2)
                     };
                     if let Some(root_pgno) = root_pgno {
                         let store = MemPageStore::with_empty_index(root_pgno, autoindex_page_size);
@@ -10385,15 +10413,16 @@ impl VdbeEngine {
             .db
             .as_ref()
             .is_none_or(|db| db.get_table(root_page).is_some());
+        let transient_root_pgno = transient_mem_root_pgno(root_pgno);
         let store = if is_table_btree {
-            MemPageStore::with_empty_table(root_pgno, self.page_size.get())
+            MemPageStore::with_empty_table(transient_root_pgno, self.page_size.get())
         } else {
-            MemPageStore::with_empty_index(root_pgno, self.page_size.get())
+            MemPageStore::with_empty_index(transient_root_pgno, self.page_size.get())
         };
         let cx = self.derive_execution_cx();
         let mut cursor = BtCursor::new_with_index_desc(
             store,
-            root_pgno,
+            transient_root_pgno,
             self.page_size.get(),
             is_table_btree,
             if is_table_btree {
@@ -11718,6 +11747,50 @@ mod tests {
     }
 
     #[test]
+    fn test_result_row_collection_cap_discards_rows_after_limit_and_clears_registers() {
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let r1 = b.alloc_reg();
+        let r2 = b.alloc_reg();
+        let r3 = b.alloc_reg();
+        let r4 = b.alloc_reg();
+        let r5 = b.alloc_reg();
+        let r6 = b.alloc_reg();
+        b.emit_op(Opcode::Integer, 7, r1, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 8, r2, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r2, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 9, r3, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r3, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::IntCopy, r1, r4, 0, P4::None, 0);
+        b.emit_op(Opcode::IntCopy, r2, r5, 0, P4::None, 0);
+        b.emit_op(Opcode::IntCopy, r3, r6, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r4, 3, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let program = b.finish().expect("program should build");
+
+        let mut engine = VdbeEngine::new(program.register_count());
+        engine.set_max_collected_result_rows(Some(2));
+        let outcome = engine.execute(&program).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(
+            engine
+                .results()
+                .iter()
+                .map(|row| row.clone().into_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(7)], vec![SqliteValue::Integer(8)],],
+            "rows after the retention cap should be discarded"
+        );
+        assert_eq!(engine.get_reg(r3), &SqliteValue::Null);
+        assert_eq!(engine.get_reg(r4), &SqliteValue::Null);
+        assert_eq!(engine.get_reg(r5), &SqliteValue::Null);
+        assert_eq!(engine.get_reg(r6), &SqliteValue::Null);
+    }
+
+    #[test]
     fn test_execute_swaps_shared_table_index_meta_per_program() {
         let first_program = {
             let mut b = ProgramBuilder::new();
@@ -11999,6 +12072,67 @@ mod tests {
                 .map(|row| row.clone().into_vec())
                 .collect::<Vec<_>>(),
             vec![vec![SqliteValue::Integer(22)]]
+        );
+    }
+
+    #[test]
+    fn test_reset_for_reuse_clears_result_row_collection_cap() {
+        let mut first_builder = ProgramBuilder::new();
+        let first_reg = first_builder.alloc_reg();
+        first_builder.emit_op(Opcode::Integer, 11, first_reg, 0, P4::None, 0);
+        first_builder.emit_op(Opcode::ResultRow, first_reg, 1, 0, P4::None, 0);
+        first_builder.emit_op(Opcode::Integer, 12, first_reg, 0, P4::None, 0);
+        first_builder.emit_op(Opcode::ResultRow, first_reg, 1, 0, P4::None, 0);
+        first_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let first_program = first_builder.finish().expect("first program should build");
+
+        let mut second_builder = ProgramBuilder::new();
+        let second_reg = second_builder.alloc_reg();
+        second_builder.emit_op(Opcode::Integer, 21, second_reg, 0, P4::None, 0);
+        second_builder.emit_op(Opcode::ResultRow, second_reg, 1, 0, P4::None, 0);
+        second_builder.emit_op(Opcode::Integer, 22, second_reg, 0, P4::None, 0);
+        second_builder.emit_op(Opcode::ResultRow, second_reg, 1, 0, P4::None, 0);
+        second_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let second_program = second_builder
+            .finish()
+            .expect("second program should build");
+
+        let mut engine = VdbeEngine::new(
+            first_program
+                .register_count()
+                .max(second_program.register_count()),
+        );
+        engine.set_max_collected_result_rows(Some(1));
+        assert_eq!(
+            engine.execute(&first_program).expect("first execution"),
+            ExecOutcome::Done
+        );
+        assert_eq!(engine.results().len(), 1);
+
+        let reset_cx = Cx::new();
+        engine.reset_for_reuse(
+            first_program
+                .register_count()
+                .max(second_program.register_count()),
+            &reset_cx,
+            PageSize::DEFAULT,
+        );
+
+        assert_eq!(
+            engine.execute(&second_program).expect("second execution"),
+            ExecOutcome::Done
+        );
+        assert_eq!(
+            engine
+                .results()
+                .iter()
+                .map(|row| row.clone().into_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![SqliteValue::Integer(21)],
+                vec![SqliteValue::Integer(22)],
+            ],
+            "reset_for_reuse should restore uncapped row collection"
         );
     }
 
@@ -14803,6 +14937,49 @@ mod tests {
         // First pass: Once falls through → counter becomes 1 → loop back.
         // Second pass: Once jumps to skip_init → output counter=1.
         assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_open_autoindex_without_memdb_supports_idxinsert_and_found() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let found = b.emit_label();
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let cursor_id = 1;
+            let r_insert_val = b.alloc_reg();
+            let r_insert_key = b.alloc_reg();
+            let r_probe_val = b.alloc_reg();
+            let r_probe_key = b.alloc_reg();
+            let r_out = b.alloc_reg();
+
+            b.emit_op(Opcode::OpenAutoindex, cursor_id, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 7, r_insert_val, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::MakeRecord,
+                r_insert_val,
+                1,
+                r_insert_key,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::IdxInsert, cursor_id, r_insert_key, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Integer, 7, r_probe_val, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, r_probe_val, 1, r_probe_key, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Found, cursor_id, r_probe_key, found, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(found);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
     }
 
     // ── Type Coercion ──────────────────────────────────────────────────

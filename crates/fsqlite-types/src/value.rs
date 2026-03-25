@@ -780,12 +780,28 @@ fn ascii_ci_eq(a: char, b: char) -> bool {
     a.is_ascii() && b.is_ascii() && a.eq_ignore_ascii_case(&b)
 }
 
+#[inline]
+fn ascii_fold_byte(byte: u8) -> u8 {
+    byte.to_ascii_lowercase()
+}
+
+#[inline]
+fn ascii_ci_eq_byte(left: u8, right: u8) -> bool {
+    left == right || ascii_fold_byte(left) == ascii_fold_byte(right)
+}
+
 fn ascii_ci_eq_bytes(left: &[u8], right: &[u8]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right.iter())
-            .all(|(lhs, rhs)| lhs.eq_ignore_ascii_case(rhs))
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut idx = 0;
+    while idx < left.len() {
+        if !ascii_ci_eq_byte(left[idx], right[idx]) {
+            return false;
+        }
+        idx += 1;
+    }
+    true
 }
 
 fn ascii_ci_starts_with(text: &str, prefix: &str) -> bool {
@@ -803,11 +819,29 @@ fn ascii_ci_ends_with(text: &str, suffix: &str) -> bool {
 fn ascii_ci_contains(text: &str, needle: &str) -> bool {
     let text = text.as_bytes();
     let needle = needle.as_bytes();
-    needle.is_empty()
-        || (needle.len() <= text.len()
-            && text
-                .windows(needle.len())
-                .any(|window| ascii_ci_eq_bytes(window, needle)))
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > text.len() {
+        return false;
+    }
+
+    let max_start = text.len() - needle.len();
+    let first = ascii_fold_byte(needle[0]);
+    let mut start = 0;
+    while start <= max_start {
+        while start <= max_start && ascii_fold_byte(text[start]) != first {
+            start += 1;
+        }
+        if start > max_start {
+            break;
+        }
+        if ascii_ci_eq_bytes(&text[start + 1..start + needle.len()], &needle[1..]) {
+            return true;
+        }
+        start += 1;
+    }
+    false
 }
 
 /// Accumulator for SQL `sum()` aggregate with SQLite overflow semantics.
@@ -2051,6 +2085,19 @@ mod tests {
         assert!(sql_like("%éL%", "héllo", None));
         assert!(!sql_like("%Él%", "héllo", None));
         assert!(sql_like("Stra%", "straße", None));
+    }
+
+    #[test]
+    fn test_like_contains_fast_path_handles_overlapping_matches() {
+        assert!(sql_like("%ana%", "bananas", None));
+        assert!(sql_like("%NAN%", "baNanas", None));
+        assert!(!sql_like("%ananasx%", "bananas", None));
+    }
+
+    #[test]
+    fn test_like_contains_fast_path_preserves_non_ascii_byte_matching() {
+        assert!(sql_like("%ß%", "straße", None));
+        assert!(!sql_like("%SS%", "straße", None));
     }
 
     // ── format_sqlite_float ────────────────────────────────────────────

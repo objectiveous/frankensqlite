@@ -1467,10 +1467,18 @@ fn build_group_commit_batch(
 
 const SNAPSHOT_PUBLICATION_MODE: &str = "seqlock_published_pages";
 const PUBLISHED_SNAPSHOT_WAIT_SLICE: Duration = Duration::from_micros(50);
+/// Maximum retries for optimistic published-page reads before falling back to
+/// the slow path. 64 iterations covers typical publish latency on x86 (1-3 µs
+/// per seqlock retry). Not runtime-configurable — tuned for low-contention
+/// steady state.
 const PUBLISHED_READ_FAST_RETRY_LIMIT: usize = 64;
+/// Number of counter stripes for published page version tracking. Power-of-2
+/// for masking. Matches typical server core counts (up to 64 cores).
 const PUBLISHED_COUNTER_STRIPE_COUNT: usize = 64;
 
 // D1-CRITICAL Change 3: Sharded published pages to eliminate publish-side serialization.
+/// Number of shards for the published pages map. Must be power of 2.
+/// 64 shards balance contention reduction with memory overhead.
 const PUBLISHED_PAGES_SHARD_COUNT: usize = 64;
 const PUBLISHED_PAGES_SHARD_MASK: usize = PUBLISHED_PAGES_SHARD_COUNT - 1;
 const PUBLISHED_PAGES_GOLDEN_RATIO: u32 = 2_654_435_769;
@@ -3658,7 +3666,9 @@ impl StagedPage {
 /// Transaction handle produced by [`SimplePager`].
 /// Number of EOF pages to pre-allocate in a single lock acquisition.
 /// Reduces `inner` mutex contention when concurrent writers cause
-/// frequent B-tree splits that each need a new page.
+/// frequent B-tree splits that each need a new page. 8 is a reasonable
+/// balance — larger batches waste pages on small transactions, smaller
+/// batches increase lock contention on write-heavy workloads.
 const PAGE_LEASE_BATCH_SIZE: u32 = 8;
 
 pub struct SimpleTransaction<V: Vfs> {

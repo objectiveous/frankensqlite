@@ -613,16 +613,19 @@ pub fn escalate_to_page_level(
 /// connections share this mode setting. Changing the mode in one connection affects
 /// all other connections in the process.
 ///
-/// # TODO: Per-Connection Mode (Track D)
+/// # Limitation: Process-Global (Track D — bead bd-bldc5.3.9)
 ///
-/// This should be refactored to per-connection state stored in `ConnectionHandle`.
-/// The current design was chosen for simplicity during initial Track C implementation.
-/// A proper fix requires:
+/// This is process-global, not per-connection. Changing the mode via PRAGMA
+/// on one connection affects all connections in the process. A proper fix
+/// requires:
 /// 1. Adding `cell_mvcc_mode: CellMvccMode` field to `ConnectionHandle`
-/// 2. Threading the connection through the routing predicate
+/// 2. Threading the connection handle through the routing predicate
+///    (`should_use_cell_path()`, `CellRoutingDecision::decide()`)
 /// 3. Updating PRAGMA handling to modify connection state, not global state
 ///
-/// Until then, be aware that this setting is process-global, not per-database.
+/// The current design was chosen for simplicity during initial Track C
+/// implementation. It is functionally correct — just has wrong isolation
+/// scope. Most workloads use a single mode process-wide anyway.
 static GLOBAL_CELL_MVCC_MODE: AtomicCellMvccMode = AtomicCellMvccMode::new(CellMvccMode::Auto);
 
 /// Atomic wrapper for [`CellMvccMode`].

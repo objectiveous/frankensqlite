@@ -359,6 +359,9 @@ impl std::fmt::Debug for PageCache {
 /// Must be a power of 2 for efficient masking. 128 shards provides good
 /// scalability up to ~64 concurrent writers while keeping memory overhead
 /// reasonable (~8KB for shard metadata on 64-byte cache lines).
+///
+/// Future: consider scaling with `std::thread::available_parallelism()` for
+/// small embedded targets (fewer shards) or large servers (more shards).
 const SHARD_COUNT: usize = 128;
 
 /// Mask for shard index calculation (`SHARD_COUNT - 1`).

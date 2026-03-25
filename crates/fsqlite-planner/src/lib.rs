@@ -1996,10 +1996,18 @@ fn analyze_expression_index_usability(
 }
 
 /// Default selectivity for range constraints when no ANALYZE data is available.
+/// 0.33 means "a range predicate eliminates ~67% of rows." This is a
+/// conservative estimate matching C SQLite's heuristic for tables without
+/// `sqlite_stat1` data. When ANALYZE has been run, the planner uses the
+/// actual statistics from sqlite_stat1 instead.
 const DEFAULT_RANGE_SELECTIVITY: f64 = 0.33;
+/// Equality selectivity for skip-scan leading columns (1% = 100 distinct values).
 const SKIP_SCAN_EQ_SELECTIVITY: f64 = 0.01;
+/// Range selectivity for skip-scan trailing columns.
 const SKIP_SCAN_RANGE_SELECTIVITY: f64 = 0.20;
+/// Maximum estimated distinct values for a skip-scan leading column.
 const SKIP_SCAN_MAX_LEADING_DISTINCT: u64 = 16;
+/// Pages per distinct value for skip-scan cost estimation.
 const SKIP_SCAN_PAGES_PER_LEADING_DISTINCT: u64 = 8;
 
 fn estimate_skip_scan_leading_distinct(index: &IndexInfo) -> u64 {

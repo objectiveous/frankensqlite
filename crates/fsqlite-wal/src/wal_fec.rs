@@ -49,7 +49,12 @@ const LENGTH_PREFIX_BYTES: usize = 4;
 const META_FIXED_PREFIX_BYTES: usize = 8 + 4 + (8 * 4) + 22 + 16;
 const META_CHECKSUM_BYTES: usize = 8;
 const WAL_FEC_PRAGMA_HEADER_BYTES: usize = 8 + 4 + 1 + 3 + 8;
+/// Maximum queued repair events. 512 is sufficient for databases with up to
+/// ~500 concurrent corrupted frames. Exhaustion means repair events are dropped
+/// (logged, not silently lost). Monitor `wal_fec_repair_events_dropped` counter.
 const RAPTORQ_REPAIR_EVENT_CAPACITY: usize = 512;
+/// Maximum queued repair evidence records. 2048 covers 4× the event capacity
+/// to allow multiple evidence records per event (typical for multi-symbol repairs).
 const RAPTORQ_REPAIR_EVIDENCE_CAPACITY: usize = 2048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1405,6 +1410,8 @@ pub struct WalFrameCandidate {
     pub page_data: Vec<u8>,
 }
 
+/// Default repair pipeline queue capacity. Configurable via
+/// `WalFecRepairPipelineConfig::queue_capacity` at construction time.
 const DEFAULT_REPAIR_PIPELINE_QUEUE_CAPACITY: usize = 64;
 
 /// Pipeline configuration for asynchronous WAL-FEC repair generation.

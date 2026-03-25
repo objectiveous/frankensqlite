@@ -9,13 +9,20 @@ use asupersync::runtime::{Runtime, RuntimeBuilder, spawn_blocking};
 use asupersync::time::{sleep, wall_now};
 use fsqlite_types::{CommitSeq, PageNumber, TxnEpoch, TxnId, TxnToken};
 
+/// Per-core WAL buffer capacity in bytes. With N CPU cores, the total
+/// memory commitment is N × 4 MiB. On memory-constrained systems, reduce
+/// this via `PerCoreBuffer::with_capacity()`. On servers with large L3
+/// caches, increasing this can reduce flush frequency.
 const DEFAULT_BUFFER_CAPACITY_BYTES: usize = 4 * 1024 * 1024;
+/// Overflow fallback buffer size when the per-core buffer is full.
 const DEFAULT_OVERFLOW_FALLBACK_BYTES: usize = 8 * 1024 * 1024;
 const RECORD_FIXED_OVERHEAD_BYTES: usize = 48;
+/// Epoch advance interval for flushing batched WAL entries.
 const DEFAULT_EPOCH_ADVANCE_INTERVAL_MS: u64 = 10;
 
 /// Default number of buffer slots. With 128 slots, 16 threads have only
-/// 12.5% probability of two threads landing on the same slot.
+/// 12.5% probability of two threads landing on the same slot. For systems
+/// with fewer cores, a smaller slot count reduces memory overhead.
 pub const DEFAULT_BUFFER_SLOT_COUNT: usize = 128;
 
 /// Global counter for assigning thread-local buffer slot indices.

@@ -765,7 +765,27 @@ pub fn integrity_check_sqlite_file_level1(db_bytes: &[u8]) -> Result<IntegrityCh
     let header_report = integrity_check_database_header(db_bytes);
 
     let page_report = if db_bytes.len() >= SQLITE_DB_HEADER_SIZE + 8 {
-        let page_size = sqlite_page_size_from_header(db_bytes).unwrap_or(4096);
+        let page_size = match sqlite_page_size_from_header(db_bytes) {
+            Some(ps) => ps,
+            None => {
+                // Cannot determine page size from a corrupted header.
+                // Silently assuming 4096 would produce false-negative
+                // corruption detection for databases with other page sizes.
+                // Report the issue and skip page-level checks.
+                let mut report = IntegrityCheckReport::ok(1);
+                report.push(
+                    IntegrityCheckLevel::Page,
+                    None,
+                    "cannot determine page size from database header; \
+                     header may be corrupted — skipping page checks"
+                        .to_owned(),
+                );
+                for issue in header_report.issues {
+                    report.issues.push(issue);
+                }
+                return Ok(report);
+            }
+        };
         let first_page_end = page_size.min(db_bytes.len());
         if first_page_end > SQLITE_DB_HEADER_SIZE {
             let mut first_page = db_bytes[SQLITE_DB_HEADER_SIZE..first_page_end].to_vec();

@@ -43,6 +43,8 @@ use crate::{
 const BEAD_ID: &str = "bd-numl";
 const MAX_BALANCED_REMOTE_IN_FLIGHT: usize = 8;
 const REMOTE_EFFECTS_EXECUTOR_NAME: &str = "fsqlite.remote_effects";
+// Tiered storage executor infrastructure — reserved for future ECS/Native mode
+// integration where cold pages are offloaded to remote object storage.
 #[allow(dead_code)]
 pub(crate) const TIERED_STORAGE_EXECUTOR_NAME: &str = "fsqlite.tiered_storage";
 #[allow(dead_code)]

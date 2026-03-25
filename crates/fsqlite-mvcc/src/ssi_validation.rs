@@ -779,10 +779,22 @@ pub fn ssi_validate_and_publish(
         "ssi_validate: edge discovery complete"
     );
 
-    // Step 4: Refinement and merge (placeholder — refinement is optional,
-    // skipping is always safe per §5.7.3 correctness rule).
-    // In a full implementation, cold-plane refinement would tighten witnesses
-    // and potentially remove spurious edges.
+    // Step 4: Witness refinement (§5.7.3) — tighten edge set using
+    // cell-level key summaries to eliminate false-positive page-granularity
+    // overlaps. The infrastructure is fully implemented in
+    // `witness_refinement::refine_edges()`. Currently invoked with an empty
+    // refinements slice (all edges pass through unchanged) because
+    // cell-level KeySummary data is not yet produced during query execution.
+    //
+    // To activate refinement: populate a `Vec<(u32, KeySummary)>` from the
+    // transaction's cell-level read set during B-tree traversal, and pass
+    // it to `refine_edges()` here. The call signature is:
+    //   refine_edges(in_edges, out_edges, &refinements, &budget)
+    //     -> RefinementResult { confirmed_edges, eliminated_edges, ... }
+    //
+    // Skipping refinement is always safe per §5.7.3: we may abort
+    // transactions that could have committed, but we never allow a
+    // transaction that should have been aborted.
 
     // Keep edges deterministic for proof/evidence generation.
     let mut in_edges = in_edges;

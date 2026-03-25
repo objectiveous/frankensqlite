@@ -814,6 +814,12 @@ pub mod pragma {
         pub differential_views: DifferentialViewsSetting,
         /// WAL-FEC repair symbol budget (`PRAGMA raptorq_repair_symbols`).
         pub raptorq_repair_symbols: u8,
+        /// MVCC maximum committed versions per page chain before eager GC.
+        /// `PRAGMA fsqlite.mvcc_max_chain_length`.
+        pub mvcc_max_chain_length: usize,
+        /// MVCC serialized writer lease duration in seconds.
+        /// `PRAGMA fsqlite.mvcc_writer_lease_secs`.
+        pub mvcc_writer_lease_secs: u64,
     }
 
     impl Default for ConnectionPragmaState {
@@ -835,6 +841,8 @@ pub mod pragma {
                 serializable: true,
                 differential_views: DifferentialViewsSetting::Off,
                 raptorq_repair_symbols: DEFAULT_RAPTORQ_REPAIR_SYMBOLS,
+                mvcc_max_chain_length: 64,
+                mvcc_writer_lease_secs: 30,
             }
         }
     }
@@ -924,6 +932,12 @@ pub mod pragma {
         }
         if name.eq_ignore_ascii_case("recursive_triggers") {
             return apply_recursive_triggers(state, stmt);
+        }
+        if is_fsqlite_mvcc_max_chain_length(&stmt.name) {
+            return apply_mvcc_max_chain_length(state, stmt);
+        }
+        if is_fsqlite_mvcc_writer_lease_secs(&stmt.name) {
+            return apply_mvcc_writer_lease_secs(state, stmt);
         }
         Ok(PragmaOutput::Unsupported)
     }
@@ -1305,6 +1319,72 @@ pub mod pragma {
             Some(schema) => schema.eq_ignore_ascii_case("fsqlite"),
         };
         schema_ok && name.name.eq_ignore_ascii_case("raptorq_repair_symbols")
+    }
+
+    fn is_fsqlite_mvcc_max_chain_length(name: &QualifiedName) -> bool {
+        name.schema
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("fsqlite"))
+            && name.name.eq_ignore_ascii_case("mvcc_max_chain_length")
+    }
+
+    fn is_fsqlite_mvcc_writer_lease_secs(name: &QualifiedName) -> bool {
+        name.schema
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("fsqlite"))
+            && name.name.eq_ignore_ascii_case("mvcc_writer_lease_secs")
+    }
+
+    fn apply_mvcc_max_chain_length(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(state.mvcc_max_chain_length as i64)),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let value = parse_integer_expr(expr)?;
+                if value < 2 {
+                    return Err(FrankenError::OutOfRange {
+                        what: "fsqlite.mvcc_max_chain_length".into(),
+                        value: format!("{value} (minimum 2)"),
+                    });
+                }
+                #[allow(clippy::cast_sign_loss)]
+                {
+                    state.mvcc_max_chain_length = value as usize;
+                }
+                // Note: value is stored in pragma_state and will be read by
+                // the MVCC layer when creating concurrent execution contexts.
+                // The MvccCoordinator's own max_chain_length is set at
+                // construction; this PRAGMA value takes effect for new
+                // concurrent transactions opened on this connection.
+                Ok(PragmaOutput::Int(value))
+            }
+        }
+    }
+
+    fn apply_mvcc_writer_lease_secs(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(state.mvcc_writer_lease_secs as i64)),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let value = parse_integer_expr(expr)?;
+                if value < 1 {
+                    return Err(FrankenError::OutOfRange {
+                        what: "fsqlite.mvcc_writer_lease_secs".into(),
+                        value: format!("{value} (minimum 1)"),
+                    });
+                }
+                #[allow(clippy::cast_sign_loss)]
+                {
+                    state.mvcc_writer_lease_secs = value as u64;
+                }
+                // Note: same propagation model as mvcc_max_chain_length above.
+                Ok(PragmaOutput::Int(value))
+            }
+        }
     }
 
     fn apply_raptorq_repair_symbols(

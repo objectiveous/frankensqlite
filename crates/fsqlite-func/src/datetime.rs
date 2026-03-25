@@ -212,11 +212,19 @@ fn day_of_year(y: i64, m: i64, d: i64) -> i64 {
 fn parse_timestring(s: &str) -> Option<f64> {
     let s = s.trim();
 
-    // Special value: 'now' — we use a fixed time for determinism in tests.
-    // Real 'now' will come from the Cx connection time source later.
+    // Special value: 'now' — return the current UTC wall-clock time as JDN.
+    // C SQLite (date.c:451) captures time once per sqlite3_step() via the VFS
+    // and caches it; we use SystemTime::now() which gives per-call resolution.
+    // A future refinement (Track: Cx time source) could freeze time at
+    // statement start for full C SQLite compatibility.
     if s.eq_ignore_ascii_case("now") {
-        // Return a placeholder JDN for 2000-01-01 00:00:00.
-        return Some(ymd_to_jdn(2000, 1, 1));
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        // Unix epoch (1970-01-01 00:00:00) = JDN 2_440_587.5
+        return Some(2_440_587.5 + secs / 86_400.0);
     }
 
     // Try as a Julian Day Number (bare float).

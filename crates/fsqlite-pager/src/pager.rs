@@ -2800,6 +2800,62 @@ where
         Ok(())
     }
 
+    /// Export the pager's main database image as a self-contained SQLite file.
+    ///
+    /// The pager must be quiescent. In WAL mode we first checkpoint and
+    /// truncate the WAL so the returned bytes contain the durable main image.
+    pub fn export_database_bytes(&self, cx: &Cx) -> Result<Vec<u8>> {
+        let source_full = self.vfs.full_pathname(cx, &self.db_path)?;
+
+        let journal_mode = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            if inner.active_transactions > 0 || inner.checkpoint_active {
+                return Err(FrankenError::Busy);
+            }
+            inner.journal_mode
+        };
+
+        if journal_mode == JournalMode::Wal {
+            self.checkpoint(cx, traits::CheckpointMode::Truncate)?;
+        }
+
+        let source_flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
+        let (mut source_file, _) = self.vfs.open(cx, Some(&source_full), source_flags)?;
+
+        let export_result = (|| -> Result<Vec<u8>> {
+            let file_size = source_file.file_size(cx)?;
+            let output_len = usize::try_from(file_size).map_err(|_| FrankenError::OutOfRange {
+                what: "database export size".to_owned(),
+                value: file_size.to_string(),
+            })?;
+            let mut bytes = vec![0_u8; output_len];
+            let mut copied = 0_usize;
+            while copied < output_len {
+                let chunk_len = (output_len - copied).min(Self::EXPORT_COPY_CHUNK_SIZE);
+                let bytes_read =
+                    source_file.read(cx, &mut bytes[copied..copied + chunk_len], copied as u64)?;
+                if bytes_read == 0 {
+                    return Err(FrankenError::internal(
+                        "unexpected EOF while exporting database image",
+                    ));
+                }
+                copied = copied
+                    .checked_add(bytes_read)
+                    .ok_or_else(|| FrankenError::internal("export size overflow"))?;
+            }
+            Ok(bytes)
+        })();
+
+        let source_close = source_file.close(cx);
+
+        let bytes = export_result?;
+        source_close?;
+        Ok(bytes)
+    }
+
     /// Copy the pager's main database file to `target_path` via the active VFS.
     ///
     /// This is the pager-side export primitive used by higher-level features
@@ -5567,6 +5623,10 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         Ok(self.predicted_conflict_pages_with_inner(&inner))
+    }
+
+    fn write_set_page_numbers(&self) -> Vec<PageNumber> {
+        self.write_pages_sorted.clone()
     }
 
     fn page_size(&self) -> PageSize {

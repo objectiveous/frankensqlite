@@ -353,6 +353,11 @@ pub struct HotPathConnectionCeremonyProfile {
     pub commit_refresh_count: u64,
     pub memdb_refresh_count: u64,
     pub execute_body_time_ns: u64,
+    pub commit_pre_txn_time_ns: u64,
+    pub commit_txn_roundtrip_time_ns: u64,
+    pub commit_finalize_seq_time_ns: u64,
+    pub commit_handle_finalize_time_ns: u64,
+    pub commit_post_write_maintenance_time_ns: u64,
     pub finalize_post_publish_time_ns: u64,
     pub column_default_evaluation_passes: u64,
     pub prepared_table_engine_fresh_allocs: u64,
@@ -1240,6 +1245,11 @@ fn build_hot_path_profile_report(
         commit_refresh_count: snapshot.commit_refresh_count,
         memdb_refresh_count: snapshot.memdb_refresh_count,
         execute_body_time_ns: snapshot.execute_body_time_ns,
+        commit_pre_txn_time_ns: snapshot.commit_pre_txn_time_ns,
+        commit_txn_roundtrip_time_ns: snapshot.commit_txn_roundtrip_time_ns,
+        commit_finalize_seq_time_ns: snapshot.commit_finalize_seq_time_ns,
+        commit_handle_finalize_time_ns: snapshot.commit_handle_finalize_time_ns,
+        commit_post_write_maintenance_time_ns: snapshot.commit_post_write_maintenance_time_ns,
         finalize_post_publish_time_ns: snapshot.finalize_post_publish_time_ns,
         column_default_evaluation_passes: snapshot.column_default_evaluation_passes,
         prepared_table_engine_fresh_allocs: snapshot.prepared_table_engine_fresh_allocs,
@@ -4688,6 +4698,11 @@ mod tests {
             commit_refresh_count: 1,
             memdb_refresh_count: 1,
             execute_body_time_ns: 4_400,
+            commit_pre_txn_time_ns: 5_500,
+            commit_txn_roundtrip_time_ns: 6_600,
+            commit_finalize_seq_time_ns: 700,
+            commit_handle_finalize_time_ns: 800,
+            commit_post_write_maintenance_time_ns: 900,
             finalize_post_publish_time_ns: 1_250,
             cached_write_txn_reuses: 1,
             cached_write_txn_parks: 1,
@@ -5196,6 +5211,22 @@ mod tests {
         assert_eq!(report.connection_ceremony.prepared_lookup_time_ns, 1_100);
         assert_eq!(report.connection_ceremony.begin_setup_time_ns, 3_300);
         assert_eq!(report.connection_ceremony.execute_body_time_ns, 4_400);
+        assert_eq!(report.connection_ceremony.commit_pre_txn_time_ns, 5_500);
+        assert_eq!(
+            report.connection_ceremony.commit_txn_roundtrip_time_ns,
+            6_600
+        );
+        assert_eq!(report.connection_ceremony.commit_finalize_seq_time_ns, 700);
+        assert_eq!(
+            report.connection_ceremony.commit_handle_finalize_time_ns,
+            800
+        );
+        assert_eq!(
+            report
+                .connection_ceremony
+                .commit_post_write_maintenance_time_ns,
+            900
+        );
         assert_eq!(
             report.connection_ceremony.finalize_post_publish_time_ns,
             1_250

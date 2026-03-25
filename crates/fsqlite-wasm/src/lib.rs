@@ -139,6 +139,18 @@ impl FrankenDb {
         Self::new(name)
     }
 
+    #[wasm_bindgen(js_name = import)]
+    pub fn import(data: Uint8Array) -> Result<Self, JsValue> {
+        install_wasm_runtime();
+        let conn = CoreConnection::import_bytes(&data.to_vec()).map_err(franken_error_to_js)?;
+        Ok(Self {
+            state: Rc::new(FrankenDbState {
+                path: ":memory:".to_owned(),
+                inner: RefCell::new(Some(conn)),
+            }),
+        })
+    }
+
     #[wasm_bindgen(getter)]
     pub fn path(&self) -> String {
         self.state.path.clone()
@@ -211,6 +223,11 @@ impl FrankenDb {
             let stmt = conn.prepare(sql)?;
             Ok(stmt.explain())
         })
+    }
+
+    pub fn export(&self) -> Result<Uint8Array, JsValue> {
+        let bytes = self.with_connection(|conn| conn.export_bytes())?;
+        Ok(Uint8Array::from(bytes.as_slice()))
     }
 }
 
@@ -939,6 +956,54 @@ mod wasm_tests {
                 .expect("database should remain usable after no-op batches"),
             1
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn wasm_export_import_roundtrips_sqlite_image() {
+        let db = FrankenDb::new(None).expect("db should open");
+        db.execute_batch(
+            "CREATE TABLE wasm_export (id INTEGER PRIMARY KEY, name TEXT, payload BLOB);\
+             INSERT INTO wasm_export VALUES (1, 'alpha', X'DEADBEEF');\
+             INSERT INTO wasm_export VALUES (2, 'beta', X'010203');",
+        )
+        .expect("seed batch should succeed");
+
+        let exported = db.export().expect("export should succeed");
+        let exported_bytes = exported.to_vec();
+        assert!(
+            exported_bytes.starts_with(b"SQLite format 3\0"),
+            "export should produce a standard SQLite image header"
+        );
+
+        let imported = FrankenDb::import(exported).expect("import should succeed");
+        assert_eq!(imported.path(), ":memory:");
+
+        let rows = row_arrays(
+            &imported
+                .query("SELECT id, name, payload FROM wasm_export ORDER BY id")
+                .expect("query should succeed after import"),
+        );
+        assert_eq!(rows.length(), 2);
+
+        let first_row = rows.get(0).unchecked_into::<Array>();
+        assert_eq!(first_row.get(0).as_f64(), Some(1.0));
+        assert_eq!(first_row.get(1).as_string().as_deref(), Some("alpha"));
+        assert_eq!(
+            Uint8Array::new(&first_row.get(2)).to_vec(),
+            vec![0xDE, 0xAD, 0xBE, 0xEF]
+        );
+
+        let second_row = rows.get(1).unchecked_into::<Array>();
+        assert_eq!(second_row.get(0).as_f64(), Some(2.0));
+        assert_eq!(second_row.get(1).as_string().as_deref(), Some("beta"));
+        assert_eq!(Uint8Array::new(&second_row.get(2)).to_vec(), vec![1, 2, 3]);
+    }
+
+    #[wasm_bindgen_test]
+    fn wasm_import_rejects_empty_database_image() {
+        let error = FrankenDb::import(Uint8Array::new_with_length(0))
+            .expect_err("empty image should be rejected");
+        assert!(error_message(&error).contains("empty"));
     }
 
     #[wasm_bindgen_test]

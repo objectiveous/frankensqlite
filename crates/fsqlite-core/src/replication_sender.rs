@@ -544,6 +544,22 @@ pub fn derive_seed_from_changeset_id(id: &ChangesetId) -> u64 {
     xxhash_rust::xxh3::xxh3_64(id.as_bytes())
 }
 
+/// Generate a deterministic placeholder repair symbol (fallback when the
+/// RaptorQ encoder cannot be constructed). NOT a real RFC 6330 repair symbol;
+/// data encoded with these placeholders cannot be recovered.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn generate_deterministic_placeholder(seed: u64, isi: u32, t: usize) -> Vec<u8> {
+    let repair_seed = seed.wrapping_add(u64::from(isi));
+    let mut data = vec![0_u8; t];
+    for (i, byte) in data.iter_mut().enumerate() {
+        let mixed = repair_seed
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(i as u64);
+        *byte = (mixed >> 32) as u8;
+    }
+    data
+}
+
 /// Compute `K_source = ceil(F / T_replication)` for a payload length `F`.
 ///
 /// This is the normative symbol-count mapping for replication object sizing.
@@ -1276,26 +1292,44 @@ impl ReplicationSender {
             // Remaining bytes are zero-padded (per RFC 6330 symbol alignment).
             data
         } else {
-            // Repair symbol: placeholder (production uses RaptorQ intermediate symbols).
-            // For now, generate deterministic placeholder from seed + ISI.
-            let mut data = vec![0_u8; t];
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                let repair_seed = shard.seed.wrapping_add(u64::from(isi));
-                for (i, byte) in data.iter_mut().enumerate() {
-                    let mixed = repair_seed
-                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                        .wrapping_add(i as u64);
-                    *byte = (mixed >> 32) as u8;
+            // Repair symbol: use asupersync's RaptorQ SystematicEncoder.
+            //
+            // IMPORTANT: The encoder is rebuilt for each repair symbol call.
+            // SystematicEncoder::new() solves a constraint matrix, which is
+            // O(K^2) or worse. For production use with many repair symbols per
+            // shard, the encoder should be cached in EncodingSession (requires
+            // making EncodingSession non-Debug or wrapping the encoder).
+            // This is correct but slow for large K_source values.
+            use asupersync::raptorq::systematic::SystematicEncoder;
+
+            let source_symbols: Vec<Vec<u8>> = (0..shard.k_source as usize)
+                .map(|i| {
+                    let start = i * t;
+                    let end = (start + t).min(shard.changeset_bytes.len());
+                    let mut sym = vec![0_u8; t];
+                    let available = end.saturating_sub(start);
+                    if available > 0 {
+                        sym[..available].copy_from_slice(&shard.changeset_bytes[start..end]);
+                    }
+                    sym
+                })
+                .collect();
+
+            match SystematicEncoder::new(&source_symbols, t, shard.seed) {
+                Some(encoder) => {
+                    let repair_esi = isi - shard.k_source;
+                    encoder.repair_symbol(repair_esi)
+                }
+                None => {
+                    warn!(
+                        bead_id = BEAD_ID,
+                        isi,
+                        shard_index = session.current_shard,
+                        "RaptorQ encoder construction failed; using placeholder repair symbol"
+                    );
+                    generate_deterministic_placeholder(shard.seed, isi, t)
                 }
             }
-            warn!(
-                bead_id = BEAD_ID,
-                isi,
-                shard_index = session.current_shard,
-                "generated placeholder repair symbol (production uses RaptorQ encoder)"
-            );
-            data
         };
 
         let r_repair = max_isi.saturating_sub(shard.k_source);

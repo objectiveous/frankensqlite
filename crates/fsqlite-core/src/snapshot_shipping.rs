@@ -356,19 +356,34 @@ impl SnapshotSender {
             }
             data
         } else {
-            // Repair symbol placeholder.
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                let seed = derive_seed_from_changeset_id(&changeset_id);
-                let repair_seed = seed.wrapping_add(u64::from(isi));
-                let mut data = vec![0_u8; t];
-                for (i, byte) in data.iter_mut().enumerate() {
-                    let mixed = repair_seed
-                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                        .wrapping_add(i as u64);
-                    *byte = (mixed >> 32) as u8;
+            // Repair symbol: use RaptorQ SystematicEncoder from asupersync.
+            // NOTE: Encoder is rebuilt per-symbol (expensive for large K).
+            // See replication_sender.rs for the same pattern and caching note.
+            use asupersync::raptorq::systematic::SystematicEncoder;
+
+            let seed = derive_seed_from_changeset_id(&changeset_id);
+            let source_symbols: Vec<Vec<u8>> = (0..k_source as usize)
+                .map(|i| {
+                    let start = i * t;
+                    let end = (start + t).min(changeset.len());
+                    let mut sym = vec![0_u8; t];
+                    let available = end.saturating_sub(start);
+                    if available > 0 {
+                        sym[..available].copy_from_slice(&changeset[start..end]);
+                    }
+                    sym
+                })
+                .collect();
+
+            match SystematicEncoder::new(&source_symbols, t, seed) {
+                Some(encoder) => {
+                    let repair_esi = isi - k_source;
+                    encoder.repair_symbol(repair_esi)
                 }
-                data
+                None => {
+                    // Fallback for degenerate parameters.
+                    crate::replication_sender::generate_deterministic_placeholder(seed, isi, t)
+                }
             }
         };
 

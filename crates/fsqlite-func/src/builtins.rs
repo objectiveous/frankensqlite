@@ -23,6 +23,7 @@
     clippy::manual_ignore_case_cmp
 )]
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -471,9 +472,8 @@ impl ScalarFunction for LowerFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
-        Ok(SqliteValue::Text(Arc::from(
-            args[0].to_text().to_ascii_lowercase().as_str(),
-        )))
+        let lowered = text_arg(&args[0]).as_ref().to_ascii_lowercase();
+        Ok(SqliteValue::Text(Arc::from(lowered)))
     }
 
     fn num_args(&self) -> i32 {
@@ -492,9 +492,8 @@ impl ScalarFunction for UpperFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
-        Ok(SqliteValue::Text(Arc::from(
-            args[0].to_text().to_ascii_uppercase().as_str(),
-        )))
+        let upper = text_arg(&args[0]).as_ref().to_ascii_uppercase();
+        Ok(SqliteValue::Text(Arc::from(upper)))
     }
 
     fn num_args(&self) -> i32 {
@@ -1128,9 +1127,14 @@ impl ScalarFunction for SubstrFunc {
             return self.invoke_blob(args);
         }
 
-        let s = args[0].to_text();
-        let chars: Vec<char> = s.chars().collect();
-        let len = chars.len() as i64;
+        let text = text_arg(&args[0]);
+        let s = text.as_ref();
+        let ascii_fast_path = s.is_ascii();
+        let len = if ascii_fast_path {
+            s.len() as i64
+        } else {
+            s.chars().count() as i64
+        };
         let has_length = args.len() > 2 && !args[2].is_null();
 
         let mut p1 = args[1].to_integer();
@@ -1177,6 +1181,13 @@ impl ScalarFunction for SubstrFunc {
             return Ok(SqliteValue::Text(Arc::from("")));
         }
 
+        if ascii_fast_path {
+            let start = p1 as usize;
+            let end = (p1 + p2) as usize;
+            return Ok(SqliteValue::Text(Arc::from(&s[start..end])));
+        }
+
+        let chars: Vec<char> = s.chars().collect();
         let result: String = chars[p1 as usize..(p1 + p2) as usize].iter().collect();
         Ok(SqliteValue::Text(Arc::from(result)))
     }
@@ -1529,14 +1540,14 @@ impl ScalarFunction for LikeFunc {
         if let Some(null) = null_propagate(args) {
             return Ok(null);
         }
-        let pattern = args[0].to_text();
-        let string = args[1].to_text();
+        let pattern = text_arg(&args[0]);
+        let string = text_arg(&args[1]);
         let escape = if args.len() > 2 && !args[2].is_null() {
-            Some(single_char_escape(args[2].to_text().as_str())?)
+            Some(single_char_escape(text_arg(&args[2]).as_ref())?)
         } else {
             None
         };
-        let matched = like_match(&pattern, &string, escape);
+        let matched = like_match(pattern.as_ref(), string.as_ref(), escape);
         Ok(SqliteValue::Integer(i64::from(matched)))
     }
 
@@ -1573,9 +1584,9 @@ impl ScalarFunction for GlobFunc {
         if let Some(null) = null_propagate(args) {
             return Ok(null);
         }
-        let pattern = args[0].to_text();
-        let string = args[1].to_text();
-        let matched = glob_match(&pattern, &string);
+        let pattern = text_arg(&args[0]);
+        let string = text_arg(&args[1]);
+        let matched = glob_match(pattern.as_ref(), string.as_ref());
         Ok(SqliteValue::Integer(i64::from(matched)))
     }
 
@@ -1593,6 +1604,13 @@ fn glob_match(pattern: &str, string: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
     let txt: Vec<char> = string.chars().collect();
     glob_match_inner(&pat, &txt, 0, 0)
+}
+
+fn text_arg(value: &SqliteValue) -> Cow<'_, str> {
+    match value.as_text_str() {
+        Some(text) => Cow::Borrowed(text),
+        None => Cow::Owned(value.to_text()),
+    }
 }
 
 fn glob_match_inner(pat: &[char], txt: &[char], mut pi: usize, mut ti: usize) -> bool {

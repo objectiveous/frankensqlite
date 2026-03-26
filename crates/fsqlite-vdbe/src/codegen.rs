@@ -1596,11 +1596,14 @@ pub fn codegen_select(
     } else {
         extract_rowid_target_expr(where_clause.as_deref(), Some(table), table_alias)
     };
+    let rowid_order = (!stmt.order_by.is_empty())
+        .then(|| resolve_order_by_rowid_direction(table, table_alias, columns, &stmt.order_by))
+        .flatten();
     let rowid_range = if (is_aggregate && !simple_count_star)
-        || !stmt.order_by.is_empty()
         || distinct != Distinctness::All
         || !group_by.is_empty()
         || having.is_some()
+        || (!stmt.order_by.is_empty() && rowid_order.is_none())
     {
         None
     } else {
@@ -1848,6 +1851,7 @@ pub fn codegen_select(
             done_label,
             end_label,
             rowid_range,
+            matches!(rowid_order, Some(SortDirection::Desc)),
         )
     } else if let Some((_index_column_name, idx_schema, index_range)) = index_range {
         codegen_select_index_range_scan(
@@ -2456,6 +2460,7 @@ fn codegen_select_rowid_range_scan(
     done_label: crate::Label,
     end_label: crate::Label,
     rowid_range: RowidRangeTarget<'_>,
+    descending: bool,
 ) -> Result<(), CodegenError> {
     let limit_reg = limit_clause.map(|lc| {
         let r = b.alloc_reg();
@@ -2486,6 +2491,9 @@ fn codegen_select_rowid_range_scan(
         b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
         reg
     });
+    let lower_comparison = rowid_range
+        .lower
+        .map(|bound| resolved_rowid_range_comparison(table, table_alias, schema, bound));
     let upper_comparison = rowid_range
         .upper
         .map(|bound| resolved_rowid_range_comparison(table, table_alias, schema, bound));
@@ -2500,7 +2508,25 @@ fn codegen_select_rowid_range_scan(
     );
     emit_set_snapshot(b, cursor, time_travel);
 
-    if let Some(bound) = rowid_range.lower {
+    if descending {
+        if let Some(bound) = rowid_range.upper {
+            let seek_opcode = if bound.inclusive {
+                Opcode::SeekLE
+            } else {
+                Opcode::SeekLT
+            };
+            b.emit_jump_to_label(
+                seek_opcode,
+                cursor,
+                upper_reg.expect("upper bound register should exist"),
+                done_label,
+                P4::None,
+                0,
+            );
+        } else {
+            b.emit_jump_to_label(Opcode::Last, cursor, 0, done_label, P4::None, 0);
+        }
+    } else if let Some(bound) = rowid_range.lower {
         let seek_opcode = if bound.inclusive {
             Opcode::SeekGE
         } else {
@@ -2521,7 +2547,29 @@ fn codegen_select_rowid_range_scan(
     let loop_top = b.current_addr();
     let skip_label = b.emit_label();
 
-    if let Some(bound) = rowid_range.upper {
+    if descending {
+        if let Some(bound) = rowid_range.lower {
+            let current_rowid_reg = b.alloc_reg();
+            let stop_opcode = if bound.inclusive {
+                Opcode::Lt
+            } else {
+                Opcode::Le
+            };
+            b.emit_op(Opcode::Rowid, cursor, current_rowid_reg, 0, P4::None, 0);
+            b.emit_jump_to_label(
+                stop_opcode,
+                lower_reg.expect("lower bound register should exist"),
+                current_rowid_reg,
+                done_label,
+                lower_comparison
+                    .as_ref()
+                    .map_or(P4::None, |comparison| comparison.collation_p4.clone()),
+                lower_comparison
+                    .as_ref()
+                    .map_or(0, |comparison| comparison.cmp_p5),
+            );
+        }
+    } else if let Some(bound) = rowid_range.upper {
         let current_rowid_reg = b.alloc_reg();
         let stop_opcode = if bound.inclusive {
             Opcode::Gt
@@ -2558,7 +2606,18 @@ fn codegen_select_rowid_range_scan(
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let loop_body = loop_top as i32;
-    b.emit_op(Opcode::Next, cursor, loop_body, 0, P4::None, 0);
+    b.emit_op(
+        if descending {
+            Opcode::Prev
+        } else {
+            Opcode::Next
+        },
+        cursor,
+        loop_body,
+        0,
+        P4::None,
+        0,
+    );
 
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
@@ -2778,7 +2837,14 @@ fn rowid_range_fast_path_is_safe(range: RowidRangeTarget<'_>) -> bool {
 
 fn rowid_range_bound_is_seek_safe(expr: &Expr) -> bool {
     match expr {
-        Expr::Literal(Literal::Integer(_), _) => true,
+        Expr::Literal(Literal::Integer(_), _)
+        | Expr::Placeholder(
+            fsqlite_ast::PlaceholderType::Numbered(_)
+            | fsqlite_ast::PlaceholderType::ColonNamed(_)
+            | fsqlite_ast::PlaceholderType::AtNamed(_)
+            | fsqlite_ast::PlaceholderType::DollarNamed(_),
+            _,
+        ) => true,
         Expr::UnaryOp {
             op: fsqlite_ast::UnaryOp::Negate,
             expr,
@@ -2973,7 +3039,7 @@ fn codegen_select_count_star(
 fn codegen_select_count_star_indexed_in_scan(
     b: &mut ProgramBuilder,
     cursor: i32,
-    _table: &TableSchema,
+    table: &TableSchema,
     _table_alias: Option<&str>,
     schema: &[TableSchema],
     out_regs: i32,
@@ -3013,11 +3079,88 @@ fn codegen_select_count_star_indexed_in_scan(
         let r_min_rowid = b.alloc_reg();
         let r_probe_record = b.alloc_reg();
         let r_current_key = b.alloc_reg();
-
         let probe_done = b.emit_label();
+        let use_exists_semijoin_merge =
+            count_exists_semijoin_merge_is_safe(table, idx_schema, probe_source);
+        if use_exists_semijoin_merge {
+            b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, probe_done, P4::None, 0);
+        }
+        let source_rowid_range = extract_safe_probe_source_rowid_range(probe_source);
+        let source_upper_reg = source_rowid_range.and_then(|range| {
+            range.upper.map(|bound| {
+                let reg = b.alloc_reg();
+                emit_expr(b, bound.expr, reg, None);
+                b.emit_jump_to_label(Opcode::IsNull, reg, 0, probe_done, P4::None, 0);
+                reg
+            })
+        });
+        let source_upper_comparison = source_rowid_range.and_then(|range| {
+            range.upper.map(|bound| {
+                resolved_rowid_range_comparison(
+                    probe_source.table,
+                    probe_source.table_alias,
+                    schema,
+                    bound,
+                )
+            })
+        });
+
         let probe_start = b.current_addr();
-        b.emit_jump_to_label(Opcode::Rewind, source_cursor, 0, probe_done, P4::None, 0);
+        if let Some(range) = source_rowid_range {
+            if let Some(bound) = range.lower {
+                let lower_reg = b.alloc_reg();
+                emit_expr(b, bound.expr, lower_reg, None);
+                b.emit_jump_to_label(Opcode::IsNull, lower_reg, 0, probe_done, P4::None, 0);
+                let seek_opcode = if bound.inclusive {
+                    Opcode::SeekGE
+                } else {
+                    Opcode::SeekGT
+                };
+                b.emit_jump_to_label(
+                    seek_opcode,
+                    source_cursor,
+                    lower_reg,
+                    probe_done,
+                    P4::None,
+                    0,
+                );
+            } else {
+                b.emit_jump_to_label(Opcode::Rewind, source_cursor, 0, probe_done, P4::None, 0);
+            }
+        } else {
+            b.emit_jump_to_label(Opcode::Rewind, source_cursor, 0, probe_done, P4::None, 0);
+        }
         let skip_row = probe_source.where_clause.map(|_| b.emit_label());
+        if let Some(range) = source_rowid_range
+            && let Some(bound) = range.upper
+        {
+            let current_rowid_reg = b.alloc_reg();
+            let stop_opcode = if bound.inclusive {
+                Opcode::Gt
+            } else {
+                Opcode::Ge
+            };
+            b.emit_op(
+                Opcode::Rowid,
+                source_cursor,
+                current_rowid_reg,
+                0,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(
+                stop_opcode,
+                source_upper_reg.expect("upper bound register should exist"),
+                current_rowid_reg,
+                probe_done,
+                source_upper_comparison
+                    .as_ref()
+                    .map_or(P4::None, |comparison| comparison.collation_p4.clone()),
+                source_upper_comparison
+                    .as_ref()
+                    .map_or(0, |comparison| comparison.cmp_p5),
+            );
+        }
         if let (Some(where_expr), Some(skip_label)) = (probe_source.where_clause, skip_row) {
             emit_where_filter(
                 b,
@@ -3042,38 +3185,85 @@ fn codegen_select_count_star_indexed_in_scan(
 
         let next_probe = b.emit_label();
         b.emit_jump_to_label(Opcode::IsNull, r_probe_value, 0, next_probe, P4::None, 0);
-        b.emit_op(Opcode::Int64, 0, r_min_rowid, 0, P4::Int64(i64::MIN), 0);
-        b.emit_op(
-            Opcode::MakeRecord,
-            r_probe_value,
-            2,
-            r_probe_record,
-            P4::None,
-            0,
-        );
-        b.emit_jump_to_label(
-            Opcode::SeekGE,
-            idx_cursor,
-            r_probe_record,
-            next_probe,
-            P4::None,
-            0,
-        );
+        if use_exists_semijoin_merge {
+            let advance_outer = b.emit_label();
+            let align_outer = b.emit_label();
+            let count_duplicate_run = b.emit_label();
 
-        let idx_loop_top = b.current_addr();
-        b.emit_op(Opcode::Column, idx_cursor, 0, r_current_key, P4::None, 0);
-        b.emit_jump_to_label(
-            Opcode::Ne,
-            r_probe_value,
-            r_current_key,
-            next_probe,
-            P4::None,
-            0,
-        );
-        b.emit_op(Opcode::AddImm, out_regs, 1, 0, P4::None, 0);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let idx_loop_body = idx_loop_top as i32;
-        b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
+            b.resolve_label(align_outer);
+            b.emit_op(Opcode::Column, idx_cursor, 0, r_current_key, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::Lt,
+                r_current_key,
+                r_probe_value,
+                advance_outer,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(
+                Opcode::Gt,
+                r_current_key,
+                r_probe_value,
+                next_probe,
+                P4::None,
+                0,
+            );
+
+            b.resolve_label(count_duplicate_run);
+            b.emit_op(Opcode::AddImm, out_regs, 1, 0, P4::None, 0);
+            let after_outer_next = b.emit_label();
+            b.emit_jump_to_label(Opcode::Next, idx_cursor, 0, after_outer_next, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, probe_done, P4::None, 0);
+
+            b.resolve_label(after_outer_next);
+            b.emit_op(Opcode::Column, idx_cursor, 0, r_current_key, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::Eq,
+                r_probe_value,
+                r_current_key,
+                count_duplicate_run,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, next_probe, P4::None, 0);
+
+            b.resolve_label(advance_outer);
+            b.emit_jump_to_label(Opcode::Next, idx_cursor, 0, align_outer, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, probe_done, P4::None, 0);
+        } else {
+            b.emit_op(Opcode::Int64, 0, r_min_rowid, 0, P4::Int64(i64::MIN), 0);
+            b.emit_op(
+                Opcode::MakeRecord,
+                r_probe_value,
+                2,
+                r_probe_record,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(
+                Opcode::SeekGE,
+                idx_cursor,
+                r_probe_record,
+                next_probe,
+                P4::None,
+                0,
+            );
+
+            let idx_loop_top = b.current_addr();
+            b.emit_op(Opcode::Column, idx_cursor, 0, r_current_key, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::Ne,
+                r_probe_value,
+                r_current_key,
+                next_probe,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::AddImm, out_regs, 1, 0, P4::None, 0);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let idx_loop_body = idx_loop_top as i32;
+            b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
+        }
 
         if let Some(skip_label) = skip_row {
             b.resolve_label(skip_label);
@@ -3132,9 +3322,81 @@ fn codegen_select_count_star_indexed_in_scan(
             );
 
             let build_done = b.emit_label();
+            let source_rowid_range = extract_safe_probe_source_rowid_range(&probe_source);
+            let source_upper_reg = source_rowid_range.and_then(|range| {
+                range.upper.map(|bound| {
+                    let reg = b.alloc_reg();
+                    emit_expr(b, bound.expr, reg, None);
+                    b.emit_jump_to_label(Opcode::IsNull, reg, 0, build_done, P4::None, 0);
+                    reg
+                })
+            });
+            let source_upper_comparison = source_rowid_range.and_then(|range| {
+                range.upper.map(|bound| {
+                    resolved_rowid_range_comparison(
+                        probe_source.table,
+                        probe_source.table_alias,
+                        schema,
+                        bound,
+                    )
+                })
+            });
             let build_start = b.current_addr();
-            b.emit_jump_to_label(Opcode::Rewind, source_cursor, 0, build_done, P4::None, 0);
+            if let Some(range) = source_rowid_range {
+                if let Some(bound) = range.lower {
+                    let lower_reg = b.alloc_reg();
+                    emit_expr(b, bound.expr, lower_reg, None);
+                    b.emit_jump_to_label(Opcode::IsNull, lower_reg, 0, build_done, P4::None, 0);
+                    let seek_opcode = if bound.inclusive {
+                        Opcode::SeekGE
+                    } else {
+                        Opcode::SeekGT
+                    };
+                    b.emit_jump_to_label(
+                        seek_opcode,
+                        source_cursor,
+                        lower_reg,
+                        build_done,
+                        P4::None,
+                        0,
+                    );
+                } else {
+                    b.emit_jump_to_label(Opcode::Rewind, source_cursor, 0, build_done, P4::None, 0);
+                }
+            } else {
+                b.emit_jump_to_label(Opcode::Rewind, source_cursor, 0, build_done, P4::None, 0);
+            }
             let skip_row = probe_source.where_clause.map(|_| b.emit_label());
+            if let Some(range) = source_rowid_range
+                && let Some(bound) = range.upper
+            {
+                let current_rowid_reg = b.alloc_reg();
+                let stop_opcode = if bound.inclusive {
+                    Opcode::Gt
+                } else {
+                    Opcode::Ge
+                };
+                b.emit_op(
+                    Opcode::Rowid,
+                    source_cursor,
+                    current_rowid_reg,
+                    0,
+                    P4::None,
+                    0,
+                );
+                b.emit_jump_to_label(
+                    stop_opcode,
+                    source_upper_reg.expect("upper bound register should exist"),
+                    current_rowid_reg,
+                    build_done,
+                    source_upper_comparison
+                        .as_ref()
+                        .map_or(P4::None, |comparison| comparison.collation_p4.clone()),
+                    source_upper_comparison
+                        .as_ref()
+                        .map_or(0, |comparison| comparison.cmp_p5),
+                );
+            }
             if let (Some(where_expr), Some(skip_label)) = (probe_source.where_clause, skip_row) {
                 emit_where_filter(
                     b,
@@ -3234,6 +3496,33 @@ fn codegen_select_count_star_indexed_in_scan(
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
     Ok(())
+}
+
+fn extract_safe_probe_source_rowid_range<'a>(
+    probe_source: &InProbeSource<'a>,
+) -> Option<RowidRangeTarget<'a>> {
+    let range = extract_rowid_range_target(
+        probe_source.where_clause,
+        Some(probe_source.table),
+        probe_source.table_alias,
+    )?;
+    rowid_range_fast_path_is_safe(range).then_some(range)
+}
+
+fn count_exists_semijoin_merge_is_safe(
+    table: &TableSchema,
+    idx_schema: &IndexSchema,
+    probe_source: &InProbeSource<'_>,
+) -> bool {
+    if !matches!(probe_source.value, InProbeValue::Rowid) {
+        return false;
+    }
+    idx_schema
+        .columns
+        .first()
+        .and_then(|column_name| table.column_index(column_name))
+        .and_then(|column_idx| table.columns.get(column_idx))
+        .is_some_and(|column| column.is_ipk || matches!(column.affinity, 'D' | 'd' | 'C'))
 }
 
 fn resolved_rowid_range_comparison(
@@ -4397,9 +4686,14 @@ fn codegen_join_select(
         return Err(CodegenError::Unsupported("empty join list".to_owned()));
     }
 
-    // For now, support only INNER joins (cross/left are more complex).
+    let supports_left_join = join_tables.len() == 1;
     for (_, _, kind, _) in &join_tables {
-        if !matches!(kind, JoinKind::Inner | JoinKind::Cross) {
+        let supported = match kind {
+            JoinKind::Inner | JoinKind::Cross => true,
+            JoinKind::Left if supports_left_join => true,
+            _ => false,
+        };
+        if !supported {
             return Err(CodegenError::Unsupported(format!(
                 "{kind:?} JOIN not yet supported in VDBE codegen"
             )));
@@ -4450,6 +4744,7 @@ fn codegen_join_select(
         let sort_key_count = stmt.order_by.len();
         let total_sort_cols = sort_key_count + out_col_count;
         let sort_regs = b.alloc_regs(total_sort_cols as i32);
+        let sort_record_reg = b.alloc_reg();
         let sort_order = stmt
             .order_by
             .iter()
@@ -4469,7 +4764,7 @@ fn codegen_join_select(
             P4::Affinity(sort_order),
             0,
         );
-        Some((sort_cursor, sort_regs, sort_key_count))
+        Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg))
     } else {
         None
     };
@@ -4478,6 +4773,13 @@ fn codegen_join_select(
     let next_left_label = b.emit_label();
     b.emit_jump_to_label(Opcode::Rewind, left_cursor, 0, done_label, P4::None, 0);
     b.resolve_label(next_left_label);
+    let left_join_match_reg = if supports_left_join && matches!(join_tables[0].2, JoinKind::Left) {
+        let reg = b.alloc_temp();
+        b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
+        Some(reg)
+    } else {
+        None
+    };
 
     // For each right table, emit a nested Rewind+Next loop.
     let mut next_labels: Vec<Label> = Vec::new();
@@ -4502,6 +4804,9 @@ fn codegen_join_select(
             b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
         }
     }
+    if let Some(match_reg) = left_join_match_reg {
+        b.emit_op(Opcode::Integer, 1, match_reg, 0, P4::None, 0);
+    }
     if let Some(where_expr) = where_clause {
         let cond_reg = b.alloc_regs(1);
         emit_join_expr(b, where_expr, cond_reg, &all_tables, ctx)?;
@@ -4511,7 +4816,7 @@ fn codegen_join_select(
     // Emit output columns.
     emit_join_result_columns(b, columns, out_regs, &all_tables, ctx)?;
 
-    if let Some((sort_cursor, sort_regs, sort_key_count)) = sorter {
+    if let Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg)) = sorter {
         // Copy sort keys then output columns into sorter registers.
         for (i, term) in stmt.order_by.iter().enumerate() {
             let sort_reg = sort_regs + i as i32;
@@ -4523,10 +4828,18 @@ fn codegen_join_select(
             b.emit_op(Opcode::SCopy, src, dst, 0, P4::None, 0);
         }
         b.emit_op(
-            Opcode::SorterInsert,
-            sort_cursor,
+            Opcode::MakeRecord,
             sort_regs,
             (sort_key_count + out_col_count) as i32,
+            sort_record_reg,
+            P4::None,
+            0,
+        );
+        b.emit_op(
+            Opcode::SorterInsert,
+            sort_cursor,
+            sort_record_reg,
+            0,
             P4::None,
             0,
         );
@@ -4549,12 +4862,74 @@ fn codegen_join_select(
         b.emit_jump_to_label(Opcode::Next, rc, 0, next_labels[i], P4::None, 0);
         b.resolve_label(done_right_labels[i]);
     }
+    if let Some(match_reg) = left_join_match_reg {
+        let skip_left_join_null_row = b.emit_label();
+        b.emit_jump_to_label(
+            Opcode::IfPos,
+            match_reg,
+            0,
+            skip_left_join_null_row,
+            P4::None,
+            0,
+        );
+        b.emit_op(Opcode::NullRow, right_cursors[0], 0, 0, P4::None, 0);
+        if let Some(where_expr) = where_clause {
+            let cond_reg = b.alloc_regs(1);
+            emit_join_expr(b, where_expr, cond_reg, &all_tables, ctx)?;
+            b.emit_jump_to_label(
+                Opcode::IfNot,
+                cond_reg,
+                1,
+                skip_left_join_null_row,
+                P4::None,
+                0,
+            );
+        }
+        emit_join_result_columns(b, columns, out_regs, &all_tables, ctx)?;
+        if let Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg)) = sorter {
+            for (i, term) in stmt.order_by.iter().enumerate() {
+                let sort_reg = sort_regs + i as i32;
+                emit_join_expr(b, &term.expr, sort_reg, &all_tables, ctx)?;
+            }
+            for i in 0..out_col_count {
+                let src = out_regs + i as i32;
+                let dst = sort_regs + (sort_key_count + i) as i32;
+                b.emit_op(Opcode::SCopy, src, dst, 0, P4::None, 0);
+            }
+            b.emit_op(
+                Opcode::MakeRecord,
+                sort_regs,
+                (sort_key_count + out_col_count) as i32,
+                sort_record_reg,
+                P4::None,
+                0,
+            );
+            b.emit_op(
+                Opcode::SorterInsert,
+                sort_cursor,
+                sort_record_reg,
+                0,
+                P4::None,
+                0,
+            );
+        } else {
+            b.emit_op(
+                Opcode::ResultRow,
+                out_regs,
+                out_col_count as i32,
+                0,
+                P4::None,
+                0,
+            );
+        }
+        b.resolve_label(skip_left_join_null_row);
+    }
     b.emit_jump_to_label(Opcode::Next, left_cursor, 0, next_left_label, P4::None, 0);
 
     b.resolve_label(done_label);
 
     // If sorting, emit sorter output.
-    if let Some((sort_cursor, sort_regs, sort_key_count)) = sorter {
+    if let Some((sort_cursor, sort_regs, sort_key_count, _sort_record_reg)) = sorter {
         let sort_loop = b.emit_label();
         let sort_done = b.emit_label();
         b.emit_jump_to_label(Opcode::SorterSort, sort_cursor, 0, sort_done, P4::None, 0);
@@ -10730,6 +11105,39 @@ fn resolve_covering_output_sources(
     Some(output)
 }
 
+fn resolve_order_by_rowid_direction(
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    columns: &[ResultColumn],
+    order_by: &[OrderingTerm],
+) -> Option<SortDirection> {
+    let [term] = order_by else {
+        return None;
+    };
+    if term.nulls.is_some() {
+        return None;
+    }
+
+    let resolved_expr = if let Expr::Literal(Literal::Integer(n), _) = &term.expr {
+        let idx = usize::try_from(*n).ok()?;
+        if idx == 0 || idx > columns.len() {
+            return None;
+        }
+        match &columns[idx - 1] {
+            ResultColumn::Expr { expr, .. } => expr,
+            ResultColumn::Star | ResultColumn::TableStar(_) => return None,
+        }
+    } else {
+        &term.expr
+    };
+
+    matches!(
+        resolve_column_ref(resolved_expr, table, table_alias),
+        Some(SortKeySource::Rowid)
+    )
+    .then_some(term.direction.unwrap_or(SortDirection::Asc))
+}
+
 fn resolve_order_by_index_plan(
     table: &TableSchema,
     table_alias: Option<&str>,
@@ -15058,7 +15466,7 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_select_ipk_range_with_numbered_params_stays_on_full_scan() {
+    fn test_codegen_select_ipk_range_with_numbered_params_uses_bounded_seek_scan() {
         let stmt = simple_select(
             &["a"],
             "t",
@@ -15075,13 +15483,116 @@ mod tests {
         let ops = prog.ops();
 
         assert!(
-            ops.iter().any(|op| op.opcode == Opcode::Rewind),
-            "numbered rowid/IPK ranges must stay on the generic scan path until runtime integer proof exists"
+            ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "numbered rowid/IPK ranges should reuse the bounded seek fast path"
         );
         assert!(
-            !ops.iter()
-                .any(|op| matches!(op.opcode, Opcode::SeekGE | Opcode::SeekGT)),
-            "numbered rowid/IPK ranges must not use the bounded seek fast path without runtime type proof"
+            !ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "numbered rowid/IPK ranges should no longer fall back to a full-table rewind"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_ipk_range_with_order_by_ipk_avoids_sorter() {
+        let mut stmt = simple_select(
+            &["a", "b"],
+            "t",
+            Some(col_cmp_param("a", AstBinaryOp::Gt, 1)),
+        );
+        stmt.order_by = vec![OrderingTerm {
+            expr: Expr::Column(ColumnRef::bare("a"), Span::ZERO),
+            direction: Some(SortDirection::Asc),
+            nulls: None,
+        }];
+        stmt.limit = Some(LimitClause {
+            limit: placeholder(2),
+            offset: None,
+        });
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            has_opcodes(
+                &prog,
+                &[
+                    Opcode::Variable,
+                    Opcode::SeekGT,
+                    Opcode::Rowid,
+                    Opcode::Column,
+                    Opcode::ResultRow,
+                    Opcode::DecrJumpZero,
+                    Opcode::Next,
+                ]
+            ),
+            "ORDER BY on an IPK range should stay on the bounded rowid scan path"
+        );
+        assert!(
+            !ops.iter().any(|op| {
+                matches!(
+                    op.opcode,
+                    Opcode::SorterOpen
+                        | Opcode::SorterInsert
+                        | Opcode::SorterSort
+                        | Opcode::SorterData
+                )
+            }),
+            "ORDER BY on an IPK range must not allocate a sorter temp B-tree"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_ipk_range_with_desc_order_by_ipk_uses_reverse_scan() {
+        let mut stmt = simple_select(
+            &["a", "b"],
+            "t",
+            Some(col_cmp_param("a", AstBinaryOp::Lt, 1)),
+        );
+        stmt.order_by = vec![OrderingTerm {
+            expr: Expr::Column(ColumnRef::bare("a"), Span::ZERO),
+            direction: Some(SortDirection::Desc),
+            nulls: None,
+        }];
+        stmt.limit = Some(LimitClause {
+            limit: placeholder(2),
+            offset: None,
+        });
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            has_opcodes(
+                &prog,
+                &[
+                    Opcode::Variable,
+                    Opcode::SeekLT,
+                    Opcode::Rowid,
+                    Opcode::Column,
+                    Opcode::ResultRow,
+                    Opcode::DecrJumpZero,
+                    Opcode::Prev,
+                ]
+            ),
+            "descending ORDER BY on an IPK range should use the reverse rowid scan path"
+        );
+        assert!(
+            !ops.iter().any(|op| {
+                matches!(
+                    op.opcode,
+                    Opcode::SorterOpen
+                        | Opcode::SorterInsert
+                        | Opcode::SorterSort
+                        | Opcode::SorterData
+                )
+            }),
+            "descending ORDER BY on an IPK range must not allocate a sorter temp B-tree"
         );
     }
 
@@ -19156,6 +19667,89 @@ mod tests {
     }
 
     #[test]
+    fn test_codegen_select_count_star_indexed_in_rowid_subquery_uses_bounded_source_scan() {
+        let where_expr = Expr::In {
+            expr: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+            set: InSet::Subquery(Box::new(SelectStatement {
+                with: None,
+                body: SelectBody {
+                    select: SelectCore::Select {
+                        distinct: Distinctness::All,
+                        columns: vec![ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::bare("rowid"), Span::ZERO),
+                            alias: None,
+                        }],
+                        from: Some(from_table("s")),
+                        where_clause: Some(Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+                            op: AstBinaryOp::Le,
+                            right: Box::new(Expr::Literal(Literal::Integer(5), Span::ZERO)),
+                            span: Span::ZERO,
+                        })),
+                        group_by: vec![],
+                        having: None,
+                        windows: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            })),
+            not: false,
+            span: Span::ZERO,
+        };
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::FunctionCall {
+                            name: "count".to_owned(),
+                            args: FunctionArgs::Star,
+                            distinct: false,
+                            order_by: vec![],
+                            filter: None,
+                            over: None,
+                            span: Span::ZERO,
+                        },
+                        alias: None,
+                    }],
+                    from: Some(from_table("t")),
+                    where_clause: Some(Box::new(where_expr)),
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let schema = test_schema_with_index_and_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
+            "rowid-driven IN-subquery should still seek into the outer index per probe value"
+        );
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::Ge | Opcode::Gt)),
+            "rowid-driven IN-subquery should bound the inner probe-source rowid scan"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Rowid),
+            "rowid-driven IN-subquery should read source rowids for bounded stop checks"
+        );
+    }
+
+    #[test]
     fn test_codegen_select_count_star_exists_semijoin_uses_index_probe_expansion() {
         let stmt = agg_count_star_exists_rowid_probe();
         let schema = test_schema_with_index_and_subquery_source();
@@ -19177,8 +19771,25 @@ mod tests {
             "count(*) EXISTS semijoin fast path should read the inner probe source"
         );
         assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
-            "count(*) EXISTS semijoin fast path should seek into the outer index per inner key"
+            prog.ops()
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::Ge | Opcode::Gt)),
+            "count(*) EXISTS semijoin fast path should bound the inner probe-source rowid scan"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Rowid),
+            "count(*) EXISTS semijoin fast path should read source rowids for bounded stop checks"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Eq),
+            "count(*) EXISTS semijoin fast path should merge duplicate outer keys instead of re-seeking per inner row"
+        );
+        assert!(
+            !prog
+                .ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::OpenAutoindex),
+            "count(*) EXISTS semijoin fast path should stay on the direct merge path without temp materialization"
         );
         assert!(
             !prog

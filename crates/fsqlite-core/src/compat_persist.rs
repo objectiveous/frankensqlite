@@ -186,7 +186,13 @@ pub fn persist_to_sqlite(
         // Build CREATE TABLE SQL for sqlite_master.
         let create_sql = build_create_table_sql(table);
         let table_name = table.name.clone();
-        master_entries.push(("table", table_name.clone(), table_name.clone(), root_page.get(), create_sql));
+        master_entries.push((
+            "table",
+            table_name.clone(),
+            table_name.clone(),
+            root_page.get(),
+            create_sql,
+        ));
 
         // Write index B-trees for explicitly created indexes (not autoindexes).
         for index in &table.indexes {
@@ -235,10 +241,7 @@ pub fn persist_to_sqlite(
                 .enumerate()
                 .map(|(i, col)| CreateIndexSqlTerm {
                     column_name: col.as_str(),
-                    collation: index
-                        .key_collations
-                        .get(i)
-                        .and_then(|c| c.as_deref()),
+                    collation: index.key_collations.get(i).and_then(|c| c.as_deref()),
                     direction: index.key_sort_directions.get(i).copied(),
                 })
                 .collect();
@@ -278,11 +281,13 @@ pub fn persist_to_sqlite(
             true,
         );
 
-        for (rowid, (name, root_page_num, create_sql)) in master_entries.iter().enumerate() {
+        for (rowid, (entry_type, name, tbl_name, root_page_num, create_sql)) in
+            master_entries.iter().enumerate()
+        {
             let record = serialize_record(&[
-                SqliteValue::Text("table".into()),
+                SqliteValue::Text((*entry_type).into()),
                 SqliteValue::Text(name.clone().into()),
-                SqliteValue::Text(name.clone().into()),
+                SqliteValue::Text(tbl_name.clone().into()),
                 SqliteValue::Integer(i64::from(*root_page_num)),
                 SqliteValue::Text(create_sql.clone().into()),
             ]);
@@ -573,6 +578,62 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
         }
     }
 
+    // Second pass: load explicit indexes from sqlite_master "index" entries.
+    // Autoindexes from UNIQUE/PK constraints are already extracted from
+    // CREATE TABLE SQL above; this handles `CREATE INDEX ...` definitions.
+    for entry in &master_entries {
+        if entry.len() < 5 {
+            continue;
+        }
+        let entry_type = match &entry[0] {
+            SqliteValue::Text(s) => s,
+            _ => continue,
+        };
+        if &**entry_type != "index" {
+            continue;
+        }
+        let index_name = match &entry[1] {
+            SqliteValue::Text(s) => s.to_string(),
+            _ => continue,
+        };
+        let tbl_name = match &entry[2] {
+            SqliteValue::Text(s) => s.to_string(),
+            _ => continue,
+        };
+        let root_page_num = match &entry[3] {
+            SqliteValue::Integer(n) => *n,
+            _ => continue,
+        };
+        let create_sql = match &entry[4] {
+            SqliteValue::Text(s) => s.to_string(),
+            _ => continue,
+        };
+
+        // Skip sqlite_autoindex_* (already handled via UNIQUE constraints).
+        if index_name.starts_with("sqlite_autoindex_") {
+            continue;
+        }
+
+        // Find the parent table in the schema.
+        let Some(table) = schema
+            .iter_mut()
+            .find(|t| t.name.eq_ignore_ascii_case(&tbl_name))
+        else {
+            continue;
+        };
+
+        // Parse the CREATE INDEX SQL to extract column names, collations,
+        // sort directions, and WHERE clause.
+        if let Some(idx_schema) =
+            self::parse_create_index_sql_to_schema(&index_name, root_page_num, &create_sql)
+        {
+            // Only add if not already present (avoid duplicates with autoindexes).
+            if !table.indexes.iter().any(|i| i.name == index_name) {
+                table.indexes.push(idx_schema);
+            }
+        }
+    }
+
     // Read schema_cookie and change_counter from the database header (page 1).
     let (schema_cookie, change_counter) = {
         let header_buf = txn.get_page(cx, PageNumber::ONE)?;
@@ -629,6 +690,98 @@ fn init_leaf_table_page(
     };
     page[5..7].copy_from_slice(&content_start.to_be_bytes());
     txn.write_page(cx, page_no, &page)
+}
+
+fn init_leaf_index_page(
+    cx: &Cx,
+    txn: &mut impl TransactionHandle,
+    page_no: PageNumber,
+    page_size: usize,
+) -> Result<()> {
+    let mut page = vec![0u8; page_size];
+    page[0] = 0x0A; // Leaf index (vs 0x0D for leaf table)
+    page[3..5].copy_from_slice(&0u16.to_be_bytes());
+    let content_start: u16 = if page_size == 65536 {
+        0
+    } else {
+        u16::try_from(page_size).map_err(|_| {
+            FrankenError::internal(format!(
+                "page_size {page_size} does not fit in u16 and is not 65536"
+            ))
+        })?
+    };
+    page[5..7].copy_from_slice(&content_start.to_be_bytes());
+    txn.write_page(cx, page_no, &page)
+}
+
+/// Parse a `CREATE INDEX` SQL string into an `IndexSchema`.
+/// Returns `None` if the SQL cannot be parsed.
+fn parse_create_index_sql_to_schema(
+    index_name: &str,
+    root_page: i64,
+    sql: &str,
+) -> Option<IndexSchema> {
+    // Simple regex-free parser: look for "ON table_name (col1, col2 COLLATE NOCASE DESC)"
+    let upper = sql.to_ascii_uppercase();
+    let is_unique = upper.contains("CREATE UNIQUE INDEX");
+    // Find the column list between the first '(' and matching ')'.
+    let paren_start = sql.find('(')?;
+    let paren_end = sql[paren_start..].find(')')? + paren_start;
+    let col_list = &sql[paren_start + 1..paren_end];
+
+    let mut columns = Vec::new();
+    let mut collations = Vec::new();
+    let mut directions = Vec::new();
+
+    for part in col_list.split(',') {
+        let tokens: Vec<&str> = part.split_whitespace().collect();
+        if tokens.is_empty() {
+            continue;
+        }
+        // First token is the column name (possibly quoted).
+        let col_name = tokens[0].trim_matches('"');
+        columns.push(col_name.to_owned());
+
+        let mut coll = None;
+        let mut dir = SortDirection::Asc;
+        let mut i = 1;
+        while i < tokens.len() {
+            if tokens[i].eq_ignore_ascii_case("COLLATE") && i + 1 < tokens.len() {
+                coll = Some(tokens[i + 1].trim_matches('"').to_owned());
+                i += 2;
+            } else if tokens[i].eq_ignore_ascii_case("DESC") {
+                dir = SortDirection::Desc;
+                i += 1;
+            } else if tokens[i].eq_ignore_ascii_case("ASC") {
+                dir = SortDirection::Asc;
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        collations.push(coll);
+        directions.push(dir);
+    }
+
+    // WHERE clause for partial indexes (everything after the closing paren).
+    let after_paren = sql[paren_end + 1..].trim();
+    let where_clause = if after_paren.to_ascii_uppercase().starts_with("WHERE ") {
+        Some(after_paren["WHERE ".len()..].to_owned())
+    } else {
+        None
+    };
+
+    #[allow(clippy::cast_possible_truncation)]
+    Some(IndexSchema {
+        name: index_name.to_owned(),
+        root_page: root_page as i32,
+        columns,
+        key_expressions: Vec::new(),
+        key_sort_directions: directions,
+        where_clause,
+        is_unique,
+        key_collations: collations,
+    })
 }
 
 fn quote_identifier(identifier: &str) -> String {

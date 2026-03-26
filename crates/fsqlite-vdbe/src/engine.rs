@@ -291,6 +291,12 @@ impl MemTable {
         id
     }
 
+    /// Return the next implicit rowid that would be allocated for this table.
+    #[must_use]
+    pub fn next_rowid_hint(&self) -> i64 {
+        self.next_rowid
+    }
+
     /// Insert a row with the given rowid and values.
     fn insert(&mut self, rowid: i64, values: Vec<SqliteValue>) {
         // Update next_rowid if needed.
@@ -4133,6 +4139,10 @@ pub struct VdbeEngine {
     /// Whether the attached `MemDatabase` contains a fully hydrated row mirror
     /// for ordinary storage-backed table reads.
     memdb_rows_loaded: bool,
+    /// Whether storage-cursor `Count` may trust the attached `MemDatabase`
+    /// row mirror for exact cardinality. VDBE write-through DML can leave the
+    /// MemDatabase rows stale until the connection reloads from pager.
+    storage_cursor_memdb_count_shortcuts_safe: bool,
     /// Scalar/aggregate/window function registry for Function/PureFunc opcodes.
     func_registry: Option<Arc<FunctionRegistry>>,
     /// Collation registry for compare, sort, DISTINCT, and grouping semantics.
@@ -4592,6 +4602,7 @@ impl VdbeEngine {
             reject_mem_fallback: true,
             db: None,
             memdb_rows_loaded: false,
+            storage_cursor_memdb_count_shortcuts_safe: false,
             func_registry: None,
             collation_registry: Arc::new(Mutex::new(CollationRegistry::new())),
             aggregates: SwissIndex::new(),
@@ -4724,6 +4735,7 @@ impl VdbeEngine {
         self.reject_mem_fallback = true;
         self.db = None;
         self.memdb_rows_loaded = false;
+        self.storage_cursor_memdb_count_shortcuts_safe = false;
         self.func_registry = None;
         // Keep the existing collation_registry Arc — don't allocate a new one.
         self.clear_statement_cold_state();
@@ -5017,6 +5029,12 @@ impl VdbeEngine {
     /// storage-backed table reads.
     pub fn set_memdb_rows_loaded(&mut self, loaded: bool) {
         self.memdb_rows_loaded = loaded;
+    }
+
+    /// Declare whether storage-cursor `Count` may trust the attached
+    /// `MemDatabase` row mirror for exact cardinality.
+    pub fn set_storage_cursor_memdb_count_shortcuts_safe(&mut self, safe: bool) {
+        self.storage_cursor_memdb_count_shortcuts_safe = safe;
     }
 
     /// Take ownership of the in-memory database back from the engine.
@@ -7998,6 +8016,7 @@ impl VdbeEngine {
                     } else if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         let memdb_count = (!sc.writable
                             && self.memdb_rows_loaded
+                            && self.storage_cursor_memdb_count_shortcuts_safe
                             && !sc.cursor.is_time_travel())
                         .then(|| self.cursor_root_pages.get(&cursor_id).copied())
                         .flatten()
@@ -8868,7 +8887,7 @@ impl VdbeEngine {
 
                     #[allow(clippy::cast_possible_wrap)]
                     let func = registry
-                        .find_scalar(func_name, arg_count as i32)
+                        .find_scalar_precanonical(func_name, arg_count as i32)
                         .ok_or_else(|| {
                             FrankenError::Internal(format!(
                                 "no such function: {func_name}/{arg_count}",

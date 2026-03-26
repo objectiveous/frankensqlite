@@ -2924,7 +2924,7 @@ impl MemDatabase {
         }
     }
 
-    fn upsert_row(&mut self, root_page: i32, rowid: i64, values: Vec<SqliteValue>) {
+    pub fn upsert_row(&mut self, root_page: i32, rowid: i64, values: Vec<SqliteValue>) {
         if let Some(table) = self.tables.get_mut(&root_page) {
             let prev_next_rowid = table.next_rowid;
             // Use binary search (O(log n)) instead of linear scan (O(n))
@@ -4130,6 +4130,9 @@ pub struct VdbeEngine {
     reject_mem_fallback: bool,
     /// In-memory database backing cursor operations (shared with Connection).
     db: Option<MemDatabase>,
+    /// Whether the attached `MemDatabase` contains a fully hydrated row mirror
+    /// for ordinary storage-backed table reads.
+    memdb_rows_loaded: bool,
     /// Scalar/aggregate/window function registry for Function/PureFunc opcodes.
     func_registry: Option<Arc<FunctionRegistry>>,
     /// Collation registry for compare, sort, DISTINCT, and grouping semantics.
@@ -4588,6 +4591,7 @@ impl VdbeEngine {
             // bd-zjisk.1: Default to parity-cert mode — reject MemPageStore fallback.
             reject_mem_fallback: true,
             db: None,
+            memdb_rows_loaded: false,
             func_registry: None,
             collation_registry: Arc::new(Mutex::new(CollationRegistry::new())),
             aggregates: SwissIndex::new(),
@@ -4719,6 +4723,7 @@ impl VdbeEngine {
         self.txn_page_io = None;
         self.reject_mem_fallback = true;
         self.db = None;
+        self.memdb_rows_loaded = false;
         self.func_registry = None;
         // Keep the existing collation_registry Arc — don't allocate a new one.
         self.clear_statement_cold_state();
@@ -5006,6 +5011,12 @@ impl VdbeEngine {
     /// Attach an in-memory database for cursor operations.
     pub fn set_database(&mut self, db: MemDatabase) {
         self.db = Some(db);
+    }
+
+    /// Declare whether the attached `MemDatabase` is a complete row mirror for
+    /// storage-backed table reads.
+    pub fn set_memdb_rows_loaded(&mut self, loaded: bool) {
+        self.memdb_rows_loaded = loaded;
     }
 
     /// Take ownership of the in-memory database back from the engine.
@@ -7969,6 +7980,12 @@ impl VdbeEngine {
 
                 Opcode::Count => {
                     // Count rows in cursor P1, store result in register P2.
+                    //
+                    // IMPORTANT: file-backed connections often keep a schema-only
+                    // MemDatabase mirror for correctness/perf reasons. In that
+                    // mode, `db.get_table(root).rows.len()` is deliberately 0 even
+                    // when the pager-backed table has real rows. Only true
+                    // MemCursors can trust the MemDatabase row count directly.
                     let cursor_id = op.p1;
                     let count: i64 = if let Some(cursor) = self.cursors.get(&cursor_id) {
                         if let Some(db) = self.db.as_ref()
@@ -7979,16 +7996,20 @@ impl VdbeEngine {
                             0
                         }
                     } else if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
-                        if !sc.cursor.is_time_travel()
-                            && let Some(root_page) = self.cursor_root_pages.get(&cursor_id).copied()
-                            && let Some(db) = self.db.as_ref()
-                            && let Some(table) = db.get_table(root_page)
-                        {
-                            i64::try_from(table.rows.len()).unwrap_or(0)
+                        let memdb_count = (!sc.writable
+                            && self.memdb_rows_loaded
+                            && !sc.cursor.is_time_travel())
+                        .then(|| self.cursor_root_pages.get(&cursor_id).copied())
+                        .flatten()
+                        .and_then(|root_page| {
+                            self.db
+                                .as_ref()
+                                .and_then(|db| db.get_table(root_page))
+                                .and_then(|table| i64::try_from(table.rows.len()).ok())
+                        });
+                        if let Some(count) = memdb_count {
+                            count
                         } else {
-                            // Fall back to walking the cursor when the visible
-                            // snapshot is not represented by the live MemDatabase
-                            // mirror, such as time-travel cursors.
                             let has_first = sc.cursor.first(&sc.cx)?;
                             if !has_first {
                                 0
@@ -15926,6 +15947,44 @@ mod tests {
         });
 
         assert_eq!(rows, vec![vec![SqliteValue::Integer(3)]]);
+    }
+
+    #[test]
+    fn test_count_on_writable_storage_cursor_ignores_hydrated_memdb_fast_path() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(1, vec![SqliteValue::Integer(10)]);
+        table.insert(2, vec![SqliteValue::Integer(20)]);
+        table.insert(3, vec![SqliteValue::Integer(30)]);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+        b.emit_op(Opcode::Integer, 2, 1, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SeekRowid, 0, 1, end, P4::None, 0);
+        b.emit_op(Opcode::Delete, 0, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::Count, 0, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_memdb_rows_loaded(true);
+        engine.set_reject_mem_fallback(false);
+
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        let rows: Vec<_> = engine
+            .take_results()
+            .into_iter()
+            .map(|row| row.into_vec())
+            .collect();
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(2)]]);
     }
 
     // ── bd-3iw8 / bd-25c6: Storage cursor WRITE path tests ────────────

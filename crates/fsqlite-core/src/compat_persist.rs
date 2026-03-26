@@ -217,8 +217,11 @@ pub fn persist_to_sqlite(
     {
         let mut hdr_page = txn.get_page(cx, PageNumber::ONE)?.into_vec();
 
-        // Compute actual page count by finding the highest page number that was allocated.
-        // In a fresh database with no freelist, allocating one more page gives us (max_page + 1).
+        // Discover the current page count by allocating one more page.
+        // The extra page is included in the commit (the pager does not
+        // support free_page), so the exported file has one trailing empty
+        // page. This is benign: SQLite tolerates pages beyond the last
+        // B-tree node, and the page_count header excludes it.
         let next_page = txn.allocate_page(cx)?.get();
         let max_page = next_page.saturating_sub(1).max(1);
 

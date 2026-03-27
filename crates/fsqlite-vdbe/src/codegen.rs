@@ -24816,4 +24816,115 @@ mod tests {
             "UPDATE should recompute STORED generated column 'a + b'"
         );
     }
+
+    /// bd-wwqen.1: Verify cheapest-index COUNT optimization fires —
+    /// when a table has a non-partial index, COUNT(*) opens the index
+    /// root page instead of the table root page.
+    #[test]
+    fn test_count_star_opens_cheapest_index_not_table() {
+        let schema = test_schema_with_index();
+        // table root_page = 2, index root_page = 3
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::FunctionCall {
+                            name: "count".to_owned(),
+                            args: FunctionArgs::Star,
+                            distinct: false,
+                            order_by: vec![],
+                            filter: None,
+                            over: None,
+                            span: Span::ZERO,
+                        },
+                        alias: None,
+                    }],
+                    from: Some(from_table("t")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // The OpenRead should target the INDEX root page (3), not
+        // the table root page (2).
+        let open_read = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::OpenRead)
+            .expect("COUNT(*) program must have OpenRead");
+        assert_eq!(
+            open_read.p2, 3,
+            "bd-wwqen.1: COUNT(*) should open cheapest index (root=3), \
+             not table (root=2); got root={}",
+            open_read.p2
+        );
+
+        // The Count opcode must be present.
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Count),
+            "bd-wwqen.1: COUNT(*) program must contain Opcode::Count"
+        );
+    }
+
+    /// bd-wwqen.1: COUNT(*) on a table with NO indexes falls back
+    /// to the table root page.
+    #[test]
+    fn test_count_star_uses_table_when_no_index() {
+        let schema = test_schema(); // no indexes
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::FunctionCall {
+                            name: "count".to_owned(),
+                            args: FunctionArgs::Star,
+                            distinct: false,
+                            order_by: vec![],
+                            filter: None,
+                            over: None,
+                            span: Span::ZERO,
+                        },
+                        alias: None,
+                    }],
+                    from: Some(from_table("t")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let open_read = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::OpenRead)
+            .expect("COUNT(*) program must have OpenRead");
+        assert_eq!(
+            open_read.p2, 2,
+            "bd-wwqen.1: COUNT(*) with no indexes should open table (root=2), got root={}",
+            open_read.p2
+        );
+    }
 }

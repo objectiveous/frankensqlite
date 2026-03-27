@@ -1991,7 +1991,7 @@ pub fn codegen_select(
         {
             tracing::info!(
                 table = %table.name,
-                index = %index_plan.index_name,
+                index = %index_plan.index.name,
                 covering = index_plan.covering_output.is_some(),
                 descending = index_plan.descending,
                 "vdbe.order_by.index_bypass"
@@ -3801,6 +3801,15 @@ fn codegen_select_index_ordered_scan(
 ) -> Result<(), CodegenError> {
     let index_cursor = cursor + 1;
     let needs_table_lookup = index_plan.covering_output.is_none() || where_clause.is_some();
+    let where_placeholder_base = b.current_anon_placeholder();
+    let equality_prefix_exprs = if index_plan.equality_prefix_len == 0 {
+        Vec::new()
+    } else {
+        extract_index_equality_prefix_exprs(&index_plan.index, table, table_alias, where_clause)
+    };
+    let use_bounded_prefix_scan = !index_plan.descending
+        && index_plan.equality_prefix_len > 0
+        && equality_prefix_exprs.len() >= index_plan.equality_prefix_len;
 
     // Allocate LIMIT/OFFSET counter registers (if present).
     let limit_reg = limit_clause.map(|lc| {
@@ -3835,19 +3844,88 @@ fn codegen_select_index_ordered_scan(
     b.emit_op(
         Opcode::OpenRead,
         index_cursor,
-        index_plan.index_root_page,
+        index_plan.index.root_page,
         0,
-        P4::Index(index_plan.index_name.clone()),
+        P4::Index(index_plan.index.name.clone()),
         0,
     );
 
-    // Position index cursor at first/last entry depending on ORDER BY direction.
-    let loop_start = b.current_addr();
-    if index_plan.descending {
-        b.emit_jump_to_label(Opcode::Last, index_cursor, 0, done_label, P4::None, 0);
+    let loop_start = if use_bounded_prefix_scan {
+        let probe_key_regs = b.alloc_regs((index_plan.index.key_term_count() + 1) as i32);
+        for (offset, expr) in equality_prefix_exprs
+            .iter()
+            .take(index_plan.equality_prefix_len)
+            .enumerate()
+        {
+            let reg = probe_key_regs + offset as i32;
+            emit_expr(b, expr, reg, None);
+            b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
+        }
+        for offset in index_plan.equality_prefix_len..index_plan.index.key_term_count() {
+            b.emit_op(
+                Opcode::Null,
+                0,
+                probe_key_regs + offset as i32,
+                0,
+                P4::None,
+                0,
+            );
+        }
+        b.emit_op(
+            Opcode::Int64,
+            0,
+            probe_key_regs + index_plan.index.key_term_count() as i32,
+            0,
+            P4::Int64(i64::MIN),
+            0,
+        );
+        let probe_record_reg = b.alloc_reg();
+        b.emit_op(
+            Opcode::MakeRecord,
+            probe_key_regs,
+            (index_plan.index.key_term_count() + 1) as i32,
+            probe_record_reg,
+            P4::None,
+            0,
+        );
+        b.emit_jump_to_label(
+            Opcode::SeekGE,
+            index_cursor,
+            probe_record_reg,
+            done_label,
+            P4::None,
+            0,
+        );
+        let loop_start = b.current_addr();
+        for key_pos in 0..index_plan.equality_prefix_len {
+            let current_key_reg = b.alloc_reg();
+            b.emit_op(
+                Opcode::Column,
+                index_cursor,
+                key_pos as i32,
+                current_key_reg,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(
+                Opcode::Ne,
+                probe_key_regs + key_pos as i32,
+                current_key_reg,
+                done_label,
+                index_key_collation_p4(&index_plan.index, key_pos),
+                index_key_cmp_p5(table, &index_plan.index, key_pos),
+            );
+        }
+        loop_start
     } else {
-        b.emit_jump_to_label(Opcode::Rewind, index_cursor, 0, done_label, P4::None, 0);
-    }
+        let loop_start = b.current_addr();
+        if index_plan.descending {
+            b.emit_jump_to_label(Opcode::Last, index_cursor, 0, done_label, P4::None, 0);
+        } else {
+            b.emit_jump_to_label(Opcode::Rewind, index_cursor, 0, done_label, P4::None, 0);
+        }
+        loop_start
+    };
 
     let skip_row = b.emit_label();
     let rowid_reg = b.alloc_reg();
@@ -3858,6 +3936,7 @@ fn codegen_select_index_ordered_scan(
     }
 
     if let Some(where_expr) = where_clause {
+        b.set_next_anon_placeholder(where_placeholder_base);
         emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_row);
     }
 
@@ -12135,9 +12214,9 @@ enum CoveringOutputSource {
 
 /// Plan for ORDER BY execution that can bypass the sorter.
 struct OrderByIndexPlan {
-    index_name: String,
-    index_root_page: i32,
+    index: IndexSchema,
     descending: bool,
+    equality_prefix_len: usize,
     /// When present, all output columns can be read from index payload/rowid
     /// and no table row lookup is required.
     covering_output: Option<Vec<CoveringOutputSource>>,
@@ -12267,6 +12346,105 @@ fn index_column_position(index: &IndexSchema, column_name: &str) -> Option<usize
         .position(|name| name.eq_ignore_ascii_case(column_name))
 }
 
+fn collect_conjunctive_terms<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let Expr::BinaryOp {
+        left,
+        op: fsqlite_ast::BinaryOp::And,
+        right,
+        ..
+    } = expr
+    {
+        collect_conjunctive_terms(left, out);
+        collect_conjunctive_terms(right, out);
+    } else {
+        out.push(expr);
+    }
+}
+
+fn expr_matches_index_column(
+    expr: &Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    expected_column: &str,
+) -> bool {
+    column_name(expr, table, table_alias)
+        .is_some_and(|column_name| column_name.eq_ignore_ascii_case(expected_column))
+}
+
+fn extract_index_column_equality_expr<'a>(
+    expr: &'a Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    expected_column: &str,
+) -> Option<&'a Expr> {
+    let Expr::BinaryOp {
+        left,
+        op: fsqlite_ast::BinaryOp::Eq,
+        right,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+
+    if expr_matches_index_column(left, table, table_alias, expected_column)
+        && is_simple_constant(right)
+    {
+        return Some(right);
+    }
+    if expr_matches_index_column(right, table, table_alias, expected_column)
+        && is_simple_constant(left)
+    {
+        return Some(left);
+    }
+    None
+}
+
+fn extract_index_equality_prefix_exprs<'a>(
+    index: &IndexSchema,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    where_clause: Option<&'a Expr>,
+) -> Vec<&'a Expr> {
+    let Some(where_expr) = where_clause else {
+        return Vec::new();
+    };
+
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_expr, &mut conjuncts);
+
+    let mut prefix_exprs = Vec::new();
+    for index_column in &index.columns {
+        let Some(expr) = conjuncts.iter().find_map(|term| {
+            extract_index_column_equality_expr(term, table, table_alias, index_column)
+        }) else {
+            break;
+        };
+        prefix_exprs.push(expr);
+    }
+    prefix_exprs
+}
+
+fn index_key_cmp_p5(table: &TableSchema, index: &IndexSchema, key_pos: usize) -> u16 {
+    let affinity = index
+        .columns
+        .get(key_pos)
+        .and_then(|column_name| table.column_index(column_name))
+        .map_or(b'A', |idx| {
+            table.columns[idx]
+                .type_name
+                .as_deref()
+                .map_or(table.columns[idx].affinity as u8, column_type_to_affinity)
+        });
+    0x80 | u16::from(affinity)
+}
+
+fn index_key_collation_p4(index: &IndexSchema, key_pos: usize) -> P4 {
+    index
+        .key_term_collation(key_pos)
+        .map_or(P4::None, |collation| P4::Collation(collation.to_owned()))
+}
+
 fn resolve_covering_output_sources(
     columns: &[ResultColumn],
     table: &TableSchema,
@@ -12388,26 +12566,65 @@ fn resolve_order_by_index_plan(
         order_columns.push(col_ref.column.clone());
     }
 
-    let index = table.indexes.iter().find(|idx| {
-        idx.columns.len() >= order_columns.len()
-            && order_columns
-                .iter()
-                .zip(&idx.columns)
-                .all(|(order_col, idx_col)| order_col.eq_ignore_ascii_case(idx_col))
-    })?;
+    let descending = direction == Some(SortDirection::Desc);
+    let mut best_plan: Option<OrderByIndexPlan> = None;
 
-    let covering_output = if where_clause.is_none() {
-        resolve_covering_output_sources(columns, table, table_alias, index)
-    } else {
-        None
-    };
+    for index in &table.indexes {
+        if !index.supports_direct_column_lookup() {
+            continue;
+        }
 
-    Some(OrderByIndexPlan {
-        index_name: index.name.clone(),
-        index_root_page: index.root_page,
-        descending: direction == Some(SortDirection::Desc),
-        covering_output,
-    })
+        let equality_prefix_len =
+            extract_index_equality_prefix_exprs(index, table, table_alias, where_clause).len();
+        if equality_prefix_len + order_columns.len() > index.key_term_count() {
+            continue;
+        }
+
+        if equality_prefix_len > 0 {
+            if descending {
+                continue;
+            }
+            if (equality_prefix_len..(equality_prefix_len + order_columns.len()))
+                .any(|key_pos| index.key_term_descending(key_pos))
+            {
+                continue;
+            }
+        }
+
+        let matches_order_columns = order_columns.iter().enumerate().all(|(offset, order_col)| {
+            index.columns[equality_prefix_len + offset].eq_ignore_ascii_case(order_col)
+        });
+        if !matches_order_columns {
+            continue;
+        }
+
+        let covering_output = if where_clause.is_none() {
+            resolve_covering_output_sources(columns, table, table_alias, index)
+        } else {
+            None
+        };
+
+        let candidate = OrderByIndexPlan {
+            index: index.clone(),
+            descending,
+            equality_prefix_len,
+            covering_output,
+        };
+        let should_replace = match best_plan.as_ref() {
+            None => true,
+            Some(existing) => {
+                candidate.equality_prefix_len > existing.equality_prefix_len
+                    || (candidate.equality_prefix_len == existing.equality_prefix_len
+                        && candidate.covering_output.is_some()
+                        && existing.covering_output.is_none())
+            }
+        };
+        if should_replace {
+            best_plan = Some(candidate);
+        }
+    }
+
+    best_plan
 }
 
 /// Resolve result columns to table column indices.

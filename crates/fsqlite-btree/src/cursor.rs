@@ -5881,4 +5881,62 @@ mod tests {
             "cancelled iteration should preserve the prior cursor position"
         );
     }
+
+    /// bd-wwqen.1: count_all_rows must return the correct count for empty,
+    /// root-only (single-leaf), and multi-leaf (interior-node) trees.
+    #[test]
+    fn test_count_all_rows_empty_root_only_and_multi_leaf() {
+        const USABLE: u32 = 4096;
+        let cx = Cx::new();
+        let root = PageNumber::new(2).unwrap();
+
+        // ── Empty tree: zero rows ──
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        assert_eq!(
+            cursor.count_all_rows(&cx).unwrap(),
+            0,
+            "bd-wwqen.1: empty table must return count 0"
+        );
+
+        // ── Root-only tree: small number of rows in a single leaf ──
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        for i in 1..=5_i64 {
+            cursor
+                .table_insert(&cx, i, format!("row-{i}").as_bytes())
+                .expect("insert should succeed");
+        }
+        assert_eq!(
+            cursor.count_all_rows(&cx).unwrap(),
+            5,
+            "bd-wwqen.1: root-only table with 5 rows must return count 5"
+        );
+
+        // ── Multi-leaf tree: enough rows to force page splits ──
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        let n = 500;
+        let payload = vec![b'X'; 200]; // ~200 bytes per row → ~20 rows/page → ~25 pages
+        for i in 1..=n {
+            cursor
+                .table_insert(&cx, i, &payload)
+                .expect("insert should succeed");
+        }
+        let count = cursor.count_all_rows(&cx).unwrap();
+        assert_eq!(
+            count, n,
+            "bd-wwqen.1: multi-leaf table with {n} rows must return count {n}, got {count}"
+        );
+
+        // ── count_all_rows preserves cursor usability ──
+        // After count, cursor should still be usable for a seek.
+        assert!(
+            cursor
+                .table_move_to(&cx, 1)
+                .expect("seek after count should succeed")
+                .is_found(),
+            "bd-wwqen.1: cursor must remain usable after count_all_rows"
+        );
+    }
 }

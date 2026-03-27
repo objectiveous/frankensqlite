@@ -93,6 +93,49 @@ fn test_not_in_subquery_null_semantics() {
     );
 }
 
+/// B2.1: IN (positive, not NOT IN) with NULLs in the subquery preserves
+/// three-valued logic: match + NULL → TRUE, no-match + NULL → NULL,
+/// no-match + no-NULL → FALSE.
+///
+/// bd-wwqen.2: This is the mirror of test_not_in_subquery_null_semantics
+/// for the positive IN case. The eager materialization path
+/// (rewrite_in_expr → value_to_literal_expr) converts subquery NULLs
+/// to Literal::Null entries in InSet::List. The evaluator must handle
+/// these correctly per SQL three-valued logic.
+#[test]
+fn test_in_subquery_null_three_valued_logic() {
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER)").unwrap();
+    conn.execute("INSERT INTO t VALUES(1)").unwrap();
+    conn.execute("INSERT INTO t VALUES(2)").unwrap();
+    conn.execute("INSERT INTO t VALUES(NULL)").unwrap();
+
+    // 1 IN (1, 2, NULL) → TRUE (1 is found, NULL irrelevant)
+    let rows = conn.query("SELECT 1 IN (SELECT id FROM t)").unwrap();
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Integer(1),
+        "1 IN (1, 2, NULL) must be TRUE"
+    );
+
+    // 99 IN (1, 2, NULL) → NULL (99 not found, but NULL present)
+    let rows = conn.query("SELECT 99 IN (SELECT id FROM t)").unwrap();
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Null,
+        "99 IN (1, 2, NULL) must be NULL, not FALSE"
+    );
+
+    // With no NULLs: 99 IN (1, 2) → FALSE
+    conn.execute("DELETE FROM t WHERE id IS NULL").unwrap();
+    let rows = conn.query("SELECT 99 IN (SELECT id FROM t)").unwrap();
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Integer(0),
+        "99 IN (1, 2) without NULL must be FALSE"
+    );
+}
+
 /// B2.1: Small IN list (below 16-element threshold) still works correctly
 /// via the original linear scan path.
 #[test]
@@ -233,4 +276,83 @@ fn test_in_and_exists_combined() {
         };
         assert!(id >= 1 && id <= 20);
     }
+}
+
+// ── B7 regression guards (bd-wwqen.7) ──────────────────────────────────
+
+/// B7 guard: 1000-row IN subquery completes within a wall-time budget.
+///
+/// If the HashSet optimization regresses back to linear scan, this test
+/// will blow past the budget on any reasonable hardware. The budget is
+/// generous (500ms) to avoid flaky failures — the optimized path runs
+/// in <5ms; the pre-fix linear scan would take >10s at 1000 rows.
+#[test]
+fn guard_large_in_subquery_completes_within_budget() {
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE lookup(id INTEGER PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE data(id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+
+    for i in 1..=1000 {
+        conn.execute(&format!("INSERT INTO lookup VALUES({i})")).unwrap();
+    }
+    for i in 1..=100 {
+        conn.execute(&format!("INSERT INTO data VALUES({i}, 'v{i}')")).unwrap();
+    }
+
+    let start = std::time::Instant::now();
+    let rows = conn
+        .query("SELECT COUNT(*) FROM data WHERE id IN (SELECT id FROM lookup)")
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(rows[0].values()[0], SqliteValue::Integer(100));
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "1000-row IN subquery should complete in <500ms (got {:?}); \
+         possible regression to linear scan",
+        elapsed
+    );
+    eprintln!("[B7 guard] 1000-row IN subquery: {:?}", elapsed);
+}
+
+/// B7 guard: correlated EXISTS over 500 outer rows completes within budget.
+///
+/// The LIMIT 1 injection means each inner execution stops after one match.
+/// Without it, each inner query scans the full child table.
+#[test]
+fn guard_correlated_exists_completes_within_budget() {
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE child(id INTEGER, pid INTEGER)").unwrap();
+
+    for i in 1..=500 {
+        conn.execute(&format!("INSERT INTO parent VALUES({i})")).unwrap();
+    }
+    // Every even parent has 10 children.
+    for i in 1..=500 {
+        if i % 2 == 0 {
+            for j in 1..=10 {
+                conn.execute(&format!("INSERT INTO child VALUES({}, {})", i * 100 + j, i))
+                    .unwrap();
+            }
+        }
+    }
+
+    let start = std::time::Instant::now();
+    let rows = conn
+        .query(
+            "SELECT COUNT(*) FROM parent p \
+             WHERE EXISTS (SELECT 1 FROM child c WHERE c.pid = p.id)",
+        )
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(rows[0].values()[0], SqliteValue::Integer(250));
+    assert!(
+        elapsed < std::time::Duration::from_millis(2000),
+        "500-row correlated EXISTS should complete in <2s (got {:?}); \
+         possible regression — LIMIT 1 injection may be missing",
+        elapsed
+    );
+    eprintln!("[B7 guard] 500-row correlated EXISTS: {:?}", elapsed);
 }

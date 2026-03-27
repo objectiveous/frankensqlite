@@ -5578,7 +5578,11 @@ where
                 inner.db_size = committed_db_size;
             }
             inner.commit_seq = inner.commit_seq.next();
-            if let Ok(file_size) = inner.db_file.file_size(cx) {
+            // B3.4: :memory: derives file size from db_size * page_size — skip VFS roundtrip
+            if self.vfs.is_memory() {
+                inner.committed_db_file_size_bytes =
+                    u64::from(inner.db_size) * u64::from(inner.page_size.get());
+            } else if let Ok(file_size) = inner.db_file.file_size(cx) {
                 inner.committed_db_file_size_bytes = file_size;
             }
             // NOTE: We intentionally do NOT decrement active_transactions or

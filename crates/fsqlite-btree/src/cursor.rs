@@ -649,64 +649,69 @@ impl<P: PageReader> BtCursor<P> {
     /// child page numbers directly from raw cell bytes (4-byte BE at cell
     /// offset) to avoid full parse_cell_at overhead.
     fn count_all_rows_iterative(&mut self, cx: &Cx) -> Result<i64> {
-        // Stack of (page_no, next_cell_idx_to_descend).
-        // When next_cell_idx == cell_count, descend into right_child.
-        // When next_cell_idx == cell_count + 1, this page is fully visited.
-        let mut visit_stack: Vec<(PageNumber, u16, u16, Option<PageNumber>)> = Vec::new();
+        // Stack: (page_no, next_cell_idx, cell_count, right_child, header_size).
+        // Zero-allocation hot path: reads page data + header only, no Vec<u16>
+        // cell_pointers per page.
+        let mut visit_stack: Vec<(PageNumber, u16, u16, Option<PageNumber>, usize)> = Vec::new();
         let mut total: i64 = 0;
         let mut current_page = self.root_page;
 
         loop {
-            let entry = self.load_page(cx, current_page)?;
+            observe_cursor_cancellation(cx)?;
+            self.note_page_visit(current_page);
 
-            if entry.header.page_type.is_leaf() {
-                // Leaf: count cells from the page header, no payload decode.
-                total = total.saturating_add(i64::from(entry.header.cell_count));
+            let page_data = self.pager.read_page_data(cx, current_page)?;
+            let page_bytes = page_data.as_bytes();
+            let header = cell::parse_page_header(page_bytes, current_page)?;
 
-                // Pop up until we find a parent with unvisited children.
+            if header.page_type.is_leaf() {
+                total = total.saturating_add(i64::from(header.cell_count));
+
                 loop {
-                    let Some((parent_page, cell_idx, cell_count, right_child)) =
+                    let Some((parent_page, cell_idx, cell_count, right_child, hdr_size)) =
                         visit_stack.last_mut()
                     else {
-                        // Stack empty — all pages visited.
                         return Ok(total);
                     };
 
                     if *cell_idx < *cell_count {
-                        // Descend into the next left_child of this parent.
-                        let parent_entry = self.load_page(cx, *parent_page)?;
-                        let child = self.read_interior_cell_child(&parent_entry, *cell_idx)?;
+                        let parent_data = self.pager.read_page_data(cx, *parent_page)?;
+                        let parent_bytes = parent_data.as_bytes();
+                        let cell_ptr = Self::read_cell_pointer_inline(
+                            parent_bytes,
+                            *parent_page,
+                            *hdr_size,
+                            *cell_idx,
+                        )?;
+                        let child = Self::read_child_at_offset(parent_bytes, cell_ptr as usize)?;
                         *cell_idx += 1;
                         current_page = child;
                         break;
                     } else if let Some(rc) = right_child.take() {
-                        // Descend into right_child.
                         current_page = rc;
                         break;
                     } else {
-                        // This parent is fully visited, pop it.
                         visit_stack.pop();
                     }
                 }
             } else {
-                // Interior page: push onto stack, descend into first child.
-                let cell_count = entry.header.cell_count;
+                let cell_count = header.cell_count;
+                let hdr_size = header.page_type.header_size() as usize;
                 let right_child =
-                    entry
-                        .header
+                    header
                         .right_child
                         .ok_or_else(|| FrankenError::DatabaseCorrupt {
                             detail: "interior page has no right child in count_all_rows".to_owned(),
                         })?;
 
                 if cell_count == 0 {
-                    // Degenerate interior page with no cells — only right child.
-                    visit_stack.push((current_page, 0, 0, None));
+                    visit_stack.push((current_page, 0, 0, None, hdr_size));
                     current_page = right_child;
                 } else {
-                    // Read first child, push parent with next_idx=1.
-                    let first_child = self.read_interior_cell_child(&entry, 0)?;
-                    visit_stack.push((current_page, 1, cell_count, Some(right_child)));
+                    let cell_ptr =
+                        Self::read_cell_pointer_inline(page_bytes, current_page, hdr_size, 0)?;
+                    let first_child = Self::read_child_at_offset(page_bytes, cell_ptr as usize)?;
+                    visit_stack.push((current_page, 1, cell_count, Some(right_child), hdr_size));
                     current_page = first_child;
                 }
             }
@@ -764,9 +769,7 @@ impl<P: PageReader> BtCursor<P> {
         let ptr_offset = header_offset + header_size + (cell_idx as usize) * 2;
         if ptr_offset + 2 > page.len() {
             return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "cell pointer {cell_idx} extends past page in count_all_rows"
-                ),
+                detail: format!("cell pointer {cell_idx} extends past page in count_all_rows"),
             });
         }
         Ok(u16::from_be_bytes([page[ptr_offset], page[ptr_offset + 1]]))

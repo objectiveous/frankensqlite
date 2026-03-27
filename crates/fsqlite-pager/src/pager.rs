@@ -5548,6 +5548,15 @@ where
                     }
                 };
                 result
+            } else if self.vfs.is_memory() {
+                // bd-wwqen.3: :memory: retained-commit fast path.
+                // Skip journal creation, pre-image backup, sync, and deletion.
+                // Just flush dirty pages directly to the MemoryFile.
+                for (&page_no, staged) in &self.write_set {
+                    inner.flush_page(cx, page_no, staged.as_page_bytes())?;
+                    inner.db_size = inner.db_size.max(page_no.get());
+                }
+                Ok(())
             } else {
                 Self::commit_journal(
                     cx,

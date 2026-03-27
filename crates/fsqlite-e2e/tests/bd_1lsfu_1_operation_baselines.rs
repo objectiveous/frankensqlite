@@ -12,8 +12,8 @@ use fsqlite_core::connection::{
     hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
 };
 use fsqlite_e2e::baseline::{
-    BaselineReport, DEFAULT_REGRESSION_THRESHOLD, LatencyStats, Operation, OperationBaseline,
-    RegressionResult, measure_operation,
+    measure_operation, BaselineReport, LatencyStats, Operation, OperationBaseline,
+    RegressionResult, DEFAULT_REGRESSION_THRESHOLD,
 };
 use fsqlite_types::SqliteValue;
 use std::sync::{Mutex, OnceLock};
@@ -1230,15 +1230,14 @@ fn manual_perf_probe_future_query_row_probe_shapes_100k() {
     const WARMUP: u32 = 20;
     const ITERATIONS: u32 = 200;
     const UNIQUE_ID: i64 = 75_000;
+    const EXPECTED_PROBE_EXECUTIONS: u64 = WARMUP as u64 + ITERATIONS as u64;
 
     let _profile_guard = ManualHotPathProfileGuard::new();
     let conn = setup_query_guard_bench(ROW_COUNT);
     conn.execute("CREATE UNIQUE INDEX idx_bench_name_probe ON bench(name)")
         .unwrap();
 
-    let indexed_stmt = conn
-        .prepare("SELECT id, name, score FROM bench WHERE name = ?1")
-        .unwrap();
+    let indexed_stmt = conn.prepare("SELECT * FROM bench WHERE name = ?1").unwrap();
     let indexed_params = [SqliteValue::Text(format!("name_{UNIQUE_ID}").into())];
     let warm_indexed = indexed_stmt.query_row_with_params(&indexed_params).unwrap();
     assert_eq!(warm_indexed.values()[0], SqliteValue::Integer(UNIQUE_ID));
@@ -1263,9 +1262,22 @@ fn manual_perf_probe_future_query_row_probe_shapes_100k() {
         indexed_profile.vdbe.result_rows_total,
         indexed_profile.vdbe.result_values_total,
     );
+    assert_eq!(
+        indexed_profile.direct_indexed_equality_query_hits,
+        EXPECTED_PROBE_EXECUTIONS,
+        "corrected indexed-equality probe should hit the B4 direct query_row path on every warmup + measured execution"
+    );
+    assert_eq!(
+        indexed_profile.vdbe.result_rows_total, 0,
+        "corrected indexed-equality probe should not materialize VDBE result rows"
+    );
+    assert_eq!(
+        indexed_profile.vdbe.result_values_total, 0,
+        "corrected indexed-equality probe should not materialize VDBE result values"
+    );
 
     let range_stmt = conn
-        .prepare("SELECT id, name, score FROM bench WHERE id >= ?1 AND id < ?2")
+        .prepare("SELECT * FROM bench WHERE id >= ?1 AND id < ?2")
         .unwrap();
     let range_params = [
         SqliteValue::Integer(UNIQUE_ID),
@@ -1293,6 +1305,19 @@ fn manual_perf_probe_future_query_row_probe_shapes_100k() {
         range_profile.direct_rowid_range_query_hits,
         range_profile.vdbe.result_rows_total,
         range_profile.vdbe.result_values_total,
+    );
+    assert_eq!(
+        range_profile.direct_rowid_range_query_hits,
+        EXPECTED_PROBE_EXECUTIONS,
+        "corrected rowid-range probe should hit the B4 direct query_row path on every warmup + measured execution"
+    );
+    assert_eq!(
+        range_profile.vdbe.result_rows_total, 0,
+        "corrected rowid-range probe should not materialize VDBE result rows"
+    );
+    assert_eq!(
+        range_profile.vdbe.result_values_total, 0,
+        "corrected rowid-range probe should not materialize VDBE result values"
     );
 
     assert!(indexed_throughput > 0.0);

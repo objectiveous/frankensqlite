@@ -96,7 +96,9 @@ impl ConnectionExt for Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compat::{OpenFlags, open_with_flags};
     use crate::compat::RowExt;
+    use rusqlite::params;
 
     #[test]
     fn query_row_map_returns_value() {
@@ -142,5 +144,136 @@ mod tests {
             .execute_compat("INSERT INTO t VALUES (?1, ?2)", &p)
             .unwrap();
         assert_eq!(affected, 1);
+    }
+
+    #[test]
+    fn query_map_collect_composite_unique_index_returns_only_matching_duplicate_run() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("messages.db");
+
+        {
+            let mut conn = rusqlite::Connection::open(&db_path).expect("open sqlite db");
+            conn.execute_batch(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY,
+                    conversation_id INTEGER NOT NULL,
+                    idx INTEGER NOT NULL,
+                    role TEXT,
+                    author TEXT,
+                    created_at INTEGER,
+                    content TEXT,
+                    UNIQUE(conversation_id, idx)
+                );",
+            )
+            .expect("create schema");
+
+            let tx = conn.transaction().expect("begin tx");
+            tx.execute(
+                "INSERT INTO messages (id, conversation_id, idx, role, author, created_at, content)
+                 VALUES (1, 1, 0, 'user', 'u', 1000, 'first')",
+                [],
+            )
+            .expect("insert first");
+            tx.execute(
+                "INSERT INTO messages (id, conversation_id, idx, role, author, created_at, content)
+                 VALUES (2, 1, 1, 'assistant', 'a', 1001, 'second')",
+                [],
+            )
+            .expect("insert second");
+
+            let mut next_id = 3_i64;
+            for conversation_id in 2_i64..=25_000_i64 {
+                tx.execute(
+                    "INSERT INTO messages (id, conversation_id, idx, role, author, created_at, content)
+                     VALUES (?1, ?2, 0, 'assistant', 'bulk', ?3, ?4)",
+                    params![
+                        next_id,
+                        conversation_id,
+                        1_700_000_000_i64 + conversation_id,
+                        format!("bulk-{conversation_id}")
+                    ],
+                )
+                .expect("insert bulk row");
+                next_id += 1;
+            }
+
+            tx.commit().expect("commit fixture");
+        }
+
+        let conn = Connection::open(db_path.to_str().expect("utf8 path")).expect("open fsqlite db");
+        let rows: Vec<(i64, i64, String)> = conn
+            .query_map_collect(
+                "SELECT id, idx, content
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1
+                 WHERE conversation_id = ?1
+                 ORDER BY idx",
+                &[ParamValue::from(1_i64)],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            )
+            .expect("query composite unique index");
+
+        assert_eq!(
+            rows,
+            vec![
+                (1, 0, "first".to_owned()),
+                (2, 1, "second".to_owned()),
+            ],
+            "indexed equality scan should stay within the conversation_id=1 duplicate run",
+        );
+
+        let readonly = open_with_flags(
+            db_path.to_str().expect("utf8 path"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open readonly fsqlite db");
+        let readonly_rows: Vec<(i64, i64, String)> = readonly
+            .query_map_collect(
+                "SELECT id, idx, content
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1
+                 WHERE conversation_id = ?1
+                 ORDER BY idx",
+                &[ParamValue::from(1_i64)],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            )
+            .expect("query composite unique index via readonly path");
+
+        assert_eq!(
+            readonly_rows,
+            vec![
+                (1, 0, "first".to_owned()),
+                (2, 1, "second".to_owned()),
+            ],
+            "readonly indexed equality scan should stay within the conversation_id=1 duplicate run",
+        );
+    }
+
+    #[test]
+    #[ignore = "machine-local cass repro; run with FSQLITE_REAL_DB=/path/to/agent_search.db"]
+    fn query_map_collect_real_cass_db_repro() {
+        let db_path = std::env::var("FSQLITE_REAL_DB").expect("FSQLITE_REAL_DB must be set");
+        let conn = open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open readonly real cass db");
+        let query = "SELECT id, idx, content
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1
+                 WHERE conversation_id = ?1
+                 ORDER BY idx
+                 LIMIT 20";
+        let stmt = conn.prepare(query).expect("prepare real cass query");
+        eprintln!("real_cass_query_explain:\n{}", stmt.explain());
+        let rows: Vec<(i64, i64, String)> = conn
+            .query_map_collect(
+                query,
+                &[ParamValue::from(1_i64)],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            )
+            .expect("query real cass db");
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "conversation_id=1 should only have two rows in the canonical cass db"
+        );
+        assert_eq!(rows[0].0, 1);
+        assert_eq!(rows[1].0, 2);
     }
 }

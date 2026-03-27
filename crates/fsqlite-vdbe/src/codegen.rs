@@ -2180,17 +2180,27 @@ fn codegen_select_index_equality_scan(
         emit_limit_zero_guard(b, lim_r, fast_path_done_label);
     }
 
-    let param_reg = b.alloc_regs(2);
-    let min_rowid_reg = param_reg + 1;
-    emit_expr(b, target_expr, param_reg, None);
+    let probe_key_regs = b.alloc_regs((idx_schema.key_term_count() + 1) as i32);
+    let min_rowid_reg = probe_key_regs + idx_schema.key_term_count() as i32;
+    emit_expr(b, target_expr, probe_key_regs, None);
     b.emit_jump_to_label(
         Opcode::IsNull,
-        param_reg,
+        probe_key_regs,
         0,
         fast_path_done_label,
         P4::None,
         0,
     );
+    for offset in 1..idx_schema.key_term_count() {
+        b.emit_op(
+            Opcode::Null,
+            0,
+            probe_key_regs + offset as i32,
+            0,
+            P4::None,
+            0,
+        );
+    }
 
     let saw_index_match_reg = b.alloc_reg();
     b.emit_op(Opcode::Integer, 0, saw_index_match_reg, 0, P4::None, 0);
@@ -2199,8 +2209,8 @@ fn codegen_select_index_equality_scan(
     let probe_record_reg = b.alloc_reg();
     b.emit_op(
         Opcode::MakeRecord,
-        param_reg,
-        2,
+        probe_key_regs,
+        (idx_schema.key_term_count() + 1) as i32,
         probe_record_reg,
         P4::None,
         0,
@@ -2233,17 +2243,15 @@ fn codegen_select_index_equality_scan(
         0,
     );
 
-    let idx_loop_top = b.current_addr();
-    let idx_key_reg = b.alloc_reg();
-    b.emit_op(Opcode::Column, idx_cursor, 0, idx_key_reg, P4::None, 0);
-    b.emit_jump_to_label(
-        Opcode::Ne,
-        param_reg,
-        idx_key_reg,
-        duplicate_run_done,
-        P4::None,
-        0,
-    );
+        let idx_loop_top = b.current_addr();
+        b.emit_jump_to_label(
+            Opcode::IdxGT,
+            idx_cursor,
+            probe_record_reg,
+            duplicate_run_done,
+            P4::None,
+            1,
+        );
 
     let rowid_reg = b.alloc_reg();
     b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
@@ -3931,25 +3939,14 @@ fn codegen_select_index_ordered_scan(
             0,
         );
         let loop_start = b.current_addr();
-        for key_pos in 0..index_plan.equality_prefix_len {
-            let current_key_reg = b.alloc_reg();
-            b.emit_op(
-                Opcode::Column,
-                index_cursor,
-                key_pos as i32,
-                current_key_reg,
-                P4::None,
-                0,
-            );
-            b.emit_jump_to_label(
-                Opcode::Ne,
-                probe_key_regs + key_pos as i32,
-                current_key_reg,
-                done_label,
-                index_key_collation_p4(&index_plan.index, key_pos),
-                index_key_cmp_p5(table, &index_plan.index, key_pos),
-            );
-        }
+        b.emit_jump_to_label(
+            Opcode::IdxGT,
+            index_cursor,
+            probe_record_reg,
+            done_label,
+            P4::None,
+            index_plan.equality_prefix_len as u16,
+        );
         loop_start
     } else {
         let loop_start = b.current_addr();
@@ -17259,7 +17256,19 @@ mod tests {
     fn test_codegen_select_by_rowid() {
         let stmt = simple_select(&["b"], "t", Some(rowid_eq_param()));
         let schema = test_schema();
-        let ctx = CodegenContext::default();
+        let ctx = CodegenContext {
+            planner_select_directive: Some(SelectPlannerDirective {
+                plan_id: "plan-messages-prefix-equality".to_owned(),
+                plan_generation: 1,
+                planner_surface: "single_table_access_path_v1".to_owned(),
+                table_name: "messages".to_owned(),
+                index_name: Some("sqlite_autoindex_messages_1".to_owned()),
+                index_column: Some("conversation_id".to_owned()),
+                covering: false,
+                access_kind: PlannerSelectAccessKind::IndexEquality,
+            }),
+            ..CodegenContext::default()
+        };
         let mut b = ProgramBuilder::new();
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
@@ -19587,20 +19596,137 @@ mod tests {
             .expect("index equality path must iterate duplicates");
         assert_eq!(next.p1, 1, "Next should advance the index cursor");
 
-        let ne = prog
+        let idx_gt = prog
             .ops()
             .iter()
-            .find(|op| op.opcode == Opcode::Ne)
-            .expect("duplicate-run equality guard should compare the index key");
+            .find(|op| op.opcode == Opcode::IdxGT)
+            .expect("duplicate-run boundary should compare the index cursor against the probe key");
         let if_addr = prog
             .ops()
             .iter()
             .position(|op| op.opcode == Opcode::If)
             .expect("normal duplicate-run exit should branch through a match gate");
         assert_eq!(
-            usize::try_from(ne.p2).unwrap(),
+            usize::try_from(idx_gt.p2).unwrap(),
             if_addr,
             "duplicate-run boundary must not jump directly into the full-scan fallback"
+        );
+        assert_eq!(
+            idx_gt.p5, 1,
+            "duplicate-run boundary should compare only the leading equality key"
+        );
+    }
+
+    fn test_schema_with_composite_prefix_index() -> Vec<TableSchema> {
+        vec![TableSchema {
+            name: "messages".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("id", 'D', true),
+                ColumnInfo::basic("conversation_id", 'D', false),
+                ColumnInfo::basic("idx", 'D', false),
+                ColumnInfo::basic("content", 'B', false),
+            ],
+            indexes: vec![IndexSchema {
+                name: "sqlite_autoindex_messages_1".to_owned(),
+                root_page: 3,
+                columns: vec!["conversation_id".to_owned(), "idx".to_owned()],
+                key_expressions: vec!["conversation_id".to_owned(), "idx".to_owned()],
+                key_sort_directions: vec![],
+                where_clause: None,
+                is_unique: true,
+                key_collations: vec![],
+            }],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }]
+    }
+
+    #[test]
+    fn test_codegen_select_with_composite_index_prefix_equality_anchors_full_key() {
+        let schema = test_schema_with_composite_prefix_index();
+        let table = &schema[0];
+        let idx_schema = &table.indexes[0];
+        let columns = vec![
+            ResultColumn::Expr {
+                expr: Expr::Column(ColumnRef::bare("id"), Span::ZERO),
+                alias: None,
+            },
+            ResultColumn::Expr {
+                expr: Expr::Column(ColumnRef::bare("idx"), Span::ZERO),
+                alias: None,
+            },
+            ResultColumn::Expr {
+                expr: Expr::Column(ColumnRef::bare("content"), Span::ZERO),
+                alias: None,
+            },
+        ];
+        let where_clause = col_eq_param("conversation_id", 1);
+        let mut b = ProgramBuilder::new();
+        let out_regs = b.alloc_regs(columns.len() as i32);
+        let done_label = b.emit_label();
+        let end_label = b.emit_label();
+        codegen_select_index_equality_scan(
+            &mut b,
+            0,
+            table,
+            None,
+            &schema,
+            &columns,
+            Some(&where_clause),
+            None,
+            out_regs,
+            columns.len() as i32,
+            done_label,
+            end_label,
+            idx_schema,
+            &placeholder(1),
+        )
+        .unwrap();
+        b.resolve_label(done_label);
+        b.resolve_label(end_label);
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        let seek_ge = ops
+            .iter()
+            .find(|op| op.opcode == Opcode::SeekGE)
+            .expect("composite equality scan should probe the autoindex");
+        let make_record = ops
+            .iter()
+            .find(|op| op.opcode == Opcode::MakeRecord && op.p3 == seek_ge.p3)
+            .expect("SeekGE should consume a dedicated composite probe record");
+        assert_eq!(
+            seek_ge.p3, make_record.p3,
+            "SeekGE must read the composite probe key from MakeRecord"
+        );
+        assert_eq!(
+            make_record.p2, 3,
+            "probe key should include conversation_id, trailing idx filler, and rowid suffix"
+        );
+
+        let null_fill = ops
+            .iter()
+            .find(|op| op.opcode == Opcode::Null)
+            .expect("composite probe should fill trailing indexed terms with NULL");
+        assert_eq!(
+            null_fill.p2,
+            make_record.p1 + 1,
+            "the filler NULL should target the second indexed key column register"
+        );
+
+        let int64 = ops
+            .iter()
+            .find(|op| op.opcode == Opcode::Int64)
+            .expect("composite probe should still append rowid lower bound");
+        assert_eq!(int64.p4, P4::Int64(i64::MIN));
+        assert_eq!(
+            int64.p2,
+            make_record.p1 + 2,
+            "rowid lower bound should be written after all indexed key terms"
         );
     }
 

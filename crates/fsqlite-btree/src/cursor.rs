@@ -728,7 +728,13 @@ impl<P: PageReader> BtCursor<P> {
             });
         }
         let cell_offset = cell_pointers[idx] as usize;
-        let page = entry.page_data.as_bytes();
+        Self::read_child_at_offset(entry.page_data.as_bytes(), cell_offset)
+    }
+
+    /// bd-wwqen.1: Read a 4-byte BE child page number directly from raw page
+    /// bytes at the given cell offset. Used by count_all_rows_iterative to
+    /// avoid needing the allocated cell_pointers Vec.
+    fn read_child_at_offset(page: &[u8], cell_offset: usize) -> Result<PageNumber> {
         if cell_offset + 4 > page.len() {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: "interior cell extends past page in count_all_rows".to_owned(),
@@ -743,6 +749,27 @@ impl<P: PageReader> BtCursor<P> {
         PageNumber::new(pgno).ok_or_else(|| FrankenError::DatabaseCorrupt {
             detail: "interior cell has zero left-child pointer in count_all_rows".to_owned(),
         })
+    }
+
+    /// bd-wwqen.1: Read the cell pointer at index `cell_idx` directly from
+    /// raw page bytes without allocating a Vec<u16>. The cell pointer array
+    /// starts right after the page header.
+    fn read_cell_pointer_inline(
+        page: &[u8],
+        page_no: PageNumber,
+        header_size: usize,
+        cell_idx: u16,
+    ) -> Result<u16> {
+        let header_offset = cell::header_offset_for_page(page_no);
+        let ptr_offset = header_offset + header_size + (cell_idx as usize) * 2;
+        if ptr_offset + 2 > page.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "cell pointer {cell_idx} extends past page in count_all_rows"
+                ),
+            });
+        }
+        Ok(u16::from_be_bytes([page[ptr_offset], page[ptr_offset + 1]]))
     }
 
     fn record_depth_gauge(&mut self, cx: &Cx) -> Result<()> {

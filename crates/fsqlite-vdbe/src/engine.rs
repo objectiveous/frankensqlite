@@ -2681,6 +2681,16 @@ impl CursorBackend {
         }
     }
 
+    fn table_insert_prechecked_absent(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
+        match self {
+            Self::Mem(c) => c.table_insert_prechecked_absent(cx, rowid, data),
+            Self::Txn(c) => c.table_insert_prechecked_absent(cx, rowid, data),
+            Self::TimeTravel(_) => Err(FrankenError::Internal(
+                "time-travel cursors are read-only: table_insert not permitted".to_owned(),
+            )),
+        }
+    }
+
     fn delete(&mut self, cx: &Cx) -> Result<()> {
         match self {
             Self::Mem(c) => c.delete(cx),
@@ -7662,6 +7672,7 @@ impl VdbeEngine {
                                 .txn_page_io
                                 .as_ref()
                                 .is_some_and(|io| io.concurrent.is_some());
+                            let mut insert_seek_result = None;
                             let exists = if !is_update
                                 && !is_concurrent_mode
                                 && sc
@@ -7670,7 +7681,9 @@ impl VdbeEngine {
                             {
                                 false // Append: key is larger than anything in the table
                             } else {
-                                sc.cursor.table_move_to(&sc.cx, rowid)?.is_found()
+                                let seek_result = sc.cursor.table_move_to(&sc.cx, rowid)?;
+                                insert_seek_result = Some(seek_result);
+                                seek_result.is_found()
                             };
 
                             if exists {
@@ -7713,8 +7726,14 @@ impl VdbeEngine {
                                     };
                                 }
                             } else {
-                                // No conflict — insert normally
-                                sc.cursor.table_insert(&sc.cx, rowid, blob)?;
+                                // No conflict — reuse the successor/EOF position from the
+                                // existence probe when it already proved the row is absent.
+                                if insert_seek_result == Some(SeekResult::NotFound) {
+                                    sc.cursor
+                                        .table_insert_prechecked_absent(&sc.cx, rowid, blob)?;
+                                } else {
+                                    sc.cursor.table_insert(&sc.cx, rowid, blob)?;
+                                }
                                 invalidate_storage_cursor_row_cache_with_reason(
                                     sc,
                                     self.collect_vdbe_metrics,
@@ -17247,6 +17266,59 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_after_missing_probe_disturbed_by_reposition_stays_sorted() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(10, vec![SqliteValue::Integer(100)]);
+        table.insert(30, vec![SqliteValue::Integer(300)]);
+
+        let (rows, _) = run_write_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            let probe_missing = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+
+            // Probe the missing rowid=20, which leaves the cursor at its
+            // successor/EOF insertion context.
+            b.emit_op(Opcode::Integer, 20, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::NotExists, 0, 1, probe_missing, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, end, P4::None, 0);
+            b.resolve_label(probe_missing);
+
+            // Disturb the cursor by repositioning it to rowid=10 before the insert.
+            b.emit_op(Opcode::Integer, 10, 2, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekRowid, 0, 2, end, P4::None, 0);
+
+            // Insert the previously probed rowid=20 with payload=200.
+            b.emit_op(Opcode::Integer, 200, 3, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, 3, 1, 4, P4::None, 0);
+            b.emit_op(Opcode::Insert, 0, 4, 1, P4::None, 0);
+
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            let body = b.current_addr();
+            b.emit_op(Opcode::Rowid, 0, 5, 0, P4::None, 0);
+            b.emit_op(Opcode::Column, 0, 0, 6, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 5, 2, 0, P4::None, 0);
+            let next_target =
+                i32::try_from(body).expect("program counter should fit into i32 for tests");
+            b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Integer(10), SqliteValue::Integer(100)],
+                vec![SqliteValue::Integer(20), SqliteValue::Integer(200)],
+                vec![SqliteValue::Integer(30), SqliteValue::Integer(300)],
+            ]
+        );
+    }
+
+    #[test]
     fn test_insert_default_conflict_errors_via_btree() {
         // Default conflict mode (OE_ABORT) must raise constraint error.
         let mut db = MemDatabase::new();
@@ -17993,6 +18065,68 @@ mod tests {
             ],
             "NoConflict should treat duplicate prefixes as conflicts and malformed probes as insertable"
         );
+    }
+
+    #[test]
+    fn test_idxinsert_unique_no_conflict_inserts_distinct_prefix_after_cursor_disturbance() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut engine, _, _) = build_storage_index_engine_with_duplicate_prefixes();
+
+        let disturb_key = encode_record(&[SqliteValue::Integer(7), SqliteValue::Integer(1)]);
+        let inserted_key = encode_record(&[SqliteValue::Integer(9), SqliteValue::Integer(500)]);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        let disturbed = b.emit_label();
+        let found = b.emit_label();
+        let done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        let r_disturb_key = b.alloc_reg();
+        let r_insert_key = b.alloc_reg();
+        let r_probe_key = b.alloc_reg();
+        let r_out = b.alloc_reg();
+
+        b.emit_op(Opcode::Blob, 0, r_disturb_key, 0, P4::Blob(disturb_key), 0);
+        b.emit_jump_to_label(Opcode::Found, 0, r_disturb_key, disturbed, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+        b.resolve_label(disturbed);
+
+        b.emit_op(
+            Opcode::Blob,
+            0,
+            r_insert_key,
+            0,
+            P4::Blob(inserted_key.clone()),
+            0,
+        );
+        b.emit_op(
+            Opcode::IdxInsert,
+            0,
+            r_insert_key,
+            1,
+            P4::Table("idx_col".to_owned()),
+            1,
+        );
+
+        b.emit_op(Opcode::Blob, 0, r_probe_key, 0, P4::Blob(inserted_key), 0);
+        b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Found, 0, r_probe_key, found, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+        b.resolve_label(found);
+        b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+        b.resolve_label(done);
+
+        b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let program = b.finish().expect("program should build");
+        let rows = execute_program_with_engine(&mut engine, &program);
+
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
     }
 
     #[test]

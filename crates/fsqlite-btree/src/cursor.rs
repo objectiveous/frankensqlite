@@ -2756,6 +2756,52 @@ impl<P: PageWriter> BtCursor<P> {
         }
     }
 
+    fn index_insert_from_current_position(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
+        let insert_idx = {
+            let top = self
+                .stack
+                .last()
+                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+            if !top.header.page_type.is_leaf() {
+                return Err(FrankenError::internal(
+                    "index insert from current position requires leaf cursor state",
+                ));
+            }
+            if self.at_eof {
+                top.header.cell_count
+            } else {
+                top.cell_idx
+            }
+        };
+
+        let mut cell_data = std::mem::take(&mut self.cell_buf);
+        let overflow_head = self.encode_index_leaf_cell_into(cx, key, &mut cell_data)?;
+
+        match self.try_insert_on_leaf(cx, insert_idx, &cell_data) {
+            Ok(true) => {
+                self.cell_buf = cell_data;
+                Ok(())
+            }
+            Ok(false) => {
+                let balance_result = self.balance_for_insert(cx, &cell_data, insert_idx);
+                self.cell_buf = cell_data;
+                if balance_result.is_err() {
+                    if let Some(first) = overflow_head {
+                        let _ = self.free_overflow_chain(cx, first);
+                    }
+                }
+                balance_result
+            }
+            Err(error) => {
+                self.cell_buf = cell_data;
+                if let Some(first) = overflow_head {
+                    let _ = self.free_overflow_chain(cx, first);
+                }
+                Err(error)
+            }
+        }
+    }
+
     fn try_table_append_on_hinted_leaf(
         &mut self,
         cx: &Cx,
@@ -2838,7 +2884,8 @@ impl<P: PageWriter> BtCursor<P> {
     /// `table_move_to(rowid)` and observed `SeekResult::NotFound`.
     ///
     /// This reuses the current successor/EOF position instead of performing a
-    /// second full B-tree seek before the insert.
+    /// second full B-tree seek before the insert. The VDBE `Insert` path uses
+    /// this as its `USESEEKRESULT`-style successor-position reuse primitive.
     #[doc(hidden)]
     pub fn table_insert_prechecked_absent(
         &mut self,
@@ -2848,6 +2895,18 @@ impl<P: PageWriter> BtCursor<P> {
     ) -> Result<()> {
         self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
             cursor.table_insert_from_current_position(cx, rowid, data)
+        })
+    }
+
+    /// Fast insert path for callers that already positioned the cursor with
+    /// `index_move_to(key)` and observed `SeekResult::NotFound`.
+    ///
+    /// This reuses the current successor/EOF position instead of performing a
+    /// second full B-tree seek before the insert.
+    #[doc(hidden)]
+    pub fn index_insert_prechecked_absent(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
+        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+            cursor.index_insert_from_current_position(cx, key)
         })
     }
 
@@ -3067,6 +3126,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         // same indexed columns but different rowids sort adjacently.
         self.with_btree_op(cx, BtreeOpType::Seek, |cursor| {
             let _seek = cursor.index_seek(cx, key)?;
+            let restore_eof = cursor.at_eof;
 
             let mut to_check = Vec::with_capacity(2);
 
@@ -3089,11 +3149,24 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                     }
                 }
             }
+
+            if restore_eof {
+                cursor.at_eof = true;
+            } else {
+                cursor.next(cx)?;
+            }
             Ok(())
         })?;
 
-        // No conflict — proceed with normal insert.
-        self.index_insert(cx, key)
+        let can_reuse_insert_position = self.stack.last().is_some_and(|top| {
+            top.header.page_type.is_leaf() && (self.at_eof || top.cell_idx < top.header.cell_count)
+        });
+
+        if can_reuse_insert_position {
+            self.index_insert_prechecked_absent(cx, key)
+        } else {
+            self.index_insert(cx, key)
+        }
     }
 
     fn table_insert(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
@@ -3713,6 +3786,32 @@ mod tests {
         assert_eq!(cursor.payload(&cx).unwrap(), b"thirty");
     }
 
+    #[test]
+    fn test_table_insert_prechecked_absent_reuses_eof_position() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(
+            2,
+            build_leaf_table(&[(1, b"one"), (2, b"two"), (3, b"three"), (4, b"four")]),
+        );
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+        let seek = cursor.table_move_to(&cx, 99).unwrap();
+        assert_eq!(seek, SeekResult::NotFound);
+        assert!(
+            cursor.eof(),
+            "seek past end should preserve EOF insertion context"
+        );
+
+        cursor
+            .table_insert_prechecked_absent(&cx, 99, b"tail")
+            .unwrap();
+
+        assert!(cursor.table_move_to(&cx, 99).unwrap().is_found());
+        assert_eq!(cursor.payload(&cx).unwrap(), b"tail");
+    }
+
     /// Helper: build a leaf table page with sorted (rowid, payload) entries.
     fn build_leaf_table(entries: &[(i64, &[u8])]) -> Vec<u8> {
         let mut page = vec![0u8; USABLE as usize];
@@ -4233,11 +4332,154 @@ mod tests {
             .insert(2, build_leaf_index(&[b"apple", b"carrot", b"pear"]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, false);
         cursor.index_insert(&cx, b"banana").unwrap();
 
         assert!(cursor.index_move_to(&cx, b"banana").unwrap().is_found());
         assert_eq!(cursor.payload(&cx).unwrap(), b"banana");
+    }
+
+    #[test]
+    fn test_index_insert_prechecked_absent_reuses_successor_position() {
+        let store = MemPageStore::with_empty_index(pn(2), USABLE);
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+
+        let low_key = serialize_record(&[SqliteValue::Integer(10), SqliteValue::Integer(1)]);
+        let mid_key = serialize_record(&[SqliteValue::Integer(20), SqliteValue::Integer(2)]);
+        let high_key = serialize_record(&[SqliteValue::Integer(30), SqliteValue::Integer(3)]);
+
+        cursor.index_insert(&cx, &low_key).unwrap();
+        cursor.index_insert(&cx, &high_key).unwrap();
+
+        let seek = cursor.index_move_to(&cx, &mid_key).unwrap();
+        assert_eq!(seek, SeekResult::NotFound);
+        assert!(!cursor.eof(), "seek should land on successor key");
+
+        cursor
+            .index_insert_prechecked_absent(&cx, &mid_key)
+            .unwrap();
+
+        assert!(cursor.first(&cx).unwrap());
+        assert_eq!(
+            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
+            vec![SqliteValue::Integer(10), SqliteValue::Integer(1)]
+        );
+        assert!(cursor.next(&cx).unwrap());
+        assert_eq!(
+            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
+            vec![SqliteValue::Integer(20), SqliteValue::Integer(2)]
+        );
+        assert!(cursor.next(&cx).unwrap());
+        assert_eq!(
+            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
+            vec![SqliteValue::Integer(30), SqliteValue::Integer(3)]
+        );
+    }
+
+    #[test]
+    fn test_index_insert_unique_no_conflict_inserts_between_adjacent_prefixes() {
+        let store = MemPageStore::with_empty_index(pn(2), USABLE);
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+
+        let low_key = serialize_record(&[SqliteValue::Integer(10), SqliteValue::Integer(1)]);
+        let mid_key = serialize_record(&[SqliteValue::Integer(20), SqliteValue::Integer(2)]);
+        let high_key = serialize_record(&[SqliteValue::Integer(30), SqliteValue::Integer(3)]);
+
+        cursor.index_insert(&cx, &low_key).unwrap();
+        cursor.index_insert(&cx, &high_key).unwrap();
+        cursor.index_insert_unique(&cx, &mid_key, 1, "t.x").unwrap();
+
+        assert!(cursor.first(&cx).unwrap());
+        assert_eq!(
+            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
+            vec![SqliteValue::Integer(10), SqliteValue::Integer(1)]
+        );
+        assert!(cursor.next(&cx).unwrap());
+        assert_eq!(
+            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
+            vec![SqliteValue::Integer(20), SqliteValue::Integer(2)]
+        );
+        assert!(cursor.next(&cx).unwrap());
+        assert_eq!(
+            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
+            vec![SqliteValue::Integer(30), SqliteValue::Integer(3)]
+        );
+    }
+
+    #[test]
+    fn test_index_insert_unique_non_leaf_restore_state_falls_back_to_full_insert() {
+        let low_key = serialize_record(&[
+            SqliteValue::Text("alpha@example.com".into()),
+            SqliteValue::Integer(1),
+        ]);
+        let separator_key = serialize_record(&[
+            SqliteValue::Text("mango@example.com".into()),
+            SqliteValue::Integer(2),
+        ]);
+        let high_key = serialize_record(&[
+            SqliteValue::Text("zebra@example.com".into()),
+            SqliteValue::Integer(3),
+        ]);
+        let probe_key = serialize_record(&[
+            SqliteValue::Text("hotel@example.com".into()),
+            SqliteValue::Integer(4),
+        ]);
+
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_interior_index(&[(pn(3), &separator_key)], pn(4)));
+        store.pages.insert(3, build_leaf_index(&[&low_key]));
+        store.pages.insert(4, build_leaf_index(&[&high_key]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+
+        let restores_to_non_leaf = cursor
+            .with_btree_op(&cx, BtreeOpType::Seek, |cursor| {
+                let _seek = cursor.index_seek(&cx, &probe_key)?;
+                let restore_eof = cursor.at_eof;
+
+                if !cursor.at_eof {
+                    let _payload = cursor.payload(&cx)?;
+                }
+
+                if cursor.prev(&cx)? {
+                    let _payload = cursor.payload(&cx)?;
+                }
+
+                if restore_eof {
+                    cursor.at_eof = true;
+                } else {
+                    cursor.next(&cx)?;
+                }
+
+                Ok(cursor
+                    .stack
+                    .last()
+                    .is_some_and(|top| !top.header.page_type.is_leaf()))
+            })
+            .unwrap();
+
+        assert!(
+            restores_to_non_leaf,
+            "test requires the uniqueness restore state to sit on an interior separator"
+        );
+
+        cursor
+            .index_insert_unique(&cx, &probe_key, 1, "bench.email")
+            .unwrap();
+
+        assert!(cursor.index_move_to(&cx, &probe_key).unwrap().is_found());
+        assert_eq!(
+            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
+            vec![
+                SqliteValue::Text("hotel@example.com".into()),
+                SqliteValue::Integer(4),
+            ]
+        );
     }
 
     #[test]

@@ -5080,6 +5080,7 @@ impl VdbeEngine {
                 DecodeCacheInvalidationReason::WriteMutation,
             );
         }
+        self.sync_storage_table_delete_into_memdb_mirror(tbl_cursor_id, conflict_rowid);
 
         Ok(())
     }
@@ -17263,6 +17264,128 @@ mod tests {
         // Only one row with the updated value.
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], SqliteValue::Integer(99));
+    }
+
+    #[test]
+    fn test_native_replace_row_deletes_conflict_victim_from_memdb_row_mirror() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let mut db = MemDatabase::new();
+        let table_root = db.create_table(1);
+        let index_root = 256;
+        let table = db
+            .get_table_mut(table_root)
+            .expect("table mirror should exist");
+        table.insert(1, vec![SqliteValue::Text("alice@example.com".into())]);
+        table.insert(2, vec![SqliteValue::Text("bob@example.com".into())]);
+        table.insert(3, vec![SqliteValue::Text("alice@example.com".into())]);
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(db);
+        engine.set_memdb_rows_loaded(true);
+        engine.set_storage_cursor_memdb_count_shortcuts_safe(true);
+        engine.set_transaction(Box::new(txn));
+        engine.table_index_meta = Arc::new(HashMap::from([(
+            0,
+            vec![IndexCursorMeta {
+                cursor_id: 1,
+                column_indices: vec![0],
+            }]
+            .into_boxed_slice(),
+        )]));
+
+        assert!(engine.open_storage_cursor(0, table_root, true));
+        assert!(engine.open_storage_cursor(1, index_root, true));
+        engine.cursor_root_pages.insert(0, table_root);
+        engine.cursor_root_pages.insert(1, index_root);
+
+        let row1 = encode_record(&[SqliteValue::Text("alice@example.com".into())]);
+        let row2 = encode_record(&[SqliteValue::Text("bob@example.com".into())]);
+        let row3 = encode_record(&[SqliteValue::Text("alice@example.com".into())]);
+        let idx1 = encode_record(&[
+            SqliteValue::Text("alice@example.com".into()),
+            SqliteValue::Integer(1),
+        ]);
+        let idx2 = encode_record(&[
+            SqliteValue::Text("bob@example.com".into()),
+            SqliteValue::Integer(2),
+        ]);
+
+        {
+            let table_cursor = engine
+                .storage_cursors
+                .get_mut(&0)
+                .expect("table storage cursor should exist");
+            table_cursor
+                .cursor
+                .table_insert(&table_cursor.cx, 1, &row1)
+                .unwrap();
+            table_cursor
+                .cursor
+                .table_insert(&table_cursor.cx, 2, &row2)
+                .unwrap();
+            table_cursor
+                .cursor
+                .table_insert(&table_cursor.cx, 3, &row3)
+                .unwrap();
+        }
+        {
+            let index_cursor = engine
+                .storage_cursors
+                .get_mut(&1)
+                .expect("index storage cursor should exist");
+            index_cursor
+                .cursor
+                .index_insert(&index_cursor.cx, &idx1)
+                .unwrap();
+            index_cursor
+                .cursor
+                .index_insert(&index_cursor.cx, &idx2)
+                .unwrap();
+        }
+
+        engine.native_replace_row(0, 1).unwrap();
+
+        let mirrored_table = engine
+            .db
+            .as_ref()
+            .and_then(|db| db.get_table(table_root))
+            .expect("mirrored table should still exist");
+        let mirrored_rowids: Vec<i64> = mirrored_table.rows.iter().map(|row| row.rowid).collect();
+        assert_eq!(
+            mirrored_rowids,
+            vec![2, 3],
+            "REPLACE victim row must be removed from the MemDB mirror so retained same-connection reads stay exact"
+        );
+        assert!(
+            engine.storage_cursor_memdb_count_shortcuts_safe(),
+            "exact delete mirroring should preserve MemDB row-mirror safety"
+        );
+
+        let index_cursor = engine
+            .storage_cursors
+            .get_mut(&1)
+            .expect("index storage cursor should still exist");
+        assert!(
+            !index_cursor
+                .cursor
+                .index_move_to(&index_cursor.cx, &idx1)
+                .unwrap()
+                .is_found(),
+            "conflicting unique index entry should be removed from storage"
+        );
+        assert!(
+            index_cursor
+                .cursor
+                .index_move_to(&index_cursor.cx, &idx2)
+                .unwrap()
+                .is_found(),
+            "non-conflicting index entries must remain intact"
+        );
     }
 
     #[test]

@@ -290,3 +290,311 @@ fn wal_mode_checkpoint() {
     }
     assert_stock_sqlite_integrity(&path, "wal_mode");
 }
+
+/// Issue #55: Multi-table schema with AUTOINCREMENT, composite UNIQUE,
+/// foreign keys, and explicit indexes. Single-table tests pass, but this
+/// combination produces "database disk image is malformed" when reopened
+/// by stock SQLite.
+#[test]
+fn issue55_multi_table_autoincrement_composite_unique_fk() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("issue55.db");
+    {
+        let conn = fsqlite::Connection::open(path.to_str().unwrap()).unwrap();
+
+        // Create multi-table schema from the issue report.
+        conn.execute(
+            "CREATE TABLE groups(
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                category TEXT NOT NULL,
+                source_ref TEXT,
+                notes TEXT,
+                created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            )",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX idx_groups_source_ref ON groups (source_ref)")
+            .unwrap();
+
+        conn.execute(
+            "CREATE TABLE records(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                value_a REAL,
+                value_b REAL,
+                value_c REAL,
+                value_d REAL,
+                value_e REAL,
+                value_f REAL,
+                payload TEXT NOT NULL DEFAULT 'null',
+                UNIQUE (group_id, seq),
+                FOREIGN KEY(group_id) REFERENCES groups(id) ON DELETE CASCADE
+            )",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX idx_records_group_seq ON records (group_id, seq)")
+            .unwrap();
+
+        conn.execute(
+            "CREATE TABLE config_snapshots (
+                config_hash TEXT PRIMARY KEY NOT NULL,
+                schema_version INTEGER NOT NULL,
+                config_json TEXT NOT NULL
+            )",
+        )
+        .unwrap();
+
+        conn.execute(
+            "CREATE TABLE group_config_links (
+                group_id TEXT PRIMARY KEY NOT NULL REFERENCES groups (id) ON DELETE CASCADE,
+                config_hash TEXT NOT NULL REFERENCES config_snapshots (config_hash),
+                linked_at INTEGER NOT NULL
+            )",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX idx_config_links_hash ON group_config_links (config_hash)")
+            .unwrap();
+
+        conn.execute(
+            "CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id TEXT NOT NULL REFERENCES groups (id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL,
+                severity TEXT NOT NULL,
+                message TEXT NOT NULL,
+                raw_payload TEXT NOT NULL DEFAULT 'null'
+            )",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX idx_events_group_seq ON events (group_id, seq)")
+            .unwrap();
+
+        // Insert data across tables.
+        conn.execute("INSERT INTO groups (id, name, category) VALUES ('g1', 'Group One', 'cat_a')")
+            .unwrap();
+        conn.execute("INSERT INTO groups (id, name, category) VALUES ('g2', 'Group Two', 'cat_b')")
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO records (group_id, seq, value_a, payload) VALUES ('g1', 1, 3.14, '{\"x\":1}')",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO records (group_id, seq, value_a, payload) VALUES ('g1', 2, 2.72, '{\"x\":2}')",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO records (group_id, seq, value_a, payload) VALUES ('g2', 1, 1.41, '{\"x\":3}')",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO config_snapshots VALUES ('hash_abc', 1, '{\"setting\":\"value\"}')",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO group_config_links VALUES ('g1', 'hash_abc', 1711900000)")
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO events (group_id, seq, severity, message) VALUES ('g1', 1, 'INFO', 'started')",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events (group_id, seq, severity, message) VALUES ('g1', 2, 'WARN', 'threshold')",
+        )
+        .unwrap();
+    }
+    assert_stock_sqlite_integrity(&path, "issue55_multi_table");
+
+    // Also verify data is readable via stock SQLite.
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    let group_count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM groups", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(group_count, 2, "expected 2 groups");
+    let record_count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(record_count, 3, "expected 3 records");
+    let event_count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(event_count, 2, "expected 2 events");
+}
+
+/// Minimal multi-table reproduction: two tables, one with AUTOINCREMENT and
+/// a UNIQUE constraint. This isolates whether the issue is autoindex + sqlite_sequence.
+#[test]
+fn multi_table_autoincrement_with_unique_constraint() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("multi_autoinc.db");
+    {
+        let conn = fsqlite::Connection::open(path.to_str().unwrap()).unwrap();
+        conn.execute("CREATE TABLE parent(id TEXT PRIMARY KEY, label TEXT NOT NULL)")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                parent_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                data TEXT,
+                UNIQUE(parent_id, seq)
+            )",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO parent VALUES ('p1', 'Parent One')")
+            .unwrap();
+        conn.execute("INSERT INTO child (parent_id, seq, data) VALUES ('p1', 1, 'first')")
+            .unwrap();
+        conn.execute("INSERT INTO child (parent_id, seq, data) VALUES ('p1', 2, 'second')")
+            .unwrap();
+    }
+    assert_stock_sqlite_integrity(&path, "multi_table_autoinc_unique");
+}
+
+/// Multi-table with explicit indexes on each table but no AUTOINCREMENT.
+#[test]
+fn multi_table_explicit_indexes_no_autoincrement() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("multi_idx_no_autoinc.db");
+    {
+        let conn = fsqlite::Connection::open(path.to_str().unwrap()).unwrap();
+        conn.execute("CREATE TABLE t1(id TEXT PRIMARY KEY, a TEXT, b INTEGER)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_t1_a ON t1(a)").unwrap();
+        conn.execute("CREATE TABLE t2(id TEXT PRIMARY KEY, t1_id TEXT, c REAL)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_t2_t1 ON t2(t1_id)").unwrap();
+        for i in 0..20 {
+            conn.execute(&format!("INSERT INTO t1 VALUES ('k{i}', 'val_{i}', {i})"))
+                .unwrap();
+            conn.execute(&format!("INSERT INTO t2 VALUES ('j{i}', 'k{i}', {i}.5)"))
+                .unwrap();
+        }
+    }
+    assert_stock_sqlite_integrity(&path, "multi_table_explicit_indexes");
+}
+
+/// Issue #55 exact reproduction schema from the bug report: five tables with
+/// AUTOINCREMENT + composite UNIQUE + foreign keys + explicit CREATE INDEX.
+/// Stock SQLite reports "unlinked pages" and "entry count mismatches" for
+/// sqlite_autoindex_records_1.
+#[test]
+fn issue55_exact_reproduction_schema() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("issue55_exact.db");
+    {
+        let conn = fsqlite::Connection::open(path.to_str().unwrap()).unwrap();
+        conn.execute(
+            "CREATE TABLE groups (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                name TEXT NOT NULL UNIQUE, \
+                created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE records (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                group_id INTEGER NOT NULL REFERENCES groups(id), \
+                key TEXT NOT NULL, \
+                value BLOB, \
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')), \
+                UNIQUE(group_id, key))",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE config_snapshots (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                group_id INTEGER NOT NULL REFERENCES groups(id), \
+                snapshot BLOB NOT NULL, \
+                taken_at TEXT NOT NULL DEFAULT (datetime('now')))",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE group_config_links (\
+                group_id INTEGER NOT NULL REFERENCES groups(id), \
+                config_id INTEGER NOT NULL REFERENCES config_snapshots(id), \
+                PRIMARY KEY (group_id, config_id))",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE events (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                record_id INTEGER REFERENCES records(id), \
+                event_type TEXT NOT NULL, \
+                payload TEXT, \
+                created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX idx_records_group ON records(group_id)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_records_key ON records(key)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_events_record ON events(record_id)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_events_type ON events(event_type)")
+            .unwrap();
+
+        // Insert data across all tables.
+        conn.execute("INSERT INTO groups (name, created_at) VALUES ('alpha', '2024-01-01')")
+            .unwrap();
+        conn.execute("INSERT INTO groups (name, created_at) VALUES ('beta', '2024-01-02')")
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO records (group_id, key, value, updated_at) VALUES (1, 'k1', X'DEADBEEF', '2024-01-01')",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO records (group_id, key, value, updated_at) VALUES (1, 'k2', X'CAFEBABE', '2024-01-01')",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO records (group_id, key, value, updated_at) VALUES (2, 'k1', X'01020304', '2024-01-02')",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO config_snapshots (group_id, snapshot, taken_at) VALUES (1, X'AABB', '2024-01-01')",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO group_config_links VALUES (1, 1)")
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO events (record_id, event_type, payload, created_at) VALUES (1, 'create', '{\"a\":1}', '2024-01-01')",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events (record_id, event_type, payload, created_at) VALUES (2, 'update', '{\"b\":2}', '2024-01-01')",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events (record_id, event_type, payload, created_at) VALUES (3, 'create', '{\"c\":3}', '2024-01-02')",
+        )
+        .unwrap();
+    }
+    assert_stock_sqlite_integrity(&path, "issue55_exact_reproduction");
+
+    // Verify data roundtrip via stock SQLite.
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    let group_count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM groups", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(group_count, 2, "expected 2 groups");
+    let record_count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(record_count, 3, "expected 3 records");
+    let event_count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(event_count, 3, "expected 3 events");
+    let config_count: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM config_snapshots", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(config_count, 1, "expected 1 config snapshot");
+}

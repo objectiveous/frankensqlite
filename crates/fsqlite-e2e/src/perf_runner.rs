@@ -4734,6 +4734,11 @@ mod tests {
             prepared_direct_insert_serialize_time_ns: 0,
             prepared_direct_insert_btree_insert_time_ns: 0,
             prepared_direct_insert_memdb_apply_time_ns: 0,
+            prepared_direct_insert_schema_validation_time_ns: 0,
+            prepared_direct_insert_autocommit_begin_time_ns: 0,
+            prepared_direct_insert_change_tracking_time_ns: 0,
+            prepared_direct_insert_autocommit_resolve_time_ns: 0,
+            prepared_direct_insert_autocommit_executions: 0,
             btree_copy_kernels: BtreeCopyProfileSnapshot {
                 local_payload_copy_calls: 2,
                 local_payload_copy_bytes: 96,

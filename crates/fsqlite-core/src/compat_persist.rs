@@ -194,9 +194,14 @@ pub fn persist_to_sqlite(
             create_sql,
         ));
 
-        // Write index B-trees for explicitly created indexes (not autoindexes).
+        // Write index B-trees for all indexes including autoindexes.
+        // Autoindexes (sqlite_autoindex_*) are created for UNIQUE constraints
+        // and non-IPK PRIMARY KEY columns. Their sqlite_master entries point to
+        // root pages that must contain valid B-tree data. Skipping them causes
+        // "wrong # of entries in index" and "page N: never used" errors when
+        // stock SQLite runs integrity_check (issue #55).
         for index in &table.indexes {
-            if index.name.starts_with("sqlite_autoindex_") || index.columns.is_empty() {
+            if index.columns.is_empty() {
                 continue;
             }
             // Allocate and initialize root page as leaf index page (0x0A).

@@ -10762,12 +10762,28 @@ impl VdbeEngine {
                 // For writable cursors on truly zeroed pages (e.g., freshly
                 // allocated roots), initialize an empty root page.
                 if writable && is_zero_page {
-                    // Infer root kind from MemDatabase when available; default to
-                    // table for backwards compatibility if MemDatabase is absent.
-                    let is_table_btree = self
-                        .db
-                        .as_ref()
-                        .is_none_or(|db| db.get_table(root_page).is_some());
+                    // Infer root kind: check the index metadata map first (it
+                    // is populated from the schema and correctly identifies all
+                    // index root pages, including autoindexes). Fall back to
+                    // MemDatabase only when the index map has no opinion.
+                    // MemDatabase::get_table() returns Some for BOTH table and
+                    // autoindex root pages (because create_table_at is called
+                    // for both), so using it alone would misclassify autoindex
+                    // pages as tables — causing "wrong # of entries" corruption
+                    // when stock SQLite reads the file (issue #55).
+                    let is_known_index = self
+                        .index_desc_flags_by_root_page
+                        .contains_key(&root_page)
+                        || self
+                            .index_collations_by_root_page
+                            .contains_key(&root_page);
+                    let is_table_btree = if is_known_index {
+                        false
+                    } else {
+                        self.db
+                            .as_ref()
+                            .is_none_or(|db| db.get_table(root_page).is_some())
+                    };
                     let init_page_type = if is_table_btree {
                         BtreePageType::LeafTable
                     } else {

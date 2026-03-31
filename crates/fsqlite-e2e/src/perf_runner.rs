@@ -4720,6 +4720,7 @@ mod tests {
             prepared_update_delete_fallback_trigger: 1,
             prepared_update_delete_fallback_foreign_key: 1,
             prepared_table_dml_affected_only_runs: 1,
+            prepared_update_delete_dml_direct_handoff_runs: 0,
             autoincrement_sequence_fast_path_updates: 1,
             autoincrement_sequence_scan_refreshes: 0,
             direct_indexed_equality_query_hits: 0,

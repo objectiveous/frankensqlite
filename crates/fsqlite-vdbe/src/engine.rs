@@ -3321,6 +3321,10 @@ static FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL: AtomicU64 = Atomic
 static FSQLITE_VDBE_MAKE_RECORD_CALLS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Total bytes produced by MakeRecord blobs.
 static FSQLITE_VDBE_MAKE_RECORD_BLOB_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// bd-7vkes: Count times the BTREE_APPEND fast path was taken (skip seek).
+static FSQLITE_VDBE_INSERT_APPEND_COUNT: AtomicU64 = AtomicU64::new(0);
+/// bd-7vkes: Count times a full B-tree seek was needed for INSERT.
+static FSQLITE_VDBE_INSERT_SEEK_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Decoded NULL values.
 static FSQLITE_VDBE_DECODED_NULLS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Decoded INTEGER values.
@@ -7672,8 +7676,10 @@ impl VdbeEngine {
                                     .last_successful_insert_rowid
                                     .is_some_and(|last| rowid > last)
                             {
+                                FSQLITE_VDBE_INSERT_APPEND_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
                                 false // Append: key is larger than anything in the table
                             } else {
+                                FSQLITE_VDBE_INSERT_SEEK_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
                                 let seek_result = sc.cursor.table_move_to(&sc.cx, rowid)?;
                                 insert_seek_result = Some(seek_result);
                                 seek_result.is_found()

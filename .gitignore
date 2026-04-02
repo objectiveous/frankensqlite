@@ -254,3 +254,12 @@ __PATCHSET__
 /D[0-9]*
 db300_*.toml
 librust_out.rlib
+
+# NTM agent session directories
+.ntm/
+
+# Benchmark/test numeric output at repo root (timing values, row counts, etc.)
+/[0-9]*
+
+# Bare test binary at repo root
+/test

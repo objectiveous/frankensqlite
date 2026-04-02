@@ -1214,57 +1214,72 @@ impl<P: PageReader> BtCursor<P> {
         F: FnOnce(&mut Self) -> Result<T>,
     {
         instrumentation::record_operation(op_type);
-        let span = tracing::span!(
-            Level::DEBUG,
-            "btree_op",
-            op_type = op_type.as_str(),
-            pages_visited = tracing::field::Empty,
-            splits = tracing::field::Empty,
-            merges = tracing::field::Empty
-        );
-        let _entered = span.enter();
-        debug!(op_type = op_type.as_str(), "starting btree operation");
 
-        self.active_op_stats = Some(BtreeOpRuntimeStats::default());
-        let result = work(self);
+        // Fast path: skip tracing span + stats when tracing is disabled (common case).
+        // tracing::span! allocates metadata even when disabled (~20-50ns).
+        // For hot-path operations like INSERT this matters: ~100ns saved per call.
+        let tracing_active =
+            tracing::enabled!(target: "fsqlite.btree", Level::DEBUG);
 
-        if let Err(error) = self.record_depth_gauge(cx) {
-            debug!(
+        if tracing_active {
+            let span = tracing::span!(
+                Level::DEBUG,
+                "btree_op",
                 op_type = op_type.as_str(),
-                error = %error,
-                "failed to refresh btree depth gauge"
+                pages_visited = tracing::field::Empty,
+                splits = tracing::field::Empty,
+                merges = tracing::field::Empty
             );
-        }
+            let _entered = span.enter();
+            debug!(op_type = op_type.as_str(), "starting btree operation");
 
-        if !matches!(op_type, BtreeOpType::Seek) {
-            self.clear_seek_cache();
-        }
+            self.active_op_stats = Some(BtreeOpRuntimeStats::default());
+            let result = work(self);
 
-        let stats = self.active_op_stats.take().unwrap_or_default();
-        span.record("pages_visited", stats.pages_visited);
-        span.record("splits", stats.splits);
-        span.record("merges", stats.merges);
+            if let Err(error) = self.record_depth_gauge(cx) {
+                debug!(
+                    op_type = op_type.as_str(),
+                    error = %error,
+                    "failed to refresh btree depth gauge"
+                );
+            }
 
-        if let Err(error) = &result {
-            debug!(
-                op_type = op_type.as_str(),
-                pages_visited = stats.pages_visited,
-                splits = stats.splits,
-                merges = stats.merges,
-                error = %error,
-                "btree operation failed"
-            );
+            if !matches!(op_type, BtreeOpType::Seek) {
+                self.clear_seek_cache();
+            }
+
+            let stats = self.active_op_stats.take().unwrap_or_default();
+            span.record("pages_visited", stats.pages_visited);
+            span.record("splits", stats.splits);
+            span.record("merges", stats.merges);
+
+            if let Err(error) = &result {
+                debug!(
+                    op_type = op_type.as_str(),
+                    pages_visited = stats.pages_visited,
+                    splits = stats.splits,
+                    merges = stats.merges,
+                    error = %error,
+                    "btree operation failed"
+                );
+            } else {
+                debug!(
+                    op_type = op_type.as_str(),
+                    pages_visited = stats.pages_visited,
+                    splits = stats.splits,
+                    merges = stats.merges,
+                    "btree operation completed"
+                );
+            }
+            result
         } else {
-            debug!(
-                op_type = op_type.as_str(),
-                pages_visited = stats.pages_visited,
-                splits = stats.splits,
-                merges = stats.merges,
-                "btree operation completed"
-            );
+            // Hot path: no tracing, no stats, minimal overhead.
+            let result = work(self);
+            if !matches!(op_type, BtreeOpType::Seek) {
+                self.clear_seek_cache();
+            }
+            result
         }
-
-        result
     }
 
     /// Load a page into a stack entry.

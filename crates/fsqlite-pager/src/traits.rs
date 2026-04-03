@@ -1065,7 +1065,9 @@ impl TransactionKind {
             Self::Windows(txn) => f(txn),
             Self::Mock(txn) => f(txn),
             Self::MemoryMock(txn) => f(txn),
-            Self::Drained => panic!("TransactionKind::Drained accessed — this is a transient sentinel between drain and refill"),
+            Self::Drained => panic!(
+                "TransactionKind::Drained accessed — this is a transient sentinel between drain and refill"
+            ),
         }
     }
 
@@ -1080,7 +1082,9 @@ impl TransactionKind {
             Self::Windows(txn) => f(txn),
             Self::Mock(txn) => f(txn),
             Self::MemoryMock(txn) => f(txn),
-            Self::Drained => panic!("TransactionKind::Drained accessed — this is a transient sentinel between drain and refill"),
+            Self::Drained => panic!(
+                "TransactionKind::Drained accessed — this is a transient sentinel between drain and refill"
+            ),
         }
     }
 }

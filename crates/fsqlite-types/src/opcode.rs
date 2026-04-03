@@ -521,11 +521,16 @@ pub enum Opcode {
     /// - Default ABORT conflict mode (OE_ABORT = 2 in low nibble)
     /// - No generated/stored columns
     FusedAppendInsert = 194,
+
+    /// Fused OpenWrite + Last for cursor setup in INSERT programs.
+    /// P1 = cursor, P2 = root page number, P3 = column count, P5 = flags.
+    /// Opens a write cursor and navigates to the last entry for append.
+    FusedOpenWriteLast = 195,
 }
 
 impl Opcode {
     /// Total number of opcodes defined.
-    pub const COUNT: usize = 195;
+    pub const COUNT: usize = 196;
 
     /// Get the opcode name as a static string slice.
     #[allow(clippy::too_many_lines)]
@@ -725,6 +730,7 @@ impl Opcode {
             Self::LikeConstFast => "LikeConstFast",
             Self::CountIndexEqRun => "CountIndexEqRun",
             Self::FusedAppendInsert => "FusedAppendInsert",
+            Self::FusedOpenWriteLast => "FusedOpenWriteLast",
         }
     }
 
@@ -1457,7 +1463,7 @@ mod tests {
 
     #[test]
     fn opcode_count() {
-        assert_eq!(Opcode::COUNT, 195);
+        assert_eq!(Opcode::COUNT, 196);
     }
 
     #[test]

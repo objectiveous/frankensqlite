@@ -168,8 +168,6 @@ pub(crate) fn opcode_register_spans(op: &VdbeOp) -> OpcodeRegisterSpans {
     }
 }
 
-// bd-perf (V2.1): Stub removed — full implementation below after ProgramBuilder.
-
 // ── Label System ────────────────────────────────────────────────────────────
 
 /// An opaque handle representing a forward-reference label.
@@ -619,7 +617,8 @@ fn peephole_fuse_append_insert(ops: &mut smallvec::SmallVec<[VdbeOp; 64]>) {
             if cursor == insert_cursor
                 && r_record == insert_record_reg
                 && r_rowid == insert_rowid_reg
-                && oe_flag == 2 // OE_ABORT only
+                && oe_flag == 2
+            // OE_ABORT only
             {
                 ops[i] = VdbeOp {
                     opcode: Opcode::FusedAppendInsert,
@@ -646,6 +645,36 @@ fn peephole_fuse_append_insert(ops: &mut smallvec::SmallVec<[VdbeOp; 64]>) {
                     p5: 0,
                 };
                 i += 3;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    // bd-perf (V2.2): Fuse OpenWrite + Last into FusedOpenWriteLast.
+    let mut i = 0;
+    while i + 1 < ops.len() {
+        if ops[i].opcode == Opcode::OpenWrite && ops[i + 1].opcode == Opcode::Last {
+            let cursor = ops[i].p1;
+            let last_cursor = ops[i + 1].p1;
+            if cursor == last_cursor {
+                ops[i] = VdbeOp {
+                    opcode: Opcode::FusedOpenWriteLast,
+                    p1: ops[i].p1,       // cursor
+                    p2: ops[i].p2,       // root page
+                    p3: ops[i].p3,       // column count
+                    p4: ops[i].p4.clone(),
+                    p5: ops[i].p5,
+                };
+                ops[i + 1] = VdbeOp {
+                    opcode: Opcode::Noop,
+                    p1: 0,
+                    p2: 0,
+                    p3: 0,
+                    p4: P4::None,
+                    p5: 0,
+                };
+                i += 2;
                 continue;
             }
         }

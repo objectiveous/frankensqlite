@@ -500,11 +500,32 @@ pub enum Opcode {
     LikeConstFast = 192,
     /// Count a run of equal first-column index keys, advancing the cursor.
     CountIndexEqRun = 193,
+
+    // === Superinstructions (bd-perf V2.1) ===
+    /// Fused NewRowid + MakeRecord + Insert for sequential append.
+    ///
+    /// P1 = cursor number
+    /// P2 = first register of column values (same as MakeRecord P1)
+    /// P3 = number of columns (same as MakeRecord P2)
+    /// P5 = Insert flags (OE_* conflict mode in low nibble)
+    ///
+    /// Combines three opcodes into one dispatch:
+    /// 1. Allocate next sequential rowid (using cached last_alloc_rowid)
+    /// 2. Serialize column registers into record blob
+    /// 3. Append to B-tree via table_insert (prechecked absent, append mode)
+    ///
+    /// Guard conditions (codegen must verify before emitting):
+    /// - No secondary indexes on the table
+    /// - No triggers
+    /// - No foreign keys
+    /// - Default ABORT conflict mode (OE_ABORT = 2 in low nibble)
+    /// - No generated/stored columns
+    FusedAppendInsert = 194,
 }
 
 impl Opcode {
     /// Total number of opcodes defined.
-    pub const COUNT: usize = 194;
+    pub const COUNT: usize = 195;
 
     /// Get the opcode name as a static string slice.
     #[allow(clippy::too_many_lines)]
@@ -703,6 +724,7 @@ impl Opcode {
             Self::Noop => "Noop",
             Self::LikeConstFast => "LikeConstFast",
             Self::CountIndexEqRun => "CountIndexEqRun",
+            Self::FusedAppendInsert => "FusedAppendInsert",
         }
     }
 
@@ -1435,7 +1457,7 @@ mod tests {
 
     #[test]
     fn opcode_count() {
-        assert_eq!(Opcode::COUNT, 192);
+        assert_eq!(Opcode::COUNT, 195);
     }
 
     #[test]

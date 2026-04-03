@@ -168,6 +168,8 @@ pub(crate) fn opcode_register_spans(op: &VdbeOp) -> OpcodeRegisterSpans {
     }
 }
 
+// bd-perf (V2.1): Stub removed — full implementation below after ProgramBuilder.
+
 // ── Label System ────────────────────────────────────────────────────────────
 
 /// An opaque handle representing a forward-reference label.
@@ -570,8 +572,12 @@ impl ProgramBuilder {
             max_register.max(opcode_register_spans(op).max_touched_register())
         });
         let has_insert = self.ops.iter().any(|op| op.opcode == Opcode::Insert);
+        // bd-perf (V2.1): Peephole pass — fuse NewRowid+MakeRecord+Insert
+        // into FusedAppendInsert for simple sequential append patterns.
+        let mut ops = self.ops;
+        peephole_fuse_append_insert(&mut ops);
         Ok(VdbeProgram {
-            ops: self.ops,
+            ops,
             register_count: self.regs.count().max(inferred_register_count),
             bind_parameter_requirement,
             table_index_meta: Arc::new(table_index_meta),
@@ -583,6 +589,67 @@ impl ProgramBuilder {
 impl Default for ProgramBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// bd-perf (V2.1): Peephole optimizer — fuse NewRowid+MakeRecord+Insert into
+/// FusedAppendInsert. Called from `ProgramBuilder::finish()` after label resolution.
+fn peephole_fuse_append_insert(ops: &mut smallvec::SmallVec<[VdbeOp; 64]>) {
+    let len = ops.len();
+    if len < 3 {
+        return;
+    }
+    let mut i = 0;
+    while i + 2 < len {
+        if ops[i].opcode == Opcode::NewRowid
+            && ops[i + 1].opcode == Opcode::MakeRecord
+            && ops[i + 2].opcode == Opcode::Insert
+        {
+            let cursor = ops[i].p1;
+            let r_rowid = ops[i].p2;
+            let r_start = ops[i + 1].p1;
+            let n_cols = ops[i + 1].p2;
+            let r_record = ops[i + 1].p3;
+            let insert_cursor = ops[i + 2].p1;
+            let insert_record_reg = ops[i + 2].p2;
+            let insert_rowid_reg = ops[i + 2].p3;
+            let insert_flags = ops[i + 2].p5;
+            let oe_flag = insert_flags & 0x0F;
+
+            if cursor == insert_cursor
+                && r_record == insert_record_reg
+                && r_rowid == insert_rowid_reg
+                && oe_flag == 2 // OE_ABORT only
+            {
+                ops[i] = VdbeOp {
+                    opcode: Opcode::FusedAppendInsert,
+                    p1: cursor,
+                    p2: r_start,
+                    p3: n_cols,
+                    p4: P4::None,
+                    p5: insert_flags,
+                };
+                ops[i + 1] = VdbeOp {
+                    opcode: Opcode::Noop,
+                    p1: 0,
+                    p2: 0,
+                    p3: 0,
+                    p4: P4::None,
+                    p5: 0,
+                };
+                ops[i + 2] = VdbeOp {
+                    opcode: Opcode::Noop,
+                    p1: 0,
+                    p2: 0,
+                    p3: 0,
+                    p4: P4::None,
+                    p5: 0,
+                };
+                i += 3;
+                continue;
+            }
+        }
+        i += 1;
     }
 }
 

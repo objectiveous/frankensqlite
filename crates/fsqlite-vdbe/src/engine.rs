@@ -84,9 +84,7 @@ impl<V> CursorSlots<V> {
 
     #[inline]
     pub fn contains_key(&self, id: &i32) -> bool {
-        self.slots
-            .get(*id as usize)
-            .is_some_and(Option::is_some)
+        self.slots.get(*id as usize).is_some_and(Option::is_some)
     }
 
     #[inline]
@@ -6128,7 +6126,11 @@ impl VdbeEngine {
             // 1. Every program ends with Halt (codegen guarantee)
             // 2. Goto/If targets are validated at compile time
             // 3. pc is only modified by opcode handlers to valid targets
-            debug_assert!(pc < ops.len(), "VDBE pc={pc} out of bounds (len={})", ops.len());
+            debug_assert!(
+                pc < ops.len(),
+                "VDBE pc={pc} out of bounds (len={})",
+                ops.len()
+            );
             if opcode_count & (VDBE_EXECUTION_CHECKPOINT_INTERVAL - 1) == 0 {
                 observe_execution_cancellation(&self.execution_cx)?;
             }
@@ -10208,6 +10210,76 @@ impl VdbeEngine {
                     }
                 } else {
                     self.set_reg(target, SqliteValue::Null);
+                }
+                *pc += 1;
+                Ok(true)
+            }
+            // bd-perf (V2.1): Fused NewRowid + MakeRecord + Insert for
+            // sequential append. Combines 3 opcodes into 1 dispatch.
+            // P1=cursor, P2=first_reg, P3=num_cols, P5=insert_flags.
+            Opcode::FusedAppendInsert => {
+                let cursor_id = op.p1;
+                let first_reg = op.p2;
+                let num_cols = usize::try_from(op.p3).unwrap_or(0);
+
+                if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
+                    if sc.writable {
+                        // 1. Allocate rowid (same logic as NewRowid hot cache)
+                        let autoinc_max = self
+                            .cursor_root_pages
+                            .get(&cursor_id)
+                            .and_then(|rp| self.autoincrement_seq_by_root_page.get(rp))
+                            .copied()
+                            .unwrap_or(0);
+                        let base = if sc.last_alloc_rowid > 0 {
+                            sc.last_alloc_rowid.max(autoinc_max)
+                        } else {
+                            let btree_max = if sc.cursor.last(&sc.cx)? {
+                                sc.cursor.rowid(&sc.cx)?
+                            } else {
+                                0
+                            };
+                            btree_max.max(autoinc_max)
+                        };
+                        let rowid = base.checked_add(1).ok_or_else(|| {
+                            FrankenError::VdbeExecutionError {
+                                detail: "rowid overflow in FusedAppendInsert".into(),
+                            }
+                        })?;
+                        sc.last_alloc_rowid = rowid;
+
+                        // 2. Serialize record from registers into sideband buf
+                        let mut rec_buf = std::mem::take(&mut self.make_record_buf);
+                        {
+                            let this = &*self;
+                            let iter = (0..num_cols).map(move |i| {
+                                #[allow(clippy::cast_possible_wrap)]
+                                let reg = first_reg + i as i32;
+                                this.get_reg(reg)
+                            });
+                            fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
+                        }
+
+                        // 3. Append to B-tree (prechecked absent — sequential rowid)
+                        let sc = self.storage_cursors.get_mut(&cursor_id).ok_or_else(|| {
+                            FrankenError::internal("cursor disappeared in FusedAppendInsert")
+                        })?;
+                        sc.cursor.table_insert(&sc.cx, rowid, &rec_buf)?;
+                        sc.last_successful_insert_rowid = Some(rowid);
+
+                        // Return buffer for reuse
+                        rec_buf.clear();
+                        self.make_record_buf = rec_buf;
+
+                        // 4. Bookkeeping (same as Insert opcode)
+                        self.changes += 1;
+                        self.last_insert_rowid = rowid;
+                        self.last_insert_rowid_valid = true;
+                        self.last_insert_cursor_id = Some(cursor_id);
+                        self.conflict_skip_idx = false;
+                        self.pending_insert_rollback = None;
+                        self.pending_next_after_delete.remove(&cursor_id);
+                    }
                 }
                 *pc += 1;
                 Ok(true)

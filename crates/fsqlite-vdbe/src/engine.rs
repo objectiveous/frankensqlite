@@ -51,6 +51,10 @@ impl<V> CursorSlots<V> {
 
     #[inline]
     fn ensure_slot(&mut self, id: i32) {
+        // SAFETY FIX: Guard against negative IDs which would wrap to usize::MAX
+        if id < 0 {
+            return;
+        }
         let idx = id as usize;
         if idx >= self.slots.len() {
             self.slots.resize_with(idx + 1, || None);
@@ -59,22 +63,34 @@ impl<V> CursorSlots<V> {
 
     #[inline]
     pub fn get(&self, id: &i32) -> Option<&V> {
+        if *id < 0 {
+            return None;
+        }
         self.slots.get(*id as usize).and_then(Option::as_ref)
     }
 
     #[inline]
     pub fn get_mut(&mut self, id: &i32) -> Option<&mut V> {
+        if *id < 0 {
+            return None;
+        }
         self.slots.get_mut(*id as usize).and_then(Option::as_mut)
     }
 
     #[inline]
     pub fn insert(&mut self, id: i32, value: V) -> Option<V> {
+        if id < 0 {
+            return None;
+        }
         self.ensure_slot(id);
         self.slots[id as usize].replace(value)
     }
 
     #[inline]
     pub fn remove(&mut self, id: &i32) -> Option<V> {
+        if *id < 0 {
+            return None;
+        }
         let idx = *id as usize;
         if idx < self.slots.len() {
             self.slots[idx].take()
@@ -85,6 +101,9 @@ impl<V> CursorSlots<V> {
 
     #[inline]
     pub fn contains_key(&self, id: &i32) -> bool {
+        if *id < 0 {
+            return false;
+        }
         self.slots.get(*id as usize).is_some_and(Option::is_some)
     }
 
@@ -10501,7 +10520,20 @@ impl VdbeEngine {
                         self.conflict_skip_idx = false;
                         self.pending_insert_rollback = None;
                         self.pending_next_after_delete.remove(&cursor_id);
+                        // CRITICAL FIX: Mark table dirty so MemDB fast paths
+                        // know the data is stale and fall back to pager reads.
+                        // Without this, subsequent COUNT(*)/LIKE queries via
+                        // MemDB would return stale results.
+                        self.mark_storage_table_dirty(cursor_id);
+                    } else {
+                        return Err(FrankenError::internal(
+                            "FusedAppendInsert: cursor is not writable",
+                        ));
                     }
+                } else {
+                    return Err(FrankenError::internal(format!(
+                        "FusedAppendInsert: no storage cursor for id {cursor_id}"
+                    )));
                 }
                 *pc += 1;
                 Ok(true)

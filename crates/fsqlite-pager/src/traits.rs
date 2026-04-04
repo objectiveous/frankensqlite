@@ -1066,7 +1066,11 @@ impl TransactionKind {
             Self::Mock(txn) => f(txn),
             Self::MemoryMock(txn) => f(txn),
             Self::Drained => panic!(
-                "TransactionKind::Drained accessed — this is a transient sentinel between drain and refill"
+                "BUG: TransactionKind::Drained accessed — a retained cursor tried to \
+                 read/write pages while the transaction was extracted. This sentinel \
+                 only exists between engine.drain_transaction() and the next \
+                 engine.refill_transaction(). If you see this, a cursor was accessed \
+                 outside the VDBE execution window."
             ),
         }
     }
@@ -1083,7 +1087,11 @@ impl TransactionKind {
             Self::Mock(txn) => f(txn),
             Self::MemoryMock(txn) => f(txn),
             Self::Drained => panic!(
-                "TransactionKind::Drained accessed — this is a transient sentinel between drain and refill"
+                "BUG: TransactionKind::Drained accessed — a retained cursor tried to \
+                 read/write pages while the transaction was extracted. This sentinel \
+                 only exists between engine.drain_transaction() and the next \
+                 engine.refill_transaction(). If you see this, a cursor was accessed \
+                 outside the VDBE execution window."
             ),
         }
     }

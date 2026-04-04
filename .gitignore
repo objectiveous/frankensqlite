@@ -263,3 +263,4 @@ librust_out.rlib
 
 # Bare test binary at repo root
 /test
+.bench-history/

@@ -13,6 +13,7 @@ use std::sync::Arc;
 pub mod codegen;
 pub mod engine;
 pub mod frame;
+pub mod jit;
 #[cfg(test)]
 mod repro_delete_skip;
 pub mod vectorized;

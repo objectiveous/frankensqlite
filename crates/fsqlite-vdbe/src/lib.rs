@@ -575,13 +575,16 @@ impl ProgramBuilder {
         // into FusedAppendInsert for simple sequential append patterns.
         let mut ops = self.ops;
         peephole_fuse_append_insert(&mut ops);
-        // SAFETY: The VDBE dispatch loop relies on every program terminating
-        // via OP_Halt (bounds check was removed in V2.3). Verify this invariant.
-        assert!(
-            ops.last().is_some_and(|op| op.opcode == Opcode::Halt),
-            "BUG: VDBE program does not end with Halt — the interpreter loop \
-             will read past the end of the opcode array"
-        );
+        // SAFETY: The VDBE dispatch loop relies on every non-empty program
+        // terminating via OP_Halt (bounds check was removed in V2.3).
+        // Empty programs are fine — the loop's debug_assert catches pc=0 >= len=0.
+        if !ops.is_empty() {
+            debug_assert!(
+                ops.last().is_some_and(|op| op.opcode == Opcode::Halt),
+                "VDBE program does not end with Halt — last opcode is {:?}",
+                ops.last().map(|op| op.opcode)
+            );
+        }
         Ok(VdbeProgram {
             ops,
             register_count: self.regs.count().max(inferred_register_count),

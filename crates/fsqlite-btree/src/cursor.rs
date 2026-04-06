@@ -404,6 +404,12 @@ struct TableSeekCacheEntry {
     cell_idx: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RightmostLeafCacheEntry {
+    page_no: PageNumber,
+    rowid: i64,
+}
+
 /// A B-tree cursor that navigates through B-tree pages using a page stack.
 ///
 /// Generic over the page I/O backend for testability.
@@ -447,12 +453,13 @@ pub struct BtCursor<P> {
     /// Set on successful leaf insert or balance-for-insert.  Used by the VDBE
     /// engine to implement `sqlite3_last_insert_rowid()` on a per-cursor basis.
     pub last_insert_rowid: Option<i64>,
-    /// bd-wwqen.3: Cached (leaf_page, last_rowid) from the most recent
-    /// successful hinted-leaf append. On the next hinted-leaf insert, if the
-    /// hint matches this cached page AND rowid > cached_rowid, skip the
-    /// `self.rowid(cx)?` cell parse and use the cached value directly.
-    /// Cleared on any non-append cursor operation.
-    append_hint_cache: Option<(PageNumber, i64)>,
+    /// bd-udl9m: Cached rightmost leaf page plus its maximum rowid.
+    ///
+    /// Sequential inserts can try this page directly and skip a full
+    /// root-to-leaf descent plus leaf binary search. The cache is updated
+    /// after successful right-edge inserts and cleared conservatively when a
+    /// mutating operation could have invalidated the tree's right edge.
+    rightmost_leaf_cache: Option<RightmostLeafCacheEntry>,
     /// Four-entry LRU of table-seek leaf anchors.
     ///
     /// Each slot remembers the rowid probe plus the leaf page/cell position
@@ -477,7 +484,7 @@ impl<P> BtCursor<P> {
     pub fn invalidate(&mut self) {
         self.at_eof = true;
         self.stack.clear();
-        self.append_hint_cache = None;
+        self.rightmost_leaf_cache = None;
         self.seek_cache.fill(None);
     }
 
@@ -537,6 +544,14 @@ impl<P> BtCursor<P> {
 
     fn clear_seek_cache(&mut self) {
         self.seek_cache.fill(None);
+    }
+
+    fn clear_rightmost_leaf_cache(&mut self) {
+        self.rightmost_leaf_cache = None;
+    }
+
+    fn remember_rightmost_leaf(&mut self, page_no: PageNumber, rowid: i64) {
+        self.rightmost_leaf_cache = Some(RightmostLeafCacheEntry { page_no, rowid });
     }
 
     fn remember_table_seek(&mut self, rowid: i64, page_no: PageNumber, cell_idx: u16) {
@@ -881,7 +896,7 @@ impl<P: PageReader> BtCursor<P> {
             active_op_stats: None,
             cell_buf: Vec::new(),
             last_insert_rowid: None,
-            append_hint_cache: None,
+            rightmost_leaf_cache: None,
             seek_cache: [None; TABLE_SEEK_CACHE_SLOTS],
         }
     }
@@ -2543,6 +2558,24 @@ enum BinarySearchResult {
 }
 
 impl<P: PageWriter> BtCursor<P> {
+    fn refresh_rightmost_leaf_cache_after_insert(&mut self, cx: &Cx, rowid: i64) -> Result<()> {
+        if let Some(page_no) = self.current_page() {
+            self.remember_rightmost_leaf(page_no, rowid);
+            return Ok(());
+        }
+
+        if self.last(cx)? {
+            let page_no = self
+                .current_page()
+                .ok_or_else(|| FrankenError::internal("cursor lost rightmost leaf after insert"))?;
+            self.remember_rightmost_leaf(page_no, rowid);
+        } else {
+            self.clear_rightmost_leaf_cache();
+        }
+
+        Ok(())
+    }
+
     fn write_overflow_chain_for_insert(
         &mut self,
         cx: &Cx,
@@ -3810,12 +3843,16 @@ impl<P: PageWriter> BtCursor<P> {
 
         let mut entry = match self.load_page(cx, hinted_leaf_page) {
             Ok(entry) => entry,
-            Err(_) => return Ok(false),
+            Err(_) => {
+                self.clear_rightmost_leaf_cache();
+                return Ok(false);
+            }
         };
         if entry.header.page_type != cell::BtreePageType::LeafTable || entry.header.cell_count == 0
         {
             self.stack.clear();
             self.at_eof = true;
+            self.clear_rightmost_leaf_cache();
             return Ok(false);
         }
 
@@ -3826,9 +3863,9 @@ impl<P: PageWriter> BtCursor<P> {
 
         // bd-wwqen.3: use cached rowid if available for this leaf page,
         // avoiding a cell parse just to read the last rowid.
-        let last_rowid = if let Some((cached_page, cached_rowid)) = self.append_hint_cache {
-            if cached_page == hinted_leaf_page {
-                cached_rowid
+        let last_rowid = if let Some(cached) = self.rightmost_leaf_cache {
+            if cached.page_no == hinted_leaf_page {
+                cached.rowid
             } else {
                 self.rowid(cx)?
             }
@@ -3838,6 +3875,7 @@ impl<P: PageWriter> BtCursor<P> {
         if rowid <= last_rowid {
             self.stack.clear();
             self.at_eof = true;
+            self.clear_rightmost_leaf_cache();
             return Ok(false);
         }
 
@@ -3849,8 +3887,7 @@ impl<P: PageWriter> BtCursor<P> {
             Ok(true) => {
                 self.cell_buf = cell_data;
                 self.last_insert_rowid = Some(rowid);
-                // bd-wwqen.3: cache the leaf page + rowid for next insert.
-                self.append_hint_cache = Some((hinted_leaf_page, rowid));
+                self.remember_rightmost_leaf(hinted_leaf_page, rowid);
                 Ok(true)
             }
             Ok(false) => {
@@ -3860,7 +3897,7 @@ impl<P: PageWriter> BtCursor<P> {
                 }
                 self.stack.clear();
                 self.at_eof = true;
-                self.append_hint_cache = None; // leaf full or stale
+                self.clear_rightmost_leaf_cache();
                 Ok(false)
             }
             Err(error) => {
@@ -3870,6 +3907,7 @@ impl<P: PageWriter> BtCursor<P> {
                 }
                 self.stack.clear();
                 self.at_eof = true;
+                self.clear_rightmost_leaf_cache();
                 Err(error)
             }
         }
@@ -3890,6 +3928,22 @@ impl<P: PageWriter> BtCursor<P> {
     ) -> Result<()> {
         self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
             cursor.table_insert_from_current_position(cx, rowid, data)
+        })
+    }
+
+    /// Refresh the persistent rightmost-leaf hint after a caller reused an
+    /// already-proven EOF insertion position via `table_insert_prechecked_absent`.
+    ///
+    /// This keeps repeated append callers on the zero-seek path without forcing
+    /// them to re-descend from the root just to reseed the hint.
+    #[doc(hidden)]
+    pub fn table_refresh_rightmost_leaf_cache_after_insert(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+    ) -> Result<()> {
+        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+            cursor.refresh_rightmost_leaf_cache_after_insert(cx, rowid)
         })
     }
 
@@ -3915,6 +3969,7 @@ impl<P: PageWriter> BtCursor<P> {
             if has_last {
                 let last_rowid = cursor.rowid(cx)?;
                 if rowid <= last_rowid {
+                    cursor.clear_rightmost_leaf_cache();
                     let seek = cursor.table_seek_for_insert(cx, rowid)?;
                     if seek.is_found() {
                         return Err(FrankenError::PrimaryKeyViolation);
@@ -3923,7 +3978,8 @@ impl<P: PageWriter> BtCursor<P> {
                 }
                 cursor.at_eof = true;
             }
-            cursor.table_insert_from_current_position(cx, rowid, data)
+            cursor.table_insert_from_current_position(cx, rowid, data)?;
+            cursor.refresh_rightmost_leaf_cache_after_insert(cx, rowid)
         })
     }
 
@@ -3950,6 +4006,7 @@ impl<P: PageWriter> BtCursor<P> {
             if has_last {
                 let last_rowid = cursor.rowid(cx)?;
                 if rowid <= last_rowid {
+                    cursor.clear_rightmost_leaf_cache();
                     let seek = cursor.table_seek_for_insert(cx, rowid)?;
                     if seek.is_found() {
                         return Err(FrankenError::PrimaryKeyViolation);
@@ -3958,7 +4015,8 @@ impl<P: PageWriter> BtCursor<P> {
                 }
                 cursor.at_eof = true;
             }
-            cursor.table_insert_from_current_position(cx, rowid, data)
+            cursor.table_insert_from_current_position(cx, rowid, data)?;
+            cursor.refresh_rightmost_leaf_cache_after_insert(cx, rowid)
         })
     }
 }
@@ -4163,17 +4221,34 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 
     fn table_insert(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
         self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
-            // ── Normal path: full B-tree seek ────────────────────────
+            if let Some(cached) = cursor.rightmost_leaf_cache {
+                if rowid > cached.rowid {
+                    if cursor.try_table_append_on_hinted_leaf(cx, cached.page_no, rowid, data)? {
+                        return Ok(());
+                    }
+                } else {
+                    // A midstream insert can rebalance the right edge, so drop
+                    // the append hint before taking the general path.
+                    cursor.clear_rightmost_leaf_cache();
+                }
+            }
+
             let seek = cursor.table_seek_for_insert(cx, rowid)?;
             if seek.is_found() {
                 return Err(FrankenError::PrimaryKeyViolation);
             }
-            cursor.table_insert_from_current_position(cx, rowid, data)
+            let rightmost_insert = cursor.at_eof;
+            cursor.table_insert_from_current_position(cx, rowid, data)?;
+            if rightmost_insert {
+                cursor.refresh_rightmost_leaf_cache_after_insert(cx, rowid)?;
+            }
+            Ok(())
         })
     }
 
     fn delete(&mut self, cx: &Cx) -> Result<()> {
         self.with_btree_op(cx, BtreeOpType::Delete, |cursor| {
+            cursor.clear_rightmost_leaf_cache();
             // Delete may rebalance and then re-seek internally to restore
             // cursor position. Any cache entries from the caller's prior seek
             // can point at a leaf that this delete is about to rewrite or free.
@@ -7626,6 +7701,96 @@ mod tests {
             }
         }
         assert!(!cursor.next(&cx).unwrap());
+    }
+
+    #[test]
+    fn test_table_insert_reuses_rightmost_leaf_cache_for_sequential_appends() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let payload = vec![b'A'; 180];
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+
+        for rowid in 1..=128_i64 {
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+        }
+
+        let root_entry = cursor.reload_page_fresh(&cx, root).unwrap();
+        assert!(
+            root_entry.header.page_type.is_interior(),
+            "test requires an interior root so the uncached path would revisit it"
+        );
+
+        let cached_before = cursor
+            .rightmost_leaf_cache
+            .expect("sequential inserts should seed the rightmost-leaf cache");
+
+        let mut cell_data = Vec::new();
+        cursor
+            .encode_table_leaf_cell_into(&cx, 129, &payload, &mut cell_data)
+            .unwrap();
+        let rightmost_leaf = cursor.load_page(&cx, cached_before.page_no).unwrap();
+        let header_offset = cell::header_offset_for_page(cached_before.page_no);
+        let content_offset = rightmost_leaf.header.content_offset(cursor.usable_size);
+        let new_content_offset = content_offset
+            .checked_sub(cell_data.len())
+            .expect("test requires free space on the cached rightmost leaf");
+        let ptr_array_end = header_offset
+            + usize::from(rightmost_leaf.header.page_type.header_size())
+            + (usize::from(rightmost_leaf.header.cell_count) + 1) * 2;
+        assert!(
+            ptr_array_end <= new_content_offset,
+            "test setup must leave room for one more append on the cached rightmost leaf"
+        );
+
+        cursor.pager.clear_reads();
+        cursor.table_insert(&cx, 129, &payload).unwrap();
+        assert_eq!(cursor.pager.read_pages(), vec![cached_before.page_no]);
+
+        let cached_after = cursor
+            .rightmost_leaf_cache
+            .expect("successful append should refresh the rightmost-leaf cache");
+        assert_eq!(cached_after.page_no, cached_before.page_no);
+        assert_eq!(cached_after.rowid, 129);
+    }
+
+    #[test]
+    fn test_table_insert_refreshes_rightmost_leaf_cache_after_split() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let payload = vec![b'S'; 220];
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+
+        let mut previous_cached_page = None;
+        let split_insert_rowid = loop {
+            let next_rowid = cursor.last_insert_rowid.unwrap_or(0) + 1;
+            cursor.table_insert(&cx, next_rowid, &payload).unwrap();
+            let cached = cursor
+                .rightmost_leaf_cache
+                .expect("sequential append should maintain a rightmost-leaf cache");
+
+            if let Some(previous_page) = previous_cached_page
+                && cached.page_no != previous_page
+            {
+                break next_rowid;
+            }
+
+            previous_cached_page = Some(cached.page_no);
+            assert!(
+                next_rowid < 512,
+                "expected a right-edge split that refreshes the cached leaf page"
+            );
+        };
+
+        let cached_after_split = cursor
+            .rightmost_leaf_cache
+            .expect("split should refresh the rightmost-leaf cache");
+        cursor.pager.clear_reads();
+        cursor
+            .table_insert(&cx, split_insert_rowid + 1, &payload)
+            .unwrap();
+        assert_eq!(cursor.pager.read_pages(), vec![cached_after_split.page_no]);
     }
 
     #[test]

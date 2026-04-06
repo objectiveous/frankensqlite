@@ -20,7 +20,7 @@
 //! false sharing between adjacent shards.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
@@ -432,6 +432,25 @@ const GOLDEN_RATIO_32: u32 = 2_654_435_769;
 const FAST_ARRAY_INITIAL_CAPACITY: usize = 1024;
 
 // ---------------------------------------------------------------------------
+// FlatPageSlots constants (bd-eorms)
+// ---------------------------------------------------------------------------
+
+/// Sentinel for an empty slot. [`PageNumber`] is `NonZeroU32`, so `0` is safe.
+const SLOT_EMPTY: u32 = 0;
+
+/// Sentinel for a deleted (tombstone) slot. `u32::MAX` is never a realistic
+/// page number (would require a 16 TiB database at 4 KiB pages).
+const SLOT_TOMBSTONE: u32 = u32::MAX;
+
+/// Maximum linear probes before declaring a lookup miss. Expected probe
+/// length at 50–70% load is 1–3; 32 handles worst-case clustering.
+const MAX_PROBE_LENGTH: usize = 32;
+
+/// Minimum flat-table capacity (power of 2). Covers ~2 800 pages at 70%
+/// load (≈ 11 MiB at 4 KiB pages).
+const FLAT_SLOTS_MIN_CAPACITY: usize = 4096;
+
+// ---------------------------------------------------------------------------
 // FastPageArray (bd-fzr07)
 // ---------------------------------------------------------------------------
 
@@ -592,6 +611,263 @@ impl FastPageArray {
         self.misses = 0;
         self.admits = 0;
         self.evictions = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FlatPageSlots — CAS-based flat hash page cache (bd-eorms)
+// ---------------------------------------------------------------------------
+
+/// A single slot in the flat hash page cache.
+///
+/// The `pgno` [`AtomicU32`] is the CAS-based state word checked via lock-free
+/// atomic loads during probing. The per-slot [`Mutex`] on `data` is only
+/// acquired after `pgno` confirms a match, so cache *misses* never take a lock.
+struct PageSlot {
+    /// `0` = empty, `u32::MAX` = tombstone, else = occupied page number.
+    pgno: AtomicU32,
+    /// Page data, locked only after `pgno` confirms a match.
+    data: Mutex<Option<PageBuf>>,
+}
+
+/// Flat hash page cache with CAS-based slot pinning (bd-eorms).
+///
+/// Models C SQLite's `pcache1`: pages stored in a power-of-2 flat array
+/// indexed by `hash(pgno)` with linear probing. Slot claiming uses
+/// compare-and-swap on the page-number word, so **cache misses are completely
+/// lock-free** (only atomic reads of `pgno` words).
+///
+/// Cache *hits* acquire a per-slot [`Mutex`] to access page data — much
+/// finer-grained than the per-shard mutex of [`ShardedPageCache`]'s
+/// overflow path.
+struct FlatPageSlots {
+    slots: Box<[PageSlot]>,
+    /// `slots.len() - 1` (capacity is always a power of two).
+    mask: usize,
+    /// Number of occupied (non-empty, non-tombstone) slots.
+    count: AtomicUsize,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    admits: AtomicU64,
+    evictions: AtomicU64,
+}
+
+impl FlatPageSlots {
+    /// Create a flat page slot table with the given capacity (rounded up to
+    /// the next power of two, clamped to [`FLAT_SLOTS_MIN_CAPACITY`]).
+    fn new(capacity: usize) -> Self {
+        let capacity = capacity.next_power_of_two().max(FLAT_SLOTS_MIN_CAPACITY);
+        let slots: Vec<PageSlot> = (0..capacity)
+            .map(|_| PageSlot {
+                pgno: AtomicU32::new(SLOT_EMPTY),
+                data: Mutex::new(None),
+            })
+            .collect();
+        Self {
+            mask: capacity - 1,
+            slots: slots.into_boxed_slice(),
+            count: AtomicUsize::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            admits: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+        }
+    }
+
+    /// Multiplicative hash of a page number → starting slot index.
+    #[inline]
+    fn hash_pgno(&self, pgno: u32) -> usize {
+        // Use the upper bits of the product for better distribution of
+        // sequential page numbers (common in B-tree scans).
+        (pgno.wrapping_mul(GOLDEN_RATIO_32) >> 16) as usize & self.mask
+    }
+
+    /// Lock-free probe for a page. Returns the slot index if found.
+    #[inline]
+    fn find_slot(&self, page_no: PageNumber) -> Option<usize> {
+        let pgno = page_no.get();
+        let start = self.hash_pgno(pgno);
+        for i in 0..MAX_PROBE_LENGTH {
+            let idx = (start + i) & self.mask;
+            let slot_pgno = self.slots[idx].pgno.load(Ordering::Acquire);
+            if slot_pgno == pgno {
+                return Some(idx);
+            }
+            if slot_pgno == SLOT_EMPTY {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Check if a page is present (lock-free).
+    #[inline]
+    fn contains(&self, page_no: PageNumber) -> bool {
+        self.find_slot(page_no).is_some()
+    }
+
+    /// Get page data as an owned copy.
+    fn get_copy(&self, page_no: PageNumber) -> Option<Vec<u8>> {
+        let idx = self.find_slot(page_no)?;
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        let guard = self.slots[idx].data.lock();
+        guard.as_ref().map(|buf| buf.as_slice().to_vec())
+    }
+
+    /// Get page data as a shared [`PageData`].
+    fn get_shared(&self, page_no: PageNumber) -> Option<PageData> {
+        let idx = self.find_slot(page_no)?;
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        let guard = self.slots[idx].data.lock();
+        guard
+            .as_ref()
+            .map(|buf| PageData::from_vec(buf.as_slice().to_vec()))
+    }
+
+    /// Try to insert a page buffer. Returns `Ok(true)` if newly inserted,
+    /// `Ok(false)` if an existing entry was updated, or `Err(buf)` if the
+    /// table is full (caller should use overflow shards).
+    #[allow(clippy::missing_errors_doc)]
+    fn try_insert(&self, page_no: PageNumber, buf: PageBuf) -> std::result::Result<bool, PageBuf> {
+        let pgno = page_no.get();
+        // u32::MAX is our tombstone sentinel — cannot store it.
+        if pgno == SLOT_TOMBSTONE {
+            return Err(buf);
+        }
+        let start = self.hash_pgno(pgno);
+        let mut first_available: Option<(usize, u32)> = None;
+
+        for i in 0..MAX_PROBE_LENGTH {
+            let idx = (start + i) & self.mask;
+            let slot_pgno = self.slots[idx].pgno.load(Ordering::Acquire);
+
+            if slot_pgno == pgno {
+                // Already present — update data.
+                *self.slots[idx].data.lock() = Some(buf);
+                return Ok(false);
+            }
+
+            if (slot_pgno == SLOT_EMPTY || slot_pgno == SLOT_TOMBSTONE) && first_available.is_none()
+            {
+                first_available = Some((idx, slot_pgno));
+            }
+
+            if slot_pgno == SLOT_EMPTY {
+                break; // End of probe chain — page not present.
+            }
+        }
+
+        let Some((avail_idx, expected)) = first_available else {
+            return Err(buf); // Probe chain exhausted with no available slot.
+        };
+
+        match self.slots[avail_idx].pgno.compare_exchange(
+            expected,
+            pgno,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                *self.slots[avail_idx].data.lock() = Some(buf);
+                self.count.fetch_add(1, Ordering::Relaxed);
+                self.admits.fetch_add(1, Ordering::Relaxed);
+                Ok(true)
+            }
+            Err(_) => {
+                // Another thread claimed the slot between our probe and CAS.
+                // Fall back to overflow shards rather than re-probing.
+                Err(buf)
+            }
+        }
+    }
+
+    /// Remove a specific page. Returns `true` if evicted.
+    fn remove(&self, page_no: PageNumber) -> bool {
+        let Some(idx) = self.find_slot(page_no) else {
+            return false;
+        };
+        let pgno = page_no.get();
+        if self.slots[idx]
+            .pgno
+            .compare_exchange(pgno, SLOT_TOMBSTONE, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            let _ = self.slots[idx].data.lock().take();
+            self.count.fetch_sub(1, Ordering::Relaxed);
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove an arbitrary page (for eviction). Returns `true` if evicted.
+    fn remove_any(&self) -> bool {
+        // Pseudo-random start to spread eviction pressure.
+        let start = self.count.load(Ordering::Relaxed) & self.mask;
+        for i in 0..self.slots.len() {
+            let idx = (start + i) & self.mask;
+            let slot_pgno = self.slots[idx].pgno.load(Ordering::Relaxed);
+            if slot_pgno != SLOT_EMPTY
+                && slot_pgno != SLOT_TOMBSTONE
+                && self.slots[idx]
+                    .pgno
+                    .compare_exchange(
+                        slot_pgno,
+                        SLOT_TOMBSTONE,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                let _ = self.slots[idx].data.lock().take();
+                self.count.fetch_sub(1, Ordering::Relaxed);
+                self.evictions.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Clear all pages. Returns the number of pages evicted.
+    fn clear(&self) -> usize {
+        let mut removed = 0_usize;
+        for slot in self.slots.iter() {
+            let pgno = slot.pgno.swap(SLOT_EMPTY, Ordering::AcqRel);
+            if pgno != SLOT_EMPTY && pgno != SLOT_TOMBSTONE {
+                let _ = slot.data.lock().take();
+                removed += 1;
+            }
+        }
+        self.count.store(0, Ordering::Relaxed);
+        #[allow(clippy::cast_possible_truncation)]
+        self.evictions.fetch_add(removed as u64, Ordering::Relaxed);
+        removed
+    }
+
+    /// Number of occupied slots.
+    #[inline]
+    fn len(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    /// Reset metrics counters.
+    fn reset_metrics(&self) {
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
+        self.admits.store(0, Ordering::Relaxed);
+        self.evictions.store(0, Ordering::Relaxed);
+    }
+}
+
+impl std::fmt::Debug for FlatPageSlots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlatPageSlots")
+            .field("capacity", &(self.mask + 1))
+            .field("count", &self.count.load(Ordering::Relaxed))
+            .field("hits", &self.hits.load(Ordering::Relaxed))
+            .field("misses", &self.misses.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
     }
 }
 
@@ -761,7 +1037,11 @@ impl std::fmt::Debug for PageCacheShard {
 /// callers don't hold multiple shard locks simultaneously. The API is designed
 /// to make multi-shard locking unnecessary.
 pub struct ShardedPageCache {
-    /// The 128 cache shards, each cache-line aligned.
+    /// CAS-based flat hash page cache (bd-eorms, pcache1 pattern).
+    /// Tried first for all lookups; cache misses are lock-free.
+    flat_slots: FlatPageSlots,
+    /// Overflow: 128 cache shards, each cache-line aligned.
+    /// Used when the flat table is full or for CAS-failure fallback.
     shards: Box<[Mutex<PageCacheShard>; SHARD_COUNT]>,
     /// Shared page buffer pool (lock-free allocation).
     pool: PageBufPool,
@@ -819,7 +1099,14 @@ impl ShardedPageCache {
         let shards: Box<[Mutex<PageCacheShard>; SHARD_COUNT]> =
             Box::new(std::array::from_fn(|_| Mutex::new(PageCacheShard::new())));
 
+        // Flat table capacity: 2× pool capacity ensures ≤50% load factor.
+        let flat_capacity = pool
+            .capacity()
+            .saturating_mul(2)
+            .max(FLAT_SLOTS_MIN_CAPACITY);
+
         Self {
+            flat_slots: FlatPageSlots::new(flat_capacity),
             shards,
             pool,
             page_size,
@@ -884,7 +1171,8 @@ impl ShardedPageCache {
                 return fast.lock().len();
             }
         }
-        self.shards.iter().map(|s| s.lock().len()).sum()
+        // Flat slots (bd-eorms) + overflow shards
+        self.flat_slots.len() + self.shards.iter().map(|s| s.lock().len()).sum::<usize>()
     }
 
     /// Whether the cache is empty.
@@ -895,7 +1183,7 @@ impl ShardedPageCache {
                 return fast.lock().len() == 0;
             }
         }
-        self.shards.iter().all(|s| s.lock().pages.is_empty())
+        self.flat_slots.len() == 0 && self.shards.iter().all(|s| s.lock().pages.is_empty())
     }
 
     /// Check if a page is present in the cache.
@@ -906,6 +1194,10 @@ impl ShardedPageCache {
             if let Some(ref fast) = self.fast_array {
                 return fast.lock().contains(page_no);
             }
+        }
+        // Flat slots first (lock-free probe), then overflow shard
+        if self.flat_slots.contains(page_no) {
+            return true;
         }
         let idx = Self::shard_index(page_no);
         self.shards[idx].lock().contains(page_no)
@@ -926,6 +1218,11 @@ impl ShardedPageCache {
                 return fast.lock().get(page_no).map(|s| s.to_vec());
             }
         }
+        // Flat slots (bd-eorms) — lock-free probe, per-slot Mutex on hit
+        if let Some(data) = self.flat_slots.get_copy(page_no) {
+            return Some(data);
+        }
+        // Overflow shard
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
         shard.get(page_no).map(|slice| slice.to_vec())
@@ -943,6 +1240,16 @@ impl ShardedPageCache {
                 return fast.lock().get(page_no).map(f);
             }
         }
+        // Flat slots (bd-eorms) — find_slot is lock-free; data Mutex on hit only
+        if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
+            self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
+            let guard = self.flat_slots.slots[slot_idx].data.lock();
+            if let Some(ref buf) = *guard {
+                return Some(f(buf.as_slice()));
+            }
+            // Data cleared between probe and lock (rare race). Fall through.
+        }
+        // Overflow shard
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
         shard.get(page_no).map(f)
@@ -961,6 +1268,15 @@ impl ShardedPageCache {
                 return fast.lock().get_mut(page_no).map(f);
             }
         }
+        // Flat slots (bd-eorms)
+        if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
+            self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
+            let mut guard = self.flat_slots.slots[slot_idx].data.lock();
+            if let Some(ref mut buf) = *guard {
+                return Some(f(buf.as_mut_slice()));
+            }
+        }
+        // Overflow shard
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
         shard.get_mut(page_no).map(f)
@@ -1005,20 +1321,31 @@ impl ShardedPageCache {
             }
         }
 
-        let idx = Self::shard_index(page_no);
-        let mut shard = self.shards[idx].lock();
-
-        // Check for cache hit first, then update metrics
-        if shard.pages.contains_key(&page_no) {
-            shard.hits = shard.hits.saturating_add(1);
-            // SAFETY: we just checked contains_key, so unwrap is safe
-            let data = shard.pages.get(&page_no).unwrap();
-            return Ok(f(data.as_slice()));
+        // Flat slots probe (bd-eorms) — lock-free miss path
+        if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
+            self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
+            let guard = self.flat_slots.slots[slot_idx].data.lock();
+            if let Some(ref buf) = *guard {
+                return Ok(f(buf.as_slice()));
+            }
+            // Data cleared between probe and lock (rare). Fall through.
         }
 
-        // Cache miss — read from VFS
-        shard.misses = shard.misses.saturating_add(1);
+        // Overflow shard hit check
+        let shard_idx = Self::shard_index(page_no);
+        {
+            let mut shard = self.shards[shard_idx].lock();
+            if shard.pages.contains_key(&page_no) {
+                shard.hits = shard.hits.saturating_add(1);
+                let data = shard.pages.get(&page_no).expect("just checked");
+                return Ok(f(data.as_slice()));
+            }
+            shard.misses = shard.misses.saturating_add(1);
+        }
+        // Shard lock released before VFS I/O — better concurrency (bd-eorms).
 
+        // Cache miss — read from VFS (no lock held)
+        self.flat_slots.misses.fetch_add(1, Ordering::Relaxed);
         let mut buf = self.pool.acquire()?;
         let offset = page_offset(page_no, self.page_size);
         let bytes_read = file.read(cx, buf.as_mut_slice(), offset)?;
@@ -1034,7 +1361,10 @@ impl ShardedPageCache {
         }
 
         let result = f(buf.as_slice());
-        shard.insert(page_no, buf);
+        // Insert into flat slots; overflow to shard on CAS failure.
+        if let Err(buf) = self.flat_slots.try_insert(page_no, buf) {
+            self.shards[shard_idx].lock().insert(page_no, buf);
+        }
         Ok(result)
     }
 
@@ -1056,10 +1386,21 @@ impl ShardedPageCache {
             }
         }
 
+        // Flat slots (bd-eorms)
+        if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
+            self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
+            let guard = self.flat_slots.slots[slot_idx].data.lock();
+            if let Some(ref buf) = *guard {
+                let offset = page_offset(page_no, self.page_size);
+                file.write(cx, buf.as_slice(), offset)?;
+                return Ok(());
+            }
+        }
+
+        // Overflow shard
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
 
-        // Check for presence first, update metrics, then get the data
         if !shard.pages.contains_key(&page_no) {
             shard.misses = shard.misses.saturating_add(1);
             return Err(FrankenError::internal(format!(
@@ -1069,8 +1410,7 @@ impl ShardedPageCache {
         }
 
         shard.hits = shard.hits.saturating_add(1);
-        // SAFETY: we just checked contains_key, so unwrap is safe
-        let buf = shard.pages.get(&page_no).unwrap();
+        let buf = shard.pages.get(&page_no).expect("just checked");
         let offset = page_offset(page_no, self.page_size);
         file.write(cx, buf.as_slice(), offset)?;
         Ok(())
@@ -1096,13 +1436,14 @@ impl ShardedPageCache {
             }
         }
 
-        let idx = Self::shard_index(page_no);
-        let mut shard = self.shards[idx].lock();
-
+        // Allocate and zero the buffer, call f, then insert into flat slots.
         let mut buf = self.pool.acquire()?;
         buf.as_mut_slice().fill(0);
         let result = f(buf.as_mut_slice());
-        shard.insert(page_no, buf);
+        if let Err(buf) = self.flat_slots.try_insert(page_no, buf) {
+            let idx = Self::shard_index(page_no);
+            self.shards[idx].lock().insert(page_no, buf);
+        }
         Ok(result)
     }
 
@@ -1115,9 +1456,11 @@ impl ShardedPageCache {
                 return;
             }
         }
-        let idx = Self::shard_index(page_no);
-        let mut shard = self.shards[idx].lock();
-        shard.insert(page_no, buf);
+        // Flat slots first; overflow to shard.
+        if let Err(buf) = self.flat_slots.try_insert(page_no, buf) {
+            let idx = Self::shard_index(page_no);
+            self.shards[idx].lock().insert(page_no, buf);
+        }
     }
 
     /// Evict a specific page from the cache.
@@ -1128,14 +1471,17 @@ impl ShardedPageCache {
                 return fast.lock().remove(page_no);
             }
         }
+        // Try flat slots first, then overflow shard.
+        if self.flat_slots.remove(page_no) {
+            return true;
+        }
         let idx = Self::shard_index(page_no);
-        let mut shard = self.shards[idx].lock();
-        shard.remove(page_no)
+        self.shards[idx].lock().remove(page_no)
     }
 
     /// Evict an arbitrary page from the cache.
     ///
-    /// Iterates through shards looking for a non-empty one to evict from.
+    /// Tries flat slots first, then iterates shards.
     /// Returns `true` if a page was evicted.
     pub fn evict_any(&self) -> bool {
         // Fast path (bd-fzr07)
@@ -1144,7 +1490,11 @@ impl ShardedPageCache {
                 return fast.lock().remove_any().is_some();
             }
         }
-        // Start from a pseudo-random shard to avoid always hitting shard 0
+        // Flat slots first (bd-eorms)
+        if self.flat_slots.remove_any() {
+            return true;
+        }
+        // Overflow shards
         let start = (std::time::Instant::now().elapsed().as_nanos() as usize) & SHARD_MASK;
         for i in 0..SHARD_COUNT {
             let idx = (start + i) & SHARD_MASK;
@@ -1165,6 +1515,7 @@ impl ShardedPageCache {
                 return;
             }
         }
+        self.flat_slots.clear();
         for shard in self.shards.iter() {
             shard.lock().clear();
         }
@@ -1195,12 +1546,14 @@ impl ShardedPageCache {
             }
         }
 
-        let mut total_hits = 0_u64;
-        let mut total_misses = 0_u64;
-        let mut total_admits = 0_u64;
-        let mut total_evictions = 0_u64;
-        let mut total_pages = 0_usize;
+        // Flat slots metrics (bd-eorms)
+        let mut total_hits = self.flat_slots.hits.load(Ordering::Relaxed);
+        let mut total_misses = self.flat_slots.misses.load(Ordering::Relaxed);
+        let mut total_admits = self.flat_slots.admits.load(Ordering::Relaxed);
+        let mut total_evictions = self.flat_slots.evictions.load(Ordering::Relaxed);
+        let mut total_pages = self.flat_slots.len();
 
+        // Add overflow shard metrics
         for shard in self.shards.iter() {
             let s = shard.lock();
             total_hits = total_hits.saturating_add(s.hits);
@@ -1236,6 +1589,7 @@ impl ShardedPageCache {
                 return;
             }
         }
+        self.flat_slots.reset_metrics();
         for shard in self.shards.iter() {
             shard.lock().reset_metrics();
         }
@@ -1277,6 +1631,11 @@ impl ShardedPageCache {
                 return fast.lock().get(page_no).map(|data| data.to_vec());
             }
         }
+        // Flat slots (bd-eorms)
+        if let Some(data) = self.flat_slots.get_copy(page_no) {
+            return Some(data);
+        }
+        // Overflow shard
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
         shard.get(page_no).map(|data| data.to_vec())
@@ -1296,6 +1655,11 @@ impl ShardedPageCache {
                     .map(|data| PageData::from_vec(data.to_vec()));
             }
         }
+        // Flat slots (bd-eorms)
+        if let Some(data) = self.flat_slots.get_shared(page_no) {
+            return Some(data);
+        }
+        // Overflow shard
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
         shard
@@ -1312,6 +1676,7 @@ impl std::fmt::Debug for ShardedPageCache {
             .field("shard_count", &SHARD_COUNT)
             .field("page_size", &self.page_size)
             .field("fast_path_enabled", &fast_path)
+            .field("flat_slots", &self.flat_slots)
             .field("cached_pages", &metrics.cached_pages)
             .field("hits", &metrics.hits)
             .field("misses", &metrics.misses)

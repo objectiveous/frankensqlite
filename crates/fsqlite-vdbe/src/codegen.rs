@@ -18,6 +18,7 @@ use fsqlite_ast::{
 };
 use fsqlite_parser::expr::parse_expr as parse_sql_expr;
 use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4};
+use fsqlite_types::serial_type::{varint_len, write_varint};
 use fsqlite_types::value::classify_sql_like_fast_path;
 use fsqlite_types::{SmallText, SqliteValue, StrictColumnType, TypeAffinity};
 
@@ -78,6 +79,17 @@ fn conflict_action_to_oe(action: Option<&ConflictAction>) -> u16 {
         Some(ConflictAction::Fail) => OE_FAIL,
         Some(ConflictAction::Ignore) => OE_IGNORE,
         Some(ConflictAction::Replace) => OE_REPLACE,
+    }
+}
+
+fn compute_record_header_size(content_size: usize) -> usize {
+    let mut header_size = content_size + 1;
+    loop {
+        let needed = varint_len(header_size as u64) + content_size;
+        if needed <= header_size {
+            return header_size;
+        }
+        header_size = needed;
     }
 }
 
@@ -9226,7 +9238,7 @@ pub fn codegen_insert(
                 col_regs,
                 n_cols,
                 rec_reg,
-                P4::Affinity(aff_str),
+                make_insert_record_p4(table, &aff_str),
                 0,
             );
             b.emit_op(
@@ -9787,6 +9799,7 @@ fn codegen_insert_values(
                     val_regs,
                     n_cols_i32,
                     rec_reg,
+                    table,
                     &aff_str,
                     preformatted_record.as_deref(),
                 );
@@ -9812,6 +9825,7 @@ fn codegen_insert_values(
                     val_regs,
                     n_cols_i32,
                     rec_reg,
+                    table,
                     &aff_str,
                     preformatted_record.as_deref(),
                 );
@@ -9835,6 +9849,7 @@ fn codegen_insert_values(
                 val_regs,
                 n_cols_i32,
                 rec_reg,
+                table,
                 &aff_str,
                 preformatted_record.as_deref(),
             );
@@ -9866,6 +9881,7 @@ fn emit_table_insert_record(
     source_regs: i32,
     column_count: i32,
     target_reg: i32,
+    table: &TableSchema,
     affinity: &str,
     preformatted_record: Option<&[u8]>,
 ) {
@@ -9885,10 +9901,48 @@ fn emit_table_insert_record(
             source_regs,
             column_count,
             target_reg,
-            P4::Affinity(affinity.to_owned()),
+            make_insert_record_p4(table, affinity),
             0,
         );
     }
+}
+
+fn make_insert_record_p4(table: &TableSchema, affinity: &str) -> P4 {
+    try_build_insert_record_header_template(table)
+        .map(P4::RecordHeaderTemplate)
+        .unwrap_or_else(|| P4::Affinity(affinity.to_owned()))
+}
+
+fn try_build_insert_record_header_template(table: &TableSchema) -> Option<Vec<u8>> {
+    let mut serial_types = Vec::with_capacity(table.columns.len());
+    for column in &table.columns {
+        if column.is_ipk {
+            serial_types.push(0);
+            continue;
+        }
+        serial_types.push(fixed_insert_serial_type(column)?);
+    }
+    Some(encode_record_header_template(&serial_types))
+}
+
+fn fixed_insert_serial_type(column: &ColumnInfo) -> Option<u64> {
+    match column.strict_type {
+        Some(StrictColumnType::Real) if column.notnull => Some(7),
+        _ => None,
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn encode_record_header_template(serial_types: &[u64]) -> Vec<u8> {
+    let header_content_size = serial_types.iter().copied().map(varint_len).sum::<usize>();
+    let header_size = compute_record_header_size(header_content_size);
+    let mut header = vec![0; header_size];
+    let mut offset = write_varint(&mut header, u64::try_from(header_size).unwrap_or(u64::MAX));
+    for serial_type in serial_types {
+        offset += write_varint(&mut header[offset..], *serial_type);
+    }
+    debug_assert_eq!(offset, header_size);
+    header
 }
 
 /// Build a table-record blob at codegen time for rows whose stored image is
@@ -10220,7 +10274,7 @@ fn codegen_insert_select(
         final_regs,
         final_n_cols,
         rec_reg,
-        P4::Affinity(aff_str),
+        make_insert_record_p4(target_table, &aff_str),
         0,
     );
 
@@ -10426,7 +10480,7 @@ fn codegen_insert_select_without_from(
         final_regs,
         final_n_cols,
         rec_reg,
-        P4::Affinity(aff_str),
+        make_insert_record_p4(target_table, &aff_str),
         0,
     );
 
@@ -17627,6 +17681,47 @@ mod tests {
             ],
             indexes: vec![],
             strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }]
+    }
+
+    fn schema_with_ipk_and_strict_real_notnull() -> Vec<TableSchema> {
+        vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo {
+                    name: "id".to_owned(),
+                    affinity: 'D',
+                    is_ipk: true,
+                    type_name: Some("INTEGER".to_owned()),
+                    notnull: true,
+                    unique: true,
+                    default_value: None,
+                    strict_type: Some(StrictColumnType::Integer),
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                },
+                ColumnInfo {
+                    name: "score".to_owned(),
+                    affinity: 'E',
+                    is_ipk: false,
+                    type_name: Some("REAL".to_owned()),
+                    notnull: true,
+                    unique: false,
+                    default_value: None,
+                    strict_type: Some(StrictColumnType::Real),
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                },
+            ],
+            indexes: vec![],
+            strict: true,
             without_rowid: false,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
@@ -25048,6 +25143,42 @@ mod tests {
         assert!(
             !ops.contains(&Opcode::MakeRecord),
             "IPK literal INSERT should still preformat the table record payload"
+        );
+    }
+
+    #[test]
+    fn test_codegen_insert_values_known_schema_uses_record_header_template() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = schema_with_ipk_and_strict_real_notnull();
+        let ctx = CodegenContext {
+            concurrent_mode: false,
+            rowid_alias_col_idx: Some(0),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let make_record = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::MakeRecord)
+            .expect("expected MakeRecord for parameterized INSERT");
+        assert!(
+            matches!(
+                &make_record.p4,
+                P4::RecordHeaderTemplate(bytes) if bytes == &vec![3, 0, 7]
+            ),
+            "expected fixed record header template [3, 0, 7] for IPK + REAL NOT NULL schema"
         );
     }
 

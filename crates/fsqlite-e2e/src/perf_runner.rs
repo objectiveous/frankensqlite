@@ -4815,6 +4815,8 @@ mod tests {
                 result_row_materialization_time_ns_total: 2_500,
                 make_record_calls_total: 3,
                 make_record_blob_bytes_total: 48,
+                insert_append_count: 0,
+                insert_seek_count: 0,
                 decoded_value_types: ValueTypeMetricsSnapshot {
                     total_values: 10,
                     nulls: 1,

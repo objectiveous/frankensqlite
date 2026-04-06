@@ -6,6 +6,8 @@
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::SqliteValue;
+use fsqlite_vdbe::engine::{reset_vdbe_metrics, set_vdbe_metrics_enabled, vdbe_metrics_snapshot};
+use std::sync::{Mutex, OnceLock};
 
 fn new_mem_conn() -> Connection {
     let conn = Connection::open(":memory:").unwrap();
@@ -13,10 +15,28 @@ fn new_mem_conn() -> Connection {
     conn
 }
 
+fn v2_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn capture_vdbe_metrics<T>(
+    f: impl FnOnce() -> T,
+) -> (T, fsqlite_vdbe::engine::VdbeMetricsSnapshot) {
+    set_vdbe_metrics_enabled(true);
+    reset_vdbe_metrics();
+    let result = f();
+    let snapshot = vdbe_metrics_snapshot();
+    reset_vdbe_metrics();
+    set_vdbe_metrics_enabled(false);
+    (result, snapshot)
+}
+
 // ── V2.1: FusedAppendInsert correctness ─────────────────────────────────
 
 #[test]
 fn test_v2_fused_insert_simple_1col() {
+    let _guard = v2_test_lock().lock().unwrap();
     // Simple INSERT that should trigger the FusedAppendInsert peephole
     // (NewRowid + MakeRecord + Insert with ABORT conflict, no indexes)
     let conn = new_mem_conn();
@@ -41,6 +61,7 @@ fn test_v2_fused_insert_simple_1col() {
 
 #[test]
 fn test_v2_fused_insert_multicol_varied_types() {
+    let _guard = v2_test_lock().lock().unwrap();
     let conn = new_mem_conn();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL, data BLOB)")
         .unwrap();
@@ -66,6 +87,7 @@ fn test_v2_fused_insert_multicol_varied_types() {
 
 #[test]
 fn test_v2_fused_insert_autoincrement() {
+    let _guard = v2_test_lock().lock().unwrap();
     let conn = new_mem_conn();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")
         .unwrap();
@@ -86,6 +108,7 @@ fn test_v2_fused_insert_autoincrement() {
 
 #[test]
 fn test_v2_fused_insert_empty_table_first_row() {
+    let _guard = v2_test_lock().lock().unwrap();
     // First INSERT into empty table — no cached last_alloc_rowid
     let conn = new_mem_conn();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
@@ -98,7 +121,77 @@ fn test_v2_fused_insert_empty_table_first_row() {
 }
 
 #[test]
+fn test_v2_sequential_explicit_rowid_inserts_keep_append_path_hot() {
+    let _guard = v2_test_lock().lock().unwrap();
+    let conn = new_mem_conn();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+
+    let (_result, metrics) = capture_vdbe_metrics(|| {
+        let values_sql = (1..=128)
+            .map(|i| format!("({i}, 'v{i}')"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute(&format!("INSERT INTO t VALUES {values_sql}"))
+            .unwrap();
+    });
+
+    let count = conn.query_row("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(count.values()[0].to_integer(), 128);
+
+    assert!(
+        metrics.insert_append_count >= 120,
+        "sequential explicit-rowid inserts should stay on the append path after the initial seed insert, got {:?}",
+        metrics
+    );
+    assert!(
+        metrics.insert_seek_count <= 8,
+        "sequential explicit-rowid inserts should avoid repeated existence seeks, got {:?}",
+        metrics
+    );
+}
+
+#[test]
+fn test_v2_midstream_insert_clears_append_hint_until_right_edge_reestablished() {
+    let _guard = v2_test_lock().lock().unwrap();
+    let conn = new_mem_conn();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+
+    let (_result, metrics) = capture_vdbe_metrics(|| {
+        conn.execute(
+            "INSERT INTO t VALUES \
+             (10, 'ten'), \
+             (30, 'thirty'), \
+             (20, 'twenty'), \
+             (21, 'twenty_one')",
+        )
+        .unwrap();
+    });
+
+    let rows = conn.query("SELECT id FROM t ORDER BY id").unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.values()[0].to_integer())
+            .collect::<Vec<_>>(),
+        vec![10, 20, 21, 30]
+    );
+
+    assert_eq!(
+        metrics.insert_append_count, 1,
+        "only the proven right-edge insert should use the append no-seek path; midstream inserts must clear the hint, got {:?}",
+        metrics
+    );
+    assert!(
+        metrics.insert_seek_count >= 3,
+        "midstream inserts should force conservative seeks until the right edge is proven again, got {:?}",
+        metrics
+    );
+}
+
+#[test]
 fn test_v2_fused_insert_after_delete() {
+    let _guard = v2_test_lock().lock().unwrap();
     let conn = new_mem_conn();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")
         .unwrap();
@@ -134,6 +227,7 @@ fn test_v2_fused_insert_after_delete() {
 
 #[test]
 fn test_v2_insert_not_fused_with_index() {
+    let _guard = v2_test_lock().lock().unwrap();
     // Table with secondary index — should NOT use FusedAppendInsert
     let conn = new_mem_conn();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
@@ -158,6 +252,7 @@ fn test_v2_insert_not_fused_with_index() {
 
 #[test]
 fn test_v2_insert_not_fused_with_conflict() {
+    let _guard = v2_test_lock().lock().unwrap();
     // INSERT OR REPLACE — should NOT use FusedAppendInsert
     let conn = new_mem_conn();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
@@ -175,6 +270,7 @@ fn test_v2_insert_not_fused_with_conflict() {
 
 #[test]
 fn test_v2_halt_sentinel_terminates() {
+    let _guard = v2_test_lock().lock().unwrap();
     // Programs must terminate via Halt — verify no infinite loop
     let conn = new_mem_conn();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -186,6 +282,7 @@ fn test_v2_halt_sentinel_terminates() {
 
 #[test]
 fn test_v2_prepared_insert_matches_adhoc() {
+    let _guard = v2_test_lock().lock().unwrap();
     // Verify prepared INSERT produces same results as ad-hoc INSERT
     let conn = new_mem_conn();
     conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER)")
@@ -227,6 +324,7 @@ fn test_v2_prepared_insert_matches_adhoc() {
 
 #[test]
 fn test_v2_mixed_insert_update_in_transaction() {
+    let _guard = v2_test_lock().lock().unwrap();
     let conn = new_mem_conn();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
         .unwrap();
@@ -259,6 +357,7 @@ fn test_v2_mixed_insert_update_in_transaction() {
 
 #[test]
 fn test_v2_large_insert_page_splits() {
+    let _guard = v2_test_lock().lock().unwrap();
     // Enough data to trigger multiple B-tree page splits during fused insert
     let conn = new_mem_conn();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)")

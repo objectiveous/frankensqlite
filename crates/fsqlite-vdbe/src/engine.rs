@@ -2975,6 +2975,20 @@ impl CursorBackend {
         }
     }
 
+    fn table_refresh_rightmost_leaf_cache_after_insert(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+    ) -> Result<()> {
+        match self {
+            Self::Mem(c) => c.table_refresh_rightmost_leaf_cache_after_insert(cx, rowid),
+            Self::Txn(c) => c.table_refresh_rightmost_leaf_cache_after_insert(cx, rowid),
+            Self::TimeTravel(_) => Err(FrankenError::Internal(
+                "time-travel cursors are read-only: table_insert not permitted".to_owned(),
+            )),
+        }
+    }
+
     fn delete(&mut self, cx: &Cx) -> Result<()> {
         match self {
             Self::Mem(c) => c.delete(cx),
@@ -3076,12 +3090,11 @@ struct StorageCursor {
     row_decode: RowDecodeScratch,
     /// Cache the cursor's physical position to avoid redundant payload reads.
     last_position_stamp: Option<(u32, u16)>,
-    /// Last rowid successfully inserted via this cursor (bd-p666i).
+    /// Last rowid known to have been inserted on the right edge via this cursor.
     ///
-    /// When the next INSERT has a rowid strictly greater than this value,
-    /// the B-tree seek can be skipped — the cursor can use `table_last()`
-    /// which is O(1) when already positioned at the rightmost leaf.
-    /// This matches C SQLite's `BTREE_APPEND` fast-path.
+    /// This is intentionally stricter than "last inserted rowid". We only keep
+    /// it when the caller proved the insert landed at EOF/rightmost, because
+    /// only then can a strictly larger next rowid safely reuse the append path.
     last_successful_insert_rowid: Option<i64>,
     /// Cached rowid for the current cursor position (avoids repeated B-tree lookups).
     cached_rowid: Option<i64>,
@@ -3940,6 +3953,10 @@ pub struct VdbeMetricsSnapshot {
     pub make_record_calls_total: u64,
     /// Total bytes produced by MakeRecord blobs.
     pub make_record_blob_bytes_total: u64,
+    /// Total INSERT executions that reused the append-eligible no-seek decision.
+    pub insert_append_count: u64,
+    /// Total INSERT executions that had to perform an existence seek.
+    pub insert_seek_count: u64,
     /// Storage-class breakdown of decoded values.
     pub decoded_value_types: ValueTypeMetricsSnapshot,
     /// Storage-class breakdown of emitted result values.
@@ -4022,6 +4039,8 @@ pub fn vdbe_metrics_snapshot() -> VdbeMetricsSnapshot {
         make_record_calls_total: FSQLITE_VDBE_MAKE_RECORD_CALLS_TOTAL.load(AtomicOrdering::Relaxed),
         make_record_blob_bytes_total: FSQLITE_VDBE_MAKE_RECORD_BLOB_BYTES_TOTAL
             .load(AtomicOrdering::Relaxed),
+        insert_append_count: FSQLITE_VDBE_INSERT_APPEND_COUNT.load(AtomicOrdering::Relaxed),
+        insert_seek_count: FSQLITE_VDBE_INSERT_SEEK_COUNT.load(AtomicOrdering::Relaxed),
         decoded_value_types: ValueTypeMetricsSnapshot {
             total_values: FSQLITE_VDBE_DECODED_VALUES_TOTAL.load(AtomicOrdering::Relaxed),
             nulls: FSQLITE_VDBE_DECODED_NULLS_TOTAL.load(AtomicOrdering::Relaxed),
@@ -4116,6 +4135,8 @@ pub fn reset_vdbe_metrics() {
     FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_MAKE_RECORD_CALLS_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_MAKE_RECORD_BLOB_BYTES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_INSERT_APPEND_COUNT.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_INSERT_SEEK_COUNT.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_DECODED_NULLS_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_DECODED_INTEGERS_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_DECODED_REALS_TOTAL.store(0, AtomicOrdering::Relaxed);
@@ -4398,6 +4419,11 @@ fn hash_program(program: &VdbeProgram) -> u64 {
                 mix_len(hash, value.len());
                 mix(hash, value.as_bytes());
             }
+            P4::RecordHeaderTemplate(value) => {
+                mix(hash, &[14]);
+                mix_len(hash, value.len());
+                mix(hash, value);
+            }
         }
     }
 
@@ -4548,6 +4574,19 @@ pub enum ExecOutcome {
     Error { code: i32, message: String },
 }
 
+/// Inline register storage for the 1-indexed VDBE register file.
+///
+/// The engine keeps `SqliteValue` cells directly in a `SmallVec` so the hot
+/// opcode loop can borrow, materialize, or consume values without going
+/// through an extra container abstraction.
+type RegisterFile = smallvec::SmallVec<[SqliteValue; 32]>;
+
+/// Bound parameter storage for `?1`, `?2`, ... lookups during execution.
+type BindingStorage = smallvec::SmallVec<[SqliteValue; 8]>;
+
+/// Buffered result-row storage retained by the engine when row collection is on.
+type ResultRowStorage = Vec<smallvec::SmallVec<[SqliteValue; 16]>>;
+
 /// The VDBE bytecode interpreter.
 ///
 /// Executes a program produced by the code generator, maintaining a register
@@ -4556,9 +4595,9 @@ pub enum ExecOutcome {
 #[allow(clippy::struct_excessive_bools)]
 pub struct VdbeEngine {
     /// Register file (1-indexed; index 0 is unused/sentinel).
-    registers: smallvec::SmallVec<[SqliteValue; 32]>,
+    registers: RegisterFile,
     /// Bound SQL parameter values (`?1`, `?2`, ...).
-    bindings: smallvec::SmallVec<[SqliteValue; 8]>,
+    bindings: BindingStorage,
     /// Root capability context for execution-owned cursor and virtual-table work.
     execution_cx: Cx,
     /// Page size for this database (bd-zjisk.2).
@@ -4568,7 +4607,7 @@ pub struct VdbeEngine {
     /// Execute-scoped metrics flag latched once per statement.
     collect_vdbe_metrics: bool,
     /// Result rows accumulated during execution.
-    results: Vec<smallvec::SmallVec<[SqliteValue; 16]>>,
+    results: ResultRowStorage,
     /// Open cursors (keyed by cursor number, i.e. p1 of OpenRead/OpenWrite).
     /// bd-perf (V1.6): Flat array instead of HashMap — direct O(1) index.
     cursors: CursorSlots<MemCursor>,
@@ -8089,12 +8128,12 @@ impl VdbeEngine {
                             // 1. last_successful_insert_rowid is per-StorageCursor (per-txn)
                             // 2. Each concurrent txn has its own COW page copies
                             // 3. SSI conflict detection happens at commit time
-                            let mut insert_seek_result = None;
-                            let exists = if !is_update
+                            let append_eligible = !is_update
                                 && sc
                                     .last_successful_insert_rowid
-                                    .is_some_and(|last| rowid > last)
-                            {
+                                    .is_some_and(|last| rowid > last);
+                            let mut insert_seek_result = None;
+                            let exists = if append_eligible {
                                 FSQLITE_VDBE_INSERT_APPEND_COUNT
                                     .fetch_add(1, AtomicOrdering::Relaxed);
                                 false // Append: key is larger than anything in the table
@@ -8107,6 +8146,7 @@ impl VdbeEngine {
                             };
 
                             if exists {
+                                sc.last_successful_insert_rowid = None;
                                 // Match on the low OE_* bits directly — p5 is
                                 // not a plain bitfield in this engine because
                                 // it also carries the custom OPFLAG_ISUPDATE
@@ -8127,7 +8167,6 @@ impl VdbeEngine {
                                         self.collect_vdbe_metrics,
                                         DecodeCacheInvalidationReason::WriteMutation,
                                     );
-                                    sc2.last_successful_insert_rowid = Some(rowid);
                                     inserted_via_storage = true;
                                     actually_inserted = true;
                                 } else if oe_flag == 4 {
@@ -8149,17 +8188,30 @@ impl VdbeEngine {
                                 // No conflict — reuse the successor/EOF position from the
                                 // existence probe when it already proved the row is absent.
                                 if insert_seek_result == Some(SeekResult::NotFound) {
+                                    let rightmost_insert = sc.cursor.eof();
                                     sc.cursor
                                         .table_insert_prechecked_absent(&sc.cx, rowid, blob)?;
+                                    if rightmost_insert {
+                                        sc.cursor.table_refresh_rightmost_leaf_cache_after_insert(
+                                            &sc.cx, rowid,
+                                        )?;
+                                        sc.last_successful_insert_rowid = Some(rowid);
+                                    } else {
+                                        sc.last_successful_insert_rowid = None;
+                                    }
                                 } else {
                                     sc.cursor.table_insert(&sc.cx, rowid, blob)?;
+                                    if append_eligible {
+                                        sc.last_successful_insert_rowid = Some(rowid);
+                                    } else {
+                                        sc.last_successful_insert_rowid = None;
+                                    }
                                 }
                                 invalidate_storage_cursor_row_cache_with_reason(
                                     sc,
                                     self.collect_vdbe_metrics,
                                     DecodeCacheInvalidationReason::WriteMutation,
                                 );
-                                sc.last_successful_insert_rowid = Some(rowid);
                                 inserted_via_storage = true;
                                 actually_inserted = true;
                             }
@@ -10348,6 +10400,10 @@ impl VdbeEngine {
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
+    /// Borrow a register cell without changing ownership.
+    ///
+    /// Opcode implementations use this for pure read paths where the register
+    /// must remain intact after the operation.
     #[inline(always)]
     #[allow(clippy::inline_always)]
     fn get_reg(&self, r: i32) -> &SqliteValue {
@@ -10395,6 +10451,10 @@ impl VdbeEngine {
         self.make_record_sideband_reg = 0;
     }
 
+    /// Materialize an owned copy of a register while preserving the source.
+    ///
+    /// This is the helper to use when a downstream routine needs an owned
+    /// `SqliteValue` but the register file should keep its current contents.
     #[inline]
     fn clone_reg_materialized(&mut self, r: i32) -> SqliteValue {
         self.materialize_make_record_sideband(r);
@@ -10902,6 +10962,10 @@ impl VdbeEngine {
         Ok(())
     }
 
+    /// Collect a borrowed register range into owned values without clearing it.
+    ///
+    /// Prefer this pattern for function arguments and compare-style opcodes
+    /// that need a stable owned snapshot but should not consume the registers.
     fn collect_reg_range(
         &mut self,
         start: i32,
@@ -10957,6 +11021,10 @@ impl VdbeEngine {
 
     #[inline(always)]
     #[allow(clippy::inline_always)]
+    /// Consume a single register cell and clear its slot back to NULL.
+    ///
+    /// Use this when the opcode is transferring ownership out of the register
+    /// file and the source register should no longer hold the previous value.
     fn take_reg(&mut self, r: i32) -> SqliteValue {
         if r >= 0 && (r as usize) < self.registers.len() {
             self.materialize_make_record_sideband(r);
@@ -10969,6 +11037,11 @@ impl VdbeEngine {
         }
     }
 
+    /// General register write path for opcodes that do not need the hottest
+    /// possible store sequence.
+    ///
+    /// All write helpers invalidate `MakeRecord` sideband state and subtype
+    /// metadata so callers do not have to remember that bookkeeping.
     #[inline]
     #[allow(clippy::cast_sign_loss)]
     fn set_reg(&mut self, r: i32, val: SqliteValue) {
@@ -10998,6 +11071,9 @@ impl VdbeEngine {
     /// Fast-path register write with NaN -> Null normalization.
     /// Auto-resizes the register file when necessary (handles both
     /// builder-allocated programs and hand-crafted test programs).
+    ///
+    /// Use this for hot opcode write paths that still need the same register
+    /// invalidation semantics as `set_reg`.
     #[inline(always)]
     #[allow(clippy::inline_always)]
     #[allow(clippy::cast_sign_loss)]
@@ -12934,16 +13010,15 @@ fn payload_includes_rowid_alias_lazy(
                     SerialTypeClass::Integer => {
                         // Decode the integer at the IPK position and compare
                         // to the rowid.
-                        if let Some(val) = fsqlite_types::record::decode_column_from_offset(
-                            payload_buf,
-                            col,
-                            false,
-                        ) {
-                            if let SqliteValue::Integer(v) = val {
-                                if v == rowid {
-                                    return true;
-                                }
-                            }
+                        if let Some(SqliteValue::Integer(v)) =
+                            fsqlite_types::record::decode_column_from_offset(
+                                payload_buf,
+                                col,
+                                false,
+                            )
+                            && v == rowid
+                        {
+                            return true;
                         }
                     }
                     _ => {}

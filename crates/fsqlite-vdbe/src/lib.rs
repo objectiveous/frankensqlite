@@ -619,6 +619,7 @@ fn peephole_fuse_append_insert(ops: &mut smallvec::SmallVec<[VdbeOp; 64]>) {
             let r_start = ops[i + 1].p1;
             let n_cols = ops[i + 1].p2;
             let r_record = ops[i + 1].p3;
+            let make_record_p4 = ops[i + 1].p4.clone();
             let insert_cursor = ops[i + 2].p1;
             let insert_record_reg = ops[i + 2].p2;
             let insert_rowid_reg = ops[i + 2].p3;
@@ -636,7 +637,7 @@ fn peephole_fuse_append_insert(ops: &mut smallvec::SmallVec<[VdbeOp; 64]>) {
                     p1: cursor,
                     p2: r_start,
                     p3: n_cols,
-                    p4: P4::None,
+                    p4: make_record_p4,
                     p5: insert_flags,
                 };
                 ops[i + 1] = VdbeOp {
@@ -772,6 +773,7 @@ impl VdbeProgram {
                 P4::Table(t) => format!("(tbl){t}"),
                 P4::Index(i) => format!("(idx){i}"),
                 P4::Affinity(a) => format!("(aff){a}"),
+                P4::RecordHeaderTemplate(bytes) => format!("(hdr)[{}B]", bytes.len()),
                 P4::TimeTravelCommitSeq(seq) => format!("(tt-seq){seq}"),
                 P4::TimeTravelTimestamp(ts) => format!("(tt-ts){ts}"),
             };
@@ -1657,8 +1659,9 @@ mod tests {
             P4::FuncName("count".to_owned()),
             P4::Table("users".to_owned()),
             P4::Affinity("ddd".to_owned()),
+            P4::RecordHeaderTemplate(vec![3, 0, 7]),
         ];
-        assert_eq!(variants.len(), 10);
+        assert_eq!(variants.len(), 11);
 
         // Verify each variant matches itself.
         assert!(matches!(variants[0], P4::None));
@@ -1671,6 +1674,9 @@ mod tests {
         assert!(matches!(variants[7], P4::FuncName(ref s) if s == "count"));
         assert!(matches!(variants[8], P4::Table(ref s) if s == "users"));
         assert!(matches!(variants[9], P4::Affinity(ref s) if s == "ddd"));
+        assert!(
+            matches!(variants[10], P4::RecordHeaderTemplate(ref bytes) if bytes == &vec![3, 0, 7])
+        );
     }
 
     // ── test_label_emit_and_resolve ─────────────────────────────────────

@@ -22,6 +22,7 @@ use fsqlite_types::{
 };
 
 use crate::cache_aligned::CacheAligned;
+use crate::commit_combiner::CommitSequenceCombiner;
 use crate::core_types::{Transaction, VersionArena, VersionIdx};
 use crate::ebr::{EbrRetireQueue, VersionGuardRegistry};
 use crate::gc::{GcTickResult, GcTodo, gc_tick_with_registry, prune_page_chain_with_registry};
@@ -55,12 +56,18 @@ use crate::observability::record_cas_attempt;
 /// includes a partial commit from a concurrent writer.
 pub struct TxnManager {
     next_txn_id: AtomicU64,
-    next_commit_seq: AtomicU64,
+    /// D1-CRITICAL Change 4: Commit sequence allocation via flat combining.
+    /// Replaces the previous `next_commit_seq: AtomicU64` + per-call mutex
+    /// with batched allocation that reduces cache-line contention from O(N)
+    /// round-trips to O(1) under concurrent commits. The combiner also
+    /// batch-registers sequences in `active_commits` atomically.
+    commit_combiner: CommitSequenceCombiner,
     /// In-flight commit sequences (allocated but not yet finished).
     /// Uses a sorted `SmallVec` instead of `BTreeSet` for cache locality
     /// under typical concurrency (≤16 concurrent commits). Sorted order
     /// enables O(1) minimum lookup via `first()`.
-    active_commits: Mutex<SmallVec<[u64; 16]>>,
+    /// Shared with `commit_combiner` via `Arc` for batch registration.
+    active_commits: Arc<Mutex<SmallVec<[u64; 16]>>>,
     /// The highest commit sequence C such that all sequences <= C are fully finished.
     stable_commit_seq: AtomicU64,
 }
@@ -69,10 +76,14 @@ impl TxnManager {
     /// Create a new manager starting from the given initial values.
     #[must_use]
     pub fn new(initial_txn_id: u64, initial_commit_seq: u64) -> Self {
+        let active_commits = Arc::new(Mutex::new(SmallVec::new()));
         Self {
             next_txn_id: AtomicU64::new(initial_txn_id),
-            next_commit_seq: AtomicU64::new(initial_commit_seq),
-            active_commits: Mutex::new(SmallVec::new()),
+            commit_combiner: CommitSequenceCombiner::new_with_registry(
+                initial_commit_seq,
+                Arc::clone(&active_commits),
+            ),
+            active_commits,
             // If starting at S, then S-1 is the last stable commit.
             stable_commit_seq: AtomicU64::new(initial_commit_seq.saturating_sub(1)),
         }
@@ -101,19 +112,14 @@ impl TxnManager {
 
     /// Allocate the next `CommitSeq` and mark it as active.
     ///
-    /// This must be called only under the commit mutex to maintain
-    /// strict ordering. Uses `Release` ordering so that readers using
-    /// `Acquire` will see all prior version chain updates.
-    #[allow(clippy::significant_drop_tightening)]
+    /// D1-CRITICAL Change 4: Routes through `CommitSequenceCombiner` for
+    /// batched allocation. Under 8-16 thread contention, this converts
+    /// N separate `fetch_add(1)` + N mutex acquisitions into 1 batched
+    /// `fetch_add(N)` + 1 mutex acquisition by the combiner thread.
+    /// The combiner batch-registers sequences in `active_commits` before
+    /// signaling waiters, so there is no gap for `finish_commit_seq`.
     pub fn alloc_commit_seq(&self) -> CommitSeq {
-        // We hold a lock to update active_commits atomically with the allocation
-        // to ensure no race allows stable_commit_seq to jump past us.
-        let mut active = self.active_commits.lock();
-        let seq = self.next_commit_seq.fetch_add(1, Ordering::Release);
-        debug_assert!(seq < u64::MAX, "CommitSeq allocation overflow");
-        // Sequences are monotonically increasing, so push to end maintains sorted order.
-        active.push(seq);
-        CommitSeq::new(seq)
+        self.commit_combiner.alloc_one_shot()
     }
 
     /// Mark a `CommitSeq` as finished (fully published).
@@ -135,9 +141,7 @@ impl TxnManager {
             min_active.saturating_sub(1)
         } else {
             // No active commits: stable is everything up to next_commit_seq - 1.
-            self.next_commit_seq
-                .load(Ordering::Acquire)
-                .saturating_sub(1)
+            self.commit_combiner.next_seq().saturating_sub(1)
         };
         drop(active);
 
@@ -178,10 +182,7 @@ impl std::fmt::Debug for TxnManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TxnManager")
             .field("next_txn_id", &self.next_txn_id.load(Ordering::Relaxed))
-            .field(
-                "next_commit_seq",
-                &self.next_commit_seq.load(Ordering::Relaxed),
-            )
+            .field("next_commit_seq", &self.commit_combiner.next_seq())
             .field("active_commits", &*self.active_commits.lock())
             .field(
                 "stable_commit_seq",

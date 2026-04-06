@@ -836,65 +836,15 @@ pub fn serialize_record_refs(values: &[&SqliteValue]) -> Vec<u8> {
 
 /// Core serialization logic.
 ///
-/// Computes each column's serial type **once** into a small stack buffer
-/// (up to 32 columns without heap allocation), then writes header + body
-/// in a single pass.  This replaces the prior 3-pass design that called
-/// `serial_type_for_value()` three times per column.
-#[allow(clippy::cast_possible_truncation)]
+/// Matches SQLite's `OP_MakeRecord` shape: one pass to measure header/body
+/// sizes, one pass to write serial types + payload bytes directly into the
+/// destination buffer.
 pub fn serialize_record_iter<'a, I>(values: I) -> Vec<u8>
 where
     I: Iterator<Item = &'a SqliteValue> + Clone,
 {
-    // ── Phase 1: compute serial types + sizes (one call per column) ──
-    // Stack-allocate for records up to 32 columns (covers 95%+ of tables).
-    let mut serial_types_buf: [u64; 32] = [0; 32];
-    let mut serial_types_heap: Vec<u64> = Vec::new();
-    let mut n_cols: usize = 0;
-    let mut header_content_size: usize = 0;
-    let mut body_size: usize = 0;
-
-    for v in values.clone() {
-        let st = serial_type_for_value(v);
-        if n_cols < 32 {
-            serial_types_buf[n_cols] = st;
-        } else {
-            if serial_types_heap.is_empty() {
-                serial_types_heap.extend_from_slice(&serial_types_buf);
-            }
-            serial_types_heap.push(st);
-        }
-        header_content_size += varint_len(st);
-        body_size += serial_type_len(st).unwrap_or(0) as usize;
-        n_cols += 1;
-    }
-
-    let serial_types: &[u64] = if n_cols <= 32 {
-        &serial_types_buf[..n_cols]
-    } else {
-        &serial_types_heap
-    };
-
-    // ── Phase 2: single-pass write header + body ─────────────────────
-    let header_size = compute_header_size(header_content_size);
-    let total_size = header_size + body_size;
-    let mut buf = vec![0u8; total_size];
-
-    // Write header-size varint.
-    let mut offset = write_varint(&mut buf, header_size as u64);
-
-    // Write serial type varints (from cached array, not recomputed).
-    for &st in serial_types {
-        offset += write_varint(&mut buf[offset..], st);
-    }
-    debug_assert_eq!(offset, header_size);
-
-    // Write encoded values (serial types read from cache).
-    for (v, &st) in values.zip(serial_types.iter()) {
-        let value_len = serial_type_len(st).unwrap_or(0) as usize;
-        encode_value(v, st, &mut buf[offset..offset + value_len]);
-        offset += value_len;
-    }
-
+    let mut buf = Vec::new();
+    serialize_record_iter_into_impl(values, &mut buf);
     buf
 }
 
@@ -907,54 +857,7 @@ pub fn serialize_record_iter_into<'a, I>(values: I, buf: &mut Vec<u8>)
 where
     I: Iterator<Item = &'a SqliteValue> + Clone,
 {
-    // ── Phase 1: compute serial types + sizes (one call per column) ──
-    let mut serial_types_buf: [u64; 32] = [0; 32];
-    let mut serial_types_heap: Vec<u64> = Vec::new();
-    let mut n_cols: usize = 0;
-    let mut header_content_size: usize = 0;
-    let mut body_size: usize = 0;
-
-    for v in values.clone() {
-        let st = serial_type_for_value(v);
-        if n_cols < 32 {
-            serial_types_buf[n_cols] = st;
-        } else {
-            if serial_types_heap.is_empty() {
-                serial_types_heap.extend_from_slice(&serial_types_buf);
-            }
-            serial_types_heap.push(st);
-        }
-        header_content_size += varint_len(st);
-        body_size += serial_type_len(st).unwrap_or(0) as usize;
-        n_cols += 1;
-    }
-
-    let serial_types: &[u64] = if n_cols <= 32 {
-        &serial_types_buf[..n_cols]
-    } else {
-        &serial_types_heap
-    };
-
-    // ── Phase 2: single-pass write header + body ─────────────────────
-    let header_size = compute_header_size(header_content_size);
-    let total_size = header_size + body_size;
-    if buf.len() < total_size {
-        buf.resize(total_size, 0);
-    } else {
-        buf.truncate(total_size);
-    }
-
-    let mut offset = write_varint(buf, header_size as u64);
-    for &st in serial_types {
-        offset += write_varint(&mut buf[offset..], st);
-    }
-    debug_assert_eq!(offset, header_size);
-
-    for (v, &st) in values.zip(serial_types.iter()) {
-        let value_len = serial_type_len(st).unwrap_or(0) as usize;
-        encode_value(v, st, &mut buf[offset..offset + value_len]);
-        offset += value_len;
-    }
+    serialize_record_iter_into_impl(values, buf);
 }
 
 /// Compute the total header size (including the header-size varint itself).
@@ -971,23 +874,86 @@ fn compute_header_size(content_size: usize) -> usize {
     }
 }
 
-/// Determine the serial type for a `SqliteValue`.
-#[allow(clippy::cast_possible_truncation)]
-fn serial_type_for_value(value: &SqliteValue) -> u64 {
+#[inline]
+fn serialized_value_layout(value: &SqliteValue) -> (u64, usize) {
     match value {
-        SqliteValue::Null => 0,
-        SqliteValue::Integer(i) => serial_type_for_integer(*i),
+        SqliteValue::Null => (0, 0),
+        SqliteValue::Integer(i) => {
+            let serial_type = serial_type_for_integer(*i);
+            let payload_len = match serial_type {
+                8 | 9 => 0,
+                1 => 1,
+                2 => 2,
+                3 => 3,
+                4 => 4,
+                5 => 6,
+                6 => 8,
+                _ => unreachable!("integer serial type must be in 1..=9"),
+            };
+            (serial_type, payload_len)
+        }
         // SQLite normalizes NaN to NULL for deterministic storage.
         SqliteValue::Float(f) => {
             if f.is_nan() {
-                0
+                (0, 0)
             } else {
-                7
+                (7, 8)
             }
         }
-        SqliteValue::Text(s) => serial_type_for_text(s.len() as u64),
-        SqliteValue::Blob(b) => serial_type_for_blob(b.len() as u64),
+        SqliteValue::Text(s) => {
+            let len = s.len();
+            (
+                serial_type_for_text(u64::try_from(len).unwrap_or(u64::MAX)),
+                len,
+            )
+        }
+        SqliteValue::Blob(b) => {
+            let len = b.len();
+            (
+                serial_type_for_blob(u64::try_from(len).unwrap_or(u64::MAX)),
+                len,
+            )
+        }
     }
+}
+
+fn serialize_record_iter_into_impl<'a, I>(values: I, buf: &mut Vec<u8>)
+where
+    I: Iterator<Item = &'a SqliteValue> + Clone,
+{
+    let mut header_content_size = 0usize;
+    let mut body_size = 0usize;
+
+    for value in values.clone() {
+        let (serial_type, payload_len) = serialized_value_layout(value);
+        header_content_size += varint_len(serial_type);
+        body_size += payload_len;
+    }
+
+    let header_size = compute_header_size(header_content_size);
+    let total_size = header_size + body_size;
+    buf.clear();
+    buf.resize(total_size, 0);
+
+    let mut header_offset = write_varint(
+        buf.as_mut_slice(),
+        u64::try_from(header_size).unwrap_or(u64::MAX),
+    );
+    let mut body_offset = header_size;
+
+    for value in values {
+        let (serial_type, payload_len) = serialized_value_layout(value);
+        header_offset += write_varint(&mut buf[header_offset..], serial_type);
+        encode_serialized_value(
+            value,
+            payload_len,
+            &mut buf[body_offset..body_offset + payload_len],
+        );
+        body_offset += payload_len;
+    }
+
+    debug_assert_eq!(header_offset, header_size);
+    debug_assert_eq!(body_offset, total_size);
 }
 
 /// Decode a value from its serial type and raw bytes.
@@ -1127,17 +1093,17 @@ fn decode_big_endian_signed(bytes: &[u8]) -> i64 {
 }
 
 /// Encode a `SqliteValue` into its serial type byte representation.
-fn encode_value(value: &SqliteValue, serial_type: u64, buf: &mut [u8]) {
+fn encode_serialized_value(value: &SqliteValue, payload_len: usize, buf: &mut [u8]) {
+    debug_assert_eq!(buf.len(), payload_len);
     match value {
         SqliteValue::Null => {} // serial type 0: no data
         SqliteValue::Integer(i) => {
-            if classify_serial_type(serial_type) == SerialTypeClass::Integer {
-                let len = buf.len();
-                let bytes = i.to_be_bytes();
-                // Take the least significant `len` bytes.
-                buf.copy_from_slice(&bytes[8 - len..]);
+            if payload_len == 0 {
+                return;
             }
-            // Zero and One serial types have no data bytes.
+            let bytes = i.to_be_bytes();
+            // Take the least significant `payload_len` bytes.
+            buf.copy_from_slice(&bytes[8 - payload_len..]);
         }
         SqliteValue::Float(f) => {
             if f.is_nan() {

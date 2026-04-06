@@ -24,7 +24,10 @@
 //! The combiner has all data in L1 cache — sequential execution is faster than
 //! parallel contention.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+use smallvec::SmallVec;
 
 use fsqlite_types::CommitSeq;
 use fsqlite_types::sync_primitives::{Instant, Mutex};
@@ -148,6 +151,11 @@ pub struct CommitSequenceCombiner {
     owners: [AtomicU64; MAX_COMMIT_THREADS],
     /// Combiner lock — only one thread processes a batch at a time.
     combiner_lock: Mutex<()>,
+    /// Optional active-commits registry for batch-registering allocated sequences.
+    /// When set, `combine_locked` batch-pushes all newly allocated sequences into
+    /// this registry before signaling waiters, ensuring sequences are registered
+    /// as active atomically with allocation (no gap for `finish_commit_seq`).
+    active_registry: Option<Arc<Mutex<SmallVec<[u64; 16]>>>>,
 }
 
 impl CommitSequenceCombiner {
@@ -158,6 +166,26 @@ impl CommitSequenceCombiner {
             slots: std::array::from_fn(|_| CommitSlot::new()),
             owners: std::array::from_fn(|_| AtomicU64::new(0)),
             combiner_lock: Mutex::new(()),
+            active_registry: None,
+        }
+    }
+
+    /// Create a combiner with active-commits batch registration.
+    ///
+    /// When `registry` is provided, `combine_locked` batch-pushes all newly
+    /// allocated sequences into it before signaling waiters. This ensures
+    /// `finish_commit_seq` cannot advance `stable_commit_seq` past an
+    /// allocated-but-unregistered sequence.
+    pub fn new_with_registry(
+        initial_commit_seq: u64,
+        registry: Arc<Mutex<SmallVec<[u64; 16]>>>,
+    ) -> Self {
+        Self {
+            next_commit_seq: AtomicU64::new(initial_commit_seq),
+            slots: std::array::from_fn(|_| CommitSlot::new()),
+            owners: std::array::from_fn(|_| AtomicU64::new(0)),
+            combiner_lock: Mutex::new(()),
+            active_registry: Some(registry),
         }
     }
 
@@ -194,6 +222,81 @@ impl CommitSequenceCombiner {
             .count()
     }
 
+    /// Claim a temporary slot for one-shot allocation.
+    fn claim_slot(&self, tid: u64) -> usize {
+        loop {
+            for i in 0..MAX_COMMIT_THREADS {
+                if self.owners[i]
+                    .compare_exchange(0, tid, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return i;
+                }
+            }
+            // All 64 slots occupied; yield and retry. Under normal operation
+            // (≤64 concurrent committers) this loop terminates on the first scan.
+            std::thread::yield_now();
+        }
+    }
+
+    /// One-shot commit sequence allocation via flat combining.
+    ///
+    /// Claims a temporary slot, submits a request, waits for the combiner
+    /// to process it, and releases the slot. This avoids the need for
+    /// pre-registered handles when the caller doesn't maintain per-thread state.
+    ///
+    /// If `active_registry` is set, the allocated sequence is batch-registered
+    /// by the combiner thread before this method returns, ensuring no gap
+    /// for `finish_commit_seq`.
+    pub fn alloc_one_shot(&self) -> CommitSeq {
+        let start = Instant::now();
+        let tid = thread_id_hash();
+        let slot = self.claim_slot(tid);
+
+        // Publish request.
+        self.slots[slot]
+            .state
+            .store(SLOT_PENDING, Ordering::Release);
+
+        // Try to become the combiner.
+        if let Some(_guard) = self.combiner_lock.try_lock() {
+            self.combine_locked();
+        }
+
+        // Wait for result.
+        let mut spins = 0u32;
+        let seq = loop {
+            let state = self.slots[slot].state.load(Ordering::Acquire);
+            if state == SLOT_DONE {
+                let raw = self.slots[slot].result.load(Ordering::Acquire);
+                self.slots[slot].state.store(SLOT_EMPTY, Ordering::Release);
+                break CommitSeq::new(raw);
+            }
+
+            spins += 1;
+            if spins < SPIN_BEFORE_YIELD {
+                std::hint::spin_loop();
+            } else {
+                if let Some(_guard) = self.combiner_lock.try_lock() {
+                    self.combine_locked();
+                } else {
+                    std::thread::yield_now();
+                }
+                spins = 0;
+            }
+        };
+
+        // Release slot ownership.
+        self.owners[slot].store(0, Ordering::Release);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        COMMIT_COMBINE_WAIT_NS_TOTAL.fetch_add(elapsed_ns, Ordering::Relaxed);
+        update_max(&COMMIT_COMBINE_WAIT_NS_MAX, elapsed_ns);
+
+        seq
+    }
+
     /// Process all pending requests in a single batch.
     /// The caller MUST hold the `combiner_lock`.
     fn combine_locked(&self) {
@@ -221,6 +324,17 @@ impl CommitSequenceCombiner {
             base_seq < u64::MAX - pending_count,
             "CommitSeq allocation overflow"
         );
+
+        // D1-CRITICAL Change 4: Batch-register in active-commits registry
+        // BEFORE signaling DONE to waiters. This ensures sequences are
+        // visible in active_commits before any waiter can call finish_commit_seq,
+        // preventing stable_commit_seq from advancing past uncommitted sequences.
+        if let Some(ref registry) = self.active_registry {
+            let mut active = registry.lock();
+            for i in 0..pending_count {
+                active.push(base_seq + i);
+            }
+        }
 
         // Assign sequences to each pending slot.
         let mut assigned = 0u64;

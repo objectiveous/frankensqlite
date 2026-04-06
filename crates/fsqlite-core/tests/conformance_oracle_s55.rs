@@ -20970,3 +20970,260 @@ fn test_conformance_self_join_ranking_s73r() {
         panic!("{} self-join ranking mismatches", m.len());
     }
 }
+
+// ---------------------------------------------------------------------------
+// s75u–s75ad: scalar functions, operators, edge cases (bd-eorms session)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_conformance_abs_max_min_scalar_s75u() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE s75u(a INTEGER, b REAL, c TEXT)",
+        "INSERT INTO s75u VALUES(-5, -3.14, 'hello')",
+        "INSERT INTO s75u VALUES(0, 0.0, '')",
+        "INSERT INTO s75u VALUES(42, 2.718, NULL)",
+        "INSERT INTO s75u VALUES(NULL, NULL, 'world')",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries = &[
+        "SELECT ABS(a), ABS(b) FROM s75u ORDER BY rowid",
+        "SELECT ABS(-9223372036854775807), ABS(0), ABS(NULL)",
+        "SELECT MAX(a, b), MIN(a, b) FROM s75u ORDER BY rowid",
+        "SELECT MAX(1, 2, 3), MIN(1, 2, 3)",
+        "SELECT MAX(NULL, 5), MIN(NULL, 5)",
+        "SELECT MAX('abc', 'def'), MIN('abc', 'def')",
+    ];
+    let m = oracle_compare(&fconn, &rconn, queries);
+    if !m.is_empty() {
+        for x in &m {
+            eprintln!("{x}\n");
+        }
+        panic!("{} ABS/MAX/MIN scalar mismatches", m.len());
+    }
+}
+
+#[test]
+fn test_conformance_zeroblob_hex_s75v() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let queries = &[
+        "SELECT LENGTH(ZEROBLOB(10)), TYPEOF(ZEROBLOB(10))",
+        "SELECT HEX(ZEROBLOB(4))",
+        "SELECT HEX(X'DEADBEEF')",
+        "SELECT HEX('abc')",
+        "SELECT LENGTH(ZEROBLOB(0))",
+        "SELECT HEX(ZEROBLOB(0))",
+        "SELECT TYPEOF(ZEROBLOB(100))",
+    ];
+    let m = oracle_compare(&fconn, &rconn, queries);
+    if !m.is_empty() {
+        for x in &m {
+            eprintln!("{x}\n");
+        }
+        panic!("{} ZEROBLOB/HEX mismatches", m.len());
+    }
+}
+
+#[test]
+fn test_conformance_printf_formats_s75w() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let queries = &[
+        "SELECT printf('%d', 42)",
+        "SELECT printf('%05d', 7)",
+        "SELECT printf('%.2f', 3.14159)",
+        "SELECT printf('%s world', 'hello')",
+        "SELECT printf('%d + %d = %d', 2, 3, 5)",
+        "SELECT printf('%%')",
+        "SELECT printf('%10s', 'hi')",
+    ];
+    let m = oracle_compare(&fconn, &rconn, queries);
+    if !m.is_empty() {
+        for x in &m {
+            eprintln!("{x}\n");
+        }
+        panic!("{} printf format mismatches", m.len());
+    }
+}
+
+#[test]
+fn test_conformance_iif_function_s75x() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE s75x(val INTEGER)",
+        "INSERT INTO s75x VALUES(1),(0),(NULL),(-1),(100)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries = &[
+        "SELECT IIF(val > 0, 'positive', 'non-positive') FROM s75x ORDER BY rowid",
+        "SELECT IIF(val IS NULL, 'null', 'not null') FROM s75x ORDER BY rowid",
+        "SELECT IIF(1, 'yes', 'no')",
+        "SELECT IIF(0, 'yes', 'no')",
+        "SELECT IIF(NULL, 'yes', 'no')",
+        "SELECT IIF(val > 50, val * 2, val + 1) FROM s75x ORDER BY rowid",
+    ];
+    let m = oracle_compare(&fconn, &rconn, queries);
+    if !m.is_empty() {
+        for x in &m {
+            eprintln!("{x}\n");
+        }
+        panic!("{} IIF function mismatches", m.len());
+    }
+}
+
+#[test]
+fn test_conformance_nullif_edges_s75y() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let queries = &[
+        "SELECT NULLIF(5, 5)",
+        "SELECT NULLIF(5, 6)",
+        "SELECT NULLIF(NULL, NULL)",
+        "SELECT NULLIF(NULL, 1)",
+        "SELECT NULLIF(1, NULL)",
+        "SELECT NULLIF('abc', 'abc')",
+        "SELECT NULLIF('abc', 'def')",
+        "SELECT TYPEOF(NULLIF(5, 5)), TYPEOF(NULLIF(5, 6))",
+    ];
+    let m = oracle_compare(&fconn, &rconn, queries);
+    if !m.is_empty() {
+        for x in &m {
+            eprintln!("{x}\n");
+        }
+        panic!("{} NULLIF edge mismatches", m.len());
+    }
+}
+
+#[test]
+fn test_conformance_unary_minus_s75z() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let queries = &[
+        "SELECT -42, -(-42), -0",
+        "SELECT -3.14, -(-3.14)",
+        "SELECT -NULL",
+        "SELECT TYPEOF(-42), TYPEOF(-3.14), TYPEOF(-NULL)",
+        "SELECT -9223372036854775807",
+        "SELECT -(1 + 2), -(3 * 4)",
+    ];
+    let m = oracle_compare(&fconn, &rconn, queries);
+    if !m.is_empty() {
+        for x in &m {
+            eprintln!("{x}\n");
+        }
+        panic!("{} unary minus mismatches", m.len());
+    }
+}
+
+#[test]
+fn test_conformance_bitwise_ops_s75aa() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let queries = &[
+        "SELECT 12 & 10",
+        "SELECT 12 | 10",
+        "SELECT ~0",
+        "SELECT ~42",
+        "SELECT 255 & 0",
+        "SELECT 0 | 0",
+        "SELECT 5 & 3, 5 | 3, ~5",
+        "SELECT (15 & 9) | 6",
+        "SELECT 1 << 4, 256 >> 3",
+    ];
+    let m = oracle_compare(&fconn, &rconn, queries);
+    if !m.is_empty() {
+        for x in &m {
+            eprintln!("{x}\n");
+        }
+        panic!("{} bitwise operator mismatches", m.len());
+    }
+}
+
+#[test]
+fn test_conformance_multi_row_values_insert_s75ab() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE s75ab(id INTEGER PRIMARY KEY, name TEXT, score INTEGER)",
+        "INSERT INTO s75ab VALUES(1,'alice',90),(2,'bob',85),(3,'carol',95)",
+        "INSERT INTO s75ab(name, score) VALUES('dave',80),('eve',88)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries = &[
+        "SELECT * FROM s75ab ORDER BY id",
+        "SELECT COUNT(*), SUM(score), AVG(score) FROM s75ab",
+        "SELECT name FROM s75ab WHERE score >= 88 ORDER BY name",
+    ];
+    let m = oracle_compare(&fconn, &rconn, queries);
+    if !m.is_empty() {
+        for x in &m {
+            eprintln!("{x}\n");
+        }
+        panic!("{} multi-row VALUES INSERT mismatches", m.len());
+    }
+}
+
+#[test]
+fn test_conformance_empty_table_aggregates_s75ac() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &["CREATE TABLE s75ac(val INTEGER, txt TEXT)"] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries = &[
+        "SELECT COUNT(*) FROM s75ac",
+        "SELECT COUNT(val) FROM s75ac",
+        "SELECT SUM(val) FROM s75ac",
+        "SELECT AVG(val) FROM s75ac",
+        "SELECT MIN(val) FROM s75ac",
+        "SELECT MAX(val) FROM s75ac",
+        "SELECT TOTAL(val) FROM s75ac",
+        "SELECT GROUP_CONCAT(txt) FROM s75ac",
+        "SELECT TYPEOF(SUM(val)), TYPEOF(TOTAL(val)) FROM s75ac",
+    ];
+    let m = oracle_compare(&fconn, &rconn, queries);
+    if !m.is_empty() {
+        for x in &m {
+            eprintln!("{x}\n");
+        }
+        panic!("{} empty table aggregate mismatches", m.len());
+    }
+}
+
+#[test]
+fn test_conformance_glob_patterns_s75ad() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE s75ad(name TEXT)",
+        "INSERT INTO s75ad VALUES('hello'),('world'),('HELLO'),('Help'),('helm'),('hero')",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries = &[
+        "SELECT name FROM s75ad WHERE name GLOB 'hel*' ORDER BY name",
+        "SELECT name FROM s75ad WHERE name GLOB 'he?o' ORDER BY name",
+        "SELECT name FROM s75ad WHERE name GLOB '*llo' ORDER BY name",
+        "SELECT name FROM s75ad WHERE name GLOB '[hH]*' ORDER BY name",
+        "SELECT name FROM s75ad WHERE name GLOB '*or*' ORDER BY name",
+        "SELECT 'abc' GLOB 'a*', 'abc' GLOB 'A*'",
+    ];
+    let m = oracle_compare(&fconn, &rconn, queries);
+    if !m.is_empty() {
+        for x in &m {
+            eprintln!("{x}\n");
+        }
+        panic!("{} GLOB pattern mismatches", m.len());
+    }
+}

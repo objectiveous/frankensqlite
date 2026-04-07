@@ -21,7 +21,7 @@ use hashbrown::{HashMap, HashSet};
 use std::any::Any;
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use fsqlite_btree::swiss_index::SwissIndex;
 use fsqlite_types::PageSize;
@@ -447,7 +447,7 @@ pub struct MemTable {
     /// Column count for this table (used when creating the table;
     /// actual row widths may vary).
     pub num_columns: usize,
-    /// Rows stored in insertion order.
+    /// Rows kept in ascending rowid order.
     rows: Vec<MemRow>,
     /// Next auto-increment rowid.
     next_rowid: i64,
@@ -457,6 +457,10 @@ pub struct MemTable {
     /// an existing row. Used by the Insert opcode to enforce unique
     /// constraints in MemDatabase mode (where indexes are no-ops).
     unique_column_groups: Vec<Vec<usize>>,
+    /// Per-constraint in-memory unique index keyed by the participating
+    /// column values. NULL-containing keys are intentionally omitted because
+    /// SQLite UNIQUE constraints treat NULL as distinct/non-conflicting.
+    unique_indexes: Vec<BTreeMap<Vec<SqliteValue>, BTreeSet<i64>>>,
 }
 
 impl MemTable {
@@ -467,37 +471,38 @@ impl MemTable {
             rows: Vec::new(),
             next_rowid: 1,
             unique_column_groups: Vec::new(),
+            unique_indexes: Vec::new(),
         }
     }
 
     /// Register a group of columns that together form a UNIQUE constraint.
     pub fn add_unique_column_group(&mut self, cols: Vec<usize>) {
         self.unique_column_groups.push(cols);
+        let group = self
+            .unique_column_groups
+            .last()
+            .expect("just pushed UNIQUE column group");
+        let mut index: BTreeMap<Vec<SqliteValue>, BTreeSet<i64>> = BTreeMap::new();
+        for row in &self.rows {
+            if let Some(key) = Self::unique_key_for_group(&row.values, group) {
+                index.entry(key).or_default().insert(row.rowid);
+            }
+        }
+        self.unique_indexes.push(index);
     }
 
     /// Find rows that conflict with `new_values` on any UNIQUE constraint.
     /// Returns the rowids of all conflicting rows.
     pub fn find_unique_conflicts(&self, new_values: &[SqliteValue]) -> Vec<i64> {
-        let mut conflicts = Vec::new();
-        for group in &self.unique_column_groups {
-            for row in &self.rows {
-                let all_match = group.iter().all(|&col_idx| {
-                    let new_val = new_values.get(col_idx);
-                    let existing_val = row.values.get(col_idx);
-                    match (new_val, existing_val) {
-                        // NULL never conflicts with NULL in UNIQUE constraints.
-                        // Missing columns also don't conflict.
-                        (Some(SqliteValue::Null) | None, _)
-                        | (_, Some(SqliteValue::Null) | None) => false,
-                        (Some(a), Some(b)) => a == b,
-                    }
-                });
-                if all_match && !conflicts.contains(&row.rowid) {
-                    conflicts.push(row.rowid);
-                }
+        let mut conflicts = BTreeSet::new();
+        for (group, index) in self.unique_column_groups.iter().zip(&self.unique_indexes) {
+            if let Some(key) = Self::unique_key_for_group(new_values, group)
+                && let Some(rowids) = index.get(&key)
+            {
+                conflicts.extend(rowids.iter().copied());
             }
         }
-        conflicts
+        conflicts.into_iter().collect()
     }
 
     /// Allocate a new unique rowid.
@@ -513,23 +518,43 @@ impl MemTable {
         self.next_rowid
     }
 
+    /// Return the exact visible row count.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Return the maximum currently visible rowid.
+    #[must_use]
+    pub fn max_visible_rowid(&self) -> Option<i64> {
+        self.rows.last().map(|row| row.rowid)
+    }
+
     /// Insert a row with the given rowid and values.
     fn insert(&mut self, rowid: i64, values: Vec<SqliteValue>) {
         // Update next_rowid if needed.
         if rowid >= self.next_rowid {
             self.next_rowid = rowid.saturating_add(1);
         }
+        let new_keys = self.unique_keys_for_values(&values);
         if self.rows.last().is_none_or(|row| row.rowid < rowid) {
             self.rows.push(MemRow { rowid, values });
+            self.insert_unique_keys(rowid, &new_keys);
             return;
         }
         // Replace if rowid already exists (UPSERT semantics).
         match self.rows.binary_search_by_key(&rowid, |r| r.rowid) {
             Ok(idx) => {
-                self.rows[idx].values = values;
+                let old_values = {
+                    let row = &mut self.rows[idx];
+                    std::mem::replace(&mut row.values, values)
+                };
+                self.remove_unique_entries(rowid, &old_values);
+                self.insert_unique_keys(rowid, &new_keys);
             }
             Err(idx) => {
                 self.rows.insert(idx, MemRow { rowid, values });
+                self.insert_unique_keys(rowid, &new_keys);
             }
         }
     }
@@ -537,7 +562,8 @@ impl MemTable {
     /// Delete a row by rowid. Returns true if a row was found and deleted.
     pub fn delete_by_rowid(&mut self, rowid: i64) -> bool {
         if let Ok(idx) = self.rows.binary_search_by_key(&rowid, |r| r.rowid) {
-            self.rows.remove(idx);
+            let row = self.rows.remove(idx);
+            self.remove_unique_entries(row.rowid, &row.values);
             true
         } else {
             false
@@ -547,6 +573,9 @@ impl MemTable {
     /// Remove all rows from the table.
     pub fn clear(&mut self) {
         self.rows.clear();
+        for index in &mut self.unique_indexes {
+            index.clear();
+        }
     }
 
     /// Pad all existing rows to have at least `target_cols` columns,
@@ -560,6 +589,7 @@ impl MemTable {
                 row.values.push(default_val.clone());
             }
         }
+        self.rebuild_unique_indexes();
     }
 
     /// Find a row by rowid. Returns the index.
@@ -629,6 +659,73 @@ impl MemTable {
     /// loader. It delegates to the private `insert` method.
     pub fn insert_row(&mut self, rowid: i64, values: Vec<SqliteValue>) {
         self.insert(rowid, values);
+    }
+
+    fn unique_key_for_group(values: &[SqliteValue], group: &[usize]) -> Option<Vec<SqliteValue>> {
+        let mut key = Vec::with_capacity(group.len());
+        for &col_idx in group {
+            let value = values.get(col_idx)?;
+            if matches!(value, SqliteValue::Null) {
+                return None;
+            }
+            key.push(value.clone());
+        }
+        Some(key)
+    }
+
+    fn remove_unique_entries(&mut self, rowid: i64, values: &[SqliteValue]) {
+        for (group, index) in self
+            .unique_column_groups
+            .iter()
+            .zip(&mut self.unique_indexes)
+        {
+            let Some(key) = Self::unique_key_for_group(values, group) else {
+                continue;
+            };
+            let remove_entry = if let Some(rowids) = index.get_mut(&key) {
+                rowids.remove(&rowid);
+                rowids.is_empty()
+            } else {
+                false
+            };
+            if remove_entry {
+                index.remove(&key);
+            }
+        }
+    }
+
+    fn unique_keys_for_values(&self, values: &[SqliteValue]) -> Vec<Option<Vec<SqliteValue>>> {
+        self.unique_column_groups
+            .iter()
+            .map(|group| Self::unique_key_for_group(values, group))
+            .collect()
+    }
+
+    fn insert_unique_keys(&mut self, rowid: i64, keys: &[Option<Vec<SqliteValue>>]) {
+        for (maybe_key, index) in keys.iter().zip(&mut self.unique_indexes) {
+            if let Some(key) = maybe_key {
+                index.entry(key.clone()).or_default().insert(rowid);
+            }
+        }
+    }
+
+    fn rebuild_unique_indexes(&mut self) {
+        self.unique_indexes = self
+            .unique_column_groups
+            .iter()
+            .map(|_| BTreeMap::new())
+            .collect();
+        for row in &self.rows {
+            for (group, index) in self
+                .unique_column_groups
+                .iter()
+                .zip(&mut self.unique_indexes)
+            {
+                if let Some(key) = Self::unique_key_for_group(&row.values, group) {
+                    index.entry(key).or_default().insert(row.rowid);
+                }
+            }
+        }
     }
 }
 
@@ -3194,15 +3291,10 @@ impl MemDbUndoOp {
                 if let Some(table) = db.tables.get_mut(&root_page) {
                     match old_values {
                         Some(values) => {
-                            match table.rows.binary_search_by_key(&rowid, |r| r.rowid) {
-                                Ok(idx) => table.rows[idx].values = values,
-                                Err(idx) => table.rows.insert(idx, MemRow { rowid, values }),
-                            }
+                            table.insert(rowid, values);
                         }
                         None => {
-                            if let Ok(idx) = table.rows.binary_search_by_key(&rowid, |r| r.rowid) {
-                                table.rows.remove(idx);
-                            }
+                            table.delete_by_rowid(rowid);
                         }
                     }
                     table.next_rowid = prev_next_rowid;
@@ -3210,13 +3302,12 @@ impl MemDbUndoOp {
             }
             Self::DeleteRow {
                 root_page,
-                index,
+                index: _,
                 row,
                 prev_next_rowid,
             } => {
                 if let Some(table) = db.tables.get_mut(&root_page) {
-                    let insert_at = index.min(table.rows.len());
-                    table.rows.insert(insert_at, row);
+                    table.insert(row.rowid, row.values);
                     table.next_rowid = prev_next_rowid;
                 }
             }
@@ -3374,7 +3465,7 @@ impl MemDatabase {
             self.push_undo(MemDbUndoOp::ClearTable { root_page, table });
         }
         if let Some(table) = self.tables.get_mut(&root_page) {
-            table.rows.clear();
+            table.clear();
         }
     }
 
@@ -3400,7 +3491,7 @@ impl MemDatabase {
     fn alloc_rowid_concurrent(&mut self, root_page: i32) -> i64 {
         if let Some(table) = self.tables.get_mut(&root_page) {
             let prev_next_rowid = table.next_rowid;
-            let max_visible = table.rows.iter().map(|r| r.rowid).max().unwrap_or(0);
+            let max_visible = table.max_visible_rowid().unwrap_or(0);
             let rowid = max_visible.saturating_add(1);
             table.next_rowid = rowid.saturating_add(1);
             self.push_undo(MemDbUndoOp::BumpRowid {
@@ -3439,6 +3530,7 @@ impl MemDatabase {
             if index < table.rows.len() {
                 let prev_next_rowid = table.next_rowid;
                 let row = table.rows.remove(index);
+                table.remove_unique_entries(row.rowid, &row.values);
                 self.push_undo(MemDbUndoOp::DeleteRow {
                     root_page,
                     index,
@@ -19307,6 +19399,63 @@ mod tests {
         // Both paths read max rowid (11) from B-tree → return 12.
         assert_eq!(rows_serialized, vec![vec![SqliteValue::Integer(12)]]);
         assert_eq!(rows_concurrent, vec![vec![SqliteValue::Integer(12)]]);
+    }
+
+    #[test]
+    fn test_memdb_concurrent_rowid_uses_visible_max_not_stale_counter() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).expect("table should exist");
+        table.insert(10, vec![SqliteValue::Integer(10)]);
+        table.insert(11, vec![SqliteValue::Integer(11)]);
+        assert!(table.delete_by_rowid(11), "max rowid should be removed");
+        table.next_rowid = 1;
+
+        let rowid = db.alloc_rowid_concurrent(root);
+        assert_eq!(rowid, 11, "concurrent rowid should reuse max_visible+1");
+        assert_eq!(
+            db.get_table(root)
+                .expect("table should exist")
+                .next_rowid_hint(),
+            12,
+            "next_rowid should advance from the visible max"
+        );
+    }
+
+    #[test]
+    fn test_memtable_unique_conflict_index_tracks_insert_delete_and_update() {
+        let mut table = MemTable::new(2);
+        table.add_unique_column_group(vec![0]);
+        table.insert(1, vec![SqliteValue::Integer(10), SqliteValue::Integer(100)]);
+        table.insert(2, vec![SqliteValue::Integer(20), SqliteValue::Integer(200)]);
+
+        assert_eq!(
+            table.find_unique_conflicts(&[SqliteValue::Integer(10), SqliteValue::Integer(999)]),
+            vec![1],
+            "lookup should find the conflicting rowid via the unique index"
+        );
+
+        assert!(table.delete_by_rowid(1), "delete should succeed");
+        assert!(
+            table
+                .find_unique_conflicts(&[SqliteValue::Integer(10), SqliteValue::Integer(999)])
+                .is_empty(),
+            "deleted rows must be removed from the unique index"
+        );
+
+        table.insert(2, vec![SqliteValue::Integer(10), SqliteValue::Integer(200)]);
+        assert_eq!(
+            table.find_unique_conflicts(&[SqliteValue::Integer(10), SqliteValue::Integer(999)]),
+            vec![2],
+            "updates must refresh the unique index entry"
+        );
+
+        assert!(
+            table
+                .find_unique_conflicts(&[SqliteValue::Null, SqliteValue::Integer(999)])
+                .is_empty(),
+            "NULL keys must remain non-conflicting under SQLite UNIQUE semantics"
+        );
     }
 
     // ── bd-1yi8: INSERT write-through tests ────────────────────────────

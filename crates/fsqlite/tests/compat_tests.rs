@@ -95,9 +95,9 @@ fn param_value_from_u64_valid() {
 }
 
 #[test]
-fn param_value_from_u64_overflow_clamps() {
+fn param_value_from_u64_overflow_preserves_exact_value() {
     let p: ParamValue = u64::MAX.into();
-    assert_eq!(p.into_inner(), SqliteValue::Integer(i64::MAX));
+    assert_eq!(p.into_inner(), SqliteValue::Text(u64::MAX.to_string().into()));
 }
 
 #[test]
@@ -636,10 +636,10 @@ fn param_slice_to_values_converts_correctly() {
 }
 
 #[test]
-fn param_slice_to_values_with_overflow_clamps() {
+fn param_slice_to_values_with_overflow_preserves_exact_value() {
     let p = [ParamValue::from(u64::MAX)];
     let values = param_slice_to_values(&p);
-    assert_eq!(values[0], SqliteValue::Integer(i64::MAX));
+    assert_eq!(values[0], SqliteValue::Text(u64::MAX.to_string().into()));
 }
 
 // ===========================================================================

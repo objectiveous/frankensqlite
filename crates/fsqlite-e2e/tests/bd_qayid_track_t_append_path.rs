@@ -227,30 +227,34 @@ fn bd_qayid_track_t_append_throughput_probe_emits_metrics() {
     let gapped_rows = interleaved_rowids(10_000);
 
     let temp = tempdir().expect("tempdir");
-    let db_path = temp.path().join("track_t_probe.db");
-    let conn = open_fsqlite(&db_path);
-    conn.execute("CREATE TABLE seq (id INTEGER PRIMARY KEY, val TEXT)")
+    let seq_db_path = temp.path().join("track_t_probe_seq.db");
+    let gap_db_path = temp.path().join("track_t_probe_gap.db");
+    let seq_conn = open_fsqlite(&seq_db_path);
+    let gap_conn = open_fsqlite(&gap_db_path);
+    seq_conn
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .expect("create seq table");
-    conn.execute("CREATE TABLE gap (id INTEGER PRIMARY KEY, val TEXT)")
+    gap_conn
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .expect("create gap table");
 
-    let seq_sql = explicit_row_insert_sql("seq", &sequential_rows);
-    let gap_sql = explicit_row_insert_sql("gap", &gapped_rows);
+    let seq_sql = explicit_row_insert_sql("t", &sequential_rows);
+    let gap_sql = explicit_row_insert_sql("t", &gapped_rows);
 
     let seq_start = Instant::now();
     let (_seq_result, seq_metrics) = capture_vdbe_metrics(|| {
-        conn.execute(&seq_sql).expect("sequential insert");
+        seq_conn.execute(&seq_sql).expect("sequential insert");
     });
     let seq_elapsed = seq_start.elapsed();
 
     let gap_start = Instant::now();
     let (_gap_result, gap_metrics) = capture_vdbe_metrics(|| {
-        conn.execute(&gap_sql).expect("gapped insert");
+        gap_conn.execute(&gap_sql).expect("gapped insert");
     });
     let gap_elapsed = gap_start.elapsed();
 
-    let seq_count = fetch_fsqlite_rows(&conn, "seq").len();
-    let gap_count = fetch_fsqlite_rows(&conn, "gap").len();
+    let seq_count = fetch_fsqlite_rows(&seq_conn, "t").len();
+    let gap_count = fetch_fsqlite_rows(&gap_conn, "t").len();
     assert_eq!(seq_count, sequential_rows.len());
     assert_eq!(gap_count, gapped_rows.len());
     assert!(

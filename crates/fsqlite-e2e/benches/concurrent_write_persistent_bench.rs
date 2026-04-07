@@ -49,6 +49,7 @@ use serde::Serialize;
 const ROWS_PER_THREAD: i64 = 1000;
 /// Maximum retries before giving up on a transaction (applies to both engines).
 const MAX_TXN_RETRIES: u32 = 100;
+const RETRY_BACKOFF: Duration = Duration::from_micros(100);
 const PERSISTENT_PHASE_CAPTURE_DIR_ENV: &str = "FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR";
 const PERSISTENT_PHASE_CAPTURE_PROVENANCE_SCHEMA_V1: &str =
     "fsqlite-e2e.persistent_phase_capture_provenance.v1";
@@ -480,7 +481,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                                 }
                                                 sleep_with_accounting(
                                                     &mut operation_timing,
-                                                    Duration::from_micros(100),
+                                                    RETRY_BACKOFF,
                                                 );
                                             } else {
                                                 panic!("BEGIN failed: {e}");
@@ -524,7 +525,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                                 }
                                                 sleep_with_accounting(
                                                     &mut operation_timing,
-                                                    Duration::from_micros(100),
+                                                    RETRY_BACKOFF,
                                                 );
                                             } else {
                                                 panic!("COMMIT failed: {e}");
@@ -687,12 +688,9 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                                             "BEGIN CONCURRENT failed after {MAX_TXN_RETRIES} retries: {e:?}"
                                                         );
                                                     }
-                                                    let backoff = Duration::from_micros(
-                                                        100 * u64::from(retry_count),
-                                                    );
                                                     sleep_with_accounting(
                                                         &mut operation_timing,
-                                                        backoff,
+                                                        RETRY_BACKOFF,
                                                     );
                                                 } else {
                                                     panic!("BEGIN CONCURRENT failed: {e:?}");
@@ -751,11 +749,9 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                             if retry_count >= MAX_TXN_RETRIES {
                                                 panic!("INSERT failed after {MAX_TXN_RETRIES} retries: {e:?}");
                                             }
-                                            let backoff =
-                                                Duration::from_micros(100 * u64::from(retry_count));
                                             sleep_with_accounting(
                                                 &mut operation_timing,
-                                                backoff,
+                                                RETRY_BACKOFF,
                                             );
                                             continue 'txn;
                                         }
@@ -806,12 +802,9 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                                 if retry_count >= MAX_TXN_RETRIES {
                                                     panic!("COMMIT failed after {MAX_TXN_RETRIES} retries: {e:?}");
                                                 }
-                                                let backoff = Duration::from_micros(
-                                                    100 * u64::from(retry_count),
-                                                );
                                                 sleep_with_accounting(
                                                     &mut operation_timing,
-                                                    backoff,
+                                                    RETRY_BACKOFF,
                                                 );
                                                 // Loop back to BEGIN CONCURRENT
                                             } else {

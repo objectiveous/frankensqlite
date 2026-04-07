@@ -1646,11 +1646,148 @@ impl StripedCounter64 {
     }
 }
 
-/// D1-CRITICAL Change 3: Sharded published pages.
+const ATOMIC_PUBLISHED_PAGE_LIMIT: u32 = 65_535;
+const ATOMIC_PUBLISHED_SLOT_COUNT: usize = 65_535;
+
+/// Direct-index slot for concurrently published pages below
+/// [`ATOMIC_PUBLISHED_PAGE_LIMIT`].
+#[derive(Debug)]
+struct AtomicPublishedPageSlot {
+    present: AtomicBool,
+    page: Mutex<Option<PageData>>,
+}
+
+/// Lock-free-on-miss publication plane for the low page-number hot set.
 ///
-/// Replaces the single `RwLock<HashMap>` with 64 shards to eliminate
-/// publish-side serialization. Each shard is independently locked,
-/// allowing concurrent reads and writes to different page number ranges.
+/// Writes are serialized by [`PublishedPagerState::publish_lock`], so the
+/// atomic state word only needs to coordinate readers with the active writer.
+#[derive(Debug)]
+struct AtomicPublishedPages {
+    slots: Box<[AtomicPublishedPageSlot]>,
+    page_count: AtomicUsize,
+}
+
+impl AtomicPublishedPages {
+    fn new() -> Self {
+        let slots = (0..ATOMIC_PUBLISHED_SLOT_COUNT)
+            .map(|_| AtomicPublishedPageSlot {
+                present: AtomicBool::new(false),
+                page: Mutex::new(None),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            slots,
+            page_count: AtomicUsize::new(0),
+        }
+    }
+
+    #[inline]
+    fn slot_index(page_no: PageNumber) -> Option<usize> {
+        let raw = page_no.get();
+        if raw > ATOMIC_PUBLISHED_PAGE_LIMIT {
+            return None;
+        }
+        usize::try_from(raw.saturating_sub(1)).ok()
+    }
+
+    fn get(&self, page_no: PageNumber) -> Option<PageData> {
+        let idx = Self::slot_index(page_no)?;
+        let slot = &self.slots[idx];
+        if !slot.present.load(AtomicOrdering::Acquire) {
+            return None;
+        }
+        slot.page
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn insert(&self, page_no: PageNumber, page: PageData) -> bool {
+        let Some(idx) = Self::slot_index(page_no) else {
+            return false;
+        };
+        let slot = &self.slots[idx];
+        let mut guard = slot
+            .page
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inserted = guard.is_none();
+        *guard = Some(page);
+        drop(guard);
+        slot.present.store(true, AtomicOrdering::Release);
+        if inserted {
+            self.page_count.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        inserted
+    }
+
+    fn remove(&self, page_no: PageNumber) -> bool {
+        let Some(idx) = Self::slot_index(page_no) else {
+            return false;
+        };
+        let slot = &self.slots[idx];
+        if !slot.present.swap(false, AtomicOrdering::AcqRel) {
+            return false;
+        }
+        let removed = slot
+            .page
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .is_some();
+        if removed {
+            self.page_count.fetch_sub(1, AtomicOrdering::Relaxed);
+        }
+        removed
+    }
+
+    fn clear(&self) {
+        for slot in self.slots.iter() {
+            if slot.present.swap(false, AtomicOrdering::AcqRel) {
+                let _ = slot
+                    .page
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+            }
+        }
+        self.page_count.store(0, AtomicOrdering::Release);
+    }
+
+    fn retain<F>(&self, f: F)
+    where
+        F: Fn(&PageNumber) -> bool,
+    {
+        let mut retained_total = 0_usize;
+        for (idx, slot) in self.slots.iter().enumerate() {
+            if !slot.present.load(AtomicOrdering::Acquire) {
+                continue;
+            }
+            let page_no = PageNumber::new(u32::try_from(idx + 1).unwrap_or(u32::MAX))
+                .expect("atomic publication slot index must map to a valid page number");
+            if f(&page_no) {
+                retained_total = retained_total.saturating_add(1);
+                continue;
+            }
+            if slot.present.swap(false, AtomicOrdering::AcqRel) {
+                let _ = slot
+                    .page
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+            }
+        }
+        self.page_count
+            .store(retained_total, AtomicOrdering::Release);
+    }
+
+    fn len(&self) -> usize {
+        self.page_count.load(AtomicOrdering::Acquire)
+    }
+}
+
+/// Overflow publication plane for pages outside the direct-index atomic range.
 #[derive(Debug)]
 struct ShardedPublishedPages {
     shards: Box<
@@ -1784,6 +1921,82 @@ impl ShardedPublishedPages {
     }
 }
 
+/// Hybrid published-page store: direct-index atomic slots for the hot
+/// `< 64K` page range, plus the legacy sharded overflow map for larger page
+/// numbers.
+#[derive(Debug)]
+struct PublishedPages {
+    atomic: AtomicPublishedPages,
+    overflow: ShardedPublishedPages,
+}
+
+impl PublishedPages {
+    fn new() -> Self {
+        Self {
+            atomic: AtomicPublishedPages::new(),
+            overflow: ShardedPublishedPages::new(),
+        }
+    }
+
+    fn get(&self, page_no: PageNumber) -> Option<PageData> {
+        if AtomicPublishedPages::slot_index(page_no).is_some() {
+            self.atomic.get(page_no)
+        } else {
+            self.overflow.get(page_no)
+        }
+    }
+
+    fn insert(&self, page_no: PageNumber, page: PageData) -> bool {
+        if AtomicPublishedPages::slot_index(page_no).is_some() {
+            self.atomic.insert(page_no, page)
+        } else {
+            self.overflow.insert(page_no, page)
+        }
+    }
+
+    fn remove(&self, page_no: PageNumber) -> bool {
+        if AtomicPublishedPages::slot_index(page_no).is_some() {
+            self.atomic.remove(page_no)
+        } else {
+            self.overflow.remove(page_no)
+        }
+    }
+
+    fn clear(&self) {
+        self.atomic.clear();
+        self.overflow.clear();
+    }
+
+    fn retain<F>(&self, f: F)
+    where
+        F: Fn(&PageNumber) -> bool,
+    {
+        self.atomic.retain(&f);
+        self.overflow.retain(f);
+    }
+
+    fn insert_batch<I>(&self, pages: I)
+    where
+        I: IntoIterator<Item = (PageNumber, PageData)>,
+    {
+        let mut overflow_pages = Vec::new();
+        for (page_no, page) in pages {
+            if AtomicPublishedPages::slot_index(page_no).is_some() {
+                let _ = self.atomic.insert(page_no, page);
+            } else {
+                overflow_pages.push((page_no, page));
+            }
+        }
+        if !overflow_pages.is_empty() {
+            self.overflow.insert_batch(overflow_pages);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.atomic.len().saturating_add(self.overflow.len())
+    }
+}
+
 /// Point-in-time view of the pager metadata publication plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PagerPublishedSnapshot {
@@ -1828,8 +2041,9 @@ struct PublishedPagerState {
     publication_write_count: AtomicU64,
     read_retry_count: StripedCounter64,
     published_page_hits: StripedCounter64,
-    // D1-CRITICAL Change 3: Sharded published pages (64 shards).
-    pages: ShardedPublishedPages,
+    // F2: Hybrid published pages - atomic direct slots for the hot low-page
+    // range, with sharded overflow for large page numbers.
+    pages: PublishedPages,
 }
 
 impl PublishedPagerState {
@@ -1854,7 +2068,7 @@ impl PublishedPagerState {
             publication_write_count: AtomicU64::new(0),
             read_retry_count: StripedCounter64::new(),
             published_page_hits: StripedCounter64::new(),
-            pages: ShardedPublishedPages::new(),
+            pages: PublishedPages::new(),
         }
     }
 
@@ -1916,7 +2130,8 @@ impl PublishedPagerState {
     }
 
     fn try_get_page(&self, page_no: PageNumber) -> Option<PageData> {
-        // D1-CRITICAL Change 3: Use sharded lookup - only locks one shard.
+        // F2: use the hybrid published-page store. Reads in the low-page hot
+        // range avoid shard hashing entirely.
         self.pages.get(page_no)
     }
 
@@ -15684,8 +15899,8 @@ mod tests {
     }
 
     #[test]
-    fn test_sharded_published_pages_len_tracks_insert_remove_clear() {
-        let published_pages = ShardedPublishedPages::new();
+    fn test_published_pages_len_tracks_insert_remove_clear() {
+        let published_pages = PublishedPages::new();
         let page_two = PageNumber::new(2).unwrap();
         let page_three = PageNumber::new(3).unwrap();
 
@@ -15713,16 +15928,16 @@ mod tests {
     }
 
     #[test]
-    fn test_sharded_published_pages_insert_batch_and_retain_track_page_count() {
-        let published_pages = ShardedPublishedPages::new();
+    fn test_published_pages_insert_batch_and_retain_track_page_count() {
+        let published_pages = PublishedPages::new();
         let page_two = PageNumber::new(2).unwrap();
         let page_sixty_five = PageNumber::new(65).unwrap();
-        let page_one_twenty_nine = PageNumber::new(129).unwrap();
+        let page_seventy_thousand = PageNumber::new(70_000).unwrap();
 
         published_pages.insert_batch([
             (page_two, PageData::from_vec(sample_page(0x02))),
             (page_sixty_five, PageData::from_vec(sample_page(0x41))),
-            (page_one_twenty_nine, PageData::from_vec(sample_page(0x81))),
+            (page_seventy_thousand, PageData::from_vec(sample_page(0x81))),
             (page_two, PageData::from_vec(sample_page(0xFF))),
         ]);
 
@@ -15745,7 +15960,7 @@ mod tests {
         );
         assert!(published_pages.get(page_two).is_none());
         assert!(published_pages.get(page_sixty_five).is_some());
-        assert!(published_pages.get(page_one_twenty_nine).is_some());
+        assert!(published_pages.get(page_seventy_thousand).is_some());
     }
 
     #[test]

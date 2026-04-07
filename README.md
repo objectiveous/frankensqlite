@@ -109,7 +109,7 @@ FrankenSQLite is organized as a 27-member Cargo workspace with strict layered de
 | **Storage** | `fsqlite-vfs` | Virtual filesystem trait (Vfs, VfsFile) abstracting all OS operations |
 | | `fsqlite-pager` | Page cache, rollback journal, ARC eviction, dirty page write-back |
 | | `fsqlite-wal` | Write-ahead log: frame append, checkpoint, WAL index, crash recovery |
-| | `fsqlite-mvcc` | MVCC page versioning, snapshot management, conflict detection, garbage collection |
+| | `fsqlite-mvcc` | MVCC page versioning, snapshot management, conflict detection, epoch-based reclamation |
 | | `fsqlite-btree` | B-tree/B+tree: cell parsing, page splitting, overflow chains, cursor navigation |
 | **SQL** | `fsqlite-ast` | Typed AST nodes for all SQL statements and expressions |
 | | `fsqlite-parser` | Hand-written recursive descent parser with Pratt expression parsing |
@@ -339,8 +339,8 @@ Old page versions are reclaimed when no active transaction can see them:
 
 - **GC horizon** = `min(active_snapshot_ids)` across all open transactions (in multi-process mode, `gc_horizon` is an `AtomicU64` in shared memory coordinated across all attached processes)
 - A version is reclaimable if a newer committed version of the same page also falls below the horizon
-- **Epoch-based reclamation** via `commit_seq`: the global commit sequence counter determines when versions fall out of all active snapshots
-- A background task runs every ~1 second, walks version chains, and unlinks reclaimable nodes
+- **Epoch-based reclamation (EBR)** batches retired version slots behind a global epoch counter and active reader pins
+- Commit-time version maintenance prunes unreachable versions, and retired slots are batch-freed once all pinned readers have advanced past the retire epoch
 - During WAL checkpointing, reclaimable frames are copied back to the main database file
 - ARC ghost entries (B1/B2) for pruned versions are cleaned when the GC horizon advances
 
@@ -2526,7 +2526,7 @@ and comparing results. Any intentional divergence is documented and annotated
 with rationale. The canonical contract file is `sqlite_version_contract.toml`.
 
 **Q: How does MVCC garbage collection affect latency?**
-A: In the current core runtime, GC is scheduler-driven from connection activity rather than a dedicated background thread. Old versions are pruned incrementally from the `VersionStore` when the scheduler decides it is time, based on version pressure and active-snapshot horizon.
+A: The current runtime uses epoch-based reclamation rather than a periodic sweep. Commit-time version maintenance prunes unreachable versions, and retired arena slots are batch-freed only after all pinned readers have advanced past the retire epoch, keeping reclamation incremental without a background GC loop.
 
 **Q: What prevents a long-running reader from causing unbounded memory growth?**
 A: A reader that holds a snapshot open for a long time pins all page versions newer than its snapshot, preventing GC from reclaiming them. This is the same tradeoff PostgreSQL makes. In practice, connection timeouts and application-level query deadlines prevent runaway memory growth.

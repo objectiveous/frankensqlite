@@ -4710,6 +4710,8 @@ mod tests {
             retained_autocommit_parks: 0,
             retained_autocommit_flushes: 0,
             retained_autocommit_read_after_write_flushes: 0,
+            retained_autocommit_overlay_hits: 0,
+            retained_autocommit_overlay_misses: 0,
             column_default_evaluation_passes: 2,
             prepared_table_engine_fresh_allocs: 1,
             prepared_table_engine_reuses: 1,
@@ -4817,6 +4819,7 @@ mod tests {
                 make_record_blob_bytes_total: 48,
                 insert_append_count: 0,
                 insert_seek_count: 0,
+                insert_append_hint_clear_count: 0,
                 decoded_value_types: ValueTypeMetricsSnapshot {
                     total_values: 10,
                     nulls: 1,

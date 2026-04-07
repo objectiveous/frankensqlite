@@ -1125,10 +1125,12 @@ dependencies = [
  "fsqlite-error",
  "fsqlite-parser",
  "fsqlite-types",
+ "lru",
  "proptest",
  "serde",
  "serde_json",
  "tracing",
+ "xxhash-rust",
 ]
 
 [[package]]

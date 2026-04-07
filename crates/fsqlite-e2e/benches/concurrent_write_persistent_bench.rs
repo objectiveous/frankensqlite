@@ -11,30 +11,16 @@
 //! - Each writer INSERTs into a DIFFERENT table (guaranteeing different pages)
 //! - File-backed database with WAL mode
 //! - Prepared statements on both sides
+//! - `PRAGMA busy_timeout=0` on both engines so contention is measured by the
+//!   harness rather than hidden inside engine-level sleeps
 //!
 //! Success criterion: FrankenSQLite shows >1.5x throughput over SQLite at N>=4
 //! writers for non-conflicting workloads.  Theoretical improvement is Nx.
 //!
 //! Metrics captured:
 //! - Wall-clock throughput (ops/sec) at each thread count
-//! - Per-thread commit latency histogram (p50, p95, p99, max)
-//! - Conflict/retry count (SQLITE_BUSY retries for C SQLite)
-//!
-//! Results (2026-03-20):
-//! - 2 threads: FrankenSQLite 8.97 Kelem/s vs C SQLite 2.32 Kelem/s (**3.87x faster**)
-//! - 4 threads: FrankenSQLite 8.60 Kelem/s vs C SQLite 2.32 Kelem/s (**3.71x faster**)
-//! - 8 threads: FrankenSQLite 1.58 Kelem/s vs C SQLite 2.36 Kelem/s (0.67x - degraded)
-//! - 16 threads: FrankenSQLite 1.29 Kelem/s vs C SQLite 2.42 Kelem/s (0.53x - degraded)
-//!
-//! The thesis is validated at 2-4 threads. At 8+ threads, internal contention
-//! causes throughput degradation below C SQLite. Investigation needed.
-//!
-//! Fixed issues:
-//! - 16-thread corruption (page 0x00 type flag) - fixed via MVCC snapshot db_size guard
-//!
-//! Remaining issues:
-//! - Performance degrades at 8+ threads (internal lock contention suspected)
-//! - p50 latency increases dramatically at higher thread counts
+//! - Per-operation commit-stage latency histogram (p50, p99, max)
+//! - Conflict/retry event count and affected-operation rate
 //!
 //! Optional machine-readable capture:
 //! - Set `FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR=/path/to/dir`
@@ -52,10 +38,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use fsqlite::{FrankenError, SqliteValue};
 use fsqlite_e2e::persistent_phase_audit::{
-    PersistentLatencySummary, PersistentOperationTiming, PersistentOperationWallTimeAudit,
-    PersistentRetryStageCounts, build_measured_commit_sub_buckets, build_operation_wall_time_audit,
-    format_operation_wall_time_audit, percentile, persistent_latency_summary,
-    sleep_with_accounting,
+    PersistentLatencySummary, PersistentMeasuredCommitSubBuckets, PersistentOperationTiming,
+    PersistentOperationWallTimeAudit, PersistentRetryStageCounts,
+    build_measured_commit_sub_buckets, build_operation_wall_time_audit,
+    format_operation_wall_time_audit, persistent_latency_summary, sleep_with_accounting,
 };
 use fsqlite_wal::ConsolidationMetricsSnapshot;
 use serde::Serialize;
@@ -66,8 +52,8 @@ const MAX_TXN_RETRIES: u32 = 100;
 const PERSISTENT_PHASE_CAPTURE_DIR_ENV: &str = "FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR";
 const PERSISTENT_PHASE_CAPTURE_PROVENANCE_SCHEMA_V1: &str =
     "fsqlite-e2e.persistent_phase_capture_provenance.v1";
-const PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V2: &str =
-    "fsqlite-e2e.persistent_phase_capture_sample.v2";
+const PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V3: &str =
+    "fsqlite-e2e.persistent_phase_capture_sample.v3";
 
 // ─── PRAGMA helpers ─────────────────────────────────────────────────────
 
@@ -82,6 +68,7 @@ fn apply_setup_pragmas_fsqlite(conn: &fsqlite::Connection) {
         "PRAGMA journal_mode = WAL;",
         "PRAGMA synchronous = NORMAL;",
         "PRAGMA cache_size = -64000;",
+        "PRAGMA busy_timeout = 0;",
         "PRAGMA fsqlite.concurrent_mode = ON;",
     ] {
         run_fsqlite_pragma(conn, pragma);
@@ -93,6 +80,7 @@ fn apply_session_pragmas_fsqlite(conn: &fsqlite::Connection) {
         "PRAGMA journal_mode = WAL;",
         "PRAGMA synchronous = NORMAL;",
         "PRAGMA cache_size = -64000;",
+        "PRAGMA busy_timeout = 0;",
         "PRAGMA fsqlite.concurrent_mode = ON;",
     ] {
         run_fsqlite_pragma(conn, pragma);
@@ -148,6 +136,20 @@ fn criterion_config() -> Criterion {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct PersistentBenchmarkMetrics {
+    total_ops: u64,
+    run_wall_ms: u64,
+    throughput_ops_per_sec: f64,
+    transaction_latency_us: PersistentLatencySummary,
+    commit_latency_us: PersistentLatencySummary,
+    contention_event_count: u64,
+    contention_events_per_op: f64,
+    operations_with_contention: u64,
+    contention_operation_rate_percent: f64,
+    operation_wall_time_audit: PersistentOperationWallTimeAudit,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct PersistentPhaseCaptureProvenance {
     schema_version: &'static str,
     benchmark: &'static str,
@@ -168,17 +170,105 @@ struct PersistentPhaseCaptureSample {
     timestamp_unix_ms: u64,
     benchmark_group: String,
     engine: &'static str,
-    counter_name: &'static str,
-    counter_value: u64,
+    contention_label: &'static str,
     concurrency: usize,
     rows_per_thread: i64,
     total_rows: u64,
-    latency_us: PersistentLatencySummary,
-    operation_wall_time_audit: Option<PersistentOperationWallTimeAudit>,
+    metrics: PersistentBenchmarkMetrics,
     phase_metrics: Option<ConsolidationMetricsSnapshot>,
     phase_timing_report: Option<String>,
     flusher_lock_wait_fraction_basis_points: Option<u64>,
     lock_topology_limited: Option<bool>,
+}
+
+fn duration_ms_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        return 0.0;
+    }
+    numerator as f64 / denominator as f64
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn throughput_ops_per_sec(total_ops: u64, run_wall: Duration) -> f64 {
+    let seconds = run_wall.as_secs_f64();
+    if seconds <= f64::EPSILON {
+        return 0.0;
+    }
+    total_ops as f64 / seconds
+}
+
+fn collect_sorted_latencies(
+    operation_timings: &[PersistentOperationTiming],
+    bucket: impl Fn(&PersistentOperationTiming) -> Duration,
+    skip_zero: bool,
+) -> Vec<Duration> {
+    let mut latencies: Vec<Duration> = operation_timings.iter().map(bucket).collect();
+    if skip_zero {
+        latencies.retain(|latency| !latency.is_zero());
+    }
+    latencies.sort();
+    latencies
+}
+
+fn build_benchmark_metrics(
+    total_ops: u64,
+    run_wall: Duration,
+    operation_timings: &[PersistentOperationTiming],
+    retry_stage_counts: PersistentRetryStageCounts,
+    measured_commit_sub_buckets: Option<PersistentMeasuredCommitSubBuckets>,
+    contention_event_count: u64,
+    operations_with_contention: u64,
+) -> PersistentBenchmarkMetrics {
+    let transaction_latencies =
+        collect_sorted_latencies(operation_timings, |timing| timing.wall_time, false);
+    let commit_latencies =
+        collect_sorted_latencies(operation_timings, |timing| timing.commit_roundtrip, true);
+    let operation_wall_time_audit = build_operation_wall_time_audit(
+        operation_timings,
+        retry_stage_counts,
+        measured_commit_sub_buckets,
+    );
+
+    PersistentBenchmarkMetrics {
+        total_ops,
+        run_wall_ms: duration_ms_u64(run_wall),
+        throughput_ops_per_sec: throughput_ops_per_sec(total_ops, run_wall),
+        transaction_latency_us: persistent_latency_summary(&transaction_latencies),
+        commit_latency_us: persistent_latency_summary(&commit_latencies),
+        contention_event_count,
+        contention_events_per_op: ratio(contention_event_count, total_ops),
+        operations_with_contention,
+        contention_operation_rate_percent: ratio(operations_with_contention, total_ops) * 100.0,
+        operation_wall_time_audit,
+    }
+}
+
+fn log_benchmark_metrics(
+    engine_label: &str,
+    n_threads: usize,
+    contention_label: &str,
+    metrics: &PersistentBenchmarkMetrics,
+) {
+    eprintln!(
+        "[{engine_label} {n_threads}t] throughput={:.2} ops/s, txn_p50={}us, txn_p99={}us, commit_p50={}us, commit_p99={}us, {}_events={}, {}_events/op={:.3}, impacted_ops={}/{} ({:.2}%)",
+        metrics.throughput_ops_per_sec,
+        metrics.transaction_latency_us.p50_us,
+        metrics.transaction_latency_us.p99_us,
+        metrics.commit_latency_us.p50_us,
+        metrics.commit_latency_us.p99_us,
+        contention_label,
+        metrics.contention_event_count,
+        contention_label,
+        metrics.contention_events_per_op,
+        metrics.operations_with_contention,
+        metrics.total_ops,
+        metrics.contention_operation_rate_percent,
+    );
 }
 
 fn persistent_phase_capture_dir() -> Option<PathBuf> {
@@ -302,7 +392,8 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                             "PRAGMA page_size = 4096;\
                              PRAGMA journal_mode = WAL;\
                              PRAGMA synchronous = NORMAL;\
-                             PRAGMA cache_size = -64000;",
+                             PRAGMA cache_size = -64000;\
+                             PRAGMA busy_timeout = 0;",
                         )
                         .unwrap();
                     // Create separate tables for each thread
@@ -311,9 +402,11 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                     }
                 }
                 let retry_count = Arc::new(AtomicU64::new(0));
-                (tmp, path, retry_count)
+                let operations_with_retries = Arc::new(AtomicU64::new(0));
+                (tmp, path, retry_count, operations_with_retries)
             },
-            |(_tmp, path, retry_count)| {
+            |(_tmp, path, retry_count, operations_with_retries)| {
+                let run_started = Instant::now();
                 let barrier = Arc::new(Barrier::new(n_threads));
                 let operation_timings: Arc<Vec<std::sync::Mutex<Vec<PersistentOperationTiming>>>> =
                     Arc::new(
@@ -334,12 +427,16 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                         let p = path.clone();
                         let bar = barrier.clone();
                         let retries = retry_count.clone();
+                        let ops_with_retries = operations_with_retries.clone();
                         let op_timings = operation_timings.clone();
                         let per_thread_retry_stages = retry_stage_counts.clone();
                         thread::spawn(move || {
                             let conn = rusqlite::Connection::open(&p).unwrap();
                             conn.execute_batch(
-                                "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
+                                "PRAGMA journal_mode=WAL;\
+                                 PRAGMA synchronous=NORMAL;\
+                                 PRAGMA cache_size=-64000;\
+                                 PRAGMA busy_timeout=0;",
                             )
                             .unwrap();
                             let insert_stmt = insert_sql(tid);
@@ -435,6 +532,9 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                         }
                                     }
                                 }
+                                if begin_retries > 0 || commit_retries > 0 {
+                                    ops_with_retries.fetch_add(1, Ordering::Relaxed);
+                                }
                                 operation_timing.wall_time = start.elapsed();
                                 op_timings[tid].lock().unwrap().push(operation_timing);
                             }
@@ -445,9 +545,11 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                 for h in handles {
                     h.join().unwrap();
                 }
+                let run_wall = run_started.elapsed();
 
                 // Report metrics
                 let total_retries = retry_count.load(Ordering::Relaxed);
+                let operations_with_retries = operations_with_retries.load(Ordering::Relaxed);
                 let flattened_operation_timings: Vec<PersistentOperationTiming> = operation_timings
                     .iter()
                     .flat_map(|m| m.lock().unwrap().clone())
@@ -459,43 +561,31 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                         acc
                     },
                 );
-                let mut all_latencies: Vec<Duration> = flattened_operation_timings
-                    .iter()
-                    .map(|timing| timing.wall_time)
-                    .collect();
-                all_latencies.sort();
-                let operation_wall_time_audit =
-                    build_operation_wall_time_audit(
-                        &flattened_operation_timings,
-                        retry_stage_counts,
-                        None,
-                    );
-
-                let p50 = percentile(&all_latencies, 50.0);
-                let p95 = percentile(&all_latencies, 95.0);
-                let p99 = percentile(&all_latencies, 99.0);
-                let max = all_latencies.last().copied().unwrap_or(Duration::ZERO);
-
-                eprintln!(
-                    "[C SQLite {n_threads}t] retries={total_retries}, p50={:?}, p95={:?}, p99={:?}, max={:?}",
-                    p50, p95, p99, max
+                let metrics = build_benchmark_metrics(
+                    total_rows,
+                    run_wall,
+                    &flattened_operation_timings,
+                    retry_stage_counts,
+                    None,
+                    total_retries,
+                    operations_with_retries,
                 );
+
+                log_benchmark_metrics("C SQLite", n_threads, "retry", &metrics);
                 eprintln!(
                     "[C SQLite {n_threads}t wall audit] {}",
-                    format_operation_wall_time_audit(&operation_wall_time_audit)
+                    format_operation_wall_time_audit(&metrics.operation_wall_time_audit)
                 );
                 maybe_write_persistent_phase_capture(&PersistentPhaseCaptureSample {
-                    schema_version: PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V2,
+                    schema_version: PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V3,
                     timestamp_unix_ms: unix_timestamp_ms(),
                     benchmark_group: format!("{label}/csqlite_concurrent_persistent"),
                     engine: "sqlite3",
-                    counter_name: "retries",
-                    counter_value: total_retries,
+                    contention_label: "retry",
                     concurrency: n_threads,
                     rows_per_thread: ROWS_PER_THREAD,
                     total_rows,
-                    latency_us: persistent_latency_summary(&all_latencies),
-                    operation_wall_time_audit: Some(operation_wall_time_audit),
+                    metrics,
                     phase_metrics: None,
                     phase_timing_report: None,
                     flusher_lock_wait_fraction_basis_points: None,
@@ -521,9 +611,11 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                     }
                 }
                 let conflict_count = Arc::new(AtomicU64::new(0));
-                (tmp, path, conflict_count)
+                let operations_with_conflicts = Arc::new(AtomicU64::new(0));
+                (tmp, path, conflict_count, operations_with_conflicts)
             },
-            |(_tmp, path, conflict_count)| {
+            |(_tmp, path, conflict_count, operations_with_conflicts)| {
+                let run_started = Instant::now();
                 let barrier = Arc::new(Barrier::new(n_threads));
                 let operation_timings: Arc<Vec<std::sync::Mutex<Vec<PersistentOperationTiming>>>> =
                     Arc::new(
@@ -544,6 +636,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                         let p = path.clone();
                         let bar = barrier.clone();
                         let conflicts = conflict_count.clone();
+                        let ops_with_conflicts = operations_with_conflicts.clone();
                         let op_timings = operation_timings.clone();
                         let per_thread_retry_stages = retry_stage_counts.clone();
                         thread::spawn(move || {
@@ -728,6 +821,9 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                     }
                                 }
 
+                                if retry_count > 0 {
+                                    ops_with_conflicts.fetch_add(1, Ordering::Relaxed);
+                                }
                                 operation_timing.wall_time = start.elapsed();
                                 op_timings[tid].lock().unwrap().push(operation_timing);
                             }
@@ -738,9 +834,11 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                 for h in handles {
                     h.join().unwrap();
                 }
+                let run_wall = run_started.elapsed();
 
                 // Report metrics
                 let total_conflicts = conflict_count.load(Ordering::Relaxed);
+                let operations_with_conflicts = operations_with_conflicts.load(Ordering::Relaxed);
                 let flattened_operation_timings: Vec<PersistentOperationTiming> = operation_timings
                     .iter()
                     .flat_map(|m| m.lock().unwrap().clone())
@@ -752,31 +850,21 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                         acc
                     },
                 );
-                let mut all_latencies: Vec<Duration> = flattened_operation_timings
-                    .iter()
-                    .map(|timing| timing.wall_time)
-                    .collect();
-                all_latencies.sort();
-
-                let p50 = percentile(&all_latencies, 50.0);
-                let p95 = percentile(&all_latencies, 95.0);
-                let p99 = percentile(&all_latencies, 99.0);
-                let max = all_latencies.last().copied().unwrap_or(Duration::ZERO);
-
-                eprintln!(
-                    "[FrankenSQLite {n_threads}t] conflicts={total_conflicts}, p50={:?}, p95={:?}, p99={:?}, max={:?}",
-                    p50, p95, p99, max
-                );
 
                 // Print phase timing report from group commit metrics
                 let metrics = fsqlite_wal::GLOBAL_CONSOLIDATION_METRICS.snapshot();
                 let has_phase_metrics = metrics.total_commits() > 0;
                 let measured_commit_sub_buckets = build_measured_commit_sub_buckets(&metrics);
-                let operation_wall_time_audit = build_operation_wall_time_audit(
+                let benchmark_metrics = build_benchmark_metrics(
+                    total_rows,
+                    run_wall,
                     &flattened_operation_timings,
                     retry_stage_counts,
-                    measured_commit_sub_buckets.clone(),
+                    measured_commit_sub_buckets,
+                    total_conflicts,
+                    operations_with_conflicts,
                 );
+                log_benchmark_metrics("FrankenSQLite", n_threads, "conflict", &benchmark_metrics);
                 let phase_timing_report = has_phase_metrics.then(|| metrics.phase_timing_report());
                 if has_phase_metrics {
                     eprintln!(
@@ -803,20 +891,20 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                 }
                 eprintln!(
                     "[FrankenSQLite {n_threads}t wall audit] {}",
-                    format_operation_wall_time_audit(&operation_wall_time_audit)
+                    format_operation_wall_time_audit(
+                        &benchmark_metrics.operation_wall_time_audit
+                    )
                 );
                 maybe_write_persistent_phase_capture(&PersistentPhaseCaptureSample {
-                    schema_version: PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V2,
+                    schema_version: PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V3,
                     timestamp_unix_ms: unix_timestamp_ms(),
                     benchmark_group: format!("{label}/frankensqlite_concurrent_persistent"),
                     engine: "fsqlite_mvcc",
-                    counter_name: "conflicts",
-                    counter_value: total_conflicts,
+                    contention_label: "conflict",
                     concurrency: n_threads,
                     rows_per_thread: ROWS_PER_THREAD,
                     total_rows,
-                    latency_us: persistent_latency_summary(&all_latencies),
-                    operation_wall_time_audit: Some(operation_wall_time_audit),
+                    metrics: benchmark_metrics,
                     phase_metrics: has_phase_metrics.then_some(metrics.clone()),
                     phase_timing_report,
                     flusher_lock_wait_fraction_basis_points:

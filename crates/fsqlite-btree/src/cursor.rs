@@ -2568,6 +2568,41 @@ enum BinarySearchResult {
 }
 
 impl<P: PageWriter> BtCursor<P> {
+    fn free_subtree_pages(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+        let page_data = self.pager.read_page_data(cx, page_no)?;
+        let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
+        if header.page_type.is_interior() {
+            let header_offset = cell::header_offset_for_page(page_no);
+            let ptrs = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
+            for ptr in ptrs {
+                let cell = CellRef::parse(
+                    page_data.as_bytes(),
+                    usize::from(ptr),
+                    header.page_type,
+                    self.usable_size,
+                )?;
+                let left_child = cell
+                    .left_child
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "interior page {} cell is missing left child",
+                            page_no.get()
+                        ),
+                    })?;
+                self.free_subtree_pages(cx, left_child)?;
+            }
+
+            let right_child = header
+                .right_child
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!("interior page {} is missing right child", page_no.get()),
+                })?;
+            self.free_subtree_pages(cx, right_child)?;
+        }
+
+        self.pager.free_page(cx, page_no)
+    }
+
     fn seed_empty_root_leaf_cursor(&mut self, cx: &Cx) -> Result<bool> {
         self.collapse_empty_table_root_if_needed(cx)?;
 
@@ -2592,6 +2627,35 @@ impl<P: PageWriter> BtCursor<P> {
         if root_entry.header.page_type.is_leaf() || self.count_all_rows_iterative(cx)? != 0 {
             return Ok(());
         }
+
+        for &ptr in &root_entry.cell_pointers {
+            let cell = CellRef::parse(
+                root_entry.page_data.as_bytes(),
+                usize::from(ptr),
+                root_entry.header.page_type,
+                self.usable_size,
+            )?;
+            let left_child = cell
+                .left_child
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "empty interior root {} has divider without left child",
+                        self.root_page.get()
+                    ),
+                })?;
+            self.free_subtree_pages(cx, left_child)?;
+        }
+        let right_child =
+            root_entry
+                .header
+                .right_child
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "empty interior root {} is missing right child",
+                        self.root_page.get()
+                    ),
+                })?;
+        self.free_subtree_pages(cx, right_child)?;
 
         let header_offset = cell::header_offset_for_page(self.root_page);
         let mut page = vec![0u8; self.page_size as usize];
@@ -4223,7 +4287,7 @@ impl<P: PageWriter> BtCursor<P> {
             return Err(FrankenError::internal("cursor stack is empty"));
         }
 
-        let mut insert_idx = {
+        let insert_idx = {
             let top = self
                 .stack
                 .last()
@@ -4238,52 +4302,29 @@ impl<P: PageWriter> BtCursor<P> {
         // Take cell_buf for reuse so repeated inserts preserve allocation capacity.
         let mut cell_data = std::mem::take(&mut self.cell_buf);
         let overflow_head = self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)?;
-        let mut attempted_compaction = false;
-
-        loop {
-            match self.try_insert_on_leaf(cx, insert_idx, &cell_data) {
-                Ok(true) => {
-                    self.cell_buf = cell_data;
+        match self.try_insert_on_leaf(cx, insert_idx, &cell_data) {
+            Ok(true) => {
+                self.cell_buf = cell_data;
+                self.last_insert_rowid = Some(rowid);
+                return Ok(());
+            }
+            Ok(false) => {
+                instrumentation::record_conservative_reload_fallback();
+                let balance_result = self.balance_for_insert(cx, &cell_data, insert_idx);
+                self.cell_buf = cell_data;
+                if balance_result.is_ok() {
                     self.last_insert_rowid = Some(rowid);
-                    return Ok(());
+                } else if let Some(first) = overflow_head {
+                    let _ = self.free_overflow_chain(cx, first);
                 }
-                Ok(false) => {
-                    if !attempted_compaction
-                        && self.current_table_leaf_needs_compaction()
-                        && self.compact_current_table_leaf(cx)?
-                    {
-                        attempted_compaction = true;
-                        insert_idx = {
-                            let top = self
-                                .stack
-                                .last()
-                                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
-                            if self.at_eof {
-                                top.header.cell_count
-                            } else {
-                                top.cell_idx
-                            }
-                        };
-                        continue;
-                    }
-
-                    instrumentation::record_conservative_reload_fallback();
-                    let balance_result = self.balance_for_insert(cx, &cell_data, insert_idx);
-                    self.cell_buf = cell_data;
-                    if balance_result.is_ok() {
-                        self.last_insert_rowid = Some(rowid);
-                    } else if let Some(first) = overflow_head {
-                        let _ = self.free_overflow_chain(cx, first);
-                    }
-                    return balance_result;
+                return balance_result;
+            }
+            Err(error) => {
+                self.cell_buf = cell_data;
+                if let Some(first) = overflow_head {
+                    let _ = self.free_overflow_chain(cx, first);
                 }
-                Err(error) => {
-                    self.cell_buf = cell_data;
-                    if let Some(first) = overflow_head {
-                        let _ = self.free_overflow_chain(cx, first);
-                    }
-                    return Err(error);
-                }
+                return Err(error);
             }
         }
     }
@@ -4546,30 +4587,14 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         observe_cursor_cancellation(cx)?;
         self.stack.clear();
         self.at_eof = true;
-        if self.is_table && self.count_all_rows_iterative(cx)? == 0 {
-            self.collapse_empty_table_root_if_needed(cx)?;
-            return Ok(false);
-        }
-        let found = self.move_to_leftmost_leaf(cx, self.root_page, true)?;
-        if !found {
-            self.collapse_empty_table_root_if_needed(cx)?;
-        }
-        Ok(found)
+        self.move_to_leftmost_leaf(cx, self.root_page, true)
     }
 
     fn last(&mut self, cx: &Cx) -> Result<bool> {
         observe_cursor_cancellation(cx)?;
         self.stack.clear();
         self.at_eof = true;
-        if self.is_table && self.count_all_rows_iterative(cx)? == 0 {
-            self.collapse_empty_table_root_if_needed(cx)?;
-            return Ok(false);
-        }
-        let found = self.move_to_rightmost_leaf(cx, self.root_page, true)?;
-        if !found {
-            self.collapse_empty_table_root_if_needed(cx)?;
-        }
-        Ok(found)
+        self.move_to_rightmost_leaf(cx, self.root_page, true)
     }
 
     fn next(&mut self, cx: &Cx) -> Result<bool> {
@@ -7930,6 +7955,59 @@ mod tests {
             "remaining right subtree should still be reachable"
         );
         assert_eq!(cursor.rowid(&cx).unwrap(), 20);
+    }
+
+    #[test]
+    fn test_empty_root_collapse_reclaims_detached_child_subtree_pages() {
+        const SMALL_USABLE: u32 = 512;
+
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, root, SMALL_USABLE, true);
+
+        for rowid in 1_i64..=200_i64 {
+            cursor.table_insert(&cx, rowid, &vec![b'R'; 180]).unwrap();
+        }
+
+        let root_page = cursor.pager.pages.get(&root.get()).unwrap();
+        let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+        assert!(
+            root_header.page_type.is_interior(),
+            "test requires an interior root before delete-all cleanup"
+        );
+
+        for rowid in 1_i64..=200_i64 {
+            let seek = cursor.table_move_to(&cx, rowid).unwrap();
+            assert!(seek.is_found(), "row {rowid} should exist before delete");
+            cursor.delete(&cx).unwrap();
+        }
+
+        assert!(
+            !cursor.first(&cx).unwrap(),
+            "delete-all cleanup should leave an empty tree"
+        );
+
+        let root_page = cursor.pager.pages.get(&root.get()).unwrap();
+        let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+        assert!(
+            root_header.page_type == cell::BtreePageType::LeafTable,
+            "empty root cleanup should rewrite the root as a leaf"
+        );
+
+        let all_pages: BTreeSet<u32> = cursor.pager.pages.keys().copied().collect();
+        let mut reachable = BTreeSet::new();
+        collect_reachable_pages(&cursor.pager, root, SMALL_USABLE, &mut reachable);
+
+        assert_eq!(
+            all_pages,
+            BTreeSet::from([root.get()]),
+            "empty root cleanup should reclaim detached child pages"
+        );
+        assert_eq!(
+            reachable, all_pages,
+            "no unreachable pages should remain after collapsing the empty root"
+        );
     }
 
     #[test]

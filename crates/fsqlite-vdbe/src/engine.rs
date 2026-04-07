@@ -10827,11 +10827,12 @@ impl VdbeEngine {
     #[inline(always)]
     fn execute_make_record_hot(&mut self, op: &VdbeOp, collect_vdbe_metrics: bool) {
         let target = op.p3;
+        let n_cols = usize::try_from(op.p2).unwrap_or(0);
         let mut rec_buf = std::mem::take(&mut self.make_record_buf);
         {
             let this = &*self;
             match &op.p4 {
-                P4::PrecomputedHeader(header) => {
+                P4::PrecomputedHeader(header) if header.column_count() == n_cols => {
                     let null_placeholder = SqliteValue::Null;
                     let make_iter = || {
                         header
@@ -10858,6 +10859,18 @@ impl VdbeEngine {
                         );
                     }
                 }
+                // The opcode's p1..p1+p2-1 register range is the source of
+                // truth for OP_MakeRecord. If cached header metadata drifts
+                // from that shape, fall back to the generic path instead of
+                // serializing the wrong number of columns.
+                P4::PrecomputedHeader(_) => {
+                    let iter = (0..n_cols).map(move |i| {
+                        #[allow(clippy::cast_possible_wrap)]
+                        let reg = op.p1 + i as i32;
+                        this.get_reg(reg)
+                    });
+                    fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
+                }
                 P4::Affinity(aff) => {
                     let null_placeholder = SqliteValue::Null;
                     let iter = aff.chars().enumerate().map(|(i, ch)| {
@@ -10872,7 +10885,6 @@ impl VdbeEngine {
                     fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
                 }
                 _ => {
-                    let n_cols = usize::try_from(op.p2).unwrap_or(0);
                     let iter = (0..n_cols).map(move |i| {
                         #[allow(clippy::cast_possible_wrap)]
                         let reg = op.p1 + i as i32;
@@ -18314,6 +18326,45 @@ mod tests {
                 SqliteValue::Integer(5),
                 SqliteValue::Float(2.5),
             ]
+        );
+    }
+
+    #[test]
+    fn test_make_record_precomputed_header_falls_back_on_column_count_mismatch() {
+        let precomputed = fsqlite_types::record::PrecomputedRecordHeader::new(&[
+            fsqlite_types::record::PrecomputedSerialTypeKind::IntegerOrNull,
+            fsqlite_types::record::PrecomputedSerialTypeKind::IntegerOrNull,
+            fsqlite_types::record::PrecomputedSerialTypeKind::IntegerOrNull,
+        ]);
+
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_a = b.alloc_reg();
+            let r_b = b.alloc_reg();
+            let r_c = b.alloc_reg();
+            let r_record = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 11, r_a, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 22, r_b, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 33, r_c, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::MakeRecord,
+                r_a,
+                2,
+                r_record,
+                P4::PrecomputedHeader(precomputed),
+                0,
+            );
+            b.emit_op(Opcode::ResultRow, r_record, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        let decoded = decode_record(&rows[0][0]).expect("record should decode");
+        assert_eq!(
+            decoded,
+            vec![SqliteValue::Integer(11), SqliteValue::Integer(22)],
+            "stale precomputed headers must not widen the record shape",
         );
     }
 

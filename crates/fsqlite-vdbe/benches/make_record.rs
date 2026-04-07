@@ -2,6 +2,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use fsqlite_types::opcode::{Opcode, P4};
 use fsqlite_types::record::{PrecomputedRecordHeader, PrecomputedSerialTypeKind, serialize_record};
 use fsqlite_types::value::SqliteValue;
+use fsqlite_types::{Cx, PageSize};
 use fsqlite_vdbe::ProgramBuilder;
 use fsqlite_vdbe::engine::{VdbeEngine, set_vdbe_jit_enabled};
 
@@ -61,9 +62,8 @@ fn bench_make_record_fixed_schema(c: &mut Criterion) {
         let row = fixed_schema_row(column_count);
         let header = integer_header(column_count);
         let record_bytes = u64::try_from(serialize_record(&row).len()).unwrap_or(u64::MAX);
-        let total_bytes = record_bytes
-            .checked_mul(u64::try_from(MAKE_RECORD_REPEATS).unwrap_or(0))
-            .unwrap_or(u64::MAX);
+        let total_bytes =
+            record_bytes.saturating_mul(u64::try_from(MAKE_RECORD_REPEATS).unwrap_or(0));
         group.throughput(Throughput::Bytes(total_bytes));
 
         let generic_program =
@@ -72,7 +72,12 @@ fn bench_make_record_fixed_schema(c: &mut Criterion) {
             BenchmarkId::new("generic", column_count),
             &generic_program,
             |b, program| {
-                let mut engine = VdbeEngine::new(program.register_count());
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
                 b.iter(|| {
                     let outcome = engine
                         .execute(program)
@@ -86,7 +91,12 @@ fn bench_make_record_fixed_schema(c: &mut Criterion) {
             BenchmarkId::new("precomputed_header", column_count),
             &build_make_record_program(column_count, P4::PrecomputedHeader(header)),
             |b, program| {
-                let mut engine = VdbeEngine::new(program.register_count());
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
                 b.iter(|| {
                     let outcome = engine
                         .execute(program)

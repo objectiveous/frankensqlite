@@ -3686,10 +3686,7 @@ impl<P: PageWriter> BtCursor<P> {
                                 self.stack.clear();
                                 self.at_eof = true;
                                 self.store_rightmost_leaf_cache_from_page(
-                                    cx,
-                                    new_pgno,
-                                    rowid,
-                                    depth,
+                                    cx, new_pgno, rowid, depth,
                                 )?;
                                 return Ok(());
                             }
@@ -5094,9 +5091,7 @@ impl<P: PageWriter> BtCursor<P> {
                 self.cell_buf = cell_data;
                 match fallback_result {
                     Ok(inserted) => {
-                        if !inserted
-                            && let Some(first) = overflow_head
-                        {
+                        if !inserted && let Some(first) = overflow_head {
                             self.free_overflow_chain(cx, first)?;
                         }
                         Ok(inserted)
@@ -9413,6 +9408,7 @@ mod tests {
             .table_cached_rightmost_leaf_hint()
             .expect("seed insert should capture a retained rightmost-leaf hint");
         let mut observed_split = false;
+        let mut inserted_through = 1_i64;
 
         for rowid in 2..=32_i64 {
             let before = crate::instrumentation::btree_copy_profile_snapshot();
@@ -9427,6 +9423,7 @@ mod tests {
                     .expect("cached rightmost-leaf helper should handle split fallback"),
                 "helper should not need a second append API when the hinted leaf fills"
             );
+            inserted_through = rowid;
 
             let after = crate::instrumentation::btree_copy_profile_snapshot();
             if hint.leaf_page() != previous_leaf {
@@ -9449,9 +9446,9 @@ mod tests {
         );
 
         assert!(cursor.first(&cx).unwrap());
-        for expected_rowid in 1..=32_i64 {
+        for expected_rowid in 1..=inserted_through {
             assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
-            if expected_rowid < 32 {
+            if expected_rowid < inserted_through {
                 assert!(cursor.next(&cx).unwrap());
             }
         }

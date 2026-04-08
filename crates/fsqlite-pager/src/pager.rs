@@ -2141,7 +2141,10 @@ impl PublishedPagerState {
     }
 
     fn page_plane_visible_commit_seq(&self) -> CommitSeq {
-        CommitSeq::new(self.page_plane_visible_commit_seq.load(AtomicOrdering::Acquire))
+        CommitSeq::new(
+            self.page_plane_visible_commit_seq
+                .load(AtomicOrdering::Acquire),
+        )
     }
 
     // D1-CRITICAL Change 3: Operation-specific publish methods using sharded pages.
@@ -5468,7 +5471,8 @@ where
         let single_connection_fast_path = self.single_connection_fast_path_enabled();
         let read_start = Instant::now();
         let mut published_retry_count = 0_usize;
-        while self.published.page_plane_visible_commit_seq() == self.published_visible_commit_seq.get()
+        while self.published.page_plane_visible_commit_seq()
+            == self.published_visible_commit_seq.get()
         {
             let snapshot = self.published.snapshot();
             if page_no.get() > snapshot.db_size {
@@ -5494,10 +5498,8 @@ where
                 if published_retry_count >= PUBLISHED_READ_FAST_RETRY_LIMIT {
                     break;
                 }
-                self.published.wait_for_sequence_change(
-                    snapshot.snapshot_gen,
-                    PUBLISHED_SNAPSHOT_WAIT_SLICE,
-                );
+                self.published
+                    .wait_for_sequence_change(snapshot.snapshot_gen, PUBLISHED_SNAPSHOT_WAIT_SLICE);
                 published_retry_count = published_retry_count.saturating_add(1);
                 continue;
             }
@@ -5526,10 +5528,8 @@ where
                 if published_retry_count >= PUBLISHED_READ_FAST_RETRY_LIMIT {
                     break;
                 }
-                self.published.wait_for_sequence_change(
-                    snapshot.snapshot_gen,
-                    PUBLISHED_SNAPSHOT_WAIT_SLICE,
-                );
+                self.published
+                    .wait_for_sequence_change(snapshot.snapshot_gen, PUBLISHED_SNAPSHOT_WAIT_SLICE);
                 published_retry_count = published_retry_count.saturating_add(1);
                 continue;
             }

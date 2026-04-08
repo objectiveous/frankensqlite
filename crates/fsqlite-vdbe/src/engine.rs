@@ -435,10 +435,13 @@ fn configure_btree_cursor_page_size<P>(
 // row store without requiring the full B-tree + pager + VFS stack.
 
 /// A row in an in-memory table: (rowid, column values).
+pub type MemRowValues = Vec<SqliteValue>;
+
+/// A row in an in-memory table: (rowid, column values).
 #[derive(Debug, Clone, PartialEq)]
 struct MemRow {
     rowid: i64,
-    values: Vec<SqliteValue>,
+    values: MemRowValues,
 }
 
 /// In-memory table storage (Phase 4 backend).
@@ -531,7 +534,11 @@ impl MemTable {
     }
 
     /// Insert a row with the given rowid and values.
-    fn insert(&mut self, rowid: i64, values: Vec<SqliteValue>) {
+    fn insert<V>(&mut self, rowid: i64, values: V)
+    where
+        V: Into<MemRowValues>,
+    {
+        let values = values.into();
         // Update next_rowid if needed.
         if rowid >= self.next_rowid {
             self.next_rowid = rowid.saturating_add(1);
@@ -657,7 +664,10 @@ impl MemTable {
     ///
     /// This is the public entry point used by the compat persistence
     /// loader. It delegates to the private `insert` method.
-    pub fn insert_row(&mut self, rowid: i64, values: Vec<SqliteValue>) {
+    pub fn insert_row<V>(&mut self, rowid: i64, values: V)
+    where
+        V: Into<MemRowValues>,
+    {
         self.insert(rowid, values);
     }
 
@@ -3267,7 +3277,7 @@ enum MemDbUndoOp {
         root_page: i32,
         rowid: i64,
         prev_next_rowid: i64,
-        old_values: Option<Vec<SqliteValue>>,
+        old_values: Option<MemRowValues>,
     },
     DeleteRow {
         root_page: i32,
@@ -3520,7 +3530,11 @@ impl MemDatabase {
         }
     }
 
-    pub fn upsert_row(&mut self, root_page: i32, rowid: i64, values: Vec<SqliteValue>) {
+    pub fn upsert_row<V>(&mut self, root_page: i32, rowid: i64, values: V)
+    where
+        V: Into<MemRowValues>,
+    {
+        let values = values.into();
         if let Some(table) = self.tables.get_mut(&root_page) {
             let prev_next_rowid = table.next_rowid;
             // Use binary search (O(log n)) instead of linear scan (O(n))
@@ -5125,7 +5139,7 @@ enum PendingUpdateRestore {
     Mem {
         root_page: i32,
         rowid: i64,
-        values: Vec<SqliteValue>,
+        values: MemRowValues,
     },
 }
 
@@ -19928,7 +19942,7 @@ mod tests {
         let db = engine.take_database().expect("database should exist");
         let table = db.get_table(root).expect("table should exist");
         assert_eq!(table.rows.len(), 1);
-        assert_eq!(table.rows[0].values, vec![SqliteValue::Integer(10)]);
+        assert_eq!(table.rows[0].values.as_slice(), &[SqliteValue::Integer(10)]);
     }
 
     #[test]
@@ -19971,7 +19985,7 @@ mod tests {
         let db = engine.take_database().expect("database should exist");
         let table = db.get_table(root).expect("table should exist");
         assert_eq!(table.rows.len(), 1);
-        assert_eq!(table.rows[0].values, vec![SqliteValue::Integer(10)]);
+        assert_eq!(table.rows[0].values.as_slice(), &[SqliteValue::Integer(10)]);
     }
 
     // ── bd-2a3y: TransactionPageIo / SharedTxnPageIo integration tests ──

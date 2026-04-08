@@ -9,7 +9,6 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
-
 use crate::shm::{
     SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion,
     WAL_TOTAL_LOCKS,
@@ -489,9 +488,38 @@ impl VfsFile for MemoryFile {
     #[allow(clippy::significant_drop_tightening)]
     fn write_page_batch(&mut self, cx: &Cx, writes: &[(u64, &[u8])]) -> Result<()> {
         checkpoint_or_abort(cx)?;
+        if writes.is_empty() {
+            return Ok(());
+        }
         let mut storage = self.storage.lock().map_err(|_| lock_err())?;
-        for (offset, data) in writes {
-            Self::write_into_storage(&mut storage, data, *offset)?;
+
+        if writes.len() == 1 {
+            let (offset, data) = writes[0];
+            return Self::write_into_storage(&mut storage, data, offset);
+        }
+
+        let mut normalized_writes = Vec::with_capacity(writes.len());
+        let mut required_len = storage.data.len();
+        for &(offset, data) in writes {
+            let offset = u64_to_usize(offset, "write offset")?;
+            let end = offset.checked_add(data.len()).ok_or_else(|| {
+                FrankenError::Io(std::io::Error::other("write offset + length overflow"))
+            })?;
+            required_len = required_len.max(end);
+            normalized_writes.push((offset, data));
+        }
+
+        if required_len > storage.data.len() {
+            storage.data.resize(required_len, 0);
+        }
+
+        for (offset, data) in normalized_writes {
+            let end = offset + data.len();
+            if end == storage.data.len() && offset == storage.data.len() - data.len() {
+                storage.data[offset..].copy_from_slice(data);
+            } else {
+                storage.data[offset..end].copy_from_slice(data);
+            }
         }
         Ok(())
     }

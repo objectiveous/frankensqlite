@@ -319,6 +319,71 @@ fn manual_profile_bench_shape_prepared_direct_insert_1000() {
 }
 
 #[test]
+#[ignore = "manual perf probe for sequential_inserts autocommit prepared direct insert shape"]
+fn manual_profile_simple_prepared_direct_insert_autocommit_512() {
+    const ROW_COUNT: i64 = 512;
+    const CREATE_TABLE: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)";
+    const INSERT_SQL: &str = "INSERT INTO t VALUES (?1, 'val')";
+
+    let _profile_guard = FastPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute(CREATE_TABLE).unwrap();
+    let stmt = conn.prepare(INSERT_SQL).unwrap();
+
+    reset_hot_path_profile();
+    let started = std::time::Instant::now();
+    for i in 0..ROW_COUNT {
+        stmt.execute_with_params(&[fsqlite_types::SqliteValue::Integer(i)])
+            .unwrap();
+    }
+    let wall = started.elapsed();
+    let profile = hot_path_profile_snapshot();
+
+    let rows = conn.query("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(
+        rows[0].values()[0],
+        fsqlite_types::SqliteValue::Integer(ROW_COUNT)
+    );
+
+    eprintln!(
+        concat!(
+            "[manual_simple_autocommit_insert_512] wall_us={} execute_body_us={} ",
+            "schema_validation_us={} row_build_us={} cursor_setup_us={} ",
+            "serialize_us={} btree_insert_us={} memdb_apply_us={} ",
+            "change_tracking_us={} autocommit_begin_us={} autocommit_resolve_us={} ",
+            "commit_roundtrip_us={} commit_finalize_us={} commit_handle_finalize_us={} ",
+            "commit_post_write_us={} finalize_post_publish_us={} commit_refreshes={} ",
+            "memory_fast_begins={} cached_write_reuses={} cached_write_parks={} ",
+            "publication_refreshes={} direct_execs={} autocommit_execs={} fast_execs={}"
+        ),
+        wall.as_micros(),
+        profile.execute_body_time_ns / 1_000,
+        profile.prepared_direct_insert_schema_validation_time_ns / 1_000,
+        profile.prepared_direct_insert_row_build_time_ns / 1_000,
+        profile.prepared_direct_insert_cursor_setup_time_ns / 1_000,
+        profile.prepared_direct_insert_serialize_time_ns / 1_000,
+        profile.prepared_direct_insert_btree_insert_time_ns / 1_000,
+        profile.prepared_direct_insert_memdb_apply_time_ns / 1_000,
+        profile.prepared_direct_insert_change_tracking_time_ns / 1_000,
+        profile.prepared_direct_insert_autocommit_begin_time_ns / 1_000,
+        profile.prepared_direct_insert_autocommit_resolve_time_ns / 1_000,
+        profile.commit_txn_roundtrip_time_ns / 1_000,
+        profile.commit_finalize_seq_time_ns / 1_000,
+        profile.commit_handle_finalize_time_ns / 1_000,
+        profile.commit_post_write_maintenance_time_ns / 1_000,
+        profile.finalize_post_publish_time_ns / 1_000,
+        profile.commit_refresh_count,
+        profile.memory_autocommit_fast_path_begins,
+        profile.cached_write_txn_reuses,
+        profile.cached_write_txn_parks,
+        profile.pager_publication_refreshes,
+        profile.prepared_direct_insert_executions,
+        profile.prepared_direct_insert_autocommit_executions,
+        profile.parser.fast_path_executions,
+    );
+}
+
+#[test]
 #[ignore = "manual perf probe for full operation_baseline_bench batch insert lifecycle"]
 fn manual_profile_full_op_batch_insert_1000_lifecycle() {
     const ROW_COUNT: i64 = 1_000;

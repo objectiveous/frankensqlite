@@ -449,6 +449,14 @@ const MAX_PROBE_LENGTH: usize = 32;
 /// Minimum flat-table capacity (power of 2). Covers ~2 800 pages at 70%
 /// load (≈ 11 MiB at 4 KiB pages).
 const FLAT_SLOTS_MIN_CAPACITY: usize = 4096;
+/// Maximum eagerly allocated flat-table capacity.
+///
+/// The page-buffer pool ceiling is a lazy upper bound used to avoid spurious
+/// OOMs on large databases; it is not the steady-state hot set. Keep the
+/// lock-free front-cache bounded so connection open does not scale with the
+/// configured maximum buffer count while overflow shards still absorb the cold
+/// tail.
+const FLAT_SLOTS_TARGET_CAPACITY: usize = 16_384;
 
 // ---------------------------------------------------------------------------
 // FastPageArray (bd-fzr07)
@@ -1099,11 +1107,14 @@ impl ShardedPageCache {
         let shards: Box<[Mutex<PageCacheShard>; SHARD_COUNT]> =
             Box::new(std::array::from_fn(|_| Mutex::new(PageCacheShard::new())));
 
-        // Flat table capacity: 2× pool capacity ensures ≤50% load factor.
+        // Bound the lock-free front-cache to a reasonable hot set. The pool
+        // ceiling is a lazy upper bound; eagerly allocating one flat slot per
+        // potential page buffer makes connection open scale with configured
+        // capacity instead of actual working set.
         let flat_capacity = pool
             .capacity()
             .saturating_mul(2)
-            .max(FLAT_SLOTS_MIN_CAPACITY);
+            .clamp(FLAT_SLOTS_MIN_CAPACITY, FLAT_SLOTS_TARGET_CAPACITY);
 
         Self {
             flat_slots: FlatPageSlots::new(flat_capacity),
@@ -3656,6 +3667,17 @@ mod tests {
                 "bead_id={BEAD_FZR07} case=single_connection_data"
             );
         });
+    }
+
+    #[test]
+    fn test_sharded_cache_caps_eager_flat_slot_capacity() {
+        let cache = ShardedPageCache::with_max_buffers(PageSize::DEFAULT, DEFAULT_PAGE_BUFFER_MAX);
+
+        assert_eq!(
+            cache.flat_slots.slots.len(),
+            FLAT_SLOTS_TARGET_CAPACITY,
+            "flat-slot front-cache should stay bounded even when the buffer pool ceiling is large"
+        );
     }
 
     #[test]

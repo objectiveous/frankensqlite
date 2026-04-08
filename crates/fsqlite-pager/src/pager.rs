@@ -5,7 +5,7 @@
 //! Full concurrent MVCC behavior is layered on top in Phase 6.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{
     AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
@@ -2953,7 +2953,7 @@ where
                 memory_db_bump_alloc,
                 rolled_back_pages: HashSet::new(),
                 txn_read_cache: RefCell::new(HashMap::new()),
-                retained_committed_pages_unflushed: false,
+                retained_memory_overlay_dirty_pages: BTreeSet::new(),
             });
         }
 
@@ -3118,7 +3118,7 @@ where
             memory_db_bump_alloc,
             rolled_back_pages: HashSet::new(),
             txn_read_cache: RefCell::new(HashMap::new()),
-            retained_committed_pages_unflushed: false,
+            retained_memory_overlay_dirty_pages: BTreeSet::new(),
         })
     }
 
@@ -3892,6 +3892,19 @@ where
         })
     }
 
+    /// Enable the single-connection cache fast path when this pager is still
+    /// uniquely owned.
+    ///
+    /// Returns `true` when the cache could be mutated in place and `false`
+    /// when the cache `Arc` was already shared.
+    pub fn enable_single_connection_cache_fast_path(&mut self) -> bool {
+        let Some(cache) = Arc::get_mut(&mut self.cache) else {
+            return false;
+        };
+        cache.enable_fast_path();
+        true
+    }
+
     /// Open a database in true read-only mode for fast analytical queries.
     ///
     /// Unlike [`open_with_cx`], this:
@@ -4358,9 +4371,11 @@ pub struct SimpleTransaction<V: Vfs> {
     /// Only used in WAL mode where the published snapshot fast path is
     /// defeated by constant commit_seq advancement.
     txn_read_cache: RefCell<HashMap<PageNumber, PageData>>,
-    /// Tracks whether retained `:memory:` metadata-only commits deferred their
-    /// backing-storage flush into `txn_read_cache` for amortized final flush.
-    retained_committed_pages_unflushed: bool,
+    /// Committed page images whose backing-store flush was intentionally
+    /// deferred for the private `:memory:` retained-autocommit fast path.
+    /// These pages stay authoritative in `txn_read_cache` until a real
+    /// release boundary flushes them once.
+    retained_memory_overlay_dirty_pages: BTreeSet<PageNumber>,
 }
 
 impl<V: Vfs> traits::sealed::Sealed for SimpleTransaction<V> {}
@@ -4666,39 +4681,102 @@ impl<V: Vfs> SimpleTransaction<V> {
             .publish_single_connection_metadata_update(cx, update, clear_pages);
     }
 
+    fn note_retained_memory_overlay_from_write_set(&mut self) {
+        self.retained_memory_overlay_dirty_pages
+            .extend(self.write_pages_sorted.iter().copied());
+    }
+
+    fn materialize_retained_memory_overlay_into_write_set(&mut self) -> Result<()> {
+        if self.retained_memory_overlay_dirty_pages.is_empty() {
+            return Ok(());
+        }
+
+        let overlay_page_nos: Vec<PageNumber> = self
+            .retained_memory_overlay_dirty_pages
+            .iter()
+            .copied()
+            .filter(|page_no| !self.write_set.contains_key(page_no))
+            .collect();
+        if overlay_page_nos.is_empty() {
+            return Ok(());
+        }
+
+        let overlay_pages = {
+            let txn_read_cache = self.txn_read_cache.borrow();
+            overlay_page_nos
+                .into_iter()
+                .map(|page_no| {
+                    let page = txn_read_cache.get(&page_no).cloned().ok_or_else(|| {
+                        FrankenError::internal(format!(
+                            "retained memory overlay missing authoritative page {}",
+                            page_no.get()
+                        ))
+                    })?;
+                    Ok((page_no, page))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        for (page_no, page) in overlay_pages {
+            insert_staged_page(
+                &mut self.write_set,
+                &mut self.write_pages_sorted,
+                page_no,
+                StagedPage::from_page_data_for_pool(&self.pool, page)?,
+            );
+        }
+        Ok(())
+    }
+
+    fn collect_retained_memory_overlay_pages(&self) -> Result<Vec<(PageNumber, PageData)>> {
+        if self.retained_memory_overlay_dirty_pages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let txn_read_cache = self.txn_read_cache.borrow();
+        self.retained_memory_overlay_dirty_pages
+            .iter()
+            .copied()
+            .map(|page_no| {
+                let page = txn_read_cache.get(&page_no).cloned().ok_or_else(|| {
+                    FrankenError::internal(format!(
+                        "retained memory overlay missing authoritative page {}",
+                        page_no.get()
+                    ))
+                })?;
+                Ok((page_no, page))
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
+    fn flush_retained_memory_overlay_pages_to_db_file(
+        cx: &Cx,
+        inner: &mut PagerInner<V::File>,
+        original_db_size: u32,
+        overlay_pages: &[(PageNumber, PageData)],
+    ) -> Result<()> {
+        if overlay_pages.is_empty() {
+            return Ok(());
+        }
+        let page_size_bytes = u64::from(inner.page_size.get());
+        let mut batched_writes: SmallVec<[(u64, &[u8]); 8]> =
+            SmallVec::with_capacity(overlay_pages.len());
+        for (page_no, page) in overlay_pages {
+            let offset = u64::from(page_no.get() - 1) * page_size_bytes;
+            batched_writes.push((offset, page.as_bytes()));
+        }
+        inner.db_file.write_page_batch(cx, batched_writes.as_slice())?;
+        inner.committed_db_file_size_bytes =
+            u64::from(original_db_size) * u64::from(inner.page_size.get());
+        Ok(())
+    }
+
     fn retain_committed_pages_in_txn_read_cache(&mut self) {
         let mut txn_read_cache = self.txn_read_cache.borrow_mut();
         for (page_no, staged) in self.write_set.drain() {
             txn_read_cache.insert(page_no, staged.into_published_page());
         }
         self.write_pages_sorted.clear();
-    }
-
-    fn flush_retained_committed_pages_to_storage(
-        cx: &Cx,
-        inner: &mut PagerInner<V::File>,
-        txn_read_cache: &RefCell<HashMap<PageNumber, PageData>>,
-        retained_committed_pages_unflushed: &mut bool,
-    ) -> Result<()> {
-        if !*retained_committed_pages_unflushed {
-            return Ok(());
-        }
-        let page_size_bytes = u64::from(inner.page_size.get());
-        let txn_read_cache = txn_read_cache.borrow();
-        let mut batched_writes: SmallVec<[(u64, &[u8]); 8]> =
-            SmallVec::with_capacity(txn_read_cache.len());
-        for (&page_no, page_data) in txn_read_cache.iter() {
-            if page_no.get() > inner.db_size {
-                continue;
-            }
-            let offset = u64::from(page_no.get() - 1) * page_size_bytes;
-            batched_writes.push((offset, page_data.as_bytes()));
-        }
-        if !batched_writes.is_empty() {
-            inner.db_file.write_page_batch(cx, batched_writes.as_slice())?;
-        }
-        *retained_committed_pages_unflushed = false;
-        Ok(())
     }
 
     /// Publish a new committed-state snapshot while the pager inner lock is still held.
@@ -5809,19 +5887,17 @@ where
             self.finished = true;
             return Ok(());
         }
+        if self.vfs.is_memory()
+            && self.memory_db_bump_alloc
+            && !self.retained_memory_overlay_dirty_pages.is_empty()
+        {
+            self.materialize_retained_memory_overlay_into_write_set()?;
+        }
         if !self.has_pending_writes() {
             let mut inner = self
                 .inner
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-            if self.vfs.is_memory() {
-                Self::flush_retained_committed_pages_to_storage(
-                    cx,
-                    &mut inner,
-                    &self.txn_read_cache,
-                    &mut self.retained_committed_pages_unflushed,
-                )?;
-            }
             // Return any unused lease pages.
             return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
@@ -5862,14 +5938,6 @@ where
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         // Return any unused lease pages before computing committed db_size.
         return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
-        if self.vfs.is_memory() {
-            Self::flush_retained_committed_pages_to_storage(
-                cx,
-                &mut inner,
-                &self.txn_read_cache,
-                &mut self.retained_committed_pages_unflushed,
-            )?;
-        }
 
         let committed_db_size = self.committed_db_size_with_inner(&inner);
         // Declared outside the block so it survives to Phase C where freed
@@ -6121,7 +6189,7 @@ where
                     }
                 }
             }
-            self.retained_committed_pages_unflushed = false;
+            self.retained_memory_overlay_dirty_pages.clear();
             self.committed = true;
             self.finished = true;
         } else {
@@ -6162,23 +6230,37 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
-
-        let committed_db_size = self.committed_db_size_with_inner(&inner);
+        let mut committed_db_size = self.committed_db_size_with_inner(&inner);
         // Compute freelist_dirty BEFORE draining freed_pages, because
         // predicted_durable_freelist_pages_with_inner reads self.freed_pages.
-        let freelist_dirty_for_retain =
+        let mut freelist_dirty_for_retain =
             self.freelist_metadata_dirty_with_inner(&inner, committed_db_size);
-        let single_connection_fast_path = self.single_connection_fast_path_enabled();
-        let metadata_only_single_connection_fast_path = single_connection_fast_path
+        let mut single_connection_fast_path = self.single_connection_fast_path_enabled();
+        let mut metadata_only_single_connection_fast_path = single_connection_fast_path
             && !freelist_dirty_for_retain
             && !self.write_set.contains_key(&PageNumber::ONE);
-        if !metadata_only_single_connection_fast_path {
-            Self::flush_retained_committed_pages_to_storage(
-                cx,
-                &mut inner,
-                &self.txn_read_cache,
-                &mut self.retained_committed_pages_unflushed,
-            )?;
+        let mut defer_private_memory_flush =
+            self.memory_db_bump_alloc && metadata_only_single_connection_fast_path;
+        if self.vfs.is_memory()
+            && self.memory_db_bump_alloc
+            && !defer_private_memory_flush
+            && !self.retained_memory_overlay_dirty_pages.is_empty()
+        {
+            drop(inner);
+            self.materialize_retained_memory_overlay_into_write_set()?;
+            inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+            committed_db_size = self.committed_db_size_with_inner(&inner);
+            freelist_dirty_for_retain =
+                self.freelist_metadata_dirty_with_inner(&inner, committed_db_size);
+            single_connection_fast_path = self.single_connection_fast_path_enabled();
+            metadata_only_single_connection_fast_path = single_connection_fast_path
+                && !freelist_dirty_for_retain
+                && !self.write_set.contains_key(&PageNumber::ONE);
+            defer_private_memory_flush =
+                self.memory_db_bump_alloc && metadata_only_single_connection_fast_path;
         }
         // CRITICAL FIX (beads_rust#138): Drain freed_pages AFTER dirty check
         // but do NOT push into inner.freelist. Pass to serializer as
@@ -6281,21 +6363,33 @@ where
                 };
                 result
             } else if self.vfs.is_memory() {
-                // bd-wwqen.3: :memory: retained-commit fast path.
-                // Skip journal creation, pre-image backup, sync, and deletion.
-                // In the isolated metadata-only case, the retained writer is
-                // the sole authority and will keep the committed page image in
-                // txn_read_cache for the next statement. Defer the backing
-                // storage flush until the retained writer is finally released,
-                // amortizing the MemoryVfs page-copy cost across the whole
-                // autocommit burst instead of paying it per statement.
-                if !metadata_only_single_connection_fast_path {
+                if defer_private_memory_flush {
+                    // For a real private `:memory:` database, a retained
+                    // single-connection metadata-only commit does not need to
+                    // rewrite the VFS backing store on every row. Keep the
+                    // committed page image in `txn_read_cache` and flush once
+                    // when the retained writer is actually released.
+                    Ok(())
+                } else {
+                    // bd-wwqen.3: :memory: retained-commit fast path.
+                    // Skip journal creation, pre-image backup, sync, and deletion.
+                    // Batch dirty-page flushes through the VFS so MemoryFile can
+                    // hold its backing-storage lock once for the whole retained
+                    // commit. Keep the staged pages in the write set for the later
+                    // publish step so the flush path avoids an eager drain/move of
+                    // the whole staging map on every autocommit write.
                     let page_size_bytes = u64::from(inner.page_size.get());
                     let mut flushed_db_size = inner.db_size;
                     let write_result = {
                         let mut batched_writes: SmallVec<[(u64, &[u8]); 8]> =
-                            SmallVec::with_capacity(self.write_set.len());
-                        for (&page_no, staged) in &self.write_set {
+                            SmallVec::with_capacity(self.write_pages_sorted.len());
+                        for &page_no in &self.write_pages_sorted {
+                            let staged = self.write_set.get(&page_no).ok_or_else(|| {
+                                FrankenError::internal(format!(
+                                    "write_set missing staged page {} referenced by write_pages_sorted",
+                                    page_no.get()
+                                ))
+                            })?;
                             let offset = u64::from(page_no.get() - 1) * page_size_bytes;
                             batched_writes.push((offset, staged.as_page_bytes()));
                             flushed_db_size = flushed_db_size.max(page_no.get());
@@ -6309,8 +6403,8 @@ where
                         return Err(e);
                     }
                     inner.db_size = flushed_db_size;
+                    Ok(())
                 }
-                Ok(())
             } else {
                 Self::commit_journal(
                     cx,
@@ -6357,9 +6451,15 @@ where
             }
             drop(inner);
             if metadata_only_single_connection_fast_path {
+                if defer_private_memory_flush {
+                    self.note_retained_memory_overlay_from_write_set();
+                } else {
+                    self.retained_memory_overlay_dirty_pages.clear();
+                }
                 self.publish_single_connection_metadata_only(cx, publish_update);
                 self.retain_committed_pages_in_txn_read_cache();
             } else {
+                self.retained_memory_overlay_dirty_pages.clear();
                 self.publish_committed_state_draining_write_set(cx, publish_update);
             }
 
@@ -6373,8 +6473,6 @@ where
             if !metadata_only_single_connection_fast_path {
                 self.txn_read_cache.borrow_mut().clear();
             }
-            self.retained_committed_pages_unflushed = metadata_only_single_connection_fast_path
-                && self.journal_mode != JournalMode::Wal;
             self.original_db_size = committed_db_size;
             self.published_visible_commit_seq
                 .set(publish_update.visible_commit_seq);
@@ -6472,6 +6570,24 @@ where
     fn rollback(&mut self, cx: &Cx) -> Result<()> {
         if self.finished {
             return Ok(());
+        }
+        if self.vfs.is_memory()
+            && self.memory_db_bump_alloc
+            && !self.retained_memory_overlay_dirty_pages.is_empty()
+        {
+            let overlay_pages = self.collect_retained_memory_overlay_pages()?;
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+            Self::flush_retained_memory_overlay_pages_to_db_file(
+                cx,
+                &mut inner,
+                self.original_db_size,
+                &overlay_pages,
+            )?;
+            drop(inner);
+            self.retained_memory_overlay_dirty_pages.clear();
         }
         self.write_set.clear();
         self.write_pages_sorted.clear();
@@ -16116,7 +16232,35 @@ mod tests {
         assert_eq!(
             reader.get_page(&cx, p).unwrap().as_ref()[0],
             0x22,
-            "bead_id={BEAD_ID} case=single_connection_commit_and_retain_final_commit_flushes_deferred_page_bytes"
+            "bead_id={BEAD_ID} case=single_connection_commit_and_retain_release_preserves_committed_visibility"
+        );
+    }
+
+    #[test]
+    fn test_single_connection_commit_and_retain_rollback_preserves_last_committed_page() {
+        init_publication_test_tracing();
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+        let shared_connection_count = Arc::new(AtomicUsize::new(1));
+        pager.bind_shared_connection_count(Arc::clone(&shared_connection_count));
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p, &vec![0x31; ps]).unwrap();
+        assert!(
+            txn.commit_and_retain(&cx).unwrap(),
+            "bead_id={BEAD_ID} case=single_connection_commit_and_retain_should_retain_writer_before_rollback"
+        );
+
+        txn.write_page(&cx, p, &vec![0x7A; ps]).unwrap();
+        txn.rollback(&cx).unwrap();
+
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            reader.get_page(&cx, p).unwrap().as_ref()[0],
+            0x31,
+            "bead_id={BEAD_ID} case=single_connection_commit_and_retain_rollback_keeps_last_committed_page"
         );
     }
 

@@ -22,8 +22,13 @@
 
 use fsqlite_error::FrankenError;
 use fsqlite_types::value::SqliteValue;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::Connection;
+
+const MIGRATION_BUSY_RETRY_BACKOFF: Duration = Duration::from_millis(2);
+const MIGRATION_BUSY_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A single schema migration with a version number, descriptive name, and SQL to execute.
 #[derive(Debug, Clone)]
@@ -163,6 +168,18 @@ impl MigrationRunner {
     /// Returns `true` when this connection actually applied the migration and
     /// `false` when another connection finished it first.
     fn apply_one(conn: &Connection, migration: &Migration) -> Result<bool, FrankenError> {
+        let started = Instant::now();
+        loop {
+            match Self::apply_one_once(conn, migration) {
+                Err(FrankenError::Busy) if started.elapsed() < MIGRATION_BUSY_RETRY_TIMEOUT => {
+                    thread::sleep(MIGRATION_BUSY_RETRY_BACKOFF);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn apply_one_once(conn: &Connection, migration: &Migration) -> Result<bool, FrankenError> {
         conn.execute("BEGIN IMMEDIATE;")?;
         let result = (|| -> Result<bool, FrankenError> {
             if Self::version_is_applied(conn, migration.version)? {

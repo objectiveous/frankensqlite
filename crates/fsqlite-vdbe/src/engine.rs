@@ -11271,11 +11271,18 @@ impl VdbeEngine {
                                 }
                             })
                     };
-                    if !serialize_record_iter_with_precomputed_header_into(
-                        make_iter(),
-                        header,
-                        &mut rec_buf,
-                    ) {
+                    let used_integer_fast_path = n_cols >= 4
+                        && crate::make_record_simd::try_serialize_integer_record_iter_into(
+                            make_iter(),
+                            &mut rec_buf,
+                        );
+                    if !used_integer_fast_path
+                        && !serialize_record_iter_with_precomputed_header_into(
+                            make_iter(),
+                            header,
+                            &mut rec_buf,
+                        )
+                    {
                         fsqlite_types::record::serialize_record_iter_into(
                             make_iter(),
                             &mut rec_buf,
@@ -11292,7 +11299,16 @@ impl VdbeEngine {
                         let reg = op.p1 + i as i32;
                         this.get_reg(reg)
                     });
-                    fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
+                    if n_cols >= 4
+                        && crate::make_record_simd::try_serialize_integer_record_iter_into(
+                            iter.clone(),
+                            &mut rec_buf,
+                        )
+                    {
+                        // Integer-only row used the SIMD/scalar fixed-width fast path.
+                    } else {
+                        fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
+                    }
                 }
                 P4::Affinity(aff) => {
                     let null_placeholder = SqliteValue::Null;
@@ -11305,7 +11321,16 @@ impl VdbeEngine {
                             this.get_reg(reg)
                         }
                     });
-                    fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
+                    if n_cols >= 4
+                        && crate::make_record_simd::try_serialize_integer_record_iter_into(
+                            iter.clone(),
+                            &mut rec_buf,
+                        )
+                    {
+                        // Integer-only row used the SIMD/scalar fixed-width fast path.
+                    } else {
+                        fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
+                    }
                 }
                 _ => {
                     let iter = (0..n_cols).map(move |i| {
@@ -11313,7 +11338,16 @@ impl VdbeEngine {
                         let reg = op.p1 + i as i32;
                         this.get_reg(reg)
                     });
-                    fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
+                    if n_cols >= 4
+                        && crate::make_record_simd::try_serialize_integer_record_iter_into(
+                            iter.clone(),
+                            &mut rec_buf,
+                        )
+                    {
+                        // Integer-only row used the SIMD/scalar fixed-width fast path.
+                    } else {
+                        fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
+                    }
                 }
             }
         }

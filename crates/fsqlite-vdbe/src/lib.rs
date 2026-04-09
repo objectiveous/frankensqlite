@@ -14,6 +14,7 @@ pub mod codegen;
 pub mod engine;
 pub mod frame;
 pub mod jit;
+mod make_record_simd;
 #[cfg(test)]
 mod repro_delete_skip;
 pub mod vectorized;

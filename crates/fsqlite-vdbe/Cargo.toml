@@ -62,5 +62,68 @@ harness = false
 name = "make_record"
 harness = false
 
-[lints]
-workspace = true
+# Cannot inherit workspace lints because workspace forbids unsafe_code
+# and the SIMD MakeRecord helper requires a tightly scoped unsafe island.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cast_lossless = { level = "allow", priority = 1 }
+cast_possible_truncation = { level = "allow", priority = 1 }
+cast_possible_wrap = { level = "allow", priority = 1 }
+cast_precision_loss = { level = "allow", priority = 1 }
+cast_sign_loss = { level = "allow", priority = 1 }
+doc_markdown = { level = "allow", priority = 1 }
+missing_const_for_fn = { level = "allow", priority = 1 }
+missing_errors_doc = { level = "allow", priority = 1 }
+missing_panics_doc = { level = "allow", priority = 1 }
+module_name_repetitions = { level = "allow", priority = 1 }
+must_use_candidate = { level = "allow", priority = 1 }
+option_if_let_else = { level = "allow", priority = 1 }
+significant_drop_tightening = { level = "allow", priority = 1 }
+similar_names = { level = "allow", priority = 1 }
+too_many_lines = { level = "allow", priority = 1 }
+unreadable_literal = { level = "allow", priority = 1 }
+uninlined_format_args = { level = "allow", priority = 1 }
+assertions_on_constants = { level = "allow", priority = 1 }
+bool_to_int_with_if = { level = "allow", priority = 1 }
+case_sensitive_file_extension_comparisons = { level = "allow", priority = 1 }
+collection_is_never_read = { level = "allow", priority = 1 }
+explicit_iter_loop = { level = "allow", priority = 1 }
+float_cmp = { level = "allow", priority = 1 }
+format_push_string = { level = "allow", priority = 1 }
+if_then_some_else_none = { level = "allow", priority = 1 }
+let_and_return = { level = "allow", priority = 1 }
+many_single_char_names = { level = "allow", priority = 1 }
+manual_range_contains = { level = "allow", priority = 1 }
+needless_collect = { level = "allow", priority = 1 }
+needless_pass_by_value = { level = "allow", priority = 1 }
+no_effect_underscore_binding = { level = "allow", priority = 1 }
+redundant_clone = { level = "allow", priority = 1 }
+redundant_closure_for_method_calls = { level = "allow", priority = 1 }
+return_self_not_must_use = { level = "allow", priority = 1 }
+single_char_pattern = { level = "allow", priority = 1 }
+single_match = { level = "allow", priority = 1 }
+stable_sort_primitive = { level = "allow", priority = 1 }
+used_underscore_binding = { level = "allow", priority = 1 }
+useless_format = { level = "allow", priority = 1 }
+useless_vec = { level = "allow", priority = 1 }
+wildcard_enum_match_arm = { level = "allow", priority = 1 }
+approx_constant = { level = "allow", priority = 1 }
+cloned_ref_to_slice_refs = { level = "allow", priority = 1 }
+default_trait_access = { level = "allow", priority = 1 }
+expect_fun_call = { level = "allow", priority = 1 }
+format_collect = { level = "allow", priority = 1 }
+if_not_else = { level = "allow", priority = 1 }
+items_after_statements = { level = "allow", priority = 1 }
+manual_assert = { level = "allow", priority = 1 }
+manual_checked_ops = { level = "allow", priority = 1 }
+manual_let_else = { level = "allow", priority = 1 }
+manual_string_new = { level = "allow", priority = 1 }
+map_unwrap_or = { level = "allow", priority = 1 }
+match_wildcard_for_single_variants = { level = "allow", priority = 1 }
+single_match_else = { level = "allow", priority = 1 }
+unnecessary_cast = { level = "allow", priority = 1 }
+unnecessary_literal_bound = { level = "allow", priority = 1 }

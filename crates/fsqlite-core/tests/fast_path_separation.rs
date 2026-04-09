@@ -1558,3 +1558,95 @@ fn test_fast_path_group_by_rowid_bucket_sum_matches_sqlite_reference_rows() {
         );
     }
 }
+
+#[test]
+fn test_track_s_insert_10k_matches_rusqlite_oracle() {
+    const ROW_COUNT: i64 = 10_000;
+    const CREATE_TABLE: &str =
+        "CREATE TABLE bench(id INTEGER PRIMARY KEY, label TEXT NOT NULL, score INTEGER NOT NULL)";
+    // Keep the insert on the register/VDBE path by using scalar expressions
+    // instead of the trivial direct VALUES(?1, ?2, ?3) shape.
+    const INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, lower(?2), abs(?3))";
+
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    fconn.execute(CREATE_TABLE).unwrap();
+    rconn.execute(CREATE_TABLE, []).unwrap();
+    fconn.execute("BEGIN").unwrap();
+    rconn.execute_batch("BEGIN").unwrap();
+
+    let fstmt = fconn.prepare(INSERT_SQL).unwrap();
+    let mut rstmt = rconn.prepare(INSERT_SQL).unwrap();
+    for id in 0_i64..ROW_COUNT {
+        let label = format!("ROW_{id}");
+        let score = -(id * 7);
+        fstmt
+            .execute_with_params(&[
+                fsqlite_types::SqliteValue::Integer(id),
+                fsqlite_types::SqliteValue::Text(label.clone().into()),
+                fsqlite_types::SqliteValue::Integer(score),
+            ])
+            .unwrap();
+        rstmt.execute(rusqlite::params![id, label, score]).unwrap();
+    }
+    fconn.execute("COMMIT").unwrap();
+    rconn.execute_batch("COMMIT").unwrap();
+
+    let frank_rows = sorted_frank_rows(&fconn, "SELECT id, label, score FROM bench");
+    let sqlite_rows = sorted_rusqlite_rows(&rconn, "SELECT id, label, score FROM bench");
+
+    assert_eq!(frank_rows.len(), ROW_COUNT as usize);
+    assert_eq!(
+        frank_rows, sqlite_rows,
+        "10K register-path INSERTs should match the rusqlite oracle exactly"
+    );
+}
+
+#[test]
+fn test_track_s_select_after_insert_matches_rusqlite_oracle() {
+    const CREATE_TABLE: &str =
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT NOT NULL, score INTEGER NOT NULL)";
+    const INSERT_SQL: &str = "INSERT INTO t VALUES (?1, lower(?2), abs(?3))";
+
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    fconn.execute(CREATE_TABLE).unwrap();
+    rconn.execute(CREATE_TABLE, []).unwrap();
+
+    let insert_stmt = fconn.prepare(INSERT_SQL).unwrap();
+    insert_stmt
+        .execute_with_params(&[
+            fsqlite_types::SqliteValue::Integer(7),
+            fsqlite_types::SqliteValue::Text("MiXeD_Label".into()),
+            fsqlite_types::SqliteValue::Integer(-45),
+        ])
+        .unwrap();
+    rconn
+        .execute(INSERT_SQL, rusqlite::params![7_i64, "MiXeD_Label", -45_i64])
+        .unwrap();
+
+    let select_sql = "SELECT label, score FROM t WHERE id = ?1";
+    let select_stmt = fconn.prepare(select_sql).unwrap();
+    let frank_rows = select_stmt
+        .query_with_params(&[fsqlite_types::SqliteValue::Integer(7)])
+        .unwrap();
+    let sqlite_row = rconn
+        .query_row(select_sql, rusqlite::params![7_i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .unwrap();
+
+    assert_eq!(frank_rows.len(), 1, "SELECT should see the inserted row");
+    assert_eq!(
+        frank_rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Text(
+            sqlite_row.0.clone().into()
+        ))
+    );
+    assert_eq!(
+        frank_rows[0].get(1),
+        Some(&fsqlite_types::SqliteValue::Integer(sqlite_row.1))
+    );
+    assert_eq!(sqlite_row.0, "mixed_label");
+    assert_eq!(sqlite_row.1, 45);
+}

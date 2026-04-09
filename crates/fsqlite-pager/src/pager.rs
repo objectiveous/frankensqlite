@@ -16709,8 +16709,8 @@ mod tests {
             "bead_id={TRACK_U_BEAD_ID} case=double_write_emits_single_data_frame"
         );
         assert_eq!(
-            page_frames[0].1,
-            final_bytes,
+            page_frames[0].1.as_slice(),
+            final_bytes.as_slice(),
             "bead_id={TRACK_U_BEAD_ID} case=double_write_keeps_last_page_image"
         );
         assert_eq!(

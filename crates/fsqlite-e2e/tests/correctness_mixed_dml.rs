@@ -16,6 +16,8 @@
 
 use fsqlite_e2e::comparison::{ComparisonRunner, SqlBackend, SqlValue};
 
+const TRACK_U_BEAD_ID: &str = "bd-c9pxw";
+
 /// Default mixed-DML workload size used in regular test runs.
 ///
 /// Keep this practical for workspace-wide CI while preserving the full
@@ -146,6 +148,26 @@ fn generate_mixed_dml(seed: u64, count: usize) -> (Vec<String>, usize) {
     let total_inserts_usize = usize::try_from(total_inserts).expect("total inserts must fit usize");
     let expected_rows = total_inserts_usize - expected_deletes;
     (stmts, expected_rows)
+}
+
+fn generate_batched_insert_statements(
+    table: &str,
+    row_count: i64,
+    batch_size: usize,
+) -> Vec<String> {
+    let mut stmts = Vec::new();
+    let mut start = 1_i64;
+    while start <= row_count {
+        let end =
+            (start + i64::try_from(batch_size).expect("batch size fits i64") - 1).min(row_count);
+        let values = (start..=end)
+            .map(|id| format!("({id}, 'name_{id}', {id})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        stmts.push(format!("INSERT INTO {table} VALUES {values}"));
+        start = end + 1;
+    }
+    stmts
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────
@@ -499,5 +521,87 @@ fn test_lazy_memdb_mixed_dml() {
         hash.matched,
         "logical state hash mismatch after lazy MemDB mixed DML:\n  frank={}\n  csqlite={}",
         hash.frank_sha256, hash.csqlite_sha256
+    );
+}
+
+#[test]
+fn bd_c9pxw_update_10k_rows_matches_oracle() {
+    const ROW_COUNT: i64 = 10_000;
+    let mut stmts =
+        vec!["CREATE TABLE dml_test (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)".to_owned()];
+    stmts.extend(generate_batched_insert_statements(
+        "dml_test", ROW_COUNT, 250,
+    ));
+    stmts.push("BEGIN".to_owned());
+    stmts.push("UPDATE dml_test SET val = val + 100000 WHERE id BETWEEN 1 AND 10000".to_owned());
+    stmts.push("COMMIT".to_owned());
+
+    let runner = ComparisonRunner::new_in_memory().expect("failed to create comparison runner");
+    let result = runner.run_and_compare(&stmts);
+    assert_eq!(
+        result.operations_mismatched, 0,
+        "bead_id={TRACK_U_BEAD_ID} case=update_10k_statement_mismatch {:?}",
+        result.mismatches
+    );
+
+    let hash = runner.compare_logical_state();
+    assert!(
+        hash.matched,
+        "bead_id={TRACK_U_BEAD_ID} case=update_10k_state_hash_mismatch frank={} csqlite={}",
+        hash.frank_sha256, hash.csqlite_sha256
+    );
+
+    let rows = runner
+        .frank()
+        .query("SELECT COUNT(*), MIN(val), MAX(val) FROM dml_test")
+        .expect("fsqlite update_10k summary");
+    assert_eq!(rows[0][0], SqlValue::Integer(ROW_COUNT));
+    assert_eq!(rows[0][1], SqlValue::Integer(100_001));
+    assert_eq!(rows[0][2], SqlValue::Integer(110_000));
+
+    eprintln!(
+        "INFO bead_id={TRACK_U_BEAD_ID} case=update_10k rows={ROW_COUNT} remaining={ROW_COUNT}"
+    );
+}
+
+#[test]
+fn bd_c9pxw_delete_5k_rows_matches_oracle() {
+    const ROW_COUNT: i64 = 10_000;
+    const DELETE_COUNT: i64 = 5_000;
+    let mut stmts =
+        vec!["CREATE TABLE dml_test (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)".to_owned()];
+    stmts.extend(generate_batched_insert_statements(
+        "dml_test", ROW_COUNT, 250,
+    ));
+    stmts.push("BEGIN".to_owned());
+    stmts.push("DELETE FROM dml_test WHERE id BETWEEN 1 AND 5000".to_owned());
+    stmts.push("COMMIT".to_owned());
+
+    let runner = ComparisonRunner::new_in_memory().expect("failed to create comparison runner");
+    let result = runner.run_and_compare(&stmts);
+    assert_eq!(
+        result.operations_mismatched, 0,
+        "bead_id={TRACK_U_BEAD_ID} case=delete_5k_statement_mismatch {:?}",
+        result.mismatches
+    );
+
+    let hash = runner.compare_logical_state();
+    assert!(
+        hash.matched,
+        "bead_id={TRACK_U_BEAD_ID} case=delete_5k_state_hash_mismatch frank={} csqlite={}",
+        hash.frank_sha256, hash.csqlite_sha256
+    );
+
+    let rows = runner
+        .frank()
+        .query("SELECT COUNT(*), MIN(id), MAX(id) FROM dml_test")
+        .expect("fsqlite delete_5k summary");
+    assert_eq!(rows[0][0], SqlValue::Integer(ROW_COUNT - DELETE_COUNT));
+    assert_eq!(rows[0][1], SqlValue::Integer(5_001));
+    assert_eq!(rows[0][2], SqlValue::Integer(10_000));
+
+    eprintln!(
+        "INFO bead_id={TRACK_U_BEAD_ID} case=delete_5k deleted={DELETE_COUNT} remaining={}",
+        ROW_COUNT - DELETE_COUNT
     );
 }

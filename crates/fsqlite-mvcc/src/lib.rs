@@ -56,8 +56,121 @@ pub mod witness_refinement;
 pub mod write_coordinator;
 pub mod xor_delta;
 
+/// Reader-visible MVCC metadata classes that participate in Track E3's
+/// publication-plane design.
+///
+/// The intent is to pin the actual hot metadata surfaces to explicit primitive
+/// choices so downstream implementation beads do not reopen the concurrency
+/// debate ad hoc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MvccMetadataPublicationClass {
+    /// Cross-process `(commit_seq, schema_epoch, ecs_epoch)` publication in
+    /// `shm.rs`.
+    SharedSnapshotTriple,
+    /// Active SSI session set plus committed reader/writer lookup indexes in
+    /// `begin_concurrent.rs`.
+    ActiveTxnRegistry,
+    /// Committed page-version chains and their reader guard discipline.
+    CommittedVersionStore,
+    /// GC horizon and reader-pin floor used to decide when retired metadata may
+    /// be reclaimed.
+    ReclamationHorizon,
+}
+
+/// Design-time publication contract for one MVCC metadata class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MvccMetadataPublicationContract {
+    /// Concrete metadata class on the hot path.
+    pub class: MvccMetadataPublicationClass,
+    /// Current implementation touchpoint.
+    pub touchpoint: &'static str,
+    /// Primitive in the current code.
+    pub current_primitive: &'static str,
+    /// Primitive selected by the E3 design contract.
+    pub selected_primitive: &'static str,
+    /// Read-side consistency and retry rule.
+    pub retry_contract: &'static str,
+    /// Reclamation / lifetime rule for superseded metadata.
+    pub reclamation_contract: &'static str,
+}
+
+/// Concrete MVCC metadata-publication mapping for Track E3.
+pub const MVCC_METADATA_PUBLICATION_CONTRACTS: [MvccMetadataPublicationContract; 4] = [
+    MvccMetadataPublicationContract {
+        class: MvccMetadataPublicationClass::SharedSnapshotTriple,
+        touchpoint: "shm.rs::SharedMemoryLayout::{publish_snapshot,load_consistent_snapshot}",
+        current_primitive: "explicit seqlock triple over commit_seq/schema_epoch/ecs_epoch",
+        selected_primitive: "keep seqlock triple",
+        retry_contract: "readers retry while snapshot_seq is odd or changes; no read-side write lock is allowed",
+        reclamation_contract: "none; the triple is overwritten in place",
+    },
+    MvccMetadataPublicationContract {
+        class: MvccMetadataPublicationClass::ActiveTxnRegistry,
+        touchpoint: "begin_concurrent.rs::ConcurrentRegistry active set plus committed reader/writer indexes",
+        current_primitive: "global Mutex<HashMap> plus per-handle Mutex leaves",
+        selected_primitive: "RCU/QSBR-published registry snapshot with per-handle mutable leaves retained separately",
+        retry_contract: "SSI readers bind to one immutable registry image per validation pass instead of holding the writer lock",
+        reclamation_contract: "retired registry snapshots wait for a QSBR grace period before recycle",
+    },
+    MvccMetadataPublicationContract {
+        class: MvccMetadataPublicationClass::CommittedVersionStore,
+        touchpoint: "invariants.rs::VersionStore plus ebr.rs::VersionGuardRegistry",
+        current_primitive: "append-only committed chains guarded by crossbeam epoch pins",
+        selected_primitive: "keep append-only EBR publication",
+        retry_contract: "readers pin the epoch and traverse a committed chain; no seqlock retry path is permitted",
+        reclamation_contract: "versions retire only after the min pinned epoch moves past the retire epoch",
+    },
+    MvccMetadataPublicationContract {
+        class: MvccMetadataPublicationClass::ReclamationHorizon,
+        touchpoint: "core_types.rs::raise_gc_horizon plus ebr.rs::VersionGuardRegistry::min_pinned_epoch",
+        current_primitive: "monotone atomics plus active-slot and reader-pin floors",
+        selected_primitive: "keep monotone atomic horizon; do not wrap it in RCU or seqlock",
+        retry_contract: "stale low horizons are safe and may be reread; readers never require a globally locked snapshot",
+        reclamation_contract: "the horizon itself is not reclaimed and only gates reclamation of other metadata",
+    },
+];
+
 #[cfg(test)]
 mod ssi_anomaly_tests;
+
+#[cfg(test)]
+mod metadata_publication_contract_tests {
+    use super::{
+        MVCC_METADATA_PUBLICATION_CONTRACTS, MvccMetadataPublicationClass,
+        MvccMetadataPublicationContract,
+    };
+
+    fn contract(class: MvccMetadataPublicationClass) -> MvccMetadataPublicationContract {
+        MVCC_METADATA_PUBLICATION_CONTRACTS
+            .iter()
+            .find(|contract| contract.class == class)
+            .copied()
+            .expect("MVCC metadata contract must exist")
+    }
+
+    #[test]
+    fn test_mvcc_metadata_publication_contract_selects_rcu_for_registry() {
+        let registry = contract(MvccMetadataPublicationClass::ActiveTxnRegistry);
+        assert_eq!(
+            registry.selected_primitive,
+            "RCU/QSBR-published registry snapshot with per-handle mutable leaves retained separately"
+        );
+        assert!(
+            registry.reclamation_contract.contains("QSBR grace period"),
+            "RCU registry design must carry grace-period reclamation"
+        );
+    }
+
+    #[test]
+    fn test_mvcc_metadata_publication_contract_keeps_seqlock_for_snapshot_triple() {
+        let snapshot = contract(MvccMetadataPublicationClass::SharedSnapshotTriple);
+        assert_eq!(snapshot.selected_primitive, "keep seqlock triple");
+        assert!(
+            snapshot.retry_contract.contains("retry"),
+            "seqlock snapshot readers must have an explicit retry rule"
+        );
+    }
+}
 
 pub use begin_concurrent::{
     ConcurrentHandle, ConcurrentPageState, ConcurrentRegistry, ConcurrentSavepoint, FcwResult,

@@ -2,7 +2,7 @@
 
 **Beads:** `bd-db300.5.4.1` (E4.1) + `bd-db300.5.3.1` (E3.1)
 **Date:** 2026-03-22
-**Status:** Design artifact — ready for downstream budgeting (E4.2) and primitive mapping (E3.2)
+**Status:** Design contract — primitive choices and implementation touchpoints fixed for downstream E3/E4 work
 **Depends on:** E1 state-placement map, ADR-0002 (tiny-publish shared state), B3 (lock-free publication work)
 
 ---
@@ -266,7 +266,7 @@ Each metadata class is scored on five axes:
 | Reclamation | **Immediate** | Session handles are recycled on finalize. No deferred reclamation needed. |
 | Topology sensitivity | **Medium** | Mutex is held briefly. Cross-NUMA penalty exists but is amortized by the (relatively) long SSI validation work inside the lock. |
 
-**Current primitive:** Arc<Mutex<ConcurrentHandle>> per session, with a global Mutex on the registry HashMap.
+**Current primitive:** `TransactionManager`-owned `Mutex<ConcurrentRegistry>` protecting the active-session `HashMap` and committed SSI indexes, plus per-handle `Mutex<ConcurrentHandle>` leaves.
 
 **Publication constraint:** SSI validation must atomically observe: (a) which transactions are active, (b) their read/write sets, (c) their commit status. This is inherently a consistent-snapshot problem.
 
@@ -275,7 +275,7 @@ Each metadata class is scored on five axes:
 2. **RCU-style snapshot** — writers publish via copy-on-write; readers see a consistent snapshot without blocking writers. Reclamation via epoch.
 3. **Seqlock + per-session atomics** — readers retry if registry changed during scan. Works if SSI scan is fast relative to commit rate.
 
-Recommendation: Option 2 (RCU snapshot) for E3.2, because SSI validation is read-dominant during the critical window, and the number of active sessions is small (bounded by core count).
+Recommendation: Option 2 (RCU snapshot) for E3.2/E3.3, because SSI validation is read-dominant during the critical window, the active-session set is bounded by core count, and long scans want an immutable view rather than a seqlock that can livelock under repeated writer churn. The code contract for this choice now lives in `MVCC_METADATA_PUBLICATION_CONTRACTS`.
 
 ---
 
@@ -289,11 +289,29 @@ Recommendation: Option 2 (RCU snapshot) for E3.2, because SSI validation is read
 | Reclamation | **None** | Overwritten in place. |
 | Topology sensitivity | **Medium** | Read on BEGIN, not on every page access. Amortized over transaction lifetime. |
 
-**Current primitive:** Mixed atomics + RefCell behind pager Mutex.
+**Current primitive:** writer-serialized seqlock-style publication plane in `PublishedPagerState`: readers sample `sequence`, read the summary atomics, and retry if the sequence is odd or changed; targeted waiters provide bounded parking when a writer is in-flight.
 
 **Publication constraint:** Internal consistency required (multi-field snapshot). Relaxed freshness is acceptable.
 
-**Observation for E3.2:** SeqLockPair is the ideal primitive. The codebase already has SeqLock and SeqLockPair implementations. The pager publication snapshot should be migrated to SeqLockPair to eliminate Mutex contention on the read path during BEGIN.
+**Observation for E3.2/E3.3:** The pager already implements the right shape: a seqlock-style multi-field summary with explicit retry and a separate lag-detecting page-plane horizon. The contract is to preserve that split rather than collapsing everything into an RCU copy or a reader lock. The code contract for this choice now lives in `PAGER_METADATA_PUBLICATION_CONTRACTS`.
+
+---
+
+#### Class M5b: Shared Durable Snapshot Triple (`ShmSnapshot`)
+
+| Axis | Value | Evidence |
+|------|-------|----------|
+| Read:Write | ~N:1 | Read by transaction admission / recovery; written once per publish/reconcile |
+| Retryability | **Yes** | Readers can spin/retry while a writer publishes the triple |
+| Snapshot semantics | **Strict** | `(commit_seq, schema_epoch, ecs_epoch)` must be mutually consistent |
+| Reclamation | **None** | Triple fields are overwritten in place |
+| Topology sensitivity | **Medium** | Shared cross-process header line, but the payload is only three `u64`s |
+
+**Current primitive:** explicit seqlock triple in `shm.rs::SharedMemoryLayout::{publish_snapshot, load_consistent_snapshot}`.
+
+**Publication constraint:** `schema_epoch` must publish before `commit_seq` on DDL paths, and readers must never combine fields from different generations.
+
+**Observation for E3.2/E3.3:** Keep the seqlock triple. RCU would allocate and reclaim an object per commit for a three-word payload, and independent atomics would allow torn reads.
 
 ---
 
@@ -333,6 +351,24 @@ Recommendation: Option 2 (RCU snapshot) for E3.2, because SSI validation is read
 
 ---
 
+#### Class M7b: Reclamation Horizon and Reader Pins
+
+| Axis | Value | Evidence |
+|------|-------|----------|
+| Read:Write | ~N:1 | GC and cleanup read the floor frequently; commits and pin/unpin events advance it |
+| Retryability | **Conditional** | A stale low horizon is safe; a stale high horizon is not |
+| Snapshot semantics | **Relaxed monotone** | Consumers need a safe lower bound, not a globally consistent multi-field snapshot |
+| Reclamation | **Self-gating** | The horizon itself is not reclaimed; it gates reclamation of other objects |
+| Topology sensitivity | **Medium** | Shared floor traffic exists, but the operations are narrow atomics and min-reductions |
+
+**Current primitive:** monotone atomics plus active-slot and epoch-pin floors in `core_types.rs::raise_gc_horizon` and `ebr.rs::VersionGuardRegistry::min_pinned_epoch`.
+
+**Publication constraint:** the horizon may advance only when every older reader pin and active transaction snapshot has moved past the retire epoch.
+
+**Observation for E3.2/E3.3:** Do not wrap the horizon in RCU or seqlock. Consumers only need a safe floor; stale-low reads are acceptable and cheaper than retrying a synthetic snapshot.
+
+---
+
 #### Class M8: SSI Evidence and Observability
 
 | Axis | Value | Evidence |
@@ -358,11 +394,33 @@ Recommendation: Option 2 (RCU snapshot) for E3.2, because SSI validation is read
 | M1 | CommitIndex | 100:1+ | Yes | Relaxed | None | High | AtomicU64 array + LeftRight | Extend flat array; replace LeftRight with epoch hash |
 | M2 | PageLockTable | 1:1 | No | Strict | None | High | AtomicU64 array + shard Mutex | No primitive change; routing (E5) is the lever |
 | M3 | next_commit_seq | 0:1 | N/A | Strict | None | High | AtomicU64 + CommitSequenceCombiner | HTM fast-path (bd-77l3t) |
-| M4 | ConcurrentRegistry | 1:2 | No | Strict | Immediate | Medium | Arc<Mutex<HashMap>> | **RCU snapshot for SSI reads** |
-| M5 | PagerPublishedSnapshot | N:1 | Yes | Relaxed | None | Medium | Mutex + atomics | **SeqLockPair** |
+| M4 | ConcurrentRegistry | 1:2 | No | Strict | Immediate | Medium | registry Mutex + per-handle Mutex leaves | **RCU snapshot for SSI reads** |
+| M5 | PagerPublishedSnapshot | N:1 | Yes | Relaxed | None | Medium | writer-serialized seqlock summary + lagging page-plane horizon | Keep seqlock summary + explicit fallback |
+| M5b | ShmSnapshot triple | N:1 | Yes | Strict | None | Medium | explicit seqlock triple | Keep seqlock triple |
 | M6 | Schema/Pragma epoch | 10000:1 | Yes | Relaxed | None | Low | SeqLock | No change |
 | M7 | VersionStore | 5:1+ | No | Strict | EBR | Medium | Epoch-based concurrent store | GC optimization (WS3) |
+| M7b | GC horizon / reader-pin floor | N:1 | Conditional | Relaxed monotone | Self-gating | Medium | monotone atomics + epoch floor | No primitive change |
 | M8 | SSI Evidence | 0.01:1 | Yes | None | None | Low | Async ring buffer | No change |
+
+---
+
+## E3.2 Primitive Selection Ledger
+
+The table below makes the primitive choice explicit for the reader-visible
+metadata classes that still had real design ambiguity.
+
+| Class | Selected Primitive | Rejected Alternatives | Why Rejected |
+|-------|--------------------|-----------------------|--------------|
+| M4 ActiveTxnRegistry | RCU/QSBR-published immutable registry snapshot plus mutable leaves | global registry `Mutex`; whole-registry seqlock; Left-Right full duplicate | long SSI scans should not hold a writer lock, and a whole-registry seqlock can livelock under commit churn |
+| M5 PagerPublishedSnapshot | seqlock-style summary over fixed fields | `RwLock`/Mutex summary; RCU copy-on-write snapshot object | read path is tiny and retryable, so allocation-heavy RCU is worse than a stable seqlock summary |
+| M5b ShmSnapshot triple | seqlock triple | independent atomics; RCU object swap | independent atomics allow torn `(commit_seq, schema_epoch, ecs_epoch)` reads; RCU is overkill for three words |
+| M7 VersionStore | append-only EBR publication | RCU full-copy chains; seqlock-protected chain heads | readers need stable historical chain traversal and delayed reclamation, not snapshot replacement |
+| M7b GC horizon | monotone atomics with floor recomputation | RCU snapshot floor; seqlock floor | stale-low floors are safe, so retryable snapshot machinery only adds latency |
+
+The corresponding code-level contract anchors are:
+
+- `crates/fsqlite-pager/src/pager.rs`: `PAGER_METADATA_PUBLICATION_CONTRACTS`
+- `crates/fsqlite-mvcc/src/lib.rs`: `MVCC_METADATA_PUBLICATION_CONTRACTS`
 
 ---
 
@@ -378,8 +436,10 @@ class, establishing the coupling between Parts 1 and 2:
 | M3 next_commit_seq | advance_commit_clock (fetch_add) | — | — | — |
 | M4 ConcurrentRegistry | SSI validation (read, under Mutex) | Session recycle | — | — |
 | M5 PagerPublishedSnapshot | Snapshot bind (read) | — | — | — |
+| M5b ShmSnapshot triple | Snapshot bind / reconcile read | — | — | — |
 | M6 Schema epoch | — | — | — | — (read-only on statement path) |
 | M7 VersionStore | — | — | — | GC tick |
+| M7b GC horizon / reader pins | — | — | — | GC tick, cleanup |
 | M8 SSI Evidence | — | — | Evidence recording | — |
 
 **Key insight:** The IC (INLINE-CRITICAL) column shows exactly what must be in
@@ -464,6 +524,15 @@ a backlog of deferred work.
    batch_update never publishes a sequence number lower than the existing value
    for any page.
 
+4. **Seqlock snapshot coherence:** Stress `PublishedPagerState::snapshot()` and
+   `SharedMemoryLayout::load_consistent_snapshot()` under concurrent publish and
+   assert readers never observe torn field combinations.
+
+5. **RCU registry grace safety:** When the M4 implementation lands, verify that
+   an SSI scan can finish against a retired registry image while writers
+   continue publishing newer images, and that recycle only happens after a
+   grace period.
+
 ### E2E Scenarios Required
 
 1. **c4 publish-window measurement:** Run the c4 disjoint benchmark with
@@ -474,6 +543,11 @@ a backlog of deferred work.
 
 3. **Offload queue depth monitoring:** Run sustained c8 workload and verify
    that OA/OB queues stay within their depth bounds.
+
+4. **Topology-sensitive publication interference:** Run c4 and c8 mixed
+   workloads while capturing pager publication retry counts, SHM seqlock retry
+   counts, and any future RCU grace-period lag so primitive choice can be tied
+   back to real interference rather than microbench aesthetics.
 
 ### Logging Artifacts Required
 

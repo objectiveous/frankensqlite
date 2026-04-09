@@ -30,7 +30,9 @@ use fsqlite_core::connection::{
 };
 
 use crate::HarnessSettings;
-use crate::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
+use crate::benchmark::{
+    BenchmarkComparisonMetadata, BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark,
+};
 use crate::fixture_select::{BenchmarkArtifactCommand, BenchmarkArtifactToolVersion};
 use crate::fsqlite_executor::run_oplog_fsqlite;
 use crate::oplog::{self, OpLog};
@@ -126,6 +128,9 @@ pub struct CellOutcome {
     pub error: Option<String>,
     /// Engine name.
     pub engine: String,
+    /// Canonical comparison mode id when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_id: Option<String>,
     /// Fixture ID.
     pub fixture_id: String,
     /// Workload preset name.
@@ -4340,6 +4345,19 @@ pub fn expand_matrix(config: &PerfMatrixConfig) -> Vec<MatrixCell> {
     cells
 }
 
+fn mode_id_for_engine(engine: Engine, concurrent_mode: bool) -> &'static str {
+    match engine {
+        Engine::Sqlite3 => "sqlite_reference",
+        Engine::Fsqlite => {
+            if concurrent_mode {
+                "fsqlite_mvcc"
+            } else {
+                "fsqlite_single_writer"
+            }
+        }
+    }
+}
+
 // ── OpLog generation ───────────────────────────────────────────────────
 
 /// Generate an `OpLog` for the given preset name and parameters.
@@ -4410,18 +4428,21 @@ fn run_cell(cell: &MatrixCell, config: &PerfMatrixConfig) -> CellOutcome {
         cell.concurrency,
         config.scale,
     ) else {
+        let mode_id = mode_id_for_engine(cell.engine, config.settings.concurrent_mode).to_owned();
         return CellOutcome {
             summary: None,
             error: Some(format!("unknown workload preset: {}", cell.workload)),
             engine: cell.engine.as_str().to_owned(),
+            mode_id: Some(mode_id),
             fixture_id: cell.fixture_id.clone(),
             workload: cell.workload.clone(),
             concurrency: cell.concurrency,
         };
     };
 
+    let mode_id = mode_id_for_engine(cell.engine, config.settings.concurrent_mode).to_owned();
     let meta = BenchmarkMeta {
-        engine: cell.engine.as_str().to_owned(),
+        engine: mode_id.clone(),
         workload: cell.workload.clone(),
         fixture_id: cell.fixture_id.clone(),
         concurrency: cell.concurrency,
@@ -4437,7 +4458,7 @@ fn run_cell(cell: &MatrixCell, config: &PerfMatrixConfig) -> CellOutcome {
     let engine = cell.engine;
     let fixture_id = cell.fixture_id.clone();
 
-    let summary = run_benchmark(&config.benchmark_config, &meta, |iteration_idx| {
+    let mut summary = run_benchmark(&config.benchmark_config, &meta, |iteration_idx| {
         run_single_iteration(
             engine,
             &fixture_id,
@@ -4447,12 +4468,30 @@ fn run_cell(cell: &MatrixCell, config: &PerfMatrixConfig) -> CellOutcome {
             iteration_idx,
         )
     });
+    summary.comparison = Some(BenchmarkComparisonMetadata {
+        mode_id: mode_id.clone(),
+        row_id: None,
+        retry_policy_id: None,
+        seed_policy_id: None,
+        build_profile_id: None,
+        placement_profile_id: None,
+        hardware_class_id: None,
+        hardware_signature: None,
+        run_id: None,
+        source_revision: None,
+        beads_data_hash: None,
+        artifact_bundle_key: None,
+        artifact_bundle_relpath: None,
+        artifact_manifest_path: None,
+        canonical_artifact_manifest: None,
+    });
     let error = benchmark_summary_error(&summary);
 
     CellOutcome {
         summary: Some(summary),
         error,
         engine: cell.engine.as_str().to_owned(),
+        mode_id: Some(mode_id),
         fixture_id: cell.fixture_id.clone(),
         workload: cell.workload.clone(),
         concurrency: cell.concurrency,

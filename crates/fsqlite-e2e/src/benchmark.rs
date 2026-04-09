@@ -17,6 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::fixture_select::BenchmarkArtifactManifest;
 use crate::methodology::{
     EnvironmentMeta, MEASUREMENT_TIME_SECS, MIN_MEASUREMENT_ITERATIONS, MethodologyMeta,
     WARMUP_ITERATIONS,
@@ -98,8 +99,49 @@ pub struct BenchmarkSummary {
     pub latency: LatencyStats,
     /// Throughput statistics across measurement iterations.
     pub throughput: ThroughputStats,
+    /// Optional canonical comparison envelope used to align SQLite, MVCC, and
+    /// forced single-writer rows under one mechanically comparable schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<BenchmarkComparisonMetadata>,
     /// Per-iteration raw data for downstream analysis.
     pub iterations: Vec<IterationRecord>,
+}
+
+/// Canonical comparison metadata shared by SQLite, MVCC, and single-writer
+/// benchmark rows when a run can be mapped onto the tracked benchmark matrix.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BenchmarkComparisonMetadata {
+    /// Stable mode id (`sqlite_reference`, `fsqlite_mvcc`,
+    /// `fsqlite_single_writer`).
+    pub mode_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_policy_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_policy_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_class_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beads_data_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_bundle_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_bundle_relpath: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_manifest_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_artifact_manifest: Option<BenchmarkArtifactManifest>,
 }
 
 impl BenchmarkSummary {
@@ -119,6 +161,35 @@ impl BenchmarkSummary {
     /// Returns a serialization error if the summary cannot be serialized.
     pub fn to_pretty_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
+    }
+
+    /// Return the canonical comparison mode when present, falling back to the
+    /// legacy `engine` label for older summaries.
+    #[must_use]
+    pub fn comparison_mode_id(&self) -> &str {
+        self.comparison
+            .as_ref()
+            .map_or(self.engine.as_str(), |comparison| {
+                comparison.mode_id.as_str()
+            })
+    }
+
+    /// Total retries summed across all measurement iterations.
+    #[must_use]
+    pub fn total_iteration_retries(&self) -> u64 {
+        self.iterations
+            .iter()
+            .map(|iteration| iteration.retries)
+            .sum()
+    }
+
+    /// Total aborts summed across all measurement iterations.
+    #[must_use]
+    pub fn total_iteration_aborts(&self) -> u64 {
+        self.iterations
+            .iter()
+            .map(|iteration| iteration.aborts)
+            .sum()
     }
 }
 
@@ -263,6 +334,7 @@ where
         total_measurement_ms,
         latency,
         throughput,
+        comparison: None,
         iterations,
     }
 }

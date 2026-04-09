@@ -16,6 +16,7 @@
 //! Certificate generation is deterministic given identical inputs.  All
 //! floating-point values use `truncate_score` for cross-platform reproducibility.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -23,16 +24,20 @@ use serde::{Deserialize, Serialize};
 use crate::adversarial_search::{
     AdversarialConfig, CampaignResult, CounterexampleSeverity, run_campaign,
 };
-use crate::ci_gate_matrix::{ArtifactEntry, GlobalFlakeBudgetResult};
+use crate::certification_policy::{
+    CERTIFICATION_MAX_HIGH_SEVERITY_COUNTEREXAMPLES, CERTIFICATION_MIN_VERIFICATION_PCT,
+    CertificationPolicy, canonical_certification_policy, certification_gate_config,
+};
+use crate::ci_gate_matrix::{ArtifactEntry, ArtifactManifest, GlobalFlakeBudgetResult};
 use crate::confidence_gates::{
     EvidenceLedger, ExpectedLossRanking, GateConfig, GateDecision, GateReport,
     build_evidence_ledger, evaluate_full,
 };
 use crate::drift_monitor::{ParityDriftConfig, ParityDriftMonitor, ParityDriftSnapshot};
 use crate::parity_invariant_catalog::{
-    CatalogStats, ReleaseTraceabilityReport, build_canonical_catalog,
+    CatalogStats, InvariantId, ProofSummaryEntry, ReleaseTraceabilityReport, build_canonical_catalog,
 };
-use crate::parity_taxonomy::{FeatureCategory, build_canonical_universe, truncate_score};
+use crate::parity_taxonomy::{FeatureCategory, FeatureId, build_canonical_universe, truncate_score};
 
 #[allow(dead_code)]
 const BEAD_ID: &str = "bd-1dp9.8.4";
@@ -105,11 +110,11 @@ pub struct CertificateConfig {
 impl Default for CertificateConfig {
     fn default() -> Self {
         Self {
-            gate_config: GateConfig::default(),
+            gate_config: certification_gate_config(),
             drift_config: ParityDriftConfig::default(),
             adversarial_config: AdversarialConfig::default(),
-            max_high_severity: 0,
-            min_verification_pct: 0.80,
+            max_high_severity: CERTIFICATION_MAX_HIGH_SEVERITY_COUNTEREXAMPLES,
+            min_verification_pct: CERTIFICATION_MIN_VERIFICATION_PCT,
         }
     }
 }
@@ -132,6 +137,97 @@ pub struct EvidenceChainEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Certification traceability
+// ---------------------------------------------------------------------------
+
+/// Schema version for embedded certification traceability payloads.
+pub const CERTIFICATION_TRACEABILITY_SCHEMA_VERSION: u32 = 1;
+
+/// Run-level metadata used to connect features/tests to a concrete artifact run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertificationRunReference {
+    /// Run identifier from the artifact manifest.
+    pub run_id: String,
+    /// Lane identifier from the artifact manifest.
+    pub lane: String,
+    /// Git revision for the run.
+    pub git_sha: String,
+    /// Manifest timestamp.
+    pub created_at: String,
+    /// Whether the producing gate passed.
+    pub gate_passed: bool,
+}
+
+/// Feature-to-test-to-run-to-artifact view for one invariant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertificationTraceabilityEntry {
+    /// Invariant ID.
+    pub invariant_id: InvariantId,
+    /// Feature ID.
+    pub feature_id: FeatureId,
+    /// Category display name.
+    pub category: String,
+    /// Invariant statement.
+    pub statement: String,
+    /// Whether the invariant is fully verified.
+    pub verified: bool,
+    /// Proof obligations recorded for the invariant.
+    pub proof_summary: Vec<ProofSummaryEntry>,
+    /// Run metadata if an artifact manifest was provided.
+    pub run: Option<CertificationRunReference>,
+    /// Artifact hashes linked from the certification manifest.
+    pub artifacts: Vec<ArtifactEntry>,
+    /// Artifact refs declared by the traceability report but missing from the manifest.
+    pub missing_artifact_refs: Vec<String>,
+}
+
+/// Embedded certification traceability report for the release certificate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertificationTraceabilityReport {
+    /// Schema version.
+    pub schema_version: u32,
+    /// Certification policy used to interpret the report.
+    pub policy_id: String,
+    /// Whether a concrete artifact manifest was provided.
+    pub manifest_present: bool,
+    /// Number of entries whose artifact refs were fully resolved.
+    pub fully_linked_entries: usize,
+    /// Total number of unresolved artifact refs.
+    pub missing_artifact_ref_count: usize,
+    /// Per-invariant traceability entries.
+    pub entries: Vec<CertificationTraceabilityEntry>,
+}
+
+/// Certification evidence summary embedded into the certificate verdict.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertificationEvidenceStatus {
+    /// Schema version.
+    pub schema_version: u32,
+    /// Certification policy used to interpret the evidence.
+    pub policy_id: String,
+    /// Whether a concrete artifact manifest was present.
+    pub artifact_manifest_present: bool,
+    /// Whether the artifact manifest's gate passed.
+    pub artifact_manifest_gate_passed: Option<bool>,
+    /// Whether verification-contract enforcement passed.
+    pub verification_contract_passed: Option<bool>,
+    /// Whether final gate enforcement passed.
+    pub final_gate_passed: Option<bool>,
+    /// Count of missing-evidence beads from verification-contract enforcement.
+    pub missing_evidence_beads: usize,
+    /// Count of invalid-reference beads from verification-contract enforcement.
+    pub invalid_reference_beads: usize,
+    /// Number of artifacts carried by the manifest.
+    pub reported_artifact_count: usize,
+    /// Number of certification traceability entries.
+    pub traceability_entry_count: usize,
+    /// Number of certification traceability entries fully resolved to artifacts.
+    pub fully_linked_traceability_entry_count: usize,
+    /// Number of unresolved artifact refs across the traceability report.
+    pub missing_artifact_ref_count: usize,
+}
+
+// ---------------------------------------------------------------------------
 // Release certificate
 // ---------------------------------------------------------------------------
 
@@ -143,6 +239,10 @@ pub struct ReleaseCertificate {
     pub schema_version: u32,
     /// Bead identifier.
     pub bead_id: String,
+    /// Certification policy identifier.
+    pub certification_policy_id: String,
+    /// Embedded certification policy.
+    pub certification_policy: CertificationPolicy,
     /// Overall verdict.
     pub verdict: CertificateVerdict,
 
@@ -191,10 +291,16 @@ pub struct ReleaseCertificate {
     pub ci_flake_budget_passed: Option<bool>,
     /// Number of CI artifact hashes in the certificate.
     pub artifact_hash_count: usize,
+    /// Certification evidence completeness and contract status.
+    pub certification_evidence: CertificationEvidenceStatus,
 
     // ---- Evidence chain ----
     /// Ordered evidence chain entries for audit trail.
     pub evidence_chain: Vec<EvidenceChainEntry>,
+
+    // ---- Certification traceability ----
+    /// Feature -> test -> run -> artifact-hash traceability view.
+    pub certification_traceability: CertificationTraceabilityReport,
 
     // ---- Unresolved risks ----
     /// Unresolved risk statements.
@@ -235,7 +341,7 @@ impl ReleaseCertificate {
             "{}: gate={} verified={:.1}% invariants={}/{} drift={} adversarial={} risks={}",
             self.verdict,
             self.gate_decision,
-            self.global_verification_pct * 100.0,
+            self.global_verification_pct,
             self.passing_invariants,
             self.total_invariants,
             if self.any_drift_rejected {
@@ -276,8 +382,8 @@ pub struct CertificateInputs {
     pub campaign_result: CampaignResult,
     /// Optional CI flake budget result.
     pub ci_flake_budget: Option<GlobalFlakeBudgetResult>,
-    /// Artifact hashes for the evidence chain.
-    pub artifact_hashes: Vec<ArtifactEntry>,
+    /// Optional CI artifact manifest for the certification bundle.
+    pub artifact_manifest: Option<ArtifactManifest>,
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +401,122 @@ fn sha256_hex(data: &str) -> String {
     format!("{h:016x}{h:016x}{h:016x}{h:016x}", h = h)
 }
 
+/// Build the embedded certification traceability view.
+#[must_use]
+fn build_certification_traceability(
+    traceability: &ReleaseTraceabilityReport,
+    artifact_manifest: Option<&ArtifactManifest>,
+    policy: &CertificationPolicy,
+) -> CertificationTraceabilityReport {
+    let artifact_index: BTreeMap<&str, &ArtifactEntry> = artifact_manifest
+        .map(|manifest| {
+            manifest
+                .artifacts
+                .iter()
+                .map(|artifact| (artifact.path.as_str(), artifact))
+                .collect()
+        })
+        .unwrap_or_default();
+    let run_reference = artifact_manifest.map(|manifest| CertificationRunReference {
+        run_id: manifest.run_id.clone(),
+        lane: manifest.lane.clone(),
+        git_sha: manifest.git_sha.clone(),
+        created_at: manifest.created_at.clone(),
+        gate_passed: manifest.gate_passed,
+    });
+
+    let mut fully_linked_entries = 0_usize;
+    let mut missing_artifact_ref_count = 0_usize;
+    let mut entries = Vec::with_capacity(traceability.entries.len());
+
+    for entry in &traceability.entries {
+        let mut artifacts = Vec::new();
+        let mut missing_artifact_refs = Vec::new();
+
+        for artifact_ref in &entry.artifact_refs {
+            if let Some(artifact) = artifact_index.get(artifact_ref.as_str()) {
+                artifacts.push((**artifact).clone());
+            } else {
+                missing_artifact_ref_count = missing_artifact_ref_count.saturating_add(1);
+                missing_artifact_refs.push(artifact_ref.clone());
+            }
+        }
+
+        if missing_artifact_refs.is_empty() {
+            fully_linked_entries = fully_linked_entries.saturating_add(1);
+        }
+
+        entries.push(CertificationTraceabilityEntry {
+            invariant_id: entry.invariant_id.clone(),
+            feature_id: entry.feature_id.clone(),
+            category: entry.category.clone(),
+            statement: entry.statement.clone(),
+            verified: entry.verified,
+            proof_summary: entry.proof_summary.clone(),
+            run: run_reference.clone(),
+            artifacts,
+            missing_artifact_refs,
+        });
+    }
+
+    CertificationTraceabilityReport {
+        schema_version: CERTIFICATION_TRACEABILITY_SCHEMA_VERSION,
+        policy_id: policy.policy_id.clone(),
+        manifest_present: artifact_manifest.is_some(),
+        fully_linked_entries,
+        missing_artifact_ref_count,
+        entries,
+    }
+}
+
+/// Build the certification evidence summary used by verdicting and audit.
+#[must_use]
+fn build_certification_evidence_status(
+    artifact_manifest: Option<&ArtifactManifest>,
+    certification_traceability: &CertificationTraceabilityReport,
+    policy: &CertificationPolicy,
+) -> CertificationEvidenceStatus {
+    let (artifact_manifest_gate_passed, verification_contract_passed, final_gate_passed) =
+        artifact_manifest
+            .map(|manifest| {
+                (
+                    Some(manifest.gate_passed),
+                    manifest
+                        .verification_contract
+                        .as_ref()
+                        .map(|contract| contract.contract_passed),
+                    manifest
+                        .verification_contract
+                        .as_ref()
+                        .map(|contract| contract.final_gate_passed),
+                )
+            })
+            .unwrap_or((None, None, None));
+
+    let missing_evidence_beads = artifact_manifest
+        .and_then(|manifest| manifest.verification_contract.as_ref())
+        .map_or(0, |contract| contract.missing_evidence_beads);
+    let invalid_reference_beads = artifact_manifest
+        .and_then(|manifest| manifest.verification_contract.as_ref())
+        .map_or(0, |contract| contract.invalid_reference_beads);
+    let reported_artifact_count = artifact_manifest.map_or(0, |manifest| manifest.artifacts.len());
+
+    CertificationEvidenceStatus {
+        schema_version: CERTIFICATION_TRACEABILITY_SCHEMA_VERSION,
+        policy_id: policy.policy_id.clone(),
+        artifact_manifest_present: artifact_manifest.is_some(),
+        artifact_manifest_gate_passed,
+        verification_contract_passed,
+        final_gate_passed,
+        missing_evidence_beads,
+        invalid_reference_beads,
+        reported_artifact_count,
+        traceability_entry_count: certification_traceability.entries.len(),
+        fully_linked_traceability_entry_count: certification_traceability.fully_linked_entries,
+        missing_artifact_ref_count: certification_traceability.missing_artifact_ref_count,
+    }
+}
+
 /// Build a release certificate from pre-assembled inputs.
 #[must_use]
 #[allow(clippy::too_many_lines)]
@@ -308,6 +530,17 @@ pub fn build_certificate(
     let drift = &inputs.drift_snapshot;
     let campaign = &inputs.campaign_result;
     let stats = &inputs.catalog_stats;
+    let certification_policy = canonical_certification_policy();
+    let certification_traceability = build_certification_traceability(
+        &inputs.traceability,
+        inputs.artifact_manifest.as_ref(),
+        &certification_policy,
+    );
+    let certification_evidence = build_certification_evidence_status(
+        inputs.artifact_manifest.as_ref(),
+        &certification_traceability,
+        &certification_policy,
+    );
 
     // ---- Evidence chain ----
     let mut evidence_chain = Vec::new();
@@ -346,12 +579,30 @@ pub fn build_certificate(
         summary: format!(
             "Gates: decision={} verified={:.1}% loss={:.4}",
             gate_report.global_decision,
-            gate_report.global_verification_pct * 100.0,
+            gate_report.global_verification_pct,
             ranking.total_expected_loss,
         ),
     });
 
-    // 4. Adversarial search
+    // 4. Certification policy + traceability
+    let certification_json =
+        serde_json::to_string(&(certification_policy.clone(), &certification_traceability))
+            .unwrap_or_default();
+    evidence_chain.push(EvidenceChainEntry {
+        source_bead: "bd-2yqp6.7".to_owned(),
+        schema_version: certification_policy.schema_version,
+        content_hash: sha256_hex(&certification_json),
+        summary: format!(
+            "Certification: policy={} manifest={} linked={}/{} missing_refs={}",
+            certification_policy.policy_id,
+            certification_traceability.manifest_present,
+            certification_traceability.fully_linked_entries,
+            certification_traceability.entries.len(),
+            certification_traceability.missing_artifact_ref_count,
+        ),
+    });
+
+    // 5. Adversarial search
     let campaign_json = serde_json::to_string(campaign).unwrap_or_default();
     evidence_chain.push(EvidenceChainEntry {
         source_bead: "bd-1dp9.8.5".to_owned(),
@@ -420,6 +671,45 @@ pub fn build_certificate(
         });
     }
 
+    if !certification_evidence.artifact_manifest_present {
+        unresolved_risks.push(UnresolvedRisk {
+            source: "certification_policy".to_owned(),
+            severity: "High".to_owned(),
+            description: "Missing artifact manifest; certification traceability does not yet reach run/artifact-hash evidence.".to_owned(),
+        });
+    }
+
+    if certification_evidence.missing_artifact_ref_count > 0 {
+        unresolved_risks.push(UnresolvedRisk {
+            source: "certification_policy".to_owned(),
+            severity: "High".to_owned(),
+            description: format!(
+                "{} traceability artifact reference(s) are missing from the certification manifest.",
+                certification_evidence.missing_artifact_ref_count,
+            ),
+        });
+    }
+
+    if let Some(false) = certification_evidence.artifact_manifest_gate_passed {
+        unresolved_risks.push(UnresolvedRisk {
+            source: "certification_policy".to_owned(),
+            severity: "High".to_owned(),
+            description: "Artifact manifest gate failed for the certification run.".to_owned(),
+        });
+    }
+
+    if let Some(false) = certification_evidence.final_gate_passed {
+        unresolved_risks.push(UnresolvedRisk {
+            source: "verification_contract".to_owned(),
+            severity: "High".to_owned(),
+            description: format!(
+                "Verification contract failed (missing_evidence_beads={}, invalid_reference_beads={}).",
+                certification_evidence.missing_evidence_beads,
+                certification_evidence.invalid_reference_beads,
+            ),
+        });
+    }
+
     // ---- Drift summary ----
     let drift_alert_categories = drift
         .category_states
@@ -428,28 +718,39 @@ pub fn build_certificate(
         .count();
 
     // ---- Verdict ----
-    let verdict = determine_verdict(gate_report, drift, high_severity_count, config);
+    let verdict = determine_verdict(
+        gate_report,
+        drift,
+        high_severity_count,
+        &certification_evidence,
+        config,
+    );
 
     // ---- Summary ----
     let summary = format!(
         "Release certificate {}: gate={} verified={:.1}% ({}/{} invariants), \
          drift_rejected={}, adversarial={} ({} counterexamples, {} high), \
-         {} unresolved risk(s)",
+         traceability={}/{} manifest={}, {} unresolved risk(s)",
         verdict,
         gate_report.global_decision,
-        truncate_score(gate_report.global_verification_pct * 100.0),
+        truncate_score(gate_report.global_verification_pct),
         gate_report.passing_invariants,
         gate_report.total_invariants,
         drift.any_rejected,
         if campaign.passed { "PASS" } else { "FAIL" },
         campaign.counterexamples.len(),
         high_severity_count,
+        certification_traceability.fully_linked_entries,
+        certification_traceability.entries.len(),
+        certification_traceability.manifest_present,
         unresolved_risks.len(),
     );
 
     ReleaseCertificate {
         schema_version: CERTIFICATE_SCHEMA_VERSION,
         bead_id: RELEASE_CERT_BEAD_ID.to_owned(),
+        certification_policy_id: certification_policy.policy_id.clone(),
+        certification_policy,
         verdict,
         global_posterior_mean: truncate_score(ledger.global_posterior_mean),
         global_lower_bound: truncate_score(ledger.global_lower_bound),
@@ -467,8 +768,10 @@ pub fn build_certificate(
         counterexample_count: campaign.counterexamples.len(),
         high_severity_count,
         ci_flake_budget_passed: inputs.ci_flake_budget.as_ref().map(|fb| fb.pipeline_pass),
-        artifact_hash_count: inputs.artifact_hashes.len(),
+        artifact_hash_count: inputs.artifact_manifest.as_ref().map_or(0, |m| m.artifacts.len()),
+        certification_evidence,
         evidence_chain,
+        certification_traceability,
         unresolved_risks,
         evidence_ledger: ledger.clone(),
         summary,
@@ -480,6 +783,7 @@ fn determine_verdict(
     gate_report: &GateReport,
     drift: &ParityDriftSnapshot,
     high_severity_count: usize,
+    certification_evidence: &CertificationEvidenceStatus,
     config: &CertificateConfig,
 ) -> CertificateVerdict {
     // Hard rejection: gate failure or too many high-severity counterexamples
@@ -492,6 +796,15 @@ fn determine_verdict(
     if drift.any_rejected {
         return CertificateVerdict::Rejected;
     }
+    if let Some(false) = certification_evidence.artifact_manifest_gate_passed {
+        return CertificateVerdict::Rejected;
+    }
+    if let Some(false) = certification_evidence.final_gate_passed {
+        return CertificateVerdict::Rejected;
+    }
+    if certification_evidence.missing_artifact_ref_count > 0 {
+        return CertificateVerdict::Rejected;
+    }
 
     // Conditional: gate is conditional, or drift alarms exist, or verification is low
     if gate_report.global_decision == GateDecision::Conditional {
@@ -501,6 +814,9 @@ fn determine_verdict(
         return CertificateVerdict::Conditional;
     }
     if gate_report.global_verification_pct < config.min_verification_pct {
+        return CertificateVerdict::Conditional;
+    }
+    if !certification_evidence.artifact_manifest_present {
         return CertificateVerdict::Conditional;
     }
 
@@ -549,7 +865,7 @@ pub fn generate_release_certificate(config: &CertificateConfig) -> ReleaseCertif
         drift_snapshot,
         campaign_result,
         ci_flake_budget: None,
-        artifact_hashes: Vec::new(),
+        artifact_manifest: None,
     };
 
     build_certificate(&inputs, config)

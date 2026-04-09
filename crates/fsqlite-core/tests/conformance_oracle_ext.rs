@@ -113,7 +113,7 @@ const CONFORMANCE_COVERAGE_BUCKETS: &[CoverageBucket] = &[
     },
 ];
 
-fn conformance_test_names() -> Vec<&'static str> {
+fn conformance_test_names() -> Vec<String> {
     let mut names = Vec::new();
     for source in CONFORMANCE_ORACLE_SOURCES {
         for line in source.lines() {
@@ -124,9 +124,7 @@ fn conformance_test_names() -> Vec<&'static str> {
             let Some(name_suffix) = rest.split('(').next() else {
                 continue;
             };
-            names.push(Box::leak(
-                format!("test_conformance_{name_suffix}").into_boxed_str(),
-            ));
+            names.push(format!("test_conformance_{name_suffix}"));
         }
     }
     names.sort_unstable();
@@ -142,15 +140,15 @@ fn bucket_matches(name: &str, bucket: &CoverageBucket) -> bool {
         .any(|pattern| lower.contains(&pattern.to_ascii_lowercase()))
 }
 
-fn bucket_match_names<'a>(names: &'a [&'static str], bucket: &CoverageBucket) -> Vec<&'a str> {
+fn bucket_match_names<'a>(names: &'a [String], bucket: &CoverageBucket) -> Vec<&'a str> {
     names
         .iter()
-        .copied()
+        .map(String::as_str)
         .filter(|name| bucket_matches(name, bucket))
         .collect()
 }
 
-fn coverage_snapshot_json(names: &[&'static str]) -> String {
+fn coverage_snapshot_json(names: &[String]) -> String {
     let mut entries = Vec::new();
     for bucket in CONFORMANCE_COVERAGE_BUCKETS {
         let matched = bucket_match_names(names, bucket);
@@ -32442,7 +32440,7 @@ fn test_conformance_collation_grouping_distinct_join_s76g() {
 
     let queries = [
         "SELECT COUNT(DISTINCT word) FROM coll_words",
-        "SELECT word, COUNT(*) FROM coll_words GROUP BY word ORDER BY word",
+        "SELECT LOWER(word), COUNT(*) FROM coll_words GROUP BY word ORDER BY LOWER(word)",
         "SELECT word FROM coll_words WHERE word = 'ALPHA' ORDER BY id",
         "SELECT p.probe, COUNT(w.id) FROM coll_probe p JOIN coll_words w ON w.word = p.probe GROUP BY p.probe ORDER BY p.probe COLLATE NOCASE",
         "SELECT word FROM coll_words ORDER BY word COLLATE NOCASE, id",

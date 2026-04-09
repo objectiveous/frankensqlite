@@ -3703,6 +3703,10 @@ static FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL: AtomicU64 = Atomic
 static FSQLITE_VDBE_MAKE_RECORD_CALLS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Total bytes produced by MakeRecord blobs.
 static FSQLITE_VDBE_MAKE_RECORD_BLOB_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Test-only count of sideband MakeRecord values that had to become Arc-backed blobs.
+#[cfg(test)]
+static FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL: AtomicU64 =
+    AtomicU64::new(0);
 /// bd-7vkes: Count times the BTREE_APPEND fast path was taken (skip seek).
 static FSQLITE_VDBE_INSERT_APPEND_COUNT: AtomicU64 = AtomicU64::new(0);
 /// bd-7vkes: Count times a full B-tree seek was needed for INSERT.
@@ -4387,6 +4391,17 @@ pub fn reset_vdbe_metrics() {
     FSQLITE_VDBE_PAGE_DATA_NORMALIZED_PAYLOAD_BYTES_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_PAGE_DATA_NORMALIZED_ZERO_FILL_BYTES_TOTAL.store(0, AtomicOrdering::Relaxed);
     reset_vdbe_jit_metrics();
+}
+
+#[cfg(test)]
+fn reset_vdbe_test_sideband_materialization_count() {
+    FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL
+        .store(0, AtomicOrdering::Relaxed);
+}
+
+#[cfg(test)]
+fn vdbe_test_sideband_materialization_count_snapshot() -> u64 {
+    FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL.load(AtomicOrdering::Relaxed)
 }
 
 fn estimated_value_heap_bytes(value: &SqliteValue) -> u64 {
@@ -10893,6 +10908,9 @@ impl VdbeEngine {
         if self.has_subtypes {
             self.register_subtypes.remove(&r);
         }
+        #[cfg(test)]
+        FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL
+            .fetch_add(1, AtomicOrdering::Relaxed);
         self.registers[idx] =
             SqliteValue::Blob(Arc::<[u8]>::from(std::mem::take(&mut self.make_record_buf)));
         self.make_record_sideband_reg = 0;

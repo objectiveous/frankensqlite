@@ -393,7 +393,11 @@ pub fn render_benchmark_summaries_markdown(summaries: &[BenchmarkSummary]) -> St
     // Detailed per-benchmark sections.
     for s in summaries {
         let _ = writeln!(out, "### {}\n", s.benchmark_id);
-        let _ = writeln!(out, "- **Mode:** {}", mode_display_name(benchmark_mode_label(s)));
+        let _ = writeln!(
+            out,
+            "- **Mode:** {}",
+            mode_display_name(benchmark_mode_label(s))
+        );
         let _ = writeln!(out, "- **Fixture:** {}", s.fixture_id);
         let _ = writeln!(out, "- **Workload:** {}", s.workload);
         let _ = writeln!(out, "- **Concurrency:** {}", s.concurrency);

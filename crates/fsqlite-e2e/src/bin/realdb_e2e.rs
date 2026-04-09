@@ -42,9 +42,9 @@ use fsqlite_e2e::fixture_select::{
     BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE, BeadsBenchmarkCampaign, BenchmarkArtifactCommand,
     BenchmarkArtifactProvenanceCapture, BenchmarkArtifactRetentionClass,
     BenchmarkArtifactToolVersion, BenchmarkMode, ExpandedBenchmarkCell,
-    PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE,
-    PLACEMENT_PROFILE_BASELINE_UNPINNED, PLACEMENT_PROFILE_RECOMMENDED_PINNED,
-    build_benchmark_artifact_manifest, load_beads_benchmark_campaign,
+    PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE, PLACEMENT_PROFILE_BASELINE_UNPINNED,
+    PLACEMENT_PROFILE_RECOMMENDED_PINNED, build_benchmark_artifact_manifest,
+    load_beads_benchmark_campaign,
 };
 use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
 use fsqlite_e2e::golden::{format_mismatch_diagnostic, verify_databases};

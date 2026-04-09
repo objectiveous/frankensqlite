@@ -499,10 +499,10 @@ class, establishing the coupling between Parts 1 and 2:
 | M8 SSI Evidence | — | — | Evidence recording | — |
 
 **Key insight:** The IC (INLINE-CRITICAL) column shows exactly what must be in
-the publish window. M1, M2, M3, and M4 are the only metadata classes touched
-inline-critical. Of these, M4 (ConcurrentRegistry) is the most promising
+the publish window. M1, M2, M3, and the M4 active snapshot table are the only
+metadata classes touched inline-critical. Of these, M4a is the most promising
 optimization target because it is the only one still using a coarse Mutex where
-a finer primitive is viable.
+an immutable reader snapshot is viable.
 
 ---
 

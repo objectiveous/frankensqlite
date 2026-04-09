@@ -209,6 +209,8 @@ pub struct CertificationEvidenceStatus {
     pub artifact_manifest_present: bool,
     /// Whether the artifact manifest's gate passed.
     pub artifact_manifest_gate_passed: Option<bool>,
+    /// Whether verification-contract evidence was embedded in the manifest.
+    pub verification_contract_present: bool,
     /// Whether verification-contract enforcement passed.
     pub verification_contract_passed: Option<bool>,
     /// Whether final gate enforcement passed.
@@ -492,6 +494,9 @@ fn build_certification_evidence_status(
                 )
             })
             .unwrap_or((None, None, None));
+    let verification_contract_present = artifact_manifest
+        .and_then(|manifest| manifest.verification_contract.as_ref())
+        .is_some();
 
     let missing_evidence_beads = artifact_manifest
         .and_then(|manifest| manifest.verification_contract.as_ref())
@@ -506,6 +511,7 @@ fn build_certification_evidence_status(
         policy_id: policy.policy_id.clone(),
         artifact_manifest_present: artifact_manifest.is_some(),
         artifact_manifest_gate_passed,
+        verification_contract_present,
         verification_contract_passed,
         final_gate_passed,
         missing_evidence_beads,
@@ -710,6 +716,16 @@ pub fn build_certificate(
         });
     }
 
+    if certification_evidence.artifact_manifest_present
+        && !certification_evidence.verification_contract_present
+    {
+        unresolved_risks.push(UnresolvedRisk {
+            source: "verification_contract".to_owned(),
+            severity: "High".to_owned(),
+            description: "Artifact manifest is present but verification-contract evidence is missing.".to_owned(),
+        });
+    }
+
     // ---- Drift summary ----
     let drift_alert_categories = drift
         .category_states
@@ -797,6 +813,11 @@ fn determine_verdict(
         return CertificateVerdict::Rejected;
     }
     if let Some(false) = certification_evidence.artifact_manifest_gate_passed {
+        return CertificateVerdict::Rejected;
+    }
+    if certification_evidence.artifact_manifest_present
+        && !certification_evidence.verification_contract_present
+    {
         return CertificateVerdict::Rejected;
     }
     if let Some(false) = certification_evidence.final_gate_passed {
@@ -1199,6 +1220,7 @@ mod tests {
                 policy_id: "policy".to_owned(),
                 artifact_manifest_present: false,
                 artifact_manifest_gate_passed: None,
+                verification_contract_present: false,
                 verification_contract_passed: None,
                 final_gate_passed: None,
                 missing_evidence_beads: 0,

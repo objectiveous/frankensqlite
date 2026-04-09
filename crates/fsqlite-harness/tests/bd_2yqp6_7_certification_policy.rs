@@ -57,7 +57,7 @@ fn failing_contract_outcome() -> ContractEnforcementOutcome {
     }
 }
 
-fn certification_manifest(contract: ContractEnforcementOutcome) -> ArtifactManifest {
+fn certification_manifest(contract: Option<ContractEnforcementOutcome>) -> ArtifactManifest {
     ArtifactManifest {
         schema_version: "1.0.0".to_owned(),
         bead_id: BEAD_ID.to_owned(),
@@ -77,7 +77,7 @@ fn certification_manifest(contract: ContractEnforcementOutcome) -> ArtifactManif
         gate_passed: true,
         bisect_request: None,
         bisect_result_summary: None,
-        verification_contract: Some(contract),
+        verification_contract: contract,
     }
 }
 
@@ -142,7 +142,7 @@ fn strict_ready_inputs(
             drift_snapshot,
             campaign_result,
             ci_flake_budget: None,
-            artifact_manifest: Some(certification_manifest(contract)),
+            artifact_manifest: Some(certification_manifest(Some(contract))),
         },
         config,
     )
@@ -212,5 +212,38 @@ fn release_certificate_rejects_failed_verification_contract_from_manifest() {
             .iter()
             .any(|risk| risk.source == "verification_contract"),
         "bead_id={BEAD_ID} case=contract_risk",
+    );
+}
+
+#[test]
+fn release_certificate_rejects_manifest_missing_verification_contract() {
+    let config = CertificateConfig::default();
+    let catalog = build_canonical_catalog();
+    let universe = build_canonical_universe();
+    let (mut gate_report, ranking) = evaluate_full(&catalog, &universe, &config.gate_config);
+    gate_report.global_decision = GateDecision::Pass;
+    gate_report.release_ready = true;
+    gate_report.global_verification_pct = 100.0;
+    gate_report.passing_invariants = gate_report.total_invariants;
+
+    let inputs = CertificateInputs {
+        gate_report: gate_report.clone(),
+        expected_loss_ranking: ranking.clone(),
+        evidence_ledger: build_evidence_ledger(&gate_report, &ranking),
+        catalog_stats: catalog.stats(),
+        traceability: certification_traceability(),
+        drift_snapshot: ParityDriftMonitor::new(config.drift_config.clone()).snapshot(),
+        campaign_result: synthetic_passing_campaign(),
+        ci_flake_budget: None,
+        artifact_manifest: Some(certification_manifest(None)),
+    };
+
+    let cert = build_certificate(&inputs, &config);
+    assert_eq!(cert.verdict, CertificateVerdict::Rejected);
+    assert!(
+        cert.unresolved_risks
+            .iter()
+            .any(|risk| risk.description.contains("verification-contract evidence is missing")),
+        "bead_id={BEAD_ID} case=missing_contract_evidence",
     );
 }

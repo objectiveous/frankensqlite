@@ -485,6 +485,94 @@ fn txn_savepoint_reuse_name() {
     );
 }
 
+#[test]
+fn test_lazy_memdb_cross_statement_visibility() {
+    let runner = ComparisonRunner::new_in_memory().expect("failed to create comparison runner");
+    let steps = [
+        (
+            "CREATE TABLE lazy_memdb_txn (id INTEGER PRIMARY KEY, val TEXT, note INTEGER)",
+            false,
+        ),
+        ("BEGIN", false),
+        ("INSERT INTO lazy_memdb_txn VALUES (1, 'alpha', 10)", false),
+        ("SELECT val, note FROM lazy_memdb_txn WHERE id = 1", true),
+        ("INSERT INTO lazy_memdb_txn VALUES (2, 'beta', 20)", false),
+        ("SELECT COUNT(*) FROM lazy_memdb_txn", true),
+        (
+            "UPDATE lazy_memdb_txn SET val = 'alpha2', note = 11 WHERE id = 1",
+            false,
+        ),
+        ("SELECT val, note FROM lazy_memdb_txn WHERE id = 1", true),
+        ("DELETE FROM lazy_memdb_txn WHERE id = 2", false),
+        ("SELECT COUNT(*) FROM lazy_memdb_txn WHERE id = 2", true),
+        ("INSERT INTO lazy_memdb_txn VALUES (3, 'gamma', 30)", false),
+        ("SELECT id, val FROM lazy_memdb_txn ORDER BY id", true),
+        ("COMMIT", false),
+        ("SELECT id, val, note FROM lazy_memdb_txn ORDER BY id", true),
+    ];
+
+    let is_txn_control = |sql: &str| {
+        let upper = sql.trim().to_uppercase();
+        upper.starts_with("BEGIN")
+            || upper.starts_with("COMMIT")
+            || upper.starts_with("ROLLBACK")
+            || upper.starts_with("SAVEPOINT")
+            || upper.starts_with("RELEASE")
+            || upper.starts_with("END")
+    };
+
+    for (sql, is_query) in steps {
+        if is_query {
+            let c_rows = runner.csqlite().query(sql).expect("csqlite query");
+            let f_rows = runner.frank().query(sql).expect("fsqlite query");
+            assert_eq!(
+                c_rows, f_rows,
+                "cross-statement visibility mismatch for query `{sql}`:\n  csqlite={c_rows:?}\n  fsqlite={f_rows:?}"
+            );
+            continue;
+        }
+
+        let c_res = runner.csqlite().execute(sql);
+        let f_res = runner.frank().execute(sql);
+        if is_txn_control(sql) {
+            assert!(
+                c_res.is_ok() == f_res.is_ok(),
+                "transaction-control outcome diverged for `{sql}`:\n  csqlite={c_res:?}\n  fsqlite={f_res:?}"
+            );
+        } else {
+            let c_changes = c_res.unwrap_or_else(|err| panic!("csqlite failed on `{sql}`: {err}"));
+            let f_changes = f_res.unwrap_or_else(|err| panic!("fsqlite failed on `{sql}`: {err}"));
+            assert_eq!(
+                c_changes, f_changes,
+                "affected-row count mismatch for `{sql}`: csqlite={c_changes} fsqlite={f_changes}"
+            );
+        }
+    }
+
+    let expected = vec![
+        vec![
+            SqlValue::Integer(1),
+            SqlValue::Text("alpha2".to_owned()),
+            SqlValue::Integer(11),
+        ],
+        vec![
+            SqlValue::Integer(3),
+            SqlValue::Text("gamma".to_owned()),
+            SqlValue::Integer(30),
+        ],
+    ];
+    let c_rows = runner
+        .csqlite()
+        .query("SELECT id, val, note FROM lazy_memdb_txn ORDER BY id")
+        .expect("csqlite final query");
+    let f_rows = runner
+        .frank()
+        .query("SELECT id, val, note FROM lazy_memdb_txn ORDER BY id")
+        .expect("fsqlite final query");
+    assert_eq!(c_rows, expected, "unexpected csqlite final rows");
+    assert_eq!(f_rows, expected, "unexpected fsqlite final rows");
+}
+
 // ─── Scenario K: WAL/checkpoint/journal-mode parity transitions ───────
 
 #[test]
@@ -771,5 +859,81 @@ fn txn_checkpoint_all_modes_with_data() {
         f_count,
         vec![vec![SqlValue::Integer(12)]],
         "expected 12 rows after all inserts"
+    );
+}
+
+#[test]
+fn txn_file_backed_retained_autocommit_interleaved_read_write_close_reopen_matches_rusqlite() {
+    let tmp = tempdir().expect("tempdir");
+    let c_path = tmp.path().join("oracle_retained_autocommit.db");
+    let f_path = tmp.path().join("candidate_retained_autocommit.db");
+    let f_path_string = f_path.to_string_lossy().into_owned();
+
+    let c_conn = rusqlite::Connection::open(&c_path).expect("open csqlite db");
+    let f_conn = fsqlite::Connection::open(&f_path_string).expect("open fsqlite db");
+    f_conn
+        .execute("PRAGMA fsqlite.concurrent_mode = OFF;")
+        .expect("disable concurrent mode for deterministic retained-autocommit coverage");
+
+    let schema_sql = "CREATE TABLE msgs(id INTEGER PRIMARY KEY, val TEXT NOT NULL);";
+    c_conn.execute(schema_sql, []).expect("csqlite schema");
+    f_conn.execute(schema_sql).expect("fsqlite schema");
+
+    for step in 1_u32..=24 {
+        let rowid = i64::from(step);
+        let insert_sql = format!("INSERT INTO msgs VALUES ({rowid}, 'v{rowid}');");
+        c_conn.execute(&insert_sql, []).expect("csqlite insert");
+        f_conn.execute(&insert_sql).expect("fsqlite insert");
+
+        let point_lookup_sql = format!("SELECT id, val FROM msgs WHERE id = {rowid};");
+        assert_eq!(
+            csqlite_query_values(&c_conn, &point_lookup_sql),
+            fsqlite_query_values(&f_conn, &point_lookup_sql),
+            "read-after-write point lookup diverged after INSERT step {step}"
+        );
+
+        if step.is_multiple_of(6) {
+            let target = rowid - 1;
+            let update_sql = format!("UPDATE msgs SET val = 'u{target}' WHERE id = {target};");
+            c_conn.execute(&update_sql, []).expect("csqlite update");
+            f_conn.execute(&update_sql).expect("fsqlite update");
+
+            let verify_update_sql = format!("SELECT id, val FROM msgs WHERE id = {target};");
+            assert_eq!(
+                csqlite_query_values(&c_conn, &verify_update_sql),
+                fsqlite_query_values(&f_conn, &verify_update_sql),
+                "read-after-write point lookup diverged after UPDATE step {step}"
+            );
+        }
+    }
+
+    let delete_sql = "DELETE FROM msgs WHERE id IN (3, 7, 11, 19);";
+    c_conn.execute(delete_sql, []).expect("csqlite delete");
+    f_conn.execute(delete_sql).expect("fsqlite delete");
+
+    let post_delete_sql = "SELECT COUNT(*), MIN(id), MAX(id) FROM msgs;";
+    assert_eq!(
+        csqlite_query_values(&c_conn, post_delete_sql),
+        fsqlite_query_values(&f_conn, post_delete_sql),
+        "post-delete retained autocommit state diverged before close"
+    );
+
+    let full_dump_sql = "SELECT id, val FROM msgs ORDER BY id;";
+    let before_close_c = csqlite_query_values(&c_conn, full_dump_sql);
+    let before_close_f = fsqlite_query_values(&f_conn, full_dump_sql);
+    assert_eq!(
+        before_close_c, before_close_f,
+        "file-backed retained autocommit should match the oracle before close"
+    );
+
+    f_conn.close().expect("close fsqlite connection");
+    drop(c_conn);
+
+    let reopened_c = rusqlite::Connection::open(&c_path).expect("reopen csqlite db");
+    let reopened_f = fsqlite::Connection::open(&f_path_string).expect("reopen fsqlite db");
+    assert_eq!(
+        csqlite_query_values(&reopened_c, full_dump_sql),
+        fsqlite_query_values(&reopened_f, full_dump_sql),
+        "close+reopen must flush retained autocommit state identically to the oracle"
     );
 }

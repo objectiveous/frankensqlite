@@ -431,6 +431,32 @@ fn configure_btree_cursor_page_size<P>(
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReusableTableExecutionStateOutcome {
+    pub metadata_rebind_count: u32,
+}
+
+#[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ReusableTableExecutionState {
+    pub func_registry: Arc<FunctionRegistry>,
+    pub collation_registry: Arc<Mutex<CollationRegistry>>,
+    pub schema_cookie: u32,
+    pub autoincrement_seq_by_root_page: HashMap<i32, i64>,
+    pub rowid_alias_col_by_root_page: Arc<HashMap<i32, usize>>,
+    pub table_column_count_by_root_page: Arc<HashMap<i32, usize>>,
+    pub first_not_null_non_ipk_col_by_root_page: Arc<HashMap<i32, usize>>,
+    pub column_defaults_by_root_page: Arc<HashMap<i32, Vec<Option<SqliteValue>>>>,
+    pub index_desc_flags_by_root_page: Arc<HashMap<i32, Vec<bool>>>,
+    pub index_collations_by_root_page: Arc<HashMap<i32, Vec<Option<String>>>>,
+    pub reject_mem_fallback: bool,
+    pub memdb_rows_loaded: bool,
+    pub storage_cursor_memdb_count_shortcuts_safe: bool,
+    pub version_store: Option<Arc<VersionStore>>,
+    pub collect_result_rows: bool,
+    pub max_collected_result_rows: Option<usize>,
+}
+
 // ── In-Memory Table Store ──────────────────────────────────────────────────
 //
 // Phase 4 in-memory cursor backend. Allows the VDBE engine to execute
@@ -1505,11 +1531,13 @@ impl SharedTxnPageIo {
         }
     }
 
+    #[cfg(test)]
     fn new(txn: impl Into<TransactionKind>) -> Self {
         Self::from_parts(txn.into(), None)
     }
 
     /// Create with MVCC concurrent context (bd-kivg / 5E.2).
+    #[cfg(test)]
     fn with_concurrent(
         txn: impl Into<TransactionKind>,
         session_id: u64,
@@ -5440,26 +5468,13 @@ impl VdbeEngine {
         self.statement_cold_state.clear();
     }
 
-    /// Reset the engine for reuse, clearing per-statement state but keeping
-    /// allocated backing memory so subsequent executions avoid 21+ collection
-    /// re-allocations.
-    ///
-    /// After `reset()` the engine is equivalent to a freshly constructed one
-    /// with the same `register_count` — but all `Vec`/`HashMap`/`SmallVec`
-    /// retain their heap capacity.
-    /// Reset engine state for reuse from the cached-engine pool.
-    ///
-    /// When `retain_cursors` is true, storage cursors and their root-page
-    /// mapping are kept alive so that repeated DML on the same table can
-    /// skip `OP_OpenWrite` cursor creation and `OP_Last` seek on subsequent
-    /// rows.  The caller is responsible for ensuring the transaction handle
-    /// (`txn_page_io`) stays valid across calls when cursors are retained.
-    pub fn reset_for_reuse_ex(
+    fn reset_for_reuse_impl(
         &mut self,
         register_count: i32,
         execution_cx: &Cx,
         page_size: PageSize,
         retain_cursors: bool,
+        preserve_runtime_setup: bool,
     ) {
         let count = register_count.max(0) as u32 + 1;
         // Clear + resize registers to reuse the SmallVec's inline/heap buffer.
@@ -5488,30 +5503,32 @@ impl VdbeEngine {
             self.txn_page_io = None;
         }
         if !retain_cursors {
-            self.reject_mem_fallback = true;
             self.db = None;
-            self.memdb_rows_loaded = false;
-            self.storage_cursor_memdb_count_shortcuts_safe = false;
             self.cursor_root_pages.clear();
             self.vtab_instances.clear();
             self.time_travel_cursors.clear();
-            self.version_store = None;
             self.time_travel_commit_log = None;
             self.time_travel_gc_horizon = None;
         }
-        self.func_registry = None;
+        if !preserve_runtime_setup {
+            self.func_registry = None;
+        }
         self.scalar_function_cache.clear();
         self.aggregate_function_cache.clear();
         // Keep the existing collation_registry Arc — don't allocate a new one.
         self.clear_statement_cold_state();
-        self.schema_cookie = 0;
+        if !preserve_runtime_setup {
+            self.schema_cookie = 0;
+        }
         self.last_compare_result = None;
         self.changes = 0;
         self.last_insert_rowid = 0;
         self.last_insert_rowid_valid = false;
         self.last_insert_cursor_id = None;
         self.fk_counter = 0;
-        self.autoincrement_seq_by_root_page.clear();
+        if !preserve_runtime_setup {
+            self.autoincrement_seq_by_root_page.clear();
+        }
         if !retain_cursors {
             self.concurrent_rowid_allocator = None;
             self.concurrent_rowid_schema_epoch = SchemaEpoch::ZERO;
@@ -5520,14 +5537,230 @@ impl VdbeEngine {
         // program at the start of each run (line ~4903).
         self.make_record_buf.truncate(0);
         self.make_record_sideband_reg = 0;
-        self.collect_result_rows = true;
-        self.max_collected_result_rows = None;
+        if !preserve_runtime_setup {
+            self.reject_mem_fallback = true;
+            self.memdb_rows_loaded = false;
+            self.storage_cursor_memdb_count_shortcuts_safe = false;
+            self.version_store = None;
+            self.collect_result_rows = true;
+            self.max_collected_result_rows = None;
+        }
         self.statement_state_clean = true;
+    }
+
+    /// Reset the engine for reuse, clearing per-statement state but keeping
+    /// allocated backing memory so subsequent executions avoid 21+ collection
+    /// re-allocations.
+    ///
+    /// After `reset()` the engine is equivalent to a freshly constructed one
+    /// with the same `register_count` — but all `Vec`/`HashMap`/`SmallVec`
+    /// retain their heap capacity.
+    /// Reset engine state for reuse from the cached-engine pool.
+    ///
+    /// When `retain_cursors` is true, storage cursors and their root-page
+    /// mapping are kept alive so that repeated DML on the same table can
+    /// skip `OP_OpenWrite` cursor creation and `OP_Last` seek on subsequent
+    /// rows.  The caller is responsible for ensuring the transaction handle
+    /// (`txn_page_io`) stays valid across calls when cursors are retained.
+    pub fn reset_for_reuse_ex(
+        &mut self,
+        register_count: i32,
+        execution_cx: &Cx,
+        page_size: PageSize,
+        retain_cursors: bool,
+    ) {
+        self.reset_for_reuse_impl(
+            register_count,
+            execution_cx,
+            page_size,
+            retain_cursors,
+            false,
+        );
+    }
+
+    /// Reset the engine while retaining runtime bindings that a caller may
+    /// immediately revalidate and reuse on the next execution.
+    ///
+    /// This is used by prepared-statement reusable lanes so hot loops can skip
+    /// rebinding identical function/schema/default metadata on every row.
+    pub fn reset_for_reuse_preserving_runtime_setup(
+        &mut self,
+        register_count: i32,
+        execution_cx: &Cx,
+        page_size: PageSize,
+        retain_cursors: bool,
+    ) {
+        self.reset_for_reuse_impl(
+            register_count,
+            execution_cx,
+            page_size,
+            retain_cursors,
+            true,
+        );
     }
 
     /// Convenience wrapper: reset without retaining cursors (legacy behavior).
     pub fn reset_for_reuse(&mut self, register_count: i32, execution_cx: &Cx, page_size: PageSize) {
         self.reset_for_reuse_ex(register_count, execution_cx, page_size, false);
+    }
+
+    pub fn apply_reusable_table_execution_state(
+        &mut self,
+        state: ReusableTableExecutionState,
+    ) -> ReusableTableExecutionStateOutcome {
+        let ReusableTableExecutionState {
+            func_registry,
+            collation_registry,
+            schema_cookie,
+            autoincrement_seq_by_root_page,
+            rowid_alias_col_by_root_page,
+            table_column_count_by_root_page,
+            first_not_null_non_ipk_col_by_root_page,
+            column_defaults_by_root_page,
+            index_desc_flags_by_root_page,
+            index_collations_by_root_page,
+            reject_mem_fallback,
+            memdb_rows_loaded,
+            storage_cursor_memdb_count_shortcuts_safe,
+            version_store,
+            collect_result_rows,
+            max_collected_result_rows,
+        } = state;
+
+        let mut outcome = ReusableTableExecutionStateOutcome::default();
+        let mut note_rebind = |changed: bool| {
+            if changed {
+                outcome.metadata_rebind_count += 1;
+            }
+        };
+
+        let func_registry_changed = self
+            .func_registry
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, &func_registry));
+        if func_registry_changed {
+            self.func_registry = Some(func_registry);
+        }
+        note_rebind(func_registry_changed);
+
+        let collation_registry_changed =
+            !Arc::ptr_eq(&self.collation_registry, &collation_registry);
+        if collation_registry_changed {
+            self.collation_registry = collation_registry;
+        }
+        note_rebind(collation_registry_changed);
+
+        let schema_cookie_changed = self.schema_cookie != schema_cookie;
+        if schema_cookie_changed {
+            self.schema_cookie = schema_cookie;
+        }
+        note_rebind(schema_cookie_changed);
+
+        let autoincrement_seq_changed =
+            self.autoincrement_seq_by_root_page != autoincrement_seq_by_root_page;
+        if autoincrement_seq_changed {
+            self.autoincrement_seq_by_root_page = autoincrement_seq_by_root_page;
+        }
+        note_rebind(autoincrement_seq_changed);
+
+        let rowid_alias_changed = !Arc::ptr_eq(
+            &self.rowid_alias_col_by_root_page,
+            &rowid_alias_col_by_root_page,
+        );
+        if rowid_alias_changed {
+            self.rowid_alias_col_by_root_page = rowid_alias_col_by_root_page;
+        }
+        note_rebind(rowid_alias_changed);
+
+        let table_column_count_changed = !Arc::ptr_eq(
+            &self.table_column_count_by_root_page,
+            &table_column_count_by_root_page,
+        );
+        if table_column_count_changed {
+            self.table_column_count_by_root_page = table_column_count_by_root_page;
+        }
+        note_rebind(table_column_count_changed);
+
+        let first_not_null_changed = !Arc::ptr_eq(
+            &self.first_not_null_non_ipk_col_by_root_page,
+            &first_not_null_non_ipk_col_by_root_page,
+        );
+        if first_not_null_changed {
+            self.first_not_null_non_ipk_col_by_root_page = first_not_null_non_ipk_col_by_root_page;
+        }
+        note_rebind(first_not_null_changed);
+
+        let column_defaults_changed = !Arc::ptr_eq(
+            &self.column_defaults_by_root_page,
+            &column_defaults_by_root_page,
+        );
+        if column_defaults_changed {
+            self.column_defaults_by_root_page = column_defaults_by_root_page;
+        }
+        note_rebind(column_defaults_changed);
+
+        let index_desc_flags_changed = !Arc::ptr_eq(
+            &self.index_desc_flags_by_root_page,
+            &index_desc_flags_by_root_page,
+        );
+        if index_desc_flags_changed {
+            self.index_desc_flags_by_root_page = index_desc_flags_by_root_page;
+        }
+        note_rebind(index_desc_flags_changed);
+
+        let index_collations_changed = !Arc::ptr_eq(
+            &self.index_collations_by_root_page,
+            &index_collations_by_root_page,
+        );
+        if index_collations_changed {
+            self.index_collations_by_root_page = index_collations_by_root_page;
+        }
+        note_rebind(index_collations_changed);
+
+        let reject_mem_fallback_changed = self.reject_mem_fallback != reject_mem_fallback;
+        if reject_mem_fallback_changed {
+            self.reject_mem_fallback = reject_mem_fallback;
+        }
+        note_rebind(reject_mem_fallback_changed);
+
+        let memdb_rows_loaded_changed = self.memdb_rows_loaded != memdb_rows_loaded;
+        if memdb_rows_loaded_changed {
+            self.memdb_rows_loaded = memdb_rows_loaded;
+        }
+        note_rebind(memdb_rows_loaded_changed);
+
+        let storage_shortcuts_changed = self.storage_cursor_memdb_count_shortcuts_safe
+            != storage_cursor_memdb_count_shortcuts_safe;
+        if storage_shortcuts_changed {
+            self.storage_cursor_memdb_count_shortcuts_safe =
+                storage_cursor_memdb_count_shortcuts_safe;
+        }
+        note_rebind(storage_shortcuts_changed);
+
+        let version_store_changed = match (&self.version_store, &version_store) {
+            (Some(current), Some(next)) => !Arc::ptr_eq(current, next),
+            (None, None) => false,
+            _ => true,
+        };
+        if version_store_changed {
+            self.version_store = version_store;
+        }
+        note_rebind(version_store_changed);
+
+        let collect_result_rows_changed = self.collect_result_rows != collect_result_rows;
+        if collect_result_rows_changed {
+            self.collect_result_rows = collect_result_rows;
+        }
+        note_rebind(collect_result_rows_changed);
+
+        let max_collected_result_rows_changed =
+            self.max_collected_result_rows != max_collected_result_rows;
+        if max_collected_result_rows_changed {
+            self.max_collected_result_rows = max_collected_result_rows;
+        }
+        note_rebind(max_collected_result_rows_changed);
+
+        outcome
     }
 
     /// Returns the number of rows modified (inserted, deleted, or updated).
@@ -19657,6 +19890,283 @@ mod tests {
             table.rows.len(),
             0,
             "write-through must keep MemDatabase stale"
+        );
+    }
+
+    #[test]
+    fn test_lazy_dirty_flag_set_on_insert() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+        b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 77, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_storage_cursor_memdb_count_shortcuts_safe(true);
+        engine.set_reject_mem_fallback(false);
+
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert!(engine.has_dirty_root_pages());
+        assert!(engine.dirty_root_pages().contains(&root));
+        assert_eq!(engine.dirty_root_pages().len(), 1);
+        assert!(
+            !engine.storage_cursor_memdb_count_shortcuts_safe(),
+            "storage-backed INSERT must mark the MemDatabase mirror stale"
+        );
+
+        let db = engine.take_database().expect("database should exist");
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(
+            table.rows.len(),
+            0,
+            "lazy dirty tracking must leave MemDatabase row mirroring deferred"
+        );
+    }
+
+    #[test]
+    fn test_lazy_dirty_read_from_btree() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+        b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 41, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+        let body = b.current_addr();
+        b.emit_op(Opcode::Column, 0, 0, 4, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 4, 1, 0, P4::None, 0);
+        let next_target =
+            i32::try_from(body).expect("program counter should fit into i32 for tests");
+        b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_storage_cursor_memdb_count_shortcuts_safe(true);
+        engine.set_reject_mem_fallback(false);
+
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        let rows: Vec<_> = engine
+            .take_results()
+            .into_iter()
+            .map(|row| row.into_vec())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Integer(41)]],
+            "same-statement reads must come from the storage-backed B-tree when the MemDatabase mirror is stale"
+        );
+        assert!(engine.has_dirty_root_pages());
+        assert!(engine.dirty_root_pages().contains(&root));
+
+        let db = engine.take_database().expect("database should exist");
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(
+            table.rows.len(),
+            0,
+            "B-tree fallback reads must not eagerly repopulate the stale MemDatabase mirror"
+        );
+    }
+
+    #[test]
+    fn test_lazy_dirty_multiple_tables() {
+        let mut db = MemDatabase::new();
+        let root_a = db.create_table(1);
+        let root_b = db.create_table(1);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 0, root_a, 0, P4::Int(1), 0);
+        b.emit_op(Opcode::OpenWrite, 1, root_b, 0, P4::Int(1), 0);
+
+        b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 10, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+
+        b.emit_op(Opcode::NewRowid, 1, 4, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 20, 5, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 5, 1, 6, P4::None, 0);
+        b.emit_op(Opcode::Insert, 1, 6, 4, P4::None, 0);
+
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_storage_cursor_memdb_count_shortcuts_safe(true);
+        engine.set_reject_mem_fallback(false);
+
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert!(engine.has_dirty_root_pages());
+        assert!(engine.dirty_root_pages().contains(&root_a));
+        assert!(engine.dirty_root_pages().contains(&root_b));
+        assert_eq!(
+            engine.dirty_root_pages().len(),
+            2,
+            "lazy dirty tracking must record every dirty table root separately"
+        );
+
+        let db = engine.take_database().expect("database should exist");
+        assert_eq!(
+            db.get_table(root_a)
+                .expect("table A should exist")
+                .rows
+                .len(),
+            0,
+            "table A should remain stale in MemDatabase until a later reload"
+        );
+        assert_eq!(
+            db.get_table(root_b)
+                .expect("table B should exist")
+                .rows
+                .len(),
+            0,
+            "table B should remain stale in MemDatabase until a later reload"
+        );
+    }
+
+    #[test]
+    fn test_lazy_dirty_update_after_insert() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+
+        b.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 10, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+
+        b.emit_op(Opcode::Integer, 99, 4, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 4, 1, 5, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 5, 1, P4::None, 5);
+
+        b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+        let body = b.current_addr();
+        b.emit_op(Opcode::Column, 0, 0, 6, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 6, 1, 0, P4::None, 0);
+        let next_target =
+            i32::try_from(body).expect("program counter should fit into i32 for tests");
+        b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_storage_cursor_memdb_count_shortcuts_safe(true);
+        engine.set_reject_mem_fallback(false);
+
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        let rows: Vec<_> = engine
+            .take_results()
+            .into_iter()
+            .map(|row| row.into_vec())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Integer(99)]],
+            "a later storage-backed REPLACE must be visible through the B-tree fallback even while the MemDatabase mirror remains stale"
+        );
+        assert!(engine.has_dirty_root_pages());
+        assert!(engine.dirty_root_pages().contains(&root));
+        assert_eq!(engine.dirty_root_pages().len(), 1);
+
+        let db = engine.take_database().expect("database should exist");
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(
+            table.rows.len(),
+            0,
+            "lazy dirty tracking must not eagerly maintain the MemDatabase row mirror across update-like writes"
+        );
+    }
+
+    #[test]
+    fn test_lazy_dirty_delete_after_insert() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        let after_delete = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+
+        b.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 10, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+
+        b.emit_op(Opcode::Integer, 1, 4, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SeekRowid, 0, 4, after_delete, P4::None, 0);
+        b.emit_op(Opcode::Delete, 0, 0, 0, P4::None, 0);
+        b.resolve_label(after_delete);
+
+        b.emit_op(Opcode::Count, 0, 5, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 5, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_storage_cursor_memdb_count_shortcuts_safe(true);
+        engine.set_reject_mem_fallback(false);
+
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        let rows: Vec<_> = engine
+            .take_results()
+            .into_iter()
+            .map(|row| row.into_vec())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Integer(0)]],
+            "storage-backed COUNT must observe the delete even while MemDatabase mirroring is deferred"
+        );
+        assert!(engine.has_dirty_root_pages());
+        assert!(engine.dirty_root_pages().contains(&root));
+        assert_eq!(engine.dirty_root_pages().len(), 1);
+
+        let db = engine.take_database().expect("database should exist");
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(
+            table.rows.len(),
+            0,
+            "lazy dirty tracking must leave the MemDatabase empty until a later bulk reload"
         );
     }
 

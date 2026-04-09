@@ -212,6 +212,102 @@ fn bd_qayid_track_t_oracle_10k_sequential_append_matches_sqlite() {
 }
 
 #[test]
+fn bd_qayid_track_t_oracle_begin_concurrent_seq_vs_interleaved_metrics() {
+    let _guard = TRACK_T_E2E_LOCK.lock().unwrap();
+    let rows: Vec<i64> = (1..=1_024).collect();
+    let interleaved_rows = interleaved_rowids(1_024);
+
+    let temp = tempdir().expect("tempdir");
+    let seq_fsqlite_db = temp.path().join("track_t_seq_fsqlite.db");
+    let seq_sqlite_db = temp.path().join("track_t_seq_sqlite.db");
+    let gap_fsqlite_db = temp.path().join("track_t_gap_fsqlite.db");
+    let gap_sqlite_db = temp.path().join("track_t_gap_sqlite.db");
+
+    let seq_fconn = open_fsqlite(&seq_fsqlite_db);
+    let seq_sconn = open_sqlite(&seq_sqlite_db);
+    let gap_fconn = open_fsqlite(&gap_fsqlite_db);
+    let gap_sconn = open_sqlite(&gap_sqlite_db);
+
+    for conn in [&seq_fconn, &gap_fconn] {
+        conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")
+            .expect("enable fsqlite concurrent mode");
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .expect("create fsqlite table");
+    }
+    for conn in [&seq_sconn, &gap_sconn] {
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .expect("create sqlite table");
+    }
+
+    let seq_sql = explicit_row_insert_sql("t", &rows);
+    let gap_sql = explicit_row_insert_sql("t", &interleaved_rows);
+
+    let (_result, seq_metrics) = capture_vdbe_metrics(|| {
+        seq_fconn
+            .execute("BEGIN CONCURRENT;")
+            .expect("fsqlite sequential begin concurrent");
+        seq_fconn
+            .execute(&seq_sql)
+            .expect("fsqlite sequential bulk insert");
+        seq_fconn
+            .execute("COMMIT;")
+            .expect("fsqlite sequential commit");
+    });
+    seq_sconn
+        .execute_batch("BEGIN;")
+        .expect("sqlite sequential begin");
+    seq_sconn
+        .execute_batch(&(seq_sql.clone() + ";"))
+        .expect("sqlite sequential bulk insert");
+    seq_sconn
+        .execute_batch("COMMIT;")
+        .expect("sqlite sequential commit");
+
+    let (_result, gap_metrics) = capture_vdbe_metrics(|| {
+        gap_fconn
+            .execute("BEGIN CONCURRENT;")
+            .expect("fsqlite interleaved begin concurrent");
+        gap_fconn
+            .execute(&gap_sql)
+            .expect("fsqlite interleaved bulk insert");
+        gap_fconn
+            .execute("COMMIT;")
+            .expect("fsqlite interleaved commit");
+    });
+    gap_sconn
+        .execute_batch("BEGIN;")
+        .expect("sqlite interleaved begin");
+    gap_sconn
+        .execute_batch(&(gap_sql.clone() + ";"))
+        .expect("sqlite interleaved bulk insert");
+    gap_sconn
+        .execute_batch("COMMIT;")
+        .expect("sqlite interleaved commit");
+
+    let seq_fsqlite_rows = fetch_fsqlite_rows(&seq_fconn, "t");
+    let seq_sqlite_rows = fetch_sqlite_rows(&seq_sconn, "t");
+    let gap_fsqlite_rows = fetch_fsqlite_rows(&gap_fconn, "t");
+    let gap_sqlite_rows = fetch_sqlite_rows(&gap_sconn, "t");
+    assert_eq!(
+        seq_fsqlite_rows, seq_sqlite_rows,
+        "sequential BEGIN CONCURRENT rowset mismatch"
+    );
+    assert_eq!(
+        gap_fsqlite_rows, gap_sqlite_rows,
+        "interleaved BEGIN CONCURRENT rowset mismatch"
+    );
+
+    assert!(
+        seq_metrics.insert_append_count > gap_metrics.insert_append_count,
+        "sequential workload should stay on the append lane more often than the interleaved workload: seq={seq_metrics:?} gap={gap_metrics:?}"
+    );
+    assert!(
+        gap_metrics.insert_seek_count > seq_metrics.insert_seek_count,
+        "interleaved workload should force more existence seeks than the sequential workload: seq={seq_metrics:?} gap={gap_metrics:?}"
+    );
+}
+
+#[test]
 #[ignore = "manual perf probe; run via rch when investigating Track T append throughput"]
 fn bd_qayid_track_t_append_throughput_probe_emits_metrics() {
     let _guard = TRACK_T_E2E_LOCK.lock().unwrap();

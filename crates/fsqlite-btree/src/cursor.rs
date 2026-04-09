@@ -7424,6 +7424,53 @@ mod tests {
     }
 
     #[test]
+    fn test_table_seek_cache_hot_set_avoids_root_descent() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(
+            2,
+            build_interior_table(&[(pn(3), 20), (pn(4), 40), (pn(5), 60), (pn(6), 80)], pn(7)),
+        );
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(10, b"a"), (20, b"b")]));
+        store
+            .pages
+            .insert(4, build_leaf_table(&[(30, b"c"), (40, b"d")]));
+        store
+            .pages
+            .insert(5, build_leaf_table(&[(50, b"e"), (60, b"f")]));
+        store
+            .pages
+            .insert(6, build_leaf_table(&[(70, b"g"), (80, b"h")]));
+        store
+            .pages
+            .insert(7, build_leaf_table(&[(90, b"i"), (100, b"j")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, true);
+
+        for rowid in [10_i64, 30, 50, 70] {
+            assert!(cursor.table_move_to(&cx, rowid).unwrap().is_found());
+        }
+
+        for (target, expected_leaf) in [(15_i64, pn(3)), (35, pn(4)), (55, pn(5)), (75, pn(6))] {
+            cursor.pager.clear_reads();
+            let result = cursor.table_move_to(&cx, target).unwrap();
+            assert!(!result.is_found());
+            let read_pages = cursor.pager.read_pages();
+            assert_eq!(
+                read_pages.last().copied(),
+                Some(expected_leaf),
+                "cached seek should still land on the expected leaf for target {target}"
+            );
+            assert!(
+                read_pages.iter().all(|page_no| *page_no != pn(2)),
+                "four-page hot set should satisfy target {target} without revisiting the root: {read_pages:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_table_leaf_interpolation_search_matches_binary_on_sparse_rowids() {
         let cx = Cx::new();
         let mut store = MemPageStore::new(USABLE);
@@ -7452,6 +7499,38 @@ mod tests {
             assert_eq!(
                 interpolation, binary,
                 "interpolation search must match binary search for target {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_table_leaf_interpolation_search_matches_binary_on_sequential_rowids() {
+        let cx = Cx::new();
+        let rowids: Vec<i64> = (1_i64..=128).collect();
+        let payloads: Vec<Vec<u8>> = rowids
+            .iter()
+            .map(|rowid| rowid.to_le_bytes().to_vec())
+            .collect();
+        let entries: Vec<(i64, &[u8])> = rowids
+            .iter()
+            .zip(payloads.iter())
+            .map(|(rowid, payload)| (*rowid, payload.as_slice()))
+            .collect();
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&entries));
+
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let entry = cursor.load_page(&cx, pn(2)).unwrap();
+
+        for target in [0_i64, 1, 2, 31, 64, 65, 127, 128, 129] {
+            let interpolation =
+                BtCursor::<MemPageStore>::search_integer_key_table_leaf(&cx, &entry, target)
+                    .unwrap();
+            let binary =
+                BtCursor::<MemPageStore>::binary_search_table_leaf(&cx, &entry, target).unwrap();
+            assert_eq!(
+                interpolation, binary,
+                "interpolation search must match binary search for sequential target {target}"
             );
         }
     }
@@ -9678,6 +9757,66 @@ mod tests {
             .expect("successful append should refresh the rightmost-leaf cache");
         assert_eq!(cached_after.page_no, cached_before.page_no);
         assert_eq!(cached_after.rowid, 129);
+    }
+
+    #[test]
+    fn test_table_insert_reuses_rightmost_leaf_cache_for_multiple_sequential_appends() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let payload = vec![b'M'; 180];
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+
+        for rowid in 1..=128_i64 {
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+        }
+
+        let root_entry = cursor.reload_page_fresh(&cx, root).unwrap();
+        assert!(
+            root_entry.header.page_type.is_interior(),
+            "test requires an interior root so the uncached path would revisit it"
+        );
+
+        let mut appended = 0_u32;
+        for rowid in 129..=256_i64 {
+            let cached = cursor
+                .rightmost_leaf_cache
+                .clone()
+                .expect("sequential inserts should seed the rightmost-leaf cache");
+            let mut cell_data = Vec::new();
+            cursor
+                .encode_table_leaf_cell_into(&cx, rowid, &payload, &mut cell_data)
+                .unwrap();
+            let header_offset = cell::header_offset_for_page(cached.page_no);
+            let content_offset = cached.header.content_offset(cursor.usable_size);
+            let Some(new_content_offset) = content_offset.checked_sub(cell_data.len()) else {
+                break;
+            };
+            let ptr_array_end = header_offset
+                + usize::from(cached.header.page_type.header_size())
+                + (usize::from(cached.header.cell_count) + 1) * 2;
+            if ptr_array_end > new_content_offset {
+                break;
+            }
+
+            cursor.pager.clear_reads();
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+            assert!(
+                cursor.pager.read_pages().is_empty(),
+                "cached sequential append should avoid page reloads before the next split (rowid {rowid})"
+            );
+            appended += 1;
+        }
+
+        assert!(
+            appended >= 3,
+            "test setup should admit several zero-read cached appends before the next split"
+        );
+        let cached_after = cursor
+            .rightmost_leaf_cache
+            .as_ref()
+            .expect("successful append should preserve the rightmost-leaf cache");
+        assert_eq!(cached_after.rowid, 128 + i64::from(appended));
     }
 
     #[test]

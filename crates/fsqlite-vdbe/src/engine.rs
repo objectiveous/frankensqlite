@@ -5552,12 +5552,6 @@ impl VdbeEngine {
     }
 
     #[inline]
-    fn has_register_subtypes(&self) -> bool {
-        self.cold_state()
-            .is_some_and(|cold_state| cold_state.has_subtypes)
-    }
-
-    #[inline]
     fn take_pending_update_restore(&mut self) -> Option<PendingUpdateRestore> {
         self.cold_state_mut()
             .and_then(|cold_state| cold_state.pending_update_restore.take())

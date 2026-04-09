@@ -13,6 +13,7 @@
 //! - **Shared foundation:** Types defined here are reused by downstream
 //!   observability beads (bd-t6sv2.2, .3, .5, .6, .8, .12).
 
+pub mod connection_pool;
 pub mod page_cache;
 
 use fsqlite_types::sync_primitives::{Duration, Instant, Mutex};
@@ -22,6 +23,14 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use connection_pool::{
+    ConnectionLifecycleSnapshot, ConnectionPoolBestPractice, ConnectionPoolFinding,
+    ConnectionPoolHealth, ConnectionPoolPattern, ConnectionPoolRecommendation,
+    ConnectionPoolSeverity, ConnectionPoolSummary, ConnectionPoolTelemetrySample,
+    ConnectionPoolValidationReport, ConnectionPoolValidator, ConnectionPoolValidatorConfig,
+    ConnectionPoolWorkloadProfile, best_practices as connection_pool_best_practices,
+    validate_connection_pool,
+};
 pub use page_cache::PageCacheEfficiencySnapshot;
 
 // ---------------------------------------------------------------------------

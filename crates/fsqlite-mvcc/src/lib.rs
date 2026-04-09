@@ -392,11 +392,15 @@ pub use write_coordinator::{
     SpillHandle, SpillLoc, SpilledWriteSet, WriteCoordinator,
 };
 pub use writer_routing_telemetry::{
-    WRITER_ROUTING_TELEMETRY_SOURCES, WriterConflictHistoryTelemetry, WriterLockHolderClue,
-    WriterOwnershipLineageTelemetry, WriterRetryAttribution, WriterRetryCause,
+    WRITER_ROUTING_TELEMETRY_SOURCES, WriterConflictHistoryTelemetry, WriterHomeHint,
+    WriterHomeHintDisposition, WriterLockHolderClue, WriterOwnershipLineageTelemetry,
+    WriterRetryAttribution, WriterRetryCause, WriterRoutingDecision, WriterRoutingDecisionConfig,
+    WriterRoutingDecisionError, WriterRoutingDecisionReason, WriterRoutingHintDegradation,
+    WriterRoutingLaneId, WriterRoutingLaneScore, WriterRoutingLaneSnapshot, WriterRoutingNodeId,
     WriterRoutingTelemetryCaptureCost, WriterRoutingTelemetryClass, WriterRoutingTelemetryInput,
     WriterRoutingTelemetryPhase, WriterRoutingTelemetryShape, WriterRoutingTelemetrySignal,
     WriterRoutingTelemetrySourceSpec, WriterTierSurfaceCounts, WriterTouchSurfaceTelemetry,
+    decide_writer_routing_target,
 };
 pub use xor_delta::{
     DEFAULT_DELTA_THRESHOLD_PCT, DELTA_FIXED_OVERHEAD_BYTES, DELTA_HEADER_BYTES, DELTA_MAGIC,

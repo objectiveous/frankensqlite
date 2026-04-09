@@ -155,7 +155,7 @@ pub struct ConnectionPoolBestPractice {
 }
 
 /// Actionable recommendation emitted by the validator.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ConnectionPoolRecommendation {
     pub recommended_pool_size: usize,
     pub recommended_max_idle_ms: u64,
@@ -261,10 +261,10 @@ impl ConnectionPoolValidator {
             prepare_ratio_percent: sample.prepare_ratio_percent(),
         };
 
-        let recommended_pool_size = self.recommended_pool_size(sample);
+        let recommended_pool_size = Self::recommended_pool_size(sample);
         let mut findings = Vec::new();
 
-        self.detect_single_connection_serialization(sample, &mut findings);
+        Self::detect_single_connection_serialization(sample, &mut findings);
         self.detect_over_pooling(
             sample,
             recommended_pool_size,
@@ -308,7 +308,6 @@ impl ConnectionPoolValidator {
     }
 
     fn detect_single_connection_serialization(
-        &self,
         sample: &ConnectionPoolTelemetrySample,
         findings: &mut Vec<ConnectionPoolFinding>,
     ) {
@@ -491,7 +490,7 @@ impl ConnectionPoolValidator {
             "Start near pool_size={} because FrankenSQLite can use multiple writer connections, but returns diminish past min(cpu_cores={}, write_parallelism={}).",
             recommended_pool_size,
             sample.cpu_cores.max(1),
-            self.write_parallelism_target(sample)
+            Self::write_parallelism_target(sample)
         )];
 
         if stale_snapshot_holders > 0 {
@@ -528,21 +527,22 @@ impl ConnectionPoolValidator {
         }
     }
 
-    fn recommended_pool_size(&self, sample: &ConnectionPoolTelemetrySample) -> usize {
+    fn recommended_pool_size(sample: &ConnectionPoolTelemetrySample) -> usize {
         let cpu_cores = sample.cpu_cores.max(1);
-        let write_parallelism = self.write_parallelism_target(sample).max(1);
+        let write_parallelism = Self::write_parallelism_target(sample).max(1);
         cpu_cores.min(write_parallelism).max(1)
     }
 
-    fn write_parallelism_target(&self, sample: &ConnectionPoolTelemetrySample) -> usize {
+    fn write_parallelism_target(sample: &ConnectionPoolTelemetrySample) -> usize {
         let observed_need = sample
             .concurrent_writers
             .max(sample.observed_active_connections)
             .max(sample.peak_concurrent_checkout_requests);
         match sample.workload_profile {
-            ConnectionPoolWorkloadProfile::ReadHeavy => observed_need.max(1).min(2),
-            ConnectionPoolWorkloadProfile::Mixed => observed_need.max(2),
-            ConnectionPoolWorkloadProfile::WriteHeavy => observed_need.max(2),
+            ConnectionPoolWorkloadProfile::ReadHeavy => observed_need.clamp(1, 2),
+            ConnectionPoolWorkloadProfile::Mixed | ConnectionPoolWorkloadProfile::WriteHeavy => {
+                observed_need.max(2)
+            }
         }
     }
 }

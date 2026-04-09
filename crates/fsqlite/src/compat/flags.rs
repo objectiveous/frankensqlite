@@ -30,6 +30,54 @@ impl OpenFlags {
     /// Create the database if it does not exist (combined with READ_WRITE).
     pub const SQLITE_OPEN_CREATE: Self = Self(0x04);
 
+    /// Interpret the database path as a URI.
+    ///
+    /// The compat layer accepts this flag for `sqlite3_open_v2` parity even
+    /// though URI query-parameter semantics are not implemented yet.
+    pub const SQLITE_OPEN_URI: Self = Self(0x40);
+
+    /// Request that the connection omit per-connection mutexes.
+    ///
+    /// FrankenSQLite's compat layer does not model SQLite's connection mutex
+    /// configuration directly, so this is accepted and ignored.
+    pub const SQLITE_OPEN_NO_MUTEX: Self = Self(0x0000_8000);
+
+    /// Request that the connection use full mutex protection.
+    ///
+    /// FrankenSQLite's compat layer does not model SQLite's connection mutex
+    /// configuration directly, so this is accepted and ignored.
+    pub const SQLITE_OPEN_FULL_MUTEX: Self = Self(0x0001_0000);
+
+    /// Request shared-cache participation.
+    ///
+    /// FrankenSQLite does not expose SQLite's shared-cache subsystem, but it
+    /// accepts the flag so callers can pass through stock `sqlite3_open_v2`
+    /// masks without being rejected in the compat layer.
+    pub const SQLITE_OPEN_SHARED_CACHE: Self = Self(0x0002_0000);
+
+    /// Request a private page cache.
+    ///
+    /// FrankenSQLite does not expose SQLite's shared-cache subsystem, but it
+    /// accepts the flag so callers can pass through stock `sqlite3_open_v2`
+    /// masks without being rejected in the compat layer.
+    pub const SQLITE_OPEN_PRIVATE_CACHE: Self = Self(0x0004_0000);
+
+    /// Request extended result codes from the connection.
+    ///
+    /// FrankenSQLite already returns rich Rust error variants, so this flag is
+    /// accepted and ignored for API compatibility.
+    pub const SQLITE_OPEN_EXRESCODE: Self = Self(0x0200_0000);
+
+    const ACCESS_MODE_MASK: u32 =
+        Self::SQLITE_OPEN_READ_ONLY.0 | Self::SQLITE_OPEN_READ_WRITE.0 | Self::SQLITE_OPEN_CREATE.0;
+    const ACCEPTED_ANCILLARY_MASK: u32 = Self::SQLITE_OPEN_URI.0
+        | Self::SQLITE_OPEN_NO_MUTEX.0
+        | Self::SQLITE_OPEN_FULL_MUTEX.0
+        | Self::SQLITE_OPEN_SHARED_CACHE.0
+        | Self::SQLITE_OPEN_PRIVATE_CACHE.0
+        | Self::SQLITE_OPEN_EXRESCODE.0;
+    const SUPPORTED_MASK: u32 = Self::ACCESS_MODE_MASK | Self::ACCEPTED_ANCILLARY_MASK;
+
     /// Default flags: READ_WRITE | CREATE.
     pub fn default_flags() -> Self {
         Self(Self::SQLITE_OPEN_READ_WRITE.0 | Self::SQLITE_OPEN_CREATE.0)
@@ -61,9 +109,12 @@ impl OpenFlags {
 }
 
 fn classify_access_mode(flags: OpenFlags) -> Result<OpenDisposition, FrankenError> {
-    let read_only = flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY);
-    let read_write = flags.contains(OpenFlags::SQLITE_OPEN_READ_WRITE);
-    let create = flags.contains(OpenFlags::SQLITE_OPEN_CREATE);
+    validate_open_flags(flags)?;
+
+    let access_mode = flags.0 & OpenFlags::ACCESS_MODE_MASK;
+    let read_only = access_mode & OpenFlags::SQLITE_OPEN_READ_ONLY.0 != 0;
+    let read_write = access_mode & OpenFlags::SQLITE_OPEN_READ_WRITE.0 != 0;
+    let create = access_mode & OpenFlags::SQLITE_OPEN_CREATE.0 != 0;
 
     match (read_only, read_write, create) {
         (true, false, false) => Ok(OpenDisposition::ReadOnly),
@@ -76,6 +127,42 @@ fn classify_access_mode(flags: OpenFlags) -> Result<OpenDisposition, FrankenErro
             actual: format!("open flags 0x{:x}", flags.0),
         }),
     }
+}
+
+fn validate_open_flags(flags: OpenFlags) -> Result<(), FrankenError> {
+    let unsupported_bits = flags.0 & !OpenFlags::SUPPORTED_MASK;
+    if unsupported_bits != 0 {
+        return Err(FrankenError::TypeMismatch {
+            expected: "SQLite-compatible open flags supported by fsqlite::compat::OpenFlags".into(),
+            actual: format!(
+                "unsupported open flag bits 0x{unsupported_bits:x} in 0x{:x}",
+                flags.0
+            ),
+        });
+    }
+
+    let mutex_mode_bits =
+        flags.0 & (OpenFlags::SQLITE_OPEN_NO_MUTEX.0 | OpenFlags::SQLITE_OPEN_FULL_MUTEX.0);
+    if mutex_mode_bits == (OpenFlags::SQLITE_OPEN_NO_MUTEX.0 | OpenFlags::SQLITE_OPEN_FULL_MUTEX.0)
+    {
+        return Err(FrankenError::TypeMismatch {
+            expected: "at most one of SQLITE_OPEN_NO_MUTEX or SQLITE_OPEN_FULL_MUTEX".into(),
+            actual: format!("open flags 0x{:x}", flags.0),
+        });
+    }
+
+    let cache_mode_bits =
+        flags.0 & (OpenFlags::SQLITE_OPEN_SHARED_CACHE.0 | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE.0);
+    if cache_mode_bits
+        == (OpenFlags::SQLITE_OPEN_SHARED_CACHE.0 | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE.0)
+    {
+        return Err(FrankenError::TypeMismatch {
+            expected: "at most one of SQLITE_OPEN_SHARED_CACHE or SQLITE_OPEN_PRIVATE_CACHE".into(),
+            actual: format!("open flags 0x{:x}", flags.0),
+        });
+    }
+
+    Ok(())
 }
 
 fn open_read_only_connection(path: &str) -> Result<Connection, FrankenError> {
@@ -199,9 +286,64 @@ mod tests {
     }
 
     #[test]
+    fn classify_access_mode_accepts_common_sqlite_ancillary_flags() {
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
+            | OpenFlags::SQLITE_OPEN_EXRESCODE;
+
+        let mode = classify_access_mode(flags).expect(
+            "common sqlite3_open_v2 ancillary flags should not be rejected by the compat layer",
+        );
+        assert_eq!(mode, OpenDisposition::WriteCreate);
+    }
+
+    #[test]
+    fn classify_access_mode_rejects_conflicting_mutex_flags() {
+        let error = classify_access_mode(
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
+        )
+        .expect_err("conflicting mutex flags should be rejected explicitly");
+        assert!(matches!(error, FrankenError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn classify_access_mode_rejects_conflicting_cache_flags() {
+        let error = classify_access_mode(
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_SHARED_CACHE
+                | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
+        )
+        .expect_err("conflicting cache-mode flags should be rejected explicitly");
+        assert!(matches!(error, FrankenError::TypeMismatch { .. }));
+    }
+
+    #[test]
     fn open_with_flags_read_only_in_memory_is_rejected() {
         let error = open_with_flags(":memory:", OpenFlags::SQLITE_OPEN_READ_ONLY)
             .expect_err("compat open must not return a writable connection for READ_ONLY");
         assert!(matches!(error, FrankenError::NotImplemented(_)));
+    }
+
+    #[test]
+    fn open_with_flags_accepts_common_sqlite_ancillary_flags() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ancillary_flags.db");
+        let conn = open_with_flags(
+            path.to_str().unwrap(),
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
+                | OpenFlags::SQLITE_OPEN_EXRESCODE,
+        )
+        .expect("ancillary sqlite3_open_v2 flags should be accepted by the compat layer");
+        conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
+        assert!(path.exists());
     }
 }

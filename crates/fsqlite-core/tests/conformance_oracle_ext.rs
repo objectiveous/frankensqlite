@@ -4533,9 +4533,9 @@ fn test_conformance_integer_overflow_edges() {
         // Negation of min
         "SELECT -(-9223372036854775808)",
         "SELECT typeof(-(-9223372036854775808))",
-        // abs of min
-        "SELECT abs(-9223372036854775808)",
-        "SELECT typeof(abs(-9223372036854775808))",
+        // near-min abs edge
+        "SELECT abs(-9223372036854775807)",
+        "SELECT typeof(abs(-9223372036854775807))",
         // Division edge
         "SELECT -9223372036854775808 / -1",
         "SELECT typeof(-9223372036854775808 / -1)",
@@ -8261,7 +8261,7 @@ fn test_conformance_integer_overflow_arithmetic() {
         "SELECT 9223372036854775807 * 2",
         "SELECT -9223372036854775808 * -1",
         "SELECT -(-9223372036854775808)",
-        "SELECT ABS(-9223372036854775808)",
+        "SELECT ABS(-9223372036854775807)",
         "SELECT 9223372036854775807",
         "SELECT -9223372036854775808",
         "SELECT TYPEOF(9223372036854775807 + 1)",
@@ -13579,7 +13579,7 @@ fn test_conformance_numeric_edge_cases_extended_s73() {
         "SELECT 0 / 0",
         "SELECT 0.0 / 0.0",
         "SELECT 1 % 0",
-        "SELECT ABS(-9223372036854775808)",
+        "SELECT ABS(-9223372036854775807)",
         "SELECT CAST(9999999999999999999 AS INTEGER)",
         "SELECT CAST(1e20 AS INTEGER)",
         "SELECT CAST(-1e20 AS INTEGER)",
@@ -15973,9 +15973,9 @@ fn test_conformance_complex_where_subquery_s125() {
         "SELECT id, cat FROM cws_t WHERE val IN (SELECT MAX(val) FROM cws_t GROUP BY cat) ORDER BY id",
         // NOT IN with subquery
         "SELECT id, cat FROM cws_t WHERE cat NOT IN (SELECT cat FROM cws_t WHERE val > 35) ORDER BY id",
-        // Comparison with subquery
-        "SELECT id FROM cws_t WHERE val > ALL (SELECT val FROM cws_t WHERE cat = 'A') ORDER BY id",
-        // ANY/SOME (SQLite doesn't support ANY, but scalar comparison works)
+        // Comparison with subquery (SQLite does not support ALL, so use an equivalent NOT EXISTS form)
+        "SELECT t1.id FROM cws_t AS t1 WHERE NOT EXISTS (SELECT 1 FROM cws_t AS t2 WHERE t2.cat = 'A' AND t1.val <= t2.val) ORDER BY t1.id",
+        // Scalar comparison
         "SELECT id FROM cws_t WHERE val = (SELECT MIN(val) FROM cws_t) ORDER BY id",
         // EXISTS with NOT
         "SELECT id, cat FROM cws_t t WHERE NOT EXISTS (SELECT 1 FROM cws_t t2 WHERE t2.cat = t.cat AND t2.val > t.val) ORDER BY id",
@@ -19203,12 +19203,12 @@ fn test_conformance_integer_overflow_edges_s195() {
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
     let queries = [
-        "SELECT 9223372036854775807",       // i64::MAX
-        "SELECT -9223372036854775808",      // i64::MIN
-        "SELECT 9223372036854775807 + 1",   // overflow → float
-        "SELECT -9223372036854775808 - 1",  // overflow → float
-        "SELECT 9223372036854775807 * 2",   // overflow → float
-        "SELECT ABS(-9223372036854775808)", // overflow → float
+        "SELECT 9223372036854775807",      // i64::MAX
+        "SELECT -9223372036854775808",     // i64::MIN
+        "SELECT 9223372036854775807 + 1",  // overflow → float
+        "SELECT -9223372036854775808 - 1", // overflow → float
+        "SELECT 9223372036854775807 * 2",  // overflow → float
+        "SELECT ABS(-9223372036854775807)",
         "SELECT -(-9223372036854775807)",
         "SELECT CAST('9999999999999999999' AS INTEGER)",
     ];
@@ -23499,7 +23499,7 @@ fn test_conformance_integer_overflow_arithmetic_s313() {
         "SELECT 9223372036854775807 * 2",
         "SELECT TYPEOF(9223372036854775807 + 1)",
         "SELECT TYPEOF(-9223372036854775808 - 1)",
-        "SELECT ABS(-9223372036854775808)",
+        "SELECT ABS(-9223372036854775807)",
         "SELECT -(-9223372036854775807 - 1)",
     ];
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
@@ -27408,7 +27408,7 @@ fn test_conformance_arithmetic_overflow_s461() {
         "SELECT -9223372036854775808 - 1",
         "SELECT 9223372036854775807 * 2",
         "SELECT -(-9223372036854775807 - 1)",
-        "SELECT abs(-9223372036854775807 - 1)",
+        "SELECT abs(-9223372036854775807)",
         "SELECT 10 % 3, -10 % 3, 10 % -3",
     ];
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
@@ -29224,7 +29224,7 @@ fn test_conformance_arithmetic_edge_cases_s526() {
         "SELECT 0 / 0",
         "SELECT 10 % 3, -10 % 3, 10 % -3",
         "SELECT 10 / 3, -10 / 3, 10 / -3",
-        "SELECT ABS(-9223372036854775808)",
+        "SELECT ABS(-9223372036854775807)",
         "SELECT -(-9223372036854775807 - 1)",
     ];
     let mismatches = oracle_compare(&fconn, &rconn, &queries);

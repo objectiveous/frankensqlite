@@ -4144,7 +4144,7 @@ mod tests {
     #[test]
     fn test_single_table_projection_expands_table_star_with_alias() {
         let core = select_core_single_table(
-            vec![ResultColumn::TableStar("tt".to_owned())],
+            vec![ResultColumn::TableStar(QualifiedName::bare("tt"))],
             "t",
             Some("tt"),
         );
@@ -5873,7 +5873,7 @@ mod tests {
     #[test]
     fn test_resolve_projection_unknown_table_qualifier() {
         let core = select_core_single_table(
-            vec![ResultColumn::TableStar("wrong_table".to_owned())],
+            vec![ResultColumn::TableStar(QualifiedName::bare("wrong_table"))],
             "t",
             None,
         );

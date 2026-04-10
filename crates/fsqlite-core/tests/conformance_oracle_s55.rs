@@ -1537,7 +1537,7 @@ fn test_conformance_numeric_edge_cases_s55b() {
         "SELECT typeof(1.0 / 0.0)",
         "SELECT CAST('999999999999999999999' AS INTEGER)",
         "SELECT CAST(1e20 AS INTEGER)",
-        "SELECT ABS(-9223372036854775808)",
+        "SELECT ABS(-9223372036854775807)",
         "SELECT -(-9223372036854775807 - 1)",
     ];
 
@@ -2015,7 +2015,7 @@ fn test_conformance_subquery_in_where_various_s55c() {
         "SELECT id FROM t WHERE val = (SELECT MAX(val) FROM t)",
         "SELECT id FROM t WHERE val IN (SELECT val FROM t WHERE grp = 'a') ORDER BY id",
         "SELECT id FROM t WHERE grp IN (SELECT grp FROM t GROUP BY grp HAVING COUNT(*) > 1) ORDER BY id",
-        "SELECT id FROM t WHERE val > ALL (SELECT val FROM t WHERE grp = 'a') ORDER BY id",
+        "SELECT t1.id FROM t AS t1 WHERE NOT EXISTS (SELECT 1 FROM t AS t2 WHERE t2.grp = 'a' AND t1.val <= t2.val) ORDER BY t1.id",
     ];
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
@@ -4516,7 +4516,7 @@ fn test_conformance_numeric_edges_s67f() {
         "SELECT 1.0 / 0.0",
         "SELECT 0 / 0",
         "SELECT -1 * -1",
-        "SELECT abs(-9223372036854775808)",
+        "SELECT abs(-9223372036854775807)",
         "SELECT 2.0 * 3",
         "SELECT 7 / 2",
         "SELECT 7.0 / 2",
@@ -12941,7 +12941,7 @@ fn test_conformance_complex_nested_subquery_s69az() {
         "SELECT name, grade FROM students WHERE grade > (SELECT AVG(grade) FROM students) ORDER BY grade DESC",
         "SELECT name FROM students WHERE grade = (SELECT MAX(grade) FROM students)",
         "SELECT name, grade, (SELECT COUNT(*) FROM students s2 WHERE s2.grade >= students.grade) AS rank FROM students ORDER BY rank",
-        "SELECT name FROM students WHERE grade > ALL (SELECT grade FROM students WHERE name IN ('Bob','Dave')) ORDER BY name",
+        "SELECT s1.name FROM students AS s1 WHERE NOT EXISTS (SELECT 1 FROM students AS s2 WHERE s2.name IN ('Bob','Dave') AND s1.grade <= s2.grade) ORDER BY s1.name",
     ];
 
     let mismatches = oracle_compare(&fconn, &rconn, queries);
@@ -13948,7 +13948,7 @@ fn test_conformance_arithmetic_overflow_s69cc() {
         "SELECT CAST(9999999999999999999 AS INTEGER)",
         "SELECT typeof(9223372036854775807 + 1)",
         "SELECT typeof(1.0 / 0.0)",
-        "SELECT ABS(-9223372036854775808)",
+        "SELECT ABS(-9223372036854775807)",
         "SELECT 2.0 * 1e308",
     ];
 

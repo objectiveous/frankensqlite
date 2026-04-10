@@ -376,14 +376,14 @@ fn parse_time_part(s: &str) -> Option<(i64, i64, i64, f64)> {
     if parts.len() < 2 {
         return None;
     }
-    // Reject fields with leading signs (`+01`, `-01`): Rust's i64 parser
-    // accepts those, but C SQLite's computeHMS requires bare decimal
-    // digits.  Without this check, `julianday('+01:00')` would return a
-    // non-NULL JDN (01:00 on 2000-01-01) instead of NULL.
-    if parts[0].starts_with('+')
-        || parts[0].starts_with('-')
-        || parts[1].starts_with('+')
-        || parts[1].starts_with('-')
+    // C SQLite's computeHMS uses getDigits with a "20" field width,
+    // meaning exactly 2 bare decimal digits per time component.  Reject
+    // fields that don't match that shape: wrong length, leading signs
+    // (`+01`), or non-digit characters.
+    if parts[0].len() != 2
+        || parts[1].len() != 2
+        || !parts[0].bytes().all(|b| b.is_ascii_digit())
+        || !parts[1].bytes().all(|b| b.is_ascii_digit())
     {
         return None;
     }
@@ -398,7 +398,18 @@ fn parse_time_part(s: &str) -> Option<(i64, i64, i64, f64)> {
     }
 
     // Third part may have fractional seconds: "SS" or "SS.SSS".
+    // Apply the same 2-digit bare-digits constraint as hours/minutes:
+    // C SQLite's computeHMS requires the seconds integer to be exactly
+    // 2 decimal digits.
     let sec_str = parts[2];
+    let sec_int_str = if let Some(dot_pos) = sec_str.find('.') {
+        &sec_str[..dot_pos]
+    } else {
+        sec_str
+    };
+    if sec_int_str.len() != 2 || !sec_int_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     if let Some(dot_pos) = sec_str.find('.') {
         let sec = sec_str[..dot_pos].parse::<i64>().ok()?;
         let frac_str = &sec_str[dot_pos..]; // ".SSS"
@@ -1298,16 +1309,22 @@ mod tests {
     }
 
     #[test]
-    fn test_julianday_rejects_signed_time_fields() {
-        // C SQLite's computeHMS requires bare decimal digits for HH and
-        // MM fields.  Rust's i64::from_str accepts leading +/- signs, so
-        // without an explicit rejection guard in parse_time_part, these
-        // inputs would be treated as valid bare times instead of NULL.
+    fn test_julianday_rejects_malformed_time_fields() {
+        // C SQLite's computeHMS requires exactly 2 bare decimal digits
+        // for each HH, MM, SS field.  Inputs with wrong digit counts,
+        // leading signs, or non-digit characters must return NULL.
         for bad in &[
-            "+01:00",      // bare time with leading +
-            "-05:30",      // bare time with leading - (looks like a tz offset)
-            "+12:30:00",   // signed hour
-            "12:+30:00",   // signed minute
+            "+01:00",        // leading + on hour
+            "-05:30",        // leading - on hour
+            "+12:30:00",     // leading + on hour (with seconds)
+            "12:+30:00",     // leading + on minute
+            "12:30:+45",     // leading + on seconds (integer)
+            "12:30:+45.123", // leading + on seconds (fractional)
+            "0:00:00",       // 1-digit hour
+            "12:0:00",       // 1-digit minute
+            "12:30:0",       // 1-digit second
+            "123:00:00",     // 3-digit hour
+            "12:345:00",     // 3-digit minute
         ] {
             let result = JuliandayFunc.invoke(&[text(bad)]).unwrap();
             assert_eq!(

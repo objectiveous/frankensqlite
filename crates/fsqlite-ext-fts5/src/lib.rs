@@ -235,18 +235,31 @@ impl Fts5Tokenizer for Unicode61Tokenizer {
     fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
         let mut token_start = None;
         let mut current_term = String::new();
+        let mut borrowed_ascii_token = false;
 
         for (byte_idx, ch) in text.char_indices() {
             if self.is_token_char(ch) {
                 if token_start.is_none() {
                     token_start = Some(byte_idx);
                     current_term.clear();
+                    borrowed_ascii_token = true;
+                }
+                if borrowed_ascii_token {
+                    if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+                        continue;
+                    }
+                    borrowed_ascii_token = false;
+                    if let Some(start) = token_start {
+                        current_term.push_str(&text[start..byte_idx]);
+                    }
                 }
                 for lc in ch.to_lowercase() {
                     current_term.push(lc);
                 }
             } else if let Some(start) = token_start.take() {
-                if !current_term.is_empty() {
+                if borrowed_ascii_token {
+                    sink(&text[start..byte_idx], start, byte_idx, false);
+                } else if !current_term.is_empty() {
                     sink(current_term.as_str(), start, byte_idx, false);
                     current_term.clear();
                 }
@@ -255,7 +268,9 @@ impl Fts5Tokenizer for Unicode61Tokenizer {
 
         // Flush trailing token.
         if let Some(start) = token_start {
-            if !current_term.is_empty() {
+            if borrowed_ascii_token {
+                sink(&text[start..], start, text.len(), false);
+            } else if !current_term.is_empty() {
                 sink(current_term.as_str(), start, text.len(), false);
             }
         }
@@ -274,16 +289,29 @@ impl Fts5Tokenizer for AsciiTokenizer {
     fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
         let mut token_start = None;
         let mut current_term = String::new();
+        let mut borrowed_ascii_token = false;
 
         for (byte_idx, ch) in text.char_indices() {
             if ch.is_ascii_alphanumeric() {
                 if token_start.is_none() {
                     token_start = Some(byte_idx);
                     current_term.clear();
+                    borrowed_ascii_token = true;
+                }
+                if borrowed_ascii_token {
+                    if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+                        continue;
+                    }
+                    borrowed_ascii_token = false;
+                    if let Some(start) = token_start {
+                        current_term.push_str(&text[start..byte_idx]);
+                    }
                 }
                 current_term.push(ch.to_ascii_lowercase());
             } else if let Some(start) = token_start.take() {
-                if !current_term.is_empty() {
+                if borrowed_ascii_token {
+                    sink(&text[start..byte_idx], start, byte_idx, false);
+                } else if !current_term.is_empty() {
                     sink(current_term.as_str(), start, byte_idx, false);
                     current_term.clear();
                 }
@@ -291,7 +319,9 @@ impl Fts5Tokenizer for AsciiTokenizer {
         }
 
         if let Some(start) = token_start {
-            if !current_term.is_empty() {
+            if borrowed_ascii_token {
+                sink(&text[start..], start, text.len(), false);
+            } else if !current_term.is_empty() {
                 sink(current_term.as_str(), start, text.len(), false);
             }
         }

@@ -13,8 +13,8 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use tracing::debug;
 
@@ -114,6 +114,113 @@ pub use vtab::{
 };
 pub use window::{WindowAdapter, WindowFunction};
 pub use window_builtins::register_window_builtins;
+
+/// Top-level function family exposed by the runtime registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BuiltinFunctionFamily {
+    Scalar,
+    Aggregate,
+    Window,
+}
+
+impl BuiltinFunctionFamily {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Scalar => "scalar",
+            Self::Aggregate => "aggregate",
+            Self::Window => "window",
+        }
+    }
+}
+
+/// Track-E built-in function class used for parity closure accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BuiltinFunctionClass {
+    CoreScalar,
+    MathScalar,
+    DateTimeScalar,
+    Aggregate,
+    Window,
+}
+
+impl BuiltinFunctionClass {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CoreScalar => "core_scalar",
+            Self::MathScalar => "math_scalar",
+            Self::DateTimeScalar => "datetime_scalar",
+            Self::Aggregate => "aggregate",
+            Self::Window => "window",
+        }
+    }
+}
+
+/// Runtime-authoritative description of one built-in function registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltinFunctionSurfaceEntry {
+    /// Lowercase SQL function name as exposed by the runtime registry.
+    pub name: String,
+    /// Declared arity, or `-1` for variadic registrations.
+    pub num_args: i32,
+    /// Top-level function family.
+    pub family: BuiltinFunctionFamily,
+    /// Track-E parity classification bucket.
+    pub class: BuiltinFunctionClass,
+    /// Whether this entry is an alternate spelling over another runtime entry.
+    pub is_alias: bool,
+    /// Canonical parity surface identifier for this function family.
+    pub surface_id: &'static str,
+}
+
+const CORE_FUNCTION_SURFACE_ID: &str = "SURF-FUNC-CORE-011";
+const WINDOW_FUNCTION_SURFACE_ID: &str = "SURF-FUNC-WINDOW-012";
+
+/// Return the runtime-authoritative built-in function surface inventory.
+///
+/// The inventory is derived from the actual registration path in this crate
+/// rather than from harness-side matrices so Track E docs and future parity
+/// checks can reuse one stable source of truth.
+#[must_use]
+pub fn builtin_function_surface_inventory() -> &'static [BuiltinFunctionSurfaceEntry] {
+    static INVENTORY: OnceLock<Vec<BuiltinFunctionSurfaceEntry>> = OnceLock::new();
+    INVENTORY
+        .get_or_init(|| {
+            let mut registry = FunctionRegistry::new();
+            register_builtins(&mut registry);
+            register_window_builtins(&mut registry);
+
+            let mut entries = Vec::with_capacity(
+                registry.scalars.len() + registry.aggregates.len() + registry.windows.len(),
+            );
+            extend_builtin_surface_entries(
+                &mut entries,
+                BuiltinFunctionFamily::Scalar,
+                registry.scalars.keys(),
+            );
+            extend_builtin_surface_entries(
+                &mut entries,
+                BuiltinFunctionFamily::Aggregate,
+                registry.aggregates.keys(),
+            );
+            extend_builtin_surface_entries(
+                &mut entries,
+                BuiltinFunctionFamily::Window,
+                registry.windows.keys(),
+            );
+            entries.sort_by(|left, right| {
+                (left.family, left.class, &left.name, left.num_args).cmp(&(
+                    right.family,
+                    right.class,
+                    &right.name,
+                    right.num_args,
+                ))
+            });
+            entries
+        })
+        .as_slice()
+}
 
 /// Type-erased aggregate function object used by the registry.
 pub type ErasedAggregateFunction = dyn AggregateFunction<State = Box<dyn Any + Send>>;
@@ -372,15 +479,243 @@ impl FunctionRegistry {
     }
 }
 
+fn extend_builtin_surface_entries<'a>(
+    entries: &mut Vec<BuiltinFunctionSurfaceEntry>,
+    family: BuiltinFunctionFamily,
+    keys: impl Iterator<Item = &'a FunctionKey>,
+) {
+    for key in keys {
+        let name = key.name.to_ascii_lowercase();
+        let class = builtin_function_class(&name, family);
+        entries.push(BuiltinFunctionSurfaceEntry {
+            is_alias: builtin_function_alias_flag(&name, family),
+            surface_id: builtin_function_surface_id(family),
+            name,
+            num_args: key.num_args,
+            family,
+            class,
+        });
+    }
+}
+
+fn builtin_function_class(name: &str, family: BuiltinFunctionFamily) -> BuiltinFunctionClass {
+    match family {
+        BuiltinFunctionFamily::Aggregate => BuiltinFunctionClass::Aggregate,
+        BuiltinFunctionFamily::Window => BuiltinFunctionClass::Window,
+        BuiltinFunctionFamily::Scalar => {
+            if matches!(
+                name,
+                "acos"
+                    | "acosh"
+                    | "asin"
+                    | "asinh"
+                    | "atan"
+                    | "atan2"
+                    | "atanh"
+                    | "ceil"
+                    | "ceiling"
+                    | "cos"
+                    | "cosh"
+                    | "degrees"
+                    | "exp"
+                    | "floor"
+                    | "ln"
+                    | "log"
+                    | "log10"
+                    | "log2"
+                    | "mod"
+                    | "pi"
+                    | "pow"
+                    | "power"
+                    | "radians"
+                    | "sin"
+                    | "sinh"
+                    | "sqrt"
+                    | "tan"
+                    | "tanh"
+                    | "trunc"
+            ) {
+                BuiltinFunctionClass::MathScalar
+            } else if matches!(
+                name,
+                "date" | "datetime" | "julianday" | "strftime" | "time" | "timediff" | "unixepoch"
+            ) {
+                BuiltinFunctionClass::DateTimeScalar
+            } else {
+                BuiltinFunctionClass::CoreScalar
+            }
+        }
+    }
+}
+
+fn builtin_function_alias_flag(name: &str, family: BuiltinFunctionFamily) -> bool {
+    match family {
+        BuiltinFunctionFamily::Scalar => {
+            matches!(name, "ceiling" | "if" | "power" | "printf" | "substring")
+        }
+        BuiltinFunctionFamily::Aggregate | BuiltinFunctionFamily::Window => name == "string_agg",
+    }
+}
+
+const fn builtin_function_surface_id(family: BuiltinFunctionFamily) -> &'static str {
+    match family {
+        BuiltinFunctionFamily::Window => WINDOW_FUNCTION_SURFACE_ID,
+        BuiltinFunctionFamily::Scalar | BuiltinFunctionFamily::Aggregate => {
+            CORE_FUNCTION_SURFACE_ID
+        }
+    }
+}
+
 fn canonical_name(name: &str) -> String {
     name.trim().to_ascii_uppercase()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use fsqlite_types::SqliteValue;
 
     use super::*;
+
+    fn runtime_registry_surface_keys() -> BTreeSet<(BuiltinFunctionFamily, String, i32)> {
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        register_window_builtins(&mut registry);
+
+        let scalar_keys = registry
+            .scalars
+            .keys()
+            .map(|key| {
+                (
+                    BuiltinFunctionFamily::Scalar,
+                    key.name.to_ascii_lowercase(),
+                    key.num_args,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let aggregate_keys = registry
+            .aggregates
+            .keys()
+            .map(|key| {
+                (
+                    BuiltinFunctionFamily::Aggregate,
+                    key.name.to_ascii_lowercase(),
+                    key.num_args,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let window_keys = registry
+            .windows
+            .keys()
+            .map(|key| {
+                (
+                    BuiltinFunctionFamily::Window,
+                    key.name.to_ascii_lowercase(),
+                    key.num_args,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+
+        scalar_keys
+            .into_iter()
+            .chain(aggregate_keys)
+            .chain(window_keys)
+            .collect()
+    }
+
+    fn inventory_surface_keys() -> BTreeSet<(BuiltinFunctionFamily, String, i32)> {
+        builtin_function_surface_inventory()
+            .iter()
+            .map(|entry| (entry.family, entry.name.clone(), entry.num_args))
+            .collect()
+    }
+
+    fn find_surface_entry(
+        family: BuiltinFunctionFamily,
+        name: &str,
+        num_args: i32,
+    ) -> &'static BuiltinFunctionSurfaceEntry {
+        builtin_function_surface_inventory()
+            .iter()
+            .find(|entry| {
+                entry.family == family && entry.name == name && entry.num_args == num_args
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing builtin surface entry: family={} name={} arity={}",
+                    family.label(),
+                    name,
+                    num_args
+                )
+            })
+    }
+
+    #[test]
+    fn test_builtin_function_surface_inventory_matches_live_registry() {
+        let inventory = builtin_function_surface_inventory();
+        let inventory_keys = inventory_surface_keys();
+        let runtime_keys = runtime_registry_surface_keys();
+
+        assert_eq!(
+            inventory.len(),
+            inventory_keys.len(),
+            "inventory must not contain duplicate family/name/arity tuples"
+        );
+        assert_eq!(
+            inventory_keys, runtime_keys,
+            "inventory must exactly match the live registration path"
+        );
+        assert!(
+            inventory.windows(2).all(|entries| {
+                (
+                    entries[0].family,
+                    entries[0].class,
+                    &entries[0].name,
+                    entries[0].num_args,
+                ) <= (
+                    entries[1].family,
+                    entries[1].class,
+                    &entries[1].name,
+                    entries[1].num_args,
+                )
+            }),
+            "inventory must stay deterministically sorted"
+        );
+    }
+
+    #[test]
+    fn test_builtin_function_surface_inventory_classifies_representative_entries() {
+        let abs = find_surface_entry(BuiltinFunctionFamily::Scalar, "abs", 1);
+        assert_eq!(abs.class, BuiltinFunctionClass::CoreScalar);
+        assert!(!abs.is_alias);
+        assert_eq!(abs.surface_id, CORE_FUNCTION_SURFACE_ID);
+
+        let date = find_surface_entry(BuiltinFunctionFamily::Scalar, "date", -1);
+        assert_eq!(date.class, BuiltinFunctionClass::DateTimeScalar);
+        assert!(!date.is_alias);
+        assert_eq!(date.surface_id, CORE_FUNCTION_SURFACE_ID);
+
+        let power = find_surface_entry(BuiltinFunctionFamily::Scalar, "power", 2);
+        assert_eq!(power.class, BuiltinFunctionClass::MathScalar);
+        assert!(power.is_alias);
+        assert_eq!(power.surface_id, CORE_FUNCTION_SURFACE_ID);
+
+        let count = find_surface_entry(BuiltinFunctionFamily::Aggregate, "count", 0);
+        assert_eq!(count.class, BuiltinFunctionClass::Aggregate);
+        assert!(!count.is_alias);
+        assert_eq!(count.surface_id, CORE_FUNCTION_SURFACE_ID);
+
+        let row_number = find_surface_entry(BuiltinFunctionFamily::Window, "row_number", 0);
+        assert_eq!(row_number.class, BuiltinFunctionClass::Window);
+        assert!(!row_number.is_alias);
+        assert_eq!(row_number.surface_id, WINDOW_FUNCTION_SURFACE_ID);
+
+        let string_agg_window = find_surface_entry(BuiltinFunctionFamily::Window, "string_agg", 2);
+        assert_eq!(string_agg_window.class, BuiltinFunctionClass::Window);
+        assert!(string_agg_window.is_alias);
+        assert_eq!(string_agg_window.surface_id, WINDOW_FUNCTION_SURFACE_ID);
+    }
 
     // -- Mock: double(x) -> x * 2, fixed 1-arg --
 

@@ -98,6 +98,7 @@ const fn avx2_available() -> bool {
 
 #[cfg(all(target_arch = "x86_64", not(target_arch = "wasm32")))]
 #[target_feature(enable = "avx2")]
+#[allow(clippy::cast_ptr_alignment)] // _mm256_*u_si256 are unaligned-safe intrinsics
 unsafe fn classify_integer_block_avx2(values: [i64; 4]) -> [IntegerEncoding; 4] {
     use std::arch::x86_64::{
         __m256i, _mm256_cmpeq_epi64, _mm256_cmpgt_epi64, _mm256_loadu_si256, _mm256_set1_epi64x,
@@ -185,7 +186,7 @@ fn write_classified_block(
     }
 }
 
-pub(crate) fn try_serialize_integer_record_iter_into<'a, I>(values: I, buf: &mut Vec<u8>) -> bool
+pub fn try_serialize_integer_record_iter_into<'a, I>(values: I, buf: &mut Vec<u8>) -> bool
 where
     I: Iterator<Item = &'a SqliteValue> + Clone,
 {

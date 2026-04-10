@@ -223,6 +223,7 @@ enum InjectedSyncFault {
 }
 
 #[derive(Debug, Default)]
+#[allow(clippy::struct_field_names)]
 struct InjectedFaultState {
     next_read: Option<InjectedReadFault>,
     next_write: Option<InjectedWriteFault>,

@@ -15741,7 +15741,7 @@ mod tests {
 
         vec![
             SqliteValue::Integer(integer),
-            SqliteValue::Float((seed as f64 * 1.625) - 777.25),
+            SqliteValue::Float((seed as f64).mul_add(1.625, -777.25)),
             SqliteValue::Text(SmallText::from_string(text)),
             SqliteValue::Blob(Arc::<[u8]>::from(blob)),
             tail,
@@ -16098,12 +16098,12 @@ mod tests {
             .expect("oracle query should prepare");
         let oracle_rows = query
             .query_map([], |row| {
-                Ok((0..5)
+                (0..5)
                     .map(|idx| {
                         row.get::<_, RusqliteValue>(idx)
                             .map(track_r_from_rusqlite_value)
                     })
-                    .collect::<rusqlite::Result<Vec<_>>>()?)
+                    .collect::<rusqlite::Result<Vec<_>>>()
             })
             .expect("oracle query should execute")
             .collect::<rusqlite::Result<Vec<_>>>()

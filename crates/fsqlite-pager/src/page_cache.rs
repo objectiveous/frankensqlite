@@ -781,7 +781,7 @@ impl std::fmt::Debug for PageCache {
             .field("admits", &self.admits)
             .field("evictions", &self.evictions)
             .field("metrics", &self.metrics_snapshot())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

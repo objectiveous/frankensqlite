@@ -128,9 +128,11 @@ impl DifferentialOutput {
     #[must_use]
     pub fn explain_label(&self) -> String {
         match self {
-            Self::Column { column, alias } => render_output_label(&column.to_string(), alias),
+            Self::Column { column, alias } => {
+                render_output_label(&column.to_string(), alias.as_ref())
+            }
             Self::Aggregate { aggregate, alias } => {
-                render_output_label(&aggregate.to_string(), alias)
+                render_output_label(&aggregate.to_string(), alias.as_ref())
             }
         }
     }
@@ -257,12 +259,12 @@ impl fmt::Display for DifferentialPlanError {
             Self::UnknownRelationBinding { binding } => {
                 write!(f, "unknown differential relation binding: {binding}")
             }
-            Self::UnsupportedSource { detail } => write!(f, "{detail}"),
-            Self::UnsupportedJoin { detail } => write!(f, "{detail}"),
-            Self::UnsupportedWhere { detail } => write!(f, "{detail}"),
-            Self::UnsupportedGroupBy { detail } => write!(f, "{detail}"),
-            Self::UnsupportedProjection { detail } => write!(f, "{detail}"),
-            Self::UnsupportedAggregate { detail } => write!(f, "{detail}"),
+            Self::UnsupportedSource { detail }
+            | Self::UnsupportedJoin { detail }
+            | Self::UnsupportedWhere { detail }
+            | Self::UnsupportedGroupBy { detail }
+            | Self::UnsupportedProjection { detail }
+            | Self::UnsupportedAggregate { detail } => write!(f, "{detail}"),
             Self::ProjectionNotGrouped { column } => {
                 write!(
                     f,
@@ -794,7 +796,7 @@ fn literal_to_sqlite_value(literal: &Literal) -> Option<SqliteValue> {
     }
 }
 
-fn render_output_label(expr: &str, alias: &Option<String>) -> String {
+fn render_output_label(expr: &str, alias: Option<&String>) -> String {
     match alias {
         Some(alias) => format!("{expr} AS {alias}"),
         None => expr.to_owned(),

@@ -91,17 +91,14 @@ fn enter_vdbe_profile_stage(stage: VdbePipelineStage) -> VdbeProfileMarker {
     }
 }
 
-#[must_use]
 pub(crate) fn enter_vdbe_decode_profile_stage() -> VdbeProfileMarker {
     enter_vdbe_profile_stage(VdbePipelineStage::Decode)
 }
 
-#[must_use]
 pub(crate) fn enter_vdbe_execute_profile_stage() -> VdbeProfileMarker {
     enter_vdbe_profile_stage(VdbePipelineStage::Execute)
 }
 
-#[must_use]
 pub(crate) fn enter_vdbe_commit_profile_stage() -> VdbeProfileMarker {
     enter_vdbe_profile_stage(VdbePipelineStage::Commit)
 }
@@ -883,10 +880,10 @@ fn compute_requires_attached_memdb(ops: &[VdbeOp]) -> bool {
             | Opcode::IdxGE
             | Opcode::SetSnapshot
             | Opcode::CountIndexEqRun
-            | Opcode::FusedAppendInsert => {
-                if !storage_cursor_ids.contains(&op.p1) {
-                    return true;
-                }
+            | Opcode::FusedAppendInsert
+                if !storage_cursor_ids.contains(&op.p1) =>
+            {
+                return true;
             }
             _ => {}
         }
@@ -986,29 +983,27 @@ impl VdbeProgram {
                     op_count,
                     JumpTargetBounds::Instruction,
                 )?,
-                Opcode::MustBeInt | Opcode::InitCoroutine => {
-                    if op.p2 > 0 {
-                        verify_jump_target_operand(
-                            pc,
-                            op.opcode,
-                            "p2",
-                            op.p2,
-                            op_count,
-                            JumpTargetBounds::Instruction,
-                        )?;
-                    }
+                Opcode::MustBeInt | Opcode::InitCoroutine if op.p2 > 0 => {
+                    verify_jump_target_operand(
+                        pc,
+                        op.opcode,
+                        "p2",
+                        op.p2,
+                        op_count,
+                        JumpTargetBounds::Instruction,
+                    )?;
                 }
-                Opcode::Eq | Opcode::Ne | Opcode::Lt | Opcode::Le | Opcode::Gt | Opcode::Ge => {
-                    if (op.p5 & 0x20) == 0 {
-                        verify_jump_target_operand(
-                            pc,
-                            op.opcode,
-                            "p2",
-                            op.p2,
-                            op_count,
-                            JumpTargetBounds::Instruction,
-                        )?;
-                    }
+                Opcode::Eq | Opcode::Ne | Opcode::Lt | Opcode::Le | Opcode::Gt | Opcode::Ge
+                    if (op.p5 & 0x20) == 0 =>
+                {
+                    verify_jump_target_operand(
+                        pc,
+                        op.opcode,
+                        "p2",
+                        op.p2,
+                        op_count,
+                        JumpTargetBounds::Instruction,
+                    )?;
                 }
                 Opcode::Jump => {
                     verify_jump_target_operand(

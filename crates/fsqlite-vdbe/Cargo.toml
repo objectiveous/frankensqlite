@@ -63,6 +63,10 @@ harness = false
 name = "make_record"
 harness = false
 
+[[bench]]
+name = "pipeline_stages"
+harness = false
+
 # Cannot inherit workspace lints because workspace forbids unsafe_code
 # and the SIMD MakeRecord helper requires a tightly scoped unsafe island.
 [lints.rust]

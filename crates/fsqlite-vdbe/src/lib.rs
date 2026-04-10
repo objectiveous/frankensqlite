@@ -9,6 +9,7 @@ use hashbrown::{HashMap, HashSet};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use std::sync::Arc;
+use std::time::Instant;
 
 pub mod codegen;
 pub mod engine;
@@ -29,6 +30,96 @@ pub mod vectorized_sort;
 
 #[cfg(test)]
 mod vectorized_prop_tests;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VdbePipelineStage {
+    Decode,
+    Execute,
+    Commit,
+}
+
+impl VdbePipelineStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Decode => "decode",
+            Self::Execute => "execute",
+            Self::Commit => "commit",
+        }
+    }
+}
+
+#[must_use]
+pub(crate) struct VdbeProfileMarker {
+    stage: VdbePipelineStage,
+    started: Option<Instant>,
+}
+
+impl Drop for VdbeProfileMarker {
+    fn drop(&mut self) {
+        let Some(started) = self.started.take() else {
+            return;
+        };
+        let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        tracing::trace!(
+            target: "fsqlite_vdbe::profile",
+            stage = self.stage.as_str(),
+            event = "end",
+            elapsed_ns,
+            "vdbe pipeline stage"
+        );
+    }
+}
+
+#[inline(never)]
+fn enter_vdbe_profile_stage(stage: VdbePipelineStage) -> VdbeProfileMarker {
+    if tracing::enabled!(target: "fsqlite_vdbe::profile", tracing::Level::TRACE) {
+        tracing::trace!(
+            target: "fsqlite_vdbe::profile",
+            stage = stage.as_str(),
+            event = "begin",
+            "vdbe pipeline stage"
+        );
+        VdbeProfileMarker {
+            stage,
+            started: Some(Instant::now()),
+        }
+    } else {
+        VdbeProfileMarker {
+            stage,
+            started: None,
+        }
+    }
+}
+
+#[must_use]
+pub(crate) fn enter_vdbe_decode_profile_stage() -> VdbeProfileMarker {
+    enter_vdbe_profile_stage(VdbePipelineStage::Decode)
+}
+
+#[must_use]
+pub(crate) fn enter_vdbe_execute_profile_stage() -> VdbeProfileMarker {
+    enter_vdbe_profile_stage(VdbePipelineStage::Execute)
+}
+
+#[must_use]
+pub(crate) fn enter_vdbe_commit_profile_stage() -> VdbeProfileMarker {
+    enter_vdbe_profile_stage(VdbePipelineStage::Commit)
+}
+
+pub fn profile_vdbe_decode_stage<R>(f: impl FnOnce() -> R) -> R {
+    let _profile_stage = enter_vdbe_decode_profile_stage();
+    f()
+}
+
+pub fn profile_vdbe_execute_stage<R>(f: impl FnOnce() -> R) -> R {
+    let _profile_stage = enter_vdbe_execute_profile_stage();
+    f()
+}
+
+pub fn profile_vdbe_commit_stage<R>(f: impl FnOnce() -> R) -> R {
+    let _profile_stage = enter_vdbe_commit_profile_stage();
+    f()
+}
 
 /// Register spans touched by an opcode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -8753,12 +8753,46 @@ impl VdbeEngine {
                         self.pending_next_after_delete.remove(&cursor_id);
                     }
                     let key_val = self.clone_reg_materialized(op.p3);
+                    let root_page = self
+                        .cursor_root_pages
+                        .get(&cursor_id)
+                        .copied()
+                        .unwrap_or_default();
+                    let index_desc_flags = self.index_desc_flags_for_root(root_page);
+                    let index_collations = self.index_collations_for_root(root_page);
 
                     // NULL short-circuit: NULL != NULL for UNIQUE purposes.
                     if key_val.is_null() {
                         pc = op.p2 as usize;
                         continue;
                     }
+
+                    let uses_collated_probe = if let SqliteValue::Blob(ref bytes) = key_val {
+                        if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                            if try_decode_storage_cursor_target_index_record(cursor, bytes)
+                                && cursor.target_vals_buf.iter().any(SqliteValue::is_null)
+                            {
+                                pc = op.p2 as usize;
+                                continue;
+                            }
+                            cursor.target_vals_buf.iter().enumerate().any(|(idx, _)| {
+                                index_collations
+                                    .get(idx)
+                                    .and_then(|collation| collation.as_deref())
+                                    .is_some_and(|name| !name.eq_ignore_ascii_case("BINARY"))
+                            })
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    let collated_probe_registry = uses_collated_probe.then(|| {
+                        self.collation_registry
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner())
+                            .clone()
+                    });
 
                     // Prefix-based conflict check: seek the index, then
                     // compare only the first N fields (where N = number of
@@ -8767,13 +8801,20 @@ impl VdbeEngine {
                     // but the probe key has only (columns).
                     let conflict = if let SqliteValue::Blob(ref bytes) = key_val {
                         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                            if try_decode_storage_cursor_target_index_record(cursor, bytes)
-                                && cursor.target_vals_buf.iter().any(SqliteValue::is_null)
-                            {
-                                pc = op.p2 as usize;
-                                continue;
+                            if uses_collated_probe {
+                                storage_cursor_no_conflict_prefix_match_collated(
+                                    cursor_id,
+                                    cursor,
+                                    bytes,
+                                    &index_desc_flags,
+                                    &index_collations,
+                                    collated_probe_registry
+                                        .as_ref()
+                                        .expect("collated NoConflict probe requires registry"),
+                                )?
+                            } else {
+                                storage_cursor_no_conflict_prefix_match(cursor_id, cursor, bytes)?
                             }
-                            storage_cursor_no_conflict_prefix_match(cursor_id, cursor, bytes)?
                         } else {
                             false
                         }
@@ -13393,6 +13434,49 @@ fn storage_cursor_no_conflict_prefix_match(
         && cursor.cur_vals_buf[..prefix_len] == cursor.target_vals_buf[..])
 }
 
+fn storage_cursor_no_conflict_prefix_match_collated(
+    cursor_id: i32,
+    cursor: &mut StorageCursor,
+    key_bytes: &[u8],
+    desc_flags: &[bool],
+    collations: &[Option<String>],
+    collation_registry: &CollationRegistry,
+) -> Result<bool> {
+    if !try_decode_storage_cursor_target_index_record(cursor, key_bytes) {
+        return Ok(false);
+    }
+    let prefix_len = cursor.target_vals_buf.len();
+    if !cursor.cursor.first(&cursor.cx)? {
+        return Ok(false);
+    }
+    if prefix_len == 0 {
+        return Ok(true);
+    }
+
+    loop {
+        if !try_decode_storage_cursor_current_index_record(cursor_id, cursor)? {
+            return Ok(false);
+        }
+        if cursor.cur_vals_buf.len() >= prefix_len
+            && compare_index_prefix_keys(
+                &cursor.cur_vals_buf,
+                &cursor.target_vals_buf,
+                prefix_len,
+                desc_flags,
+                collations,
+                collation_registry,
+            ) == Ordering::Equal
+        {
+            return Ok(true);
+        }
+        if !cursor.cursor.next(&cursor.cx)? {
+            break;
+        }
+    }
+
+    Ok(false)
+}
+
 fn storage_cursor_current_first_index_key_equals(
     cursor: &mut StorageCursor,
     probe_value: &SqliteValue,
@@ -15097,6 +15181,44 @@ mod tests {
     fn build_storage_index_engine_with_duplicate_prefixes() -> (VdbeEngine, Vec<u8>, Vec<u8>) {
         let mut engine = VdbeEngine::new(8);
         let (conflict_key, miss_key) = install_duplicate_prefix_index_fixture(&mut engine, 0);
+        (engine, conflict_key, miss_key)
+    }
+
+    fn build_storage_index_engine_with_nocase_prefixes() -> (VdbeEngine, Vec<u8>, Vec<u8>) {
+        let mut engine = VdbeEngine::new(8);
+        let mut db = MemDatabase::new();
+        let index_root = db.allocate_root_page();
+
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        engine.set_index_collations_by_root_page(HashMap::from([(
+            index_root,
+            vec![Some("NOCASE".to_owned())],
+        )]));
+
+        assert!(
+            engine.open_storage_cursor(0, index_root, true),
+            "NOCASE index storage cursor should open"
+        );
+
+        let sc = engine
+            .storage_cursors
+            .get_mut(&0)
+            .expect("NOCASE storage cursor should exist");
+        for (text, rowid) in [("alpha", 1_i64), ("beta", 2_i64)] {
+            let key = encode_record(&[
+                SqliteValue::Text(text.to_owned().into()),
+                SqliteValue::Integer(rowid),
+            ]);
+            sc.cursor
+                .index_insert(&sc.cx, &key)
+                .expect("NOCASE fixture key should insert");
+        }
+
+        let conflict_key = encode_record(&[SqliteValue::Text("ALPHA".into())]);
+        let miss_key = encode_record(&[SqliteValue::Text("gamma".into())]);
+
         (engine, conflict_key, miss_key)
     }
 
@@ -22726,6 +22848,53 @@ mod tests {
     }
 
     #[test]
+    fn test_storage_cursor_no_conflict_collated_probe_honors_nocase() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut engine, conflict_key, miss_key) =
+            build_storage_index_engine_with_nocase_prefixes();
+        let coll_arc = Arc::clone(&engine.collation_registry);
+        let coll_guard = coll_arc.lock().unwrap_or_else(|e| e.into_inner());
+        let root_page = engine
+            .cursor_root_pages
+            .get(&0)
+            .copied()
+            .expect("storage cursor should record its root page");
+        let desc_flags = engine.index_desc_flags_for_root(root_page);
+        let collations = engine.index_collations_for_root(root_page);
+        let cursor = engine
+            .storage_cursors
+            .get_mut(&0)
+            .expect("storage cursor should exist");
+
+        assert!(
+            storage_cursor_no_conflict_prefix_match_collated(
+                0,
+                cursor,
+                &conflict_key,
+                &desc_flags,
+                &collations,
+                &coll_guard,
+            )
+            .expect("collated conflict probe should succeed"),
+            "NOCASE-equivalent text must be treated as a duplicate prefix"
+        );
+        assert!(
+            !storage_cursor_no_conflict_prefix_match_collated(
+                0,
+                cursor,
+                &miss_key,
+                &desc_flags,
+                &collations,
+                &coll_guard,
+            )
+            .expect("collated miss probe should succeed"),
+            "distinct NOCASE text must remain insertable"
+        );
+    }
+
+    #[test]
     fn test_storage_cursor_no_conflict_reuses_payload_and_value_scratch() {
         let _guard = VDBE_OBSERVABILITY_LOCK
             .lock()
@@ -23170,6 +23339,27 @@ mod tests {
                 vec![SqliteValue::Integer(1)],
             ],
             "NoConflict should treat duplicate prefixes as conflicts and malformed probes as insertable"
+        );
+    }
+
+    #[test]
+    fn test_no_conflict_opcode_honors_nocase_collation() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut engine, conflict_key, miss_key) =
+            build_storage_index_engine_with_nocase_prefixes();
+        let program = build_no_conflict_opcode_probe_program(conflict_key, miss_key, vec![0x80]);
+        let rows = execute_program_with_engine(&mut engine, &program);
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Integer(0)],
+                vec![SqliteValue::Integer(1)],
+                vec![SqliteValue::Integer(1)],
+            ],
+            "NoConflict must honor per-index NOCASE equality when probing storage indexes"
         );
     }
 

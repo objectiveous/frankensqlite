@@ -160,6 +160,7 @@ fn component_row(
 }
 
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn build_persistent_phase_component_comparison_report(
     benchmark_group: &str,
     concurrency: usize,

@@ -1056,6 +1056,7 @@ fn counter_preference(counter_id: &str) -> CounterPreference {
     }
 }
 
+#[allow(clippy::match_same_arms)]
 fn metric_direction(preference: CounterPreference, baseline: f64, candidate: f64) -> String {
     let changed = (candidate - baseline).abs() > f64::EPSILON;
     match preference {
@@ -1078,9 +1079,10 @@ fn metric_improvement_pct(
         return None;
     }
     Some(match preference {
-        CounterPreference::HigherIsBetter => ((candidate - baseline) / baseline) * 100.0,
+        CounterPreference::HigherIsBetter | CounterPreference::Invariant => {
+            ((candidate - baseline) / baseline) * 100.0
+        }
         CounterPreference::LowerIsBetter => ((baseline - candidate) / baseline) * 100.0,
-        CounterPreference::Invariant => ((candidate - baseline) / baseline) * 100.0,
     })
 }
 

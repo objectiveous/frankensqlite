@@ -1250,10 +1250,10 @@ fn txn_concurrent_schema_and_dml_preserve_index_and_rows() {
         )
         .expect("candidate schema");
         for id in 0_i64..512 {
+            let payload = format!("seed-payload-{id:04}-{}", "x".repeat(48));
+            let category = if id % 2 == 0 { "seed_even" } else { "seed_odd" };
             let sql = format!(
-                "INSERT INTO schema_mix(id, category, payload) VALUES ({id}, '{}', '{}');",
-                if id % 2 == 0 { "seed_even" } else { "seed_odd" },
-                format!("seed-payload-{id:04}-{}", "x".repeat(48))
+                "INSERT INTO schema_mix(id, category, payload) VALUES ({id}, '{category}', '{payload}');"
             );
             setup.execute(&sql).expect("candidate seed insert");
         }

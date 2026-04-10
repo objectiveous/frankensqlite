@@ -1,3 +1,10 @@
+#![allow(
+    clippy::derive_partial_eq_without_eq,
+    clippy::derivable_impls,
+    clippy::zero_sized_map_values
+)]
+// Pedantic-only style preferences inside this module's gate-policy types.
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;

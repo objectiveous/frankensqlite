@@ -50,7 +50,7 @@ struct BenchTargetDeclaration {
     section_line_no: usize,
 }
 
-pub(crate) fn validate_benchmark_lifecycle_parity(workspace_root: &Path) -> Vec<String> {
+pub fn validate_benchmark_lifecycle_parity(workspace_root: &Path) -> Vec<String> {
     let bench_relpaths = match discover_benchmark_source_files(workspace_root) {
         Ok(bench_relpaths) => bench_relpaths,
         Err(violations) => return violations,
@@ -258,24 +258,24 @@ fn validate_benchmark_metadata_records(records: Vec<BenchmarkMetaRecord>) -> Vec
         }
 
         match csqlite.comparisons.first() {
-            Some(BenchmarkComparisonMode::Parity) => {
-                if csqlite.dimensions != frankensqlite.dimensions {
-                    violations.push(format!(
-                        "{file_relpath}:{benchmark_group}: lifecycle/storage/concurrency parity mismatch: csqlite={} frankensqlite={}",
-                        describe_dimension_set(&csqlite.dimensions),
-                        describe_dimension_set(&frankensqlite.dimensions),
-                    ));
-                }
+            Some(BenchmarkComparisonMode::Parity)
+                if csqlite.dimensions != frankensqlite.dimensions =>
+            {
+                violations.push(format!(
+                    "{file_relpath}:{benchmark_group}: lifecycle/storage/concurrency parity mismatch: csqlite={} frankensqlite={}",
+                    describe_dimension_set(&csqlite.dimensions),
+                    describe_dimension_set(&frankensqlite.dimensions),
+                ));
             }
-            Some(BenchmarkComparisonMode::Control) => {
-                if csqlite.dimensions == frankensqlite.dimensions {
-                    violations.push(format!(
-                        "{file_relpath}:{benchmark_group}: comparison=control is unnecessary because lifecycle/storage/concurrency already match ({})",
-                        describe_dimension_set(&csqlite.dimensions),
-                    ));
-                }
+            Some(BenchmarkComparisonMode::Control)
+                if csqlite.dimensions == frankensqlite.dimensions =>
+            {
+                violations.push(format!(
+                    "{file_relpath}:{benchmark_group}: comparison=control is unnecessary because lifecycle/storage/concurrency already match ({})",
+                    describe_dimension_set(&csqlite.dimensions),
+                ));
             }
-            None => {}
+            _ => {}
         }
     }
 
@@ -371,7 +371,7 @@ fn parse_benchmark_meta_records(
                 } else {
                     let benchmark_group =
                         parse_benchmark_group_name(&body).unwrap_or_else(|| function_name.clone());
-                    for meta in pending_meta.drain(..) {
+                    for meta in std::mem::take(&mut pending_meta) {
                         let engine =
                             match normalize_bench_engine(relpath, meta.line_no, &meta.engine) {
                                 Ok(engine) => Some(engine),
@@ -565,7 +565,7 @@ fn normalize_bench_dimension(
     value: &str,
     allowed: &[&str],
 ) -> Result<String, String> {
-    if allowed.iter().any(|allowed_value| *allowed_value == value) {
+    if allowed.contains(&value) {
         Ok(value.to_owned())
     } else {
         Err(format!(

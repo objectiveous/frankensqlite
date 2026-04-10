@@ -909,15 +909,15 @@ impl<F: VfsFile> PagerInner<F> {
             }
         }
 
-        if let Some(data) = cache.get_copy(page_no) {
-            return Ok(data);
-        }
-
         // Reads of yet-unallocated pages should observe zero-filled content.
         // This is relied upon by savepoint rollback semantics for pages that
         // were allocated and then rolled back before commit.
         if page_no.get() > self.db_size {
             return Ok(vec![0_u8; self.page_size.as_usize()]);
+        }
+
+        if let Some(data) = cache.get_copy(page_no) {
+            return Ok(data);
         }
 
         match cache.read_page_copy(cx, &mut self.db_file, page_no) {
@@ -2300,6 +2300,30 @@ impl PublishedPagerState {
         )
     }
 
+    fn should_skip_stale_publish(
+        &self,
+        cx: &Cx,
+        update: PublishedPagerUpdate,
+        scenario_id: &'static str,
+    ) -> bool {
+        let current_visible_commit_seq =
+            CommitSeq::new(self.visible_commit_seq.load(AtomicOrdering::Acquire));
+        if current_visible_commit_seq > update.visible_commit_seq {
+            tracing::trace!(
+                target: "fsqlite.snapshot_publication",
+                trace_id = cx.trace_id(),
+                run_id = "pager-publication",
+                scenario_id,
+                observed_commit_seq = update.visible_commit_seq.get(),
+                visible_commit_seq = current_visible_commit_seq.get(),
+                publication_mode = SNAPSHOT_PUBLICATION_MODE,
+                "skipping stale pager publication"
+            );
+            return true;
+        }
+        false
+    }
+
     // D1-CRITICAL Change 3: Operation-specific publish methods using sharded pages.
     // Replaces the closure-based publish API with type-safe operations.
 
@@ -2315,17 +2339,13 @@ impl PublishedPagerState {
             .publish_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let current_visible_commit_seq =
-            CommitSeq::new(self.visible_commit_seq.load(AtomicOrdering::Acquire));
-        if current_visible_commit_seq > update.visible_commit_seq {
+        if self.should_skip_stale_publish(cx, update, "stale_read_publish_skip") {
             tracing::trace!(
                 target: "fsqlite.snapshot_publication",
                 trace_id = cx.trace_id(),
                 run_id = "pager-publication",
-                scenario_id = "stale_read_publish_skip",
+                scenario_id = "stale_read_publish_page_skip",
                 page_no = page_no.get(),
-                observed_commit_seq = update.visible_commit_seq.get(),
-                visible_commit_seq = current_visible_commit_seq.get(),
                 publication_mode = SNAPSHOT_PUBLICATION_MODE,
                 "skipping stale published page observation"
             );
@@ -2342,6 +2362,9 @@ impl PublishedPagerState {
             .publish_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.should_skip_stale_publish(cx, update, "stale_clear_publish_skip") {
+            return;
+        }
 
         let start = Instant::now();
         let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
@@ -2361,6 +2384,9 @@ impl PublishedPagerState {
             .publish_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.should_skip_stale_publish(cx, update, "stale_remove_publish_skip") {
+            return;
+        }
 
         let start = Instant::now();
         let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
@@ -2378,6 +2404,9 @@ impl PublishedPagerState {
             .publish_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.should_skip_stale_publish(cx, update, "stale_metadata_publish_skip") {
+            return;
+        }
 
         let start = Instant::now();
         let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
@@ -2393,11 +2422,54 @@ impl PublishedPagerState {
     /// purpose; page reads detect that and fall back to cache/inner state.
     fn publish_single_connection_metadata_update(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         update: PublishedPagerUpdate,
-        _clear_pages: bool,
+        clear_pages: bool,
     ) {
+        let _publish_guard = self
+            .publish_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.should_skip_stale_publish(cx, update, "stale_single_connection_metadata_skip") {
+            return;
+        }
+
+        let start = Instant::now();
+        let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        self.signal_sequence_waiters(publish_start_sequence, "publish_begin");
+
+        if clear_pages {
+            // Metadata-only single-connection commits intentionally do not
+            // republish the page plane, but any previously published pages are
+            // now stale relative to the new visible commit horizon. Clear them
+            // under the publish lock so a later page-plane publish cannot
+            // accidentally combine fresh metadata with old page bytes.
+            self.pages.clear();
+        }
         self.sync_metadata_without_page_publish(update);
+
+        let previous_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        let snapshot_gen = previous_sequence.saturating_add(1);
+        self.signal_sequence_waiters(previous_sequence, "publish_complete");
+        tracing::trace!(
+            target: "fsqlite.snapshot_publication",
+            trace_id = cx.trace_id(),
+            run_id = "pager-publication",
+            scenario_id = if clear_pages {
+                "metadata_only_plane_clear"
+            } else {
+                "metadata_only_summary_only"
+            },
+            snapshot_gen,
+            visible_commit_seq = self.visible_commit_seq.load(AtomicOrdering::Acquire),
+            publication_mode = SNAPSHOT_PUBLICATION_MODE,
+            freelist_count = self.freelist_count.load(AtomicOrdering::Acquire),
+            checkpoint_active = self.checkpoint_active.load(AtomicOrdering::Acquire),
+            read_retry_count = self.read_retry_count(),
+            page_set_size = self.page_set_size.load(AtomicOrdering::Acquire),
+            elapsed_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            "published metadata-only single-connection summary"
+        );
     }
 
     /// Publish truncate during checkpoint: retain pages up to max_page, then remove page one.
@@ -2406,6 +2478,9 @@ impl PublishedPagerState {
             .publish_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.should_skip_stale_publish(cx, update, "stale_truncate_publish_skip") {
+            return;
+        }
 
         let start = Instant::now();
         let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
@@ -2429,6 +2504,9 @@ impl PublishedPagerState {
             .publish_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.should_skip_stale_publish(cx, update, "stale_commit_publish_skip") {
+            return;
+        }
 
         let start = Instant::now();
         let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
@@ -2467,6 +2545,9 @@ impl PublishedPagerState {
             .publish_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.should_skip_stale_publish(cx, update, "stale_commit_publish_skip") {
+            return;
+        }
 
         let start = Instant::now();
         let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
@@ -2501,6 +2582,9 @@ impl PublishedPagerState {
             .publish_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.should_skip_stale_publish(cx, update, "stale_commit_publish_skip") {
+            return;
+        }
 
         let start = Instant::now();
         let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
@@ -2561,6 +2645,9 @@ impl PublishedPagerState {
             .publish_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.should_skip_stale_publish(cx, update, "stale_insert_publish_skip") {
+            return;
+        }
 
         let start = Instant::now();
         let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
@@ -2580,6 +2667,9 @@ impl PublishedPagerState {
         page_no: PageNumber,
         page: PageData,
     ) {
+        if self.should_skip_stale_publish(cx, update, "stale_insert_publish_skip") {
+            return;
+        }
         let start = Instant::now();
         let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
         self.signal_sequence_waiters(publish_start_sequence, "publish_begin");
@@ -2601,15 +2691,20 @@ impl PublishedPagerState {
     ) {
         self.publication_write_count
             .fetch_add(1, AtomicOrdering::Relaxed);
+        let previous_visible_commit_seq = self.visible_commit_seq.load(AtomicOrdering::Acquire);
         // Monotonic max: commit_seq must never regress under group commit.
         self.visible_commit_seq
             .fetch_max(update.visible_commit_seq.get(), AtomicOrdering::Release);
-        // Monotonic max: db_size must never regress. Under group commit,
-        // Transaction A (db_size=5) may publish after Transaction B (db_size=7),
-        // which would revert the published db_size from 7 to 5. This causes
-        // BusySnapshot errors where subsequent transactions can't see pages 6-7.
-        self.db_size
-            .fetch_max(update.db_size, AtomicOrdering::Release);
+        // Stale older publications must not shrink the visible db_size out from
+        // under a newer larger commit, but newer-or-equal publications are
+        // allowed to publish the real size, including legitimate shrink/
+        // truncate operations.
+        if update.visible_commit_seq.get() < previous_visible_commit_seq {
+            self.db_size
+                .fetch_max(update.db_size, AtomicOrdering::Release);
+        } else {
+            self.db_size.store(update.db_size, AtomicOrdering::Release);
+        }
         self.journal_mode.store(
             encode_journal_mode(update.journal_mode),
             AtomicOrdering::Release,
@@ -2647,12 +2742,18 @@ impl PublishedPagerState {
     fn sync_metadata_without_page_publish(&self, update: PublishedPagerUpdate) {
         // Single-connection fast path: keep publication metadata monotonic for
         // callers that inspect the latest commit horizon, but do not mutate the
-        // published page plane or wake publication waiters. Any subsequent page
-        // read will skip the stale plane because `page_plane_visible_commit_seq`
-        // intentionally remains behind `visible_commit_seq`.
+        // published page plane. Any subsequent page read will skip the stale
+        // plane because `page_plane_visible_commit_seq` intentionally remains
+        // behind `visible_commit_seq`.
+        let previous_visible_commit_seq = self.visible_commit_seq.load(AtomicOrdering::Acquire);
         self.visible_commit_seq
-            .store(update.visible_commit_seq.get(), AtomicOrdering::Release);
-        self.db_size.store(update.db_size, AtomicOrdering::Release);
+            .fetch_max(update.visible_commit_seq.get(), AtomicOrdering::Release);
+        if update.visible_commit_seq.get() < previous_visible_commit_seq {
+            self.db_size
+                .fetch_max(update.db_size, AtomicOrdering::Release);
+        } else {
+            self.db_size.store(update.db_size, AtomicOrdering::Release);
+        }
         self.journal_mode.store(
             encode_journal_mode(update.journal_mode),
             AtomicOrdering::Release,
@@ -6393,12 +6494,15 @@ where
                 checkpoint_active: inner.checkpoint_active,
             };
             let single_connection_fast_path = self.single_connection_fast_path_enabled();
-            let metadata_only_single_connection_fast_path =
-                single_connection_fast_path && !self.write_set.contains_key(&PageNumber::ONE);
-            if !metadata_only_single_connection_fast_path {
-                // bd-db300.5.3.3.1: publish immutable snapshot while inner is still held.
-                self.publish_committed_snapshot_from_inner(&inner);
-            }
+            // In an isolated single-connection commit, page-plane publication
+            // is unnecessary even when page 1 was staged for internal durable
+            // bookkeeping such as change-counter/page-count maintenance. The
+            // committed bytes are already authoritative in the pager/cache.
+            let metadata_only_single_connection_fast_path = single_connection_fast_path;
+            // bd-db300.5.3.3.1: publish immutable snapshot while inner is
+            // still held so any later multi-connection readers inherit the
+            // committed metadata even if this commit skipped page-plane publish.
+            self.publish_committed_snapshot_from_inner(&inner);
             let preserve_level =
                 retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
             let _ = inner.db_file.unlock(cx, preserve_level);
@@ -16593,6 +16697,45 @@ mod tests {
     }
 
     #[test]
+    fn test_single_connection_metadata_only_commit_clears_stale_page_plane_before_later_publish() {
+        init_publication_test_tracing();
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+        let shared_connection_count = Arc::new(AtomicUsize::new(2));
+        pager.bind_shared_connection_count(Arc::clone(&shared_connection_count));
+
+        let p = {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let p = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, p, &vec![0x11; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+            p
+        };
+
+        shared_connection_count.store(1, AtomicOrdering::Release);
+        {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            txn.write_page(&cx, p, &vec![0x22; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+        }
+
+        {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_one = txn.get_page(&cx, PageNumber::ONE).unwrap().into_vec();
+            txn.write_page(&cx, PageNumber::ONE, &page_one).unwrap();
+            txn.commit(&cx).unwrap();
+        }
+
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            reader.get_page(&cx, p).unwrap().as_ref()[0],
+            0x22,
+            "bead_id={BEAD_ID} case=metadata_only_single_connection_commit_must_not_leave_stale_page_plane_bytes"
+        );
+    }
+
+    #[test]
     fn test_single_connection_read_skips_publication_plane_population() {
         init_publication_test_tracing();
         let (pager, _) = test_pager();
@@ -17365,7 +17508,7 @@ mod tests {
     }
 
     #[test]
-    fn test_publish_commit_skips_sweep_for_stale_smaller_db_size_update() {
+    fn test_stale_smaller_commit_publish_does_not_mutate_newer_snapshot() {
         init_publication_test_tracing();
         let published = PublishedPagerState::new(8, CommitSeq::new(8), JournalMode::Wal, 0);
         let cx = Cx::new();
@@ -17384,7 +17527,7 @@ mod tests {
                 checkpoint_active: false,
             },
             page_two,
-            original_page_two,
+            original_page_two.clone(),
         );
         published.publish_insert_single(
             &cx,
@@ -17418,13 +17561,13 @@ mod tests {
 
         assert_eq!(
             published.try_get_page(page_two),
-            Some(refreshed_page_two),
-            "bead_id=bd-wwqen.3 case=stale_smaller_commit_still_refreshes_written_pages"
+            Some(original_page_two),
+            "bead_id=bd-wwqen.3 case=stale_smaller_commit_must_not_overwrite_newer_page_bytes"
         );
         assert_eq!(
             published.try_get_page(page_seven),
             Some(original_page_seven),
-            "bead_id=bd-wwqen.3 case=stale_smaller_commit_must_not_evict_newer_larger_pages"
+            "bead_id=bd-wwqen.3 case=stale_smaller_commit_must_not_evict_newer_pages"
         );
         assert_eq!(
             published.snapshot().db_size,
@@ -17479,6 +17622,256 @@ mod tests {
         assert!(
             published.try_get_page(page_seven).is_none(),
             "bead_id=bd-wwqen.3 case=shrink_commit_evicts_pages_above_new_db_size"
+        );
+        assert_eq!(
+            published.snapshot().db_size,
+            4,
+            "bead_id=bd-wwqen.3 case=shrink_commit_updates_published_db_size"
+        );
+    }
+
+    #[test]
+    fn test_read_page_copy_zero_fills_pages_beyond_db_size_even_if_cache_is_stale() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let page_seven = PageNumber::new(7).unwrap();
+
+        let mut stale_buf = PageBuf::new(PageSize::DEFAULT);
+        stale_buf.fill(0x7A);
+        pager.cache.insert_buffer(page_seven, stale_buf);
+
+        let mut inner = pager
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.db_size = 4;
+
+        let bytes = inner
+            .read_page_copy(&cx, &pager.cache, &pager.wal_backend, page_seven)
+            .expect("read_page_copy should succeed for pages beyond db_size");
+
+        assert!(
+            bytes.iter().all(|byte| *byte == 0),
+            "bead_id=bd-wwqen.3 case=stale_cached_page_above_db_size_must_zero_fill"
+        );
+    }
+
+    #[test]
+    fn test_publish_truncate_checkpoint_updates_published_db_size_on_same_commit_seq() {
+        init_publication_test_tracing();
+        let published = PublishedPagerState::new(8, CommitSeq::new(8), JournalMode::Wal, 0);
+        let cx = Cx::new();
+        let page_seven = PageNumber::new(7).unwrap();
+
+        published.publish_insert_single(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(8),
+                db_size: 8,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            page_seven,
+            PageData::from_vec(sample_page(0x77)),
+        );
+
+        published.publish_truncate_checkpoint(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(8),
+                db_size: 4,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            4,
+        );
+
+        assert!(
+            published.try_get_page(page_seven).is_none(),
+            "bead_id=bd-wwqen.3 case=truncate_checkpoint_evicts_pages_above_new_db_size"
+        );
+        assert_eq!(
+            published.snapshot().db_size,
+            4,
+            "bead_id=bd-wwqen.3 case=truncate_checkpoint_updates_published_db_size"
+        );
+    }
+
+    #[test]
+    fn test_stale_larger_commit_publish_does_not_reopen_newer_shrunken_snapshot() {
+        init_publication_test_tracing();
+        let published = PublishedPagerState::new(8, CommitSeq::new(8), JournalMode::Wal, 0);
+        let cx = Cx::new();
+        let page_two = PageNumber::new(2).unwrap();
+        let page_seven = PageNumber::new(7).unwrap();
+
+        let current_page_two = PageData::from_vec(sample_page(0x22));
+        let shrink_write_set = HashMap::from([(
+            page_two,
+            StagedPage::from_page_data(current_page_two.clone()),
+        )]);
+        published.publish_commit(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(9),
+                db_size: 4,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            &shrink_write_set,
+        );
+
+        let stale_page_two = PageData::from_vec(sample_page(0x99));
+        let stale_page_seven = PageData::from_vec(sample_page(0x77));
+        let stale_write_set = HashMap::from([
+            (page_two, StagedPage::from_page_data(stale_page_two)),
+            (page_seven, StagedPage::from_page_data(stale_page_seven)),
+        ]);
+        published.publish_commit(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(8),
+                db_size: 8,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            &stale_write_set,
+        );
+
+        let after = published.snapshot();
+        assert_eq!(
+            after.visible_commit_seq,
+            CommitSeq::new(9),
+            "bead_id=bd-wwqen.3 case=stale_larger_commit_must_not_regress_visible_commit_seq"
+        );
+        assert_eq!(
+            after.db_size, 4,
+            "bead_id=bd-wwqen.3 case=stale_larger_commit_must_not_reopen_shrunken_db_size"
+        );
+        assert_eq!(
+            published.try_get_page(page_two),
+            Some(current_page_two),
+            "bead_id=bd-wwqen.3 case=stale_larger_commit_must_not_overwrite_newer_page_bytes"
+        );
+        assert!(
+            published.try_get_page(page_seven).is_none(),
+            "bead_id=bd-wwqen.3 case=stale_larger_commit_must_not_restore_truncated_pages"
+        );
+    }
+
+    #[test]
+    fn test_metadata_only_publish_without_page_clear_advances_snapshot_generation() {
+        init_publication_test_tracing();
+        let published = PublishedPagerState::new(4, CommitSeq::new(7), JournalMode::Wal, 0);
+        let cx = Cx::new();
+
+        let before = published.snapshot();
+        let writes_before = published.publication_write_count();
+        published.publish_single_connection_metadata_update(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(8),
+                db_size: 4,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 2,
+                checkpoint_active: true,
+            },
+            false,
+        );
+
+        let after = published.snapshot();
+        assert!(
+            after.snapshot_gen > before.snapshot_gen,
+            "bead_id=bd-wwqen.3 case=metadata_only_publish_must_advance_snapshot_generation"
+        );
+        assert_eq!(
+            after.visible_commit_seq,
+            CommitSeq::new(8),
+            "bead_id=bd-wwqen.3 case=metadata_only_publish_updates_visible_commit_seq"
+        );
+        assert_eq!(
+            after.freelist_count, 2,
+            "bead_id=bd-wwqen.3 case=metadata_only_publish_updates_freelist_count"
+        );
+        assert!(
+            after.checkpoint_active,
+            "bead_id=bd-wwqen.3 case=metadata_only_publish_updates_checkpoint_flag"
+        );
+        assert_eq!(
+            after.page_set_size, 0,
+            "bead_id=bd-wwqen.3 case=metadata_only_publish_keeps_page_plane_empty"
+        );
+        assert_eq!(
+            published.page_plane_visible_commit_seq(),
+            before.visible_commit_seq,
+            "bead_id=bd-wwqen.3 case=metadata_only_publish_keeps_page_plane_horizon_stale"
+        );
+        assert_eq!(
+            published.publication_write_count(),
+            writes_before,
+            "bead_id=bd-wwqen.3 case=metadata_only_publish_still_elides_page_plane_write_count"
+        );
+    }
+
+    #[test]
+    fn test_metadata_only_publish_without_page_clear_preserves_newer_visible_snapshot() {
+        init_publication_test_tracing();
+        let published = PublishedPagerState::new(8, CommitSeq::new(8), JournalMode::Wal, 0);
+        let cx = Cx::new();
+
+        published.publish_single_connection_metadata_update(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(8),
+                db_size: 8,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 3,
+                checkpoint_active: true,
+            },
+            false,
+        );
+        let before = published.snapshot();
+
+        published.publish_single_connection_metadata_update(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(7),
+                db_size: 4,
+                journal_mode: JournalMode::Delete,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            false,
+        );
+
+        let after = published.snapshot();
+        assert_eq!(
+            after.visible_commit_seq, before.visible_commit_seq,
+            "bead_id=bd-wwqen.3 case=stale_metadata_only_publish_must_not_regress_visible_commit_seq"
+        );
+        assert_eq!(
+            after.db_size, before.db_size,
+            "bead_id=bd-wwqen.3 case=stale_metadata_only_publish_must_not_shrink_newer_db_size"
+        );
+        assert_eq!(
+            after.snapshot_gen, before.snapshot_gen,
+            "bead_id=bd-wwqen.3 case=stale_metadata_only_publish_must_be_a_noop"
+        );
+        assert_eq!(
+            after.journal_mode, before.journal_mode,
+            "bead_id=bd-wwqen.3 case=stale_metadata_only_publish_must_not_regress_journal_mode"
+        );
+        assert_eq!(
+            after.freelist_count, before.freelist_count,
+            "bead_id=bd-wwqen.3 case=stale_metadata_only_publish_must_not_regress_freelist_count"
+        );
+        assert_eq!(
+            after.checkpoint_active, before.checkpoint_active,
+            "bead_id=bd-wwqen.3 case=stale_metadata_only_publish_must_not_regress_checkpoint_flag"
         );
     }
 

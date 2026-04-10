@@ -8215,6 +8215,56 @@ mod tests {
     }
 
     #[test]
+    fn test_index_seek_text_keys_falls_back_to_binary_search_successor_positioning() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_index(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+
+        for (text, rowid) in [("alpha", 1_i64), ("charlie", 3_i64), ("echo", 5_i64)] {
+            let key =
+                serialize_record(&[SqliteValue::Text(text.into()), SqliteValue::Integer(rowid)]);
+            cursor.index_insert(&cx, &key).unwrap();
+        }
+
+        let between_probe = serialize_record(&[
+            SqliteValue::Text("bravo".into()),
+            SqliteValue::Integer(i64::MIN),
+        ]);
+        let between_seek = cursor.index_move_to(&cx, &between_probe).unwrap();
+        assert!(
+            !between_seek.is_found(),
+            "missing text probe should fall back to successor positioning on index pages"
+        );
+        assert!(
+            !cursor.eof(),
+            "a text probe between existing keys should land on the successor entry"
+        );
+        assert_eq!(cursor.rowid(&cx).unwrap(), 3);
+        let successor_fields = parse_record(&cursor.payload(&cx).unwrap()).unwrap();
+        assert_eq!(
+            successor_fields,
+            vec![SqliteValue::Text("charlie".into()), SqliteValue::Integer(3),],
+            "text-key seek should preserve binary-search successor semantics on index pages"
+        );
+
+        let tail_probe = serialize_record(&[
+            SqliteValue::Text("zulu".into()),
+            SqliteValue::Integer(i64::MIN),
+        ]);
+        let tail_seek = cursor.index_move_to(&cx, &tail_probe).unwrap();
+        assert!(
+            !tail_seek.is_found(),
+            "tail text probe should not report a false-positive exact hit"
+        );
+        assert!(
+            cursor.eof(),
+            "text probe beyond the last key should still fall off the right edge"
+        );
+    }
+
+    #[test]
     fn test_cursor_seek_observes_cancellation_during_leaf_binary_search() {
         let mut store = MemPageStore::new(USABLE);
         store.pages.insert(
@@ -10795,6 +10845,85 @@ mod tests {
             .as_ref()
             .expect("successful append should preserve the rightmost-leaf cache");
         assert_eq!(cached_after.rowid, 128 + i64::from(appended));
+    }
+
+    #[test]
+    fn test_table_insert_sequential_fast_path_records_append_metrics_without_reloads() {
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .expect("leaf-reuse cursor test lock");
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .expect("leaf-reuse shared test lock");
+
+        crate::instrumentation::reset_btree_copy_profile();
+        crate::instrumentation::set_btree_copy_profile_enabled(true);
+
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let payload = vec![b'G'; 180];
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+
+        for rowid in 1..=128_i64 {
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+        }
+
+        let root_entry = cursor.reload_page_fresh(&cx, root).unwrap();
+        assert!(
+            root_entry.header.page_type.is_interior(),
+            "test requires an interior root so the fast path would otherwise revisit it"
+        );
+
+        let before = crate::instrumentation::btree_leaf_reuse_snapshot();
+        let mut appended = 0_u64;
+        for rowid in 129..=256_i64 {
+            let cached = cursor
+                .rightmost_leaf_cache
+                .clone()
+                .expect("sequential inserts should seed the rightmost-leaf cache");
+            let mut cell_data = Vec::new();
+            cursor
+                .encode_table_leaf_cell_into(&cx, rowid, &payload, &mut cell_data)
+                .unwrap();
+            let header_offset = cell::header_offset_for_page(cached.page_no);
+            let content_offset = cached.header.content_offset(cursor.usable_size);
+            let Some(new_content_offset) = content_offset.checked_sub(cell_data.len()) else {
+                break;
+            };
+            let ptr_array_end = header_offset
+                + usize::from(cached.header.page_type.header_size())
+                + (usize::from(cached.header.cell_count) + 1) * 2;
+            if ptr_array_end > new_content_offset {
+                break;
+            }
+
+            cursor.pager.clear_reads();
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+            assert!(
+                cursor.pager.read_pages().is_empty(),
+                "fast sequential append should not re-read the rightmost leaf before the next split (rowid {rowid})"
+            );
+            appended = appended.saturating_add(1);
+        }
+
+        let after = crate::instrumentation::btree_leaf_reuse_snapshot();
+        crate::instrumentation::set_btree_copy_profile_enabled(false);
+
+        assert!(
+            appended >= 3,
+            "test setup should permit multiple zero-read sequential appends"
+        );
+        let before_fast_appends = before
+            .fast_table_leaf_payload_appends
+            .saturating_add(before.fast_table_leaf_full_cell_appends);
+        let after_fast_appends = after
+            .fast_table_leaf_payload_appends
+            .saturating_add(after.fast_table_leaf_full_cell_appends);
+        assert!(
+            after_fast_appends >= before_fast_appends.saturating_add(appended),
+            "sequential fast-path appends should be reflected in the append metrics: before={before:?} after={after:?} appended={appended}"
+        );
     }
 
     #[test]

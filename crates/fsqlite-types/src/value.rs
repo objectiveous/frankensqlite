@@ -125,6 +125,15 @@ pub fn pool_return(value: SqliteValue) {
     });
 }
 
+/// Return a heap-carrying value to the thread-local pool when preserving its
+/// backing allocation is likely to pay off on the next decode/write.
+#[inline]
+pub fn pool_return_reusable(value: SqliteValue) {
+    if matches!(value, SqliteValue::Text(_) | SqliteValue::Blob(_)) {
+        pool_return(value);
+    }
+}
+
 /// Clear the thread-local value pool.
 ///
 /// Use this to release memory when a thread's workload is complete,
@@ -174,7 +183,7 @@ enum SmallTextRepr {
     /// The `Arc<str>` is materialized lazily on demand so a single-owner value
     /// pays no refcount cost until it is actually shared.
     HeapOwned {
-        text: Box<str>,
+        text: String,
         shared: OnceLock<Arc<str>>,
     },
     /// Heap storage after the text has been shared.
@@ -197,7 +206,7 @@ impl Clone for SmallTextRepr {
                 buf: *buf,
             },
             Self::HeapOwned { text, shared } => {
-                let shared = Arc::clone(shared.get_or_init(|| Arc::from(text.clone())));
+                let shared = Arc::clone(shared.get_or_init(|| Arc::from(text.as_str())));
                 Self::HeapShared(shared)
             }
             Self::HeapShared(text) => Self::HeapShared(Arc::clone(text)),
@@ -221,7 +230,7 @@ impl SmallText {
         } else {
             Self {
                 repr: SmallTextRepr::HeapOwned {
-                    text: Box::<str>::from(s),
+                    text: s.to_owned(),
                     shared: OnceLock::new(),
                 },
             }
@@ -239,7 +248,7 @@ impl SmallText {
         } else {
             Self {
                 repr: SmallTextRepr::HeapOwned {
-                    text: s.into().into_boxed_str(),
+                    text: s.into(),
                     shared: OnceLock::new(),
                 },
             }
@@ -258,13 +267,41 @@ impl SmallText {
         }
     }
 
+    /// Overwrite this string, reusing the existing heap allocation when the
+    /// value is still single-owner.
+    #[inline]
+    pub fn overwrite(&mut self, s: &str) {
+        if s.len() <= SMALL_TEXT_INLINE_CAP {
+            let mut buf = [0u8; SMALL_TEXT_INLINE_CAP];
+            buf[..s.len()].copy_from_slice(s.as_bytes());
+            self.repr = SmallTextRepr::Inline {
+                len: s.len() as u8,
+                buf,
+            };
+            return;
+        }
+
+        match &mut self.repr {
+            SmallTextRepr::HeapOwned { text, shared } if shared.get().is_none() => {
+                text.clear();
+                text.push_str(s);
+            }
+            _ => {
+                self.repr = SmallTextRepr::HeapOwned {
+                    text: s.to_owned(),
+                    shared: OnceLock::new(),
+                };
+            }
+        }
+    }
+
     /// Get the string as a slice.
     #[inline]
     pub fn as_str(&self) -> &str {
         match &self.repr {
             SmallTextRepr::Inline { len, buf } => std::str::from_utf8(&buf[..*len as usize])
                 .expect("SmallText inline representation must always contain valid UTF-8"),
-            SmallTextRepr::HeapOwned { text, .. } => text,
+            SmallTextRepr::HeapOwned { text, .. } => text.as_str(),
             SmallTextRepr::HeapShared(text) => text,
         }
     }
@@ -300,9 +337,9 @@ impl SmallText {
                     .expect("SmallText inline representation must always contain valid UTF-8");
                 Arc::from(s)
             }
-            SmallTextRepr::HeapOwned { text, shared } => {
-                shared.into_inner().unwrap_or_else(|| Arc::from(text))
-            }
+            SmallTextRepr::HeapOwned { text, shared } => shared
+                .into_inner()
+                .unwrap_or_else(|| Arc::<str>::from(text)),
             SmallTextRepr::HeapShared(text) => text,
         }
     }
@@ -1926,6 +1963,64 @@ mod tests {
             "cloned text should use the shared Arc representation"
         );
         assert_eq!(text.as_str(), cloned.as_str());
+    }
+
+    #[test]
+    fn test_small_text_overwrite_reuses_unique_heap_buffer() {
+        let mut text = SmallText::new("this string is definitely longer than twenty three bytes");
+        let (original_ptr, original_capacity) = match &text.repr {
+            SmallTextRepr::HeapOwned { text, shared } => {
+                assert!(shared.get().is_none(), "fresh heap text should be unshared");
+                (text.as_ptr(), text.capacity())
+            }
+            _ => panic!("long text should start in heap-owned mode"),
+        };
+
+        text.overwrite("another long string that still fits the same allocation");
+
+        match &text.repr {
+            SmallTextRepr::HeapOwned { text, shared } => {
+                assert!(
+                    shared.get().is_none(),
+                    "overwrite should keep text single-owner"
+                );
+                assert_eq!(text.as_ptr(), original_ptr);
+                assert_eq!(text.capacity(), original_capacity);
+                assert_eq!(
+                    text.as_str(),
+                    "another long string that still fits the same allocation"
+                );
+            }
+            _ => panic!("overwrite should keep long text in heap-owned mode"),
+        }
+    }
+
+    #[test]
+    fn test_small_text_overwrite_detaches_from_shared_arc() {
+        let original = "this string is definitely longer than twenty three bytes";
+        let mut text = SmallText::new(original);
+        let clone = text.clone();
+
+        text.overwrite("replacement text that must not mutate the shared clone");
+
+        assert_eq!(
+            clone.as_str(),
+            original,
+            "existing shared clones must keep the original contents"
+        );
+        assert_eq!(
+            text.as_str(),
+            "replacement text that must not mutate the shared clone"
+        );
+        match &text.repr {
+            SmallTextRepr::HeapOwned { shared, .. } => {
+                assert!(
+                    shared.get().is_none(),
+                    "overwrite should reset the lazy shared cache after detaching"
+                );
+            }
+            _ => panic!("overwrite should restore heap-owned mode"),
+        }
     }
 
     #[test]

@@ -871,7 +871,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
     }
 
     fn prepare_append_frames(
-        &mut self,
+        &self,
         frames: &[WalFrameRef<'_>],
     ) -> Result<Option<PreparedWalFrameBatch>> {
         if frames.is_empty() {
@@ -913,6 +913,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         Ok(Some(PreparedWalFrameBatch {
             frame_size: self.wal.frame_size(),
             page_data_offset: WAL_FRAME_HEADER_SIZE,
+            big_endian_checksum: self.wal.big_endian_checksum(),
             frame_metas,
             checksum_transforms,
             frame_bytes,
@@ -923,7 +924,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
     }
 
     fn finalize_prepared_frames(
-        &mut self,
+        &self,
         _cx: &Cx,
         prepared: &mut PreparedWalFrameBatch,
     ) -> Result<()> {

@@ -118,13 +118,38 @@ pub struct FrameSubmission {
 pub struct TransactionFrameBatch {
     /// Frames belonging to this transaction, in write order.
     pub frames: Vec<FrameSubmission>,
+    /// Lane-local staging context captured before group-commit submission.
+    pub context: TransactionFrameBatchContext,
+}
+
+/// Lane-local staging context attached to a transaction batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TransactionFrameBatchContext {
+    /// Monotonic identifier used to correlate the batch with lane-local staging.
+    pub batch_id: u64,
+    /// Stable lane identity chosen for the submitting writer.
+    pub lane_id: u16,
+    /// Number of frames locally staged for this batch.
+    pub staged_frame_count: u32,
+    /// Time spent in local staging before queue submission.
+    pub staging_elapsed_ns: u64,
 }
 
 impl TransactionFrameBatch {
     /// Create a new batch with the given frames.
     #[must_use]
     pub fn new(frames: Vec<FrameSubmission>) -> Self {
-        Self { frames }
+        Self {
+            frames,
+            context: TransactionFrameBatchContext::default(),
+        }
+    }
+
+    /// Attach lane-local staging context to this batch.
+    #[must_use]
+    pub fn with_context(mut self, context: TransactionFrameBatchContext) -> Self {
+        self.context = context;
+        self
     }
 
     /// Number of frames in this batch.

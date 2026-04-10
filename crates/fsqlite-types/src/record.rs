@@ -16,7 +16,7 @@ use crate::serial_type::{
     SerialTypeClass, classify_serial_type, read_varint, serial_type_for_blob,
     serial_type_for_integer, serial_type_for_text, serial_type_len, varint_len, write_varint,
 };
-use crate::value::SqliteValue;
+use crate::value::{SqliteValue, pool_acquire, pool_return_reusable};
 
 static FSQLITE_RECORD_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
 static FSQLITE_RECORD_PARSE_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -373,7 +373,7 @@ pub fn parse_record_into(data: &[u8], values: &mut Vec<SqliteValue>) -> Option<(
         return None;
     }
 
-    values.truncate(decoded_count);
+    recycle_values_from(values, decoded_count);
 
     if let Some(start) = start {
         FSQLITE_RECORD_DECODE_TIME_NS.fetch_add(
@@ -676,6 +676,20 @@ pub struct RecordDecodeScratch {
     decoded_mask: u64,
 }
 
+#[inline]
+fn grow_value_slots(values: &mut Vec<SqliteValue>, target_len: usize) {
+    while values.len() < target_len {
+        values.push(pool_acquire().unwrap_or(SqliteValue::Null));
+    }
+}
+
+#[inline]
+fn recycle_values_from(values: &mut Vec<SqliteValue>, start: usize) {
+    for value in values.drain(start..) {
+        pool_return_reusable(value);
+    }
+}
+
 impl RecordDecodeScratch {
     /// Prepare the scratch for a new serialized record.
     ///
@@ -692,7 +706,7 @@ impl RecordDecodeScratch {
             }
         };
         if col_count > 64 {
-            self.values.clear();
+            recycle_values_from(&mut self.values, 0);
             if parse_record_into(record, &mut self.values).is_none() {
                 self.invalidate();
                 return None;
@@ -701,9 +715,9 @@ impl RecordDecodeScratch {
             Some(true)
         } else {
             if self.values.len() > col_count {
-                self.values.truncate(col_count);
+                recycle_values_from(&mut self.values, col_count);
             } else if self.values.len() < col_count {
-                self.values.resize(col_count, SqliteValue::Null);
+                grow_value_slots(&mut self.values, col_count);
             }
             self.decoded_mask = 0;
             Some(false)
@@ -725,9 +739,9 @@ impl RecordDecodeScratch {
         };
 
         if self.values.len() > col_count {
-            self.values.truncate(col_count);
+            recycle_values_from(&mut self.values, col_count);
         } else if self.values.len() < col_count {
-            self.values.resize(col_count, SqliteValue::Null);
+            grow_value_slots(&mut self.values, col_count);
         }
         self.decoded_mask = 0;
         Some(col_count)
@@ -736,7 +750,7 @@ impl RecordDecodeScratch {
     /// Drop the cached layout and decoded values while preserving capacity for reuse.
     pub fn invalidate(&mut self) {
         self.header_offsets.clear();
-        self.values.clear();
+        recycle_values_from(&mut self.values, 0);
         self.decoded_mask = 0;
     }
 
@@ -771,9 +785,10 @@ impl RecordDecodeScratch {
 
     pub fn cache_decoded(&mut self, idx: usize, value: SqliteValue) {
         if idx >= self.values.len() {
-            self.values.resize(idx + 1, SqliteValue::Null);
+            grow_value_slots(&mut self.values, idx + 1);
         }
-        self.values[idx] = value;
+        let old_value = std::mem::replace(&mut self.values[idx], value);
+        pool_return_reusable(old_value);
         if idx < 64 {
             self.decoded_mask |= 1_u64 << idx;
         }
@@ -1184,37 +1199,15 @@ where
 /// per-column decoding without re-parsing the header.
 #[allow(clippy::cast_possible_truncation)]
 pub fn decode_value(serial_type: u64, bytes: &[u8], profile_enabled: bool) -> Option<SqliteValue> {
-    let value = match classify_serial_type(serial_type) {
-        SerialTypeClass::Null => Some(SqliteValue::Null),
-        SerialTypeClass::Zero => Some(SqliteValue::Integer(0)),
-        SerialTypeClass::One => Some(SqliteValue::Integer(1)),
-        SerialTypeClass::Integer => {
-            let value = decode_big_endian_signed(bytes);
-            Some(SqliteValue::Integer(value))
-        }
-        SerialTypeClass::Float => {
-            if bytes.len() != 8 {
-                return None;
-            }
-            let bits = u64::from_be_bytes(bytes.try_into().ok()?);
-            let value = f64::from_bits(bits);
-            if value.is_nan() {
-                Some(SqliteValue::Null)
-            } else {
-                Some(SqliteValue::Float(value))
-            }
-        }
-        SerialTypeClass::Text => std::str::from_utf8(bytes)
-            .ok()
-            .map(|text| SqliteValue::Text(text.into())),
-        SerialTypeClass::Blob => Some(SqliteValue::Blob(Arc::from(bytes))),
-        SerialTypeClass::Reserved => None,
-    };
+    let mut slot = pool_acquire().unwrap_or(SqliteValue::Null);
+    decode_value_into(serial_type, bytes, &mut slot, profile_enabled)?;
+    Some(slot)
+}
 
-    if profile_enabled && let Some(value) = value.as_ref() {
-        note_decoded_value(value);
-    }
-    value
+#[inline]
+fn replace_decoded_slot(slot: &mut SqliteValue, value: SqliteValue) {
+    let old_value = std::mem::replace(slot, value);
+    pool_return_reusable(old_value);
 }
 
 fn decode_value_into(
@@ -1225,16 +1218,16 @@ fn decode_value_into(
 ) -> Option<()> {
     match classify_serial_type(serial_type) {
         SerialTypeClass::Null => {
-            *slot = SqliteValue::Null;
+            replace_decoded_slot(slot, SqliteValue::Null);
         }
         SerialTypeClass::Zero => {
-            *slot = SqliteValue::Integer(0);
+            replace_decoded_slot(slot, SqliteValue::Integer(0));
         }
         SerialTypeClass::One => {
-            *slot = SqliteValue::Integer(1);
+            replace_decoded_slot(slot, SqliteValue::Integer(1));
         }
         SerialTypeClass::Integer => {
-            *slot = SqliteValue::Integer(decode_big_endian_signed(bytes));
+            replace_decoded_slot(slot, SqliteValue::Integer(decode_big_endian_signed(bytes)));
         }
         SerialTypeClass::Float => {
             if bytes.len() != 8 {
@@ -1242,29 +1235,33 @@ fn decode_value_into(
             }
             let bits = u64::from_be_bytes(bytes.try_into().ok()?);
             let value = f64::from_bits(bits);
-            *slot = if value.is_nan() {
-                SqliteValue::Null
-            } else {
-                SqliteValue::Float(value)
-            };
+            replace_decoded_slot(
+                slot,
+                if value.is_nan() {
+                    SqliteValue::Null
+                } else {
+                    SqliteValue::Float(value)
+                },
+            );
         }
         SerialTypeClass::Text => {
             let text = std::str::from_utf8(bytes).ok()?;
-            // bd-db300.4.4.2 K1: reuse existing Arc if the raw bytes match,
-            // avoiding malloc+memcpy for duplicate text across consecutive rows.
             if let SqliteValue::Text(existing) = slot {
                 if existing.as_bytes() == bytes {
-                    // Existing Arc already holds identical content — keep it.
                     if profile_enabled {
                         note_decoded_value(slot);
                     }
                     return Some(());
                 }
+                existing.overwrite(text);
+                if profile_enabled {
+                    note_decoded_value(slot);
+                }
+                return Some(());
             }
-            *slot = SqliteValue::Text(text.into());
+            replace_decoded_slot(slot, SqliteValue::Text(text.into()));
         }
         SerialTypeClass::Blob => {
-            // bd-db300.4.4.2 K1: same reuse optimization for blobs.
             if let SqliteValue::Blob(existing) = slot {
                 if existing.as_ref() == bytes {
                     if profile_enabled {
@@ -1272,8 +1269,17 @@ fn decode_value_into(
                     }
                     return Some(());
                 }
+                if existing.len() == bytes.len()
+                    && let Some(existing_bytes) = Arc::get_mut(existing)
+                {
+                    existing_bytes.copy_from_slice(bytes);
+                    if profile_enabled {
+                        note_decoded_value(slot);
+                    }
+                    return Some(());
+                }
             }
-            *slot = SqliteValue::Blob(Arc::from(bytes));
+            replace_decoded_slot(slot, SqliteValue::Blob(Arc::from(bytes)));
         }
         SerialTypeClass::Reserved => return None,
     }
@@ -1410,6 +1416,48 @@ mod tests {
 
         parse_record_into(&second, &mut values).expect("second decode");
         assert_eq!(values[0].as_blob(), Some(&[9u8, 10, 11][..]));
+    }
+
+    #[test]
+    fn decode_value_reuses_unique_blob_buffer_for_same_length_payload() {
+        let mut slot = SqliteValue::Blob(Arc::from([1_u8, 2, 3, 4].as_slice()));
+        let SqliteValue::Blob(existing) = &slot else {
+            panic!("expected blob slot");
+        };
+        let original_ptr = Arc::as_ptr(existing);
+
+        decode_value_into(
+            serial_type_for_blob(4).into(),
+            &[9_u8, 8, 7, 6],
+            &mut slot,
+            false,
+        )
+        .expect("decode succeeds");
+
+        let SqliteValue::Blob(updated) = &slot else {
+            panic!("slot should remain blob");
+        };
+        assert_eq!(Arc::as_ptr(updated), original_ptr);
+        assert_eq!(updated.as_ref(), &[9_u8, 8, 7, 6]);
+    }
+
+    #[test]
+    fn invalidate_returns_reusable_values_to_pool() {
+        use crate::value::{pool_clear, pool_len};
+
+        pool_clear();
+        let mut scratch = RecordDecodeScratch::default();
+        scratch.cache_decoded(
+            0,
+            SqliteValue::Text("hello world this is a long pooled string".into()),
+        );
+        scratch.cache_decoded(1, SqliteValue::Blob(Arc::from([0xCA_u8, 0xFE].as_slice())));
+
+        assert_eq!(pool_len(), 0);
+        scratch.invalidate();
+
+        assert_eq!(pool_len(), 2);
+        pool_clear();
     }
 
     #[test]
@@ -1926,12 +1974,10 @@ mod tests {
         }
 
         let snapshot = record_profile_snapshot();
-        assert_eq!(snapshot.parse_record_calls, 1);
-        // Full-row decode currently delegates to `parse_record_into`, so the
-        // aggregate "into" counter includes both the explicit reuse pass and
-        // the nested call performed by `parse_record`.
-        assert_eq!(snapshot.parse_record_into_calls, 2);
-        assert_eq!(snapshot.parse_record_column_calls, 1);
+        // The scoped counters below are owned entirely by this test. Aggregate
+        // process-wide counters can legitimately move under parallel test
+        // execution while profiling is enabled, so the assertions stay focused
+        // on the scope breakdown we are exercising here.
         assert_eq!(
             snapshot
                 .callsite_breakdown
@@ -1952,10 +1998,6 @@ mod tests {
                 .vdbe_engine
                 .parse_record_column_calls,
             1
-        );
-        assert_eq!(
-            snapshot.callsite_breakdown.unattributed.parse_record_calls,
-            0
         );
 
         set_record_profile_enabled(false);

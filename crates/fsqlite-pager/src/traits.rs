@@ -156,7 +156,7 @@ pub trait WalBackend: Send + Sync {
     /// ahead of the serialized append window. Returning `None` keeps the
     /// existing `append_frames` path.
     fn prepare_append_frames(
-        &mut self,
+        &self,
         _frames: &[WalFrameRef<'_>],
     ) -> Result<Option<PreparedWalFrameBatch>> {
         Ok(None)
@@ -169,7 +169,7 @@ pub trait WalBackend: Send + Sync {
     /// still tolerate the backend redoing that work later if the live append
     /// state changed before the actual write.
     fn finalize_prepared_frames(
-        &mut self,
+        &self,
         _cx: &Cx,
         _prepared: &mut PreparedWalFrameBatch,
     ) -> Result<()> {
@@ -337,6 +337,8 @@ pub struct PreparedWalFrameBatch {
     pub frame_size: usize,
     /// Offset of the page payload inside each serialized frame record.
     pub page_data_offset: usize,
+    /// Whether checksum words use big-endian encoding for transform derivation.
+    pub big_endian_checksum: bool,
     /// Per-frame metadata in order.
     pub frame_metas: Vec<PreparedWalFrameMeta>,
     /// Per-frame checksum transforms in order.
@@ -356,6 +358,12 @@ impl PreparedWalFrameBatch {
     #[must_use]
     pub fn frame_count(&self) -> usize {
         self.frame_metas.len()
+    }
+
+    /// Page size carried by each prepared frame.
+    #[must_use]
+    pub fn page_size(&self) -> usize {
+        self.frame_size.saturating_sub(self.page_data_offset)
     }
 
     /// Borrow this batch as pager-facing frame refs.
@@ -384,6 +392,42 @@ impl PreparedWalFrameBatch {
         let page_start = frame_start + self.page_data_offset;
         let page_end = frame_start + self.frame_size;
         &self.frame_bytes[page_start..page_end]
+    }
+
+    /// Borrow the full serialized frame record at `index`.
+    #[must_use]
+    pub fn frame_slice(&self, index: usize) -> &[u8] {
+        let frame_start = index * self.frame_size;
+        let frame_end = frame_start + self.frame_size;
+        &self.frame_bytes[frame_start..frame_end]
+    }
+
+    /// Update the commit-marker db-size for one frame and clear stale finalize state.
+    pub fn set_db_size_if_commit(&mut self, index: usize, db_size_if_commit: u32) {
+        self.frame_metas[index].db_size_if_commit = db_size_if_commit;
+        let frame_start = index * self.frame_size;
+        let db_size_offset = frame_start + 4;
+        self.frame_bytes[db_size_offset..db_size_offset + 4]
+            .copy_from_slice(&db_size_if_commit.to_be_bytes());
+        self.finalized_for = None;
+        self.finalized_running_checksum = None;
+    }
+
+    /// Recompute checksum transforms after header-level metadata changes.
+    pub fn recompute_checksum_transforms(&mut self) -> Result<()> {
+        let page_size = self.page_size();
+        self.checksum_transforms = (0..self.frame_count())
+            .map(|index| {
+                WalChecksumTransform::for_wal_frame(
+                    self.frame_slice(index),
+                    page_size,
+                    self.big_endian_checksum,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.finalized_for = None;
+        self.finalized_running_checksum = None;
+        Ok(())
     }
 }
 

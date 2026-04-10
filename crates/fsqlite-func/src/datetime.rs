@@ -1147,11 +1147,7 @@ mod tests {
     fn test_julianday_rfc3339_z_suffix() {
         // Zulu (UTC) — should match the equivalent naive form exactly.
         let naive = julianday_float("2026-04-07 16:00:00");
-        assert_jdn_close(
-            julianday_float("2026-04-07T16:00:00Z"),
-            naive,
-            "T...Z",
-        );
+        assert_jdn_close(julianday_float("2026-04-07T16:00:00Z"), naive, "T...Z");
         assert_jdn_close(
             julianday_float("2026-04-07T16:00:00z"),
             naive,

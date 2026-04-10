@@ -19,15 +19,26 @@
 
 use fsqlite_e2e::comparison::{ComparisonRunner, SqlBackend, SqlValue};
 use serde_json::json;
+use std::env;
+use std::path::Path;
+use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 use tempfile::tempdir;
 
+use fsqlite_core::connection::{
+    hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
+    set_hot_path_profile_enabled,
+};
+
 const SCENARIO_COMPLETENESS_BEAD_ID: &str = "bd-mblr.4";
 const SCENARIO_COMPLETENESS_SEED: u64 = 0x006D_626C_722E_3400;
 const SCENARIO_COMPLETENESS_REPLAY: &str =
     "cargo test -p fsqlite-e2e --test correctness_transactions -- --nocapture --test-threads=1";
+const RETAINED_AUTOCOMMIT_CRASH_HELPER_DB_PATH_ENV: &str =
+    "FSQLITE_RETAINED_AUTOCOMMIT_CRASH_DB_PATH";
+const RETAINED_AUTOCOMMIT_CRASH_HELPER_TEST: &str = "retained_autocommit_crash_helper_entrypoint";
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -124,6 +135,45 @@ fn fsqlite_query_values(conn: &fsqlite::Connection, sql: &str) -> Vec<Vec<SqlVal
                 .collect()
         })
         .collect()
+}
+
+struct HotPathProfileGuard {
+    was_enabled: bool,
+}
+
+impl HotPathProfileGuard {
+    fn new() -> Self {
+        let was_enabled = hot_path_profile_enabled();
+        reset_hot_path_profile();
+        set_hot_path_profile_enabled(true);
+        Self { was_enabled }
+    }
+}
+
+impl Drop for HotPathProfileGuard {
+    fn drop(&mut self) {
+        set_hot_path_profile_enabled(self.was_enabled);
+        reset_hot_path_profile();
+    }
+}
+
+fn spawn_retained_autocommit_crash_helper(db_path: &Path) {
+    let helper_status = Command::new(env::current_exe().expect("current_exe"))
+        .arg("--exact")
+        .arg(RETAINED_AUTOCOMMIT_CRASH_HELPER_TEST)
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env(
+            RETAINED_AUTOCOMMIT_CRASH_HELPER_DB_PATH_ENV,
+            db_path.as_os_str(),
+        )
+        .status()
+        .expect("spawn retained-autocommit crash helper");
+
+    assert!(
+        !helper_status.success(),
+        "retained-autocommit crash helper should abort"
+    );
 }
 
 fn checkpoint_triplet(rows: &[Vec<SqlValue>], label: &str) -> (i64, i64, i64) {
@@ -1166,6 +1216,143 @@ fn txn_file_backed_retained_autocommit_interleaved_read_write_close_reopen_match
         fsqlite_query_values(&reopened_f, full_dump_sql),
         "close+reopen must flush retained autocommit state identically to the oracle"
     );
+}
+
+#[test]
+fn txn_file_backed_retained_autocommit_10k_profile_matches_rusqlite_after_close_reopen() {
+    const ROW_COUNT: i64 = 10_000;
+
+    let _profile_guard = HotPathProfileGuard::new();
+    let tmp = tempdir().expect("tempdir");
+    let c_path = tmp.path().join("oracle_retained_autocommit_10k.db");
+    let f_path = tmp.path().join("candidate_retained_autocommit_10k.db");
+    let f_path_string = f_path.to_string_lossy().into_owned();
+
+    let c_conn = rusqlite::Connection::open(&c_path).expect("open csqlite db");
+    let f_conn = fsqlite::Connection::open(&f_path_string).expect("open fsqlite db");
+    f_conn
+        .execute("PRAGMA fsqlite.concurrent_mode = OFF;")
+        .expect("disable concurrent mode for deterministic retained-autocommit coverage");
+
+    let schema_sql = "CREATE TABLE msgs(id INTEGER PRIMARY KEY, val TEXT NOT NULL);";
+    c_conn.execute(schema_sql, []).expect("csqlite schema");
+    f_conn.execute(schema_sql).expect("fsqlite schema");
+
+    reset_hot_path_profile();
+    let started = std::time::Instant::now();
+    for rowid in 1_i64..=ROW_COUNT {
+        let insert_sql = format!("INSERT INTO msgs VALUES ({rowid}, 'v{rowid}');");
+        c_conn.execute(&insert_sql, []).expect("csqlite insert");
+        f_conn.execute(&insert_sql).expect("fsqlite insert");
+    }
+    let elapsed = started.elapsed();
+    let profile = hot_path_profile_snapshot();
+
+    eprintln!(
+        "bd-iuvw4 retained-autocommit-10k elapsed_ms={} reuses={} parks={} flushes={}",
+        elapsed.as_millis(),
+        profile.retained_autocommit_reuses,
+        profile.retained_autocommit_parks,
+        profile.retained_autocommit_flushes
+    );
+
+    assert!(
+        profile.retained_autocommit_reuses >= 9_000,
+        "10k pure-write autocommit should heavily reuse the retained txn path: {profile:?}"
+    );
+    assert!(
+        profile.retained_autocommit_parks >= profile.retained_autocommit_reuses,
+        "10k pure-write autocommit should keep re-parking the retained txn across the reused fast path: {profile:?}"
+    );
+    assert!(
+        profile.retained_autocommit_flushes <= 64,
+        "10k pure-write autocommit should batch flushes rather than flushing every statement: {profile:?}"
+    );
+
+    let full_dump_sql = "SELECT id, val FROM msgs ORDER BY id;";
+    assert_eq!(
+        csqlite_query_values(&c_conn, full_dump_sql),
+        fsqlite_query_values(&f_conn, full_dump_sql),
+        "10k retained autocommit state diverged before close"
+    );
+
+    f_conn.close().expect("close fsqlite connection");
+    drop(c_conn);
+
+    let reopened_c = rusqlite::Connection::open(&c_path).expect("reopen csqlite db");
+    let reopened_f = fsqlite::Connection::open(&f_path_string).expect("reopen fsqlite db");
+    assert_eq!(
+        csqlite_query_values(&reopened_c, full_dump_sql),
+        fsqlite_query_values(&reopened_f, full_dump_sql),
+        "10k retained autocommit close+reopen must match the oracle"
+    );
+}
+
+#[test]
+fn txn_file_backed_retained_autocommit_crash_recovery_discards_unflushed_batch() {
+    let tmp = tempdir().expect("tempdir");
+    let db_path = tmp.path().join("retained_autocommit_crash_recovery.db");
+    let f_path_string = db_path.to_string_lossy().into_owned();
+
+    spawn_retained_autocommit_crash_helper(&db_path);
+
+    let reopened_f = fsqlite::Connection::open(&f_path_string).expect("reopen fsqlite db");
+    let reopened_c = rusqlite::Connection::open(&db_path).expect("reopen csqlite db");
+    let dump_sql = "SELECT id, val FROM msgs ORDER BY id;";
+    let expected = vec![vec![
+        SqlValue::Integer(1),
+        SqlValue::Text("committed".to_owned()),
+    ]];
+
+    assert_eq!(
+        csqlite_query_values(&reopened_c, dump_sql),
+        expected,
+        "stock SQLite should recover only the flushed retained-autocommit prefix"
+    );
+    assert_eq!(
+        fsqlite_query_values(&reopened_f, dump_sql),
+        expected,
+        "FrankenSQLite should recover only the flushed retained-autocommit prefix"
+    );
+}
+
+#[test]
+#[ignore = "invoked via subprocess by retained-autocommit crash-recovery test"]
+fn retained_autocommit_crash_helper_entrypoint() {
+    let Ok(db_path) = env::var(RETAINED_AUTOCOMMIT_CRASH_HELPER_DB_PATH_ENV) else {
+        return;
+    };
+
+    let conn = fsqlite::Connection::open(&db_path).expect("open retained-autocommit crash db");
+    conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;")
+        .expect("disable concurrent mode");
+    conn.execute("PRAGMA synchronous=FULL;")
+        .expect("force WAL durability");
+    conn.execute("PRAGMA wal_autocheckpoint=0;")
+        .expect("disable autocheckpoint");
+    let journal_mode = conn
+        .query("PRAGMA journal_mode=WAL;")
+        .expect("enable WAL mode");
+    assert_eq!(journal_mode.len(), 1);
+    assert_eq!(
+        journal_mode[0].values()[0],
+        fsqlite_types::SqliteValue::Text("wal".into())
+    );
+    conn.execute("CREATE TABLE msgs(id INTEGER PRIMARY KEY, val TEXT NOT NULL);")
+        .expect("create table");
+
+    conn.execute("INSERT INTO msgs VALUES (1, 'committed');")
+        .expect("insert flushed retained prefix");
+    conn.execute("BEGIN;")
+        .expect("explicit begin should flush retained prefix");
+    conn.execute("COMMIT;").expect("finish explicit boundary");
+
+    conn.execute("INSERT INTO msgs VALUES (2, 'pending_2');")
+        .expect("insert first unflushed retained row");
+    conn.execute("INSERT INTO msgs VALUES (3, 'pending_3');")
+        .expect("insert second unflushed retained row");
+
+    std::process::abort();
 }
 
 #[test]

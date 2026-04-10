@@ -166,7 +166,7 @@ use fsqlite_types::record::{
 };
 use fsqlite_types::serial_type::{read_varint, serial_type_len};
 use fsqlite_types::value::{
-    SmallText, SqlLikeFastPathKind, SqliteValue, sql_like_fast_path_matches,
+    SmallText, SqlLikeFastPathKind, SqliteValue, pool_return_reusable, sql_like_fast_path_matches,
 };
 use fsqlite_types::{
     CommitSeq, DATABASE_HEADER_SIZE, DatabaseHeader, PageData, PageNumber, RowId, RowIdMode,
@@ -11542,9 +11542,15 @@ impl VdbeEngine {
         #[cfg(test)]
         FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL
             .fetch_add(1, AtomicOrdering::Relaxed);
-        self.registers[idx] =
-            SqliteValue::Blob(Arc::<[u8]>::from(self.make_record_lookaside.take_buf()));
+        let buf = self.make_record_lookaside.take_buf();
+        self.replace_register_value(idx, SqliteValue::Blob(Arc::<[u8]>::from(buf)));
         self.make_record_lookaside.disarm();
+    }
+
+    #[inline]
+    fn replace_register_value(&mut self, idx: usize, value: SqliteValue) {
+        let old_value = std::mem::replace(&mut self.registers[idx], value);
+        pool_return_reusable(old_value);
     }
 
     /// Materialize an owned copy of a register while preserving the source.
@@ -12246,10 +12252,11 @@ impl VdbeEngine {
         // avoid a HashMap probe on every register write — subtypes are
         // rare (only JSON/pointer types).
         self.clear_register_subtype(r);
-        self.registers[idx] = match val {
+        let normalized = match val {
             SqliteValue::Float(f) if f.is_nan() => SqliteValue::Null,
             other => other,
         };
+        self.replace_register_value(idx, normalized);
     }
 
     /// Fast-path register write with NaN -> Null normalization.
@@ -12271,10 +12278,11 @@ impl VdbeEngine {
         }
         self.invalidate_make_record_sideband_if_overwritten(r);
         self.clear_register_subtype(r);
-        self.registers[idx] = match val {
+        let normalized = match val {
             SqliteValue::Float(f) if f.is_nan() => SqliteValue::Null,
             other => other,
         };
+        self.replace_register_value(idx, normalized);
     }
 
     /// Fastest possible register write for Integer values.
@@ -12295,7 +12303,7 @@ impl VdbeEngine {
         if idx < self.registers.len() {
             self.invalidate_make_record_sideband_if_overwritten(r);
             self.clear_register_subtype(r);
-            self.registers[idx] = SqliteValue::Integer(val);
+            self.replace_register_value(idx, SqliteValue::Integer(val));
         }
     }
 
@@ -12315,13 +12323,17 @@ impl VdbeEngine {
         }
         self.invalidate_make_record_sideband_if_overwritten(r);
         self.clear_register_subtype(r);
-        self.registers[idx] = SqliteValue::Text(SmallText::new(text));
+        if let SqliteValue::Text(existing) = &mut self.registers[idx] {
+            existing.overwrite(text);
+        } else {
+            self.replace_register_value(idx, SqliteValue::Text(SmallText::new(text)));
+        }
     }
 
     /// Write a blob to a register.
     ///
-    /// With `Arc<[u8]>` backing, in-place mutation is not possible; a new
-    /// `Arc` is allocated each time.
+    /// Reuses the existing `Arc<[u8]>` allocation when the register owns a
+    /// same-length blob exclusively; otherwise allocates a fresh `Arc`.
     #[inline]
     #[allow(clippy::cast_sign_loss)]
     fn write_blob_to_reg(&mut self, r: i32, blob: &[u8]) {
@@ -12334,7 +12346,14 @@ impl VdbeEngine {
         }
         self.invalidate_make_record_sideband_if_overwritten(r);
         self.clear_register_subtype(r);
-        self.registers[idx] = SqliteValue::Blob(Arc::from(blob));
+        if let SqliteValue::Blob(existing) = &mut self.registers[idx]
+            && existing.len() == blob.len()
+            && let Some(existing_bytes) = Arc::get_mut(existing)
+        {
+            existing_bytes.copy_from_slice(blob);
+            return;
+        }
+        self.replace_register_value(idx, SqliteValue::Blob(Arc::from(blob)));
     }
 
     /// Zero-clone column-to-register write for storage cursors.
@@ -21225,6 +21244,69 @@ mod tests {
         });
 
         assert_eq!(rows, vec![vec![SqliteValue::Integer(42)]]);
+    }
+
+    #[test]
+    fn test_write_text_to_reg_reuses_unique_heap_buffer() {
+        let mut engine = VdbeEngine::new(2);
+
+        engine.write_text_to_reg(
+            1,
+            "this string is definitely longer than twenty three bytes",
+        );
+        let SqliteValue::Text(first) = engine.get_reg(1) else {
+            panic!("register should contain text");
+        };
+        let original_ptr = first.as_str().as_ptr();
+
+        engine.write_text_to_reg(1, "another long string that still fits the same allocation");
+
+        let SqliteValue::Text(updated) = engine.get_reg(1) else {
+            panic!("register should still contain text");
+        };
+        assert_eq!(updated.as_str().as_ptr(), original_ptr);
+        assert_eq!(
+            updated.as_str(),
+            "another long string that still fits the same allocation"
+        );
+    }
+
+    #[test]
+    fn test_write_blob_to_reg_reuses_unique_buffer() {
+        let mut engine = VdbeEngine::new(2);
+
+        engine.write_blob_to_reg(1, &[1_u8, 2, 3, 4]);
+        let SqliteValue::Blob(first) = engine.get_reg(1) else {
+            panic!("register should contain blob");
+        };
+        let original_ptr = Arc::as_ptr(first);
+
+        engine.write_blob_to_reg(1, &[9_u8, 8, 7, 6]);
+
+        let SqliteValue::Blob(updated) = engine.get_reg(1) else {
+            panic!("register should still contain blob");
+        };
+        assert_eq!(Arc::as_ptr(updated), original_ptr);
+        assert_eq!(updated.as_ref(), &[9_u8, 8, 7, 6]);
+    }
+
+    #[test]
+    fn test_set_reg_returns_reusable_values_to_pool() {
+        use fsqlite_types::value::{pool_clear, pool_len};
+
+        pool_clear();
+        let mut engine = VdbeEngine::new(2);
+
+        engine.set_reg(
+            1,
+            SqliteValue::Text("this string is definitely longer than twenty three bytes".into()),
+        );
+        assert_eq!(pool_len(), 0);
+
+        engine.set_reg(1, SqliteValue::Integer(7));
+        assert_eq!(pool_len(), 1);
+
+        pool_clear();
     }
 
     #[test]

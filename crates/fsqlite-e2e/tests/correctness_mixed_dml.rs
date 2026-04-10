@@ -14,7 +14,12 @@
 //! The generator maintains a deterministic state machine (seeded RNG) that
 //! ensures UPDATE and DELETE only target rows that currently exist.
 
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::Duration;
+
 use fsqlite_e2e::comparison::{ComparisonRunner, NormalizedOutcome, SqlBackend, SqlValue};
+use tempfile::tempdir;
 
 const TRACK_U_BEAD_ID: &str = "bd-c9pxw";
 
@@ -168,6 +173,57 @@ fn generate_batched_insert_statements(
         start = end + 1;
     }
     stmts
+}
+
+fn csqlite_query_values(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<SqlValue>> {
+    let mut stmt = conn.prepare(sql).expect("csqlite prepare");
+    let col_count = stmt.column_count();
+    let rows = stmt
+        .query_map([], |row| {
+            let mut values = Vec::with_capacity(col_count);
+            for idx in 0..col_count {
+                let value: rusqlite::types::Value =
+                    row.get(idx).unwrap_or(rusqlite::types::Value::Null);
+                values.push(match value {
+                    rusqlite::types::Value::Null => SqlValue::Null,
+                    rusqlite::types::Value::Integer(v) => SqlValue::Integer(v),
+                    rusqlite::types::Value::Real(v) => SqlValue::Real(v),
+                    rusqlite::types::Value::Text(v) => SqlValue::Text(v),
+                    rusqlite::types::Value::Blob(v) => SqlValue::Blob(v),
+                });
+            }
+            Ok(values)
+        })
+        .expect("csqlite query_map");
+    rows.collect::<Result<Vec<_>, _>>()
+        .expect("csqlite collect rows")
+}
+
+fn fsqlite_query_values(conn: &fsqlite::Connection, sql: &str) -> Vec<Vec<SqlValue>> {
+    conn.query(sql)
+        .expect("fsqlite query")
+        .into_iter()
+        .map(|row| {
+            row.values()
+                .iter()
+                .map(|value| match value {
+                    fsqlite_types::SqliteValue::Null => SqlValue::Null,
+                    fsqlite_types::SqliteValue::Integer(v) => SqlValue::Integer(*v),
+                    fsqlite_types::SqliteValue::Float(v) => SqlValue::Real(*v),
+                    fsqlite_types::SqliteValue::Text(v) => SqlValue::Text(v.to_string()),
+                    fsqlite_types::SqliteValue::Blob(v) => SqlValue::Blob(v.to_vec()),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn is_retryable_txn_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("busy")
+        || lower.contains("locked")
+        || lower.contains("conflict")
+        || lower.contains("snapshot")
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────
@@ -635,5 +691,135 @@ fn bd_c9pxw_delete_5k_rows_matches_oracle() {
         "INFO bead_id={TRACK_U_BEAD_ID} case=delete_5k deleted={DELETE_COUNT} mismatches={} remaining={}",
         result.mismatches.len(),
         ROW_COUNT - DELETE_COUNT
+    );
+}
+
+#[test]
+fn bd_c9pxw_concurrent_disjoint_table_writes_match_oracle_after_reopen() {
+    const ROW_COUNT: i64 = 5_000;
+    const UPDATE_SQL: &str = "UPDATE dml_a SET val = val + 100000 WHERE id BETWEEN 1 AND 5000";
+    const DELETE_SQL: &str = "DELETE FROM dml_b WHERE id BETWEEN 1 AND 2500";
+    const CREATE_A_SQL: &str =
+        "CREATE TABLE dml_a (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)";
+    const CREATE_B_SQL: &str =
+        "CREATE TABLE dml_b (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)";
+    const SUMMARY_SQL: &str = "\
+        SELECT \
+            (SELECT COUNT(*) FROM dml_a), \
+            (SELECT MIN(val) FROM dml_a), \
+            (SELECT MAX(val) FROM dml_a), \
+            (SELECT COUNT(*) FROM dml_b), \
+            (SELECT MIN(id) FROM dml_b), \
+            (SELECT MAX(id) FROM dml_b)";
+
+    let tmp = tempdir().expect("tempdir");
+    let oracle_path = tmp.path().join("track_u_concurrent_oracle.db");
+    let candidate_path = tmp.path().join("track_u_concurrent_candidate.db");
+    let candidate_path_string = candidate_path.to_string_lossy().into_owned();
+    let insert_a = generate_batched_insert_statements("dml_a", ROW_COUNT, 250);
+    let insert_b = generate_batched_insert_statements("dml_b", ROW_COUNT, 250);
+
+    let oracle = rusqlite::Connection::open(&oracle_path).expect("open oracle db");
+    oracle.execute(CREATE_A_SQL, []).expect("oracle create table a");
+    oracle.execute(CREATE_B_SQL, []).expect("oracle create table b");
+    for stmt in insert_a.iter().chain(insert_b.iter()) {
+        oracle.execute(stmt, []).expect("oracle seed rows");
+    }
+    oracle.execute("BEGIN;", []).expect("oracle begin");
+    oracle.execute(UPDATE_SQL, []).expect("oracle update");
+    oracle.execute(DELETE_SQL, []).expect("oracle delete");
+    oracle.execute("COMMIT;", []).expect("oracle commit");
+    let expected_a = csqlite_query_values(&oracle, "SELECT id, val FROM dml_a ORDER BY id");
+    let expected_b = csqlite_query_values(&oracle, "SELECT id, val FROM dml_b ORDER BY id");
+    let expected_summary = csqlite_query_values(&oracle, SUMMARY_SQL);
+    drop(oracle);
+
+    let setup = fsqlite::Connection::open(&candidate_path_string).expect("open candidate db");
+    assert!(
+        setup.is_concurrent_mode_default(),
+        "bead_id={TRACK_U_BEAD_ID} case=concurrent_disjoint_writes_require_default_concurrent_mode"
+    );
+    setup.execute(CREATE_A_SQL).expect("candidate create table a");
+    setup.execute(CREATE_B_SQL).expect("candidate create table b");
+    for stmt in insert_a.iter().chain(insert_b.iter()) {
+        setup.execute(stmt).expect("candidate seed rows");
+    }
+    setup.close().expect("close candidate setup connection");
+
+    let barrier = Arc::new(Barrier::new(2));
+    let spawn_worker = |sql: &'static str, worker: &'static str| {
+        let path = candidate_path_string.clone();
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || -> (bool, usize) {
+            let conn = fsqlite::Connection::open(&path).expect("open worker connection");
+            assert!(
+                conn.is_concurrent_mode_default(),
+                "bead_id={TRACK_U_BEAD_ID} case={worker}_default_concurrent_mode_must_stay_on"
+            );
+            barrier.wait();
+
+            let mut last_error = String::new();
+            for attempt in 1..=64 {
+                match conn.execute("BEGIN;") {
+                    Ok(_) => {
+                        let concurrent_txn = conn.is_concurrent_transaction();
+                        match conn.execute(sql).and_then(|_| conn.execute("COMMIT;")) {
+                            Ok(_) => return (concurrent_txn, attempt),
+                            Err(err) => {
+                                last_error = err.to_string();
+                                let _ = conn.execute("ROLLBACK;");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        last_error = err.to_string();
+                    }
+                }
+
+                assert!(
+                    is_retryable_txn_error(&last_error),
+                    "bead_id={TRACK_U_BEAD_ID} case={worker}_non_retryable_error error={last_error}"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+
+            panic!(
+                "bead_id={TRACK_U_BEAD_ID} case={worker}_exhausted_retries error={last_error}"
+            );
+        })
+    };
+
+    let update_handle = spawn_worker(UPDATE_SQL, "concurrent_update_worker");
+    let delete_handle = spawn_worker(DELETE_SQL, "concurrent_delete_worker");
+    let (update_concurrent, update_attempts) = update_handle.join().unwrap();
+    let (delete_concurrent, delete_attempts) = delete_handle.join().unwrap();
+
+    assert!(
+        update_concurrent && delete_concurrent,
+        "bead_id={TRACK_U_BEAD_ID} case=concurrent_disjoint_writes_begin_promotes_to_concurrent"
+    );
+
+    let reopened = fsqlite::Connection::open(&candidate_path_string).expect("reopen candidate db");
+    let actual_a = fsqlite_query_values(&reopened, "SELECT id, val FROM dml_a ORDER BY id");
+    let actual_b = fsqlite_query_values(&reopened, "SELECT id, val FROM dml_b ORDER BY id");
+    let actual_summary = fsqlite_query_values(&reopened, SUMMARY_SQL);
+    reopened.close().expect("close reopened candidate connection");
+
+    assert_eq!(
+        actual_a, expected_a,
+        "bead_id={TRACK_U_BEAD_ID} case=concurrent_update_table_a_state_mismatch"
+    );
+    assert_eq!(
+        actual_b, expected_b,
+        "bead_id={TRACK_U_BEAD_ID} case=concurrent_delete_table_b_state_mismatch"
+    );
+    assert_eq!(
+        actual_summary, expected_summary,
+        "bead_id={TRACK_U_BEAD_ID} case=concurrent_disjoint_writes_summary_mismatch"
+    );
+
+    eprintln!(
+        "INFO bead_id={TRACK_U_BEAD_ID} case=concurrent_disjoint_table_writes \
+         update_attempts={update_attempts} delete_attempts={delete_attempts} rows={ROW_COUNT}"
     );
 }

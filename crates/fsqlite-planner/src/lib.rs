@@ -2288,7 +2288,13 @@ pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> In
 }
 
 /// Analyze usability for an expression index by matching WHERE term expressions
-/// against the index's expression columns using structural equality (AST `PartialEq`).
+/// against the index's expression columns using structural equality
+/// (`Expr::PartialEq`, which is manually implemented in fsqlite-ast to ignore
+/// every node's `Span` field — see the doc comment on `impl PartialEq for
+/// Expr`).  That span-insensitivity is what makes cross-parse-context
+/// matching work: the index key is parsed from its stand-alone SQL text at
+/// schema-load time while the WHERE clause is parsed as part of the
+/// enclosing SELECT, so the two ASTs carry different byte offsets.
 ///
 /// Note on classification interplay (issue #63):
 /// `classify_where_term` only assigns `WhereTermKind::Equality` when the left-
@@ -2297,9 +2303,7 @@ pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> In
 /// call, so the term is classified as `WhereTermKind::Other` even though it
 /// is structurally `<expr> = <literal>`.  We therefore match against the raw
 /// `term.expr` AST here — inspecting the BinaryOp / Between directly —
-/// instead of filtering by `term.kind`.  The structural `PartialEq` against
-/// the recorded `expression_columns[0]` is what actually guarantees the
-/// predicate matches the index.
+/// instead of filtering by `term.kind`.
 fn analyze_expression_index_usability(
     index: &IndexInfo,
     terms: &[WhereTerm<'_>],
@@ -5097,10 +5101,7 @@ mod tests {
                     span: Span::ZERO,
                 }),
                 op: AstBinaryOp::Eq,
-                right: Box::new(Expr::Literal(
-                    Literal::String(val.to_owned()),
-                    Span::ZERO,
-                )),
+                right: Box::new(Expr::Literal(Literal::String(val.to_owned()), Span::ZERO)),
                 span: Span::ZERO,
             }))
         };
@@ -5203,6 +5204,103 @@ mod tests {
                 IndexUsability::NotUsable
             ),
             "expression index must reject structurally-unrelated WHERE terms"
+        );
+    }
+
+    /// Real-parser regression test for issue #63.
+    ///
+    /// The index key is parsed from its stand-alone SQL text (the way the
+    /// schema loader in `fsqlite-core/src/connection.rs` builds
+    /// `expression_columns`); the WHERE clause is extracted from a full
+    /// SELECT parse where the `lower(name)` sub-expression lands at a
+    /// non-zero byte offset inside the outer query.  This test asserts:
+    ///
+    /// 1. The two parse contexts really do produce different `Span`
+    ///    byte offsets for the logically identical expression (sanity
+    ///    check — if this ever stops being true the test loses its
+    ///    teeth but the bug it guards against may come back).
+    /// 2. `Expr::PartialEq` — manually implemented in fsqlite-ast to
+    ///    skip the span field on every variant — still reports the
+    ///    two expressions as equal despite the span mismatch.  A
+    ///    future refactor that accidentally auto-derived `PartialEq`
+    ///    would silently break the expression-index planner, so this
+    ///    assertion catches that.
+    /// 3. The full `analyze_index_usability` path reaches
+    ///    `IndexUsability::Equality` for a real-parser round trip —
+    ///    the end-to-end guarantee that the bounded repro from the
+    ///    issue ships as an index lookup plan.
+    #[test]
+    fn test_index_usability_expression_index_real_parser_spans_differ() {
+        use fsqlite_ast::{SelectCore, Statement};
+
+        // Parse the index key the way the schema loader does: from its
+        // stand-alone text, with spans starting at 0.
+        let key_expr =
+            fsqlite_parser::expr::parse_expr("lower(name)").expect("key expression should parse");
+
+        // Parse a full SELECT so the WHERE clause's `lower(name)` lands
+        // at a non-zero byte offset inside the outer query, exactly
+        // matching how the planner sees it at runtime.
+        let select_sql = "SELECT id FROM users WHERE lower(name) = 'alice'";
+        let mut scratch = fsqlite_parser::StatementParseScratch::default();
+        let statement =
+            fsqlite_parser::parse_single_statement_with_scratch(select_sql, &mut scratch)
+                .expect("select should parse");
+        let Statement::Select(select) = statement else {
+            panic!("expected SELECT statement");
+        };
+        let SelectCore::Select { where_clause, .. } = select.body.select else {
+            panic!("expected SELECT core");
+        };
+        let where_expr = *where_clause.expect("WHERE clause must be present");
+        let left_of_where = match &where_expr {
+            Expr::BinaryOp { left, .. } => left.as_ref().clone(),
+            _ => panic!("expected BinaryOp for `lower(name) = 'alice'`"),
+        };
+
+        // Sanity: the two spans really are different — if this ever stops
+        // being true, the test's premise is wrong.
+        assert_ne!(
+            left_of_where.span(),
+            key_expr.span(),
+            "real parser should assign different spans across parse \
+             contexts: stand-alone `lower(name)` starts at 0 but the \
+             WHERE-side one starts after `SELECT id FROM users WHERE `"
+        );
+
+        // Span-insensitive structural equality must accept — this is
+        // the property the planner relies on for expression-index
+        // matching and it is provided by the manual `impl PartialEq
+        // for Expr` in fsqlite-ast.  If someone ever changes that
+        // impl to a derive, this assertion will fail loudly.
+        assert_eq!(
+            left_of_where, key_expr,
+            "Expr::PartialEq is manually span-insensitive in fsqlite-ast; \
+             if that invariant breaks, the expression-index planner stops \
+             matching across parse contexts (issue #63)"
+        );
+
+        // And the full planner path should accept it end-to-end.
+        let idx = IndexInfo {
+            name: "idx_lower_name".to_owned(),
+            table: "users".to_owned(),
+            columns: vec![],
+            unique: false,
+            n_pages: 50,
+            source: StatsSource::Heuristic,
+            partial_where: None,
+            expression_columns: vec![key_expr],
+        };
+        // Leak the parsed WHERE expression so the WhereTerm can hold a
+        // reference with `'static` lifetime, matching the other tests.
+        let leaked: &'static Expr = Box::leak(Box::new(where_expr));
+        let terms = [classify_where_term(leaked)];
+        assert!(
+            matches!(
+                analyze_index_usability(&idx, &terms),
+                IndexUsability::Equality
+            ),
+            "real-parser expression index lookup must reach Equality"
         );
     }
 

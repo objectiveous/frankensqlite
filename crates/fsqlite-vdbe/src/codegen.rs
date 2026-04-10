@@ -6276,11 +6276,14 @@ struct MultiJoinLookupStep<'a> {
 ///   (the probe source).
 /// - The lookup target must be the rowid (INTEGER PRIMARY KEY) or a
 ///   single-column index on the right table.
-/// - LEFT JOINs are allowed, but only if no *later* join's probe source
-///   depends on a LEFT-joined table.  Otherwise the NullRow sentinel a
-///   LEFT JOIN uses for misses would poison subsequent lookups with
-///   NULL values that the downstream SeekRowid cannot distinguish from
-///   "seek with literal 0" or "seek with a real id of 0".
+/// - **At most one LEFT JOIN is allowed, and it must be the final step
+///   in the chain.**  Anything else is refused so the codegen below can
+///   emit a single trailing null-row block without having to re-run
+///   later steps with a NullRow-poisoned probe cursor — which is
+///   genuinely hard to get right in the general case and is not needed
+///   for the bd_zjisk issue #62 repro (that query is INNER + INNER +
+///   terminal LEFT).  Non-terminal LEFT JOINs and chains with more
+///   than one LEFT fall back to the scan path.
 fn resolve_multi_join_lookup_plan<'a>(
     left_table: &'a TableSchema,
     left_alias: Option<&'a str>,
@@ -6306,13 +6309,23 @@ fn resolve_multi_join_lookup_plan<'a>(
     tables.push((left_table, left_alias));
 
     let mut steps: Vec<MultiJoinLookupStep<'a>> = Vec::with_capacity(join_tables.len());
-    // Track which table indices are LEFT-joined.  A later step whose
-    // probe_table_index points at such a table is rejected (see above).
-    let mut is_left_table = vec![false; join_tables.len() + 1];
+    let last_index = join_tables.len() - 1;
 
-    for (right_table, right_alias_opt, join_kind, on_expr) in join_tables {
-        if !matches!(join_kind, JoinKind::Inner | JoinKind::Left) {
-            return None;
+    for (step_idx, (right_table, right_alias_opt, join_kind, on_expr)) in
+        join_tables.iter().enumerate()
+    {
+        match join_kind {
+            JoinKind::Inner => {}
+            // Only the final step in the chain may be a LEFT JOIN — see
+            // the doc comment above.  A LEFT miss jumps to a trailing
+            // null-row block that emits the row with NULLs for the
+            // left-joined table's columns and then runs the outer Next.
+            // Allowing a non-terminal LEFT JOIN would require re-running
+            // the rest of the chain from that null-row block against the
+            // remaining probe cursors, which the current code does not
+            // implement.
+            JoinKind::Left if step_idx == last_index => {}
+            _ => return None,
         }
         let on_expr = (*on_expr)?;
         let Expr::BinaryOp {
@@ -6329,6 +6342,9 @@ fn resolve_multi_join_lookup_plan<'a>(
         let mut found: Option<(usize, SortKeySource, SortKeySource)> = None;
 
         // Try each already-bound table as the probe source; first hit wins.
+        // Because LEFT JOINs are only allowed as the terminal step, no
+        // already-bound table in this loop can be a LEFT-joined table —
+        // we therefore do not need to track LEFT-joined state separately.
         for (probe_idx, (probe_table, probe_alias)) in tables.iter().enumerate() {
             if let (Some(left_probe), Some(right_lookup)) = (
                 resolve_column_ref(left, probe_table, *probe_alias),
@@ -6348,12 +6364,6 @@ fn resolve_multi_join_lookup_plan<'a>(
 
         let (probe_table_index, probe_source, lookup_source) = found?;
 
-        // LEFT-joined tables must not feed later probes: a NullRow on the
-        // probe cursor would surface as NULL and corrupt the seek.
-        if is_left_table[probe_table_index] {
-            return None;
-        }
-
         let lookup_target = match lookup_source {
             SortKeySource::Rowid => SingleJoinLookupTarget::Rowid,
             SortKeySource::Column(col_idx) => {
@@ -6372,11 +6382,7 @@ fn resolve_multi_join_lookup_plan<'a>(
 
         // Record the new table in the accumulator before the next step
         // resolves its probe.
-        let new_table_index = tables.len();
         tables.push((right_table, right_alias));
-        if matches!(join_kind, JoinKind::Left) {
-            is_left_table[new_table_index] = true;
-        }
     }
 
     Some(MultiJoinLookupPlan { steps })
@@ -6470,10 +6476,10 @@ fn codegen_multi_join_lookup_select(
         }
     }
 
-    // Optional sorter for ORDER BY.
+    // Optional sorter for ORDER BY.  The sorter is the last cursor we
+    // allocate, so we do not bump `next_aux_cursor` after consuming it.
     let sorter = if !stmt.order_by.is_empty() {
         let sort_cursor = next_aux_cursor;
-        next_aux_cursor += 1;
         let sort_key_count = stmt.order_by.len();
         let total_sort_cols = sort_key_count + out_col_count;
         let sort_regs = b.alloc_regs(total_sort_cols as i32);
@@ -6501,36 +6507,40 @@ fn codegen_multi_join_lookup_select(
     } else {
         None
     };
-    let _ = next_aux_cursor; // silence unused-var warning when no sorter
-
     // Single outer rewind over the driver.
     let next_left_label = b.emit_label();
     let row_done_label = b.emit_label();
     b.emit_jump_to_label(Opcode::Rewind, left_cursor, 0, done_label, P4::None, 0);
     b.resolve_label(next_left_label);
 
-    // For LEFT JOINs, each LEFT-joined cursor needs a NullRow fallback
-    // at the end of the row if the lookup didn't land on a real match.
-    // We track this per-step with a small "did we land on a match?"
-    // register initialised to 0 at the top of each outer iteration and
-    // set to 1 only after a successful seek.
-    let mut left_match_regs: Vec<Option<i32>> = Vec::with_capacity(plan.steps.len());
-    for step in &plan.steps {
-        if matches!(step.join_kind, JoinKind::Left) {
-            let reg = b.alloc_temp();
-            b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
-            left_match_regs.push(Some(reg));
-        } else {
-            left_match_regs.push(None);
-        }
-    }
-
     // Emit each lookup in order.  For INNER joins a miss jumps to
-    // row_done_label (skip this outer row entirely).  For LEFT joins a
-    // miss jumps to a per-step label that leaves the cursor on a NullRow
-    // and continues — downstream expressions see NULL for the right
-    // table's columns.
-    let mut null_fallback_labels: Vec<Option<Label>> = Vec::with_capacity(plan.steps.len());
+    // row_done_label (skip this outer row entirely).  For the terminal
+    // LEFT JOIN (if any) a miss jumps to `left_null_label` — a block
+    // emitted past the main result row that NullRow-poisons the LEFT
+    // table's cursor and re-emits the row with NULLs.
+    //
+    // `resolve_multi_join_lookup_plan` guarantees that a LEFT join can
+    // only appear as the final step, so a miss never has to skip any
+    // remaining INNER probes.
+    let left_null_label = if plan
+        .steps
+        .last()
+        .is_some_and(|step| matches!(step.join_kind, JoinKind::Left))
+    {
+        Some(b.emit_label())
+    } else {
+        None
+    };
+
+    // The "emit one result row" tail is duplicated inline below — once
+    // on the all-lookups-landed path and once inside the trailing
+    // null-row block for the terminal LEFT JOIN miss.  They MUST stay
+    // in lock-step when someone edits the sort-vs-direct branching.
+    // Extracting a helper is awkward because both call sites bind the
+    // `sorter` tuple fields, the `out_regs`/`out_col_count` locals,
+    // and emit bytecode through the same `ProgramBuilder` — leaving
+    // them inline keeps the control-flow structure visible next to
+    // the label resolution above and below.
     for (i, step) in plan.steps.iter().enumerate() {
         let right_cursor = (i + 1) as i32;
         // Tables that have been bound by the time we emit step i.
@@ -6549,18 +6559,13 @@ fn codegen_multi_join_lookup_select(
         };
         emit_resolved_column(b, &step.probe_source, probe_cursor, probe_base, &probe_scan);
 
-        // Label for LEFT JOIN miss: NullRow + continue to next step.
-        // For INNER JOIN misses the target is row_done_label.
+        // A LEFT-join miss (only allowed on the last step) jumps to the
+        // trailing null-row block.  Every other miss skips the whole row.
         let miss_label = if matches!(step.join_kind, JoinKind::Left) {
-            b.emit_label()
+            left_null_label.expect("LEFT JOIN step must have allocated its null label")
         } else {
             row_done_label
         };
-        null_fallback_labels.push(if matches!(step.join_kind, JoinKind::Left) {
-            Some(miss_label)
-        } else {
-            None
-        });
 
         // NULL probe → miss.  (C SQLite treats NULL = X as "unknown" and
         // therefore as not matching, so the row is skipped.)
@@ -6580,14 +6585,12 @@ fn codegen_multi_join_lookup_select(
             SingleJoinLookupTarget::Index(_) => {
                 let idx_cursor =
                     index_cursors[i].expect("index lookup step must have an index cursor");
-                // Probe the secondary index for `probe = X`, then SeekRowid
-                // on the data cursor using the resulting rowid.  Unlike
-                // the single-join codegen we only need the *first* match
-                // for each outer row (join semantics for unique keys and
-                // matching rowid lookups); walking the duplicate run here
-                // would re-emit the entire outer row once per duplicate,
-                // which is only what the planner wants when the index key
-                // is non-unique.
+                // Probe the secondary index for `probe = X`, then
+                // SeekRowid on the data cursor using the resulting
+                // rowid.  Unlike the single-join codegen we only need
+                // the *first* match for each outer row: index lookups
+                // on unique keys have at most one row, and the planner
+                // should not hit this path for non-unique keys.
                 let min_rowid_reg = b.alloc_reg();
                 b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
                 let probe_record_reg = b.alloc_reg();
@@ -6634,15 +6637,10 @@ fn codegen_multi_join_lookup_select(
                 );
             }
         }
-
-        if let Some(match_reg) = left_match_regs[i] {
-            b.emit_op(Opcode::Integer, 1, match_reg, 0, P4::None, 0);
-        }
     }
 
-    // All lookups landed on a real row (or a LEFT JOIN miss fell through
-    // to its NullRow block below).  Evaluate the optional WHERE clause
-    // against the full bound tuple.
+    // All lookups landed on a real row.  Evaluate the optional WHERE
+    // clause against the full bound tuple.
     if let Some(where_expr) = where_clause {
         let cond_reg = b.alloc_regs(1);
         emit_join_expr(b, where_expr, cond_reg, &all_tables, ctx)?;
@@ -6688,36 +6686,22 @@ fn codegen_multi_join_lookup_select(
         );
     }
 
-    // Jump past the LEFT-JOIN null-row stub blocks to the outer Next.
+    // Jump past the trailing LEFT-JOIN null-row block (if any) to the
+    // outer Next.  When there is no LEFT JOIN this is a harmless extra
+    // unconditional jump; keeping it makes the control-flow layout
+    // symmetric with the branch below.
     b.emit_jump_to_label(Opcode::Goto, 0, 0, row_done_label, P4::None, 0);
 
-    // For each LEFT JOIN step whose lookup missed, emit a NullRow on
-    // that step's cursor and continue the chain.  The labels we laid
-    // down as miss targets above land here in order.  We run any later
-    // lookups against the still-live probe cursors (LEFT-joined tables
-    // are forbidden as probe sources by resolve_multi_join_lookup_plan).
-    //
-    // NOTE: the current conservative shape only supports a single
-    // terminal LEFT JOIN — if a LEFT JOIN is followed by another join
-    // the planner would need to either re-run the chain from here or
-    // give up.  Until we wire that in, refuse chains with a non-terminal
-    // LEFT JOIN up front via the is_left_table check in the resolver.
-    // Rendering the NullRow block here for only the *last* step is
-    // sufficient for that restricted shape and avoids the combinatorial
-    // "re-run later steps with a NULL probe" bookkeeping.
-    if let Some(last_left_label) = null_fallback_labels.last().and_then(|l| *l) {
-        debug_assert!(
-            null_fallback_labels
-                .iter()
-                .take(null_fallback_labels.len() - 1)
-                .all(Option::is_none),
-            "non-terminal LEFT JOIN should have been rejected at plan time"
-        );
-        b.resolve_label(last_left_label);
+    // Trailing LEFT JOIN null-row block: the final step's lookup missed,
+    // so we emit `NullRow` on its cursor, re-evaluate the WHERE clause
+    // (which sees NULLs for the left-joined table's columns), and emit
+    // the row with those NULLs.  `resolve_multi_join_lookup_plan`
+    // guarantees the LEFT join is the terminal step, so no later steps
+    // need to be re-run here.
+    if let Some(null_label) = left_null_label {
+        b.resolve_label(null_label);
         let last_right_cursor = join_tables.len() as i32;
         b.emit_op(Opcode::NullRow, last_right_cursor, 0, 0, P4::None, 0);
-        // Re-evaluate WHERE and emit the row with NULLs for the
-        // left-joined table.
         if let Some(where_expr) = where_clause {
             let cond_reg = b.alloc_regs(1);
             emit_join_expr(b, where_expr, cond_reg, &all_tables, ctx)?;
@@ -24339,10 +24323,7 @@ mod tests {
                     Span::ZERO,
                 )),
                 op: AstBinaryOp::Eq,
-                right: Box::new(Expr::Column(
-                    ColumnRef::qualified("c", "id"),
-                    Span::ZERO,
-                )),
+                right: Box::new(Expr::Column(ColumnRef::qualified("c", "id"), Span::ZERO)),
                 span: Span::ZERO,
             };
             let on_c_a = Expr::BinaryOp {
@@ -24351,10 +24332,7 @@ mod tests {
                     Span::ZERO,
                 )),
                 op: AstBinaryOp::Eq,
-                right: Box::new(Expr::Column(
-                    ColumnRef::qualified("a", "id"),
-                    Span::ZERO,
-                )),
+                right: Box::new(Expr::Column(ColumnRef::qualified("a", "id"), Span::ZERO)),
                 span: Span::ZERO,
             };
             SelectStatement {
@@ -24364,17 +24342,11 @@ mod tests {
                         distinct: Distinctness::All,
                         columns: vec![
                             ResultColumn::Expr {
-                                expr: Expr::Column(
-                                    ColumnRef::qualified("m", "id"),
-                                    Span::ZERO,
-                                ),
+                                expr: Expr::Column(ColumnRef::qualified("m", "id"), Span::ZERO),
                                 alias: None,
                             },
                             ResultColumn::Expr {
-                                expr: Expr::Column(
-                                    ColumnRef::qualified("a", "slug"),
-                                    Span::ZERO,
-                                ),
+                                expr: Expr::Column(ColumnRef::qualified("a", "slug"), Span::ZERO),
                                 alias: None,
                             },
                         ],
@@ -24459,6 +24431,164 @@ mod tests {
             null_row_count, 0,
             "pure INNER JOIN chain must not emit NullRow stubs"
         );
+    }
+
+    /// A non-terminal LEFT JOIN (LEFT followed by another join) must NOT
+    /// take the multi-join lookup fast path, because the codegen below
+    /// only knows how to emit a trailing null-row block for the *last*
+    /// step.  Today the scan fallback (`codegen_join_select`) also
+    /// refuses multi-table LEFT joins, so the expected outcome for this
+    /// shape is `CodegenError::Unsupported` bubbled out of the
+    /// VDBE-codegen layer and handled by the connection-level
+    /// interpreter.  The important invariant we are asserting here is:
+    /// we do NOT silently return a 1-Rewind fast-path plan (which would
+    /// be incorrect because the middle LEFT miss would skip the
+    /// trailing INNER step and produce wrong rows).
+    #[test]
+    fn test_codegen_non_terminal_left_join_does_not_take_fast_path() {
+        // messages m
+        //   INNER JOIN workspaces w ON m.conversation_id = w.id
+        //   LEFT JOIN agents a ON m.conversation_id = a.id
+        //   INNER JOIN conversations c ON m.conversation_id = c.id
+        //
+        // (the exact FK edges are contrived — we just want an INNER +
+        // LEFT + INNER chain over the issue-62 schema that every step
+        // could in principle resolve to a rowid lookup.)
+        let on_m_w = Expr::BinaryOp {
+            left: Box::new(Expr::Column(
+                ColumnRef::qualified("m", "conversation_id"),
+                Span::ZERO,
+            )),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::qualified("w", "id"), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        let on_m_a = Expr::BinaryOp {
+            left: Box::new(Expr::Column(
+                ColumnRef::qualified("m", "conversation_id"),
+                Span::ZERO,
+            )),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::qualified("a", "id"), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        let on_m_c = Expr::BinaryOp {
+            left: Box::new(Expr::Column(
+                ColumnRef::qualified("m", "conversation_id"),
+                Span::ZERO,
+            )),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::qualified("c", "id"), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::qualified("m", "id"), Span::ZERO),
+                        alias: None,
+                    }],
+                    from: Some(FromClause {
+                        source: TableOrSubquery::Table {
+                            name: QualifiedName::bare("messages"),
+                            alias: Some("m".to_owned()),
+                            index_hint: None,
+                            time_travel: None,
+                        },
+                        joins: vec![
+                            fsqlite_ast::JoinClause {
+                                join_type: fsqlite_ast::JoinType {
+                                    kind: fsqlite_ast::JoinKind::Inner,
+                                    natural: false,
+                                },
+                                table: TableOrSubquery::Table {
+                                    name: QualifiedName::bare("workspaces"),
+                                    alias: Some("w".to_owned()),
+                                    index_hint: None,
+                                    time_travel: None,
+                                },
+                                constraint: Some(fsqlite_ast::JoinConstraint::On(on_m_w)),
+                            },
+                            fsqlite_ast::JoinClause {
+                                join_type: fsqlite_ast::JoinType {
+                                    kind: fsqlite_ast::JoinKind::Left,
+                                    natural: false,
+                                },
+                                table: TableOrSubquery::Table {
+                                    name: QualifiedName::bare("agents"),
+                                    alias: Some("a".to_owned()),
+                                    index_hint: None,
+                                    time_travel: None,
+                                },
+                                constraint: Some(fsqlite_ast::JoinConstraint::On(on_m_a)),
+                            },
+                            fsqlite_ast::JoinClause {
+                                join_type: fsqlite_ast::JoinType {
+                                    kind: fsqlite_ast::JoinKind::Inner,
+                                    natural: false,
+                                },
+                                table: TableOrSubquery::Table {
+                                    name: QualifiedName::bare("conversations"),
+                                    alias: Some("c".to_owned()),
+                                    index_hint: None,
+                                    time_travel: None,
+                                },
+                                constraint: Some(fsqlite_ast::JoinConstraint::On(on_m_c)),
+                            },
+                        ],
+                    }),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema_issue_62_fts_rebuild();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let result = codegen_select(&mut b, &stmt, &schema, &ctx);
+
+        match result {
+            Ok(()) => {
+                // If codegen DOES succeed (e.g. because the scan
+                // fallback ever learns multi-table LEFT), the crucial
+                // invariant we care about is that the fast path was
+                // not silently taken.  The fast path always emits
+                // exactly one Rewind; more than one Rewind means we
+                // landed on the nested-scan path, which is the only
+                // correct shape for this chain today.
+                let prog = b.finish().unwrap();
+                let rewind_count = prog
+                    .ops()
+                    .iter()
+                    .filter(|op| op.opcode == Opcode::Rewind)
+                    .count();
+                assert!(
+                    rewind_count >= 2,
+                    "non-terminal LEFT JOIN landed on the fast path \
+                     (only {rewind_count} Rewinds) — the resolver \
+                     should have rejected it"
+                );
+            }
+            Err(CodegenError::Unsupported(_)) => {
+                // Expected today: the scan fallback also refuses
+                // multi-table LEFT, so the whole codegen layer bubbles
+                // up Unsupported and the statement runs through the
+                // connection-level interpreter.
+            }
+            Err(other) => {
+                panic!(
+                    "non-terminal LEFT JOIN must be rejected via \
+                     Unsupported, got {other:?}"
+                );
+            }
+        }
     }
 
     #[test]

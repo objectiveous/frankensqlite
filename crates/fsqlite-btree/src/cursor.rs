@@ -1108,6 +1108,24 @@ impl<P: PageReader> BtCursor<P> {
         self.collation_registry = collation_registry;
     }
 
+    /// Returns the descending-key metadata for index cursors.
+    #[must_use]
+    pub fn index_desc_flags(&self) -> &[bool] {
+        &self.index_desc_flags
+    }
+
+    /// Returns the per-key collation metadata for index cursors.
+    #[must_use]
+    pub fn index_collations(&self) -> &[Option<String>] {
+        &self.index_collations
+    }
+
+    /// Returns the shared collation registry used for index-key comparisons.
+    #[must_use]
+    pub fn collation_registry(&self) -> Arc<Mutex<CollationRegistry>> {
+        Arc::clone(&self.collation_registry)
+    }
+
     /// Returns the read witness keys captured by the cursor.
     #[must_use]
     pub fn witness_keys(&self) -> &[WitnessKey] {
@@ -2552,7 +2570,7 @@ impl<P: PageReader> BtCursor<P> {
                 .get(idx)
                 .and_then(|coll| coll.as_deref());
             let mut ord =
-                self.cmp_index_values_collated(&lhs[idx], &rhs[idx], coll_name, &registry_guard)?;
+                Self::cmp_index_values_collated(&lhs[idx], &rhs[idx], coll_name, &registry_guard)?;
             if self.index_desc_flags.get(idx).copied().unwrap_or(false) {
                 ord = ord.reverse();
             }
@@ -2564,7 +2582,6 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     fn cmp_index_values_collated(
-        &self,
         lhs: &SqliteValue,
         rhs: &SqliteValue,
         coll_name: Option<&str>,
@@ -2573,7 +2590,7 @@ impl<P: PageReader> BtCursor<P> {
         if let (Some(coll_name), SqliteValue::Text(left), SqliteValue::Text(right)) =
             (coll_name, lhs, rhs)
         {
-            return Some(self.compare_text_with_collation(
+            return Some(Self::compare_text_with_collation(
                 left.as_bytes(),
                 right.as_bytes(),
                 coll_name,
@@ -2584,7 +2601,6 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     fn compare_text_with_collation(
-        &self,
         left: &[u8],
         right: &[u8],
         coll_name: &str,

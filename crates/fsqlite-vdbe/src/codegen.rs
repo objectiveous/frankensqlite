@@ -1568,6 +1568,29 @@ pub fn codegen_select(
             ));
         }
     };
+    let join_has_time_travel = from_clause.joins.iter().any(|join| {
+        matches!(
+            &join.table,
+            fsqlite_ast::TableOrSubquery::Table {
+                time_travel: Some(_),
+                ..
+            }
+        )
+    });
+    if !from_clause.joins.is_empty() {
+        let simple_join_eligible = !has_aggregate_columns(columns)
+            && group_by.is_empty()
+            && having.is_none()
+            && !has_window_columns(columns)
+            && distinct == Distinctness::All
+            && time_travel.is_none()
+            && !join_has_time_travel;
+        if !simple_join_eligible {
+            return Err(CodegenError::Unsupported(
+                "JOIN shape not yet supported in VDBE codegen".to_owned(),
+            ));
+        }
+    }
 
     // Route simple 2-table INNER JOINs through dedicated codegen when there
     // are no aggregates, GROUP BY, window functions, or DISTINCT — this is
@@ -3533,6 +3556,10 @@ fn codegen_select_count_star_indexed_in_scan(
     let idx_cursor = cursor + 1;
     let probe_cursor = cursor + 2;
     let source_cursor = cursor + 3;
+    let count_key_collation = idx_schema
+        .key_term_collation(0)
+        .filter(|name| !name.eq_ignore_ascii_case("BINARY"))
+        .map_or(P4::None, |name| P4::Collation(name.to_owned()));
 
     if let CountIndexedInTarget::ProbeSource(probe_source) = &in_target
         && count_probe_source_can_skip_materialization(probe_source)
@@ -3690,7 +3717,7 @@ fn codegen_select_count_star_indexed_in_scan(
                 r_current_key,
                 r_probe_value,
                 advance_outer,
-                P4::None,
+                count_key_collation.clone(),
                 0,
             );
             b.emit_jump_to_label(
@@ -3698,7 +3725,7 @@ fn codegen_select_count_star_indexed_in_scan(
                 r_current_key,
                 r_probe_value,
                 next_probe,
-                P4::None,
+                count_key_collation.clone(),
                 0,
             );
 
@@ -3742,7 +3769,7 @@ fn codegen_select_count_star_indexed_in_scan(
                 r_probe_value,
                 r_current_key,
                 next_probe,
-                P4::None,
+                count_key_collation.clone(),
                 0,
             );
             b.emit_op(Opcode::AddImm, out_regs, 1, 0, P4::None, 0);
@@ -3777,7 +3804,14 @@ fn codegen_select_count_star_indexed_in_scan(
         P4::Index(idx_schema.name.clone()),
         0,
     );
-    b.emit_op(Opcode::OpenAutoindex, probe_cursor, 1, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::OpenAutoindex,
+        probe_cursor,
+        1,
+        0,
+        count_key_collation.clone(),
+        0,
+    );
 
     let use_materialized_semijoin_merge = matches!(
         &in_target,
@@ -3952,7 +3986,7 @@ fn codegen_select_count_star_indexed_in_scan(
             r_current_key,
             r_probe_value,
             advance_outer,
-            P4::None,
+            count_key_collation.clone(),
             0,
         );
         b.emit_jump_to_label(
@@ -3960,7 +3994,7 @@ fn codegen_select_count_star_indexed_in_scan(
             r_current_key,
             r_probe_value,
             next_probe,
-            P4::None,
+            count_key_collation.clone(),
             0,
         );
 
@@ -4017,7 +4051,7 @@ fn codegen_select_count_star_indexed_in_scan(
             r_probe_value,
             r_current_key,
             next_probe,
-            P4::None,
+            count_key_collation,
             0,
         );
         b.emit_op(Opcode::AddImm, out_regs, 1, 0, P4::None, 0);
@@ -6674,25 +6708,70 @@ fn emit_join_expr(
             let right_reg = b.alloc_regs(1);
             emit_join_expr(b, left, left_reg, tables, _ctx)?;
             emit_join_expr(b, right, right_reg, tables, _ctx)?;
+            let comparison_collation = join_effective_collation(left, tables)
+                .or_else(|| join_effective_collation(right, tables))
+                .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
             match op {
                 BinaryOp::Eq => {
                     // Use Eq with STOREP2 to store result in target.
-                    b.emit_op(Opcode::Eq, right_reg, target, left_reg, P4::None, 0x20);
+                    b.emit_op(
+                        Opcode::Eq,
+                        right_reg,
+                        target,
+                        left_reg,
+                        comparison_collation,
+                        0x20,
+                    );
                 }
                 BinaryOp::Ne => {
-                    b.emit_op(Opcode::Ne, right_reg, target, left_reg, P4::None, 0x20);
+                    b.emit_op(
+                        Opcode::Ne,
+                        right_reg,
+                        target,
+                        left_reg,
+                        comparison_collation,
+                        0x20,
+                    );
                 }
                 BinaryOp::Lt => {
-                    b.emit_op(Opcode::Lt, right_reg, target, left_reg, P4::None, 0x20);
+                    b.emit_op(
+                        Opcode::Lt,
+                        right_reg,
+                        target,
+                        left_reg,
+                        comparison_collation,
+                        0x20,
+                    );
                 }
                 BinaryOp::Le => {
-                    b.emit_op(Opcode::Le, right_reg, target, left_reg, P4::None, 0x20);
+                    b.emit_op(
+                        Opcode::Le,
+                        right_reg,
+                        target,
+                        left_reg,
+                        comparison_collation,
+                        0x20,
+                    );
                 }
                 BinaryOp::Gt => {
-                    b.emit_op(Opcode::Gt, right_reg, target, left_reg, P4::None, 0x20);
+                    b.emit_op(
+                        Opcode::Gt,
+                        right_reg,
+                        target,
+                        left_reg,
+                        comparison_collation,
+                        0x20,
+                    );
                 }
                 BinaryOp::Ge => {
-                    b.emit_op(Opcode::Ge, right_reg, target, left_reg, P4::None, 0x20);
+                    b.emit_op(
+                        Opcode::Ge,
+                        right_reg,
+                        target,
+                        left_reg,
+                        comparison_collation,
+                        0x20,
+                    );
                 }
                 BinaryOp::Add => {
                     b.emit_op(Opcode::Add, right_reg, left_reg, target, P4::None, 0);
@@ -13323,6 +13402,12 @@ fn extract_count_indexed_in_target<'a>(
     if idx_schema.key_term_count() != 1 || idx_schema.key_term_descending(0) {
         return None;
     }
+    if !collation_names_equivalent(
+        effective_collation_ctx(operand, Some(scan_ctx)),
+        idx_schema.key_term_collation(0),
+    ) {
+        return None;
+    }
 
     match set {
         InSet::List(values)
@@ -13356,6 +13441,22 @@ fn extract_count_indexed_in_target<'a>(
             ))
         }
         InSet::List(_) => None,
+    }
+}
+
+fn collation_names_equivalent(left: Option<&str>, right: Option<&str>) -> bool {
+    let left = match left {
+        Some(collation) if !collation.eq_ignore_ascii_case("BINARY") => Some(collation),
+        _ => None,
+    };
+    let right = match right {
+        Some(collation) if !collation.eq_ignore_ascii_case("BINARY") => Some(collation),
+        _ => None,
+    };
+    match (left, right) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -14993,8 +15094,8 @@ fn in_list_value_supports_once_materialization(expr: &Expr) -> bool {
 
 fn can_use_once_materialized_in_list(
     values: &[Expr],
-    operand: &Expr,
-    ctx: Option<&ScanCtx<'_>>,
+    _operand: &Expr,
+    _ctx: Option<&ScanCtx<'_>>,
 ) -> bool {
     if values.len() < ONCE_MATERIALIZED_IN_LIST_THRESHOLD {
         return false;
@@ -15005,10 +15106,7 @@ fn can_use_once_materialized_in_list(
     {
         return false;
     }
-    match effective_collation_ctx(operand, ctx) {
-        Some(collation) => collation.eq_ignore_ascii_case("BINARY"),
-        None => true,
-    }
+    true
 }
 
 fn probe_expr_references_outer_scan(
@@ -15114,16 +15212,13 @@ fn in_probe_source_references_outer_scan(
 
 fn can_use_once_materialized_in_probe_source(
     probe_source: &InProbeSource<'_>,
-    operand: &Expr,
+    _operand: &Expr,
     scan_ctx: &ScanCtx<'_>,
 ) -> bool {
     if in_probe_source_references_outer_scan(probe_source, scan_ctx) {
         return false;
     }
-    match effective_collation_ctx(operand, Some(scan_ctx)) {
-        Some(collation) => collation.eq_ignore_ascii_case("BINARY"),
-        None => true,
-    }
+    true
 }
 
 fn expr_contains_nested_subquery(expr: &Expr) -> bool {
@@ -15245,7 +15340,16 @@ fn emit_once_materialized_in_list(
     let build_done = b.emit_label();
     b.emit_jump_to_label(Opcode::Once, 0, 0, build_done, P4::None, 0);
     b.emit_op(Opcode::Integer, 0, r_saw_null, 0, P4::None, 0);
-    b.emit_op(Opcode::OpenAutoindex, autoindex_cursor, 1, 0, P4::None, 0);
+    let autoindex_collation = effective_collation_ctx(operand, ctx)
+        .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
+    b.emit_op(
+        Opcode::OpenAutoindex,
+        autoindex_cursor,
+        1,
+        0,
+        autoindex_collation,
+        0,
+    );
     let r_value = b.alloc_temp();
     let r_key = b.alloc_temp();
     for value_expr in values {
@@ -15314,7 +15418,16 @@ fn emit_once_materialized_in_probe_source(
     let build_done = b.emit_label();
     b.emit_jump_to_label(Opcode::Once, 0, 0, build_done, P4::None, 0);
     b.emit_op(Opcode::Integer, 0, r_saw_null, 0, P4::None, 0);
-    b.emit_op(Opcode::OpenAutoindex, autoindex_cursor, 1, 0, P4::None, 0);
+    let autoindex_collation = effective_collation_ctx(operand, Some(scan_ctx))
+        .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
+    b.emit_op(
+        Opcode::OpenAutoindex,
+        autoindex_cursor,
+        1,
+        0,
+        autoindex_collation,
+        0,
+    );
     b.emit_op(
         Opcode::OpenRead,
         source_cursor,
@@ -16512,6 +16625,33 @@ fn extract_collation(expr: &Expr) -> Option<&str> {
     }
 }
 
+fn join_effective_collation<'a>(
+    expr: &'a Expr,
+    tables: &[(&'a TableSchema, Option<&'a str>)],
+) -> Option<&'a str> {
+    if let Some(collation) = extract_collation(expr) {
+        return Some(collation);
+    }
+    let inner = if let Expr::Collate { expr: inner, .. } = expr {
+        inner.as_ref()
+    } else {
+        expr
+    };
+    let Expr::Column(col_ref, _) = inner else {
+        return None;
+    };
+    tables.iter().find_map(|(table, alias)| {
+        if let Some(qualifier) = col_ref.table.as_deref()
+            && !matches_table_or_alias(qualifier, table, *alias)
+        {
+            return None;
+        }
+        table
+            .column_index(&col_ref.column)
+            .and_then(|index| table.columns[index].collation.as_deref())
+    })
+}
+
 /// Extract explicit COLLATE from an ORDER BY term's expression.
 #[allow(dead_code)]
 fn extract_collation_from_ordering_term(term: &OrderingTerm) -> Option<&str> {
@@ -16970,10 +17110,10 @@ mod tests {
     use crate::engine::{ExecOutcome, MemDatabase, VdbeEngine};
     use fsqlite_ast::{
         Assignment, AssignmentTarget, BinaryOp as AstBinaryOp, ColumnRef, DeleteStatement,
-        Distinctness, Expr, FromClause, InSet, InsertSource, InsertStatement, LimitClause, Literal,
-        OrderingTerm, PlaceholderType, QualifiedName, QualifiedTableRef, ResultColumn, SelectBody,
-        SelectCore, SelectStatement, SortDirection, Span, Statement, TableOrSubquery,
-        UpdateStatement,
+        Distinctness, Expr, FromClause, InSet, InsertSource, InsertStatement, JoinClause,
+        JoinConstraint, JoinKind, JoinType, LimitClause, Literal, OrderingTerm, PlaceholderType,
+        QualifiedName, QualifiedTableRef, ResultColumn, SelectBody, SelectCore, SelectStatement,
+        SortDirection, Span, Statement, TableOrSubquery, UpdateStatement,
     };
     use fsqlite_func::{FunctionRegistry, register_builtins};
     use fsqlite_parser::parse_first_statement_with_tail;
@@ -20034,7 +20174,7 @@ mod tests {
             body: SelectBody {
                 select: SelectCore::Select {
                     distinct: Distinctness::All,
-                    columns: vec![ResultColumn::TableStar("u".to_owned())],
+                    columns: vec![ResultColumn::TableStar(QualifiedName::bare("u"))],
                     from: Some(from_table("t")),
                     where_clause: None,
                     group_by: vec![],
@@ -22192,6 +22332,42 @@ mod tests {
     }
 
     #[test]
+    fn test_codegen_select_large_collated_in_list_materializes_autoindex_with_collation() {
+        let values = (1..=8)
+            .map(|value| Expr::Literal(Literal::String(format!("v{value}")), Span::ZERO))
+            .collect();
+        let where_expr = Expr::In {
+            expr: Box::new(Expr::Collate {
+                expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                collation: "NOCASE".to_owned(),
+                span: Span::ZERO,
+            }),
+            set: InSet::List(values),
+            not: false,
+            span: Span::ZERO,
+        };
+        let stmt = simple_select(&["a"], "t", Some(Box::new(where_expr)));
+
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Once),
+            "collated large IN lists should still materialize once per statement"
+        );
+        assert!(
+            prog.ops().iter().any(|op| {
+                op.opcode == Opcode::OpenAutoindex
+                    && matches!(&op.p4, P4::Collation(name) if name == "NOCASE")
+            }),
+            "materialized collated IN lists must thread their collation into OpenAutoindex"
+        );
+    }
+
+    #[test]
     fn test_codegen_select_uncorrelated_in_subquery_uses_once_materialized_autoindex() {
         let where_expr = Expr::In {
             expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
@@ -22259,6 +22435,75 @@ mod tests {
         assert!(
             prog.ops().iter().any(|op| op.opcode == Opcode::Found),
             "uncorrelated IN subqueries should probe membership via Found"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_uncorrelated_collated_in_subquery_materializes_autoindex_with_collation()
+    {
+        let where_expr = Expr::In {
+            expr: Box::new(Expr::Collate {
+                expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                collation: "NOCASE".to_owned(),
+                span: Span::ZERO,
+            }),
+            set: InSet::Subquery(Box::new(SelectStatement {
+                with: None,
+                body: SelectBody {
+                    select: SelectCore::Select {
+                        distinct: Distinctness::All,
+                        columns: vec![ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::qualified("s", "b"), Span::ZERO),
+                            alias: None,
+                        }],
+                        from: Some(FromClause {
+                            source: TableOrSubquery::Table {
+                                name: QualifiedName::bare("s"),
+                                alias: Some("s".to_owned()),
+                                index_hint: None,
+                                time_travel: None,
+                            },
+                            joins: vec![],
+                        }),
+                        where_clause: Some(Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column(
+                                ColumnRef::qualified("s", "b"),
+                                Span::ZERO,
+                            )),
+                            op: AstBinaryOp::Le,
+                            right: Box::new(Expr::Literal(Literal::Integer(5), Span::ZERO)),
+                            span: Span::ZERO,
+                        })),
+                        group_by: vec![],
+                        having: None,
+                        windows: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            })),
+            not: false,
+            span: Span::ZERO,
+        };
+        let stmt = simple_select(&["a"], "t", Some(Box::new(where_expr)));
+
+        let schema = test_schema_with_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Once),
+            "collated uncorrelated IN subqueries should still materialize once per statement"
+        );
+        assert!(
+            prog.ops().iter().any(|op| {
+                op.opcode == Opcode::OpenAutoindex
+                    && matches!(&op.p4, P4::Collation(name) if name == "NOCASE")
+            }),
+            "materialized collated IN subqueries must thread their collation into OpenAutoindex"
         );
     }
 
@@ -22445,6 +22690,72 @@ mod tests {
                 .iter()
                 .any(|op| matches!(op.opcode, Opcode::AggStep | Opcode::AggFinal)),
             "count(*) with indexed IN-list should stay on the direct counter path"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_count_star_indexed_collated_in_list_threads_nocase() {
+        let where_expr = Expr::In {
+            expr: Box::new(Expr::Column(ColumnRef::bare("name"), Span::ZERO)),
+            set: InSet::List(
+                [
+                    "alpha", "ALPHA", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+                ]
+                .into_iter()
+                .map(|value| Expr::Literal(Literal::String(value.to_owned()), Span::ZERO))
+                .collect(),
+            ),
+            not: false,
+            span: Span::ZERO,
+        };
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::FunctionCall {
+                            name: "count".to_owned(),
+                            args: FunctionArgs::Star,
+                            distinct: false,
+                            order_by: vec![],
+                            filter: None,
+                            over: None,
+                            span: Span::ZERO,
+                        },
+                        alias: None,
+                    }],
+                    from: Some(from_table("t")),
+                    where_clause: Some(Box::new(where_expr)),
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let schema = test_schema_with_nocase_text_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(|op| {
+                op.opcode == Opcode::OpenAutoindex
+                    && matches!(op.p4, P4::Collation(ref name) if name == "NOCASE")
+            }),
+            "collated COUNT(*) IN fast path must materialize the probe set with NOCASE semantics"
+        );
+        assert!(
+            prog.ops().iter().any(|op| {
+                op.opcode == Opcode::Ne
+                    && matches!(op.p4, P4::Collation(ref name) if name == "NOCASE")
+            }),
+            "collated COUNT(*) IN fast path must compare probe keys against the outer index with NOCASE semantics"
         );
     }
 
@@ -22789,6 +23100,44 @@ mod tests {
                 panic!("IPK-projected IN target should lower to a rowid probe source");
             }
         }
+    }
+
+    #[test]
+    fn test_extract_count_indexed_in_target_rejects_collation_mismatch() {
+        let where_expr = Expr::In {
+            expr: Box::new(Expr::Collate {
+                expr: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+                collation: "NOCASE".to_owned(),
+                span: Span::ZERO,
+            }),
+            set: InSet::List(
+                [
+                    "alpha", "ALPHA", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+                ]
+                .into_iter()
+                .map(|value| Expr::Literal(Literal::String(value.to_owned()), Span::ZERO))
+                .collect(),
+            ),
+            not: false,
+            span: Span::ZERO,
+        };
+
+        let schema = test_schema_with_index();
+        let table = find_table(&schema, "t").expect("table should exist");
+        let scan_ctx = ScanCtx {
+            cursor: 0,
+            table,
+            table_alias: None,
+            schema: Some(&schema),
+            register_base: None,
+            secondary: None,
+        };
+
+        assert!(
+            extract_count_indexed_in_target(Some(&where_expr), table, None, &schema, &scan_ctx)
+                .is_none(),
+            "count(*) indexed-IN fast path must reject indexes whose collation does not match the probe semantics"
+        );
     }
 
     #[test]
@@ -24415,6 +24764,102 @@ mod tests {
             .expect("scan-based WHERE should emit Ne");
         assert_eq!(filter_cmp.p4, P4::Collation("NOCASE".to_owned()));
         assert_eq!(filter_cmp.p5, 0x80 | u16::from(b'B'));
+    }
+
+    #[test]
+    fn test_codegen_join_on_nocase_column_emits_collation() {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::qualified("p", "probe"), Span::ZERO),
+                        alias: None,
+                    }],
+                    from: Some(FromClause {
+                        source: TableOrSubquery::Table {
+                            name: QualifiedName::bare("coll_probe"),
+                            alias: Some("p".to_owned()),
+                            index_hint: None,
+                            time_travel: None,
+                        },
+                        joins: vec![JoinClause {
+                            join_type: JoinType {
+                                natural: false,
+                                kind: JoinKind::Inner,
+                            },
+                            table: TableOrSubquery::Table {
+                                name: QualifiedName::bare("coll_words"),
+                                alias: Some("w".to_owned()),
+                                index_hint: None,
+                                time_travel: None,
+                            },
+                            constraint: Some(JoinConstraint::On(Expr::BinaryOp {
+                                left: Box::new(Expr::Column(
+                                    ColumnRef::qualified("w", "word"),
+                                    Span::ZERO,
+                                )),
+                                op: AstBinaryOp::Eq,
+                                right: Box::new(Expr::Column(
+                                    ColumnRef::qualified("p", "probe"),
+                                    Span::ZERO,
+                                )),
+                                span: Span::ZERO,
+                            })),
+                        }],
+                    }),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = vec![
+            TableSchema {
+                name: "coll_probe".to_owned(),
+                root_page: 2,
+                columns: vec![ColumnInfo::basic("probe", 'B', false)],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: vec![],
+                foreign_keys: vec![],
+                check_constraints: vec![],
+            },
+            TableSchema {
+                name: "coll_words".to_owned(),
+                root_page: 3,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo {
+                        collation: Some("NOCASE".to_owned()),
+                        ..ColumnInfo::basic("word", 'B', false)
+                    },
+                ],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: vec![],
+                foreign_keys: vec![],
+                check_constraints: vec![],
+            },
+        ];
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let join_cmp = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Eq && op.p5 == 0x20)
+            .expect("JOIN ON equality should emit an Eq STOREP2 opcode");
+        assert_eq!(join_cmp.p4, P4::Collation("NOCASE".to_owned()));
     }
 
     #[test]

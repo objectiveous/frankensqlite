@@ -3207,6 +3207,33 @@ impl CursorBackend {
             Self::TimeTravel(c) => c.page_size(),
         }
     }
+
+    #[must_use]
+    fn index_desc_flags(&self) -> &[bool] {
+        match self {
+            Self::Mem(c) => c.index_desc_flags(),
+            Self::Txn(c) => c.index_desc_flags(),
+            Self::TimeTravel(c) => c.index_desc_flags(),
+        }
+    }
+
+    #[must_use]
+    fn index_collations(&self) -> &[Option<String>] {
+        match self {
+            Self::Mem(c) => c.index_collations(),
+            Self::Txn(c) => c.index_collations(),
+            Self::TimeTravel(c) => c.index_collations(),
+        }
+    }
+
+    #[must_use]
+    fn collation_registry(&self) -> Arc<Mutex<CollationRegistry>> {
+        match self {
+            Self::Mem(c) => c.collation_registry(),
+            Self::Txn(c) => c.collation_registry(),
+            Self::TimeTravel(c) => c.collation_registry(),
+        }
+    }
 }
 
 /// Dispatch B-tree cursor operations across all backends.
@@ -6199,19 +6226,38 @@ impl VdbeEngine {
             .unwrap_or_default()
     }
 
+    fn index_desc_flags_for_cursor(&self, cursor_id: i32) -> Vec<bool> {
+        if let Some(cursor) = self.storage_cursors.get(&cursor_id) {
+            return cursor.cursor.index_desc_flags().to_vec();
+        }
+        let root_page = self
+            .cursor_root_pages
+            .get(&cursor_id)
+            .copied()
+            .unwrap_or_default();
+        self.index_desc_flags_for_root(root_page)
+    }
+
+    fn index_collations_for_cursor(&self, cursor_id: i32) -> Vec<Option<String>> {
+        if let Some(cursor) = self.storage_cursors.get(&cursor_id) {
+            return cursor.cursor.index_collations().to_vec();
+        }
+        let root_page = self
+            .cursor_root_pages
+            .get(&cursor_id)
+            .copied()
+            .unwrap_or_default();
+        self.index_collations_for_root(root_page)
+    }
+
     fn storage_cursor_find_exact_index_key(
         &mut self,
         cursor_id: i32,
         key_bytes: &[u8],
         missing_registry_detail: &'static str,
     ) -> Result<bool> {
-        let root_page = self
-            .cursor_root_pages
-            .get(&cursor_id)
-            .copied()
-            .unwrap_or_default();
-        let index_desc_flags = self.index_desc_flags_for_root(root_page);
-        let index_collations = self.index_collations_for_root(root_page);
+        let index_desc_flags = self.index_desc_flags_for_cursor(cursor_id);
+        let index_collations = self.index_collations_for_cursor(cursor_id);
         let uses_collated_probe = index_collations.iter().any(|collation| {
             collation
                 .as_deref()
@@ -7973,7 +8019,21 @@ impl VdbeEngine {
                     if let Some(root_pgno) = root_pgno {
                         let store = MemPageStore::with_empty_index(root_pgno, autoindex_page_size);
                         let cx = self.derive_execution_cx();
-                        let cursor = BtCursor::new(store, root_pgno, autoindex_page_size, false);
+                        let mut cursor =
+                            BtCursor::new(store, root_pgno, autoindex_page_size, false);
+                        let autoindex_collations = parse_compare_collations(&op.p4)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(Some)
+                            .collect::<Vec<_>>();
+                        if !autoindex_collations.is_empty() {
+                            cursor.set_index_collation_context(
+                                autoindex_collations,
+                                Arc::clone(&self.collation_registry),
+                            );
+                        }
+                        self.cursor_root_pages
+                            .insert(cursor_id, root_pgno.get() as i32);
                         self.cursors.remove(&cursor_id);
                         self.storage_cursors.insert(
                             cursor_id,
@@ -8447,24 +8507,8 @@ impl VdbeEngine {
                     // table_move_to, triggering "table leaf cell has no rowid"
                     // on index pages. (Fixes br#138-140, #144, #145.)
                     let coll_arc = Arc::clone(&self.collation_registry);
-                    let seek_idx_desc_flags = {
-                        let root_page = self
-                            .cursor_root_pages
-                            .get(&cursor_id)
-                            .copied()
-                            .unwrap_or_default();
-                        self.index_desc_flags_for_root(root_page)
-                    };
-                    // Pre-fetch index collations before borrowing storage_cursors
-                    // mutably.
-                    let seek_idx_collations = {
-                        let root_page = self
-                            .cursor_root_pages
-                            .get(&cursor_id)
-                            .copied()
-                            .unwrap_or_default();
-                        self.index_collations_for_root(root_page)
-                    };
+                    let seek_idx_desc_flags = self.index_desc_flags_for_cursor(cursor_id);
+                    let seek_idx_collations = self.index_collations_for_cursor(cursor_id);
                     let uses_collated_seek = seek_idx_collations.iter().any(|collation| {
                         collation
                             .as_deref()
@@ -8846,13 +8890,8 @@ impl VdbeEngine {
                         self.pending_next_after_delete.remove(&cursor_id);
                     }
                     let key_val = self.clone_reg_materialized(op.p3);
-                    let root_page = self
-                        .cursor_root_pages
-                        .get(&cursor_id)
-                        .copied()
-                        .unwrap_or_default();
-                    let index_desc_flags = self.index_desc_flags_for_root(root_page);
-                    let index_collations = self.index_collations_for_root(root_page);
+                    let index_desc_flags = self.index_desc_flags_for_cursor(cursor_id);
+                    let index_collations = self.index_collations_for_cursor(cursor_id);
 
                     // NULL short-circuit: NULL != NULL for UNIQUE purposes.
                     if key_val.is_null() {
@@ -9456,13 +9495,8 @@ impl VdbeEngine {
                         continue;
                     }
 
-                    let index_root_page = self.cursor_root_pages.get(&cursor_id).copied();
-                    let index_desc_flags = index_root_page
-                        .map(|root_page| self.index_desc_flags_for_root(root_page))
-                        .unwrap_or_default();
-                    let index_collations = index_root_page
-                        .map(|root_page| self.index_collations_for_root(root_page))
-                        .unwrap_or_default();
+                    let index_desc_flags = self.index_desc_flags_for_cursor(cursor_id);
+                    let index_collations = self.index_collations_for_cursor(cursor_id);
                     let uses_collated_unique_probe = is_unique
                         && n_idx_cols > 0
                         && index_collations.iter().take(n_idx_cols).any(|collation| {
@@ -10244,13 +10278,8 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let probe_val = self.clone_reg_materialized(op.p3);
 
-                    let root_page = self
-                        .cursor_root_pages
-                        .get(&cursor_id)
-                        .copied()
-                        .unwrap_or_default();
-                    let desc_flags = self.index_desc_flags_for_root(root_page);
-                    let collations = self.index_collations_for_root(root_page);
+                    let desc_flags = self.index_desc_flags_for_cursor(cursor_id);
+                    let collations = self.index_collations_for_cursor(cursor_id);
 
                     // Extract current cursor key as parsed fields.
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
@@ -12338,38 +12367,42 @@ impl VdbeEngine {
 
         // ── Resolve IPK alias and payload column index ────────────
         let root_page = self.cursor_root_pages.get(&cursor_id).copied();
-        let rowid = storage_cursor_cached_rowid(cursor)?;
         let ipk_col_idx = root_page
             .and_then(|rp| self.rowid_alias_col_by_root_page.get(&rp))
             .copied();
-        if let Some(ipk) = ipk_col_idx
-            && let Some(ipk_col) = cursor.row_decode.column_offset(ipk).copied()
-            && let Some(ipk_end) = column_payload_end(&ipk_col)
-        {
-            let ipk_refresh =
-                ensure_storage_cursor_row_layout(cursor, ipk_end, self.collect_vdbe_metrics)?;
-            refresh_state.refreshed |= ipk_refresh.refreshed;
-        }
-        let payload_includes = if let Some(cached) = cursor.payload_includes_rowid_alias {
-            cached
+        let payload_includes = if let Some(ipk) = ipk_col_idx {
+            let rowid = storage_cursor_cached_rowid(cursor)?;
+            if let Some(ipk_col) = cursor.row_decode.column_offset(ipk).copied()
+                && let Some(ipk_end) = column_payload_end(&ipk_col)
+            {
+                let ipk_refresh =
+                    ensure_storage_cursor_row_layout(cursor, ipk_end, self.collect_vdbe_metrics)?;
+                refresh_state.refreshed |= ipk_refresh.refreshed;
+            }
+            if let Some(cached) = cursor.payload_includes_rowid_alias {
+                cached
+            } else {
+                let includes = root_page.is_some_and(|rp| {
+                    payload_includes_rowid_alias_lazy(
+                        &cursor.row_decode,
+                        &cursor.payload_buf,
+                        rowid,
+                        ipk,
+                        self.table_column_count_by_root_page.get(&rp).copied(),
+                        self.first_not_null_non_ipk_col_by_root_page
+                            .get(&rp)
+                            .copied(),
+                    )
+                });
+                cursor.payload_includes_rowid_alias = Some(includes);
+                includes
+            }
         } else {
-            let includes = root_page.zip(ipk_col_idx).is_some_and(|(rp, ipk)| {
-                payload_includes_rowid_alias_lazy(
-                    &cursor.row_decode,
-                    &cursor.payload_buf,
-                    rowid,
-                    ipk,
-                    self.table_column_count_by_root_page.get(&rp).copied(),
-                    self.first_not_null_non_ipk_col_by_root_page
-                        .get(&rp)
-                        .copied(),
-                )
-            });
-            cursor.payload_includes_rowid_alias = Some(includes);
-            includes
+            false
         };
 
         let payload_idx = if let Some(ipk) = ipk_col_idx {
+            let rowid = storage_cursor_cached_rowid(cursor)?;
             if col_idx == ipk {
                 self.set_reg_fast(target, SqliteValue::Integer(rowid));
                 return Ok(true);
@@ -12510,43 +12543,43 @@ impl VdbeEngine {
                 ensure_storage_cursor_row_layout(cursor, 0, collect_vdbe_metrics)?;
 
             let root_page = self.cursor_root_pages.get(&cursor_id).copied();
-            let rowid = storage_cursor_cached_rowid(cursor)?;
             let ipk_col_idx = root_page
                 .and_then(|root_page| self.rowid_alias_col_by_root_page.get(&root_page))
                 .copied();
-            if let Some(ipk_col_idx) = ipk_col_idx
-                && let Some(ipk_col) = cursor.row_decode.column_offset(ipk_col_idx).copied()
-                && let Some(ipk_end) = column_payload_end(&ipk_col)
-            {
-                let ipk_refresh =
-                    ensure_storage_cursor_row_layout(cursor, ipk_end, collect_vdbe_metrics)?;
-                refresh_state.refreshed |= ipk_refresh.refreshed;
-            }
-            let payload_includes_rowid_alias =
+            let payload_includes_rowid_alias = if let Some(ipk_col_idx) = ipk_col_idx {
+                let rowid = storage_cursor_cached_rowid(cursor)?;
+                if let Some(ipk_col) = cursor.row_decode.column_offset(ipk_col_idx).copied()
+                    && let Some(ipk_end) = column_payload_end(&ipk_col)
+                {
+                    let ipk_refresh =
+                        ensure_storage_cursor_row_layout(cursor, ipk_end, collect_vdbe_metrics)?;
+                    refresh_state.refreshed |= ipk_refresh.refreshed;
+                }
                 if let Some(cached) = cursor.payload_includes_rowid_alias {
                     cached
                 } else {
-                    let includes =
-                        root_page
-                            .zip(ipk_col_idx)
-                            .is_some_and(|(root_page, ipk_col_idx)| {
-                                payload_includes_rowid_alias_lazy(
-                                    &cursor.row_decode,
-                                    &cursor.payload_buf,
-                                    rowid,
-                                    ipk_col_idx,
-                                    self.table_column_count_by_root_page
-                                        .get(&root_page)
-                                        .copied(),
-                                    self.first_not_null_non_ipk_col_by_root_page
-                                        .get(&root_page)
-                                        .copied(),
-                                )
-                            });
+                    let includes = root_page.is_some_and(|root_page| {
+                        payload_includes_rowid_alias_lazy(
+                            &cursor.row_decode,
+                            &cursor.payload_buf,
+                            rowid,
+                            ipk_col_idx,
+                            self.table_column_count_by_root_page
+                                .get(&root_page)
+                                .copied(),
+                            self.first_not_null_non_ipk_col_by_root_page
+                                .get(&root_page)
+                                .copied(),
+                        )
+                    });
                     cursor.payload_includes_rowid_alias = Some(includes);
                     includes
-                };
+                }
+            } else {
+                false
+            };
             let payload_idx = if let Some(ipk) = ipk_col_idx {
+                let rowid = storage_cursor_cached_rowid(cursor)?;
                 if col_idx == ipk {
                     return Ok(SqliteValue::Integer(rowid));
                 }
@@ -13776,7 +13809,11 @@ fn storage_cursor_current_first_index_key_equals_at_current_row(
         if collect_vdbe_metrics {
             record_decoded_value_metrics(cached);
         }
-        return Ok(values_equal_without_collation(cached, probe_value));
+        return Ok(storage_cursor_first_index_key_equals_probe(
+            cursor,
+            cached,
+            probe_value,
+        ));
     }
 
     note_decode_cache_miss(collect_vdbe_metrics);
@@ -13939,9 +13976,38 @@ fn storage_cursor_current_first_index_key_equals_generic_fallback(
     if collect_vdbe_metrics {
         record_decoded_value_metrics(&value);
     }
-    let matches = values_equal_without_collation(&value, probe_value);
+    let matches = storage_cursor_first_index_key_equals_probe(cursor, &value, probe_value);
     cursor.row_decode.cache_decoded(0, value);
     Ok(matches)
+}
+
+fn storage_cursor_first_index_key_collation(cursor: &StorageCursor) -> Option<&str> {
+    cursor
+        .cursor
+        .index_collations()
+        .first()
+        .and_then(|collation| collation.as_deref())
+        .filter(|name| !name.eq_ignore_ascii_case("BINARY"))
+}
+
+fn storage_cursor_first_index_key_equals_probe(
+    cursor: &StorageCursor,
+    current_value: &SqliteValue,
+    probe_value: &SqliteValue,
+) -> bool {
+    let Some(collation) = storage_cursor_first_index_key_collation(cursor) else {
+        return values_equal_without_collation(current_value, probe_value);
+    };
+
+    if let (SqliteValue::Text(left), SqliteValue::Text(right)) = (current_value, probe_value)
+        && let Some(ordering) = builtin_collation_compare_text(left, right, collation)
+    {
+        return ordering == Ordering::Equal;
+    }
+
+    let registry = cursor.cursor.collation_registry();
+    let guard = registry.lock().unwrap_or_else(|err| err.into_inner());
+    cmp_values_collated(current_value, probe_value, Some(collation), &guard) == Ordering::Equal
 }
 
 enum FirstIndexKeyIntegerProbe {
@@ -20305,6 +20371,111 @@ mod tests {
         assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
     }
 
+    #[test]
+    fn test_open_autoindex_honors_nocase_collation_for_found() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let found = b.emit_label();
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let cursor_id = 1;
+            let r_insert_val = b.alloc_reg();
+            let r_insert_key = b.alloc_reg();
+            let r_probe_val = b.alloc_reg();
+            let r_probe_key = b.alloc_reg();
+            let r_out = b.alloc_reg();
+
+            b.emit_op(
+                Opcode::OpenAutoindex,
+                cursor_id,
+                1,
+                0,
+                P4::Collation("NOCASE".to_owned()),
+                0,
+            );
+            b.emit_op(
+                Opcode::String8,
+                0,
+                r_insert_val,
+                0,
+                P4::Str("alpha".to_owned()),
+                0,
+            );
+            b.emit_op(
+                Opcode::MakeRecord,
+                r_insert_val,
+                1,
+                r_insert_key,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::IdxInsert, cursor_id, r_insert_key, 0, P4::None, 0);
+
+            b.emit_op(
+                Opcode::String8,
+                0,
+                r_probe_val,
+                0,
+                P4::Str("ALPHA".to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::MakeRecord, r_probe_val, 1, r_probe_key, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Found, cursor_id, r_probe_key, found, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(found);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+    }
+
+    #[test]
+    fn test_column_reads_from_key_only_autoindex_without_trailing_rowid() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let cursor_id = 1;
+            let r_insert_val = b.alloc_reg();
+            let r_insert_key = b.alloc_reg();
+            let r_out = b.alloc_reg();
+
+            b.emit_op(Opcode::OpenAutoindex, cursor_id, 1, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::String8,
+                0,
+                r_insert_val,
+                0,
+                P4::Str("alpha".to_owned()),
+                0,
+            );
+            b.emit_op(
+                Opcode::MakeRecord,
+                r_insert_val,
+                1,
+                r_insert_key,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::IdxInsert, cursor_id, r_insert_key, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Rewind, cursor_id, 0, done, P4::None, 0);
+            b.emit_op(Opcode::Column, cursor_id, 0, r_out, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows, vec![vec![SqliteValue::Text("alpha".into())]]);
+    }
+
     // ── Type Coercion ──────────────────────────────────────────────────
 
     #[test]
@@ -24096,6 +24267,55 @@ mod tests {
         assert!(
             cursor.row_decode.cached_value_ready(0),
             "CountIndexEqRun should leave the first index key cached in row-decode scratch"
+        );
+    }
+
+    #[test]
+    fn test_count_index_eq_run_honors_nocase_collation() {
+        let mut engine = build_storage_index_engine_with_nocase_mixed_case_ordering();
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        let done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        let r_probe = b.alloc_reg();
+        let r_min_rowid = b.alloc_reg();
+        let r_seek_key = b.alloc_reg();
+        let r_count = b.alloc_reg();
+        let r_next_key = b.alloc_reg();
+
+        b.emit_op(
+            Opcode::String8,
+            0,
+            r_probe,
+            0,
+            P4::Str("ALPHA".to_owned()),
+            0,
+        );
+        b.emit_op(Opcode::Int64, 0, r_min_rowid, 0, P4::Int64(i64::MIN), 0);
+        b.emit_op(Opcode::MakeRecord, r_probe, 2, r_seek_key, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SeekGE, 0, r_seek_key, done, P4::None, 0);
+        b.emit_op(Opcode::Integer, 0, r_count, 0, P4::None, 0);
+        b.emit_op(Opcode::CountIndexEqRun, 0, r_count, r_probe, P4::None, 0);
+        b.emit_jump_to_label(Opcode::IfNullRow, 0, 0, done, P4::None, 0);
+        b.emit_op(Opcode::Column, 0, 0, r_next_key, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r_count, 2, 0, P4::None, 0);
+
+        b.resolve_label(done);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let program = b.finish().expect("program should build");
+        let rows = execute_program_with_engine(&mut engine, &program);
+
+        assert_eq!(
+            rows,
+            vec![vec![
+                SqliteValue::Integer(2),
+                SqliteValue::Text("beta".into())
+            ]],
+            "CountIndexEqRun must consume a full NOCASE-equivalent run and stop on the next distinct key"
         );
     }
 

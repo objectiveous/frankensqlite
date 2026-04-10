@@ -293,9 +293,13 @@ id = "F-SQL.30"
 family = "SQL"
 title = "VACUUM and VACUUM INTO"
 weight = 4
-status = "partial"
-observability = ["test_vacuum"]
-notes = "VACUUM INTO for compact backup; full VACUUM needs pager wiring"
+status = "pass"
+observability = [
+  "test_vacuum",
+  "test_vacuum_into_copies_main_database_to_new_file",
+  "canonical_sha256_convenience_works",
+]
+notes = "Pager-backed VACUUM rebuilds file-backed databases in place, and VACUUM INTO writes compact backup copies while preserving page size and header pragmas"
 
 [[features]]
 id = "F-SQL.31"

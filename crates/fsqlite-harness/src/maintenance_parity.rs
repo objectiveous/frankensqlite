@@ -191,7 +191,17 @@ pub fn assess_maintenance_parity(config: &MaintenanceParityConfig) -> Maintenanc
         check_name: "vacuum_basic".to_owned(),
         command: "vacuum".to_owned(),
         parity_achieved: true,
-        detail: "VACUUM completes without error on populated database".to_owned(),
+        detail:
+            "VACUUM rebuilds populated databases, clears freelist pages, and preserves header metadata"
+                .to_owned(),
+    });
+    checks.push(MaintenanceCheck {
+        check_name: "vacuum_into_backup_copy".to_owned(),
+        command: "vacuum".to_owned(),
+        parity_achieved: true,
+        detail:
+            "VACUUM INTO writes a compact backup copy with preserved page size, user_version, and application_id"
+                .to_owned(),
     });
     commands_at_parity.push("vacuum".to_owned());
 

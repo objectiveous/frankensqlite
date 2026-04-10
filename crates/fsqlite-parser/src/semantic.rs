@@ -205,6 +205,12 @@ fn table_lookup_key(name: &QualifiedName) -> String {
     }
 }
 
+fn lookup_key_table_name(lookup_key: &str) -> &str {
+    lookup_key
+        .split_once('\0')
+        .map_or(lookup_key, |(_, table_name)| table_name)
+}
+
 // ---------------------------------------------------------------------------
 // Scope tracking
 // ---------------------------------------------------------------------------
@@ -300,6 +306,32 @@ impl Scope {
             return true;
         }
         self.parent.as_ref().is_some_and(|p| p.has_alias(alias))
+    }
+
+    /// Check if a table reference is visible in this scope (or parent scopes).
+    ///
+    /// Bare `table.*` can match either a visible alias or the underlying table
+    /// name. Schema-qualified references must match the bound table identity
+    /// exactly, with `main.table` normalized to bare `table`.
+    #[must_use]
+    pub fn has_table_reference(&self, name: &QualifiedName) -> bool {
+        let target_lookup_key = table_lookup_key(name);
+        let target_name = name.name.to_ascii_lowercase();
+
+        if self.aliases.iter().any(|(alias, bound_name)| {
+            if name.schema.is_none() {
+                alias.eq_ignore_ascii_case(&target_name)
+                    || lookup_key_table_name(bound_name).eq_ignore_ascii_case(&target_name)
+            } else {
+                bound_name.eq_ignore_ascii_case(&target_lookup_key)
+            }
+        }) {
+            return true;
+        }
+
+        self.parent
+            .as_ref()
+            .is_some_and(|parent| parent.has_table_reference(name))
     }
 
     /// Check if an alias is defined locally in this scope.
@@ -1178,7 +1210,7 @@ impl<'a> Resolver<'a> {
                 }
             }
             ResultColumn::TableStar(table_name) => {
-                if !scope.has_alias(&table_name.name) {
+                if !scope.has_table_reference(table_name) {
                     self.push_error(SemanticErrorKind::UnresolvedTable {
                         name: table_name.to_string(),
                     });

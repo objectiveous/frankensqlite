@@ -282,9 +282,9 @@ fn qualifier_matches_table(
     table_name: &QualifiedName,
     table_alias: Option<&str>,
 ) -> bool {
-    qualifier.name.eq_ignore_ascii_case(&table_name.name)
-        || (qualifier.schema.is_none()
-            && table_alias.is_some_and(|alias| qualifier.name.eq_ignore_ascii_case(alias)))
+    qualifier.schema.is_none()
+        && (qualifier.name.eq_ignore_ascii_case(&table_name.name)
+            || table_alias.is_some_and(|alias| qualifier.name.eq_ignore_ascii_case(alias)))
 }
 
 fn qualified_name_matches_table(
@@ -292,9 +292,21 @@ fn qualified_name_matches_table(
     table_name: &QualifiedName,
     table_alias: Option<&str>,
 ) -> bool {
-    qualifier.name.eq_ignore_ascii_case(&table_name.name)
-        || (qualifier.schema.is_none()
-            && table_alias.is_some_and(|alias| qualifier.name.eq_ignore_ascii_case(alias)))
+    if qualifier.schema.is_none() {
+        qualifier.name.eq_ignore_ascii_case(&table_name.name)
+            || table_alias.is_some_and(|alias| qualifier.name.eq_ignore_ascii_case(alias))
+    } else {
+        normalized_schema_name(qualifier.schema.as_deref())
+            == normalized_schema_name(table_name.schema.as_deref())
+            && qualifier.name.eq_ignore_ascii_case(&table_name.name)
+    }
+}
+
+fn normalized_schema_name(schema: Option<&str>) -> Option<&str> {
+    match schema {
+        Some(name) if name.eq_ignore_ascii_case("main") => None,
+        other => other,
+    }
 }
 
 fn is_rowid_alias_name(name: &str) -> bool {
@@ -4199,6 +4211,52 @@ mod tests {
         let resolved = resolve_single_table_result_columns(&core, &table_columns)
             .expect("schema-qualified table.* should expand");
         assert_eq!(resolved.len(), 2);
+    }
+
+    #[test]
+    fn test_single_table_projection_expands_explicit_main_table_star_for_bare_main_table() {
+        let core = select_core_single_table(
+            vec![ResultColumn::TableStar(QualifiedName::qualified(
+                "main", "t",
+            ))],
+            "t",
+            None,
+        );
+        let table_columns = vec!["a".to_owned(), "b".to_owned()];
+        let resolved = resolve_single_table_result_columns(&core, &table_columns)
+            .expect("main-qualified table.* should expand for bare main table");
+        assert_eq!(resolved.len(), 2);
+    }
+
+    #[test]
+    fn test_single_table_projection_rejects_wrong_schema_table_star() {
+        let core = SelectCore::Select {
+            distinct: Distinctness::All,
+            columns: vec![ResultColumn::TableStar(QualifiedName::qualified(
+                "main", "t",
+            ))],
+            from: Some(FromClause {
+                source: TableOrSubquery::Table {
+                    name: QualifiedName::qualified("aux", "t"),
+                    alias: None,
+                    index_hint: None,
+                    time_travel: None,
+                },
+                joins: vec![],
+            }),
+            where_clause: None,
+            group_by: vec![],
+            having: None,
+            windows: vec![],
+        };
+        let table_columns = vec!["a".to_owned(), "b".to_owned()];
+        let err = resolve_single_table_result_columns(&core, &table_columns)
+            .expect_err("wrong-schema table.* should fail");
+        assert!(matches!(
+            err,
+            SingleTableProjectionError::UnknownTableQualifier { qualifier }
+                if qualifier == "main.t"
+        ));
     }
 
     #[test]

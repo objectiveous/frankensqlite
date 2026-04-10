@@ -180,3 +180,57 @@ fn test_delete_limit_cannot_see_target_table() {
         errors[0]
     );
 }
+
+#[test]
+fn test_main_qualified_table_star_resolves_bare_main_table() {
+    let schema = make_schema();
+    let stmt = parse_one("SELECT main.users.* FROM users");
+    let mut resolver = Resolver::new(&schema);
+    let errors = resolver.resolve_statement(&stmt);
+    assert!(
+        errors.is_empty(),
+        "Expected explicit main table.* to resolve, got {:?}",
+        errors
+    );
+}
+
+#[test]
+fn test_schema_qualified_table_star_rejects_wrong_schema_binding() {
+    let mut schema = make_schema();
+    schema.add_table_in_schema(
+        "aux",
+        TableDef {
+            name: "users".to_owned(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_owned(),
+                    affinity: TypeAffinity::Integer,
+                    is_ipk: true,
+                    not_null: true,
+                },
+                ColumnDef {
+                    name: "nickname".to_owned(),
+                    affinity: TypeAffinity::Text,
+                    is_ipk: false,
+                    not_null: false,
+                },
+            ],
+            without_rowid: false,
+            strict: false,
+        },
+    );
+    let stmt = parse_one("SELECT main.users.* FROM aux.users");
+    let mut resolver = Resolver::new(&schema);
+    let errors = resolver.resolve_statement(&stmt);
+    assert_eq!(
+        errors.len(),
+        1,
+        "Expected exactly 1 error, got {:?}",
+        errors
+    );
+    assert!(
+        matches!(errors[0].kind, SemanticErrorKind::UnresolvedTable { ref name } if name == "main.users"),
+        "Expected UnresolvedTable(main.users), got {:?}",
+        errors[0]
+    );
+}

@@ -8447,8 +8447,16 @@ impl VdbeEngine {
                     // table_move_to, triggering "table leaf cell has no rowid"
                     // on index pages. (Fixes br#138-140, #144, #145.)
                     let coll_arc = Arc::clone(&self.collation_registry);
+                    let seek_idx_desc_flags = {
+                        let root_page = self
+                            .cursor_root_pages
+                            .get(&cursor_id)
+                            .copied()
+                            .unwrap_or_default();
+                        self.index_desc_flags_for_root(root_page)
+                    };
                     // Pre-fetch index collations before borrowing storage_cursors
-                    // mutably (needed by SeekGT/SeekLE equality skip loops).
+                    // mutably.
                     let seek_idx_collations = {
                         let root_page = self
                             .cursor_root_pages
@@ -8457,6 +8465,17 @@ impl VdbeEngine {
                             .unwrap_or_default();
                         self.index_collations_for_root(root_page)
                     };
+                    let uses_collated_seek = seek_idx_collations.iter().any(|collation| {
+                        collation
+                            .as_deref()
+                            .is_some_and(|name| !name.eq_ignore_ascii_case("BINARY"))
+                    });
+                    let collated_seek_registry = uses_collated_seek.then(|| {
+                        self.collation_registry
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner())
+                            .clone()
+                    });
                     let found = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                         if cursor.cursor.is_table_btree() {
                             // Table seek: key is a rowid (integer).
@@ -8511,101 +8530,122 @@ impl VdbeEngine {
                         } else {
                             // Index seek: key is a packed record blob.
                             let key_bytes = record_blob_bytes(&key_val);
-                            let seek_result = cursor.cursor.index_move_to(&cursor.cx, key_bytes)?;
+                            if uses_collated_seek {
+                                let Some(collation_registry) = collated_seek_registry.as_ref()
+                                else {
+                                    return Err(FrankenError::internal(
+                                        "Seek*: missing collation registry for collated index seek",
+                                    ));
+                                };
+                                storage_cursor_seek_collated(
+                                    cursor_id,
+                                    cursor,
+                                    key_bytes,
+                                    op.opcode,
+                                    &seek_idx_desc_flags,
+                                    &seek_idx_collations,
+                                    collation_registry,
+                                )?
+                            } else {
+                                let seek_result =
+                                    cursor.cursor.index_move_to(&cursor.cx, key_bytes)?;
 
-                            match op.opcode {
-                                Opcode::SeekGE => !cursor.cursor.eof(),
-                                Opcode::SeekGT => {
-                                    if seek_result.is_found() {
-                                        cursor.cursor.next(&cursor.cx)?;
-                                    }
-                                    if !cursor.cursor.eof() {
-                                        decode_storage_cursor_target_index_record_strict(
-                                            cursor,
-                                            key_bytes,
-                                            "SeekGT: malformed seek key record",
-                                        )?;
-                                        // Use pre-fetched index collations for
-                                        // COLLATE NOCASE and similar — &[] would
-                                        // use binary comparison, breaking
-                                        // case-insensitive indexes.
-                                        let idx_collations = seek_idx_collations.as_slice();
-                                        loop {
-                                            if cursor.cursor.eof() {
-                                                break;
-                                            }
-                                            decode_storage_cursor_current_index_record_strict(
-                                                cursor_id,
+                                match op.opcode {
+                                    Opcode::SeekGE => !cursor.cursor.eof(),
+                                    Opcode::SeekGT => {
+                                        if seek_result.is_found() {
+                                            cursor.cursor.next(&cursor.cx)?;
+                                        }
+                                        if !cursor.cursor.eof() {
+                                            decode_storage_cursor_target_index_record_strict(
                                                 cursor,
-                                                "SeekGT: malformed cursor record",
+                                                key_bytes,
+                                                "SeekGT: malformed seek key record",
                                             )?;
-                                            let coll =
-                                                coll_arc.lock().unwrap_or_else(|e| e.into_inner());
-                                            let cmp = compare_sorter_keys(
-                                                &cursor.cur_vals_buf,
-                                                &cursor.target_vals_buf,
-                                                cursor.target_vals_buf.len(),
-                                                idx_collations,
-                                                &coll,
-                                            );
-                                            drop(coll);
-                                            if cmp == std::cmp::Ordering::Equal {
-                                                cursor.cursor.next(&cursor.cx)?;
-                                            } else {
-                                                break;
+                                            // Use pre-fetched index collations for
+                                            // COLLATE NOCASE and similar — &[] would
+                                            // use binary comparison, breaking
+                                            // case-insensitive indexes.
+                                            let idx_collations = seek_idx_collations.as_slice();
+                                            loop {
+                                                if cursor.cursor.eof() {
+                                                    break;
+                                                }
+                                                decode_storage_cursor_current_index_record_strict(
+                                                    cursor_id,
+                                                    cursor,
+                                                    "SeekGT: malformed cursor record",
+                                                )?;
+                                                let coll = coll_arc
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
+                                                let cmp = compare_sorter_keys(
+                                                    &cursor.cur_vals_buf,
+                                                    &cursor.target_vals_buf,
+                                                    cursor.target_vals_buf.len(),
+                                                    idx_collations,
+                                                    &coll,
+                                                );
+                                                drop(coll);
+                                                if cmp == std::cmp::Ordering::Equal {
+                                                    cursor.cursor.next(&cursor.cx)?;
+                                                } else {
+                                                    break;
+                                                }
                                             }
                                         }
+                                        !cursor.cursor.eof()
                                     }
-                                    !cursor.cursor.eof()
-                                }
-                                Opcode::SeekLE => {
-                                    if !cursor.cursor.eof() {
-                                        decode_storage_cursor_target_index_record_strict(
-                                            cursor,
-                                            key_bytes,
-                                            "SeekLE: malformed seek key record",
-                                        )?;
-                                        let idx_collations = seek_idx_collations.as_slice();
-                                        loop {
-                                            if cursor.cursor.eof() {
-                                                break;
-                                            }
-                                            decode_storage_cursor_current_index_record_strict(
-                                                cursor_id,
+                                    Opcode::SeekLE => {
+                                        if !cursor.cursor.eof() {
+                                            decode_storage_cursor_target_index_record_strict(
                                                 cursor,
-                                                "SeekLE: malformed cursor record",
+                                                key_bytes,
+                                                "SeekLE: malformed seek key record",
                                             )?;
-                                            let coll =
-                                                coll_arc.lock().unwrap_or_else(|e| e.into_inner());
-                                            let cmp = compare_sorter_keys(
-                                                &cursor.cur_vals_buf,
-                                                &cursor.target_vals_buf,
-                                                cursor.target_vals_buf.len(),
-                                                idx_collations,
-                                                &coll,
-                                            );
-                                            drop(coll);
-                                            if cmp == std::cmp::Ordering::Equal {
-                                                cursor.cursor.next(&cursor.cx)?;
-                                            } else {
-                                                break;
+                                            let idx_collations = seek_idx_collations.as_slice();
+                                            loop {
+                                                if cursor.cursor.eof() {
+                                                    break;
+                                                }
+                                                decode_storage_cursor_current_index_record_strict(
+                                                    cursor_id,
+                                                    cursor,
+                                                    "SeekLE: malformed cursor record",
+                                                )?;
+                                                let coll = coll_arc
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
+                                                let cmp = compare_sorter_keys(
+                                                    &cursor.cur_vals_buf,
+                                                    &cursor.target_vals_buf,
+                                                    cursor.target_vals_buf.len(),
+                                                    idx_collations,
+                                                    &coll,
+                                                );
+                                                drop(coll);
+                                                if cmp == std::cmp::Ordering::Equal {
+                                                    cursor.cursor.next(&cursor.cx)?;
+                                                } else {
+                                                    break;
+                                                }
                                             }
                                         }
+                                        if cursor.cursor.eof() {
+                                            cursor.cursor.last(&cursor.cx)?
+                                        } else {
+                                            cursor.cursor.prev(&cursor.cx)?
+                                        }
                                     }
-                                    if cursor.cursor.eof() {
-                                        cursor.cursor.last(&cursor.cx)?
-                                    } else {
-                                        cursor.cursor.prev(&cursor.cx)?
+                                    Opcode::SeekLT => {
+                                        if cursor.cursor.eof() {
+                                            cursor.cursor.last(&cursor.cx)?
+                                        } else {
+                                            cursor.cursor.prev(&cursor.cx)?
+                                        }
                                     }
+                                    _ => unreachable!(),
                                 }
-                                Opcode::SeekLT => {
-                                    if cursor.cursor.eof() {
-                                        cursor.cursor.last(&cursor.cx)?
-                                    } else {
-                                        cursor.cursor.prev(&cursor.cx)?
-                                    }
-                                }
-                                _ => unreachable!(),
                             }
                         }
                     } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
@@ -9631,24 +9671,20 @@ impl VdbeEngine {
                         None
                     };
 
-                    if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
-                        if sc.writable {
-                            if let Some(ref key) = key_bytes {
-                                // Seek to the key first, then delete.
-                                if self.storage_cursor_find_exact_index_key(
-                                    cursor_id,
-                                    key,
-                                    "IdxDelete: missing collation registry for collated exact probe",
-                                )? {
-                                    sc.cursor.delete(&sc.cx)?;
-                                    invalidate_storage_cursor_row_cache_with_reason(
-                                        sc,
-                                        self.collect_vdbe_metrics,
-                                        DecodeCacheInvalidationReason::WriteMutation,
-                                    );
-                                }
-                            } else if !sc.cursor.eof() {
-                                // Delete at current position.
+                    if let Some(ref key) = key_bytes {
+                        let writable = self
+                            .storage_cursors
+                            .get(&cursor_id)
+                            .map(|sc| sc.writable)
+                            .unwrap_or(false);
+                        if writable
+                            && self.storage_cursor_find_exact_index_key(
+                                cursor_id,
+                                key,
+                                "IdxDelete: missing collation registry for collated exact probe",
+                            )?
+                        {
+                            if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                                 sc.cursor.delete(&sc.cx)?;
                                 invalidate_storage_cursor_row_cache_with_reason(
                                     sc,
@@ -9656,6 +9692,16 @@ impl VdbeEngine {
                                     DecodeCacheInvalidationReason::WriteMutation,
                                 );
                             }
+                        }
+                    } else if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
+                        if sc.writable && !sc.cursor.eof() {
+                            // Delete at current position.
+                            sc.cursor.delete(&sc.cx)?;
+                            invalidate_storage_cursor_row_cache_with_reason(
+                                sc,
+                                self.collect_vdbe_metrics,
+                                DecodeCacheInvalidationReason::WriteMutation,
+                            );
                         }
                     }
                     // No MemDatabase fallback for indexes.
@@ -13587,6 +13633,95 @@ fn storage_cursor_exact_match_collated(
     Ok(false)
 }
 
+fn storage_cursor_seek_collated(
+    cursor_id: i32,
+    cursor: &mut StorageCursor,
+    key_bytes: &[u8],
+    opcode: Opcode,
+    desc_flags: &[bool],
+    collations: &[Option<String>],
+    collation_registry: &CollationRegistry,
+) -> Result<bool> {
+    decode_storage_cursor_target_index_record_strict(
+        cursor,
+        key_bytes,
+        "Seek*: malformed seek key record",
+    )?;
+    if !cursor.cursor.first(&cursor.cx)? {
+        return Ok(false);
+    }
+
+    let target_len = cursor.target_vals_buf.len();
+    let mut best_values: Option<Vec<SqliteValue>> = None;
+    let mut best_key_bytes: Option<Vec<u8>> = None;
+
+    loop {
+        decode_storage_cursor_current_index_record_strict(
+            cursor_id,
+            cursor,
+            "Seek*: malformed cursor record",
+        )?;
+
+        let compare_len = cursor.cur_vals_buf.len().max(target_len);
+        let cmp_to_target = compare_index_prefix_keys(
+            &cursor.cur_vals_buf,
+            &cursor.target_vals_buf,
+            compare_len,
+            desc_flags,
+            collations,
+            collation_registry,
+        );
+        let relation_matches = match opcode {
+            Opcode::SeekGE => cmp_to_target != Ordering::Less,
+            Opcode::SeekGT => cmp_to_target == Ordering::Greater,
+            Opcode::SeekLE => cmp_to_target != Ordering::Greater,
+            Opcode::SeekLT => cmp_to_target == Ordering::Less,
+            _ => {
+                return Err(FrankenError::internal(
+                    "storage_cursor_seek_collated called with non-seek opcode",
+                ));
+            }
+        };
+
+        if relation_matches {
+            let replace_best = if let Some(best_values) = best_values.as_ref() {
+                let best_compare_len = cursor.cur_vals_buf.len().max(best_values.len());
+                let cmp_to_best = compare_index_prefix_keys(
+                    &cursor.cur_vals_buf,
+                    best_values,
+                    best_compare_len,
+                    desc_flags,
+                    collations,
+                    collation_registry,
+                );
+                match opcode {
+                    Opcode::SeekGE | Opcode::SeekGT => cmp_to_best == Ordering::Less,
+                    Opcode::SeekLE | Opcode::SeekLT => cmp_to_best == Ordering::Greater,
+                    _ => unreachable!(),
+                }
+            } else {
+                true
+            };
+
+            if replace_best {
+                best_values = Some(cursor.cur_vals_buf.clone());
+                best_key_bytes = Some(cursor.payload_buf.clone());
+            }
+        }
+
+        if !cursor.cursor.next(&cursor.cx)? {
+            break;
+        }
+    }
+
+    if let Some(best_key_bytes) = best_key_bytes {
+        cursor.cursor.index_move_to(&cursor.cx, &best_key_bytes)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 fn storage_cursor_current_first_index_key_equals(
     cursor: &mut StorageCursor,
     probe_value: &SqliteValue,
@@ -15330,6 +15465,41 @@ mod tests {
         let miss_key = encode_record(&[SqliteValue::Text("gamma".into())]);
 
         (engine, conflict_key, miss_key)
+    }
+
+    fn build_storage_index_engine_with_nocase_mixed_case_ordering() -> VdbeEngine {
+        let mut engine = VdbeEngine::new(8);
+        let mut db = MemDatabase::new();
+        let index_root = db.allocate_root_page();
+
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        engine.set_index_collations_by_root_page(HashMap::from([(
+            index_root,
+            vec![Some("NOCASE".to_owned())],
+        )]));
+
+        assert!(
+            engine.open_storage_cursor(0, index_root, true),
+            "NOCASE index storage cursor should open"
+        );
+
+        let sc = engine
+            .storage_cursors
+            .get_mut(&0)
+            .expect("NOCASE storage cursor should exist");
+        for key in [
+            encode_record(&[SqliteValue::Text("alpha".into()), SqliteValue::Integer(1)]),
+            encode_record(&[SqliteValue::Text("ALPHA".into()), SqliteValue::Integer(2)]),
+            encode_record(&[SqliteValue::Text("beta".into()), SqliteValue::Integer(3)]),
+        ] {
+            sc.cursor
+                .index_insert(&sc.cx, &key)
+                .expect("mixed-case NOCASE fixture key should insert");
+        }
+
+        engine
     }
 
     #[test]
@@ -23604,6 +23774,142 @@ mod tests {
             rows,
             vec![vec![SqliteValue::Integer(0)], vec![SqliteValue::Integer(1)]],
             "NotFound must respect NOCASE equality when probing storage indexes"
+        );
+    }
+
+    #[test]
+    fn test_seekge_honors_nocase_collation_for_full_index_keys() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut engine = build_storage_index_engine_with_nocase_mixed_case_ordering();
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        let done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        let r_text = b.alloc_reg();
+        let r_rowid = b.alloc_reg();
+        let r_seek_key = b.alloc_reg();
+        let r_found_text = b.alloc_reg();
+        let r_found_rowid = b.alloc_reg();
+
+        b.emit_op(
+            Opcode::String8,
+            0,
+            r_text,
+            0,
+            P4::Str("ALPHA".to_owned()),
+            0,
+        );
+        b.emit_op(Opcode::Integer, 1, r_rowid, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, r_text, 2, r_seek_key, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SeekGE, 0, r_seek_key, done, P4::None, 0);
+        b.emit_op(Opcode::Column, 0, 0, r_found_text, P4::None, 0);
+        b.emit_op(Opcode::IdxRowid, 0, r_found_rowid, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r_found_text, 2, 0, P4::None, 0);
+
+        b.resolve_label(done);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let program = b.finish().expect("program should build");
+        let rows = execute_program_with_engine(&mut engine, &program);
+
+        assert_eq!(
+            rows,
+            vec![vec![
+                SqliteValue::Text("alpha".into()),
+                SqliteValue::Integer(1),
+            ]],
+            "SeekGE must land on the smallest collated key >= the probe, not the first raw-binary successor"
+        );
+    }
+
+    #[test]
+    fn test_seekgt_honors_nocase_collation_for_full_index_keys() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut engine = build_storage_index_engine_with_nocase_mixed_case_ordering();
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        let done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        let r_text = b.alloc_reg();
+        let r_rowid = b.alloc_reg();
+        let r_seek_key = b.alloc_reg();
+        let r_found_text = b.alloc_reg();
+        let r_found_rowid = b.alloc_reg();
+
+        b.emit_op(Opcode::String8, 0, r_text, 0, P4::Str("alpha".to_owned()), 0);
+        b.emit_op(Opcode::Integer, 1, r_rowid, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, r_text, 2, r_seek_key, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SeekGT, 0, r_seek_key, done, P4::None, 0);
+        b.emit_op(Opcode::Column, 0, 0, r_found_text, P4::None, 0);
+        b.emit_op(Opcode::IdxRowid, 0, r_found_rowid, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r_found_text, 2, 0, P4::None, 0);
+
+        b.resolve_label(done);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let program = b.finish().expect("program should build");
+        let rows = execute_program_with_engine(&mut engine, &program);
+
+        assert_eq!(
+            rows,
+            vec![vec![
+                SqliteValue::Text("ALPHA".into()),
+                SqliteValue::Integer(2),
+            ]],
+            "SeekGT must skip only collated-equal predecessors and land on the next greater key"
+        );
+    }
+
+    #[test]
+    fn test_seeklt_honors_nocase_collation_for_full_index_keys() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut engine = build_storage_index_engine_with_nocase_mixed_case_ordering();
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        let done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        let r_text = b.alloc_reg();
+        let r_rowid = b.alloc_reg();
+        let r_seek_key = b.alloc_reg();
+        let r_found_text = b.alloc_reg();
+        let r_found_rowid = b.alloc_reg();
+
+        b.emit_op(Opcode::String8, 0, r_text, 0, P4::Str("ALPHA".to_owned()), 0);
+        b.emit_op(Opcode::Integer, 2, r_rowid, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, r_text, 2, r_seek_key, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SeekLT, 0, r_seek_key, done, P4::None, 0);
+        b.emit_op(Opcode::Column, 0, 0, r_found_text, P4::None, 0);
+        b.emit_op(Opcode::IdxRowid, 0, r_found_rowid, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r_found_text, 2, 0, P4::None, 0);
+
+        b.resolve_label(done);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let program = b.finish().expect("program should build");
+        let rows = execute_program_with_engine(&mut engine, &program);
+
+        assert_eq!(
+            rows,
+            vec![vec![
+                SqliteValue::Text("alpha".into()),
+                SqliteValue::Integer(1),
+            ]],
+            "SeekLT must return the greatest collated key strictly below the probe"
         );
     }
 

@@ -11,7 +11,7 @@ use std::fmt;
 use fsqlite_ast::{
     BinaryOp, ColumnRef, Distinctness, Expr, FromClause, FunctionArgs, JoinConstraint, JoinKind,
     Literal, OrderingTerm, QualifiedName, ResultColumn, SelectCore, SelectStatement,
-    TableOrSubquery,
+    TableOrSubquery, UnaryOp,
 };
 use fsqlite_types::SqliteValue;
 
@@ -533,18 +533,12 @@ fn collect_literal_filters(
 ) -> Result<Vec<DifferentialLiteralFilter>, DifferentialPlanError> {
     let mut filters = Vec::new();
     for term in flatten_conjunction(expr) {
-        let Some((column_expr, literal_expr)) = match_literal_equality(term) else {
+        let Some((column_expr, value)) = match_literal_equality(term) else {
             return Err(DifferentialPlanError::UnsupportedWhere {
                 detail: "differential WHERE clauses only support column = literal predicates joined by AND".to_owned(),
             });
         };
         let column = resolve_column_ref(column_expr, sources)?;
-        let value = literal_to_sqlite_value(literal_expr).ok_or_else(|| {
-            DifferentialPlanError::UnsupportedWhere {
-                detail: "differential WHERE clauses require non-NULL literal equality predicates"
-                    .to_owned(),
-            }
-        })?;
         filters.push(DifferentialLiteralFilter { column, value });
     }
     Ok(filters)
@@ -723,7 +717,7 @@ fn flatten_conjunction(expr: &Expr) -> Vec<&Expr> {
     }
 }
 
-fn match_literal_equality(expr: &Expr) -> Option<(&ColumnRef, &Literal)> {
+fn match_literal_equality(expr: &Expr) -> Option<(&ColumnRef, SqliteValue)> {
     let Expr::BinaryOp {
         left,
         op: BinaryOp::Eq,
@@ -734,13 +728,13 @@ fn match_literal_equality(expr: &Expr) -> Option<(&ColumnRef, &Literal)> {
         return None;
     };
 
-    match (extract_column_expr(left), extract_literal_expr(right)) {
-        (Some(column), Some(literal)) => Some((column, literal)),
-        _ => match (extract_literal_expr(left), extract_column_expr(right)) {
-            (Some(literal), Some(column)) => Some((column, literal)),
-            _ => None,
-        },
+    if let (Some(column), Some(value)) = (extract_column_expr(left), extract_literal_value(right)) {
+        return Some((column, value));
     }
+    if let (Some(value), Some(column)) = (extract_literal_value(left), extract_column_expr(right)) {
+        return Some((column, value));
+    }
+    None
 }
 
 fn extract_column_expr(expr: &Expr) -> Option<&ColumnRef> {
@@ -750,9 +744,29 @@ fn extract_column_expr(expr: &Expr) -> Option<&ColumnRef> {
     }
 }
 
-fn extract_literal_expr(expr: &Expr) -> Option<&Literal> {
+/// Extract a literal value from an expression, including signed numeric
+/// literals that the parser represents as `UnaryOp(Negate|Plus, Literal)`.
+/// NULL and time-function constants (CURRENT_TIME/DATE/TIMESTAMP) are
+/// intentionally rejected so that downstream code can continue to assume
+/// differential filters carry concrete bindable values.
+fn extract_literal_value(expr: &Expr) -> Option<SqliteValue> {
     match expr {
-        Expr::Literal(literal, _) => Some(literal),
+        Expr::Literal(literal, _) => literal_to_sqlite_value(literal),
+        Expr::UnaryOp {
+            op: UnaryOp::Plus,
+            expr: operand,
+            ..
+        } => extract_literal_value(operand),
+        Expr::UnaryOp {
+            op: UnaryOp::Negate,
+            expr: operand,
+            ..
+        } => match extract_literal_value(operand)? {
+            SqliteValue::Integer(value) => Some(SqliteValue::Integer(value.wrapping_neg())),
+            SqliteValue::Float(value) => Some(SqliteValue::Float(-value)),
+            // Negating non-numeric literals is not meaningful.
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1234,30 +1248,75 @@ mod tests {
     }
 
     fn arb_identifier() -> BoxedStrategy<String> {
+        // Identifiers are drawn from the lowercase ASCII alphanumeric
+        // alphabet and then filtered against the SQL keyword set.  The
+        // regex width (up to 5 chars) happily lands on tokens like
+        // `in`, `to`, `or`, `not`, `is`, `null`, `into`, `case` etc., so
+        // every such keyword must be excluded or the parser will (correctly)
+        // reject the generated SQL and the test will fail through no fault
+        // of the compiler under test.
         prop::string::string_regex("[a-z][a-z0-9]{0,4}")
             .expect("valid identifier regex")
             .prop_filter("identifiers must avoid SQL keywords", |identifier| {
                 !matches!(
                     identifier.as_str(),
+                    // Reserved words that appear in the productions we
+                    // generate (SELECT / FROM / JOIN / WHERE / GROUP BY
+                    // / ORDER BY / LIMIT / DISTINCT / aggregate names).
                     "and"
                         | "as"
+                        | "between"
                         | "by"
+                        | "case"
+                        | "cast"
                         | "count"
+                        | "cross"
                         | "distinct"
+                        | "else"
+                        | "end"
+                        | "except"
+                        | "exists"
                         | "false"
                         | "from"
+                        | "full"
+                        | "glob"
                         | "group"
+                        | "having"
+                        | "in"
                         | "inner"
+                        | "intersect"
+                        | "into"
+                        | "is"
+                        | "isnull"
                         | "join"
                         | "left"
+                        | "like"
                         | "limit"
+                        | "match"
+                        | "natural"
+                        | "not"
+                        | "notnull"
+                        | "null"
+                        | "of"
+                        | "offset"
                         | "on"
+                        | "or"
                         | "order"
+                        | "outer"
+                        | "regexp"
+                        | "right"
                         | "select"
+                        | "set"
                         | "sum"
+                        | "then"
+                        | "to"
                         | "true"
+                        | "union"
                         | "using"
+                        | "values"
+                        | "when"
                         | "where"
+                        | "with"
                 )
             })
             .boxed()

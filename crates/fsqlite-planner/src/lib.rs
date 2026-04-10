@@ -2164,15 +2164,20 @@ fn like_prefix_upper_bound(prefix: &str) -> Option<String> {
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> IndexUsability {
-    if index.columns.is_empty() {
-        return IndexUsability::NotUsable;
-    }
-
     // --- Expression index matching ---
-    // If the index has expression columns, try to match WHERE terms against
-    // the expressions structurally (AST PartialEq) rather than by column name.
+    // Expression indexes store their real key terms in `expression_columns`
+    // and leave `columns` empty by convention (see the schema loader at
+    // fsqlite-core/src/connection.rs), so the expression-index branch MUST
+    // run BEFORE the `columns.is_empty()` guard below — otherwise it would
+    // be unreachable and every expression index would appear planner-dead
+    // (issue #63).  We still fall through to `NotUsable` if neither
+    // `columns` nor `expression_columns` carries a matchable term.
     if !index.expression_columns.is_empty() {
         return analyze_expression_index_usability(index, terms);
+    }
+
+    if index.columns.is_empty() {
+        return IndexUsability::NotUsable;
     }
 
     // Helper: check if a WHERE column matches an index column, respecting
@@ -2284,34 +2289,76 @@ pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> In
 
 /// Analyze usability for an expression index by matching WHERE term expressions
 /// against the index's expression columns using structural equality (AST `PartialEq`).
+///
+/// Note on classification interplay (issue #63):
+/// `classify_where_term` only assigns `WhereTermKind::Equality` when the left-
+/// hand side of an `=` BinaryOp is a bare column (via `extract_where_column`).
+/// For predicates like `lower(name) = 'alice'` the left side is a function
+/// call, so the term is classified as `WhereTermKind::Other` even though it
+/// is structurally `<expr> = <literal>`.  We therefore match against the raw
+/// `term.expr` AST here — inspecting the BinaryOp / Between directly —
+/// instead of filtering by `term.kind`.  The structural `PartialEq` against
+/// the recorded `expression_columns[0]` is what actually guarantees the
+/// predicate matches the index.
 fn analyze_expression_index_usability(
     index: &IndexInfo,
     terms: &[WhereTerm<'_>],
 ) -> IndexUsability {
-    // For expression indexes, we check if any WHERE equality term's left-side
-    // expression structurally matches the index's first expression column.
-    if let Some(first_expr) = index.expression_columns.first() {
-        for term in terms {
-            if matches!(term.kind, WhereTermKind::Equality) {
-                // Check if the term's expression is `expr_col = value` where
-                // expr_col matches the index expression.
-                if let Expr::BinaryOp { left, .. } = term.expr {
-                    if **left == *first_expr {
-                        return IndexUsability::Equality;
-                    }
-                }
+    let Some(first_expr) = index.expression_columns.first() else {
+        return IndexUsability::NotUsable;
+    };
+
+    // Pass 1: prefer Equality matches (Equality beats Range on the same key).
+    for term in terms {
+        if let Expr::BinaryOp {
+            left,
+            op: AstBinaryOp::Eq,
+            right,
+            ..
+        } = term.expr
+        {
+            // Match <expr> = <value> or <value> = <expr>.  NULL equality
+            // cannot drive an index seek (SQL semantics), so skip the
+            // `x = NULL` / `NULL = x` degenerate forms exactly like
+            // classify_where_term does for plain columns.
+            let left_is_null = matches!(left.as_ref(), Expr::Literal(Literal::Null, _));
+            let right_is_null = matches!(right.as_ref(), Expr::Literal(Literal::Null, _));
+            if left_is_null || right_is_null {
+                continue;
             }
-            if matches!(term.kind, WhereTermKind::Range | WhereTermKind::Between) {
-                if let Expr::BinaryOp { left, .. } | Expr::Between { expr: left, .. } = term.expr {
-                    if **left == *first_expr {
-                        return IndexUsability::Range {
-                            selectivity: DEFAULT_RANGE_SELECTIVITY,
-                        };
-                    }
-                }
+            if **left == *first_expr || **right == *first_expr {
+                return IndexUsability::Equality;
             }
         }
     }
+
+    // Pass 2: fall back to Range/Between matches.
+    for term in terms {
+        if let Expr::BinaryOp {
+            left,
+            op: AstBinaryOp::Lt | AstBinaryOp::Le | AstBinaryOp::Gt | AstBinaryOp::Ge,
+            right,
+            ..
+        } = term.expr
+        {
+            if **left == *first_expr || **right == *first_expr {
+                return IndexUsability::Range {
+                    selectivity: DEFAULT_RANGE_SELECTIVITY,
+                };
+            }
+        }
+        if let Expr::Between {
+            expr: inner, not, ..
+        } = term.expr
+        {
+            if !*not && **inner == *first_expr {
+                return IndexUsability::Range {
+                    selectivity: DEFAULT_RANGE_SELECTIVITY,
+                };
+            }
+        }
+    }
+
     IndexUsability::NotUsable
 }
 
@@ -5018,6 +5065,166 @@ mod tests {
         assert!(matches!(
             analyze_index_usability(&idx, &terms),
             IndexUsability::Equality
+        ));
+    }
+
+    /// Regression test for issue #63.
+    ///
+    /// Expression indexes store their real key terms in `expression_columns`
+    /// and leave `columns` empty by convention (see the schema loader in
+    /// fsqlite-core/src/connection.rs).  Before the fix, analyze_index_usability
+    /// bailed out at the `columns.is_empty()` guard BEFORE checking
+    /// `expression_columns`, so every expression index looked planner-dead
+    /// and queries like `WHERE lower(name) = 'alice'` degraded to a full
+    /// table scan despite a matching expression index being present.
+    #[test]
+    fn test_index_usability_expression_index_equality() {
+        // Build a `lower(name)` expression that the index will match against.
+        // The key_expression stored on the index is an identical AST so that
+        // structural `PartialEq` succeeds.
+        let lower_name_expr = |val: &'static str| -> &'static Expr {
+            Box::leak(Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::FunctionCall {
+                    name: "lower".to_owned(),
+                    args: fsqlite_ast::FunctionArgs::List(vec![Expr::Column(
+                        ColumnRef::bare("name"),
+                        Span::ZERO,
+                    )]),
+                    distinct: false,
+                    order_by: vec![],
+                    filter: None,
+                    over: None,
+                    span: Span::ZERO,
+                }),
+                op: AstBinaryOp::Eq,
+                right: Box::new(Expr::Literal(
+                    Literal::String(val.to_owned()),
+                    Span::ZERO,
+                )),
+                span: Span::ZERO,
+            }))
+        };
+
+        let where_expr = lower_name_expr("alice");
+        // The index's recorded key expression is just `lower(name)` (no
+        // equality wrapper), matching how connection.rs parses the DDL
+        // expression string.
+        let key_expr = Expr::FunctionCall {
+            name: "lower".to_owned(),
+            args: fsqlite_ast::FunctionArgs::List(vec![Expr::Column(
+                ColumnRef::bare("name"),
+                Span::ZERO,
+            )]),
+            distinct: false,
+            order_by: vec![],
+            filter: None,
+            over: None,
+            span: Span::ZERO,
+        };
+
+        let idx = IndexInfo {
+            name: "idx_lower_name".to_owned(),
+            table: "users".to_owned(),
+            // Expression indexes leave `columns` empty by convention.
+            columns: vec![],
+            unique: false,
+            n_pages: 50,
+            source: StatsSource::Heuristic,
+            partial_where: None,
+            expression_columns: vec![key_expr],
+        };
+
+        let terms = [classify_where_term(where_expr)];
+        assert!(
+            matches!(
+                analyze_index_usability(&idx, &terms),
+                IndexUsability::Equality
+            ),
+            "expression index must reach analyze_expression_index_usability \
+             even though `columns` is empty (issue #63)"
+        );
+    }
+
+    /// Expression-index regression companion: a non-matching WHERE term must
+    /// still return NotUsable (i.e. the reordered guard does not accidentally
+    /// widen acceptance).
+    #[test]
+    fn test_index_usability_expression_index_non_matching() {
+        // Index is on `lower(name)`, but the WHERE clause uses `upper(name)`.
+        let upper_name_eq: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::FunctionCall {
+                name: "upper".to_owned(),
+                args: fsqlite_ast::FunctionArgs::List(vec![Expr::Column(
+                    ColumnRef::bare("name"),
+                    Span::ZERO,
+                )]),
+                distinct: false,
+                order_by: vec![],
+                filter: None,
+                over: None,
+                span: Span::ZERO,
+            }),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(
+                Literal::String("ALICE".to_owned()),
+                Span::ZERO,
+            )),
+            span: Span::ZERO,
+        }));
+
+        let key_expr = Expr::FunctionCall {
+            name: "lower".to_owned(),
+            args: fsqlite_ast::FunctionArgs::List(vec![Expr::Column(
+                ColumnRef::bare("name"),
+                Span::ZERO,
+            )]),
+            distinct: false,
+            order_by: vec![],
+            filter: None,
+            over: None,
+            span: Span::ZERO,
+        };
+
+        let idx = IndexInfo {
+            name: "idx_lower_name".to_owned(),
+            table: "users".to_owned(),
+            columns: vec![],
+            unique: false,
+            n_pages: 50,
+            source: StatsSource::Heuristic,
+            partial_where: None,
+            expression_columns: vec![key_expr],
+        };
+
+        let terms = [classify_where_term(upper_name_eq)];
+        assert!(
+            matches!(
+                analyze_index_usability(&idx, &terms),
+                IndexUsability::NotUsable
+            ),
+            "expression index must reject structurally-unrelated WHERE terms"
+        );
+    }
+
+    /// An index with neither `columns` nor `expression_columns` is degenerate
+    /// and must still fall through to NotUsable.  Guards against the reorder
+    /// accidentally exposing a new reachable code path.
+    #[test]
+    fn test_index_usability_empty_index_still_not_usable() {
+        let idx = IndexInfo {
+            name: "idx_empty".to_owned(),
+            table: "t1".to_owned(),
+            columns: vec![],
+            unique: false,
+            n_pages: 50,
+            source: StatsSource::Heuristic,
+            partial_where: None,
+            expression_columns: vec![],
+        };
+        let terms = [eq_term("a")];
+        assert!(matches!(
+            analyze_index_usability(&idx, &terms),
+            IndexUsability::NotUsable
         ));
     }
 

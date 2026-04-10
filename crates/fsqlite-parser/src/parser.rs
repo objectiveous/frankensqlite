@@ -783,12 +783,15 @@ impl Parser {
         if self.eat(&TokenKind::Star) {
             return Ok(ResultColumn::Star);
         }
-        // table.* check: identifier followed by dot-star.
+        // table.* / schema.table.* check.
         if matches!(self.peek(), TokenKind::Id(_) | TokenKind::QuotedId(_, _))
             && self.peek_nth(1) == &TokenKind::Dot
-            && self.peek_nth(2) == &TokenKind::Star
+            && (self.peek_nth(2) == &TokenKind::Star
+                || (matches!(self.peek_nth(2), TokenKind::Id(_) | TokenKind::QuotedId(_, _))
+                    && self.peek_nth(3) == &TokenKind::Dot
+                    && self.peek_nth(4) == &TokenKind::Star))
         {
-            let tbl = self.parse_identifier()?;
+            let tbl = self.parse_qualified_name()?;
             self.advance(); // dot
             self.advance(); // star
             return Ok(ResultColumn::TableStar(tbl));
@@ -3139,8 +3142,26 @@ mod tests {
         if let Statement::Select(s) = stmt {
             if let SelectCore::Select { columns, .. } = &s.body.select {
                 assert!(
-                    matches!(&columns[0], ResultColumn::TableStar(t) if t == "t1"),
+                    matches!(&columns[0], ResultColumn::TableStar(t) if t == &QualifiedName::bare("t1")),
                     "expected TableStar(t1), got {:?}",
+                    columns[0]
+                );
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_select_schema_table_star() {
+        let stmt = parse_one("SELECT aux.t1.* FROM aux.t1");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { columns, .. } = &s.body.select {
+                assert!(
+                    matches!(&columns[0], ResultColumn::TableStar(t) if t == &QualifiedName::qualified("aux", "t1")),
+                    "expected TableStar(aux.t1), got {:?}",
                     columns[0]
                 );
             } else {

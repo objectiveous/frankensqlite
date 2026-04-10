@@ -903,7 +903,7 @@ pub enum ResultColumn {
     /// `*` — all columns from all tables.
     Star,
     /// `table.*` — all columns from a specific table.
-    TableStar(String),
+    TableStar(QualifiedName),
     /// `expr [AS alias]`.
     Expr { expr: Expr, alias: Option<String> },
 }
@@ -3185,7 +3185,7 @@ mod tests {
     fn test_result_column_variants() {
         let span = Span::ZERO;
         let star = ResultColumn::Star;
-        let table_star = ResultColumn::TableStar("t1".to_owned());
+        let table_star = ResultColumn::TableStar(QualifiedName::bare("t1"));
         let expr = ResultColumn::Expr {
             expr: Expr::Literal(Literal::Integer(1), span),
             alias: Some("one".to_owned()),

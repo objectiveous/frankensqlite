@@ -681,7 +681,7 @@ impl fmt::Display for ResultColumn {
         match self {
             Self::Star => f.write_str("*"),
             Self::TableStar(t) => {
-                write_ident(f, t)?;
+                write_qualified_name(f, t)?;
                 f.write_str(".*")
             }
             Self::Expr { expr, alias } => {

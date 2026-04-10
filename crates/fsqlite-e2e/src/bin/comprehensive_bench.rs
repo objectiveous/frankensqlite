@@ -352,6 +352,7 @@ struct ReportRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 struct CliOptions {
     quick: bool,
     filter: Option<String>,
@@ -621,7 +622,7 @@ impl DetectedEnvironment {
         if let Some(cpu_model) = &self.cpu_model {
             match self.cpu_cores {
                 Some(cpu_cores) => {
-                    emit_line(to_stdout, format!("  CPU: {cpu_model} ({cpu_cores} cores)"))
+                    emit_line(to_stdout, format!("  CPU: {cpu_model} ({cpu_cores} cores)"));
                 }
                 None => emit_line(to_stdout, format!("  CPU: {cpu_model}")),
             }

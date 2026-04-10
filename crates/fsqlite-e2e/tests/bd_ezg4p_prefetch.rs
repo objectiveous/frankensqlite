@@ -22,6 +22,7 @@ const COLD_READ_SPIN_ITERS: usize = 1_024;
 static PREFETCH_E2E_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(clippy::struct_field_names)]
 struct PrefetchStatsSnapshot {
     prefetch_issued_count: usize,
     prefetch_hit_count: usize,
@@ -73,6 +74,7 @@ impl SharedPrefetchStore {
 }
 
 impl PageReader for SharedPrefetchStore {
+    #[allow(clippy::useless_let_if_seq)]
     fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
         let prefetched = {
             let mut stats = self.stats.borrow_mut();

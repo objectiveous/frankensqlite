@@ -8802,15 +8802,19 @@ impl VdbeEngine {
                     let conflict = if let SqliteValue::Blob(ref bytes) = key_val {
                         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                             if uses_collated_probe {
+                                let Some(collation_registry) = collated_probe_registry.as_ref()
+                                else {
+                                    return Err(FrankenError::internal(
+                                        "NoConflict: missing collation registry for collated probe",
+                                    ));
+                                };
                                 storage_cursor_no_conflict_prefix_match_collated(
                                     cursor_id,
                                     cursor,
                                     bytes,
                                     &index_desc_flags,
                                     &index_collations,
-                                    collated_probe_registry
-                                        .as_ref()
-                                        .expect("collated NoConflict probe requires registry"),
+                                    collation_registry,
                                 )?
                             } else {
                                 storage_cursor_no_conflict_prefix_match(cursor_id, cursor, bytes)?
@@ -9390,15 +9394,20 @@ impl VdbeEngine {
                                     _ => "",
                                 };
                                 let unique_insert_result = if uses_collated_unique_probe {
+                                    let Some(collation_registry) =
+                                        collated_unique_registry.as_ref()
+                                    else {
+                                        return Err(FrankenError::internal(
+                                            "IdxInsert: missing collation registry for collated unique probe",
+                                        ));
+                                    };
                                     let conflict_rowid = find_conflicting_rowid_in_index_collated(
                                         sc,
                                         key_bytes,
                                         n_idx_cols,
                                         &index_desc_flags,
                                         &index_collations,
-                                        collated_unique_registry
-                                            .as_ref()
-                                            .expect("collated probe requires registry"),
+                                        collation_registry,
                                     )?;
                                     if let Some(conflict_rowid) = conflict_rowid {
                                         Err((

@@ -787,8 +787,10 @@ impl Parser {
         if matches!(self.peek(), TokenKind::Id(_) | TokenKind::QuotedId(_, _))
             && self.peek_nth(1) == &TokenKind::Dot
             && (self.peek_nth(2) == &TokenKind::Star
-                || (matches!(self.peek_nth(2), TokenKind::Id(_) | TokenKind::QuotedId(_, _))
-                    && self.peek_nth(3) == &TokenKind::Dot
+                || (matches!(
+                    self.peek_nth(2),
+                    TokenKind::Id(_) | TokenKind::QuotedId(_, _)
+                ) && self.peek_nth(3) == &TokenKind::Dot
                     && self.peek_nth(4) == &TokenKind::Star))
         {
             let tbl = self.parse_qualified_name()?;

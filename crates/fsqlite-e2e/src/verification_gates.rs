@@ -16,6 +16,8 @@ use std::fmt::Write;
 use std::path::Path;
 use std::process::{Command, Output};
 
+use crate::benchmark_metadata::validate_benchmark_lifecycle_parity;
+
 const E2E_PACKAGE_NAME: &str = "fsqlite-e2e";
 const FMT_GATE_ARGS: &[&str] = &["fmt", "-p", E2E_PACKAGE_NAME, "--", "--check"];
 const CHECK_GATE_ARGS: &[&str] = &["check", "-p", E2E_PACKAGE_NAME, "--all-targets"];
@@ -66,6 +68,9 @@ pub struct GateConfig {
     pub check_ubs: bool,
     /// Whether to scan for `master` branch references.
     pub check_master_refs: bool,
+    /// Whether to scan benchmark source files for lifecycle/storage parity
+    /// metadata drift between SQLite and FrankenSQLite variants.
+    pub check_benchmark_lifecycle_parity: bool,
     /// Maximum length of output snippets in reports.
     pub max_snippet_len: usize,
 }
@@ -76,6 +81,7 @@ impl Default for GateConfig {
             workspace_root: std::path::PathBuf::from("."),
             check_ubs: true,
             check_master_refs: true,
+            check_benchmark_lifecycle_parity: true,
             max_snippet_len: 2000,
         }
     }
@@ -95,6 +101,10 @@ pub fn run_all_gates(config: &GateConfig) -> GateReport {
 
     if config.check_ubs {
         gates.push(run_ubs_gate(config));
+    }
+
+    if config.check_benchmark_lifecycle_parity {
+        gates.push(run_benchmark_lifecycle_parity_gate(config));
     }
 
     if config.check_master_refs {
@@ -276,7 +286,35 @@ fn run_master_refs_gate(config: &GateConfig) -> GateResult {
     }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────
+fn run_benchmark_lifecycle_parity_gate(config: &GateConfig) -> GateResult {
+    let start = std::time::Instant::now();
+    let violations = validate_benchmark_lifecycle_parity(&config.workspace_root);
+
+    #[allow(clippy::cast_possible_truncation)]
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    if violations.is_empty() {
+        GateResult {
+            name: "benchmark-lifecycle-parity".to_owned(),
+            passed: true,
+            summary: "Benchmark metadata parity/control contract OK".to_owned(),
+            output_snippet: String::new(),
+            elapsed_ms,
+        }
+    } else {
+        let mut snippet = String::new();
+        for violation in &violations {
+            let _ = writeln!(snippet, "{violation}");
+        }
+        GateResult {
+            name: "benchmark-lifecycle-parity".to_owned(),
+            passed: false,
+            summary: format!("{} benchmark metadata parity issue(s)", violations.len()),
+            output_snippet: truncate_string(&snippet, config.max_snippet_len),
+            elapsed_ms,
+        }
+    }
+}
 
 fn run_cargo_gate(
     name: &str,
@@ -461,6 +499,7 @@ mod tests {
     fn gate_config_default_has_master_refs_check() {
         let config = GateConfig::default();
         assert!(config.check_master_refs);
+        assert!(config.check_benchmark_lifecycle_parity);
         assert_eq!(config.max_snippet_len, 2000);
     }
 

@@ -143,6 +143,8 @@ fn setup_fsqlite_in_regression_bench(row_count: i64) -> fsqlite::Connection {
 // autocommit resolve path, so this group is the right place to look at
 // per-row autocommit overhead rather than batched insert throughput.
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_sequential_inserts(c: &mut Criterion) {
     let mut group = c.benchmark_group("sequential_inserts_100");
     group.sample_size(20);
@@ -194,6 +196,8 @@ fn bench_sequential_inserts(c: &mut Criterion) {
 // execution loop stays identical, but commit work is paid once at the end
 // instead of once per row.
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_sequential_inserts_single_txn(c: &mut Criterion) {
     let mut group = c.benchmark_group("sequential_inserts_100_single_txn");
     group.sample_size(20);
@@ -245,6 +249,8 @@ fn bench_sequential_inserts_single_txn(c: &mut Criterion) {
 
 // ─── Bulk INSERT benchmark (1000 rows) ──────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_bulk_inserts(c: &mut Criterion) {
     let mut group = c.benchmark_group("bulk_inserts_1000");
     group.sample_size(10);
@@ -302,6 +308,8 @@ fn bench_bulk_inserts(c: &mut Criterion) {
 
 // ─── SELECT query benchmark ─────────────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_select_queries(c: &mut Criterion) {
     let mut group = c.benchmark_group("select_after_100_rows");
     group.sample_size(20);
@@ -361,6 +369,8 @@ fn bench_select_queries(c: &mut Criterion) {
 
 // ─── Mixed DML benchmark ────────────────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_mixed_dml(c: &mut Criterion) {
     let mut group = c.benchmark_group("mixed_dml");
     group.sample_size(10);
@@ -466,6 +476,8 @@ fn bench_mixed_dml(c: &mut Criterion) {
 
 // ─── bd-1dus: Sequential write throughput (10K rows, 3 variants) ────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_write_throughput_autocommit(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_10k_autocommit");
     group.sample_size(10);
@@ -517,6 +529,8 @@ fn bench_write_throughput_autocommit(c: &mut Criterion) {
     group.finish();
 }
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_write_throughput_batched(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_10k_batched_1k");
     group.sample_size(10);
@@ -578,6 +592,8 @@ fn bench_write_throughput_batched(c: &mut Criterion) {
     group.finish();
 }
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_write_throughput_single_txn(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_10k_single_txn");
     group.sample_size(10);
@@ -635,6 +651,8 @@ fn bench_write_throughput_single_txn(c: &mut Criterion) {
 
 // ─── bd-72im: Read-heavy SELECT workload (WHERE/aggregates/GROUP BY) ──
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_read_heavy_select(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_heavy_select_1k");
     group.sample_size(20);
@@ -743,6 +761,8 @@ fn bench_read_heavy_select(c: &mut Criterion) {
     group.finish();
 }
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_exists_subquery_100k(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_exists_subquery_count_100k");
     group.sample_size(10);
@@ -773,6 +793,8 @@ fn bench_exists_subquery_100k(c: &mut Criterion) {
     group.finish();
 }
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_in_subquery_100k(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_in_subquery_count_100k");
     group.sample_size(10);
@@ -806,6 +828,8 @@ fn bench_in_subquery_100k(c: &mut Criterion) {
 // ─── bd-1fez: Mixed OLTP workload (80% read / 20% write) ─────────────
 
 #[allow(clippy::too_many_lines)]
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_mixed_oltp(c: &mut Criterion) {
     let mut group = c.benchmark_group("mixed_oltp_80r_20w");
     group.sample_size(10);
@@ -918,6 +942,8 @@ fn bench_mixed_oltp(c: &mut Criterion) {
 
 // ─── bd-6d9v: Large transaction (100K / 1M row single-txn insert) ────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_large_txn_100k(c: &mut Criterion) {
     let mut group = c.benchmark_group("large_txn_100k");
     group.sample_size(10);
@@ -975,6 +1001,8 @@ fn bench_large_txn_100k(c: &mut Criterion) {
     group.finish();
 }
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_large_txn_1m(c: &mut Criterion) {
     let mut group = c.benchmark_group("large_txn_1m");
     group.sample_size(10);
@@ -1038,6 +1066,8 @@ fn bench_large_txn_1m(c: &mut Criterion) {
 // in a single transaction.  FrankenSQLite's Connection uses Rc (not Send),
 // so connections must be created inside each thread.
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=concurrent
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=concurrent
 fn bench_concurrent_writes(c: &mut Criterion) {
     let mut group = c.benchmark_group("concurrent_write_throughput");
     group.sample_size(10);

@@ -12,8 +12,9 @@ use fsqlite_core::connection::{
     hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
 };
 use fsqlite_e2e::baseline::{
-    BaselineReport, DEFAULT_REGRESSION_THRESHOLD, LatencyStats, Operation, OperationBaseline,
-    RegressionResult, measure_operation,
+    BaselineReport, BenchmarkRecoveryMeasurement, BenchmarkRecoveryProbeId,
+    DEFAULT_REGRESSION_THRESHOLD, LatencyStats, Operation, OperationBaseline, RegressionResult,
+    evaluate_bd_wwqen_in_subquery_recovery, measure_operation, render_benchmark_recovery_markdown,
 };
 use fsqlite_types::SqliteValue;
 use std::sync::{Mutex, OnceLock};
@@ -1107,6 +1108,21 @@ fn manual_perf_probe_read_guard_shapes_count_in_exists_recursive_cte() {
         "manual_perf_probe.read_guard_shapes.recursive_cte p50_us={} p95_us={} throughput_ops_per_sec={recursive_cte_throughput:.1}",
         recursive_cte_stats.p50_micros, recursive_cte_stats.p95_micros,
     );
+    let in_subquery_recovery = evaluate_bd_wwqen_in_subquery_recovery(
+        "test",
+        vec![BenchmarkRecoveryMeasurement::latency_probe(
+            BenchmarkRecoveryProbeId::InSubquery10kLatency,
+            ROW_COUNT as u64,
+            in_stats.p50_micros,
+            in_stats.p95_micros,
+            in_throughput,
+        )],
+    );
+    eprintln!(
+        "{}",
+        render_benchmark_recovery_markdown(&in_subquery_recovery)
+    );
+    eprintln!("{}", in_subquery_recovery.to_pretty_json().unwrap());
 
     assert!(count_throughput > 0.0);
     assert!(count_range_throughput > 0.0);
@@ -1249,6 +1265,19 @@ fn manual_hot_path_profile_read_guard_shapes_count_in_exists_100k() {
     );
     let in_profile = hot_path_profile_snapshot();
     log_manual_hot_path_profile("in_subquery_100k", in_wall, &in_profile);
+    let in_subquery_recovery = evaluate_bd_wwqen_in_subquery_recovery(
+        "test",
+        vec![BenchmarkRecoveryMeasurement::wall_time_probe(
+            BenchmarkRecoveryProbeId::InSubquery100kWallTime,
+            ROW_COUNT as u64,
+            u64::try_from(in_wall.as_micros()).unwrap_or(u64::MAX),
+        )],
+    );
+    eprintln!(
+        "{}",
+        render_benchmark_recovery_markdown(&in_subquery_recovery)
+    );
+    eprintln!("{}", in_subquery_recovery.to_pretty_json().unwrap());
 }
 
 #[test]

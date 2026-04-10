@@ -187,6 +187,8 @@ fn criterion_config() -> Criterion {
 
 // ─── 1. Point lookup ────────────────────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_point_lookup(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_point_lookup");
     group.sample_size(50);
@@ -227,6 +229,8 @@ fn bench_point_lookup(c: &mut Criterion) {
 
 // ─── 2. Range scan ──────────────────────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_range_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_range_scan_50");
     group.sample_size(50);
@@ -268,6 +272,8 @@ fn bench_range_scan(c: &mut Criterion) {
 
 // ─── 3. Full-table aggregate ────────────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_full_count(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_count_star");
     group.sample_size(50);
@@ -295,6 +301,8 @@ fn bench_full_count(c: &mut Criterion) {
     group.finish();
 }
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_full_count_large(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_count_star_10000");
     group.sample_size(30);
@@ -322,6 +330,8 @@ fn bench_full_count_large(c: &mut Criterion) {
     group.finish();
 }
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_count_range(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_count_range_50");
     group.sample_size(50);
@@ -357,6 +367,8 @@ fn bench_count_range(c: &mut Criterion) {
     group.finish();
 }
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_count_sum_aggregate(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_count_sum_aggregate");
     group.sample_size(50);
@@ -397,6 +409,8 @@ fn bench_count_sum_aggregate(c: &mut Criterion) {
 
 // ─── 4. GROUP BY aggregate ──────────────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_group_by(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_group_by");
     group.sample_size(50);
@@ -440,6 +454,8 @@ fn bench_group_by(c: &mut Criterion) {
 
 // ─── 5. ORDER BY + LIMIT ───────────────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_order_limit(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_order_limit_10");
     group.sample_size(50);
@@ -475,6 +491,8 @@ fn bench_order_limit(c: &mut Criterion) {
     group.finish();
 }
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_exists_subquery(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_exists_subquery_count");
     group.sample_size(30);
@@ -509,6 +527,8 @@ fn bench_exists_subquery(c: &mut Criterion) {
     group.finish();
 }
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_in_subquery(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_in_subquery_count");
     group.sample_size(30);
@@ -539,6 +559,8 @@ fn bench_in_subquery(c: &mut Criterion) {
     group.finish();
 }
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_recursive_cte(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_recursive_cte_sum_1000");
     group.sample_size(30);

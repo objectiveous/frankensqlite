@@ -22,6 +22,8 @@ pub const DEFAULT_REGRESSION_THRESHOLD: f64 = 0.10;
 
 /// Schema version for the operation baseline JSON format.
 pub const BASELINE_SCHEMA_V1: &str = "fsqlite-e2e.operation_baseline.v1";
+/// Schema version for structured benchmark-recovery slice reports.
+pub const BENCHMARK_RECOVERY_REPORT_SCHEMA_V1: &str = "fsqlite-e2e.benchmark_recovery_report.v1";
 
 /// Baseline directory relative to the workspace root.
 pub const BASELINE_DIR: &str = "baselines/operations";
@@ -199,6 +201,395 @@ impl BaselineReport {
 
         results
     }
+}
+
+/// Probe IDs for benchmark-catastrophe recovery slices that need explicit
+/// operator-facing pass/fail evaluation rather than raw log lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkRecoveryProbeId {
+    /// `manual_perf_probe.read_guard_shapes.in_subquery`
+    InSubquery10kLatency,
+    /// `manual_hot_path_profile.in_subquery_100k`
+    InSubquery100kWallTime,
+}
+
+impl BenchmarkRecoveryProbeId {
+    #[must_use]
+    pub const fn display_name(&self) -> &'static str {
+        match self {
+            Self::InSubquery10kLatency => "in_subquery_10k_latency",
+            Self::InSubquery100kWallTime => "in_subquery_100k_wall_time",
+        }
+    }
+
+    #[must_use]
+    pub const fn evidence_label(&self) -> &'static str {
+        match self {
+            Self::InSubquery10kLatency => "manual_perf_probe.read_guard_shapes.in_subquery",
+            Self::InSubquery100kWallTime => "manual_hot_path_profile.in_subquery_100k",
+        }
+    }
+}
+
+/// Contract threshold for one benchmark recovery probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchmarkRecoveryThreshold {
+    pub probe_id: BenchmarkRecoveryProbeId,
+    pub target_summary: String,
+    pub legacy_anchor: String,
+    pub max_p50_micros: Option<u64>,
+    pub max_p95_micros: Option<u64>,
+    pub max_wall_time_micros: Option<u64>,
+    pub hard_fail_wall_time_micros: Option<u64>,
+}
+
+/// Captured benchmark measurement for one recovery probe.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BenchmarkRecoveryMeasurement {
+    pub probe_id: BenchmarkRecoveryProbeId,
+    pub evidence_label: String,
+    pub row_count: u64,
+    pub p50_micros: Option<u64>,
+    pub p95_micros: Option<u64>,
+    pub throughput_ops_per_sec: Option<f64>,
+    pub wall_time_micros: Option<u64>,
+}
+
+impl BenchmarkRecoveryMeasurement {
+    #[must_use]
+    pub fn latency_probe(
+        probe_id: BenchmarkRecoveryProbeId,
+        row_count: u64,
+        p50_micros: u64,
+        p95_micros: u64,
+        throughput_ops_per_sec: f64,
+    ) -> Self {
+        Self {
+            probe_id,
+            evidence_label: probe_id.evidence_label().to_owned(),
+            row_count,
+            p50_micros: Some(p50_micros),
+            p95_micros: Some(p95_micros),
+            throughput_ops_per_sec: Some(throughput_ops_per_sec),
+            wall_time_micros: None,
+        }
+    }
+
+    #[must_use]
+    pub fn wall_time_probe(
+        probe_id: BenchmarkRecoveryProbeId,
+        row_count: u64,
+        wall_time_micros: u64,
+    ) -> Self {
+        Self {
+            probe_id,
+            evidence_label: probe_id.evidence_label().to_owned(),
+            row_count,
+            p50_micros: None,
+            p95_micros: None,
+            throughput_ops_per_sec: None,
+            wall_time_micros: Some(wall_time_micros),
+        }
+    }
+}
+
+/// Outcome for a benchmark recovery probe against its declared threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkRecoveryStatus {
+    Passed,
+    Failed,
+    HardFail,
+}
+
+impl BenchmarkRecoveryStatus {
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::HardFail => "hard_fail",
+        }
+    }
+}
+
+/// Evaluation record for one captured recovery probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchmarkRecoveryAssessment {
+    pub probe_id: BenchmarkRecoveryProbeId,
+    pub status: BenchmarkRecoveryStatus,
+    pub findings: Vec<String>,
+}
+
+/// Structured artifact for one benchmark-catastrophe recovery slice.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkRecoveryReport {
+    pub schema_version: String,
+    pub bead_id: String,
+    pub slice_id: String,
+    pub captured_at: String,
+    pub methodology: MethodologyMeta,
+    pub environment: EnvironmentMeta,
+    pub thresholds: Vec<BenchmarkRecoveryThreshold>,
+    pub measurements: Vec<BenchmarkRecoveryMeasurement>,
+    pub assessments: Vec<BenchmarkRecoveryAssessment>,
+}
+
+impl BenchmarkRecoveryReport {
+    /// Serialize the report as pretty JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails.
+    pub fn to_pretty_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+}
+
+/// Threshold pack for the `bd-wwqen` IN-subquery catastrophe-recovery slice.
+///
+/// This codifies the operator note from the benchmark catastrophe rerun:
+/// the 10k residual must get back below the sub-millisecond band, and the
+/// 100k catastrophe shape must stop living in the seconds range.
+#[must_use]
+pub fn bd_wwqen_in_subquery_recovery_thresholds() -> Vec<BenchmarkRecoveryThreshold> {
+    vec![
+        BenchmarkRecoveryThreshold {
+            probe_id: BenchmarkRecoveryProbeId::InSubquery10kLatency,
+            target_summary: "PASS if p50 < 500us and p95 < 800us".to_owned(),
+            legacy_anchor:
+                "2026-03-26 residual anchor: p50=3760us p95=4429us throughput=266 ops/sec"
+                    .to_owned(),
+            max_p50_micros: Some(500),
+            max_p95_micros: Some(800),
+            max_wall_time_micros: None,
+            hard_fail_wall_time_micros: None,
+        },
+        BenchmarkRecoveryThreshold {
+            probe_id: BenchmarkRecoveryProbeId::InSubquery100kWallTime,
+            target_summary: "PASS if wall < 200ms; HARD FAIL if wall > 5s".to_owned(),
+            legacy_anchor: "2026-03-26 catastrophe anchor: ~20s wall time at 100k rows".to_owned(),
+            max_p50_micros: None,
+            max_p95_micros: None,
+            max_wall_time_micros: Some(200_000),
+            hard_fail_wall_time_micros: Some(5_000_000),
+        },
+    ]
+}
+
+fn evaluate_benchmark_recovery_probe(
+    threshold: &BenchmarkRecoveryThreshold,
+    measurement: &BenchmarkRecoveryMeasurement,
+) -> BenchmarkRecoveryAssessment {
+    let mut status = BenchmarkRecoveryStatus::Passed;
+    let mut findings = Vec::new();
+
+    if let Some(max_p50_micros) = threshold.max_p50_micros {
+        match measurement.p50_micros {
+            Some(value) if value <= max_p50_micros => findings.push(format!(
+                "p50 {}us is within the {}us target",
+                value, max_p50_micros
+            )),
+            Some(value) => {
+                status = BenchmarkRecoveryStatus::Failed;
+                findings.push(format!(
+                    "p50 {}us exceeds the {}us target",
+                    value, max_p50_micros
+                ));
+            }
+            None => {
+                status = BenchmarkRecoveryStatus::Failed;
+                findings.push("missing p50 measurement for this recovery probe".to_owned());
+            }
+        }
+    }
+
+    if let Some(max_p95_micros) = threshold.max_p95_micros {
+        match measurement.p95_micros {
+            Some(value) if value <= max_p95_micros => findings.push(format!(
+                "p95 {}us is within the {}us target",
+                value, max_p95_micros
+            )),
+            Some(value) => {
+                status = BenchmarkRecoveryStatus::Failed;
+                findings.push(format!(
+                    "p95 {}us exceeds the {}us target",
+                    value, max_p95_micros
+                ));
+            }
+            None => {
+                status = BenchmarkRecoveryStatus::Failed;
+                findings.push("missing p95 measurement for this recovery probe".to_owned());
+            }
+        }
+    }
+
+    if let Some(max_wall_time_micros) = threshold.max_wall_time_micros {
+        match measurement.wall_time_micros {
+            Some(value) if value <= max_wall_time_micros => findings.push(format!(
+                "wall {}us is within the {}us pass target",
+                value, max_wall_time_micros
+            )),
+            Some(value) => {
+                if status == BenchmarkRecoveryStatus::Passed {
+                    status = BenchmarkRecoveryStatus::Failed;
+                }
+                findings.push(format!(
+                    "wall {}us exceeds the {}us pass target",
+                    value, max_wall_time_micros
+                ));
+            }
+            None => {
+                if status == BenchmarkRecoveryStatus::Passed {
+                    status = BenchmarkRecoveryStatus::Failed;
+                }
+                findings.push("missing wall-time measurement for this recovery probe".to_owned());
+            }
+        }
+    }
+
+    if let Some(hard_fail_wall_time_micros) = threshold.hard_fail_wall_time_micros {
+        if let Some(value) = measurement.wall_time_micros {
+            if value > hard_fail_wall_time_micros {
+                status = BenchmarkRecoveryStatus::HardFail;
+                findings.push(format!(
+                    "wall {}us breaches the {}us hard-fail ceiling",
+                    value, hard_fail_wall_time_micros
+                ));
+            }
+        }
+    }
+
+    BenchmarkRecoveryAssessment {
+        probe_id: measurement.probe_id,
+        status,
+        findings,
+    }
+}
+
+/// Evaluate a partial or complete `bd-wwqen` IN-subquery recovery slice.
+///
+/// The caller can pass just the probes collected in one manual rerun; the
+/// report will assess only those measurements while still carrying the full
+/// declared threshold contract for the slice.
+#[must_use]
+pub fn evaluate_bd_wwqen_in_subquery_recovery(
+    cargo_profile: &str,
+    measurements: Vec<BenchmarkRecoveryMeasurement>,
+) -> BenchmarkRecoveryReport {
+    let thresholds = bd_wwqen_in_subquery_recovery_thresholds();
+    let assessments = measurements
+        .iter()
+        .filter_map(|measurement| {
+            thresholds
+                .iter()
+                .find(|threshold| threshold.probe_id == measurement.probe_id)
+                .map(|threshold| evaluate_benchmark_recovery_probe(threshold, measurement))
+        })
+        .collect();
+
+    BenchmarkRecoveryReport {
+        schema_version: BENCHMARK_RECOVERY_REPORT_SCHEMA_V1.to_owned(),
+        bead_id: "bd-wwqen".to_owned(),
+        slice_id: "in_subquery_catastrophe_recovery".to_owned(),
+        captured_at: now_iso8601(),
+        methodology: MethodologyMeta::current(),
+        environment: EnvironmentMeta::capture(cargo_profile),
+        thresholds,
+        measurements,
+        assessments,
+    }
+}
+
+/// Render a benchmark-recovery slice report as operator-facing markdown.
+#[must_use]
+pub fn render_benchmark_recovery_markdown(report: &BenchmarkRecoveryReport) -> String {
+    let mut out = String::with_capacity(2048);
+    let _ = std::fmt::Write::write_str(&mut out, "# Benchmark Recovery Slice\n\n");
+    let _ = std::fmt::Write::write_fmt(
+        &mut out,
+        format_args!(
+            "- Bead: `{}`\n- Slice: `{}`\n- Schema: `{}`\n- Captured at: `{}`\n- Cargo profile: `{}`\n\n",
+            report.bead_id,
+            report.slice_id,
+            report.schema_version,
+            report.captured_at,
+            report.environment.cargo_profile
+        ),
+    );
+    let _ = std::fmt::Write::write_str(&mut out, "## Thresholds\n\n");
+    for threshold in &report.thresholds {
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "- `{}`: {}. Legacy anchor: {}.\n",
+                threshold.probe_id.display_name(),
+                threshold.target_summary,
+                threshold.legacy_anchor
+            ),
+        );
+    }
+    let _ = std::fmt::Write::write_str(&mut out, "\n## Measurements\n\n");
+    if report.measurements.is_empty() {
+        let _ = std::fmt::Write::write_str(
+            &mut out,
+            "- No measurements were recorded for this recovery slice.\n",
+        );
+    } else {
+        for measurement in &report.measurements {
+            let p50 = measurement
+                .p50_micros
+                .map_or_else(|| "-".to_owned(), |value| format!("{value}us"));
+            let p95 = measurement
+                .p95_micros
+                .map_or_else(|| "-".to_owned(), |value| format!("{value}us"));
+            let throughput = measurement
+                .throughput_ops_per_sec
+                .map_or_else(|| "-".to_owned(), |value| format!("{value:.1} ops/sec"));
+            let wall = measurement
+                .wall_time_micros
+                .map_or_else(|| "-".to_owned(), |value| format!("{value}us"));
+            let _ = std::fmt::Write::write_fmt(
+                &mut out,
+                format_args!(
+                    "- `{}` from `{}`: rows={} p50={} p95={} throughput={} wall={}\n",
+                    measurement.probe_id.display_name(),
+                    measurement.evidence_label,
+                    measurement.row_count,
+                    p50,
+                    p95,
+                    throughput,
+                    wall
+                ),
+            );
+        }
+    }
+    let _ = std::fmt::Write::write_str(&mut out, "\n## Assessment\n\n");
+    if report.assessments.is_empty() {
+        let _ = std::fmt::Write::write_str(
+            &mut out,
+            "- No assessments were produced because no matching recovery probes were provided.\n",
+        );
+    } else {
+        for assessment in &report.assessments {
+            let finding_summary = if assessment.findings.is_empty() {
+                "no findings".to_owned()
+            } else {
+                assessment.findings.join("; ")
+            };
+            let _ = std::fmt::Write::write_fmt(
+                &mut out,
+                format_args!(
+                    "- `{}`: {}. {}\n",
+                    assessment.probe_id.display_name(),
+                    assessment.status.label(),
+                    finding_summary
+                ),
+            );
+        }
+    }
+    out
 }
 
 /// Result of comparing one operation's baseline against current measurements.
@@ -542,6 +933,120 @@ mod tests {
         assert_eq!(percentile(&[42], 50), 42);
         assert_eq!(percentile(&[10, 20, 30, 40, 50], 0), 10);
         assert_eq!(percentile(&[10, 20, 30, 40, 50], 100), 50);
+    }
+
+    #[test]
+    fn bd_wwqen_in_subquery_recovery_threshold_pack_matches_operator_contract() {
+        let thresholds = bd_wwqen_in_subquery_recovery_thresholds();
+        assert_eq!(thresholds.len(), 2);
+        assert_eq!(
+            thresholds[0].probe_id,
+            BenchmarkRecoveryProbeId::InSubquery10kLatency
+        );
+        assert_eq!(thresholds[0].max_p50_micros, Some(500));
+        assert_eq!(thresholds[0].max_p95_micros, Some(800));
+        assert!(
+            thresholds[0]
+                .legacy_anchor
+                .contains("p50=3760us p95=4429us throughput=266 ops/sec")
+        );
+        assert_eq!(
+            thresholds[1].probe_id,
+            BenchmarkRecoveryProbeId::InSubquery100kWallTime
+        );
+        assert_eq!(thresholds[1].max_wall_time_micros, Some(200_000));
+        assert_eq!(thresholds[1].hard_fail_wall_time_micros, Some(5_000_000));
+        assert!(thresholds[1].legacy_anchor.contains("~20s wall time"));
+    }
+
+    #[test]
+    fn benchmark_recovery_report_evaluates_pass_fail_and_hard_fail() {
+        let pass_report = evaluate_bd_wwqen_in_subquery_recovery(
+            "test",
+            vec![BenchmarkRecoveryMeasurement::latency_probe(
+                BenchmarkRecoveryProbeId::InSubquery10kLatency,
+                10_000,
+                420,
+                700,
+                2_500.0,
+            )],
+        );
+        assert_eq!(pass_report.assessments.len(), 1);
+        assert_eq!(
+            pass_report.assessments[0].status,
+            BenchmarkRecoveryStatus::Passed
+        );
+
+        let fail_report = evaluate_bd_wwqen_in_subquery_recovery(
+            "test",
+            vec![BenchmarkRecoveryMeasurement::latency_probe(
+                BenchmarkRecoveryProbeId::InSubquery10kLatency,
+                10_000,
+                900,
+                1_100,
+                1_000.0,
+            )],
+        );
+        assert_eq!(fail_report.assessments.len(), 1);
+        assert_eq!(
+            fail_report.assessments[0].status,
+            BenchmarkRecoveryStatus::Failed
+        );
+        assert!(
+            fail_report.assessments[0]
+                .findings
+                .iter()
+                .any(|finding| finding.contains("exceeds the 500us target"))
+        );
+
+        let hard_fail_report = evaluate_bd_wwqen_in_subquery_recovery(
+            "test",
+            vec![BenchmarkRecoveryMeasurement::wall_time_probe(
+                BenchmarkRecoveryProbeId::InSubquery100kWallTime,
+                100_000,
+                6_000_000,
+            )],
+        );
+        assert_eq!(hard_fail_report.assessments.len(), 1);
+        assert_eq!(
+            hard_fail_report.assessments[0].status,
+            BenchmarkRecoveryStatus::HardFail
+        );
+        assert!(
+            hard_fail_report.assessments[0]
+                .findings
+                .iter()
+                .any(|finding| finding.contains("hard-fail ceiling"))
+        );
+    }
+
+    #[test]
+    fn benchmark_recovery_markdown_renders_contract_and_results() {
+        let report = evaluate_bd_wwqen_in_subquery_recovery(
+            "test",
+            vec![
+                BenchmarkRecoveryMeasurement::latency_probe(
+                    BenchmarkRecoveryProbeId::InSubquery10kLatency,
+                    10_000,
+                    420,
+                    700,
+                    2_500.0,
+                ),
+                BenchmarkRecoveryMeasurement::wall_time_probe(
+                    BenchmarkRecoveryProbeId::InSubquery100kWallTime,
+                    100_000,
+                    250_000,
+                ),
+            ],
+        );
+        let markdown = render_benchmark_recovery_markdown(&report);
+        assert!(markdown.contains("# Benchmark Recovery Slice"));
+        assert!(markdown.contains("in_subquery_10k_latency"));
+        assert!(markdown.contains("in_subquery_100k_wall_time"));
+        assert!(markdown.contains("PASS if p50 < 500us and p95 < 800us"));
+        assert!(markdown.contains("PASS if wall < 200ms; HARD FAIL if wall > 5s"));
+        assert!(markdown.contains("passed"));
+        assert!(markdown.contains("failed"));
     }
 
     #[test]

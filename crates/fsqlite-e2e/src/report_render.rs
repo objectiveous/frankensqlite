@@ -25,6 +25,9 @@ use crate::benchmark::{
     BenchmarkCausalChainLink, BenchmarkCausalScorecard, BenchmarkSummary,
     build_benchmark_causal_scorecard_report,
 };
+use crate::overlay_honesty_gate::{
+    BenchmarkHonestGateClassification, build_benchmark_honest_gate_report,
+};
 use crate::perf_runner::{CellOutcome, PerfResult};
 use crate::report::RunRecordV1;
 
@@ -71,6 +74,10 @@ fn ratio_string(numerator: Option<f64>, denominator: Option<f64>) -> String {
         }
         _ => "-".to_owned(),
     }
+}
+
+fn format_ratio_value(value: Option<f64>) -> String {
+    value.map_or_else(|| "-".to_owned(), |ratio| format!("{ratio:.2}x"))
 }
 
 fn scorecard_mode_label(scorecard: &BenchmarkCausalScorecard) -> &str {
@@ -332,6 +339,30 @@ pub fn render_benchmark_summaries_markdown(summaries: &[BenchmarkSummary]) -> St
     let _ = writeln!(out, "- **rustc:** {}", env.rustc_version);
     let _ = writeln!(out, "- **Profile:** {}\n", env.cargo_profile);
 
+    let _ = writeln!(out, "## Mandatory Perf Checklist\n");
+    let _ = writeln!(
+        out,
+        "- [ ] Confirm every compared row uses the declared methodology version `{}` and that any build-profile or placement differences are disclosed before calling rows directly comparable.",
+        meth.version
+    );
+    let _ = writeln!(
+        out,
+        "- [ ] Confirm the published bundle includes `summary.md`, `results.jsonl`, `scorecards.json`, and the row-level manifests before citing a wall-time or throughput claim."
+    );
+    let _ = writeln!(
+        out,
+        "- [ ] Confirm each optimization claim names the comparator row and causal-chain step that supports it; if the bridge row is missing, keep the negative finding in the report."
+    );
+    let _ = writeln!(
+        out,
+        "- [ ] Confirm retry policy, placement, and row identity are recorded for each comparison group so counter deltas can be matched up mechanically."
+    );
+    let _ = writeln!(
+        out,
+        "- [ ] Confirm regressions or advisory-only rows remain visible in the final report instead of being filtered out of the scorecard narrative."
+    );
+    let _ = writeln!(out);
+
     let mut comparison_groups: BTreeMap<FixtureWorkloadConcurrencyKey, Vec<&BenchmarkSummary>> =
         BTreeMap::new();
     for summary in summaries {
@@ -347,6 +378,93 @@ pub fn render_benchmark_summaries_markdown(summaries: &[BenchmarkSummary]) -> St
         .iter()
         .filter(|(_, group)| group.len() > 1)
         .collect::<Vec<_>>();
+    if let Some(honest_gate) = build_benchmark_honest_gate_report(summaries) {
+        let _ = writeln!(out, "## Critical Benchmark Gates\n");
+        let _ = writeln!(
+            out,
+            "- **Verdict:** {}",
+            honest_gate.honest_gate_summary.verdict
+        );
+        let _ = writeln!(
+            out,
+            "- **Healthy margin threshold:** {:.2}x throughput vs same-row sqlite_reference",
+            honest_gate.healthy_margin_min
+        );
+        let _ = writeln!(
+            out,
+            "- **Aggregate rows are secondary:** {}",
+            honest_gate.aggregate_rows_are_secondary
+        );
+        let _ = writeln!(
+            out,
+            "- **Critical surfaces are primary:** {}\n",
+            honest_gate.critical_surface_primary
+        );
+        let _ = writeln!(
+            out,
+            "| Surface | Verdict | Expected | Present | Comparable | Red | Margin | Missing Baseline |"
+        );
+        let _ = writeln!(
+            out,
+            "|---------|---------|----------|---------|------------|-----|--------|------------------|"
+        );
+        for surface in &honest_gate.surfaces {
+            let red_count = surface.below_parity_count + surface.tail_slower_than_sqlite_count;
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} | {} | {} | {} |",
+                surface.surface_id,
+                surface.verdict,
+                surface.expected_critical_row_count,
+                surface.critical_row_count,
+                surface.comparable_row_count,
+                red_count,
+                surface.parity_to_margin_count,
+                surface.missing_baseline_count,
+            );
+        }
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "| Surface | Row | Throughput vs sqlite | Median Latency vs sqlite | p95 vs sqlite | p99 vs sqlite | Verdict | Retries | Aborts |"
+        );
+        let _ = writeln!(
+            out,
+            "|---------|-----|----------------------|---------------------------|---------------|---------------|---------|---------|--------|"
+        );
+        for row in &honest_gate.rows {
+            let row_label = row
+                .cell_key
+                .row_id
+                .clone()
+                .unwrap_or_else(|| row.cell_key.benchmark_id.clone());
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                row.surface_id,
+                row_label,
+                format_ratio_value(row.throughput_ratio_vs_sqlite),
+                format_ratio_value(row.median_latency_ratio_vs_sqlite),
+                format_ratio_value(row.p95_latency_ratio_vs_sqlite),
+                format_ratio_value(row.p99_latency_ratio_vs_sqlite),
+                row.classification,
+                row.retries_total,
+                row.aborts_total,
+            );
+        }
+        let _ = writeln!(out);
+        if honest_gate.rows.iter().any(|row| {
+            matches!(
+                row.classification,
+                BenchmarkHonestGateClassification::TailSlowerThanSqlite
+            )
+        }) {
+            let _ = writeln!(
+                out,
+                "- Persistent high-thread rows stay red when throughput clears parity but p95/p99 remain slower than same-row sqlite_reference.\n"
+            );
+        }
+    }
     if !comparison_sections.is_empty() {
         let _ = writeln!(out, "## Direct Comparison\n");
         for ((fixture_id, workload, concurrency), group) in comparison_sections {
@@ -1211,6 +1329,7 @@ mod tests {
         assert!(md.contains("# Benchmark Report"));
         assert!(md.contains("## Methodology"));
         assert!(md.contains("## Environment"));
+        assert!(md.contains("## Mandatory Perf Checklist"));
         assert!(md.contains("## Summary"));
         assert!(md.contains("sqlite3:inserts:db-a:c4"));
         assert!(md.contains("Latency (ms)"));
@@ -1230,6 +1349,67 @@ mod tests {
         assert!(md.contains("mvcc_concurrency_routing"));
         assert!(md.contains("Share of Total Gain"));
         assert!(md.contains("Counter deltas"));
+        assert!(md.contains("Confirm each optimization claim names the comparator row"));
+    }
+
+    #[test]
+    fn render_benchmark_summaries_surfaces_critical_benchmark_gates() {
+        let mut c1_sqlite = make_benchmark_summary(
+            "sqlite_reference",
+            "fixture",
+            "commutative_inserts_disjoint_keys",
+            1,
+        );
+        c1_sqlite.throughput.median_ops_per_sec = 100.0;
+        c1_sqlite.latency.median_ms = 1.0;
+        c1_sqlite.latency.p95_ms = 1.0;
+        c1_sqlite.latency.p99_ms = 1.0;
+
+        let mut c1_mvcc = make_benchmark_summary(
+            "fsqlite_mvcc",
+            "fixture",
+            "commutative_inserts_disjoint_keys",
+            1,
+        );
+        c1_mvcc.throughput.median_ops_per_sec = 80.0;
+        c1_mvcc.latency.median_ms = 1.2;
+        c1_mvcc.latency.p95_ms = 1.3;
+        c1_mvcc.latency.p99_ms = 1.4;
+
+        let mut persistent_sqlite = make_benchmark_summary(
+            "sqlite_reference",
+            "fixture",
+            "persistent_concurrent_write_16t",
+            16,
+        );
+        persistent_sqlite.throughput.median_ops_per_sec = 100.0;
+        persistent_sqlite.latency.median_ms = 1.0;
+        persistent_sqlite.latency.p95_ms = 1.0;
+        persistent_sqlite.latency.p99_ms = 1.0;
+
+        let mut persistent_mvcc = make_benchmark_summary(
+            "fsqlite_mvcc",
+            "fixture",
+            "persistent_concurrent_write_16t",
+            16,
+        );
+        persistent_mvcc.throughput.median_ops_per_sec = 120.0;
+        persistent_mvcc.latency.median_ms = 2.0;
+        persistent_mvcc.latency.p95_ms = 3.0;
+        persistent_mvcc.latency.p99_ms = 4.0;
+
+        let md = render_benchmark_summaries_markdown(&[
+            c1_sqlite,
+            c1_mvcc,
+            persistent_sqlite,
+            persistent_mvcc,
+        ]);
+
+        assert!(md.contains("## Critical Benchmark Gates"));
+        assert!(md.contains("c1_fixed_tax"));
+        assert!(md.contains("persistent_concurrent_write_16t"));
+        assert!(md.contains("below_parity"));
+        assert!(md.contains("tail_slower_than_sqlite"));
     }
 
     #[test]

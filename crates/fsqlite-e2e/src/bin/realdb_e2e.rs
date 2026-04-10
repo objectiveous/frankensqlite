@@ -52,6 +52,13 @@ use fsqlite_e2e::golden::{format_mismatch_diagnostic, verify_databases};
 use fsqlite_e2e::methodology::{EnvironmentMeta, MethodologyMeta};
 use fsqlite_e2e::oplog::{self, OpLog};
 #[cfg(test)]
+use fsqlite_e2e::overlay_honesty_gate::{
+    BENCHMARK_HONEST_GATE_SCHEMA_V1, BenchmarkHonestGateClassification, OverlayGateVerdict,
+};
+use fsqlite_e2e::overlay_honesty_gate::{
+    BenchmarkHonestGateReport, build_benchmark_honest_gate_report,
+};
+#[cfg(test)]
 use fsqlite_e2e::perf_runner::HotPathConnectionCeremonyProfile;
 use fsqlite_e2e::perf_runner::{
     FsqliteHotPathProfileConfig, HotPathArtifactFile, HotPathArtifactManifest,
@@ -79,7 +86,7 @@ const VERIFY_SUITE_FOCUSED_RERUN_NAME: &str = "focused_rerun_entrypoint.sh";
 const VERIFY_SUITE_LOG_NAME: &str = "logs/verify_suite.jsonl";
 const VERIFY_SUITE_COUNTEREXAMPLE_NAME: &str = "counterexamples/shadow_counterexample_bundle.json";
 const DEFAULT_VERIFY_SUITE_ID: &str = "db300_verification";
-const BENCHMARK_EVIDENCE_PACK_SCHEMA_V1: &str = "fsqlite-e2e.benchmark_evidence_pack.v1";
+const BENCHMARK_EVIDENCE_PACK_SCHEMA_V2: &str = "fsqlite-e2e.benchmark_evidence_pack.v2";
 const BENCHMARK_EVIDENCE_PACK_BEAD_ID: &str = "bd-db300.7.7";
 const BENCHMARK_EVIDENCE_PACK_MANIFEST_NAME: &str = "manifest.json";
 const BENCHMARK_EVIDENCE_PACK_RESULTS_NAME: &str = "bench/results.jsonl";
@@ -369,8 +376,33 @@ struct BenchMatrixSelection {
     fixture_ids: Vec<String>,
     presets: Vec<String>,
     concurrency: Vec<u16>,
+    placement_profile_ids: Vec<String>,
+    storage_profile: BenchStorageProfile,
     workspace_root: Option<PathBuf>,
     canonical_fixture_paths: HashMap<String, PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchStorageProfile {
+    FileBacked,
+    Memory,
+}
+
+impl BenchStorageProfile {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::FileBacked => "file_backed",
+            Self::Memory => "memory",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "file_backed" => Some(Self::FileBacked),
+            "memory" => Some(Self::Memory),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -601,6 +633,8 @@ struct BenchmarkEvidencePackManifest {
     scorecards_json_path: String,
     summary_count: usize,
     scorecard_group_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    honest_gate_report: Option<BenchmarkHonestGateReport>,
     row_artifacts: Vec<BenchmarkEvidencePackRowArtifact>,
     environment: Option<EnvironmentMeta>,
 }
@@ -634,6 +668,7 @@ fn resolve_canonical_benchmark_cell(
     campaign: &BeadsBenchmarkCampaign,
     summary: &BenchmarkSummary,
     mode: BenchmarkMode,
+    placement_profile_id: Option<&str>,
 ) -> Result<ExpandedBenchmarkCell, String> {
     let matching_rows = campaign
         .matrix_rows
@@ -674,17 +709,28 @@ fn resolve_canonical_benchmark_cell(
             ));
         }
     };
-    let placement = row
-        .placement_variants
-        .iter()
-        .find(|variant| variant.placement_profile_id == PLACEMENT_PROFILE_BASELINE_UNPINNED)
-        .or_else(|| {
-            row.placement_variants
-                .iter()
-                .find(|variant| variant.required)
-        })
-        .or_else(|| row.placement_variants.first())
-        .ok_or_else(|| format!("row `{}` has no placement variants", row.row_id))?;
+    let placement = if let Some(requested_placement_profile_id) = placement_profile_id {
+        row.placement_variants
+            .iter()
+            .find(|variant| variant.placement_profile_id == requested_placement_profile_id)
+            .ok_or_else(|| {
+                format!(
+                    "row `{}` does not define placement profile `{requested_placement_profile_id}`",
+                    row.row_id
+                )
+            })?
+    } else {
+        row.placement_variants
+            .iter()
+            .find(|variant| variant.placement_profile_id == PLACEMENT_PROFILE_BASELINE_UNPINNED)
+            .or_else(|| {
+                row.placement_variants
+                    .iter()
+                    .find(|variant| variant.required)
+            })
+            .or_else(|| row.placement_variants.first())
+            .ok_or_else(|| format!("row `{}` has no placement variants", row.row_id))?
+    };
     Ok(ExpandedBenchmarkCell {
         row_id: row.row_id.clone(),
         fixture_id: summary.fixture_id.clone(),
@@ -970,11 +1016,13 @@ fn write_benchmark_artifact_bundle(
 fn attach_canonical_benchmark_metadata(
     mut summary: BenchmarkSummary,
     context: &CanonicalBenchContext,
+    placement_profile_id: Option<&str>,
 ) -> Result<BenchmarkSummary, String> {
     let Some(mode) = benchmark_mode_from_engine_label(&summary.engine) else {
         return Ok(summary);
     };
-    let cell = resolve_canonical_benchmark_cell(&context.campaign, &summary, mode)?;
+    let cell =
+        resolve_canonical_benchmark_cell(&context.campaign, &summary, mode, placement_profile_id)?;
     let manifest = build_benchmark_artifact_manifest(
         &context.workspace_root,
         &context.campaign,
@@ -2365,6 +2413,8 @@ fn resolve_bench_matrix_selection(
     mut presets: Vec<String>,
     mut concurrency: Vec<u16>,
     concurrency_overridden: bool,
+    mut placement_profile_ids: Vec<String>,
+    storage_profile: BenchStorageProfile,
 ) -> Result<BenchMatrixSelection, String> {
     let needs_canonical_defaults = !golden_dir_overridden
         || !db_overridden
@@ -2418,11 +2468,22 @@ fn resolve_bench_matrix_selection(
         .filter(|defaults| golden_dir == defaults.golden_dir)
         .map_or_else(HashMap::new, |defaults| defaults.fixture_paths.clone());
 
+    if placement_profile_ids.is_empty() {
+        placement_profile_ids.push(PLACEMENT_PROFILE_BASELINE_UNPINNED.to_owned());
+    }
+    for placement_profile_id in &placement_profile_ids {
+        validate_verify_suite_placement_profile(placement_profile_id)?;
+    }
+    placement_profile_ids.sort();
+    placement_profile_ids.dedup();
+
     Ok(BenchMatrixSelection {
         golden_dir,
         fixture_ids,
         presets,
         concurrency,
+        placement_profile_ids,
+        storage_profile,
         workspace_root,
         canonical_fixture_paths,
     })
@@ -2470,85 +2531,113 @@ fn execute_benchmark_matrix(
 
         for preset in &request.selection.presets {
             for &concurrency in &request.selection.concurrency {
-                for lane in request.lanes {
-                    let meta = BenchmarkMeta {
-                        engine: lane.engine_label.to_owned(),
-                        workload: preset.to_owned(),
-                        fixture_id: fixture_id.to_owned(),
-                        concurrency,
-                        cargo_profile: request.cargo_profile.to_owned(),
-                    };
+                for placement_profile_id in &request.selection.placement_profile_ids {
+                    for lane in request.lanes {
+                        let meta = BenchmarkMeta {
+                            engine: lane.engine_label.to_owned(),
+                            workload: preset.to_owned(),
+                            fixture_id: fixture_id.to_owned(),
+                            concurrency,
+                            cargo_profile: request.cargo_profile.to_owned(),
+                        };
 
-                    let sqlite_cfg = SqliteExecConfig {
-                        run_integrity_check: false,
-                        ..SqliteExecConfig::default()
-                    };
-                    let fsqlite_cfg = FsqliteExecConfig {
-                        concurrent_mode: lane.fsqlite_mvcc,
-                        run_integrity_check: false,
-                        ..FsqliteExecConfig::default()
-                    };
+                        let sqlite_cfg = SqliteExecConfig {
+                            run_integrity_check: false,
+                            ..SqliteExecConfig::default()
+                        };
+                        let fsqlite_cfg = FsqliteExecConfig {
+                            concurrent_mode: lane.fsqlite_mvcc,
+                            run_integrity_check: false,
+                            ..FsqliteExecConfig::default()
+                        };
 
-                    let mut summary = run_benchmark(request.bench_cfg, &meta, |global_idx| {
-                        let _ = global_idx;
-                        let tempdir = tempfile::tempdir()
-                            .map_err(|error| format!("failed to create temp dir: {error}"))?;
-                        let work_db = tempdir.path().join("work.db");
-                        copy_db_with_sidecars(&golden_path, &work_db)?;
+                        let mut summary = run_benchmark(request.bench_cfg, &meta, |global_idx| {
+                            let _ = global_idx;
+                            let oplog = resolve_workload(preset, fixture_id, concurrency)?;
+                            match request.selection.storage_profile {
+                                BenchStorageProfile::FileBacked => {
+                                    let tempdir = tempfile::tempdir().map_err(|error| {
+                                        format!("failed to create temp dir: {error}")
+                                    })?;
+                                    let work_db = tempdir.path().join("work.db");
+                                    copy_db_with_sidecars(&golden_path, &work_db)?;
 
-                        let oplog = resolve_workload(preset, fixture_id, concurrency)?;
-
-                        if lane.engine_name == "sqlite3" {
-                            run_oplog_sqlite(&work_db, &oplog, &sqlite_cfg)
-                                .map_err(|error| format!("{error}"))
-                        } else {
-                            run_oplog_fsqlite(&work_db, &oplog, &fsqlite_cfg)
-                                .map_err(|error| format!("{error}"))
-                        }
-                    });
-                    if let Some(context) = request.canonical_context {
-                        match attach_canonical_benchmark_metadata(summary.clone(), context) {
-                            Ok(enriched) => summary = enriched,
-                            Err(error) => {
-                                eprintln!(
-                                    "warning: failed to attach canonical benchmark metadata for {}:{}:{}:c{}: {error}",
-                                    lane.engine_label, preset, fixture_id, concurrency
-                                );
+                                    if lane.engine_name == "sqlite3" {
+                                        run_oplog_sqlite(&work_db, &oplog, &sqlite_cfg)
+                                            .map_err(|error| format!("{error}"))
+                                    } else {
+                                        run_oplog_fsqlite(&work_db, &oplog, &fsqlite_cfg)
+                                            .map_err(|error| format!("{error}"))
+                                    }
+                                }
+                                BenchStorageProfile::Memory => {
+                                    if lane.engine_name == "sqlite3" {
+                                        run_oplog_sqlite(Path::new(":memory:"), &oplog, &sqlite_cfg)
+                                            .map_err(|error| format!("{error}"))
+                                    } else {
+                                        run_oplog_fsqlite(
+                                            Path::new(":memory:"),
+                                            &oplog,
+                                            &fsqlite_cfg,
+                                        )
+                                        .map_err(|error| format!("{error}"))
+                                    }
+                                }
+                            }
+                        });
+                        if let Some(context) = request.canonical_context {
+                            match attach_canonical_benchmark_metadata(
+                                summary.clone(),
+                                context,
+                                Some(placement_profile_id),
+                            ) {
+                                Ok(enriched) => summary = enriched,
+                                Err(error) => {
+                                    eprintln!(
+                                        "warning: failed to attach canonical benchmark metadata for {}:{}:{}:c{} placement={} storage={}: {error}",
+                                        lane.engine_label,
+                                        preset,
+                                        fixture_id,
+                                        concurrency,
+                                        placement_profile_id,
+                                        request.selection.storage_profile.as_str()
+                                    );
+                                }
                             }
                         }
+
+                        outcome.any_iteration_error |= summary
+                            .iterations
+                            .iter()
+                            .any(|iteration| iteration.error.is_some());
+
+                        if let Some(path) = request.output_jsonl {
+                            let compact = summary.to_jsonl().map_err(|error| {
+                                format!("failed to serialize benchmark for JSONL output: {error}")
+                            })?;
+                            append_jsonl_line(path, &compact).map_err(|error| {
+                                format!(
+                                    "failed to append benchmark JSONL output {}: {error}",
+                                    path.display()
+                                )
+                            })?;
+                        }
+
+                        if request.emit_stdout {
+                            let rendered = if request.pretty_stdout {
+                                summary
+                                    .to_pretty_json()
+                                    .map_err(|error| format!("serialize benchmark: {error}"))?
+                            } else {
+                                summary
+                                    .to_jsonl()
+                                    .map_err(|error| format!("serialize benchmark: {error}"))?
+                            };
+                            println!("{rendered}");
+                        }
+
+                        outcome.summaries.push(summary);
                     }
-
-                    outcome.any_iteration_error |= summary
-                        .iterations
-                        .iter()
-                        .any(|iteration| iteration.error.is_some());
-
-                    if let Some(path) = request.output_jsonl {
-                        let compact = summary.to_jsonl().map_err(|error| {
-                            format!("failed to serialize benchmark for JSONL output: {error}")
-                        })?;
-                        append_jsonl_line(path, &compact).map_err(|error| {
-                            format!(
-                                "failed to append benchmark JSONL output {}: {error}",
-                                path.display()
-                            )
-                        })?;
-                    }
-
-                    if request.emit_stdout {
-                        let rendered = if request.pretty_stdout {
-                            summary
-                                .to_pretty_json()
-                                .map_err(|error| format!("serialize benchmark: {error}"))?
-                        } else {
-                            summary
-                                .to_jsonl()
-                                .map_err(|error| format!("serialize benchmark: {error}"))?
-                        };
-                        println!("{rendered}");
-                    }
-
-                    outcome.summaries.push(summary);
                 }
             }
         }
@@ -2625,6 +2714,7 @@ fn write_benchmark_evidence_pack(
     write_output_file(&summary_path, summary_md.as_bytes())?;
 
     let scorecard_report = build_benchmark_causal_scorecard_report(summaries);
+    let honest_gate_report = build_benchmark_honest_gate_report(summaries);
     let scorecards_json = serde_json::to_vec_pretty(&scorecard_report)
         .map_err(|error| format!("serialize benchmark causal scorecards: {error}"))?;
     write_output_file(&scorecards_path, &scorecards_json)?;
@@ -2658,7 +2748,7 @@ fn write_benchmark_evidence_pack(
             .collect(),
     );
     let manifest = BenchmarkEvidencePackManifest {
-        schema_version: BENCHMARK_EVIDENCE_PACK_SCHEMA_V1.to_owned(),
+        schema_version: BENCHMARK_EVIDENCE_PACK_SCHEMA_V2.to_owned(),
         bead_id: BENCHMARK_EVIDENCE_PACK_BEAD_ID.to_owned(),
         run_id: context.run_id.clone(),
         command_entrypoint: context.command_entrypoint.clone(),
@@ -2686,6 +2776,7 @@ fn write_benchmark_evidence_pack(
         scorecards_json_path: path_string_for_manifest(&context.workspace_root, &scorecards_path),
         summary_count: summaries.len(),
         scorecard_group_count: scorecard_report.groups.len(),
+        honest_gate_report,
         row_artifacts: scorecard_row_artifacts(summaries),
         environment: summaries.first().map(|summary| summary.environment.clone()),
     };
@@ -4999,6 +5090,8 @@ fn cmd_bench(argv: &[String]) -> i32 {
     let mut concurrency: Vec<u16> = vec![1, 2, 4, 8];
     let mut engine = "both".to_owned(); // sqlite3|fsqlite|both
     let mut mvcc = true;
+    let mut placement_profile_ids: Vec<String> = Vec::new();
+    let mut storage_profile = BenchStorageProfile::FileBacked;
     let defaults = BenchmarkConfig::default();
     let mut warmup_iterations = defaults.warmup_iterations;
     let mut min_iterations = defaults.min_iterations;
@@ -5076,6 +5169,34 @@ fn cmd_bench(argv: &[String]) -> i32 {
             }
             "--mvcc" => mvcc = true,
             "--no-mvcc" => mvcc = false,
+            "--placement-profile" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --placement-profile requires an id or comma-separated list");
+                    return 2;
+                }
+                for part in argv[i].split(',') {
+                    let part = part.trim();
+                    if !part.is_empty() {
+                        placement_profile_ids.push(part.to_owned());
+                    }
+                }
+            }
+            "--storage-profile" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --storage-profile requires file_backed|memory");
+                    return 2;
+                }
+                let Some(parsed) = BenchStorageProfile::parse(&argv[i]) else {
+                    eprintln!(
+                        "error: unknown --storage-profile `{}` (expected file_backed|memory)",
+                        argv[i]
+                    );
+                    return 2;
+                };
+                storage_profile = parsed;
+            }
             "--warmup" => {
                 i += 1;
                 if i >= argv.len() {
@@ -5174,6 +5295,8 @@ fn cmd_bench(argv: &[String]) -> i32 {
         presets,
         concurrency,
         concurrency_overridden,
+        placement_profile_ids,
+        storage_profile,
     ) {
         Ok(selection) => selection,
         Err(error) => {
@@ -5249,6 +5372,10 @@ OPTIONS:
                             (default: both = sqlite3 + current fsqlite mode)
     --mvcc                  For fsqlite: force MVCC concurrent_mode on (default)
     --no-mvcc               For fsqlite: disable MVCC concurrent_mode (reports fsqlite_single_writer)
+    --placement-profile <ID|LIST>
+                            Canonical placement profile id(s) to attach to benchmark rows
+                            (default: baseline_unpinned)
+    --storage-profile <ID>  file_backed | memory (default: file_backed)
     --warmup <N>            Warmup iterations discarded (default: methodology default)
     --repeat <N>            Exact measurement iterations (sets --min-iters=N and --time-secs=0)
     --min-iters <N>         Minimum measurement iterations (default: methodology default)
@@ -5420,6 +5547,8 @@ fn cmd_evidence_pack(argv: &[String]) -> i32 {
         presets,
         concurrency,
         concurrency_overridden,
+        Vec::new(),
+        BenchStorageProfile::FileBacked,
     ) {
         Ok(selection) => selection,
         Err(error) => {
@@ -8051,6 +8180,68 @@ mod tests {
         summary
     }
 
+    fn anonymous_benchmark_summary(
+        mode_id: &str,
+        fixture_id: &str,
+        workload: &str,
+        concurrency: u16,
+        median_ops_per_sec: f64,
+        median_latency_ms: f64,
+    ) -> BenchmarkSummary {
+        let engine = match mode_id {
+            "sqlite_reference" => "sqlite3",
+            "fsqlite_single_writer" => "fsqlite_single_writer",
+            _ => "fsqlite_mvcc",
+        };
+        let mut summary = BenchmarkSummary {
+            benchmark_id: format!("{engine}:{workload}:{fixture_id}:c{concurrency}"),
+            engine: engine.to_owned(),
+            workload: workload.to_owned(),
+            fixture_id: fixture_id.to_owned(),
+            concurrency,
+            methodology: MethodologyMeta::current(),
+            environment: EnvironmentMeta {
+                capture_mode: EnvironmentCaptureMode::Captured,
+                os: "Linux 6.17.0-test".to_owned(),
+                arch: "x86_64".to_owned(),
+                cpu_count: 16,
+                cpu_model: Some("Test CPU".to_owned()),
+                ram_bytes: Some(64 * 1_073_741_824),
+                rustc_version: "rustc 1.91.0-nightly".to_owned(),
+                cargo_profile: "release-perf".to_owned(),
+            },
+            warmup_count: 0,
+            measurement_count: 1,
+            total_measurement_ms: 10,
+            latency: LatencyStats {
+                min_ms: median_latency_ms,
+                max_ms: median_latency_ms * 1.05,
+                mean_ms: median_latency_ms,
+                median_ms: median_latency_ms,
+                p95_ms: median_latency_ms * 1.10,
+                p99_ms: median_latency_ms * 1.15,
+                stddev_ms: 0.0,
+            },
+            throughput: ThroughputStats {
+                mean_ops_per_sec: median_ops_per_sec,
+                median_ops_per_sec,
+                peak_ops_per_sec: median_ops_per_sec,
+            },
+            comparison: None,
+            iterations: vec![IterationRecord {
+                iteration: 0,
+                wall_time_ms: 10,
+                ops_per_sec: median_ops_per_sec,
+                ops_total: 100,
+                retries: 0,
+                aborts: 0,
+                error: None,
+            }],
+        };
+        summary.comparison = Some(BenchmarkComparisonMetadata::anonymous(&summary, mode_id));
+        summary
+    }
+
     fn sample_hot_path_manifest() -> HotPathArtifactManifest {
         HotPathArtifactManifest {
             schema_version: HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1.to_owned(),
@@ -9128,6 +9319,8 @@ mod tests {
             fixture_ids: vec!["frankensqlite".to_owned()],
             presets: vec!["mixed_read_write".to_owned()],
             concurrency: vec![4],
+            placement_profile_ids: vec![PLACEMENT_PROFILE_BASELINE_UNPINNED.to_owned()],
+            storage_profile: BenchStorageProfile::FileBacked,
             workspace_root: Some(workspace_root.clone()),
             canonical_fixture_paths: HashMap::new(),
         };
@@ -9183,7 +9376,7 @@ mod tests {
         )
         .expect("evidence pack should be written");
 
-        assert_eq!(manifest.schema_version, BENCHMARK_EVIDENCE_PACK_SCHEMA_V1);
+        assert_eq!(manifest.schema_version, BENCHMARK_EVIDENCE_PACK_SCHEMA_V2);
         assert_eq!(manifest.bead_id, BENCHMARK_EVIDENCE_PACK_BEAD_ID);
         assert_eq!(manifest.cargo_profile, "release-perf");
         assert_eq!(manifest.benchmark_config.warmup_iterations, 0);
@@ -9199,6 +9392,7 @@ mod tests {
                 "sqlite_reference".to_owned(),
             ]
         );
+        assert!(manifest.honest_gate_report.is_none());
         assert_eq!(manifest.row_artifacts.len(), 3);
         assert!(
             output_dir
@@ -9245,6 +9439,147 @@ mod tests {
                 .as_array()
                 .map(Vec::len),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn benchmark_evidence_pack_manifest_surfaces_honest_gate_rows() {
+        let tempdir = tempfile::tempdir().expect("tempdir should succeed");
+        let workspace_root = tempdir.path().to_path_buf();
+        let output_dir = workspace_root.join("artifacts/perf/bd-db300.7.7/run-critical");
+        let selection = BenchMatrixSelection {
+            golden_dir: workspace_root.join("golden"),
+            fixture_ids: vec!["frankensqlite".to_owned()],
+            presets: vec![
+                "commutative_inserts_disjoint_keys".to_owned(),
+                "persistent_concurrent_write_16t".to_owned(),
+            ],
+            concurrency: vec![1, 16],
+            placement_profile_ids: vec![PLACEMENT_PROFILE_BASELINE_UNPINNED.to_owned()],
+            storage_profile: BenchStorageProfile::FileBacked,
+            workspace_root: Some(workspace_root.clone()),
+            canonical_fixture_paths: HashMap::new(),
+        };
+        let context = CanonicalBenchContext {
+            workspace_root: workspace_root.clone(),
+            campaign: sample_benchmark_campaign(),
+            run_id: "run-20260409T010000Z".to_owned(),
+            source_revision: "1234567890abcdef1234567890abcdef12345678".to_owned(),
+            beads_data_hash: "b".repeat(64),
+            command_entrypoint: "realdb-e2e evidence-pack".to_owned(),
+            command_line: "realdb-e2e evidence-pack --repeat 1 --critical".to_owned(),
+            rerun_command:
+                "cargo run -p fsqlite-e2e --bin realdb-e2e -- evidence-pack --repeat 1 --critical"
+                    .to_owned(),
+            retention_class: BenchmarkArtifactRetentionClass::FinalScorecard,
+            tool_versions: vec![BenchmarkArtifactToolVersion {
+                tool: "cargo".to_owned(),
+                version: "cargo 1.91.0-nightly".to_owned(),
+            }],
+        };
+        let bench_cfg = BenchmarkConfig {
+            warmup_iterations: 0,
+            min_iterations: 1,
+            measurement_time_secs: 0,
+        };
+        let summaries = vec![
+            anonymous_benchmark_summary(
+                "sqlite_reference",
+                "frankensqlite",
+                "commutative_inserts_disjoint_keys",
+                1,
+                100.0,
+                1.0,
+            ),
+            anonymous_benchmark_summary(
+                "fsqlite_single_writer",
+                "frankensqlite",
+                "commutative_inserts_disjoint_keys",
+                1,
+                105.0,
+                1.1,
+            ),
+            anonymous_benchmark_summary(
+                "fsqlite_mvcc",
+                "frankensqlite",
+                "commutative_inserts_disjoint_keys",
+                1,
+                80.0,
+                1.2,
+            ),
+            anonymous_benchmark_summary(
+                "sqlite_reference",
+                "frankensqlite",
+                "persistent_concurrent_write_16t",
+                16,
+                100.0,
+                1.0,
+            ),
+            anonymous_benchmark_summary(
+                "fsqlite_mvcc",
+                "frankensqlite",
+                "persistent_concurrent_write_16t",
+                16,
+                110.0,
+                3.0,
+            ),
+        ];
+
+        let manifest = write_benchmark_evidence_pack(
+            &output_dir,
+            &selection,
+            &summaries,
+            &bench_cfg,
+            "release-perf",
+            &context,
+        )
+        .expect("critical evidence pack should be written");
+
+        let honest_gate = manifest
+            .honest_gate_report
+            .expect("critical rows should produce an honest-gate report");
+        assert_eq!(honest_gate.schema_version, BENCHMARK_HONEST_GATE_SCHEMA_V1);
+        assert_eq!(
+            honest_gate.honest_gate_summary.verdict,
+            OverlayGateVerdict::Fail
+        );
+        assert_eq!(
+            honest_gate.honest_gate_summary.expected_critical_row_count,
+            3
+        );
+        assert_eq!(honest_gate.honest_gate_summary.critical_row_count, 3);
+        assert!(honest_gate.rows.iter().any(|row| {
+            row.surface_id == "c1_fixed_tax"
+                && row.classification == BenchmarkHonestGateClassification::BelowParity
+        }));
+        assert!(honest_gate.rows.iter().any(|row| {
+            row.surface_id == "persistent_concurrent_write_16t"
+                && row.classification == BenchmarkHonestGateClassification::TailSlowerThanSqlite
+        }));
+    }
+
+    #[test]
+    fn canonical_benchmark_cell_respects_requested_placement_profile() {
+        let workspace_root = workspace_root();
+        let campaign = sample_benchmark_campaign();
+        let summary = sample_benchmark_summary(
+            &workspace_root,
+            BenchmarkMode::FsqliteMvcc,
+            "fsqlite_mvcc",
+            400,
+        );
+
+        let cell = resolve_canonical_benchmark_cell(
+            &campaign,
+            &summary,
+            BenchmarkMode::FsqliteMvcc,
+            Some(PLACEMENT_PROFILE_RECOMMENDED_PINNED),
+        )
+        .expect("requested placement profile should resolve");
+
+        assert_eq!(
+            cell.placement_profile_id,
+            PLACEMENT_PROFILE_RECOMMENDED_PINNED
         );
     }
 

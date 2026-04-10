@@ -14,7 +14,11 @@
 //! comparison helpers below account for this by using fractional values that
 //! never resolve to exact integers (multiplier `0.00137` instead of `0.001`).
 
+use fsqlite::{Connection as FsqliteConnection, SqliteValue as FsqliteValue};
 use fsqlite_e2e::comparison::{ComparisonRunner, SqlBackend, SqlValue};
+use rusqlite::{Connection as RusqliteConnection, types::Value as RusqliteValue};
+use sha2::{Digest, Sha256};
+use tempfile::tempdir;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
 
@@ -117,6 +121,87 @@ fn generate_edge_case_stmts(base_id: i64) -> Vec<String> {
     // id += 1; // last one, not needed
 
     stmts
+}
+
+fn sql_value_from_fsqlite(value: &FsqliteValue) -> SqlValue {
+    match value {
+        FsqliteValue::Null => SqlValue::Null,
+        FsqliteValue::Integer(value) => SqlValue::Integer(*value),
+        FsqliteValue::Float(value) => SqlValue::Real(*value),
+        FsqliteValue::Text(value) => SqlValue::Text(value.to_string()),
+        FsqliteValue::Blob(value) => SqlValue::Blob(value.to_vec()),
+    }
+}
+
+fn sql_value_from_rusqlite(value: &RusqliteValue) -> SqlValue {
+    match value {
+        RusqliteValue::Null => SqlValue::Null,
+        RusqliteValue::Integer(value) => SqlValue::Integer(*value),
+        RusqliteValue::Real(value) => SqlValue::Real(*value),
+        RusqliteValue::Text(value) => SqlValue::Text(value.clone()),
+        RusqliteValue::Blob(value) => SqlValue::Blob(value.clone()),
+    }
+}
+
+fn execute_fsqlite_workload(conn: &FsqliteConnection, statements: &[String]) {
+    for (index, sql) in statements.iter().enumerate() {
+        conn.execute(sql)
+            .unwrap_or_else(|error| panic!("fsqlite statement {index} failed: {error}"));
+    }
+}
+
+fn execute_rusqlite_workload(conn: &RusqliteConnection, statements: &[String]) {
+    for (index, sql) in statements.iter().enumerate() {
+        conn.execute(sql, [])
+            .unwrap_or_else(|error| panic!("csqlite statement {index} failed: {error}"));
+    }
+}
+
+fn fetch_fsqlite_rows(conn: &FsqliteConnection, sql: &str) -> Vec<Vec<SqlValue>> {
+    conn.query(sql)
+        .expect("query fsqlite rows")
+        .into_iter()
+        .map(|row| row.values().iter().map(sql_value_from_fsqlite).collect())
+        .collect()
+}
+
+fn fetch_rusqlite_rows(conn: &RusqliteConnection, sql: &str) -> Vec<Vec<SqlValue>> {
+    let mut prepared = conn.prepare(sql).expect("prepare sqlite query");
+    let column_count = prepared.column_count();
+    prepared
+        .query_map([], |row| {
+            let mut values = Vec::with_capacity(column_count);
+            for index in 0..column_count {
+                let value: RusqliteValue = row.get(index)?;
+                values.push(sql_value_from_rusqlite(&value));
+            }
+            Ok(values)
+        })
+        .expect("query sqlite rows")
+        .map(|row| row.expect("sqlite row"))
+        .collect()
+}
+
+fn normalized_rows_hash(rows: &[Vec<SqlValue>]) -> String {
+    use std::fmt::Write as _;
+
+    let mut dump = String::new();
+    for row in rows {
+        for (index, value) in row.iter().enumerate() {
+            if index > 0 {
+                dump.push('|');
+            }
+            let _ = write!(dump, "{value}");
+        }
+        dump.push('\n');
+    }
+
+    let digest = Sha256::digest(dump.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────
@@ -228,6 +313,70 @@ fn sequential_insert_flood_logical_state_hash() {
         hash.matched,
         "logical state hash mismatch:\n  frank={}\n  csqlite={}",
         hash.frank_sha256, hash.csqlite_sha256
+    );
+}
+
+#[test]
+fn sequential_insert_file_backed_reopen_matches_sqlite() {
+    let base_row_count = 4_096_usize;
+    let mut stmts = generate_insert_stmts(base_row_count);
+    let edge_case_stmts = generate_edge_case_stmts(
+        i64::try_from(base_row_count + 1).expect("base row count fits in i64"),
+    );
+    let expected_rows = base_row_count + edge_case_stmts.len();
+    stmts.extend(edge_case_stmts);
+
+    let temp = tempdir().expect("tempdir");
+    let fsqlite_path = temp.path().join("sequential_insert_fsqlite.db");
+    let csqlite_path = temp.path().join("sequential_insert_csqlite.db");
+    let fsqlite_path_string = fsqlite_path.to_string_lossy().into_owned();
+
+    {
+        let fsqlite_conn =
+            FsqliteConnection::open(fsqlite_path_string.as_str()).expect("open fsqlite db");
+        let csqlite_conn = RusqliteConnection::open(&csqlite_path).expect("open csqlite db");
+        execute_fsqlite_workload(&fsqlite_conn, &stmts);
+        execute_rusqlite_workload(&csqlite_conn, &stmts);
+    }
+
+    let reopened_fsqlite =
+        FsqliteConnection::open(fsqlite_path_string.as_str()).expect("reopen fsqlite db");
+    let reopened_csqlite = RusqliteConnection::open(&csqlite_path).expect("reopen csqlite db");
+
+    let ordered_rows_sql = "SELECT id, name, value, data, created FROM e2e_insert_test ORDER BY id";
+    let fsqlite_rows = fetch_fsqlite_rows(&reopened_fsqlite, ordered_rows_sql);
+    let csqlite_rows = fetch_rusqlite_rows(&reopened_csqlite, ordered_rows_sql);
+
+    assert_eq!(
+        csqlite_rows.len(),
+        expected_rows,
+        "expected {expected_rows} rows in the C SQLite file-backed oracle"
+    );
+    assert_eq!(
+        fsqlite_rows.len(),
+        expected_rows,
+        "expected {expected_rows} rows in the FrankenSQLite file-backed database"
+    );
+
+    for index in [
+        0_usize,
+        (base_row_count / 2) - 1,
+        base_row_count - 1,
+        expected_rows - 4,
+        expected_rows - 3,
+        expected_rows - 1,
+    ] {
+        assert_eq!(
+            csqlite_rows[index], fsqlite_rows[index],
+            "file-backed row mismatch at logical row index {index}"
+        );
+    }
+
+    let csqlite_hash = normalized_rows_hash(&csqlite_rows);
+    let fsqlite_hash = normalized_rows_hash(&fsqlite_rows);
+    assert_eq!(
+        csqlite_hash, fsqlite_hash,
+        "file-backed logical state hash mismatch after reopen:\n  csqlite={csqlite_hash}\n  fsqlite={fsqlite_hash}"
     );
 }
 

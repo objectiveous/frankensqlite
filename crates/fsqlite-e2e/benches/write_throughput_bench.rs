@@ -105,6 +105,10 @@ fn criterion_config() -> Criterion {
 
 // ─── Variant 1: Autocommit ──────────────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=csqlite, lifecycle=ad_hoc, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=ad_hoc, storage=memory, concurrency=sequential
 fn bench_write_autocommit(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_10k_autocommit");
     group.sample_size(10);
@@ -180,6 +184,10 @@ fn bench_write_autocommit(c: &mut Criterion) {
 
 // ─── Variant 2: Batched (1,000 per transaction, 10 batches) ─────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=csqlite, lifecycle=ad_hoc, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=ad_hoc, storage=memory, concurrency=sequential
 fn bench_write_batched(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_10k_batched");
     group.sample_size(10);
@@ -275,6 +283,10 @@ fn bench_write_batched(c: &mut Criterion) {
 
 // ─── Variant 3: Single transaction ──────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=csqlite, lifecycle=ad_hoc, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=ad_hoc, storage=memory, concurrency=sequential
 fn bench_write_single_txn(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_10k_single_txn");
     group.sample_size(10);

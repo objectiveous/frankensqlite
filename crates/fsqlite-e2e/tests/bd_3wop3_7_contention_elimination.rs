@@ -52,10 +52,10 @@ const SCALING_THREAD_COUNTS: &[usize] = &[1, 2, 4, 8, 16];
 const ROWS_PER_THREAD: u64 = 10_000;
 
 /// Historical 8-thread placeholder gate from the pre-overlay contention file.
-const GATE_8T_SPEEDUP: f64 = 1.5;
+const HISTORICAL_PLACEHOLDER_8T_SPEEDUP: f64 = 1.5;
 
 /// Historical 16-thread placeholder gate from the pre-overlay contention file.
-const GATE_16T_SPEEDUP: f64 = 1.0;
+const HISTORICAL_PLACEHOLDER_16T_SPEEDUP: f64 = 1.0;
 
 // ---------------------------------------------------------------------------
 // Test result types
@@ -406,7 +406,7 @@ fn test_scaling_curve() {
 #[ignore = "stale placeholder; pending bd-3wop3.1.5, bd-db300.1.7.4, and bd-db300.7.9.1"]
 fn test_8t_throughput_regression_gate() {
     panic!(
-        "test_8t_throughput_regression_gate: historical {GATE_8T_SPEEDUP}x placeholder is non-authoritative; final 8t gate belongs to scripts/capture_persistent_phase_pack.sh with same-pack sqlite3 comparison"
+        "test_8t_throughput_regression_gate: historical {HISTORICAL_PLACEHOLDER_8T_SPEEDUP}x placeholder is non-authoritative; final 8t gate belongs to scripts/capture_persistent_phase_pack.sh with same-pack sqlite3 comparison"
     );
 }
 
@@ -418,7 +418,7 @@ fn test_8t_throughput_regression_gate() {
 #[ignore = "stale placeholder; pending bd-3wop3.1.5, bd-db300.1.7.4, and bd-db300.7.9.1"]
 fn test_16t_throughput_regression_gate() {
     panic!(
-        "test_16t_throughput_regression_gate: historical {GATE_16T_SPEEDUP}x placeholder is non-authoritative; final persistent 16t gate belongs to scripts/capture_persistent_phase_pack.sh with phase-attribution evidence"
+        "test_16t_throughput_regression_gate: historical {HISTORICAL_PLACEHOLDER_16T_SPEEDUP}x placeholder is non-authoritative; final persistent 16t gate belongs to scripts/capture_persistent_phase_pack.sh with phase-attribution evidence"
     );
 }
 
@@ -881,8 +881,8 @@ fn test_split_lock_wal_io_does_not_block_prepare() {
 #[ignore = "manual benchmark - run with --ignored"]
 fn scaling_report() {
     println!("\n=== D-TEST Scaling Report (bd-3wop3.7) ===\n");
-    println!("Thread | C SQLite ops/s | FS placeholder ops/s | Speedup");
-    println!("-------|----------------|----------------------|--------");
+    println!("Thread | C SQLite ops/s | FS placeholder ops/s | Historical placeholder ratio");
+    println!("-------|----------------|----------------------|----------------------------");
 
     for &threads in SCALING_THREAD_COUNTS {
         let csqlite = measure_csqlite_throughput(threads, ROWS_PER_THREAD / 10);

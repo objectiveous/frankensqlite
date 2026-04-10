@@ -49,6 +49,8 @@ fn criterion_config() -> Criterion {
 
 // ─── 10K single-transaction INSERT ──────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_large_txn_10k(c: &mut Criterion) {
     let mut group = c.benchmark_group("large_txn_prepared_insert_10k");
     group.sample_size(20);
@@ -128,6 +130,8 @@ fn bench_large_txn_10k(c: &mut Criterion) {
 
 // ─── 100K single-transaction INSERT ─────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_large_txn_100k(c: &mut Criterion) {
     let mut group = c.benchmark_group("large_txn_100k");
     group.sample_size(10);
@@ -207,6 +211,8 @@ fn bench_large_txn_100k(c: &mut Criterion) {
 
 // ─── 100K batched (10 × 10K) ────────────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_large_txn_100k_batched(c: &mut Criterion) {
     let mut group = c.benchmark_group("large_txn_100k_batched_10k");
     group.sample_size(10);

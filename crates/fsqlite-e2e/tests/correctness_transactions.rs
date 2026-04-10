@@ -18,7 +18,16 @@
 //! transaction pattern must be identical on both engines.
 
 use fsqlite_e2e::comparison::{ComparisonRunner, SqlBackend, SqlValue};
+use serde_json::json;
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::Duration;
 use tempfile::tempdir;
+
+const SCENARIO_COMPLETENESS_BEAD_ID: &str = "bd-mblr.4";
+const SCENARIO_COMPLETENESS_SEED: u64 = 0x006D_626C_722E_3400;
+const SCENARIO_COMPLETENESS_REPLAY: &str =
+    "cargo test -p fsqlite-e2e --test correctness_transactions -- --nocapture --test-threads=1";
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -133,6 +142,62 @@ fn checkpoint_triplet(rows: &[Vec<SqlValue>], label: &str) -> (i64, i64, i64) {
         }
     };
     (read_i64(0), read_i64(1), read_i64(2))
+}
+
+fn emit_scenario_completeness_log(test_name: &str, phase: &str, extra: serde_json::Value) {
+    eprintln!(
+        "SCENARIO_COMPLETENESS:{}",
+        json!({
+            "bead_id": SCENARIO_COMPLETENESS_BEAD_ID,
+            "seed": SCENARIO_COMPLETENESS_SEED,
+            "replay_command": SCENARIO_COMPLETENESS_REPLAY,
+            "test_name": test_name,
+            "phase": phase,
+            "extra": extra
+        })
+    );
+}
+
+fn sql_rows_to_json(rows: &[Vec<SqlValue>]) -> serde_json::Value {
+    serde_json::Value::Array(
+        rows.iter()
+            .map(|row| {
+                serde_json::Value::Array(
+                    row.iter()
+                        .map(|value| match value {
+                            SqlValue::Null => serde_json::Value::Null,
+                            SqlValue::Integer(v) => json!(*v),
+                            SqlValue::Real(v) => json!(*v),
+                            SqlValue::Text(v) => json!(v),
+                            SqlValue::Blob(v) => json!(v),
+                        })
+                        .collect(),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn is_retryable_txn_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("busy")
+        || lower.contains("locked")
+        || lower.contains("conflict")
+        || lower.contains("snapshot")
+}
+
+fn configure_connection_mode(conn: &fsqlite::Connection, concurrent_mode: bool) {
+    let pragma = if concurrent_mode {
+        "PRAGMA fsqlite.concurrent_mode=ON;"
+    } else {
+        "PRAGMA fsqlite.concurrent_mode=OFF;"
+    };
+    conn.execute(pragma).expect("set concurrent_mode pragma");
+    assert_eq!(
+        conn.is_concurrent_mode_default(),
+        concurrent_mode,
+        "concurrent_mode pragma must remain connection-local"
+    );
 }
 
 // ─── Scenario A: Simple transaction commit ─────────────────────────────
@@ -935,5 +1000,372 @@ fn txn_file_backed_retained_autocommit_interleaved_read_write_close_reopen_match
         csqlite_query_values(&reopened_c, full_dump_sql),
         fsqlite_query_values(&reopened_f, full_dump_sql),
         "close+reopen must flush retained autocommit state identically to the oracle"
+    );
+}
+
+#[test]
+fn txn_mixed_connection_modes_remain_local_and_preserve_rows() {
+    let tmp = tempdir().expect("tempdir");
+    let oracle_path = tmp.path().join("oracle_mixed_modes.db");
+    let candidate_path = tmp.path().join("candidate_mixed_modes.db");
+    let candidate_path_string = candidate_path.to_string_lossy().into_owned();
+    let barrier = Arc::new(Barrier::new(2));
+
+    let oracle = rusqlite::Connection::open(&oracle_path).expect("open oracle db");
+    oracle
+        .execute(
+            "CREATE TABLE mode_mix(id INTEGER PRIMARY KEY, source TEXT NOT NULL, val INTEGER NOT NULL);",
+            [],
+        )
+        .expect("oracle schema");
+    for id in 0_i64..8 {
+        oracle
+            .execute(
+                "INSERT INTO mode_mix(id, source, val) VALUES (?1, 'mvcc', ?2);",
+                rusqlite::params![id, id * 10],
+            )
+            .expect("oracle mvcc insert");
+    }
+    for id in 100_i64..108 {
+        oracle
+            .execute(
+                "INSERT INTO mode_mix(id, source, val) VALUES (?1, 'serialized', ?2);",
+                rusqlite::params![id, id * 10],
+            )
+            .expect("oracle serialized insert");
+    }
+
+    {
+        let setup = fsqlite::Connection::open(&candidate_path_string).expect("open candidate db");
+        setup.execute(
+            "CREATE TABLE mode_mix(id INTEGER PRIMARY KEY, source TEXT NOT NULL, val INTEGER NOT NULL);",
+        )
+        .expect("candidate schema");
+        setup.close().expect("close setup connection");
+    }
+
+    let mvcc_path = candidate_path_string.clone();
+    let mvcc_barrier = Arc::clone(&barrier);
+    let mvcc = thread::spawn(move || -> (bool, bool, usize) {
+        let conn = fsqlite::Connection::open(&mvcc_path).expect("open mvcc connection");
+        configure_connection_mode(&conn, true);
+        let mode_default = conn.is_concurrent_mode_default();
+        mvcc_barrier.wait();
+
+        let mut last_error = String::new();
+        for attempt in 1..=64 {
+            match conn.execute("BEGIN;") {
+                Ok(_) => {
+                    let concurrent_txn = conn.is_concurrent_transaction();
+                    let mut failed = false;
+                    for id in 0_i64..8 {
+                        let sql = format!(
+                            "INSERT INTO mode_mix(id, source, val) VALUES ({id}, 'mvcc', {});",
+                            id * 10
+                        );
+                        if let Err(err) = conn.execute(&sql) {
+                            last_error = err.to_string();
+                            failed = true;
+                            break;
+                        }
+                    }
+                    if failed {
+                        let _ = conn.execute("ROLLBACK;");
+                    } else {
+                        match conn.execute("COMMIT;") {
+                            Ok(_) => return (mode_default, concurrent_txn, attempt),
+                            Err(err) => {
+                                last_error = err.to_string();
+                                if let Err(rollback_err) = conn.execute("ROLLBACK;") {
+                                    last_error = format!(
+                                        "{last_error}; rollback after failed commit also failed: {rollback_err}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    last_error = err.to_string();
+                }
+            }
+
+            assert!(
+                is_retryable_txn_error(&last_error),
+                "mixed-mode MVCC worker hit non-retryable error: {last_error}"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        panic!("mixed-mode MVCC worker exhausted retries: {last_error}");
+    });
+
+    let serialized_path = candidate_path_string.clone();
+    let serialized_barrier = Arc::clone(&barrier);
+    let serialized = thread::spawn(move || -> (bool, bool, usize) {
+        let conn = fsqlite::Connection::open(&serialized_path).expect("open serialized connection");
+        configure_connection_mode(&conn, false);
+        let mode_default = conn.is_concurrent_mode_default();
+        serialized_barrier.wait();
+
+        let mut last_error = String::new();
+        for attempt in 1..=64 {
+            match conn.execute("BEGIN;") {
+                Ok(_) => {
+                    let concurrent_txn = conn.is_concurrent_transaction();
+                    let mut failed = false;
+                    for id in 100_i64..108 {
+                        let sql = format!(
+                            "INSERT INTO mode_mix(id, source, val) VALUES ({id}, 'serialized', {});",
+                            id * 10
+                        );
+                        if let Err(err) = conn.execute(&sql) {
+                            last_error = err.to_string();
+                            failed = true;
+                            break;
+                        }
+                    }
+                    if failed {
+                        let _ = conn.execute("ROLLBACK;");
+                    } else {
+                        match conn.execute("COMMIT;") {
+                            Ok(_) => return (mode_default, concurrent_txn, attempt),
+                            Err(err) => {
+                                last_error = err.to_string();
+                                if let Err(rollback_err) = conn.execute("ROLLBACK;") {
+                                    last_error = format!(
+                                        "{last_error}; rollback after failed commit also failed: {rollback_err}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    last_error = err.to_string();
+                }
+            }
+
+            assert!(
+                is_retryable_txn_error(&last_error),
+                "mixed-mode serialized worker hit non-retryable error: {last_error}"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        panic!("mixed-mode serialized worker exhausted retries: {last_error}");
+    });
+
+    let (mvcc_default, mvcc_txn, mvcc_attempts) = mvcc.join().expect("join mvcc worker");
+    let (serialized_default, serialized_txn, serialized_attempts) =
+        serialized.join().expect("join serialized worker");
+
+    let candidate = fsqlite::Connection::open(&candidate_path_string).expect("reopen candidate db");
+    let full_dump_sql = "SELECT id, source, val FROM mode_mix ORDER BY id;";
+    let oracle_rows = csqlite_query_values(&oracle, full_dump_sql);
+    let candidate_rows = fsqlite_query_values(&candidate, full_dump_sql);
+    assert_eq!(
+        oracle_rows, candidate_rows,
+        "mixed connection modes should preserve the same logical rows as the oracle"
+    );
+
+    emit_scenario_completeness_log(
+        "txn_mixed_connection_modes_remain_local_and_preserve_rows",
+        "result",
+        json!({
+            "mvcc_mode_default": mvcc_default,
+            "mvcc_transaction_concurrent": mvcc_txn,
+            "mvcc_attempts": mvcc_attempts,
+            "serialized_mode_default": serialized_default,
+            "serialized_transaction_concurrent": serialized_txn,
+            "serialized_attempts": serialized_attempts,
+            "row_count": candidate_rows.len()
+        }),
+    );
+
+    assert!(
+        mvcc_default,
+        "MVCC worker must keep concurrent mode enabled"
+    );
+    assert!(
+        mvcc_txn,
+        "BEGIN on MVCC connection must promote to concurrent txn"
+    );
+    assert!(
+        !serialized_default,
+        "serialized worker must keep concurrent mode opt-out local to its connection"
+    );
+    assert!(
+        !serialized_txn,
+        "BEGIN on serialized connection must stay single-writer"
+    );
+}
+
+#[test]
+fn txn_concurrent_schema_and_dml_preserve_index_and_rows() {
+    let tmp = tempdir().expect("tempdir");
+    let oracle_path = tmp.path().join("oracle_schema_dml.db");
+    let candidate_path = tmp.path().join("candidate_schema_dml.db");
+    let candidate_path_string = candidate_path.to_string_lossy().into_owned();
+    let barrier = Arc::new(Barrier::new(2));
+
+    let oracle = rusqlite::Connection::open(&oracle_path).expect("open oracle db");
+    oracle
+        .execute(
+            "CREATE TABLE schema_mix(id INTEGER PRIMARY KEY, category TEXT NOT NULL, payload TEXT NOT NULL);",
+            [],
+        )
+        .expect("oracle schema");
+    for id in 0_i64..512 {
+        oracle
+            .execute(
+                "INSERT INTO schema_mix(id, category, payload) VALUES (?1, ?2, ?3);",
+                rusqlite::params![
+                    id,
+                    if id % 2 == 0 { "seed_even" } else { "seed_odd" },
+                    format!("seed-payload-{id:04}-{}", "x".repeat(48))
+                ],
+            )
+            .expect("oracle seed insert");
+    }
+    oracle
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_schema_mix_category ON schema_mix(category);",
+            [],
+        )
+        .expect("oracle create index");
+    for id in 1_000_i64..1_064 {
+        oracle
+            .execute(
+                "INSERT INTO schema_mix(id, category, payload) VALUES (?1, 'writer', ?2);",
+                rusqlite::params![id, format!("writer-payload-{id:04}")],
+            )
+            .expect("oracle writer insert");
+    }
+
+    {
+        let setup = fsqlite::Connection::open(&candidate_path_string).expect("open candidate db");
+        setup.execute(
+            "CREATE TABLE schema_mix(id INTEGER PRIMARY KEY, category TEXT NOT NULL, payload TEXT NOT NULL);",
+        )
+        .expect("candidate schema");
+        for id in 0_i64..512 {
+            let sql = format!(
+                "INSERT INTO schema_mix(id, category, payload) VALUES ({id}, '{}', '{}');",
+                if id % 2 == 0 { "seed_even" } else { "seed_odd" },
+                format!("seed-payload-{id:04}-{}", "x".repeat(48))
+            );
+            setup.execute(&sql).expect("candidate seed insert");
+        }
+        setup.close().expect("close setup connection");
+    }
+
+    let schema_path = candidate_path_string.clone();
+    let schema_barrier = Arc::clone(&barrier);
+    let schema_thread = thread::spawn(move || -> usize {
+        let conn = fsqlite::Connection::open(&schema_path).expect("open schema connection");
+        configure_connection_mode(&conn, true);
+        schema_barrier.wait();
+
+        let mut last_error = String::new();
+        for attempt in 1..=64 {
+            match conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_schema_mix_category ON schema_mix(category);",
+            ) {
+                Ok(_) => return attempt,
+                Err(err) => {
+                    last_error = err.to_string();
+                    assert!(
+                        is_retryable_txn_error(&last_error),
+                        "schema worker hit non-retryable error: {last_error}"
+                    );
+                    thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+
+        panic!("schema worker exhausted retries: {last_error}");
+    });
+
+    let writer_path = candidate_path_string.clone();
+    let writer_barrier = Arc::clone(&barrier);
+    let writer_thread = thread::spawn(move || -> usize {
+        let conn = fsqlite::Connection::open(&writer_path).expect("open writer connection");
+        configure_connection_mode(&conn, true);
+        writer_barrier.wait();
+
+        let mut max_attempts = 0_usize;
+        for id in 1_000_i64..1_064 {
+            let sql = format!(
+                "INSERT INTO schema_mix(id, category, payload) VALUES ({id}, 'writer', 'writer-payload-{id:04}');"
+            );
+            let mut last_error = String::new();
+            let mut inserted = false;
+            for attempt in 1..=64 {
+                max_attempts = max_attempts.max(attempt);
+                match conn.execute(&sql) {
+                    Ok(_) => {
+                        inserted = true;
+                        break;
+                    }
+                    Err(err) => {
+                        last_error = err.to_string();
+                        assert!(
+                            is_retryable_txn_error(&last_error),
+                            "writer hit non-retryable error: {last_error}"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+            assert!(
+                inserted,
+                "writer exhausted retries for row {id}: {last_error}"
+            );
+        }
+        max_attempts
+    });
+
+    let schema_attempts = schema_thread.join().expect("join schema thread");
+    let writer_attempts = writer_thread.join().expect("join writer thread");
+
+    let candidate = fsqlite::Connection::open(&candidate_path_string).expect("reopen candidate db");
+    let state_sql = "SELECT COUNT(*), MIN(id), MAX(id) FROM schema_mix;";
+    let index_sql =
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_schema_mix_category';";
+    let writer_sql = "SELECT COUNT(*) FROM schema_mix WHERE category='writer';";
+    assert_eq!(
+        csqlite_query_values(&oracle, state_sql),
+        fsqlite_query_values(&candidate, state_sql),
+        "concurrent schema + DML row-state diverged from oracle"
+    );
+    assert_eq!(
+        csqlite_query_values(&oracle, index_sql),
+        fsqlite_query_values(&candidate, index_sql),
+        "concurrent schema + DML index state diverged from oracle"
+    );
+    assert_eq!(
+        csqlite_query_values(&oracle, writer_sql),
+        fsqlite_query_values(&candidate, writer_sql),
+        "concurrent schema + DML inserted writer rows diverged from oracle"
+    );
+
+    let integrity: String = rusqlite::Connection::open(&candidate_path)
+        .expect("open candidate with rusqlite")
+        .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+        .expect("integrity_check");
+    assert_eq!(integrity, "ok", "candidate db must remain integrity-clean");
+
+    emit_scenario_completeness_log(
+        "txn_concurrent_schema_and_dml_preserve_index_and_rows",
+        "result",
+        json!({
+            "schema_attempts": schema_attempts,
+            "writer_max_attempts": writer_attempts,
+            "integrity_check": integrity,
+            "state": sql_rows_to_json(&fsqlite_query_values(&candidate, state_sql)),
+            "index_state": sql_rows_to_json(&fsqlite_query_values(&candidate, index_sql)),
+            "writer_rows": sql_rows_to_json(&fsqlite_query_values(&candidate, writer_sql))
+        }),
     );
 }

@@ -15,17 +15,15 @@ use fsqlite_e2e::fixture_select::{
     load_beads_benchmark_campaign,
 };
 use fsqlite_e2e::methodology::{EnvironmentMeta, MethodologyMeta};
+use fsqlite_e2e::overlay_honesty_gate::{
+    MatrixRegressionThresholds, OVERLAY_C1_SCORECARD_JSON_ENV, OVERLAY_ENFORCE_HONESTY_GATE_ENV,
+    OVERLAY_PERSISTENT_SCORECARD_JSON_ENV, evaluate_matrix_regression_gate_from_paths,
+    evaluate_overlay_honesty_gate_from_paths, load_benchmark_summaries,
+};
 use fsqlite_e2e::report_render::render_benchmark_summaries_markdown;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
-
-const MATRIX_REGRESSION_GATE_SCHEMA_V1: &str =
-    "fsqlite-e2e.complete_benchmark_matrix_regression_gate.v1";
-const DEFAULT_MAX_P95_RATIO: f64 = 1.25;
-const DEFAULT_MIN_THROUGHPUT_RATIO: f64 = 0.80;
 const MATRIX_BASELINE_JSONL_ENV: &str = "FSQLITE_MATRIX_BASELINE_JSONL";
-const MATRIX_MAX_P95_RATIO_ENV: &str = "FSQLITE_MATRIX_MAX_P95_RATIO";
-const MATRIX_MIN_THROUGHPUT_RATIO_ENV: &str = "FSQLITE_MATRIX_MIN_THROUGHPUT_RATIO";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -273,208 +271,6 @@ fn resolve_repo_relative_env_path(repo_root: &Path, key: &str) -> Option<PathBuf
         } else {
             repo_root.join(path)
         }
-    })
-}
-
-fn parse_ratio_env(key: &str, default: f64) -> Result<f64, Box<dyn Error>> {
-    let Some(raw) = std::env::var_os(key) else {
-        return Ok(default);
-    };
-    let text = raw.to_string_lossy();
-    let value: f64 = text
-        .parse()
-        .map_err(|error| format!("invalid {key} `{text}`: {error}"))?;
-    if !value.is_finite() || value <= 0.0 {
-        return Err(format!("{key} must be finite and > 0, got `{text}`").into());
-    }
-    Ok(value)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-struct MatrixRegressionThresholds {
-    max_p95_ratio: f64,
-    min_throughput_ratio: f64,
-}
-
-impl Default for MatrixRegressionThresholds {
-    fn default() -> Self {
-        Self {
-            max_p95_ratio: DEFAULT_MAX_P95_RATIO,
-            min_throughput_ratio: DEFAULT_MIN_THROUGHPUT_RATIO,
-        }
-    }
-}
-
-impl MatrixRegressionThresholds {
-    fn from_env() -> Result<Self, Box<dyn Error>> {
-        Ok(Self {
-            max_p95_ratio: parse_ratio_env(MATRIX_MAX_P95_RATIO_ENV, DEFAULT_MAX_P95_RATIO)?,
-            min_throughput_ratio: parse_ratio_env(
-                MATRIX_MIN_THROUGHPUT_RATIO_ENV,
-                DEFAULT_MIN_THROUGHPUT_RATIO,
-            )?,
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct MatrixRegressionCheck {
-    benchmark_id: String,
-    baseline_p95_ms: f64,
-    current_p95_ms: f64,
-    p95_ratio: f64,
-    baseline_throughput_ops_per_sec: f64,
-    current_throughput_ops_per_sec: f64,
-    throughput_ratio: f64,
-    passed: bool,
-    reasons: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct MatrixRegressionGateReport {
-    schema_version: String,
-    baseline_jsonl: String,
-    current_jsonl: String,
-    thresholds: MatrixRegressionThresholds,
-    compared_cells: usize,
-    missing_baseline_cells: Vec<String>,
-    failing_cells: Vec<String>,
-    checks: Vec<MatrixRegressionCheck>,
-}
-
-impl MatrixRegressionGateReport {
-    fn failure_summary(&self) -> Option<String> {
-        if self.missing_baseline_cells.is_empty() && self.failing_cells.is_empty() {
-            return None;
-        }
-
-        let mut segments = Vec::new();
-        if !self.missing_baseline_cells.is_empty() {
-            segments.push(format!(
-                "missing baseline cells: {}",
-                self.missing_baseline_cells.join(", ")
-            ));
-        }
-        if !self.failing_cells.is_empty() {
-            segments.push(format!(
-                "regressed cells: {}",
-                self.failing_cells.join(", ")
-            ));
-        }
-        Some(segments.join(" | "))
-    }
-}
-
-fn load_benchmark_summary_map(
-    path: &Path,
-) -> Result<BTreeMap<String, BenchmarkSummary>, Box<dyn Error>> {
-    let mut summaries = BTreeMap::new();
-    let raw = fs::read_to_string(path)?;
-    for (line_idx, line) in raw.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let summary: BenchmarkSummary = serde_json::from_str(line).map_err(|error| {
-            format!(
-                "parse benchmark summary line {} from {}: {error}",
-                line_idx + 1,
-                path.display()
-            )
-        })?;
-        if summaries
-            .insert(summary.benchmark_id.clone(), summary)
-            .is_some()
-        {
-            return Err(format!(
-                "duplicate benchmark_id in {} on line {}",
-                path.display(),
-                line_idx + 1
-            )
-            .into());
-        }
-    }
-    Ok(summaries)
-}
-
-fn evaluate_matrix_regression_gate(
-    baseline_jsonl: &Path,
-    current_jsonl: &Path,
-    thresholds: MatrixRegressionThresholds,
-) -> Result<MatrixRegressionGateReport, Box<dyn Error>> {
-    let baseline = load_benchmark_summary_map(baseline_jsonl)?;
-    let current = load_benchmark_summary_map(current_jsonl)?;
-
-    let mut checks = Vec::new();
-    let mut missing_baseline_cells = Vec::new();
-    let mut failing_cells = Vec::new();
-
-    for (benchmark_id, current_summary) in &current {
-        let Some(baseline_summary) = baseline.get(benchmark_id) else {
-            missing_baseline_cells.push(benchmark_id.clone());
-            continue;
-        };
-
-        let mut reasons = Vec::new();
-
-        let p95_ratio = if baseline_summary.latency.p95_ms > 0.0 {
-            current_summary.latency.p95_ms / baseline_summary.latency.p95_ms
-        } else {
-            reasons.push(format!(
-                "baseline p95 must be > 0, got {:.4}",
-                baseline_summary.latency.p95_ms
-            ));
-            f64::INFINITY
-        };
-        if p95_ratio > thresholds.max_p95_ratio {
-            reasons.push(format!(
-                "p95 ratio {:.4} > allowed {:.4}",
-                p95_ratio, thresholds.max_p95_ratio
-            ));
-        }
-
-        let throughput_ratio = if baseline_summary.throughput.median_ops_per_sec > 0.0 {
-            current_summary.throughput.median_ops_per_sec
-                / baseline_summary.throughput.median_ops_per_sec
-        } else {
-            reasons.push(format!(
-                "baseline throughput must be > 0, got {:.4}",
-                baseline_summary.throughput.median_ops_per_sec
-            ));
-            0.0
-        };
-        if throughput_ratio < thresholds.min_throughput_ratio {
-            reasons.push(format!(
-                "throughput ratio {:.4} < allowed {:.4}",
-                throughput_ratio, thresholds.min_throughput_ratio
-            ));
-        }
-
-        let passed = reasons.is_empty();
-        if !passed {
-            failing_cells.push(benchmark_id.clone());
-        }
-        checks.push(MatrixRegressionCheck {
-            benchmark_id: benchmark_id.clone(),
-            baseline_p95_ms: baseline_summary.latency.p95_ms,
-            current_p95_ms: current_summary.latency.p95_ms,
-            p95_ratio,
-            baseline_throughput_ops_per_sec: baseline_summary.throughput.median_ops_per_sec,
-            current_throughput_ops_per_sec: current_summary.throughput.median_ops_per_sec,
-            throughput_ratio,
-            passed,
-            reasons,
-        });
-    }
-
-    Ok(MatrixRegressionGateReport {
-        schema_version: MATRIX_REGRESSION_GATE_SCHEMA_V1.to_owned(),
-        baseline_jsonl: baseline_jsonl.display().to_string(),
-        current_jsonl: current_jsonl.display().to_string(),
-        thresholds,
-        compared_cells: checks.len(),
-        missing_baseline_cells,
-        failing_cells,
-        checks,
     })
 }
 
@@ -774,9 +570,9 @@ fn matrix_regression_gate_loads_canonical_record_lines_via_benchmark_summary() {
     )
     .expect("write canonical jsonl");
 
-    let summaries = load_benchmark_summary_map(&path).expect("load summaries");
+    let summaries = load_benchmark_summaries(&path).expect("load summaries");
     assert_eq!(summaries.len(), 1);
-    assert!(summaries.contains_key("fsqlite:count_star:fixture:c1"));
+    assert_eq!(summaries[0].benchmark_id, "fsqlite:count_star:fixture:c1");
 }
 
 #[test]
@@ -845,7 +641,7 @@ fn matrix_regression_gate_flags_ratio_failures_and_missing_baselines() {
     )
     .expect("write current");
 
-    let report = evaluate_matrix_regression_gate(
+    let report = evaluate_matrix_regression_gate_from_paths(
         &baseline_path,
         &current_path,
         MatrixRegressionThresholds {
@@ -858,11 +654,25 @@ fn matrix_regression_gate_flags_ratio_failures_and_missing_baselines() {
     assert_eq!(report.compared_cells, 1);
     assert_eq!(
         report.missing_baseline_cells,
-        vec!["fsqlite:missing_baseline:fixture:c1".to_owned()]
+        vec![fsqlite_e2e::overlay_honesty_gate::BenchmarkCellKey {
+            benchmark_id: "fsqlite:missing_baseline:fixture:c1".to_owned(),
+            row_id: None,
+            fixture_id: "fixture".to_owned(),
+            workload: "missing_baseline".to_owned(),
+            concurrency: 1,
+            mode_id: "fsqlite".to_owned(),
+        }]
     );
     assert_eq!(
         report.failing_cells,
-        vec!["fsqlite:count_star:fixture:c1".to_owned()]
+        vec![fsqlite_e2e::overlay_honesty_gate::BenchmarkCellKey {
+            benchmark_id: "fsqlite:count_star:fixture:c1".to_owned(),
+            row_id: None,
+            fixture_id: "fixture".to_owned(),
+            workload: "count_star".to_owned(),
+            concurrency: 1,
+            mode_id: "fsqlite".to_owned(),
+        }]
     );
     assert!(
         report
@@ -1137,6 +947,7 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
     let full_jsonl = artifact_dir.join(format!("{stem}_full.jsonl"));
     let manifest_json = artifact_dir.join(format!("{stem}.manifest.json"));
     let regression_summary_json = artifact_dir.join(format!("{stem}.regression_summary.json"));
+    let overlay_honesty_gate_json = artifact_dir.join(format!("{stem}.overlay_honesty_gate.json"));
 
     let mut ran_both = false;
     let mut ran_single = false;
@@ -1255,11 +1066,13 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
     fs::write(&full_jsonl, combined)?;
 
     let baseline_jsonl = resolve_repo_relative_env_path(&repo_root, MATRIX_BASELINE_JSONL_ENV);
+    let matrix_thresholds =
+        MatrixRegressionThresholds::from_env().map_err(std::io::Error::other)?;
     let regression_gate_report = if let Some(baseline_jsonl) = baseline_jsonl.as_ref() {
-        let report = evaluate_matrix_regression_gate(
+        let report = evaluate_matrix_regression_gate_from_paths(
             baseline_jsonl,
             &full_jsonl,
-            MatrixRegressionThresholds::from_env()?,
+            matrix_thresholds,
         )?;
         fs::write(
             &regression_summary_json,
@@ -1271,6 +1084,47 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
                 baseline_jsonl.display()
             )
             .into());
+        }
+        Some(report)
+    } else {
+        None
+    };
+
+    let overlay_c1_scorecard_json =
+        resolve_repo_relative_env_path(&repo_root, OVERLAY_C1_SCORECARD_JSON_ENV);
+    let overlay_persistent_scorecard_json =
+        resolve_repo_relative_env_path(&repo_root, OVERLAY_PERSISTENT_SCORECARD_JSON_ENV);
+    let enforce_overlay_honesty_gate =
+        std::env::var_os(OVERLAY_ENFORCE_HONESTY_GATE_ENV).is_some_and(|value| value != "0");
+    let overlay_honesty_gate_report = if enforce_overlay_honesty_gate
+        || overlay_c1_scorecard_json.is_some()
+        || overlay_persistent_scorecard_json.is_some()
+    {
+        let report = evaluate_overlay_honesty_gate_from_paths(
+            &full_jsonl,
+            baseline_jsonl.as_deref(),
+            overlay_c1_scorecard_json.as_deref(),
+            overlay_persistent_scorecard_json.as_deref(),
+            if enforce_overlay_honesty_gate {
+                fsqlite_e2e::overlay_honesty_gate::OverlayHonestyGateConfig {
+                    matrix_thresholds,
+                    ..fsqlite_e2e::overlay_honesty_gate::OverlayHonestyGateConfig::strict_overlay()
+                }
+            } else {
+                fsqlite_e2e::overlay_honesty_gate::OverlayHonestyGateConfig {
+                    matrix_thresholds,
+                    require_c1_pack: false,
+                    require_persistent_pack: false,
+                    fail_on_warning: true,
+                }
+            },
+        )?;
+        fs::write(
+            &overlay_honesty_gate_json,
+            serde_json::to_vec_pretty(&report)?,
+        )?;
+        if let Some(summary) = report.failure_summary() {
+            return Err(format!("overlay honesty gate failed: {summary}").into());
         }
         Some(report)
     } else {
@@ -1300,6 +1154,11 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
         "matrix_regression_compared_cells": regression_gate_report.as_ref().map(|report| report.compared_cells),
         "matrix_regression_missing_baseline_cells": regression_gate_report.as_ref().map(|report| report.missing_baseline_cells.clone()),
         "matrix_regression_failing_cells": regression_gate_report.as_ref().map(|report| report.failing_cells.clone()),
+        "overlay_honesty_gate_json": overlay_honesty_gate_report.as_ref().map(|_| overlay_honesty_gate_json.clone()),
+        "overlay_honesty_gate_c1_scorecard_json": overlay_c1_scorecard_json,
+        "overlay_honesty_gate_persistent_scorecard_json": overlay_persistent_scorecard_json,
+        "overlay_honesty_gate_overall_verdict": overlay_honesty_gate_report.as_ref().map(|report| report.overall_verdict),
+        "overlay_honesty_gate_blocking_findings": overlay_honesty_gate_report.as_ref().map(|report| report.blocking_findings.clone()),
         "generated_bundle_count": generated_bundles.len(),
         "generated_bundles": generated_bundles,
     });

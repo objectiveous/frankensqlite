@@ -374,10 +374,16 @@ struct ReportSummaryStats {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 struct DetectedEnvironment {
     os: Option<String>,
+    arch: String,
+    kernel_release: Option<String>,
     cpu_model: Option<String>,
     cpu_cores: Option<usize>,
     ram_gb: Option<f64>,
+    active_toolchain: Option<String>,
     rust_version: Option<String>,
+    cargo_version: Option<String>,
+    git_commit_sha: Option<String>,
+    git_branch: Option<String>,
     build_profile: String,
 }
 
@@ -524,6 +530,16 @@ impl JsonMeasurement {
 
 impl DetectedEnvironment {
     fn detect() -> Self {
+        fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
+            std::process::Command::new(program)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                .filter(|stdout| !stdout.is_empty())
+        }
+
         let os = std::fs::read_to_string("/etc/os-release")
             .ok()
             .and_then(|os_release| {
@@ -550,6 +566,11 @@ impl DetectedEnvironment {
                     (model, (count > 0).then_some(count))
                 });
 
+        let kernel_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .ok()
+            .map(|release| release.trim().to_owned())
+            .filter(|release| !release.is_empty());
+
         let ram_gb = std::fs::read_to_string("/proc/meminfo")
             .ok()
             .and_then(|meminfo| {
@@ -562,20 +583,29 @@ impl DetectedEnvironment {
                 })
             });
 
-        let rust_version = std::process::Command::new("rustc")
-            .arg("--version")
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-            .filter(|version| !version.is_empty());
+        let active_toolchain =
+            command_stdout("rustup", &["show", "active-toolchain"]).or_else(|| {
+                std::env::var("RUSTUP_TOOLCHAIN")
+                    .ok()
+                    .filter(|toolchain| !toolchain.is_empty())
+            });
+        let rust_version = command_stdout("rustc", &["--version"]);
+        let cargo_version = command_stdout("cargo", &["--version"]);
+        let git_commit_sha = command_stdout("git", &["rev-parse", "HEAD"]);
+        let git_branch = command_stdout("git", &["branch", "--show-current"]);
 
         Self {
             os,
+            arch: std::env::consts::ARCH.to_owned(),
+            kernel_release,
             cpu_model,
             cpu_cores,
             ram_gb,
+            active_toolchain,
             rust_version,
+            cargo_version,
+            git_commit_sha,
+            git_branch,
             build_profile: "release-perf".to_owned(),
         }
     }
@@ -583,6 +613,10 @@ impl DetectedEnvironment {
     fn print(&self, to_stdout: bool) {
         if let Some(os) = &self.os {
             emit_line(to_stdout, format!("  OS: {os}"));
+        }
+        emit_line(to_stdout, format!("  Arch: {}", self.arch));
+        if let Some(kernel_release) = &self.kernel_release {
+            emit_line(to_stdout, format!("  Kernel: {kernel_release}"));
         }
         if let Some(cpu_model) = &self.cpu_model {
             match self.cpu_cores {
@@ -595,8 +629,22 @@ impl DetectedEnvironment {
         if let Some(ram_gb) = self.ram_gb {
             emit_line(to_stdout, format!("  RAM: {ram_gb:.1} GB"));
         }
+        if let Some(active_toolchain) = &self.active_toolchain {
+            emit_line(to_stdout, format!("  Toolchain: {active_toolchain}"));
+        }
         if let Some(rust_version) = &self.rust_version {
             emit_line(to_stdout, format!("  Rust: {rust_version}"));
+        }
+        if let Some(cargo_version) = &self.cargo_version {
+            emit_line(to_stdout, format!("  Cargo: {cargo_version}"));
+        }
+        if let Some(git_commit_sha) = &self.git_commit_sha {
+            match &self.git_branch {
+                Some(git_branch) => {
+                    emit_line(to_stdout, format!("  Git: {git_branch} @ {git_commit_sha}"));
+                }
+                None => emit_line(to_stdout, format!("  Git: {git_commit_sha}")),
+            }
         }
         emit_line(
             to_stdout,
@@ -1962,10 +2010,16 @@ mod tests {
             },
             DetectedEnvironment {
                 os: Some("TestOS".to_owned()),
+                arch: "x86_64".to_owned(),
+                kernel_release: Some("6.0.0-test".to_owned()),
                 cpu_model: Some("Test CPU".to_owned()),
                 cpu_cores: Some(8),
                 ram_gb: Some(32.0),
+                active_toolchain: Some("nightly-x86_64-unknown-linux-gnu".to_owned()),
                 rust_version: Some("rustc test".to_owned()),
+                cargo_version: Some("cargo test".to_owned()),
+                git_commit_sha: Some("0123456789abcdef".to_owned()),
+                git_branch: Some("main".to_owned()),
                 build_profile: "release-perf".to_owned(),
             },
         );

@@ -13,8 +13,13 @@ use std::process::Command;
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
+use serde_json::json;
 use tempfile::tempdir;
 
+const SCENARIO_COMPLETENESS_BEAD_ID: &str = "bd-mblr.4";
+const SCENARIO_COMPLETENESS_SEED: u64 = 0x006D_626C_722E_3401;
+const SCENARIO_COMPLETENESS_REPLAY: &str =
+    "cargo test -p fsqlite-e2e --test recovery_crash_wal_replay -- --nocapture --test-threads=1";
 const HELPER_MODE_ENV: &str = "FSQLITE_CRASH_HELPER_MODE";
 const HELPER_DB_PATH_ENV: &str = "FSQLITE_CRASH_HELPER_DB_PATH";
 const HELPER_TEST_NAME: &str = "crash_helper_entrypoint";
@@ -87,6 +92,20 @@ fn assert_recovered_rows_match_oracle(db_path: &Path, expected: &[i64], label: &
     assert_eq!(
         f_rows, c_rows,
         "[{label}] recovered logical rows differed between FrankenSQLite and stock SQLite"
+    );
+}
+
+fn emit_crash_replay_log(test_name: &str, phase: &str, extra: serde_json::Value) {
+    eprintln!(
+        "CRASH_REPLAY_COMPLETENESS:{}",
+        json!({
+            "bead_id": SCENARIO_COMPLETENESS_BEAD_ID,
+            "seed": SCENARIO_COMPLETENESS_SEED,
+            "replay_command": SCENARIO_COMPLETENESS_REPLAY,
+            "test_name": test_name,
+            "phase": phase,
+            "extra": extra
+        })
     );
 }
 
@@ -220,6 +239,55 @@ fn only_committed_prefix_survives_multi_transaction_crash() {
         row_count(&conn),
         20,
         "two committed transactions should survive while trailing uncommitted writes are discarded"
+    );
+}
+
+#[test]
+fn recovered_database_accepts_follow_up_schema_and_writes() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("recovered_follow_up_work.db");
+    let expected: Vec<i64> = (0..102).collect();
+
+    spawn_crash_helper("committed", &db_path);
+    assert_recovered_rows_match_oracle(&db_path, &(0..100).collect::<Vec<_>>(), "follow_up_seed");
+
+    let recovered =
+        Connection::open(db_path.to_string_lossy().as_ref()).expect("open recovered db");
+    recovered
+        .execute("CREATE INDEX idx_t_x_post_recovery ON t(x);")
+        .expect("create follow-up index");
+    recovered
+        .execute("INSERT INTO t VALUES (100);")
+        .expect("insert row 100 after recovery");
+    recovered
+        .execute("INSERT INTO t VALUES (101);")
+        .expect("insert row 101 after recovery");
+    recovered.close().expect("close recovered connection");
+
+    assert_recovered_rows_match_oracle(&db_path, &expected, "follow_up_after_recovery");
+
+    let sqlite = rusqlite::Connection::open(&db_path).expect("open recovered sqlite db");
+    let index_count: i64 = sqlite
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_t_x_post_recovery';",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query index count");
+    assert_eq!(
+        index_count, 1,
+        "follow-up index must persist after recovery"
+    );
+
+    emit_crash_replay_log(
+        "recovered_database_accepts_follow_up_schema_and_writes",
+        "result",
+        json!({
+            "row_count": expected.len(),
+            "index_count": index_count,
+            "min_row": expected.first().copied(),
+            "max_row": expected.last().copied()
+        }),
     );
 }
 

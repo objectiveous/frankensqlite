@@ -47,6 +47,8 @@ fn criterion_config() -> Criterion {
 
 // ─── C SQLite concurrent writers (file-backed WAL) ──────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=file, concurrency=concurrent, comparison=control
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential, comparison=control
 fn bench_concurrent_csqlite(c: &mut Criterion, n_threads: usize, label: &str) {
     #[allow(clippy::cast_possible_wrap)]
     let total_rows = n_threads as u64 * ROWS_PER_THREAD as u64;

@@ -56,7 +56,7 @@ pub const MEASUREMENT_TIME_SECS: u64 = 10;
 ///
 /// This record is serialized into the report JSON so that consumers can
 /// verify exactly how the numbers were produced without reading source code.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MethodologyMeta {
     /// Human-readable methodology version for schema evolution.
     pub version: String,
@@ -111,7 +111,7 @@ pub enum EnvironmentCaptureMode {
     Suppressed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvironmentMeta {
     /// Whether the environment was fully probed or intentionally suppressed.
     ///

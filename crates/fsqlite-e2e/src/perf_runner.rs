@@ -2070,6 +2070,32 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
         out,
         "- `manifest.json` — replay metadata + artifact inventory"
     );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Mandatory Perf Checklist\n");
+    let _ = writeln!(
+        out,
+        "- [ ] Confirm the cited claim matches this exact tuple: fixture `{}`, workload `{}`, concurrency `c{}`, concurrent mode `{}`.",
+        report.fixture_id,
+        report.workload,
+        report.concurrency,
+        if report.concurrent_mode { "ON" } else { "OFF" }
+    );
+    let _ = writeln!(
+        out,
+        "- [ ] Confirm the build/profile provenance is carried with the artifact bundle and that `manifest.json` plus the replay command remain attached to any benchmark note or PR."
+    );
+    let _ = writeln!(
+        out,
+        "- [ ] Confirm `summary.md`, `profile.json`, `subsystem_profile.json`, and `actionable_ranking.json` are published together before drawing conclusions from a single wall-time number."
+    );
+    let _ = writeln!(
+        out,
+        "- [ ] Confirm the top hotspot or causal bucket is translated into a concrete next action, including the mapped bead IDs or an explicit note that no mapped follow-up exists."
+    );
+    let _ = writeln!(
+        out,
+        "- [ ] Confirm any caveat from integrity-check state, retry behavior, or fallback counters is disclosed alongside the claim instead of being left implicit."
+    );
     out
 }
 
@@ -5455,6 +5481,16 @@ mod tests {
             std::fs::read_to_string(artifact_dir.join("summary.md"))
                 .unwrap()
                 .contains("## Causal Classification")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("## Mandatory Perf Checklist")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("fixture `smoke`, workload `hot_page_contention`, concurrency `c1`")
         );
         assert!(
             actionable_ranking

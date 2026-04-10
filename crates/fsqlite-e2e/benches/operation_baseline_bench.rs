@@ -152,6 +152,8 @@ fn criterion_config() -> Criterion {
 
 // ─── 1. Sequential scan ────────────────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_sequential_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("op_sequential_scan");
     group.sample_size(50);
@@ -191,6 +193,8 @@ fn bench_sequential_scan(c: &mut Criterion) {
 
 // ─── 2. Point lookup ───────────────────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_point_lookup(c: &mut Criterion) {
     let mut group = c.benchmark_group("op_point_lookup");
     group.sample_size(100);
@@ -229,6 +233,8 @@ fn bench_point_lookup(c: &mut Criterion) {
 
 // ─── 3. Range scan ─────────────────────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_range_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("op_range_scan_100");
     group.sample_size(50);
@@ -276,6 +282,8 @@ fn bench_range_scan(c: &mut Criterion) {
 // connection state. Use this group for end-to-end "one row on a fresh
 // database" latency, not for the steady-state prepared INSERT hot path.
 
+// BENCH-META: engine=csqlite, lifecycle=ad_hoc, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=ad_hoc, storage=memory, concurrency=sequential
 fn bench_single_row_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("op_single_row_insert");
     group.sample_size(50);
@@ -334,6 +342,8 @@ fn bench_single_row_insert(c: &mut Criterion) {
 
 // ─── 5. Batch insert (1000 rows in one transaction) ────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_batch_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("op_batch_insert_1000");
     group.sample_size(20);
@@ -405,6 +415,8 @@ fn bench_batch_insert(c: &mut Criterion) {
 
 // ─── 6. Single-row update ──────────────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_single_row_update(c: &mut Criterion) {
     let mut group = c.benchmark_group("op_single_row_update");
     group.sample_size(100);
@@ -441,6 +453,8 @@ fn bench_single_row_update(c: &mut Criterion) {
 
 // ─── 7. Single-row delete ──────────────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=ad_hoc, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=ad_hoc, storage=memory, concurrency=sequential
 fn bench_single_row_delete(c: &mut Criterion) {
     let mut group = c.benchmark_group("op_single_row_delete");
     group.sample_size(20);
@@ -483,6 +497,8 @@ fn bench_single_row_delete(c: &mut Criterion) {
 
 // ─── 8. 2-way equi-join ───────────────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_two_way_join(c: &mut Criterion) {
     let mut group = c.benchmark_group("op_two_way_equi_join");
     group.sample_size(50);
@@ -526,6 +542,8 @@ fn bench_two_way_join(c: &mut Criterion) {
 
 // ─── 9. Aggregation (COUNT/SUM/AVG) ────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_aggregation(c: &mut Criterion) {
     let mut group = c.benchmark_group("op_aggregation");
     group.sample_size(100);
@@ -574,6 +592,11 @@ fn bench_aggregation(c: &mut Criterion) {
 // The fix (tracked in bd-wwqen.3) should eliminate this gap by supporting
 // column reordering in the direct insert path.
 
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_column_list_insert_prepared(c: &mut Criterion) {
     let mut group = c.benchmark_group("op_column_list_insert_prepared_1000");
     group.sample_size(20);

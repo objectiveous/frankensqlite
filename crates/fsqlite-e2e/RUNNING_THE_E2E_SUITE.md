@@ -451,14 +451,16 @@ bash scripts/verify_bd_db300_8_1_1_matched_artifact_packs.sh
 ```
 
 By default it targets the current Track H steering cell
-`mixed_read_write_c4`, uses `baseline_unpinned`, and routes every benchmark
-through `rch exec`. Narrow the scope explicitly when you want a smaller or more
-focused pack:
+`mixed_read_write_c4`, uses `baseline_unpinned`, collects both
+`file_backed` and `memory` storage profiles, and routes every benchmark through
+`rch exec`. Narrow the scope explicitly when you want a smaller or more focused
+pack:
 
 ```bash
 ROW_IDS=mixed_read_write_c4 \
 FIXTURE_IDS=frankensqlite \
 PLACEMENT_PROFILE_IDS=baseline_unpinned \
+STORAGE_PROFILE_IDS=file_backed,memory \
 WARMUP=0 \
 REPEAT=1 \
 bash scripts/verify_bd_db300_8_1_1_matched_artifact_packs.sh
@@ -466,18 +468,48 @@ bash scripts/verify_bd_db300_8_1_1_matched_artifact_packs.sh
 
 The output goes under `artifacts/perf/bd-db300.8.1.1/<run_id>/` and includes:
 
-- one pack directory per `row_id` × `fixture_id` × `placement_profile_id`
+- one pack directory per `row_id` × `fixture_id` × `placement_profile_id` ×
+  `storage_profile_id`
 - mode-specific `results.jsonl` and `summary.md` artifacts for
   `sqlite_reference`, `fsqlite_mvcc`, and `fsqlite_single_writer`
 - a per-pack `manifest.json` plus `summary.md` with shared provenance fields and
   direct deltas between MVCC and forced single-writer behavior
 - a run-level `report.json` and `summary.md`
 
+The underlying bench entrypoint now accepts:
+
+- `--placement-profile baseline_unpinned|recommended_pinned|adversarial_cross_node`
+- `--storage-profile file_backed|memory`
+
 `baseline_unpinned` packs are directly comparable under scheduler-default
 placement. If you request `recommended_pinned` or `adversarial_cross_node`, the
 collector records the declared placement profile but does not enforce remote CPU
 or memory placement on your behalf; those packs are marked as declared-only
 until the operator supplies external placement enforcement.
+
+`memory` storage profiles replay the same canonical OpLog against `:memory:`
+databases for all three engines. That is a storage-backend contrast, not a
+replacement for external NUMA or CPU pinning, so the placement profile remains
+provenance metadata rather than a claim that memory-only runs enforce topology.
+
+For the H1.2 follow-on collection, keep the same steering row and fixture but
+override the bead id and placement list explicitly:
+
+```bash
+BEAD_ID=bd-db300.8.1.2 \
+ROW_IDS=mixed_read_write_c4 \
+FIXTURE_IDS=frankensqlite \
+PLACEMENT_PROFILE_IDS=recommended_pinned,adversarial_cross_node \
+STORAGE_PROFILE_IDS=file_backed,memory \
+WARMUP=0 \
+REPEAT=1 \
+bash scripts/verify_bd_db300_8_1_1_matched_artifact_packs.sh
+```
+
+Those non-baseline packs still inherit the declared placement contract from the
+campaign manifest, but unless the operator also supplies external CPU and memory
+binding, the collector will mark them as declared-only rather than cleanly
+comparable topology-enforced runs.
 
 ### Persistent Phase-Attribution Packs
 

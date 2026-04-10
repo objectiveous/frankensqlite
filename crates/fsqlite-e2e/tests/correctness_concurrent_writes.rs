@@ -17,7 +17,61 @@
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+use serde_json::json;
+
+const BEAD_ID: &str = "bd-244z";
+const SCENARIO_COMPLETENESS_BEAD_ID: &str = "bd-mblr.4";
+const SCENARIO_COMPLETENESS_REPLAY: &str = "cargo test -p fsqlite-e2e --test correctness_concurrent_writes -- --nocapture --test-threads=1";
+const SEED_CONCURRENT_WRITES_2T: u64 = 0x006D_626C_722E_3402;
+const SEED_CONCURRENT_WRITES_4T: u64 = 0x006D_626C_722E_3403;
+const SEED_CONCURRENT_WRITES_8T: u64 = 0x006D_626C_722E_3404;
+const SEED_CONCURRENT_WRITES_NO_LOSS: u64 = 0x006D_626C_722E_3405;
+
 // ─── Helpers ───────────────────────────────────────────────────────────
+
+fn emit_scenario_completeness_log(
+    test_name: &str,
+    seed: u64,
+    phase: &str,
+    extra: serde_json::Value,
+) {
+    eprintln!(
+        "SCENARIO_COMPLETENESS:{}",
+        json!({
+            "bead_id": SCENARIO_COMPLETENESS_BEAD_ID,
+            "seed": seed,
+            "replay_command": SCENARIO_COMPLETENESS_REPLAY,
+            "test_name": test_name,
+            "phase": phase,
+            "extra": extra
+        })
+    );
+}
+
+fn row_summary(rows: &[(i64, String, i64)]) -> serde_json::Value {
+    let first_row = rows.first().map(|(id, name, val)| {
+        json!({
+            "id": id,
+            "name": name,
+            "val": val,
+        })
+    });
+    let last_row = rows.last().map(|(id, name, val)| {
+        json!({
+            "id": id,
+            "name": name,
+            "val": val,
+        })
+    });
+
+    json!({
+        "row_count": rows.len(),
+        "min_id": rows.first().map(|(id, _, _)| *id),
+        "max_id": rows.last().map(|(id, _, _)| *id),
+        "first_row": first_row,
+        "last_row": last_row,
+    })
+}
 
 /// Query all rows from the test table, returning sorted by id.
 fn query_sorted(conn: &rusqlite::Connection) -> Vec<(i64, String, i64)> {
@@ -97,20 +151,40 @@ fn gen_thread_inserts(thread_id: usize, count: usize, range_size: usize) -> Vec<
 
 #[test]
 fn concurrent_writes_2_threads_disjoint_keys() {
-    concurrent_writes_n_threads(2, 500);
+    concurrent_writes_n_threads(
+        "concurrent_writes_2_threads_disjoint_keys",
+        SEED_CONCURRENT_WRITES_2T,
+        2,
+        500,
+    );
 }
 
 #[test]
 fn concurrent_writes_4_threads_disjoint_keys() {
-    concurrent_writes_n_threads(4, 250);
+    concurrent_writes_n_threads(
+        "concurrent_writes_4_threads_disjoint_keys",
+        SEED_CONCURRENT_WRITES_4T,
+        4,
+        250,
+    );
 }
 
 #[test]
 fn concurrent_writes_8_threads_disjoint_keys() {
-    concurrent_writes_n_threads(8, 125);
+    concurrent_writes_n_threads(
+        "concurrent_writes_8_threads_disjoint_keys",
+        SEED_CONCURRENT_WRITES_8T,
+        8,
+        125,
+    );
 }
 
-fn concurrent_writes_n_threads(n_threads: usize, ops_per_thread: usize) {
+fn concurrent_writes_n_threads(
+    test_name: &str,
+    seed: u64,
+    n_threads: usize,
+    ops_per_thread: usize,
+) {
     let range_size = 10_000; // non-overlapping ranges
     let total_expected = n_threads * ops_per_thread;
 
@@ -154,14 +228,9 @@ fn concurrent_writes_n_threads(n_threads: usize, ops_per_thread: usize) {
 
     let csqlite_conn = rusqlite::Connection::open(&db_path).unwrap();
     let csqlite_rows = query_sorted(&csqlite_conn);
-    assert_eq!(
-        csqlite_rows.len(),
-        total_expected,
-        "C SQLite row count mismatch"
-    );
+    let frank = fsqlite::Connection::open(":memory:").unwrap();
 
     // ── FrankenSQLite: sequential execution (same operations) ──
-    let frank = fsqlite::Connection::open(":memory:").unwrap();
     frank
         .execute("CREATE TABLE concurrent_test (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)")
         .unwrap();
@@ -176,6 +245,29 @@ fn concurrent_writes_n_threads(n_threads: usize, ops_per_thread: usize) {
     }
 
     let frank_rows = frank_query_sorted(&frank);
+    let logically_equivalent = csqlite_rows == frank_rows;
+
+    emit_scenario_completeness_log(
+        test_name,
+        seed,
+        "result",
+        json!({
+            "scenario_bead_id": BEAD_ID,
+            "threads": n_threads,
+            "ops_per_thread": ops_per_thread,
+            "range_size": range_size,
+            "total_expected": total_expected,
+            "logical_equivalence": logically_equivalent,
+            "csqlite": row_summary(&csqlite_rows),
+            "fsqlite": row_summary(&frank_rows),
+        }),
+    );
+
+    assert_eq!(
+        csqlite_rows.len(),
+        total_expected,
+        "C SQLite row count mismatch"
+    );
     assert_eq!(
         frank_rows.len(),
         total_expected,
@@ -247,17 +339,36 @@ fn concurrent_writes_verify_no_data_loss() {
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     let rows = query_sorted(&conn);
 
-    // Verify every expected row is present.
+    let mut missing_ids = Vec::new();
     for tid in 0..n_threads {
         for i in 0..ops_per_thread {
             #[allow(clippy::cast_possible_wrap)]
             let expected_id = (tid * range_size + i) as i64;
-            assert!(
-                rows.iter().any(|(id, _, _)| *id == expected_id),
-                "missing row id={expected_id} (thread={tid}, offset={i})"
-            );
+            if !rows.iter().any(|(id, _, _)| *id == expected_id) {
+                missing_ids.push(expected_id);
+            }
         }
     }
 
+    emit_scenario_completeness_log(
+        "concurrent_writes_verify_no_data_loss",
+        SEED_CONCURRENT_WRITES_NO_LOSS,
+        "result",
+        json!({
+            "scenario_bead_id": BEAD_ID,
+            "threads": n_threads,
+            "ops_per_thread": ops_per_thread,
+            "range_size": range_size,
+            "row_summary": row_summary(&rows),
+            "missing_id_count": missing_ids.len(),
+            "missing_id_sample": missing_ids.iter().take(8).copied().collect::<Vec<_>>(),
+        }),
+    );
+
+    assert!(
+        missing_ids.is_empty(),
+        "missing row ids detected: {:?}",
+        missing_ids.iter().take(8).copied().collect::<Vec<_>>()
+    );
     assert_eq!(rows.len(), n_threads * ops_per_thread);
 }

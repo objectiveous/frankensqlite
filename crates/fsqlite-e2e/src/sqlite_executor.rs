@@ -95,6 +95,10 @@ pub fn run_oplog_sqlite(
         )));
     }
 
+    if db_path == Path::new(":memory:") {
+        return run_oplog_sqlite_in_memory(oplog, config);
+    }
+
     // Extract leading SQL-only records as global setup (DDL/PRAGMAs).
     let setup_len = oplog
         .records
@@ -215,6 +219,98 @@ pub fn run_oplog_sqlite(
     })
 }
 
+fn run_oplog_sqlite_in_memory(
+    oplog: &OpLog,
+    config: &SqliteExecConfig,
+) -> E2eResult<EngineRunReport> {
+    let worker_count = oplog.header.concurrency.worker_count;
+    let setup_len = oplog
+        .records
+        .iter()
+        .take_while(|record| matches!(&record.kind, OpKind::Sql { .. }))
+        .count();
+
+    let mut conn = Connection::open(":memory:")?;
+    apply_pragmas(&conn, config)?;
+    for rec in &oplog.records[..setup_len] {
+        if let OpKind::Sql { statement } = &rec.kind {
+            conn.execute_batch(statement)?;
+        }
+    }
+
+    let mut per_worker: Vec<Vec<OpRecord>> = vec![Vec::new(); usize::from(worker_count)];
+    for rec in oplog.records.iter().skip(setup_len) {
+        let idx = usize::from(rec.worker);
+        if idx >= per_worker.len() {
+            return Err(E2eError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "oplog record worker={} out of range (worker_count={worker_count})",
+                    rec.worker
+                ),
+            )));
+        }
+        per_worker[idx].push(rec.clone());
+    }
+
+    let started = Instant::now();
+    let mut stats = WorkerStats {
+        ops_ok: 0,
+        ops_err: 0,
+        retries: 0,
+        aborts: 0,
+        error: None,
+    };
+
+    for records in &per_worker {
+        let worker_stats = replay_worker_batches_serially(&mut conn, records, config);
+        stats.ops_ok = stats.ops_ok.saturating_add(worker_stats.ops_ok);
+        stats.ops_err = stats.ops_err.saturating_add(worker_stats.ops_err);
+        stats.retries = stats.retries.saturating_add(worker_stats.retries);
+        stats.aborts = stats.aborts.saturating_add(worker_stats.aborts);
+        if stats.error.is_none() {
+            stats.error = worker_stats.error;
+        }
+    }
+
+    let wall = started.elapsed();
+    let wall_ms = duration_to_u64_ms(wall);
+    let wall_secs = wall.as_secs_f64();
+    let ops_total = stats.ops_ok + stats.ops_err;
+    #[allow(clippy::cast_precision_loss)]
+    let ops_per_sec = if wall_secs > 0.0 {
+        (stats.ops_ok as f64) / wall_secs
+    } else {
+        0.0
+    };
+
+    Ok(EngineRunReport {
+        wall_time_ms: wall_ms,
+        ops_total,
+        ops_per_sec,
+        retries: stats.retries,
+        aborts: stats.aborts,
+        correctness: CorrectnessReport {
+            raw_sha256_match: None,
+            dump_match: None,
+            canonical_sha256_match: None,
+            integrity_check_ok: None,
+            raw_sha256: None,
+            canonical_sha256: None,
+            logical_sha256: None,
+            notes: None,
+        },
+        latency_ms: None,
+        first_failure_diagnostic: stats.error.clone(),
+        error: stats
+            .error
+            .or_else(|| (stats.ops_err > 0).then(|| format!("ops_err={}", stats.ops_err))),
+        storage_wiring: None,
+        runtime_phase_timing: None,
+        hot_path_profile: None,
+    })
+}
+
 /// Run `PRAGMA integrity_check` on the database at `db_path`.
 ///
 /// Opens a fresh connection, checkpoints the WAL, then executes the pragma.
@@ -295,6 +391,56 @@ fn run_worker(
                 }
                 Err(BatchError::Fatal(msg)) => {
                     stats.error = Some(format!("worker {worker_id}: {msg}"));
+                    break;
+                }
+            }
+        }
+    }
+
+    stats
+}
+
+fn replay_worker_batches_serially(
+    conn: &mut Connection,
+    records: &[OpRecord],
+    config: &SqliteExecConfig,
+) -> WorkerStats {
+    let mut stats = WorkerStats {
+        ops_ok: 0,
+        ops_err: 0,
+        retries: 0,
+        aborts: 0,
+        error: None,
+    };
+
+    for batch in split_into_batches(records) {
+        if stats.error.is_some() {
+            break;
+        }
+
+        let mut attempt = 0_u32;
+        loop {
+            match execute_batch(conn, &batch) {
+                Ok((ok, err)) => {
+                    stats.ops_ok = stats.ops_ok.saturating_add(ok);
+                    stats.ops_err = stats.ops_err.saturating_add(err);
+                    break;
+                }
+                Err(BatchError::Busy(msg)) => {
+                    stats.retries = stats.retries.saturating_add(1);
+                    stats.aborts = stats.aborts.saturating_add(1);
+                    attempt = attempt.saturating_add(1);
+                    if attempt > config.max_busy_retries {
+                        stats.error = Some(format!(
+                            "exceeded max_busy_retries={} (last={msg})",
+                            config.max_busy_retries
+                        ));
+                        break;
+                    }
+                    std::thread::sleep(backoff_duration(config, attempt));
+                }
+                Err(BatchError::Fatal(msg)) => {
+                    stats.error = Some(msg);
                     break;
                 }
             }
@@ -706,6 +852,20 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM t0", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 100);
+    }
+
+    #[test]
+    fn test_run_oplog_sqlite_in_memory_replays_with_single_connection() {
+        let oplog = preset_commutative_inserts_disjoint_keys("test-fixture", 101, 4, 25);
+        let report =
+            run_oplog_sqlite(Path::new(":memory:"), &oplog, &SqliteExecConfig::default()).unwrap();
+
+        assert!(report.error.is_none(), "error={:?}", report.error);
+        assert!(report.ops_total > 0);
+        assert_eq!(
+            report.correctness.integrity_check_ok, None,
+            "in-memory replays should not claim file-backed integrity_check coverage"
+        );
     }
 
     #[test]

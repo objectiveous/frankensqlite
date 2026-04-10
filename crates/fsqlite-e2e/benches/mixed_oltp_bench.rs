@@ -117,6 +117,7 @@ fn setup_fsqlite() -> fsqlite::Connection {
 // ─── C SQLite mixed OLTP ────────────────────────────────────────────────
 
 #[allow(clippy::cast_possible_wrap)]
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_mixed_oltp_csqlite(c: &mut Criterion) {
     let mut group = c.benchmark_group("mixed_oltp_80r_20w");
     group.sample_size(10);
@@ -181,6 +182,7 @@ fn bench_mixed_oltp_csqlite(c: &mut Criterion) {
 // ─── FrankenSQLite mixed OLTP ───────────────────────────────────────────
 
 #[allow(clippy::cast_possible_wrap)]
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_mixed_oltp_fsqlite(c: &mut Criterion) {
     let mut group = c.benchmark_group("mixed_oltp_80r_20w");
     group.sample_size(10);

@@ -24,11 +24,14 @@
 //!
 //! Optional machine-readable capture:
 //! - Set `FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR=/path/to/dir`
-//! - The benchmark writes `provenance.json` once and appends per-iteration
-//!   records to `samples.jsonl` without changing default stderr output
+//! - The benchmark writes `provenance.json` once, appends per-iteration
+//!   records to `samples.jsonl`, and refreshes paired SQLite-vs-FrankenSQLite
+//!   `component_comparison.{json,md}` artifacts without changing default
+//!   stderr output
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -38,13 +41,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use fsqlite::{FrankenError, SqliteValue};
 use fsqlite_e2e::persistent_phase_audit::{
-    PersistentLatencySummary, PersistentMeasuredCommitSubBuckets, PersistentOperationTiming,
-    PersistentOperationWallTimeAudit, PersistentRetryStageCounts,
-    build_measured_commit_sub_buckets, build_operation_wall_time_audit,
-    format_operation_wall_time_audit, persistent_latency_summary, sleep_with_accounting,
+    PERSISTENT_PHASE_COMPONENT_COMPARISON_SUITE_SCHEMA_V1, PersistentLatencySummary,
+    PersistentMeasuredCommitSubBuckets, PersistentOperationTiming,
+    PersistentOperationWallTimeAudit, PersistentPhaseComponentComparisonSuite,
+    PersistentRetryStageCounts, build_measured_commit_sub_buckets, build_operation_wall_time_audit,
+    build_persistent_phase_component_comparison_report, format_operation_wall_time_audit,
+    persistent_latency_summary, render_persistent_phase_component_comparison_suite_markdown,
+    sleep_with_accounting,
 };
 use fsqlite_wal::ConsolidationMetricsSnapshot;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const ROWS_PER_THREAD: i64 = 1000;
 /// Maximum retries before giving up on a transaction (applies to both engines).
@@ -55,6 +61,8 @@ const PERSISTENT_PHASE_CAPTURE_PROVENANCE_SCHEMA_V1: &str =
     "fsqlite-e2e.persistent_phase_capture_provenance.v1";
 const PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V3: &str =
     "fsqlite-e2e.persistent_phase_capture_sample.v3";
+const SQLITE_ENGINE_ID: &str = "sqlite3";
+const FSQLITE_ENGINE_ID: &str = "fsqlite_mvcc";
 
 // ─── PRAGMA helpers ─────────────────────────────────────────────────────
 
@@ -178,6 +186,25 @@ struct PersistentPhaseCaptureSample {
     metrics: PersistentBenchmarkMetrics,
     phase_metrics: Option<ConsolidationMetricsSnapshot>,
     phase_timing_report: Option<String>,
+    flusher_lock_wait_fraction_basis_points: Option<u64>,
+    lock_topology_limited: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PersistentPhaseCaptureArtifactMetrics {
+    throughput_ops_per_sec: f64,
+    operation_wall_time_audit: PersistentOperationWallTimeAudit,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PersistentPhaseCaptureArtifactSample {
+    timestamp_unix_ms: u64,
+    benchmark_group: String,
+    engine: String,
+    concurrency: usize,
+    rows_per_thread: i64,
+    total_rows: u64,
+    metrics: PersistentPhaseCaptureArtifactMetrics,
     flusher_lock_wait_fraction_basis_points: Option<u64>,
     lock_topology_limited: Option<bool>,
 }
@@ -336,6 +363,117 @@ fn flusher_lock_wait_fraction_basis_points(metrics: &ConsolidationMetricsSnapsho
     (total > 0).then_some(lock_wait_total.saturating_mul(10_000) / total)
 }
 
+fn persistent_phase_base_group(benchmark_group: &str) -> &str {
+    benchmark_group
+        .split_once('/')
+        .map_or(benchmark_group, |(base_group, _)| base_group)
+}
+
+fn refresh_persistent_phase_component_comparison_artifacts(
+    output_dir: &Path,
+) -> std::io::Result<()> {
+    type ComparisonKey = (String, usize, i64, u64);
+
+    let sample_path = output_dir.join("samples.jsonl");
+    if !sample_path.exists() {
+        return Ok(());
+    }
+
+    let sample_file = fs::File::open(&sample_path)?;
+    let reader = BufReader::new(sample_file);
+    let mut sqlite_samples: BTreeMap<ComparisonKey, PersistentPhaseCaptureArtifactSample> =
+        BTreeMap::new();
+    let mut fsqlite_samples: BTreeMap<ComparisonKey, PersistentPhaseCaptureArtifactSample> =
+        BTreeMap::new();
+
+    for (line_index, line_result) in reader.lines().enumerate() {
+        let line = line_result?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let raw_value: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "failed to parse {} line {} as JSON: {error}",
+                    sample_path.display(),
+                    line_index + 1
+                ),
+            )
+        })?;
+        let Some(schema_version) = raw_value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if schema_version != PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V3 {
+            continue;
+        }
+
+        let sample: PersistentPhaseCaptureArtifactSample = serde_json::from_value(raw_value)
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "failed to decode {} line {} as persistent phase sample: {error}",
+                        sample_path.display(),
+                        line_index + 1
+                    ),
+                )
+            })?;
+        let key = (
+            persistent_phase_base_group(&sample.benchmark_group).to_owned(),
+            sample.concurrency,
+            sample.rows_per_thread,
+            sample.total_rows,
+        );
+        let sample_map = match sample.engine.as_str() {
+            SQLITE_ENGINE_ID => &mut sqlite_samples,
+            FSQLITE_ENGINE_ID => &mut fsqlite_samples,
+            _ => continue,
+        };
+        let should_replace = sample_map
+            .get(&key)
+            .is_none_or(|existing| sample.timestamp_unix_ms >= existing.timestamp_unix_ms);
+        if should_replace {
+            sample_map.insert(key, sample);
+        }
+    }
+
+    let reports = sqlite_samples
+        .into_iter()
+        .filter_map(|(key, sqlite_sample)| {
+            let fsqlite_sample = fsqlite_samples.get(&key)?;
+            let (benchmark_group, concurrency, rows_per_thread, total_rows) = key;
+            Some(build_persistent_phase_component_comparison_report(
+                &benchmark_group,
+                concurrency,
+                rows_per_thread,
+                total_rows,
+                sqlite_sample.metrics.throughput_ops_per_sec,
+                fsqlite_sample.metrics.throughput_ops_per_sec,
+                &sqlite_sample.metrics.operation_wall_time_audit,
+                &fsqlite_sample.metrics.operation_wall_time_audit,
+                fsqlite_sample.flusher_lock_wait_fraction_basis_points,
+                fsqlite_sample.lock_topology_limited,
+            ))
+        })
+        .collect();
+
+    let suite = PersistentPhaseComponentComparisonSuite {
+        schema_version: PERSISTENT_PHASE_COMPONENT_COMPARISON_SUITE_SCHEMA_V1.to_owned(),
+        reports,
+    };
+    let json_path = output_dir.join("component_comparison.json");
+    let markdown_path = output_dir.join("component_comparison.md");
+    let json_payload = serde_json::to_string_pretty(&suite).map_err(std::io::Error::other)?;
+    let markdown_payload = render_persistent_phase_component_comparison_suite_markdown(&suite);
+    fs::write(json_path, json_payload.as_bytes())?;
+    fs::write(markdown_path, markdown_payload.as_bytes())
+}
+
 fn maybe_write_persistent_phase_capture(sample: &PersistentPhaseCaptureSample) {
     let Some(output_dir) = persistent_phase_capture_dir() else {
         return;
@@ -368,11 +506,20 @@ fn maybe_write_persistent_phase_capture(sample: &PersistentPhaseCaptureSample) {
             "[persistent phase capture] failed to append {}: {error}",
             sample_path.display()
         );
+        return;
+    }
+    if let Err(error) = refresh_persistent_phase_component_comparison_artifacts(&output_dir) {
+        eprintln!(
+            "[persistent phase capture] failed to refresh comparison artifacts in {}: {error}",
+            output_dir.display()
+        );
     }
 }
 
 // ─── C SQLite concurrent writers (file-backed WAL) ──────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=file, concurrency=concurrent
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=file, concurrency=concurrent
 fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, label: &str) {
     #[allow(clippy::cast_possible_wrap)]
     let total_rows = n_threads as u64 * ROWS_PER_THREAD as u64;
@@ -581,7 +728,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                     schema_version: PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V3,
                     timestamp_unix_ms: unix_timestamp_ms(),
                     benchmark_group: format!("{label}/csqlite_concurrent_persistent"),
-                    engine: "sqlite3",
+                    engine: SQLITE_ENGINE_ID,
                     contention_label: "retry",
                     concurrency: n_threads,
                     rows_per_thread: ROWS_PER_THREAD,
@@ -892,7 +1039,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                     schema_version: PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V3,
                     timestamp_unix_ms: unix_timestamp_ms(),
                     benchmark_group: format!("{label}/frankensqlite_concurrent_persistent"),
-                    engine: "fsqlite_mvcc",
+                    engine: FSQLITE_ENGINE_ID,
                     contention_label: "conflict",
                     concurrency: n_threads,
                     rows_per_thread: ROWS_PER_THREAD,

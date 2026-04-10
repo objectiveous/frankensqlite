@@ -93,8 +93,8 @@ pub use parallel_wal::{
     ParallelWalTraceRecord, SegmentHeader, SegmentRecoveryOptions, SegmentRecoveryResult,
     cleanup_segments, default_parallel_wal_lane_count, delete_segment, list_segments,
     max_durable_epoch, parallel_wal_coordinator_for_path, parallel_wal_fallback_reason_name,
-    parallel_wal_mode_name, parallel_wal_shadow_verdict_name, read_segment,
-    recover_and_apply_segments, recover_segments, remove_parallel_wal_coordinator,
+    parallel_wal_mode_name, parallel_wal_shadow_verdict_name, parallel_wal_should_shadow_compare,
+    read_segment, recover_and_apply_segments, recover_segments, remove_parallel_wal_coordinator,
     resolve_parallel_wal_control_surface_from_env, segment_path, write_segment,
 };
 pub use per_core_buffer::{

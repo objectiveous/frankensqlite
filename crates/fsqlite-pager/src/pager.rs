@@ -40,7 +40,7 @@ use fsqlite_wal::{
     ParallelWalFallbackReason, ParallelWalLaneBatch, ParallelWalLaneStager,
     ParallelWalOperatingMode, ParallelWalShadowVerdict, SubmitOutcome, TransactionFrameBatch,
     TransactionFrameBatchContext, WalFile, parallel_wal_fallback_reason_name,
-    parallel_wal_mode_name, parallel_wal_shadow_verdict_name,
+    parallel_wal_mode_name, parallel_wal_shadow_verdict_name, parallel_wal_should_shadow_compare,
     resolve_parallel_wal_control_surface_from_env,
 };
 
@@ -1713,6 +1713,15 @@ fn prepared_batch_matches_frame_refs(
                     && meta.db_size_if_commit == frame.db_size_if_commit
                     && prepared.page_data(index) == frame.page_data
             })
+}
+
+fn should_shadow_compare_batches(
+    control: &ParallelWalControlSurface,
+    batches: &[TransactionFrameBatch],
+) -> bool {
+    batches
+        .iter()
+        .any(|batch| parallel_wal_should_shadow_compare(control, batch.context.batch_id))
 }
 
 fn prepare_group_commit_batch_for_lane(
@@ -5781,9 +5790,9 @@ where
                                         final_db_size,
                                     ) {
                                         Ok(merged) => {
-                                            if matches!(
-                                                parallel_wal_control.mode,
-                                                ParallelWalOperatingMode::ShadowCompare
+                                            if should_shadow_compare_batches(
+                                                &parallel_wal_control,
+                                                &batches,
                                             ) {
                                                 if prepared_batch_matches_frame_refs(
                                                     &merged,
@@ -13697,6 +13706,70 @@ mod tests {
             written[0].1,
             sample_page(0x5A),
             "bead_id=bd-3wop3.1.2 case=shadow_compare_fallback_preserves_committed_payload"
+        );
+    }
+
+    #[test]
+    fn test_parallel_wal_auto_shadow_sampling_can_force_compare_fallback() {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/parallel_wal_auto_shadow_sampled_fallback.db");
+        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+        let (backend, frames, prepare_calls, append_frames_calls, append_prepared_calls) =
+            ShadowCompareMismatchWalBackend::new();
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        let inner = Arc::clone(&pager.inner);
+        let wal_backend = Arc::clone(&pager.wal_backend);
+        let queue = Arc::new(GroupCommitQueue::with_parallel_wal_control(
+            GroupCommitConfig::default(),
+            ParallelWalControlSurface {
+                mode: ParallelWalOperatingMode::Auto,
+                lane_count_override: Some(2),
+                shadow_compare_sampling_per_mille: Some(1_000),
+                ..ParallelWalControlSurface::default()
+            },
+        ));
+        let page_two = PageNumber::new(2).unwrap();
+        let mut write_set = HashMap::new();
+        write_set.insert(
+            page_two,
+            StagedPage::from_bytes(&pager.pool, &sample_page(0x6C)).unwrap(),
+        );
+
+        SimpleTransaction::<MemoryVfs>::commit_wal_group_commit(
+            &cx,
+            &wal_backend,
+            &inner,
+            &write_set,
+            &[page_two],
+            &queue,
+        )
+        .unwrap();
+
+        assert_eq!(
+            *prepare_calls.lock().unwrap(),
+            2,
+            "bead_id=bd-3wop3.1.2 case=auto_shadow_sampling_rebuilds_conservative_candidate"
+        );
+        assert_eq!(
+            *append_frames_calls.lock().unwrap(),
+            1,
+            "bead_id=bd-3wop3.1.2 case=auto_shadow_sampling_falls_back_to_append_frames"
+        );
+        assert_eq!(
+            *append_prepared_calls.lock().unwrap(),
+            0,
+            "bead_id=bd-3wop3.1.2 case=auto_shadow_sampling_skips_bad_prepared_append"
+        );
+        let written = frames.lock().unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].0, 2);
+        assert_eq!(
+            written[0].1,
+            sample_page(0x6C),
+            "bead_id=bd-3wop3.1.2 case=auto_shadow_sampling_preserves_committed_payload"
         );
     }
 

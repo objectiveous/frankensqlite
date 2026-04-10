@@ -344,6 +344,30 @@ pub fn parallel_wal_shadow_verdict_name(verdict: ParallelWalShadowVerdict) -> &'
     }
 }
 
+/// Decide whether a batch should run the shadow-compare proof path.
+///
+/// `ShadowCompare` mode always compares. In `Auto`, operators can enable a
+/// deterministic sample using `shadow_compare_sampling_per_mille`; the first
+/// `N` batch ids in each 1000-batch window take the compare path.
+#[must_use]
+pub fn parallel_wal_should_shadow_compare(
+    control: &ParallelWalControlSurface,
+    batch_id: u64,
+) -> bool {
+    match control.mode {
+        ParallelWalOperatingMode::Conservative => false,
+        ParallelWalOperatingMode::ShadowCompare => true,
+        ParallelWalOperatingMode::Auto => {
+            control
+                .shadow_compare_sampling_per_mille
+                .map_or(false, |rate| {
+                    let rate = u64::from(rate.min(1_000));
+                    rate > 0 && batch_id.saturating_sub(1) % 1_000 < rate
+                })
+        }
+    }
+}
+
 #[must_use]
 pub fn default_parallel_wal_lane_count() -> usize {
     std::thread::available_parallelism()
@@ -1623,6 +1647,46 @@ mod tests {
         assert_eq!(drained.get(&10).map(|batch| batch.payload), Some(10));
         assert_eq!(drained.get(&11).map(|batch| batch.payload), Some(11));
         assert_eq!(stager.current_lane_backlog(0), 0);
+    }
+
+    #[test]
+    fn test_auto_shadow_compare_sampling_is_deterministic_by_batch_window() {
+        let control = ParallelWalControlSurface {
+            mode: ParallelWalOperatingMode::Auto,
+            shadow_compare_sampling_per_mille: Some(2),
+            ..ParallelWalControlSurface::default()
+        };
+
+        assert!(parallel_wal_should_shadow_compare(&control, 1));
+        assert!(parallel_wal_should_shadow_compare(&control, 2));
+        assert!(!parallel_wal_should_shadow_compare(&control, 3));
+        assert!(parallel_wal_should_shadow_compare(&control, 1_001));
+        assert!(parallel_wal_should_shadow_compare(&control, 1_002));
+        assert!(!parallel_wal_should_shadow_compare(&control, 1_003));
+    }
+
+    #[test]
+    fn test_shadow_compare_mode_ignores_sampling_gate() {
+        let control = ParallelWalControlSurface {
+            mode: ParallelWalOperatingMode::ShadowCompare,
+            shadow_compare_sampling_per_mille: Some(0),
+            ..ParallelWalControlSurface::default()
+        };
+
+        assert!(parallel_wal_should_shadow_compare(&control, 1));
+        assert!(parallel_wal_should_shadow_compare(&control, 7));
+    }
+
+    #[test]
+    fn test_conservative_mode_never_runs_shadow_compare_sampling() {
+        let control = ParallelWalControlSurface {
+            mode: ParallelWalOperatingMode::Conservative,
+            shadow_compare_sampling_per_mille: Some(1_000),
+            ..ParallelWalControlSurface::default()
+        };
+
+        assert!(!parallel_wal_should_shadow_compare(&control, 1));
+        assert!(!parallel_wal_should_shadow_compare(&control, 1_000));
     }
 
     #[test]

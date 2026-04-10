@@ -263,7 +263,12 @@ fn run_root_for(label: &str) -> (PathBuf, Option<tempfile::TempDir>) {
     }
 }
 
-fn spawn_mode_run(label: &str, mode: &str, max_batch_bytes: Option<u64>) -> LaneRunSummary {
+fn spawn_mode_run(
+    label: &str,
+    mode: &str,
+    max_batch_bytes: Option<u64>,
+    shadow_compare_per_mille: Option<u16>,
+) -> LaneRunSummary {
     let (run_dir, _tmp_guard) = run_root_for(label);
     let summary_path = run_dir.join("summary.json");
 
@@ -281,6 +286,12 @@ fn spawn_mode_run(label: &str, mode: &str, max_batch_bytes: Option<u64>) -> Lane
         .env("FSQLITE_PARALLEL_WAL_LANES", "2");
     if let Some(limit) = max_batch_bytes {
         command.env("FSQLITE_PARALLEL_WAL_MAX_BATCH_BYTES", limit.to_string());
+    }
+    if let Some(rate) = shadow_compare_per_mille {
+        command.env(
+            "FSQLITE_PARALLEL_WAL_SHADOW_COMPARE_PER_MILLE",
+            rate.to_string(),
+        );
     }
 
     let status = command.status().expect("spawn child lane-staging run");
@@ -332,13 +343,15 @@ fn expected_final_rows() -> Vec<FinalRow> {
 fn bd_3wop3_1_2_parallel_wal_staging_control_modes_emit_lane_logs_and_preserve_rows() {
     let _guard = E2E_LOCK.lock().expect("lane staging e2e lock");
 
-    let auto = spawn_mode_run("auto", "auto", None);
-    let conservative = spawn_mode_run("conservative", "conservative", None);
-    let shadow_compare = spawn_mode_run("shadow_compare", "shadow_compare", None);
+    let auto = spawn_mode_run("auto", "auto", None, None);
+    let auto_sampled = spawn_mode_run("auto-sampled", "auto", None, Some(1_000));
+    let conservative = spawn_mode_run("conservative", "conservative", None, None);
+    let shadow_compare = spawn_mode_run("shadow_compare", "shadow_compare", None, None);
 
     let expected_rows = expected_final_rows();
     for (case, summary) in [
         ("auto", &auto),
+        ("auto", &auto_sampled),
         ("conservative", &conservative),
         ("shadow_compare", &shadow_compare),
     ] {
@@ -370,6 +383,10 @@ fn bd_3wop3_1_2_parallel_wal_staging_control_modes_emit_lane_logs_and_preserve_r
         "bead_id={BEAD_ID} case=auto_vs_conservative_row_level_equivalence"
     );
     assert_eq!(
+        auto.final_rows, auto_sampled.final_rows,
+        "bead_id={BEAD_ID} case=auto_vs_auto_sampled_row_level_equivalence"
+    );
+    assert_eq!(
         auto.final_rows, shadow_compare.final_rows,
         "bead_id={BEAD_ID} case=auto_vs_shadow_compare_row_level_equivalence"
     );
@@ -384,6 +401,14 @@ fn bd_3wop3_1_2_parallel_wal_staging_control_modes_emit_lane_logs_and_preserve_r
         vec![0],
         "bead_id={BEAD_ID} case=conservative_collapses_to_single_lane observed={:?}",
         conservative.lane_ids_seen
+    );
+    assert!(
+        auto_sampled
+            .shadow_verdicts
+            .iter()
+            .any(|verdict| verdict == "clean"),
+        "bead_id={BEAD_ID} case=auto_sampled_shadow_compare_emits_clean_shadow_verdict verdicts={:?}",
+        auto_sampled.shadow_verdicts
     );
     assert!(
         shadow_compare
@@ -401,6 +426,7 @@ fn bd_3wop3_1_2_parallel_wal_staging_control_modes_emit_lane_logs_and_preserve_r
             "replay_command": REPLAY_COMMAND,
             "runs": {
                 "auto": auto,
+                "auto_sampled": auto_sampled,
                 "conservative": conservative,
                 "shadow_compare": shadow_compare,
             }
@@ -421,8 +447,8 @@ fn bd_3wop3_1_2_parallel_wal_staging_control_modes_emit_lane_logs_and_preserve_r
 fn bd_3wop3_1_2_parallel_wal_staging_lane_overflow_falls_back_without_row_drift() {
     let _guard = E2E_LOCK.lock().expect("lane staging e2e lock");
 
-    let baseline = spawn_mode_run("baseline-auto", "auto", None);
-    let overflow = spawn_mode_run("overflow-auto", "auto", Some(1));
+    let baseline = spawn_mode_run("baseline-auto", "auto", None, None);
+    let overflow = spawn_mode_run("overflow-auto", "auto", Some(1), None);
 
     assert_eq!(
         overflow.final_rows, baseline.final_rows,

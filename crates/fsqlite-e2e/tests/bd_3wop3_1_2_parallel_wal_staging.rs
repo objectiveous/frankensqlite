@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fsqlite_e2e::logging::init_logging;
 use fsqlite_types::SqliteValue;
@@ -46,6 +46,7 @@ struct LaneRunSummary {
     queue_submit_events: usize,
     flush_events: usize,
     lane_ids_seen: Vec<u16>,
+    wave_lane_ids: Vec<Vec<u16>>,
     fallback_reasons: Vec<String>,
     shadow_verdicts: Vec<String>,
     control_modes: Vec<String>,
@@ -128,7 +129,54 @@ fn field_u16(event: &Value, key: &str) -> Option<u16> {
         .and_then(|value| u16::try_from(value).ok())
 }
 
-fn summarize_lane_logs(log_path: &Path, mode: &str, final_rows: Vec<FinalRow>) -> LaneRunSummary {
+fn stage_lane_ids_from_log(log_path: &Path) -> Vec<u16> {
+    let Ok(log_text) = fs::read_to_string(log_path) else {
+        return Vec::new();
+    };
+
+    let mut lane_ids = Vec::new();
+    for line in log_text.lines().filter(|line| !line.trim().is_empty()) {
+        let event: Value = serde_json::from_str(line).expect("parse json log event");
+        let target = event
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if target != "fsqlite::wal::lane_staging" {
+            continue;
+        }
+        if field_string(&event, "scenario_id").as_deref() != Some("parallel_wal_lane_stage") {
+            continue;
+        }
+        if let Some(wal_lane_id) = field_u16(&event, "wal_lane_id") {
+            lane_ids.push(wal_lane_id);
+        }
+    }
+
+    lane_ids
+}
+
+fn wait_for_stage_lane_ids(log_path: &Path, expected_total: usize) -> Vec<u16> {
+    for _ in 0..50 {
+        let stage_lane_ids = stage_lane_ids_from_log(log_path);
+        if stage_lane_ids.len() >= expected_total {
+            return stage_lane_ids;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let observed = stage_lane_ids_from_log(log_path);
+    panic!(
+        "bead_id={BEAD_ID} case=wave_stage_events_missing expected_at_least={expected_total} observed={}",
+        observed.len()
+    );
+}
+
+fn summarize_lane_logs(
+    log_path: &Path,
+    mode: &str,
+    final_rows: Vec<FinalRow>,
+    wave_lane_ids: Vec<Vec<u16>>,
+) -> LaneRunSummary {
     let mut queue_submit_events = 0_usize;
     let mut flush_events = 0_usize;
     let mut lane_ids_seen = BTreeSet::new();
@@ -198,6 +246,7 @@ fn summarize_lane_logs(log_path: &Path, mode: &str, final_rows: Vec<FinalRow>) -
         queue_submit_events,
         flush_events,
         lane_ids_seen: lane_ids_seen.into_iter().collect(),
+        wave_lane_ids,
         fallback_reasons: fallback_reasons.into_iter().collect(),
         shadow_verdicts: shadow_verdicts.into_iter().collect(),
         control_modes: control_modes.into_iter().collect(),
@@ -209,6 +258,7 @@ fn run_child_workload(run_dir: &Path, mode: &str) -> LaneRunSummary {
     let _guard = init_logging(run_dir, true).expect("initialize child logging");
 
     let db_path = run_dir.join("parallel_wal_staging.db");
+    let log_path = run_dir.join("test.log.jsonl");
     {
         let conn = open_connection(&db_path);
         conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, value TEXT)")
@@ -217,7 +267,9 @@ fn run_child_workload(run_dir: &Path, mode: &str) -> LaneRunSummary {
             .expect("create table b");
     }
 
+    let mut wave_lane_ids = Vec::new();
     for wave in 0..2_i64 {
+        let stage_events_before_wave = stage_lane_ids_from_log(&log_path).len();
         let barrier = Arc::new(Barrier::new(3));
         let db_path_a = db_path.clone();
         let db_path_b = db_path.clone();
@@ -234,11 +286,18 @@ fn run_child_workload(run_dir: &Path, mode: &str) -> LaneRunSummary {
         barrier.wait();
         writer_a.join().expect("join writer_a");
         writer_b.join().expect("join writer_b");
+
+        let mut observed_lane_ids =
+            wait_for_stage_lane_ids(&log_path, stage_events_before_wave + 2)
+                .into_iter()
+                .skip(stage_events_before_wave)
+                .collect::<Vec<_>>();
+        observed_lane_ids.sort_unstable();
+        wave_lane_ids.push(observed_lane_ids);
     }
 
     let final_rows = fetch_final_rows(&db_path);
-    let log_path = run_dir.join("test.log.jsonl");
-    summarize_lane_logs(&log_path, mode, final_rows)
+    summarize_lane_logs(&log_path, mode, final_rows, wave_lane_ids)
 }
 
 fn read_summary(path: &Path) -> LaneRunSummary {
@@ -401,6 +460,26 @@ fn bd_3wop3_1_2_parallel_wal_staging_control_modes_emit_lane_logs_and_preserve_r
         vec![0],
         "bead_id={BEAD_ID} case=conservative_collapses_to_single_lane observed={:?}",
         conservative.lane_ids_seen
+    );
+    assert_eq!(
+        auto.wave_lane_ids,
+        vec![vec![0, 1], vec![0, 1]],
+        "bead_id={BEAD_ID} case=auto_reuses_lane_ids_after_worker_churn observed={:?}",
+        auto.wave_lane_ids
+    );
+    assert_eq!(
+        conservative.wave_lane_ids,
+        vec![vec![0, 0], vec![0, 0]],
+        "bead_id={BEAD_ID} case=conservative_routes_all_waves_through_single_lane observed={:?}",
+        conservative.wave_lane_ids
+    );
+    assert!(
+        conservative
+            .fallback_reasons
+            .iter()
+            .any(|reason| reason == "operator_forced"),
+        "bead_id={BEAD_ID} case=conservative_logs_operator_forced_fallback reasons={:?}",
+        conservative.fallback_reasons
     );
     assert!(
         auto_sampled

@@ -783,20 +783,30 @@ impl Parser {
         if self.eat(&TokenKind::Star) {
             return Ok(ResultColumn::Star);
         }
-        // table.* / schema.table.* check.
         if matches!(self.peek(), TokenKind::Id(_) | TokenKind::QuotedId(_, _))
             && self.peek_nth(1) == &TokenKind::Dot
-            && (self.peek_nth(2) == &TokenKind::Star
-                || (matches!(
-                    self.peek_nth(2),
-                    TokenKind::Id(_) | TokenKind::QuotedId(_, _)
-                ) && self.peek_nth(3) == &TokenKind::Dot
-                    && self.peek_nth(4) == &TokenKind::Star))
         {
-            let tbl = self.parse_qualified_name()?;
-            self.advance(); // dot
-            self.advance(); // star
-            return Ok(ResultColumn::TableStar(tbl));
+            if self.peek_nth(2) == &TokenKind::Star {
+                let table = self.parse_identifier()?;
+                self.expect_token(&TokenKind::Dot)?;
+                self.expect_token(&TokenKind::Star)?;
+                return Ok(ResultColumn::TableStar(QualifiedName::bare(table)));
+            }
+            if matches!(
+                self.peek_nth(2),
+                TokenKind::Id(_) | TokenKind::QuotedId(_, _)
+            ) && self.peek_nth(3) == &TokenKind::Dot
+                && self.peek_nth(4) == &TokenKind::Star
+            {
+                let schema = self.parse_identifier()?;
+                self.expect_token(&TokenKind::Dot)?;
+                let table = self.parse_identifier()?;
+                self.expect_token(&TokenKind::Dot)?;
+                self.expect_token(&TokenKind::Star)?;
+                return Ok(ResultColumn::TableStar(QualifiedName::qualified(
+                    schema, table,
+                )));
+            }
         }
         let expr = self.parse_expr()?;
         let alias = self.try_alias()?;

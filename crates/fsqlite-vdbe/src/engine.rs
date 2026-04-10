@@ -6199,6 +6199,55 @@ impl VdbeEngine {
             .unwrap_or_default()
     }
 
+    fn storage_cursor_find_exact_index_key(
+        &mut self,
+        cursor_id: i32,
+        key_bytes: &[u8],
+        missing_registry_detail: &'static str,
+    ) -> Result<bool> {
+        let root_page = self
+            .cursor_root_pages
+            .get(&cursor_id)
+            .copied()
+            .unwrap_or_default();
+        let index_desc_flags = self.index_desc_flags_for_root(root_page);
+        let index_collations = self.index_collations_for_root(root_page);
+        let uses_collated_probe = index_collations.iter().any(|collation| {
+            collation
+                .as_deref()
+                .is_some_and(|name| !name.eq_ignore_ascii_case("BINARY"))
+        });
+        let collated_probe_registry = uses_collated_probe.then(|| {
+            self.collation_registry
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .clone()
+        });
+
+        let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) else {
+            return Ok(false);
+        };
+
+        if uses_collated_probe {
+            let Some(collation_registry) = collated_probe_registry.as_ref() else {
+                return Err(FrankenError::internal(missing_registry_detail));
+            };
+            storage_cursor_exact_match_collated(
+                cursor_id,
+                cursor,
+                key_bytes,
+                &index_desc_flags,
+                &index_collations,
+                collation_registry,
+            )
+        } else {
+            cursor
+                .cursor
+                .index_move_to(&cursor.cx, key_bytes)
+                .map(|seek| seek.is_found())
+        }
+    }
+
     /// Handles REPLACE conflict resolution natively (bd-2yqp6.x).
     /// Deletes the conflicting row from the table AND from all associated indexes.
     fn native_replace_row(&mut self, tbl_cursor_id: i32, conflict_rowid: i64) -> Result<()> {
@@ -6242,8 +6291,16 @@ impl VdbeEngine {
                 let key_bytes = encode_record(&key_values);
 
                 // Seek to the key in the index cursor and delete it.
-                if let Some(sc) = self.storage_cursors.get_mut(&meta.cursor_id) {
-                    if sc.writable && sc.cursor.index_move_to(&sc.cx, &key_bytes)?.is_found() {
+                let found =
+                    self.storage_cursor_find_exact_index_key(
+                        meta.cursor_id,
+                        &key_bytes,
+                        "delete_secondary_index_entries: missing collation registry for collated exact probe",
+                    )?;
+                if found
+                    && let Some(sc) = self.storage_cursors.get_mut(&meta.cursor_id)
+                    && sc.writable
+                {
                         sc.cursor.delete(&sc.cx)?;
                         invalidate_storage_cursor_row_cache_with_reason(
                             sc,
@@ -6273,8 +6330,11 @@ impl VdbeEngine {
     fn rollback_pending_insert_after_index_conflict(&mut self) -> Result<()> {
         let entries = self.take_pending_idx_entries();
         for (idx_cid, idx_key) in entries {
-            if let Some(isc) = self.storage_cursors.get_mut(&idx_cid)
-                && isc.cursor.index_move_to(&isc.cx, &idx_key)?.is_found()
+            if self.storage_cursor_find_exact_index_key(
+                idx_cid,
+                &idx_key,
+                "rollback_pending_insert_after_index_conflict: missing collation registry for collated exact probe",
+            )? && let Some(isc) = self.storage_cursors.get_mut(&idx_cid)
             {
                 isc.cursor.delete(&isc.cx)?;
                 invalidate_storage_cursor_row_cache_with_reason(
@@ -8656,14 +8716,11 @@ impl VdbeEngine {
                         // Index seek path: P3 contains a packed record blob
                         // (from MakeRecord). Use index_move_to to find the key.
                         let key_bytes = record_blob_bytes(&key_val);
-                        if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                            cursor
-                                .cursor
-                                .index_move_to(&cursor.cx, key_bytes)?
-                                .is_found()
-                        } else {
-                            false
-                        }
+                        self.storage_cursor_find_exact_index_key(
+                            cursor_id,
+                            key_bytes,
+                            "NotFound: missing collation registry for collated probe",
+                        )?
                     } else {
                         // Table seek path: P3 contains an integer rowid.
                         let rowid_val = key_val.to_integer();
@@ -8707,14 +8764,11 @@ impl VdbeEngine {
                     }
                     let exists = if matches!(key_val, SqliteValue::Blob(_)) {
                         let key_bytes = record_blob_bytes(&key_val);
-                        if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                            cursor
-                                .cursor
-                                .index_move_to(&cursor.cx, key_bytes)?
-                                .is_found()
-                        } else {
-                            false
-                        }
+                        self.storage_cursor_find_exact_index_key(
+                            cursor_id,
+                            key_bytes,
+                            "Found: missing collation registry for collated probe",
+                        )?
                     } else {
                         let rowid_val = key_val.to_integer();
                         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
@@ -9582,7 +9636,11 @@ impl VdbeEngine {
                         if sc.writable {
                             if let Some(ref key) = key_bytes {
                                 // Seek to the key first, then delete.
-                                if sc.cursor.index_move_to(&sc.cx, key)?.is_found() {
+                                if self.storage_cursor_find_exact_index_key(
+                                    cursor_id,
+                                    key,
+                                    "IdxDelete: missing collation registry for collated exact probe",
+                                )? {
                                     sc.cursor.delete(&sc.cx)?;
                                     invalidate_storage_cursor_row_cache_with_reason(
                                         sc,
@@ -13490,6 +13548,46 @@ fn storage_cursor_no_conflict_prefix_match_collated(
     Ok(false)
 }
 
+fn storage_cursor_exact_match_collated(
+    cursor_id: i32,
+    cursor: &mut StorageCursor,
+    key_bytes: &[u8],
+    desc_flags: &[bool],
+    collations: &[Option<String>],
+    collation_registry: &CollationRegistry,
+) -> Result<bool> {
+    if !try_decode_storage_cursor_target_index_record(cursor, key_bytes) {
+        return Ok(false);
+    }
+    let key_len = cursor.target_vals_buf.len();
+    if !cursor.cursor.first(&cursor.cx)? {
+        return Ok(false);
+    }
+
+    loop {
+        if !try_decode_storage_cursor_current_index_record(cursor_id, cursor)? {
+            return Ok(false);
+        }
+        if cursor.cur_vals_buf.len() == key_len
+            && compare_index_prefix_keys(
+                &cursor.cur_vals_buf,
+                &cursor.target_vals_buf,
+                key_len,
+                desc_flags,
+                collations,
+                collation_registry,
+            ) == Ordering::Equal
+        {
+            return Ok(true);
+        }
+        if !cursor.cursor.next(&cursor.cx)? {
+            break;
+        }
+    }
+
+    Ok(false)
+}
+
 fn storage_cursor_current_first_index_key_equals(
     cursor: &mut StorageCursor,
     probe_value: &SqliteValue,
@@ -15357,6 +15455,71 @@ mod tests {
                 P4::None,
                 0,
             );
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+        }
+
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        b.finish().expect("program should build")
+    }
+
+    fn build_found_opcode_probe_program(
+        conflict_key: Vec<u8>,
+        miss_key: Vec<u8>,
+    ) -> crate::VdbeProgram {
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        let r_key = b.alloc_reg();
+        let r_out = b.alloc_reg();
+
+        for (probe_key, expected_found) in [(conflict_key, true), (miss_key, false)] {
+            let found = b.emit_label();
+            let done = b.emit_label();
+            b.emit_op(Opcode::Blob, 0, r_key, 0, P4::Blob(probe_key), 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Found, 0, r_key, found, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(found);
+            b.emit_op(
+                Opcode::Integer,
+                i32::from(expected_found),
+                r_out,
+                0,
+                P4::None,
+                0,
+            );
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+        }
+
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        b.finish().expect("program should build")
+    }
+
+    fn build_not_found_opcode_probe_program(
+        conflict_key: Vec<u8>,
+        miss_key: Vec<u8>,
+    ) -> crate::VdbeProgram {
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        let r_key = b.alloc_reg();
+        let r_out = b.alloc_reg();
+
+        for probe_key in [conflict_key, miss_key] {
+            let missing = b.emit_label();
+            let done = b.emit_label();
+            b.emit_op(Opcode::Blob, 0, r_key, 0, P4::Blob(probe_key), 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::NotFound, 0, r_key, missing, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(missing);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
             b.resolve_label(done);
             b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
         }
@@ -23402,6 +23565,46 @@ mod tests {
                 vec![SqliteValue::Integer(1)],
             ],
             "NoConflict must honor per-index NOCASE equality when probing storage indexes"
+        );
+    }
+
+    #[test]
+    fn test_found_opcode_honors_nocase_collation() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut engine, _, _) = build_storage_index_engine_with_nocase_prefixes();
+        let conflict_key =
+            encode_record(&[SqliteValue::Text("ALPHA".into()), SqliteValue::Integer(1)]);
+        let miss_key =
+            encode_record(&[SqliteValue::Text("gamma".into()), SqliteValue::Integer(99)]);
+        let program = build_found_opcode_probe_program(conflict_key, miss_key);
+        let rows = execute_program_with_engine(&mut engine, &program);
+
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(0)]],
+            "Found must treat NOCASE-equivalent index keys as exact matches"
+        );
+    }
+
+    #[test]
+    fn test_not_found_opcode_honors_nocase_collation() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut engine, _, _) = build_storage_index_engine_with_nocase_prefixes();
+        let conflict_key =
+            encode_record(&[SqliteValue::Text("ALPHA".into()), SqliteValue::Integer(1)]);
+        let miss_key =
+            encode_record(&[SqliteValue::Text("gamma".into()), SqliteValue::Integer(99)]);
+        let program = build_not_found_opcode_probe_program(conflict_key, miss_key);
+        let rows = execute_program_with_engine(&mut engine, &program);
+
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Integer(0)], vec![SqliteValue::Integer(1)]],
+            "NotFound must respect NOCASE equality when probing storage indexes"
         );
     }
 

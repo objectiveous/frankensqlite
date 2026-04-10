@@ -149,6 +149,7 @@ impl WasmDatabaseOptions {
         }
     }
 
+    #[allow(clippy::useless_let_if_seq)] // three independent optional fields
     fn memory_vfs_config(&self) -> Result<Option<fsqlite_vfs::MemoryVfsConfig>, FrankenError> {
         let mut config = fsqlite_vfs::MemoryVfsConfig::default();
         let mut configured = false;

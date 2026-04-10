@@ -699,7 +699,7 @@ pub fn build_certificate(
         });
     }
 
-    if let Some(false) = certification_evidence.artifact_manifest_gate_passed {
+    if certification_evidence.artifact_manifest_gate_passed == Some(false) {
         unresolved_risks.push(UnresolvedRisk {
             source: "certification_policy".to_owned(),
             severity: "High".to_owned(),
@@ -707,7 +707,7 @@ pub fn build_certificate(
         });
     }
 
-    if let Some(false) = certification_evidence.final_gate_passed {
+    if certification_evidence.final_gate_passed == Some(false) {
         unresolved_risks.push(UnresolvedRisk {
             source: "verification_contract".to_owned(),
             severity: "High".to_owned(),
@@ -820,7 +820,7 @@ fn determine_verdict(
     if drift.any_rejected {
         return CertificateVerdict::Rejected;
     }
-    if let Some(false) = certification_evidence.artifact_manifest_gate_passed {
+    if certification_evidence.artifact_manifest_gate_passed == Some(false) {
         return CertificateVerdict::Rejected;
     }
     if certification_evidence.artifact_manifest_present
@@ -828,7 +828,7 @@ fn determine_verdict(
     {
         return CertificateVerdict::Rejected;
     }
-    if let Some(false) = certification_evidence.final_gate_passed {
+    if certification_evidence.final_gate_passed == Some(false) {
         return CertificateVerdict::Rejected;
     }
     if certification_evidence.missing_artifact_ref_count > 0 {

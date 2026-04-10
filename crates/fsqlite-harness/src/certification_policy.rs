@@ -127,10 +127,11 @@ pub const REQUIRED_CERTIFICATION_LANES: [CiLane; 6] = [
 /// Build the strict gate configuration used by Track G certification.
 #[must_use]
 pub fn certification_gate_config() -> GateConfig {
-    let mut config = GateConfig::default();
-    config.release_threshold = 1.0;
-    config.category_min_verification_pct = CERTIFICATION_MIN_VERIFICATION_PCT;
-    config
+    GateConfig {
+        release_threshold: 1.0,
+        category_min_verification_pct: CERTIFICATION_MIN_VERIFICATION_PCT,
+        ..GateConfig::default()
+    }
 }
 
 /// Build the strict ratchet configuration used by Track G certification.

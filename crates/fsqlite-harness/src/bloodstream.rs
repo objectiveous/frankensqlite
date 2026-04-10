@@ -13,6 +13,11 @@
 //!            histogram `bloodstream_propagation_duration_us`,
 //!            gauge `bloodstream_active_bindings`.
 
+// SmallText carries a OnceLock for lazy long-string interning, which trips
+// `mutable_key_type` at every BTreeMap<SmallText, _> site even though hash
+// and equality remain stable.
+#![allow(clippy::mutable_key_type)]
+
 use fsqlite_types::SqliteValue;
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use serde::{Deserialize, Serialize};

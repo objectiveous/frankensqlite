@@ -73,6 +73,7 @@ impl ShellOptions {
         }
     }
 
+    #[allow(clippy::unused_self)] // signature parallels nested_script for symmetry
     const fn forced_batch(self) -> Self {
         Self {
             show_prompts: false,
@@ -1295,10 +1296,10 @@ fn sql_segment_has_tokens(segment: &str) -> bool {
                 }
                 return true;
             }
-            StatementScanState::SingleQuote => unreachable!(),
-            StatementScanState::DoubleQuote => unreachable!(),
-            StatementScanState::Backtick => unreachable!(),
-            StatementScanState::BracketIdent => unreachable!(),
+            StatementScanState::SingleQuote
+            | StatementScanState::DoubleQuote
+            | StatementScanState::Backtick
+            | StatementScanState::BracketIdent => unreachable!(),
             StatementScanState::LineComment => {
                 if byte == b'\n' || byte == b'\r' {
                     state = StatementScanState::Normal;
@@ -1469,6 +1470,7 @@ fn is_sql_keyword(token: &str) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_execute_dot_command<W, E>(
     trimmed: &str,
     connection: &mut Connection,

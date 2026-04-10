@@ -40,6 +40,7 @@ pub use fsqlite_planner as planner;
 pub use fsqlite_types as types;
 
 static WASM_RUNTIME_INIT: Once = Once::new();
+const WASM_LINEAR_MEMORY_PAGE_BYTES: usize = 64 * 1024;
 
 /// Parse a SQL string into a list of AST statements.
 ///
@@ -106,6 +107,7 @@ struct FrankenDbState {
     path: String,
     inner: RefCell<Option<CoreConnection>>,
     memory_warning_threshold_bytes: Cell<Option<usize>>,
+    memory_warning_threshold_percent: Cell<Option<usize>>,
     memory_warning_above_threshold: Cell<bool>,
     memory_warning_callback: RefCell<Option<Function>>,
 }
@@ -122,10 +124,31 @@ struct WasmDatabaseOptions {
     growth_chunk_bytes: Option<usize>,
     max_bytes: Option<usize>,
     warning_threshold_bytes: Option<usize>,
+    warning_threshold_percent: Option<usize>,
     warning_callback: Option<Function>,
 }
 
 impl WasmDatabaseOptions {
+    fn effective_warning_threshold_bytes(&self) -> Result<Option<usize>, FrankenError> {
+        match (self.warning_threshold_bytes, self.warning_threshold_percent) {
+            (Some(_), Some(_)) => Err(FrankenError::TypeMismatch {
+                expected: "use either memory.warningThresholdBytes or memory.warnAtPercent"
+                    .to_owned(),
+                actual: "both threshold properties were provided".to_owned(),
+            }),
+            (Some(bytes), None) => Ok(Some(bytes)),
+            (None, Some(percent)) => {
+                let max_bytes = self.max_bytes.ok_or_else(|| FrankenError::TypeMismatch {
+                    expected: "memory.maxBytes or memory.maxPages when using memory.warnAtPercent"
+                        .to_owned(),
+                    actual: "warnAtPercent without a tracked memory cap".to_owned(),
+                })?;
+                threshold_bytes_from_percent(max_bytes, percent).map(Some)
+            }
+            (None, None) => Ok(None),
+        }
+    }
+
     fn memory_vfs_config(&self) -> Result<Option<fsqlite_vfs::MemoryVfsConfig>, FrankenError> {
         let mut config = fsqlite_vfs::MemoryVfsConfig::default();
         let mut configured = false;
@@ -313,7 +336,12 @@ impl FrankenDb {
             state: Rc::new(FrankenDbState {
                 path,
                 inner: RefCell::new(Some(conn)),
-                memory_warning_threshold_bytes: Cell::new(options.warning_threshold_bytes),
+                memory_warning_threshold_bytes: Cell::new(
+                    options
+                        .effective_warning_threshold_bytes()
+                        .map_err(franken_error_to_js)?,
+                ),
+                memory_warning_threshold_percent: Cell::new(options.warning_threshold_percent),
                 memory_warning_above_threshold: Cell::new(false),
                 memory_warning_callback: RefCell::new(options.warning_callback),
             }),
@@ -358,7 +386,12 @@ impl FrankenDbState {
         let stats = conn
             .memory_stats()
             .map_err(|error| self.connection_error_to_js(conn, error))?;
-        connection_memory_stats_to_js(conn, stats, self.memory_warning_threshold_bytes.get())
+        connection_memory_stats_to_js(
+            conn,
+            stats,
+            self.memory_warning_threshold_bytes.get(),
+            self.memory_warning_threshold_percent.get(),
+        )
     }
 
     fn observe_memory_warning(&self) {
@@ -383,6 +416,7 @@ impl FrankenDbState {
                 conn,
                 stats,
                 self.memory_warning_threshold_bytes.get(),
+                self.memory_warning_threshold_percent.get(),
             )
         {
             let _ = callback.call1(&JsValue::NULL, &payload);
@@ -397,7 +431,7 @@ impl FrankenDbState {
                 &object,
                 "message",
                 &JsValue::from_str(
-                    "FrankenSQLite WASM ran out of memory; adjust memory.maxBytes, memory.growthChunkBytes, or pageBufferMax and remember the browser WebAssembly linear-memory ceiling is 4 GiB",
+                    "FrankenSQLite WASM ran out of memory; adjust memory.maxPages or memory.maxBytes, memory.growthChunkPages or memory.growthChunkBytes, or pageBufferMax, and remember the browser WebAssembly linear-memory ceiling is 4 GiB",
                 ),
             );
             let _ = set_property(&object, "oom", &JsValue::from_bool(true));
@@ -406,6 +440,7 @@ impl FrankenDbState {
                     conn,
                     stats,
                     self.memory_warning_threshold_bytes.get(),
+                    self.memory_warning_threshold_percent.get(),
                 )
             {
                 let _ = set_property(&object, "memoryStats", &stats_js);
@@ -902,21 +937,46 @@ fn parse_database_options(options: Option<JsValue>) -> Result<WasmDatabaseOption
                 actual: describe_js_value(&memory_options),
             }));
         }
-        parsed.initial_reserve_bytes =
+        parsed.initial_reserve_bytes = resolve_byte_or_page_memory_setting(
             parse_optional_usize_property(&memory_options, "initialReserveBytes")
-                .map_err(franken_error_to_js)?;
-        parsed.growth_chunk_bytes =
+                .map_err(franken_error_to_js)?,
+            parse_optional_usize_property(&memory_options, "initialPages")
+                .map_err(franken_error_to_js)?,
+            "memory.initialReserveBytes",
+            "memory.initialPages",
+        )
+        .map_err(franken_error_to_js)?;
+        parsed.growth_chunk_bytes = resolve_byte_or_page_memory_setting(
             parse_optional_usize_property(&memory_options, "growthChunkBytes")
-                .map_err(franken_error_to_js)?;
-        parsed.max_bytes = parse_optional_usize_property(&memory_options, "maxBytes")
-            .map_err(franken_error_to_js)?;
+                .map_err(franken_error_to_js)?,
+            parse_optional_usize_property(&memory_options, "growthChunkPages")
+                .map_err(franken_error_to_js)?,
+            "memory.growthChunkBytes",
+            "memory.growthChunkPages",
+        )
+        .map_err(franken_error_to_js)?;
+        parsed.max_bytes = resolve_byte_or_page_memory_setting(
+            parse_optional_usize_property(&memory_options, "maxBytes")
+                .map_err(franken_error_to_js)?,
+            parse_optional_usize_property(&memory_options, "maxPages")
+                .map_err(franken_error_to_js)?,
+            "memory.maxBytes",
+            "memory.maxPages",
+        )
+        .map_err(franken_error_to_js)?;
         parsed.warning_threshold_bytes =
             parse_optional_usize_property(&memory_options, "warningThresholdBytes")
+                .map_err(franken_error_to_js)?;
+        parsed.warning_threshold_percent =
+            parse_optional_percent_property(&memory_options, "warnAtPercent")
                 .map_err(franken_error_to_js)?;
         parsed.warning_callback = parse_optional_function_property(&memory_options, "onWarning")
             .map_err(franken_error_to_js)?;
     }
 
+    parsed
+        .effective_warning_threshold_bytes()
+        .map_err(franken_error_to_js)?;
     parsed.memory_vfs_config().map_err(franken_error_to_js)?;
     Ok(parsed)
 }
@@ -943,6 +1003,23 @@ fn parse_optional_usize_property(
         return Ok(None);
     };
     parse_js_usize(&value, key).map(Some)
+}
+
+fn parse_optional_percent_property(
+    object: &JsValue,
+    key: &str,
+) -> Result<Option<usize>, FrankenError> {
+    let Some(value) = get_optional_property(object, key)? else {
+        return Ok(None);
+    };
+    let percent = parse_js_usize(&value, key)?;
+    if percent > 100 {
+        return Err(FrankenError::OutOfRange {
+            what: key.to_owned(),
+            value: percent.to_string(),
+        });
+    }
+    Ok(Some(percent))
 }
 
 fn parse_optional_function_property(
@@ -985,10 +1062,118 @@ fn parse_js_usize(value: &JsValue, key: &str) -> Result<usize, FrankenError> {
     })
 }
 
+fn resolve_byte_or_page_memory_setting(
+    byte_value: Option<usize>,
+    page_value: Option<usize>,
+    byte_key: &str,
+    page_key: &str,
+) -> Result<Option<usize>, FrankenError> {
+    let page_bytes = page_value
+        .map(|pages| wasm_pages_to_bytes(pages, page_key))
+        .transpose()?;
+    match (byte_value, page_value, page_bytes) {
+        (Some(bytes), Some(pages), Some(page_bytes)) if bytes != page_bytes => {
+            Err(FrankenError::TypeMismatch {
+                expected: format!("{byte_key} and {page_key} to resolve to the same byte count"),
+                actual: format!("{byte_key}={bytes}, {page_key}={pages} ({page_bytes} bytes)"),
+            })
+        }
+        (Some(bytes), _, _) => Ok(Some(bytes)),
+        (None, _, Some(page_bytes)) => Ok(Some(page_bytes)),
+        (None, None, None) => Ok(None),
+        (None, Some(_), None) => unreachable!("page settings either convert to bytes or error"),
+    }
+}
+
+fn wasm_pages_to_bytes(pages: usize, key: &str) -> Result<usize, FrankenError> {
+    pages
+        .checked_mul(WASM_LINEAR_MEMORY_PAGE_BYTES)
+        .ok_or_else(|| FrankenError::OutOfRange {
+            what: key.to_owned(),
+            value: pages.to_string(),
+        })
+}
+
+fn threshold_bytes_from_percent(max_bytes: usize, percent: usize) -> Result<usize, FrankenError> {
+    max_bytes
+        .checked_mul(percent)
+        .map(|scaled| scaled / 100)
+        .ok_or_else(|| FrankenError::OutOfRange {
+            what: "memory.warnAtPercent".to_owned(),
+            value: percent.to_string(),
+        })
+}
+
+fn exact_wasm_page_count(bytes: usize) -> Option<usize> {
+    (bytes % WASM_LINEAR_MEMORY_PAGE_BYTES == 0).then_some(bytes / WASM_LINEAR_MEMORY_PAGE_BYTES)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PageCachePressureAdvisory {
+    level: &'static str,
+    tracked_headroom_bytes: Option<usize>,
+    budget_bytes: Option<usize>,
+    recommended_page_buffer_max_pages: Option<usize>,
+    recommended_page_buffer_max_bytes: Option<usize>,
+}
+
+fn page_cache_pressure_advisory(
+    stats: ConnectionMemoryStats,
+    warning_threshold_bytes: Option<usize>,
+) -> PageCachePressureAdvisory {
+    let tracked_max_bytes = stats.memory_vfs.and_then(|memory_vfs| memory_vfs.max_bytes);
+    let budget_bytes = warning_threshold_bytes.or(tracked_max_bytes);
+    let estimated_used_bytes = stats.estimated_used_bytes();
+    let page_cache_used_bytes = stats.page_cache_used_bytes();
+    let non_page_cache_bytes = estimated_used_bytes.saturating_sub(page_cache_used_bytes);
+    let page_size_bytes = stats.page_size_bytes.max(1);
+    let recommended_page_buffer_max_pages = budget_bytes.map(|budget| {
+        let page_cache_budget_bytes = budget.saturating_sub(non_page_cache_bytes);
+        let recommended_pages = page_cache_budget_bytes / page_size_bytes;
+        recommended_pages.min(stats.page_cache.pool_capacity)
+    });
+    let recommended_page_buffer_max_bytes = recommended_page_buffer_max_pages
+        .map(|recommended_pages| recommended_pages.saturating_mul(stats.page_size_bytes));
+    let tracked_headroom_bytes =
+        tracked_max_bytes.map(|max_bytes| max_bytes.saturating_sub(estimated_used_bytes));
+    let level = if let Some(max_bytes) = tracked_max_bytes {
+        if estimated_used_bytes >= max_bytes {
+            "critical"
+        } else if warning_threshold_bytes.is_some_and(|threshold| estimated_used_bytes >= threshold)
+            || recommended_page_buffer_max_pages
+                .is_some_and(|recommended_pages| recommended_pages < stats.page_cache.pool_capacity)
+        {
+            "warning"
+        } else {
+            "normal"
+        }
+    } else if warning_threshold_bytes.is_some() {
+        if warning_threshold_bytes.is_some_and(|threshold| estimated_used_bytes >= threshold)
+            || recommended_page_buffer_max_pages
+                .is_some_and(|recommended_pages| recommended_pages < stats.page_cache.pool_capacity)
+        {
+            "warning"
+        } else {
+            "normal"
+        }
+    } else {
+        "unbounded"
+    };
+
+    PageCachePressureAdvisory {
+        level,
+        tracked_headroom_bytes,
+        budget_bytes,
+        recommended_page_buffer_max_pages,
+        recommended_page_buffer_max_bytes,
+    }
+}
+
 fn connection_memory_stats_to_js(
     conn: &CoreConnection,
     stats: ConnectionMemoryStats,
     warning_threshold_bytes: Option<usize>,
+    warning_threshold_percent: Option<usize>,
 ) -> Result<JsValue, JsValue> {
     let object = Object::new();
     let page_cache_used_bytes = stats.page_cache_used_bytes();
@@ -1003,6 +1188,7 @@ fn connection_memory_stats_to_js(
         .memory_vfs
         .map_or(0, fsqlite_vfs::MemoryVfsUsageSnapshot::fragmentation_bytes);
     let estimated_used_bytes = stats.estimated_used_bytes();
+    let pressure_advisory = page_cache_pressure_advisory(stats, warning_threshold_bytes);
 
     set_property(
         &object,
@@ -1070,6 +1256,52 @@ fn connection_memory_stats_to_js(
         &JsValue::from_f64(estimated_used_bytes as f64),
     )
     .map_err(franken_error_to_js)?;
+    set_property(
+        &object,
+        "pageCachePressureLevel",
+        &JsValue::from_str(pressure_advisory.level),
+    )
+    .map_err(franken_error_to_js)?;
+    match pressure_advisory.tracked_headroom_bytes {
+        Some(headroom_bytes) => set_property(
+            &object,
+            "trackedHeadroomBytes",
+            &JsValue::from_f64(headroom_bytes as f64),
+        )
+        .map_err(franken_error_to_js)?,
+        None => set_property(&object, "trackedHeadroomBytes", &JsValue::NULL)
+            .map_err(franken_error_to_js)?,
+    }
+    match pressure_advisory.budget_bytes {
+        Some(budget_bytes) => set_property(
+            &object,
+            "pageCachePressureBudgetBytes",
+            &JsValue::from_f64(budget_bytes as f64),
+        )
+        .map_err(franken_error_to_js)?,
+        None => set_property(&object, "pageCachePressureBudgetBytes", &JsValue::NULL)
+            .map_err(franken_error_to_js)?,
+    }
+    match pressure_advisory.recommended_page_buffer_max_pages {
+        Some(recommended_pages) => set_property(
+            &object,
+            "recommendedPageBufferMaxPages",
+            &JsValue::from_f64(recommended_pages as f64),
+        )
+        .map_err(franken_error_to_js)?,
+        None => set_property(&object, "recommendedPageBufferMaxPages", &JsValue::NULL)
+            .map_err(franken_error_to_js)?,
+    }
+    match pressure_advisory.recommended_page_buffer_max_bytes {
+        Some(recommended_bytes) => set_property(
+            &object,
+            "recommendedPageBufferMaxBytes",
+            &JsValue::from_f64(recommended_bytes as f64),
+        )
+        .map_err(franken_error_to_js)?,
+        None => set_property(&object, "recommendedPageBufferMaxBytes", &JsValue::NULL)
+            .map_err(franken_error_to_js)?,
+    }
 
     if let Some(memory_vfs) = stats.memory_vfs {
         set_property(
@@ -1114,24 +1346,64 @@ fn connection_memory_stats_to_js(
             &JsValue::from_f64(memory_vfs.initial_reserve_bytes as f64),
         )
         .map_err(franken_error_to_js)?;
+        match exact_wasm_page_count(memory_vfs.initial_reserve_bytes) {
+            Some(page_count) => set_property(
+                &object,
+                "initialReservePages",
+                &JsValue::from_f64(page_count as f64),
+            )
+            .map_err(franken_error_to_js)?,
+            None => set_property(&object, "initialReservePages", &JsValue::NULL)
+                .map_err(franken_error_to_js)?,
+        }
         set_property(
             &object,
             "growthChunkBytes",
             &JsValue::from_f64(memory_vfs.growth_chunk_bytes as f64),
         )
         .map_err(franken_error_to_js)?;
-        match memory_vfs.max_bytes {
-            Some(max_bytes) => set_property(
+        match exact_wasm_page_count(memory_vfs.growth_chunk_bytes) {
+            Some(page_count) => set_property(
                 &object,
-                "trackedMaxBytes",
-                &JsValue::from_f64(max_bytes as f64),
+                "growthChunkPages",
+                &JsValue::from_f64(page_count as f64),
             )
             .map_err(franken_error_to_js)?,
-            None => set_property(&object, "trackedMaxBytes", &JsValue::NULL)
+            None => set_property(&object, "growthChunkPages", &JsValue::NULL)
                 .map_err(franken_error_to_js)?,
+        }
+        match memory_vfs.max_bytes {
+            Some(max_bytes) => {
+                set_property(
+                    &object,
+                    "trackedMaxBytes",
+                    &JsValue::from_f64(max_bytes as f64),
+                )
+                .map_err(franken_error_to_js)?;
+                match exact_wasm_page_count(max_bytes) {
+                    Some(page_count) => set_property(
+                        &object,
+                        "trackedMaxPages",
+                        &JsValue::from_f64(page_count as f64),
+                    )
+                    .map_err(franken_error_to_js)?,
+                    None => set_property(&object, "trackedMaxPages", &JsValue::NULL)
+                        .map_err(franken_error_to_js)?,
+                }
+            }
+            None => {
+                set_property(&object, "trackedMaxBytes", &JsValue::NULL)
+                    .map_err(franken_error_to_js)?;
+                set_property(&object, "trackedMaxPages", &JsValue::NULL)
+                    .map_err(franken_error_to_js)?;
+            }
         }
     } else {
         set_property(&object, "trackedMaxBytes", &JsValue::NULL).map_err(franken_error_to_js)?;
+        set_property(&object, "trackedMaxPages", &JsValue::NULL).map_err(franken_error_to_js)?;
+        set_property(&object, "initialReservePages", &JsValue::NULL)
+            .map_err(franken_error_to_js)?;
+        set_property(&object, "growthChunkPages", &JsValue::NULL).map_err(franken_error_to_js)?;
     }
 
     match warning_threshold_bytes {
@@ -1160,16 +1432,42 @@ fn connection_memory_stats_to_js(
             .map_err(franken_error_to_js)?;
         }
     }
-
-    match wasm_linear_memory_bytes() {
-        Some(linear_memory_bytes) => set_property(
+    match warning_threshold_percent {
+        Some(percent) => set_property(
             &object,
-            "linearMemoryBytes",
-            &JsValue::from_f64(linear_memory_bytes as f64),
+            "warningThresholdPercent",
+            &JsValue::from_f64(percent as f64),
         )
         .map_err(franken_error_to_js)?,
-        None => set_property(&object, "linearMemoryBytes", &JsValue::NULL)
+        None => set_property(&object, "warningThresholdPercent", &JsValue::NULL)
             .map_err(franken_error_to_js)?,
+    }
+
+    match wasm_linear_memory_bytes() {
+        Some(linear_memory_bytes) => {
+            set_property(
+                &object,
+                "linearMemoryBytes",
+                &JsValue::from_f64(linear_memory_bytes as f64),
+            )
+            .map_err(franken_error_to_js)?;
+            match exact_wasm_page_count(linear_memory_bytes) {
+                Some(page_count) => set_property(
+                    &object,
+                    "linearMemoryPages",
+                    &JsValue::from_f64(page_count as f64),
+                )
+                .map_err(franken_error_to_js)?,
+                None => set_property(&object, "linearMemoryPages", &JsValue::NULL)
+                    .map_err(franken_error_to_js)?,
+            }
+        }
+        None => {
+            set_property(&object, "linearMemoryBytes", &JsValue::NULL)
+                .map_err(franken_error_to_js)?;
+            set_property(&object, "linearMemoryPages", &JsValue::NULL)
+                .map_err(franken_error_to_js)?;
+        }
     }
 
     Ok(object.into())
@@ -1191,6 +1489,7 @@ fn wasm_linear_memory_bytes() -> Option<usize> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use fsqlite_pager::PageCacheMetricsSnapshot;
     use std::sync::{Mutex, OnceLock};
 
     fn host_connection_test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -1198,6 +1497,30 @@ mod tests {
         HOST_CONNECTION_TEST_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
+            .unwrap()
+    }
+
+    fn set_js_number_property(object: &Object, key: &str, value: usize) {
+        set_property(object, key, &JsValue::from_f64(value as f64)).unwrap();
+    }
+
+    fn js_object_property_usize(object: &Object, key: &str) -> Option<usize> {
+        Reflect::get(object, &JsValue::from_str(key))
+            .unwrap()
+            .as_f64()
+            .map(|value| value as usize)
+    }
+
+    fn js_object_property_string(object: &Object, key: &str) -> Option<String> {
+        Reflect::get(object, &JsValue::from_str(key))
+            .unwrap()
+            .as_string()
+    }
+
+    fn js_error_message_field(error: &JsValue) -> String {
+        Reflect::get(error, &JsValue::from_str("message"))
+            .unwrap()
+            .as_string()
             .unwrap()
     }
 
@@ -1267,6 +1590,7 @@ mod tests {
             growth_chunk_bytes: Some(16 * 1024),
             max_bytes: Some(128 * 1024),
             warning_threshold_bytes: Some(96 * 1024),
+            warning_threshold_percent: None,
             warning_callback: None,
         };
         let conn = open_core_connection_with_options(":memory:", &options)
@@ -1283,6 +1607,240 @@ mod tests {
         assert_eq!(memory_vfs.growth_chunk_bytes, 16 * 1024);
         assert_eq!(memory_vfs.max_bytes, Some(128 * 1024));
         assert_eq!(memory_vfs.file_reserved_bytes, 64 * 1024);
+    }
+
+    #[test]
+    fn parse_database_options_accepts_page_aliases_and_warn_at_percent() {
+        let options = Object::new();
+        set_js_number_property(&options, "pageBufferMax", 16);
+        let memory = Object::new();
+        set_js_number_property(&memory, "initialPages", 2);
+        set_js_number_property(&memory, "growthChunkPages", 1);
+        set_js_number_property(&memory, "maxPages", 8);
+        set_js_number_property(&memory, "warnAtPercent", 75);
+        set_property(&options, "memory", &memory.into()).unwrap();
+
+        let parsed = parse_database_options(Some(options.into())).expect("options should parse");
+        assert_eq!(parsed.page_buffer_max, Some(16));
+        assert_eq!(
+            parsed.initial_reserve_bytes,
+            Some(2 * WASM_LINEAR_MEMORY_PAGE_BYTES)
+        );
+        assert_eq!(
+            parsed.growth_chunk_bytes,
+            Some(WASM_LINEAR_MEMORY_PAGE_BYTES)
+        );
+        assert_eq!(parsed.max_bytes, Some(8 * WASM_LINEAR_MEMORY_PAGE_BYTES));
+        assert_eq!(parsed.warning_threshold_percent, Some(75));
+        assert_eq!(
+            parsed.effective_warning_threshold_bytes().unwrap(),
+            Some((8 * WASM_LINEAR_MEMORY_PAGE_BYTES * 75) / 100)
+        );
+    }
+
+    #[test]
+    fn parse_database_options_rejects_conflicting_page_and_byte_aliases() {
+        let options = Object::new();
+        let memory = Object::new();
+        set_js_number_property(
+            &memory,
+            "initialReserveBytes",
+            WASM_LINEAR_MEMORY_PAGE_BYTES,
+        );
+        set_js_number_property(&memory, "initialPages", 2);
+        set_property(&options, "memory", &memory.into()).unwrap();
+
+        let error = match parse_database_options(Some(options.into())) {
+            Ok(_) => panic!("conflicting aliases should fail"),
+            Err(error) => error,
+        };
+        let message = js_error_message_field(&error);
+        assert!(message.contains("memory.initialReserveBytes"));
+        assert!(message.contains("memory.initialPages"));
+    }
+
+    #[test]
+    fn parse_database_options_requires_tracked_cap_for_warn_at_percent() {
+        let options = Object::new();
+        let memory = Object::new();
+        set_js_number_property(&memory, "warnAtPercent", 80);
+        set_property(&options, "memory", &memory.into()).unwrap();
+
+        let error = match parse_database_options(Some(options.into())) {
+            Ok(_) => panic!("warnAtPercent without cap should fail"),
+            Err(error) => error,
+        };
+        assert!(js_error_message_field(&error).contains("memory.maxBytes or memory.maxPages"));
+    }
+
+    #[test]
+    fn connection_memory_stats_surface_page_aliases_and_warning_percent() {
+        let _guard = host_connection_test_guard();
+        let options = WasmDatabaseOptions {
+            page_buffer_max: Some(8),
+            initial_reserve_bytes: Some(2 * WASM_LINEAR_MEMORY_PAGE_BYTES),
+            growth_chunk_bytes: Some(WASM_LINEAR_MEMORY_PAGE_BYTES),
+            max_bytes: Some(8 * WASM_LINEAR_MEMORY_PAGE_BYTES),
+            warning_threshold_bytes: None,
+            warning_threshold_percent: Some(75),
+            warning_callback: None,
+        };
+        let conn = open_core_connection_with_options(":memory:", &options)
+            .expect("memory-configured connection should open");
+        let stats = conn
+            .memory_stats()
+            .expect("memory stats should be available");
+        let js = connection_memory_stats_to_js(
+            &conn,
+            stats,
+            options.effective_warning_threshold_bytes().unwrap(),
+            options.warning_threshold_percent,
+        )
+        .expect("memory stats js should build");
+        let object = js.unchecked_into::<Object>();
+
+        assert_eq!(
+            js_object_property_usize(&object, "initialReservePages"),
+            Some(2)
+        );
+        assert_eq!(
+            js_object_property_usize(&object, "growthChunkPages"),
+            Some(1)
+        );
+        assert_eq!(
+            js_object_property_usize(&object, "trackedMaxPages"),
+            Some(8)
+        );
+        assert_eq!(
+            js_object_property_usize(&object, "warningThresholdPercent"),
+            Some(75)
+        );
+        assert_eq!(
+            js_object_property_usize(&object, "warningThresholdBytes"),
+            Some((8 * WASM_LINEAR_MEMORY_PAGE_BYTES * 75) / 100)
+        );
+        assert_eq!(
+            js_object_property_string(&object, "pageCachePressureLevel").as_deref(),
+            Some("normal")
+        );
+        assert_eq!(
+            js_object_property_usize(&object, "pageCachePressureBudgetBytes"),
+            Some((8 * WASM_LINEAR_MEMORY_PAGE_BYTES * 75) / 100)
+        );
+    }
+
+    #[test]
+    fn page_cache_pressure_advisory_is_unbounded_without_budget() {
+        let stats = ConnectionMemoryStats {
+            page_size_bytes: 4096,
+            page_cache: PageCacheMetricsSnapshot {
+                hits: 0,
+                misses: 0,
+                admits: 0,
+                evictions: 0,
+                cached_pages: 8,
+                pool_capacity: 32,
+                dirty_ratio_pct: 0,
+                t1_size: 0,
+                t2_size: 0,
+                b1_size: 0,
+                b2_size: 0,
+                p_target: 0,
+                mvcc_multi_version_pages: 0,
+            },
+            memory_vfs: None,
+        };
+
+        let advisory = page_cache_pressure_advisory(stats, None);
+        assert_eq!(advisory.level, "unbounded");
+        assert_eq!(advisory.tracked_headroom_bytes, None);
+        assert_eq!(advisory.budget_bytes, None);
+        assert_eq!(advisory.recommended_page_buffer_max_pages, None);
+        assert_eq!(advisory.recommended_page_buffer_max_bytes, None);
+    }
+
+    #[test]
+    fn page_cache_pressure_advisory_recommends_lower_page_buffer_cap_under_budget() {
+        let stats = ConnectionMemoryStats {
+            page_size_bytes: 4096,
+            page_cache: PageCacheMetricsSnapshot {
+                hits: 0,
+                misses: 0,
+                admits: 0,
+                evictions: 0,
+                cached_pages: 64,
+                pool_capacity: 128,
+                dirty_ratio_pct: 0,
+                t1_size: 0,
+                t2_size: 0,
+                b1_size: 0,
+                b2_size: 0,
+                p_target: 0,
+                mvcc_multi_version_pages: 0,
+            },
+            memory_vfs: Some(fsqlite_vfs::MemoryVfsUsageSnapshot {
+                file_bytes: 65_536,
+                file_reserved_bytes: 131_072,
+                shm_bytes: 0,
+                shm_reserved_bytes: 0,
+                peak_reserved_bytes: 131_072,
+                growth_events: 1,
+                file_count: 1,
+                shm_region_count: 0,
+                initial_reserve_bytes: 65_536,
+                growth_chunk_bytes: 65_536,
+                max_bytes: Some(524_288),
+            }),
+        };
+
+        let advisory = page_cache_pressure_advisory(stats, Some(327_680));
+        assert_eq!(advisory.level, "warning");
+        assert_eq!(advisory.tracked_headroom_bytes, Some(131_072));
+        assert_eq!(advisory.budget_bytes, Some(327_680));
+        assert_eq!(advisory.recommended_page_buffer_max_pages, Some(48));
+        assert_eq!(advisory.recommended_page_buffer_max_bytes, Some(196_608));
+    }
+
+    #[test]
+    fn page_cache_pressure_advisory_becomes_critical_at_tracked_cap() {
+        let stats = ConnectionMemoryStats {
+            page_size_bytes: 4096,
+            page_cache: PageCacheMetricsSnapshot {
+                hits: 0,
+                misses: 0,
+                admits: 0,
+                evictions: 0,
+                cached_pages: 96,
+                pool_capacity: 128,
+                dirty_ratio_pct: 0,
+                t1_size: 0,
+                t2_size: 0,
+                b1_size: 0,
+                b2_size: 0,
+                p_target: 0,
+                mvcc_multi_version_pages: 0,
+            },
+            memory_vfs: Some(fsqlite_vfs::MemoryVfsUsageSnapshot {
+                file_bytes: 65_536,
+                file_reserved_bytes: 131_072,
+                shm_bytes: 0,
+                shm_reserved_bytes: 0,
+                peak_reserved_bytes: 131_072,
+                growth_events: 1,
+                file_count: 1,
+                shm_region_count: 0,
+                initial_reserve_bytes: 65_536,
+                growth_chunk_bytes: 65_536,
+                max_bytes: Some(524_288),
+            }),
+        };
+
+        let advisory = page_cache_pressure_advisory(stats, Some(393_216));
+        assert_eq!(advisory.level, "critical");
+        assert_eq!(advisory.tracked_headroom_bytes, Some(0));
+        assert_eq!(advisory.budget_bytes, Some(393_216));
+        assert_eq!(advisory.recommended_page_buffer_max_pages, Some(64));
+        assert_eq!(advisory.recommended_page_buffer_max_bytes, Some(262_144));
     }
 
     #[test]

@@ -67,10 +67,10 @@ inside that ceiling:
 const db = FrankenDB.openWithOptions(":memory:", {
   pageBufferMax: 256,
   memory: {
-    initialReserveBytes: 256 * 1024,
-    growthChunkBytes: 64 * 1024,
-    maxBytes: 32 * 1024 * 1024,
-    warningThresholdBytes: 24 * 1024 * 1024,
+    initialPages: 4,
+    growthChunkPages: 1,
+    maxPages: 512,
+    warnAtPercent: 75,
     onWarning(stats) {
       console.warn("FrankenSQLite memory pressure", stats);
     },
@@ -79,14 +79,27 @@ const db = FrankenDB.openWithOptions(":memory:", {
 ```
 
 - `pageBufferMax` caps the pager's page-buffer pool in pages.
-- `memory.initialReserveBytes` reserves the initial main-database heap backing.
-- `memory.growthChunkBytes` controls how aggressively the in-memory VFS grows.
-- `memory.maxBytes` is a hard cap for tracked `MemoryVfs` heap usage. When the
-  engine crosses that cap, operations fail with a structured out-of-memory
-  error instead of trapping through an `unreachable`.
-- `memory.warningThresholdBytes` plus `memory.onWarning` let applications react
-  before the hard cap is hit.
+- `memory.initialPages`, `memory.growthChunkPages`, and `memory.maxPages`
+  express the same policy in WebAssembly pages (`64 KiB` each). The byte-level
+  aliases `memory.initialReserveBytes`, `memory.growthChunkBytes`, and
+  `memory.maxBytes` remain available when callers want exact byte counts.
+- `memory.maxPages` / `memory.maxBytes` act as a hard cap for tracked
+  `MemoryVfs` heap usage. When the engine crosses that cap, operations fail
+  with a structured out-of-memory error instead of trapping through an
+  `unreachable`.
+- `memory.warnAtPercent` derives the warning threshold from the tracked max.
+  `memory.warningThresholdBytes` remains available for exact byte thresholds.
+- `memory.onWarning` fires once when usage crosses the configured threshold and
+  the payload includes both byte-level fields and page-oriented diagnostics such
+  as `initialReservePages`, `growthChunkPages`, `trackedMaxPages`, and
+  `linearMemoryPages` when available.
+- `db.memoryStats()` now also emits page-cache pressure advisory fields:
+  `pageCachePressureLevel`, `pageCachePressureBudgetBytes`,
+  `recommendedPageBufferMaxPages`, `recommendedPageBufferMaxBytes`, and
+  `trackedHeadroomBytes`. These let the JS side decide when to ratchet
+  `pageBufferMax` down before the tracked heap reaches its hard cap.
 
 Call `db.memoryStats()` at any point to inspect tracked heap bytes, page-cache
-resident bytes, page-cache capacity, and current linear-memory size (when
-running under `wasm32`).
+resident bytes, page-cache capacity, configured warning thresholds, growth
+events, current linear-memory size/pages (when running under `wasm32`), and the
+derived page-cache pressure recommendation.

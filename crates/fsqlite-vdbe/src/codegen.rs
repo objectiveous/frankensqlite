@@ -6368,7 +6368,21 @@ fn resolve_multi_join_lookup_plan<'a>(
             SortKeySource::Rowid => SingleJoinLookupTarget::Rowid,
             SortKeySource::Column(col_idx) => {
                 let column_name = &right_table.columns.get(col_idx)?.name;
-                SingleJoinLookupTarget::Index(right_table.index_for_column(column_name)?)
+                let index = right_table.index_for_column(column_name)?;
+                // Only accept UNIQUE indexes for the multi-join fast path.
+                // Non-unique indexes can have multiple rows per key value,
+                // and the codegen below takes only the *first* match per
+                // outer row (no duplicate-run walk).  Emitting a single
+                // row where a 1:N join should emit N rows is a silent
+                // correctness bug.  The single-join codegen handles this
+                // correctly via a SeekGE + Next loop, but generalising
+                // that to N-way chains adds substantial complexity.
+                // Rejecting non-unique indexes here forces the scan
+                // fallback for those cases — correct if slower.
+                if !index.is_unique {
+                    return None;
+                }
+                SingleJoinLookupTarget::Index(index)
             }
             SortKeySource::Expression(_) => return None,
         };

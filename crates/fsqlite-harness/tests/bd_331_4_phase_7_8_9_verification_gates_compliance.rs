@@ -70,6 +70,7 @@ const REQUIRED_TOKENS: &[&str] = &[
     "FTS5 Full-Text Search (100 Test Queries)",
     "R*-Tree Spatial Queries (50 Bounding Box Tests)",
     "100% Conformance Parity (1,000+ Golden Files)",
+    "Time-Travel MVCC Snapshot Verification",
     "Single-Writer Benchmark Within 3x of C SQLite",
     "No Performance Regression (Conformal Calibration)",
     "Replication Under Packet Loss",
@@ -317,6 +318,49 @@ fn test_bd_331_4_unit_compliance_gate() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[test]
+fn test_required_tokens_cover_all_compliance_requirements() {
+    for unit_id in UNIT_TEST_IDS {
+        assert!(
+            REQUIRED_TOKENS.contains(&unit_id),
+            "bead_id={BEAD_ID} case=required_tokens_missing_unit_id id={unit_id}"
+        );
+    }
+
+    for gate_id in PHASE_GATE_TEST_IDS {
+        assert!(
+            REQUIRED_TOKENS.contains(&gate_id),
+            "bead_id={BEAD_ID} case=required_tokens_missing_phase_gate_id id={gate_id}"
+        );
+    }
+
+    for e2e_id in E2E_TEST_IDS {
+        assert!(
+            REQUIRED_TOKENS.contains(&e2e_id),
+            "bead_id={BEAD_ID} case=required_tokens_missing_e2e_id id={e2e_id}"
+        );
+    }
+
+    for marker in PHASE_GATE_MARKERS {
+        assert!(
+            REQUIRED_TOKENS.contains(&marker),
+            "bead_id={BEAD_ID} case=required_tokens_missing_phase_marker marker={marker}"
+        );
+    }
+
+    for level in LOG_LEVEL_MARKERS {
+        assert!(
+            REQUIRED_TOKENS.contains(&level),
+            "bead_id={BEAD_ID} case=required_tokens_missing_log_level level={level}"
+        );
+    }
+
+    assert!(
+        REQUIRED_TOKENS.contains(&LOG_STANDARD_REF),
+        "bead_id={BEAD_ID} case=required_tokens_missing_log_standard_ref expected_ref={LOG_STANDARD_REF}"
+    );
 }
 
 #[test]

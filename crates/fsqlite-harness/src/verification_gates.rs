@@ -1286,6 +1286,21 @@ fn late_phase_gate_specs() -> Vec<GateSpec> {
             expected_exit_code: 0,
         },
         GateSpec {
+            gate_id: "phase9.time_travel_mvcc",
+            gate_name: "Phase 9 gate: time-travel MVCC snapshot verification",
+            scope: GateScope::Phase9,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "--test",
+                "bd_1sf8n_phase9_time_travel_gate",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
             gate_id: "phase9.benchmark_3x",
             gate_name: "Phase 9 gate: overlay honesty scorecards replace stale single-writer 3x placeholder",
             scope: GateScope::Phase9,
@@ -2010,6 +2025,17 @@ mod tests {
         assert!(command.contains("cargo test -p fsqlite-e2e --lib overlay_honesty_gate_"));
         assert!(!command.contains("exit 1"));
         assert!(!command.contains("unimplemented"));
+    }
+
+    #[test]
+    fn test_phase9_gate_time_travel_mvcc() {
+        let plan = phase_7_to_9_gate_plan();
+        let gate = find_gate(&plan, "phase9.time_travel_mvcc");
+        let command = gate.command.join(" ");
+
+        assert_eq!(gate.scope, GateScope::Phase9);
+        assert!(command.contains("bd_1sf8n_phase9_time_travel_gate"));
+        assert!(!command.contains("test_phase9_gate_"));
     }
 
     #[test]

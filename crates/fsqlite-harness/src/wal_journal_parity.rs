@@ -374,13 +374,11 @@ pub fn assess_wal_journal_parity(config: &WalJournalParityConfig) -> WalJournalP
     });
 
     // -- Known gaps --
-    let known_gaps = vec![KnownGap {
-        feature: "wal_autocheckpoint".to_owned(),
-        description:
-            "PRAGMA wal_autocheckpoint value stored but auto-checkpoint not triggered after commits"
-                .to_owned(),
-        affects_query_results: false,
-    }];
+    // The wal_autocheckpoint gap was removed: auto-checkpoint IS triggered
+    // after commits, as proven by
+    // test_pragma_checkpoint_autocheckpoint_triggers_and_disable_semantics
+    // in connection.rs. See GitHub issue #66.
+    let known_gaps: Vec<KnownGap> = vec![];
 
     // -- Compute verdict --
     let total_checks = checks.len();
@@ -569,9 +567,8 @@ mod tests {
     fn assess_known_gaps() {
         let cfg = WalJournalParityConfig::default();
         let report = assess_wal_journal_parity(&cfg);
-        assert_eq!(report.known_gaps.len(), 1);
-        assert_eq!(report.known_gaps[0].feature, "wal_autocheckpoint");
-        assert!(!report.known_gaps[0].affects_query_results);
+        // All previously-known gaps have been resolved (see issue #66).
+        assert_eq!(report.known_gaps.len(), 0);
     }
 
     #[test]

@@ -1292,6 +1292,8 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             frames_backfilled: result.frames_backfilled,
             completed: result.plan.completes_checkpoint(),
             wal_was_reset: result.wal_was_reset,
+            requested_mode: mode,
+            effective_mode: mode,
         })
     }
 }

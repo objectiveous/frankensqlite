@@ -8010,24 +8010,52 @@ where
 
         // Create a checkpoint writer that writes directly to the database file.
         let mut writer = self.checkpoint_writer();
+
+        // Single-connection fast path (issue #66): when this pager is the only
+        // connection to the database (shared_connection_count == 1) and no
+        // transactions are active (already verified above), there are no
+        // readers whose WAL end-marks we need to track. Restart and Truncate
+        // are safe because no other connection can be reading from the WAL.
+        let sole_connection = self
+            .shared_connection_count
+            .get()
+            .is_some_and(|counter| counter.load(std::sync::atomic::Ordering::Acquire) == 1);
+
         let effective_mode = match mode {
-            traits::CheckpointMode::Restart | traits::CheckpointMode::Truncate => {
+            traits::CheckpointMode::Restart | traits::CheckpointMode::Truncate
+                if !sole_connection =>
+            {
                 tracing::debug!(
                     requested_mode = ?mode,
-                    "downgrading checkpoint mode because pager lacks reader-tracking for safe WAL reset"
+                    "downgrading checkpoint mode because pager has multiple connections or lacks reader-tracking for safe WAL reset"
                 );
                 traits::CheckpointMode::Full
             }
             _ => mode,
         };
 
+        if sole_connection && effective_mode != mode {
+            // This branch is unreachable but guards against future refactors.
+            tracing::warn!(
+                requested_mode = ?mode,
+                effective_mode = ?effective_mode,
+                "unexpected downgrade despite sole-connection fast path"
+            );
+        }
+
         // Run the checkpoint from the beginning. Reader-aware incremental
         // checkpointing requires exposing oldest-reader tracking from pager.
-        guard
+        let mut result = guard
             .wal
             .as_mut()
             .expect("wal was just inserted")
-            .checkpoint(cx, effective_mode, &mut writer, 0, None)
+            .checkpoint(cx, effective_mode, &mut writer, 0, None)?;
+
+        // Surface any pager-level downgrade in the result so callers can
+        // detect that their requested mode was not honored (issue #66 fix 4).
+        result.requested_mode = mode;
+        result.effective_mode = effective_mode;
+        Ok(result)
     }
 }
 
@@ -8259,6 +8287,8 @@ mod tests {
                 frames_backfilled: 0,
                 completed: false,
                 wal_was_reset: false,
+                requested_mode: _mode,
+                effective_mode: _mode,
             })
         }
     }
@@ -11188,6 +11218,8 @@ mod tests {
                 frames_backfilled: 0,
                 completed: false,
                 wal_was_reset: false,
+                requested_mode: _mode,
+                effective_mode: _mode,
             })
         }
     }
@@ -11353,6 +11385,8 @@ mod tests {
                 frames_backfilled: 0,
                 completed: false,
                 wal_was_reset: false,
+                requested_mode: _mode,
+                effective_mode: _mode,
             })
         }
     }
@@ -11860,6 +11894,8 @@ mod tests {
                 frames_backfilled: total_frames,
                 completed: true,
                 wal_was_reset: false,
+                requested_mode: _mode,
+                effective_mode: _mode,
             })
         }
     }
@@ -11928,6 +11964,8 @@ mod tests {
                 frames_backfilled: 0,
                 completed: true,
                 wal_was_reset: false,
+                requested_mode: _mode,
+                effective_mode: _mode,
             })
         }
     }
@@ -12087,6 +12125,8 @@ mod tests {
                 frames_backfilled: total_frames,
                 completed: true,
                 wal_was_reset: false,
+                requested_mode: _mode,
+                effective_mode: _mode,
             })
         }
     }
@@ -12205,6 +12245,8 @@ mod tests {
                 frames_backfilled: total_frames,
                 completed: true,
                 wal_was_reset: false,
+                requested_mode: _mode,
+                effective_mode: _mode,
             })
         }
     }
@@ -20118,6 +20160,8 @@ mod tests {
                     frames_backfilled: 0,
                     completed: true,
                     wal_was_reset: false,
+                    requested_mode: _mode,
+                    effective_mode: _mode,
                 })
             }
         }
@@ -20226,6 +20270,8 @@ mod tests {
                     frames_backfilled: 0,
                     completed: true,
                     wal_was_reset: false,
+                    requested_mode: _mode,
+                    effective_mode: _mode,
                 })
             }
         }

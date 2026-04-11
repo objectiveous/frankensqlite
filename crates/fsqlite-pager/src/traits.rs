@@ -101,6 +101,11 @@ pub struct CheckpointResult {
     pub completed: bool,
     /// Whether the WAL was reset after the checkpoint.
     pub wal_was_reset: bool,
+    /// The mode the caller originally requested.
+    pub requested_mode: CheckpointMode,
+    /// The mode actually executed (may differ from `requested_mode` if the
+    /// pager conservatively downgraded due to safety constraints).
+    pub effective_mode: CheckpointMode,
 }
 
 /// Public summary of the commit-published WAL visibility plane.

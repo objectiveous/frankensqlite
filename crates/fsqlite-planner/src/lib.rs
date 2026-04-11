@@ -4734,6 +4734,24 @@ mod tests {
         classify_where_term(expr)
     }
 
+    fn like_term_with_escape(col: &str, pattern: &str, escape: &str) -> WhereTerm<'static> {
+        let expr: &'static Expr = Box::leak(Box::new(Expr::Like {
+            expr: Box::new(Expr::Column(ColumnRef::bare(col), Span::ZERO)),
+            pattern: Box::new(Expr::Literal(
+                Literal::String(pattern.to_owned()),
+                Span::ZERO,
+            )),
+            escape: Some(Box::new(Expr::Literal(
+                Literal::String(escape.to_owned()),
+                Span::ZERO,
+            ))),
+            op: LikeOp::Like,
+            not: false,
+            span: Span::ZERO,
+        }));
+        classify_where_term(expr)
+    }
+
     fn glob_term(col: &str, pattern: &str) -> WhereTerm<'static> {
         let expr: &'static Expr = Box::leak(Box::new(Expr::Like {
             expr: Box::new(Expr::Column(ColumnRef::bare(col), Span::ZERO)),
@@ -6498,6 +6516,25 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_where_term_like_escape_case_stable_prefix() {
+        let term = like_term_with_escape("name", "123\\%%", "\\");
+        assert!(matches!(
+            term.kind,
+            WhereTermKind::LikePrefix {
+                ref prefix,
+                upper_bound: Some(ref upper_bound),
+            } if prefix == "123%" && upper_bound == "123&"
+        ));
+        assert_eq!(term.column.as_ref().unwrap().column, "name");
+    }
+
+    #[test]
+    fn test_classify_where_term_like_escape_ascii_prefix_is_other() {
+        let term = like_term_with_escape("name", "abc\\%%", "\\");
+        assert!(matches!(term.kind, WhereTermKind::Other));
+    }
+
+    #[test]
     fn test_classify_where_term_glob_prefix() {
         let term = glob_term("name", "abc*");
         assert!(matches!(
@@ -6777,10 +6814,29 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_like_prefix_with_escape_bails_out() {
-        // With escape character, we bail out for safety
-        let pat = Expr::Literal(Literal::String("abc%".to_owned()), Span::ZERO);
+    fn test_extract_like_prefix_with_escape_percent_in_prefix() {
+        let pat = Expr::Literal(Literal::String("123\\%%".to_owned()), Span::ZERO);
         let esc = Expr::Literal(Literal::String("\\".to_owned()), Span::ZERO);
+        assert_eq!(
+            extract_like_prefix(&pat, Some(&esc)),
+            Some("123%".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_extract_like_prefix_with_escape_underscore_in_prefix() {
+        let pat = Expr::Literal(Literal::String("123!_%".to_owned()), Span::ZERO);
+        let esc = Expr::Literal(Literal::String("!".to_owned()), Span::ZERO);
+        assert_eq!(
+            extract_like_prefix(&pat, Some(&esc)),
+            Some("123_".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_extract_like_prefix_with_invalid_escape_literal() {
+        let pat = Expr::Literal(Literal::String("123\\%%".to_owned()), Span::ZERO);
+        let esc = Expr::Literal(Literal::String("xx".to_owned()), Span::ZERO);
         assert_eq!(extract_like_prefix(&pat, Some(&esc)), None);
     }
 
@@ -6865,6 +6921,19 @@ mod tests {
         assert!(
             matches!(ap.kind, AccessPathKind::IndexScanRange { .. }),
             "case-stable LIKE prefix should use index scan, got {:?}",
+            ap.kind
+        );
+    }
+
+    #[test]
+    fn test_best_access_path_like_escape_case_stable_prefix_uses_index_scan() {
+        let table = table_stats("t1", 100, 1000);
+        let idx = index_info("idx_name", "t1", &["name"], false, 20);
+        let terms = [like_term_with_escape("name", "123\\%%", "\\")];
+        let ap = best_access_path(&table, &[idx], &terms, None);
+        assert!(
+            matches!(ap.kind, AccessPathKind::IndexScanRange { .. }),
+            "escaped case-stable LIKE prefix should use index scan, got {:?}",
             ap.kind
         );
     }

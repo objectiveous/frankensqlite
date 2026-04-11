@@ -639,12 +639,16 @@ mod tests {
         }
 
         fn column(&self, ctx: &mut ColumnContext, _col: i32) -> Result<()> {
+            if self.eof() {
+                ctx.set_value(SqliteValue::Null);
+                return Ok(());
+            }
             ctx.set_value(SqliteValue::Integer(self.current));
             Ok(())
         }
 
         fn rowid(&self) -> Result<i64> {
-            Ok(self.current)
+            Ok(if self.eof() { 0 } else { self.current })
         }
     }
 
@@ -689,7 +693,8 @@ mod tests {
             true
         }
 
-        fn column(&self, _ctx: &mut ColumnContext, _col: i32) -> Result<()> {
+        fn column(&self, ctx: &mut ColumnContext, _col: i32) -> Result<()> {
+            ctx.set_value(SqliteValue::Null);
             Ok(())
         }
 
@@ -767,13 +772,20 @@ mod tests {
         }
 
         fn column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()> {
+            if self.eof() {
+                ctx.set_value(SqliteValue::Null);
+                return Ok(());
+            }
+
             #[allow(clippy::cast_sign_loss)]
             let col_idx = col as usize;
             if let Some((_, cols)) = self.rows.get(self.pos) {
                 if let Some(val) = cols.get(col_idx) {
                     ctx.set_value(val.clone());
+                    return Ok(());
                 }
             }
+            ctx.set_value(SqliteValue::Null);
             Ok(())
         }
 
@@ -927,6 +939,58 @@ mod tests {
         assert_eq!(values[0], (1, SqliteValue::Integer(1)));
         assert_eq!(values[1], (2, SqliteValue::Integer(2)));
         assert_eq!(values[2], (3, SqliteValue::Integer(3)));
+    }
+
+    #[test]
+    fn test_generate_series_cursor_past_end_returns_null_and_zero_rowid() {
+        let cx = Cx::new();
+        let vtab = GenerateSeries::connect(&cx, &[]).unwrap();
+        let mut cursor = vtab.open().unwrap();
+
+        cursor
+            .filter(
+                &cx,
+                0,
+                None,
+                &[SqliteValue::Integer(1), SqliteValue::Integer(1)],
+            )
+            .unwrap();
+        cursor.next(&cx).unwrap();
+        assert!(cursor.eof());
+
+        let mut ctx = ColumnContext::new();
+        cursor.column(&mut ctx, 0).unwrap();
+        assert_eq!(ctx.take_value(), Some(SqliteValue::Null));
+        assert_eq!(cursor.rowid().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_writable_cursor_missing_column_returns_null() {
+        let cx = Cx::new();
+        let mut vtab = WritableVtab::connect(&cx, &[]).unwrap();
+        VirtualTable::update(
+            &mut vtab,
+            &cx,
+            &[
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Text("hello".into()),
+            ],
+        )
+        .unwrap();
+
+        let mut cursor = vtab.open().unwrap();
+        cursor.filter(&cx, 0, None, &[]).unwrap();
+
+        let mut ctx = ColumnContext::new();
+        cursor.column(&mut ctx, 3).unwrap();
+        assert_eq!(ctx.take_value(), Some(SqliteValue::Null));
+
+        cursor.next(&cx).unwrap();
+        assert!(cursor.eof());
+        cursor.column(&mut ctx, 0).unwrap();
+        assert_eq!(ctx.take_value(), Some(SqliteValue::Null));
+        assert_eq!(cursor.rowid().unwrap(), 0);
     }
 
     #[test]

@@ -2201,8 +2201,10 @@ impl VirtualTableCursor for Fts5Cursor {
         #[allow(clippy::cast_sign_loss)]
         let col_idx = col as usize;
 
+        let is_rank_column = col == -1 || (col >= 0 && col_idx == self.columns.len());
+
         // Column -1 or column == num_columns is the rank.
-        if col < 0 || col_idx >= self.columns.len() {
+        if is_rank_column {
             ctx.set_value(SqliteValue::Float(*score));
         } else if let Some(cols) = self.documents.get(rowid)
             && let Some(val) = cols.get(col_idx)
@@ -4040,6 +4042,40 @@ mod tests {
 
         let mut ctx = ColumnContext::new();
         cursor.column(&mut ctx, 0).unwrap();
+        assert_eq!(ctx.take_value(), Some(SqliteValue::Null));
+    }
+
+    #[test]
+    fn test_fts5_cursor_column_out_of_range_returns_null() {
+        let mut cursor = Fts5Cursor {
+            results: Vec::new(),
+            position: 0,
+            columns: vec!["content".to_owned()],
+            index: InvertedIndex::new(),
+            documents: HashMap::new(),
+        };
+
+        cursor.set_results(vec![(1, -1.0, vec!["hello world".to_owned()])]);
+
+        let mut ctx = ColumnContext::new();
+        cursor.column(&mut ctx, 2).unwrap();
+        assert_eq!(ctx.take_value(), Some(SqliteValue::Null));
+    }
+
+    #[test]
+    fn test_fts5_cursor_column_negative_out_of_range_returns_null() {
+        let mut cursor = Fts5Cursor {
+            results: Vec::new(),
+            position: 0,
+            columns: vec!["content".to_owned()],
+            index: InvertedIndex::new(),
+            documents: HashMap::new(),
+        };
+
+        cursor.set_results(vec![(1, -1.0, vec!["hello world".to_owned()])]);
+
+        let mut ctx = ColumnContext::new();
+        cursor.column(&mut ctx, -2).unwrap();
         assert_eq!(ctx.take_value(), Some(SqliteValue::Null));
     }
 

@@ -938,15 +938,27 @@ impl VirtualTableCursor for RtreeCursor {
     }
 
     fn column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()> {
+        if self.eof() {
+            ctx.set_value(SqliteValue::Null);
+            return Ok(());
+        }
+
         let row = self.current_row()?;
         if col == 0 {
             ctx.set_value(SqliteValue::Integer(row.id));
             return Ok(());
         }
 
-        let coordinate_index = usize::try_from(col - 1).map_err(|error| {
-            FrankenError::function_error(format!("rtree column index conversion failed: {error}"))
-        })?;
+        let Some(adjusted_col) = col.checked_sub(1) else {
+            ctx.set_value(SqliteValue::Null);
+            return Ok(());
+        };
+
+        let coordinate_index = usize::try_from(adjusted_col).ok();
+        let Some(coordinate_index) = coordinate_index else {
+            ctx.set_value(SqliteValue::Null);
+            return Ok(());
+        };
         if let Some(coord) = row.bbox.coords.get(coordinate_index) {
             ctx.set_value(self.coordinate_value(*coord)?);
         } else {
@@ -956,7 +968,11 @@ impl VirtualTableCursor for RtreeCursor {
     }
 
     fn rowid(&self) -> Result<i64> {
-        Ok(self.current_row()?.id)
+        Ok(if self.eof() {
+            0
+        } else {
+            self.current_row()?.id
+        })
     }
 }
 
@@ -2465,6 +2481,74 @@ mod tests {
             ]
         );
         assert_eq!(rows[1][0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn test_rtree_cursor_past_end_returns_null_and_zero_rowid() {
+        let cx = Cx::new();
+        let mut table = RtreeVirtualTable::from_args(
+            &["id", "min_x", "max_x", "min_y", "max_y"],
+            RtreeCoordType::Float32,
+        )
+        .unwrap();
+
+        VirtualTable::update(
+            &mut table,
+            &cx,
+            &[
+                SqliteValue::Null,
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Float(0.0),
+                SqliteValue::Float(1.0),
+                SqliteValue::Float(0.0),
+                SqliteValue::Float(1.0),
+            ],
+        )
+        .unwrap();
+
+        let mut cursor = table.open().unwrap();
+        cursor.filter(&cx, RTREE_SCAN_FULL, None, &[]).unwrap();
+        assert!(!cursor.eof());
+        cursor.next(&cx).unwrap();
+        assert!(cursor.eof());
+
+        let mut ctx = ColumnContext::new();
+        cursor.column(&mut ctx, 0).unwrap();
+        assert_eq!(ctx.take_value(), Some(SqliteValue::Null));
+        assert_eq!(cursor.rowid().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_rtree_cursor_negative_column_returns_null() {
+        let cx = Cx::new();
+        let mut table = RtreeVirtualTable::from_args(
+            &["id", "min_x", "max_x", "min_y", "max_y"],
+            RtreeCoordType::Float32,
+        )
+        .unwrap();
+
+        VirtualTable::update(
+            &mut table,
+            &cx,
+            &[
+                SqliteValue::Null,
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Float(0.0),
+                SqliteValue::Float(1.0),
+                SqliteValue::Float(0.0),
+                SqliteValue::Float(1.0),
+            ],
+        )
+        .unwrap();
+
+        let mut cursor = table.open().unwrap();
+        cursor.filter(&cx, RTREE_SCAN_FULL, None, &[]).unwrap();
+
+        let mut ctx = ColumnContext::new();
+        cursor.column(&mut ctx, -1).unwrap();
+        assert_eq!(ctx.take_value(), Some(SqliteValue::Null));
     }
 
     #[test]

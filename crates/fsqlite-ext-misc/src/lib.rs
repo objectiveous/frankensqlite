@@ -141,6 +141,11 @@ impl VirtualTableCursor for GenerateSeriesCursor {
     }
 
     fn column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()> {
+        if self.done {
+            ctx.set_value(SqliteValue::Null);
+            return Ok(());
+        }
+
         let val = match col {
             0 => SqliteValue::Integer(self.current), // value
             1 => SqliteValue::Integer(self.start),   // start
@@ -153,7 +158,7 @@ impl VirtualTableCursor for GenerateSeriesCursor {
     }
 
     fn rowid(&self) -> Result<i64> {
-        Ok(self.current)
+        Ok(if self.done { 0 } else { self.current })
     }
 }
 
@@ -1354,6 +1359,21 @@ mod tests {
         let mut ctx4 = ColumnContext::new();
         cursor.column(&mut ctx4, 99).unwrap();
         assert_eq!(ctx4.take_value(), Some(SqliteValue::Null));
+    }
+
+    #[test]
+    fn test_generate_series_past_end_returns_null_and_zero_rowid() {
+        let table = GenerateSeriesTable;
+        let mut cursor = table.open().unwrap();
+        cursor.init(5, 5, 1).unwrap();
+        let cx = Cx::new();
+        cursor.next(&cx).unwrap();
+        assert!(cursor.eof());
+
+        let mut ctx = ColumnContext::new();
+        cursor.column(&mut ctx, 0).unwrap();
+        assert_eq!(ctx.take_value(), Some(SqliteValue::Null));
+        assert_eq!(cursor.rowid().unwrap(), 0);
     }
 
     #[test]

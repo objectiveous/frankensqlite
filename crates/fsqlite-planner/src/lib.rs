@@ -2216,7 +2216,9 @@ pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> In
             match &term.kind {
                 WhereTermKind::Equality => {
                     summary.has_equality = true;
-                    if column_index == 0 && leftmost_first_constraint.is_none() {
+                    if column_index == 0 {
+                        // Equality must dominate weaker leftmost probes on the
+                        // same column, regardless of term visitation order.
                         leftmost_first_constraint = Some(IndexUsability::Equality);
                     }
                 }
@@ -5152,6 +5154,17 @@ mod tests {
     fn test_index_usability_equality_beats_range_on_same_leftmost_column() {
         let idx = index_info("idx_a", "t1", &["a"], false, 50);
         let terms = [range_term("a"), eq_term("a")];
+
+        assert!(matches!(
+            analyze_index_usability(&idx, &terms),
+            IndexUsability::Equality
+        ));
+    }
+
+    #[test]
+    fn test_index_usability_equality_beats_like_prefix_on_same_leftmost_column() {
+        let idx = index_info("idx_name", "t1", &["name"], false, 50);
+        let terms = [like_term("name", "123%"), eq_term("name")];
 
         assert!(matches!(
             analyze_index_usability(&idx, &terms),

@@ -1559,6 +1559,10 @@ fn expr_guarantees_non_null(expr: &Expr, predicate_column: &WhereColumn) -> bool
             && !matches!(query_cmp.literal, Literal::Null);
     }
 
+    if let Some((column, _)) = classify_or_disjunction_as_in_list(expr) {
+        return where_columns_compatible(&column, predicate_column);
+    }
+
     match expr {
         Expr::Between { expr: inner, .. }
         | Expr::In { expr: inner, .. }
@@ -7349,6 +7353,24 @@ mod tests {
         assert!(matches!(
             ap.kind,
             AccessPathKind::IndexScanRange { .. } | AccessPathKind::CoveringIndexScan { .. }
+        ));
+    }
+
+    #[test]
+    fn test_best_access_path_partial_index_accepts_is_not_null_from_or_disjunction() {
+        let table = table_stats("t1", 100, 1000);
+        let mut partial_idx = index_info("idx_partial_a", "t1", &["a"], false, 20);
+        partial_idx.partial_where = Some(Expr::IsNull {
+            expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            not: true,
+            span: Span::ZERO,
+        });
+
+        let ap = best_access_path(&table, &[partial_idx], &[or_eq_term("a", &[1, 2, 3])], None);
+        assert_eq!(ap.index.as_deref(), Some("idx_partial_a"));
+        assert!(matches!(
+            ap.kind,
+            AccessPathKind::IndexScanEquality | AccessPathKind::CoveringIndexScan { .. }
         ));
     }
 

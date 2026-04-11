@@ -1,11 +1,11 @@
 # bd-1sf8n progress
 
-Current slice: fresh-eyes review of the dedicated Phase 9 time-travel gate traceability contract, specifically hardening the emitted `SCENARIO_OUTCOME` metadata so the gate self-validates its scenario catalog and replay command.
+Current slice: final fresh-eyes review of the dedicated Phase 9 time-travel gate traceability work, specifically fixing the gap where the prior "contract" test only rechecked local constants instead of the actual shell runner and canonical inventory.
 
 Implemented in this increment:
-- Added an explicit `SCENARIO_IDS` catalog in `crates/fsqlite-harness/tests/bd_1sf8n_phase9_time_travel_gate.rs` and switched the existing scenario emitters to use it, so the three shipped Phase 9 time-travel cases are declared once and reused consistently.
-- Refactored the scenario JSON builder behind `emit_scenario_outcome` into a reusable helper and added self-check tests that assert the emitted metadata always carries the correct `bd-1sf8n` bead id, `MVCC-7` family, scenario id, and replay command.
-- Added a traceability-contract test that validates the exact expected scenario ids plus the replay-command shape, so future edits cannot silently drift away from the Phase 9 script and harness registry contract.
+- Audited the recent `bd-1sf8n` commits with a fresh-eyes review and found that the earlier traceability-contract test in `crates/fsqlite-harness/tests/bd_1sf8n_phase9_time_travel_gate.rs` could still pass if the external shell runner or canonical inventory drifted, because it only compared local constants against other local literals.
+- Fixed that gap by binding the test to the actual canonical traceability inventory via `fsqlite_harness::e2e_traceability::build_canonical_inventory()` and asserting the registered Rust harness entry plus the shell utility entry both still advertise `bd-1sf8n`, `MVCC-7`, and the expected replay command.
+- Added a direct shell-runner contract check against `scripts/verify_bd_1sf8n_phase9_time_travel.sh`, so the Phase 9 script's `SCENARIO_ID`, `REPLAY_COMMAND`, and minimum scenario-outcome count cannot silently drift from the Rust gate test.
 
 Notes:
 - `bd-1mt2x` is still blocked by `bd-3mgq5`, so this commit remains an epic-level verification increment rather than a claim/closure of the child bead.
@@ -15,6 +15,7 @@ Notes:
 Verification target for this increment:
 - `cargo test -p fsqlite-harness --test bd_1sf8n_phase9_time_travel_gate -- --nocapture --test-threads=1`
 - `cargo test -p fsqlite-harness scenario_catalog_matches_phase9_traceability_contract -- --nocapture`
+- `ubs crates/fsqlite-harness/tests/bd_1sf8n_phase9_time_travel_gate.rs`
 - `cargo check --workspace --all-targets`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo fmt --all --check`

@@ -1,4 +1,5 @@
 use fsqlite::{Connection, SqliteValue};
+use fsqlite_harness::e2e_traceability::{ScriptKind, build_canonical_inventory};
 use serde_json::{Value, json};
 
 const BEAD_ID: &str = "bd-1sf8n";
@@ -9,6 +10,8 @@ const SCENARIO_IDS: [&str; 3] = [
     "MVCC-7-TIMESTAMP-LATEST",
     "MVCC-7-TIMESTAMP-MISS",
 ];
+const SHELL_RUNNER_PATH: &str = "scripts/verify_bd_1sf8n_phase9_time_travel.sh";
+const HARNESS_TEST_PATH: &str = "crates/fsqlite-harness/tests/bd_1sf8n_phase9_time_travel_gate.rs";
 
 fn open_connection() -> Connection {
     let conn = Connection::open(":memory:").expect("in-memory connection should open");
@@ -96,6 +99,71 @@ fn scenario_catalog_matches_phase9_traceability_contract() {
     assert!(
         REPLAY_COMMAND.contains("--nocapture --test-threads=1"),
         "bead_id={BEAD_ID} case=replay_command_keeps_scenario_output"
+    );
+
+    let inventory = build_canonical_inventory();
+    let harness_entry = inventory
+        .scripts
+        .iter()
+        .find(|entry| entry.path == HARNESS_TEST_PATH)
+        .expect("time-travel harness entry should exist in canonical inventory");
+    assert_eq!(
+        harness_entry.kind,
+        ScriptKind::RustHarnessTest,
+        "bead_id={BEAD_ID} case=harness_entry_kind"
+    );
+    assert_eq!(
+        harness_entry.bead_id.as_deref(),
+        Some(BEAD_ID),
+        "bead_id={BEAD_ID} case=harness_entry_bead_id"
+    );
+    assert_eq!(
+        harness_entry.invocation.command, REPLAY_COMMAND,
+        "bead_id={BEAD_ID} case=harness_entry_replay_command"
+    );
+    assert_eq!(
+        harness_entry.scenario_ids,
+        vec![SCENARIO_FAMILY.to_owned()],
+        "bead_id={BEAD_ID} case=harness_entry_scenario_family"
+    );
+
+    let shell_entry = inventory
+        .scripts
+        .iter()
+        .find(|entry| entry.path == SHELL_RUNNER_PATH)
+        .expect("time-travel shell runner should exist in canonical inventory");
+    assert_eq!(
+        shell_entry.kind,
+        ScriptKind::ShellUtility,
+        "bead_id={BEAD_ID} case=shell_entry_kind"
+    );
+    assert_eq!(
+        shell_entry.bead_id.as_deref(),
+        Some(BEAD_ID),
+        "bead_id={BEAD_ID} case=shell_entry_bead_id"
+    );
+    assert_eq!(
+        shell_entry.scenario_ids,
+        vec![SCENARIO_FAMILY.to_owned()],
+        "bead_id={BEAD_ID} case=shell_entry_scenario_family"
+    );
+}
+
+#[test]
+fn shell_runner_matches_time_travel_traceability_contract() {
+    let shell_runner = include_str!("../../../scripts/verify_bd_1sf8n_phase9_time_travel.sh");
+
+    assert!(
+        shell_runner.contains("SCENARIO_ID=\"MVCC-7\""),
+        "bead_id={BEAD_ID} case=shell_runner_scenario_family"
+    );
+    assert!(
+        shell_runner.contains(&format!("REPLAY_COMMAND=\"{REPLAY_COMMAND}\"")),
+        "bead_id={BEAD_ID} case=shell_runner_replay_command"
+    );
+    assert!(
+        shell_runner.contains("expected at least 3 scenario outcomes"),
+        "bead_id={BEAD_ID} case=shell_runner_expected_scenario_count"
     );
 }
 

@@ -858,6 +858,7 @@ mod tests {
         ConnectionPoolWorkloadProfile, best_practices, simulate_connection_pool,
         validate_connection_pool,
     };
+    use serde_json::Value;
 
     fn sample(workload_profile: ConnectionPoolWorkloadProfile) -> ConnectionPoolTelemetrySample {
         ConnectionPoolTelemetrySample {
@@ -1096,6 +1097,99 @@ mod tests {
         let right = simulate_connection_pool(&sample, &[1, 2, 4, 8]);
 
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn test_validation_report_serializes_auditable_fields() {
+        let mut sample = sample(ConnectionPoolWorkloadProfile::WriteHeavy);
+        sample.configured_pool_size = 1;
+        sample.observed_active_connections = 1;
+        sample.peak_concurrent_checkout_requests = 4;
+        sample.concurrent_writers = 4;
+
+        let report = validate_connection_pool(&sample);
+        let value = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(value["health"], Value::String("Critical".to_owned()));
+        assert_eq!(value["summary"]["configured_pool_size"], Value::from(1));
+        assert_eq!(value["summary"]["concurrent_writers"], Value::from(4));
+        assert_eq!(
+            value["recommendation"]["recommended_pool_size"],
+            Value::from(4)
+        );
+
+        let findings = value["findings"].as_array().unwrap();
+        let single_connection = findings
+            .iter()
+            .find(|finding| {
+                finding["pattern"] == Value::String("SingleConnectionSerializedWriters".to_owned())
+            })
+            .expect("expected serialized single-connection finding");
+        assert_eq!(
+            single_connection["severity"],
+            Value::String("Critical".to_owned())
+        );
+        assert_eq!(single_connection["confidence_score"], Value::from(0.95));
+        assert!(
+            single_connection["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| {
+                    entry.as_str().is_some_and(|text| {
+                        text.contains("FrankenSQLite benefits from multiple writer connections")
+                    })
+                }),
+            "serialized evidence should preserve MVCC-specific guidance",
+        );
+    }
+
+    #[test]
+    fn test_simulation_report_serializes_candidate_metrics() {
+        let mut sample = sample(ConnectionPoolWorkloadProfile::WriteHeavy);
+        sample.configured_pool_size = 1;
+        sample.observed_active_connections = 1;
+        sample.peak_concurrent_checkout_requests = 4;
+        sample.concurrent_writers = 4;
+
+        let simulation = simulate_connection_pool(&sample, &[1, 2, 4, 8]);
+        let value = serde_json::to_value(&simulation).unwrap();
+
+        assert_eq!(value["recommended_pool_size"], Value::from(4));
+
+        let points = value["points"].as_array().unwrap();
+        assert_eq!(points.len(), 4);
+
+        let recommended_point = points
+            .iter()
+            .find(|point| point["pool_size"].as_i64() == Some(4))
+            .expect("expected serialized point for pool_size=4");
+        let undersized_point = points
+            .iter()
+            .find(|point| point["pool_size"].as_i64() == Some(1))
+            .expect("expected serialized point for pool_size=1");
+
+        assert!(
+            recommended_point["throughput_score"].as_f64().unwrap()
+                > undersized_point["throughput_score"].as_f64().unwrap(),
+            "serialized throughput scores should preserve the recommendation ordering",
+        );
+        assert_eq!(
+            recommended_point["validation"]["recommendation"]["recommended_pool_size"],
+            Value::from(4)
+        );
+        assert!(
+            recommended_point["rationale"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| {
+                    entry.as_str().is_some_and(|text| {
+                        text.contains("Validator recommendation for the observed workload")
+                    })
+                }),
+            "serialized rationale should retain deterministic replay context",
+        );
     }
 
     #[test]

@@ -34,6 +34,11 @@ pub use connection_pool::{
 };
 pub use page_cache::PageCacheEfficiencySnapshot;
 
+#[cfg(doctest)]
+#[doc = include_str!("../../../docs/connection-pooling.md")]
+#[doc(hidden)]
+pub struct _ConnectionPoolingGuideDoctests;
+
 // ---------------------------------------------------------------------------
 // Structured trace metrics (bd-19u.1)
 // ---------------------------------------------------------------------------

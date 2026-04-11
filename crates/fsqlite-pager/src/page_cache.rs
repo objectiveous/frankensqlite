@@ -483,6 +483,16 @@ impl PageCacheEvictionTracker {
             Self::S3Fifo(tracker) => tracker.queue_snapshot(resident_pages),
         }
     }
+
+    fn queue_assignments(
+        &self,
+        resident_pages: &[PageNumber],
+    ) -> std::collections::HashMap<PageNumber, PageCacheQueueKind> {
+        match self {
+            Self::Arbitrary => std::collections::HashMap::new(),
+            Self::S3Fifo(tracker) => tracker.queue_assignments(resident_pages),
+        }
+    }
 }
 
 fn scale_nonzero_for_eviction_policy(
@@ -2640,8 +2650,12 @@ impl ShardedPageCache {
             }
         }
 
-        let resident_pages: Vec<PageNumber> = snapshots.iter().map(|snapshot| snapshot.page_no).collect();
-        let queue_assignments = self.eviction_policy.lock().queue_assignments(&resident_pages);
+        let resident_pages: Vec<PageNumber> =
+            snapshots.iter().map(|snapshot| snapshot.page_no).collect();
+        let queue_assignments = self
+            .eviction_policy
+            .lock()
+            .queue_assignments(&resident_pages);
         for snapshot in &mut snapshots {
             snapshot.queue = queue_assignments.get(&snapshot.page_no).copied();
         }
@@ -2802,6 +2816,20 @@ impl std::fmt::Debug for ShardedPageCache {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn percent_ratio_u64(numerator: usize, denominator: usize) -> u64 {
+    if denominator == 0 {
+        return 0;
+    }
+
+    let numerator = u64::try_from(numerator).unwrap_or(u64::MAX);
+    let denominator = u64::try_from(denominator).unwrap_or(u64::MAX).max(1);
+    numerator
+        .saturating_mul(100)
+        .saturating_add(denominator / 2)
+        .checked_div(denominator)
+        .unwrap_or(0)
+}
 
 /// Compute the byte offset of a page within the database file.
 ///

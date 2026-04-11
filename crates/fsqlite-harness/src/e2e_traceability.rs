@@ -739,6 +739,22 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .build(),
     );
 
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "scripts/verify_bd_1sf8n_phase9_time_travel.sh",
+            ScriptKind::ShellUtility,
+            "Phase 9 time-travel verification gate artifact runner",
+        )
+        .bead("bd-1sf8n")
+        .command("bash scripts/verify_bd_1sf8n_phase9_time_travel.sh")
+        .scenarios(&["MVCC-7"])
+        .storage(&[StorageMode::InMemory])
+        .concurrency(&[ConcurrencyMode::MvccIsolation])
+        .artifacts(&["artifacts/bd-1sf8n/"])
+        .timeout(300)
+        .build(),
+    );
+
     // ── TypeScript spec ──────────────────────────────────────────────
     scripts.push(
         ScriptEntryBuilder::new(
@@ -1863,6 +1879,23 @@ fn add_harness_tests(scripts: &mut Vec<ScriptEntry>) {
         .command("cargo test -p fsqlite-harness --test bd_cfj0_time_travel_compliance")
         .scenarios(&["MVCC-7"])
         .storage(&[StorageMode::InMemory, StorageMode::FileBacked])
+        .concurrency(&[ConcurrencyMode::MvccIsolation])
+        .timeout(120)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-harness/tests/bd_1sf8n_phase9_time_travel_gate.rs",
+            ScriptKind::RustHarnessTest,
+            "Phase 9 time-travel verification gate",
+        )
+        .bead("bd-1sf8n")
+        .command(
+            "cargo test -p fsqlite-harness --test bd_1sf8n_phase9_time_travel_gate -- --nocapture --test-threads=1",
+        )
+        .scenarios(&["MVCC-7"])
+        .storage(&[StorageMode::InMemory])
         .concurrency(&[ConcurrencyMode::MvccIsolation])
         .timeout(120)
         .build(),

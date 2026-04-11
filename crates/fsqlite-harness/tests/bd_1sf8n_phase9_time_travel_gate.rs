@@ -3,8 +3,7 @@ use serde_json::{Value, json};
 
 const BEAD_ID: &str = "bd-1sf8n";
 const SCENARIO_FAMILY: &str = "MVCC-7";
-const REPLAY_COMMAND: &str =
-    "cargo test -p fsqlite-harness --test bd_1sf8n_phase9_time_travel_gate -- --nocapture --test-threads=1";
+const REPLAY_COMMAND: &str = "cargo test -p fsqlite-harness --test bd_1sf8n_phase9_time_travel_gate -- --nocapture --test-threads=1";
 
 fn open_connection() -> Connection {
     let conn = Connection::open(":memory:").expect("in-memory connection should open");
@@ -69,11 +68,7 @@ fn commitseq_historical_read_returns_point_in_time_state() {
     let live_names = query_names(&conn, "SELECT name FROM tt_events ORDER BY id;");
     assert_eq!(
         live_names,
-        vec![
-            "boot".to_owned(),
-            "steady".to_owned(),
-            "settled".to_owned()
-        ],
+        vec!["boot".to_owned(), "steady".to_owned(), "settled".to_owned()],
         "bead_id={BEAD_ID} case=commitseq_live_state_preserved"
     );
 
@@ -117,7 +112,9 @@ fn early_timestamp_errors_explicitly_without_corrupting_live_state() {
     seed_time_travel_rows(&conn);
 
     let error = conn
-        .query("SELECT name FROM tt_events FOR SYSTEM_TIME AS OF '1970-01-01 00:00:00' ORDER BY id;")
+        .query(
+            "SELECT name FROM tt_events FOR SYSTEM_TIME AS OF '1970-01-01 00:00:00' ORDER BY id;",
+        )
         .expect_err("early timestamp should miss the retained snapshot ring");
     let error_text = error.to_string();
     assert!(
@@ -128,11 +125,7 @@ fn early_timestamp_errors_explicitly_without_corrupting_live_state() {
     let live_names = query_names(&conn, "SELECT name FROM tt_events ORDER BY id;");
     assert_eq!(
         live_names,
-        vec![
-            "boot".to_owned(),
-            "steady".to_owned(),
-            "settled".to_owned()
-        ],
+        vec!["boot".to_owned(), "steady".to_owned(), "settled".to_owned()],
         "bead_id={BEAD_ID} case=early_timestamp_live_state_preserved"
     );
 

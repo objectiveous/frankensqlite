@@ -24603,6 +24603,172 @@ mod tests {
         }
     }
 
+    fn test_schema_multi_join_composite_unique_prefix_lookup() -> Vec<TableSchema> {
+        vec![
+            TableSchema {
+                name: "messages".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("conversation_id", 'D', false),
+                ],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+            TableSchema {
+                name: "conversations".to_owned(),
+                root_page: 3,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("tenant_id", 'D', false),
+                    ColumnInfo::basic("title", 'B', false),
+                ],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+            TableSchema {
+                name: "agents".to_owned(),
+                root_page: 4,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("tenant_id", 'D', false),
+                    ColumnInfo::basic("slug", 'B', false),
+                    ColumnInfo::basic("label", 'B', false),
+                ],
+                indexes: vec![IndexSchema {
+                    name: "agents_tenant_slug_unique".to_owned(),
+                    root_page: 5,
+                    columns: vec!["tenant_id".to_owned(), "slug".to_owned()],
+                    key_expressions: vec!["tenant_id".to_owned(), "slug".to_owned()],
+                    key_sort_directions: vec![],
+                    where_clause: None,
+                    is_unique: true,
+                    key_collations: vec![],
+                }],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+        ]
+    }
+
+    fn composite_unique_prefix_multi_join_stmt() -> SelectStatement {
+        let on_m_c = Expr::BinaryOp {
+            left: Box::new(Expr::Column(
+                ColumnRef::qualified("m", "conversation_id"),
+                Span::ZERO,
+            )),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::qualified("c", "id"), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        let on_c_a = Expr::BinaryOp {
+            left: Box::new(Expr::Column(
+                ColumnRef::qualified("c", "tenant_id"),
+                Span::ZERO,
+            )),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(
+                ColumnRef::qualified("a", "tenant_id"),
+                Span::ZERO,
+            )),
+            span: Span::ZERO,
+        };
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::qualified("m", "id"), Span::ZERO),
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::qualified("a", "label"), Span::ZERO),
+                            alias: None,
+                        },
+                    ],
+                    from: Some(FromClause {
+                        source: TableOrSubquery::Table {
+                            name: QualifiedName::bare("messages"),
+                            alias: Some("m".to_owned()),
+                            index_hint: None,
+                            time_travel: None,
+                        },
+                        joins: vec![
+                            fsqlite_ast::JoinClause {
+                                join_type: fsqlite_ast::JoinType {
+                                    kind: fsqlite_ast::JoinKind::Inner,
+                                    natural: false,
+                                },
+                                table: TableOrSubquery::Table {
+                                    name: QualifiedName::bare("conversations"),
+                                    alias: Some("c".to_owned()),
+                                    index_hint: None,
+                                    time_travel: None,
+                                },
+                                constraint: Some(fsqlite_ast::JoinConstraint::On(on_m_c)),
+                            },
+                            fsqlite_ast::JoinClause {
+                                join_type: fsqlite_ast::JoinType {
+                                    kind: fsqlite_ast::JoinKind::Inner,
+                                    natural: false,
+                                },
+                                table: TableOrSubquery::Table {
+                                    name: QualifiedName::bare("agents"),
+                                    alias: Some("a".to_owned()),
+                                    index_hint: None,
+                                    time_travel: None,
+                                },
+                                constraint: Some(fsqlite_ast::JoinConstraint::On(on_c_a)),
+                            },
+                        ],
+                    }),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
+    #[test]
+    fn test_codegen_multi_join_rejects_composite_unique_prefix_lookup() {
+        let stmt = composite_unique_prefix_multi_join_stmt();
+        let schema = test_schema_multi_join_composite_unique_prefix_lookup();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let rewind_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Rewind)
+            .count();
+
+        assert!(
+            rewind_count >= 2,
+            "joining on the leftmost column of UNIQUE(tenant_id, slug) is not a \
+             single-row lookup; the multi-join fast path must be rejected"
+        );
+    }
+
     #[test]
     fn test_codegen_grouped_inner_join_uses_index_lookup_plan() {
         let stmt = grouped_join_count_sum_index_lookup_stmt();

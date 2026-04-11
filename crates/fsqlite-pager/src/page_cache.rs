@@ -2549,12 +2549,9 @@ impl ShardedPageCache {
             .flat_slots
             .slots
             .iter()
-            .filter_map(|slot| {
+            .filter(|slot| {
                 let pgno = slot.pgno.load(Ordering::Acquire);
-                if pgno == SLOT_EMPTY || pgno == SLOT_TOMBSTONE {
-                    return None;
-                }
-                Some(slot)
+                pgno != SLOT_EMPTY && pgno != SLOT_TOMBSTONE
             })
             .filter(|slot| {
                 let guard = slot.data.lock();

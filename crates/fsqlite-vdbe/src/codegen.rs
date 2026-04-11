@@ -6369,17 +6369,20 @@ fn resolve_multi_join_lookup_plan<'a>(
             SortKeySource::Column(col_idx) => {
                 let column_name = &right_table.columns.get(col_idx)?.name;
                 let index = right_table.index_for_column(column_name)?;
-                // Only accept UNIQUE indexes for the multi-join fast path.
-                // Non-unique indexes can have multiple rows per key value,
-                // and the codegen below takes only the *first* match per
-                // outer row (no duplicate-run walk).  Emitting a single
-                // row where a 1:N join should emit N rows is a silent
-                // correctness bug.  The single-join codegen handles this
-                // correctly via a SeekGE + Next loop, but generalising
-                // that to N-way chains adds substantial complexity.
-                // Rejecting non-unique indexes here forces the scan
-                // fallback for those cases — correct if slower.
-                if !index.is_unique {
+                // Only accept single-column UNIQUE indexes for the
+                // multi-join fast path. The codegen below takes only the
+                // *first* matching row per outer row (no duplicate-run
+                // walk), so it is only correct when probing the join key
+                // can produce at most one row. UNIQUE(a, b) does not make
+                // `a = ?` unique; multiple rows may still share the same
+                // leftmost prefix with different trailing key terms.
+                //
+                // The single-join codegen handles multi-row probes via a
+                // SeekGE + Next loop, but generalising that to N-way chains
+                // adds substantial complexity. Rejecting everything except
+                // true single-column unique lookups here keeps the fast path
+                // correct and lets the scan fallback handle broader shapes.
+                if !index.is_unique || index.columns.len() != 1 {
                     return None;
                 }
                 SingleJoinLookupTarget::Index(index)

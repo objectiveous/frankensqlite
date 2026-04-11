@@ -56,6 +56,16 @@ pub mod host_fs {
         Ok(())
     }
 
+    pub fn copy_file(from: &Path, to: &Path) -> Result<()> {
+        if let Some(parent) = to.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        std::fs::copy(from, to)?;
+        Ok(())
+    }
+
     pub fn remove_file(path: &Path) -> Result<()> {
         std::fs::remove_file(path).map_err(|e| {
             std::io::Error::new(e.kind(), format!("remove {}: {e}", path.display()))

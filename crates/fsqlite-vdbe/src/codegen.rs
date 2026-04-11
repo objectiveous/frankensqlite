@@ -265,6 +265,22 @@ impl PlannerSelectAccessKind {
     }
 }
 
+/// Planner-facing description of a single bound in an index range probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannerIndexRangeBound {
+    /// Human-readable rendering of the bound expression.
+    pub label: String,
+    /// Whether the bound is inclusive (<= / >=) or exclusive (< / >).
+    pub inclusive: bool,
+}
+
+/// Planner-facing description of an index range probe target.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlannerIndexRangeTarget {
+    pub lower: Option<PlannerIndexRangeBound>,
+    pub upper: Option<PlannerIndexRangeBound>,
+}
+
 /// Planner-produced directive for a single-table SELECT lowering path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectPlannerDirective {
@@ -280,6 +296,14 @@ pub struct SelectPlannerDirective {
     pub index_name: Option<String>,
     /// Leading index column the planner expects to drive the probe.
     pub index_column: Option<String>,
+    /// Label for the probe key (column name or expression label).
+    pub index_key_label: Option<String>,
+    /// Whether the planner expects the index key to be an expression.
+    pub index_key_is_expression: bool,
+    /// Equality probe target (if any).
+    pub index_equality_target: Option<PlannerIndexRangeBound>,
+    /// Range probe target (if any).
+    pub index_range_target: Option<PlannerIndexRangeTarget>,
     /// Whether the planner expects a covering-index lowering.
     pub covering: bool,
     /// Access-path family lowering should consume.
@@ -18770,6 +18794,10 @@ mod tests {
                 table_name: "messages".to_owned(),
                 index_name: Some("sqlite_autoindex_messages_1".to_owned()),
                 index_column: Some("conversation_id".to_owned()),
+                index_key_label: Some("conversation_id".to_owned()),
+                index_key_is_expression: false,
+                index_equality_target: None,
+                index_range_target: None,
                 covering: false,
                 access_kind: PlannerSelectAccessKind::IndexEquality,
             }),
@@ -20845,6 +20873,10 @@ mod tests {
                 table_name: "t".to_owned(),
                 index_name: None,
                 index_column: None,
+                index_key_label: None,
+                index_key_is_expression: false,
+                index_equality_target: None,
+                index_range_target: None,
                 covering: false,
                 access_kind: PlannerSelectAccessKind::FullTableScan,
             }),
@@ -20885,6 +20917,10 @@ mod tests {
                 table_name: "t".to_owned(),
                 index_name: None,
                 index_column: None,
+                index_key_label: None,
+                index_key_is_expression: false,
+                index_equality_target: None,
+                index_range_target: None,
                 covering: false,
                 access_kind: PlannerSelectAccessKind::RowidLookup,
             }),
@@ -20920,6 +20956,10 @@ mod tests {
                 table_name: "t".to_owned(),
                 index_name: Some("idx_t_b".to_owned()),
                 index_column: Some("b".to_owned()),
+                index_key_label: Some("b".to_owned()),
+                index_key_is_expression: false,
+                index_equality_target: None,
+                index_range_target: None,
                 covering: true,
                 access_kind: PlannerSelectAccessKind::IndexEquality,
             }),

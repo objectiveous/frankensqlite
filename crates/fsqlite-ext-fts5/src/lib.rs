@@ -2193,20 +2193,23 @@ impl VirtualTableCursor for Fts5Cursor {
     }
 
     fn column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()> {
-        if let Some((rowid, score)) = self.results.get(self.position) {
-            #[allow(clippy::cast_sign_loss)]
-            let col_idx = col as usize;
+        let Some((rowid, score)) = self.results.get(self.position) else {
+            ctx.set_value(SqliteValue::Null);
+            return Ok(());
+        };
 
-            // Column -1 or column == num_columns is the rank.
-            if col < 0 || col_idx >= self.columns.len() {
-                ctx.set_value(SqliteValue::Float(*score));
-            } else if let Some(cols) = self.documents.get(rowid)
-                && let Some(val) = cols.get(col_idx)
-            {
-                ctx.set_value(SqliteValue::Text(SmallText::new(val.as_str())));
-            } else {
-                ctx.set_value(SqliteValue::Null);
-            }
+        #[allow(clippy::cast_sign_loss)]
+        let col_idx = col as usize;
+
+        // Column -1 or column == num_columns is the rank.
+        if col < 0 || col_idx >= self.columns.len() {
+            ctx.set_value(SqliteValue::Float(*score));
+        } else if let Some(cols) = self.documents.get(rowid)
+            && let Some(val) = cols.get(col_idx)
+        {
+            ctx.set_value(SqliteValue::Text(SmallText::new(val.as_str())));
+        } else {
+            ctx.set_value(SqliteValue::Null);
         }
         Ok(())
     }
@@ -4017,6 +4020,27 @@ mod tests {
         let mut ctx2 = ColumnContext::new();
         cursor.column(&mut ctx2, 1).unwrap();
         assert_eq!(ctx2.take_value(), Some(SqliteValue::Float(-1.0)));
+    }
+
+    #[test]
+    fn test_fts5_cursor_column_past_end_returns_null() {
+        let mut cursor = Fts5Cursor {
+            results: Vec::new(),
+            position: 0,
+            columns: vec!["content".to_owned()],
+            index: InvertedIndex::new(),
+            documents: HashMap::new(),
+        };
+
+        cursor.set_results(vec![(1, -1.0, vec!["hello world".to_owned()])]);
+
+        let cx = Cx::new();
+        cursor.next(&cx).unwrap();
+        assert!(cursor.eof());
+
+        let mut ctx = ColumnContext::new();
+        cursor.column(&mut ctx, 0).unwrap();
+        assert_eq!(ctx.take_value(), Some(SqliteValue::Null));
     }
 
     #[test]

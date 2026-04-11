@@ -32,3 +32,10 @@ Verification planned for this slice:
 - `cargo fmt --check`
 - `cargo check --workspace --all-targets`
 - `cargo clippy --workspace --all-targets -- -D warnings`
+
+Date: 2026-04-11
+
+Additional scope landed in this slice:
+- Fixed explicit `RANGE` frame boundary evaluation for descending `ORDER BY` windows in the connection-level window executor.
+- Fixed non-numeric `RANGE <expr> PRECEDING/FOLLOWING` behavior so peer-group boundaries follow SQLite semantics instead of collapsing text/blob values into numeric zero.
+- Added SQLite-oracle regression coverage for descending numeric `RANGE` offsets and text-ordered `RANGE` frames in `crates/fsqlite-core/src/connection.rs`.

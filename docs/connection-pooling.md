@@ -193,3 +193,6 @@ scripts/verify_pool_advisor.sh --json
 It runs the connection-pool validator tests, simulator tests, doc tests, and a
 content check that this guide still covers the required MVCC guidance, the
 `PRAGMA fsqlite.connection_stats` workflow, and the common Rust pool wrappers.
+The markdown examples in this guide are wired into
+`cargo test -p fsqlite-observability --doc`, so the validator and simulator
+snippets above are compile-checked directly from this file.

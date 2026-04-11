@@ -45,11 +45,20 @@ declare -A CASE_FAILED
 declare -A CASE_EXIT
 declare -A CASE_DURATION_MS
 declare -A CASE_COMMAND
+declare -a CASE_IDS
+declare -a SCENARIO_CASE_IDS
+
+run_scenario_case() {
+  local case_id="$1"
+  SCENARIO_CASE_IDS+=("$case_id")
+  run_case "$@"
+}
 
 run_case() {
   local case_id="$1"
   shift
 
+  CASE_IDS+=("$case_id")
   CASE_COMMAND["$case_id"]="$*"
   echo "phase=${case_id} bead_id=${BEAD_ID} run_id=${RUN_ID}"
 
@@ -90,6 +99,50 @@ run_case \
   "validator_suite" \
   run_build cargo test -p fsqlite-observability connection_pool::tests:: -- --nocapture
 
+run_scenario_case \
+  "scenario_single_conn" \
+  run_build cargo test -p fsqlite-observability test_single_connection_serialization_is_detected -- --exact --nocapture
+
+run_scenario_case \
+  "scenario_over_pool" \
+  run_build cargo test -p fsqlite-observability test_over_pooling_is_detected_when_parallelism_is_low -- --exact --nocapture
+
+run_scenario_case \
+  "scenario_stale_snapshot" \
+  run_build cargo test -p fsqlite-observability test_stale_idle_snapshot_holders_are_flagged -- --exact --nocapture
+
+run_scenario_case \
+  "scenario_thrash" \
+  run_build cargo test -p fsqlite-observability test_connection_thrashing_is_detected -- --exact --nocapture
+
+run_scenario_case \
+  "scenario_hot_loop" \
+  run_build cargo test -p fsqlite-observability test_unprepared_hot_loop_is_detected -- --exact --nocapture
+
+run_scenario_case \
+  "scenario_recommendation_bounds" \
+  run_build cargo test -p fsqlite-observability test_recommendation_is_bounded_by_cpu_and_grows_with_writer_need -- --exact --nocapture
+
+run_scenario_case \
+  "scenario_validation_json" \
+  run_build cargo test -p fsqlite-observability test_validation_report_serializes_auditable_fields -- --exact --nocapture
+
+run_scenario_case \
+  "scenario_simulation_json" \
+  run_build cargo test -p fsqlite-observability test_simulation_report_serializes_candidate_metrics -- --exact --nocapture
+
+run_scenario_case \
+  "scenario_docs_validator" \
+  run_build cargo test -p fsqlite-observability test_docs_validator_example_matches_exported_api -- --exact --nocapture
+
+run_scenario_case \
+  "scenario_docs_simulator" \
+  run_build cargo test -p fsqlite-observability test_docs_simulator_example_matches_exported_api -- --exact --nocapture
+
+run_scenario_case \
+  "scenario_simulation_stability" \
+  run_build cargo test -p fsqlite-observability test_simulator_is_stable_across_runs -- --exact --nocapture
+
 run_case \
   "doctest_suite" \
   run_build cargo test -p fsqlite-observability --doc -- --nocapture
@@ -101,6 +154,18 @@ run_case \
 run_case \
   "core_pragma_suite" \
   run_build cargo test -p fsqlite-core connection_stats -- --nocapture
+
+run_case \
+  "core_pragma_lifecycle" \
+  run_build cargo test -p fsqlite-core test_pragma_connection_stats_reports_shared_pool_lifecycle -- --exact --nocapture
+
+run_case \
+  "core_pragma_disconnects" \
+  run_build cargo test -p fsqlite-core test_pragma_connection_stats_tracks_active_transactions_and_disconnects -- --exact --nocapture
+
+run_case \
+  "core_pragma_failed_attempts" \
+  run_build cargo test -p fsqlite-core test_pragma_connection_stats_excludes_failed_statement_attempts -- --exact --nocapture
 
 run_case \
   "docs_contract" \
@@ -119,7 +184,7 @@ TOTAL_FAILED=0
 TOTAL_CASES=0
 PASSED_CASES=0
 VERDICT="pass"
-for case_id in "${!CASE_STATUS[@]}"; do
+for case_id in "${CASE_IDS[@]}"; do
   TOTAL_PASSED=$((TOTAL_PASSED + CASE_PASSED["$case_id"]))
   TOTAL_FAILED=$((TOTAL_FAILED + CASE_FAILED["$case_id"]))
   TOTAL_CASES=$((TOTAL_CASES + 1))
@@ -130,7 +195,45 @@ for case_id in "${!CASE_STATUS[@]}"; do
   fi
 done
 
-RECOMMENDATION_ACCURACY_PCT=$((PASSED_CASES * 100 / TOTAL_CASES))
+SCENARIO_TOTAL_CASES=0
+SCENARIO_PASSED_CASES=0
+for case_id in "${SCENARIO_CASE_IDS[@]}"; do
+  SCENARIO_TOTAL_CASES=$((SCENARIO_TOTAL_CASES + 1))
+  if [ "${CASE_STATUS["$case_id"]}" = "pass" ]; then
+    SCENARIO_PASSED_CASES=$((SCENARIO_PASSED_CASES + 1))
+  fi
+done
+
+if [ "$SCENARIO_TOTAL_CASES" -eq 0 ]; then
+  RECOMMENDATION_ACCURACY_PCT=0
+else
+  RECOMMENDATION_ACCURACY_PCT=$((SCENARIO_PASSED_CASES * 100 / SCENARIO_TOTAL_CASES))
+fi
+
+CASES_JSON=""
+for case_id in "${CASE_IDS[@]}"; do
+  if [ -n "$CASES_JSON" ]; then
+    CASES_JSON="${CASES_JSON},"
+  fi
+  CASES_JSON="${CASES_JSON}
+    \"${case_id}\": {
+      \"status\": \"${CASE_STATUS["$case_id"]}\",
+      \"command\": \"${CASE_COMMAND["$case_id"]}\",
+      \"exit_code\": ${CASE_EXIT["$case_id"]},
+      \"duration_ms\": ${CASE_DURATION_MS["$case_id"]},
+      \"passed\": ${CASE_PASSED["$case_id"]},
+      \"failed\": ${CASE_FAILED["$case_id"]}
+    }"
+done
+
+SCENARIO_CASES_JSON=""
+for case_id in "${SCENARIO_CASE_IDS[@]}"; do
+  if [ -n "$SCENARIO_CASES_JSON" ]; then
+    SCENARIO_CASES_JSON="${SCENARIO_CASES_JSON}, "
+  fi
+  SCENARIO_CASES_JSON="${SCENARIO_CASES_JSON}\"${case_id}\""
+done
+
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 REPORT_CONTENT=$(cat <<ENDJSON
 {
@@ -140,53 +243,17 @@ REPORT_CONTENT=$(cat <<ENDJSON
   "timestamp": "${TIMESTAMP}",
   "verdict": "${VERDICT}",
   "recommendation_accuracy_pct": ${RECOMMENDATION_ACCURACY_PCT},
+  "scenario_cases": [${SCENARIO_CASES_JSON}],
   "cases": {
-    "validator_suite": {
-      "status": "${CASE_STATUS["validator_suite"]}",
-      "command": "${CASE_COMMAND["validator_suite"]}",
-      "exit_code": ${CASE_EXIT["validator_suite"]},
-      "duration_ms": ${CASE_DURATION_MS["validator_suite"]},
-      "passed": ${CASE_PASSED["validator_suite"]},
-      "failed": ${CASE_FAILED["validator_suite"]}
-    },
-    "doctest_suite": {
-      "status": "${CASE_STATUS["doctest_suite"]}",
-      "command": "${CASE_COMMAND["doctest_suite"]}",
-      "exit_code": ${CASE_EXIT["doctest_suite"]},
-      "duration_ms": ${CASE_DURATION_MS["doctest_suite"]},
-      "passed": ${CASE_PASSED["doctest_suite"]},
-      "failed": ${CASE_FAILED["doctest_suite"]}
-    },
-    "clippy_observability": {
-      "status": "${CASE_STATUS["clippy_observability"]}",
-      "command": "${CASE_COMMAND["clippy_observability"]}",
-      "exit_code": ${CASE_EXIT["clippy_observability"]},
-      "duration_ms": ${CASE_DURATION_MS["clippy_observability"]},
-      "passed": ${CASE_PASSED["clippy_observability"]},
-      "failed": ${CASE_FAILED["clippy_observability"]}
-    },
-    "core_pragma_suite": {
-      "status": "${CASE_STATUS["core_pragma_suite"]}",
-      "command": "${CASE_COMMAND["core_pragma_suite"]}",
-      "exit_code": ${CASE_EXIT["core_pragma_suite"]},
-      "duration_ms": ${CASE_DURATION_MS["core_pragma_suite"]},
-      "passed": ${CASE_PASSED["core_pragma_suite"]},
-      "failed": ${CASE_FAILED["core_pragma_suite"]}
-    },
-    "docs_contract": {
-      "status": "${CASE_STATUS["docs_contract"]}",
-      "command": "${CASE_COMMAND["docs_contract"]}",
-      "exit_code": ${CASE_EXIT["docs_contract"]},
-      "duration_ms": ${CASE_DURATION_MS["docs_contract"]},
-      "passed": ${CASE_PASSED["docs_contract"]},
-      "failed": ${CASE_FAILED["docs_contract"]}
-    }
+${CASES_JSON}
   },
   "totals": {
     "passed": ${TOTAL_PASSED},
     "failed": ${TOTAL_FAILED},
     "passed_cases": ${PASSED_CASES},
-    "total_cases": ${TOTAL_CASES}
+    "total_cases": ${TOTAL_CASES},
+    "scenario_passed_cases": ${SCENARIO_PASSED_CASES},
+    "scenario_total_cases": ${SCENARIO_TOTAL_CASES}
   }
 }
 ENDJSON
@@ -199,12 +266,11 @@ if $JSON_MODE; then
   echo "$REPORT_CONTENT"
 else
   echo "phase=complete bead_id=${BEAD_ID} run_id=${RUN_ID} verdict=${VERDICT}"
-  echo "  validator_suite: ${CASE_STATUS["validator_suite"]}"
-  echo "  doctest_suite: ${CASE_STATUS["doctest_suite"]}"
-  echo "  clippy_observability: ${CASE_STATUS["clippy_observability"]}"
-  echo "  core_pragma_suite: ${CASE_STATUS["core_pragma_suite"]}"
-  echo "  docs_contract: ${CASE_STATUS["docs_contract"]}"
+  for case_id in "${CASE_IDS[@]}"; do
+    echo "  ${case_id}: ${CASE_STATUS["$case_id"]}"
+  done
   echo "  recommendation_accuracy_pct=${RECOMMENDATION_ACCURACY_PCT}"
+  echo "  scenario_cases=${SCENARIO_PASSED_CASES}/${SCENARIO_TOTAL_CASES}"
   echo "  report_path=${REPORT_FILE}"
   echo "  report_sha256=${REPORT_SHA}"
 fi

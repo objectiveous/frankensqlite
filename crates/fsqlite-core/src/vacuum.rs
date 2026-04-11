@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::DatabaseHeader;
 use fsqlite_types::cx::Cx;
+use fsqlite_types::value::SqliteValue;
 use fsqlite_vdbe::codegen::TableSchema;
 use fsqlite_vdbe::engine::MemDatabase;
 #[cfg(not(target_arch = "wasm32"))]
@@ -15,6 +16,7 @@ use crate::compat_persist::SqliteMasterEntry;
 use crate::compat_persist::persist_to_sqlite_with_header_and_master_entries;
 
 pub(crate) const ATTACHED_SCHEMA_UNSUPPORTED: &str = "VACUUM on attached schemas";
+pub(crate) const NON_TEXT_FILENAME: &str = "non-text filename";
 
 #[cfg(not(target_arch = "wasm32"))]
 static NEXT_TEMP_REBUILD_ID: AtomicU64 = AtomicU64::new(1);
@@ -67,6 +69,23 @@ pub(crate) fn validate_vacuum_into_target(source_path: &str, target_path: &Path)
     Ok(())
 }
 
+pub(crate) fn resolve_vacuum_into_target(
+    source_path: &str,
+    target_value: &SqliteValue,
+) -> Result<PathBuf> {
+    let target_path = match target_value {
+        SqliteValue::Text(path) if !path.is_empty() => PathBuf::from(&**path),
+        SqliteValue::Text(_) => {
+            return Err(FrankenError::CannotOpen {
+                path: PathBuf::new(),
+            });
+        }
+        _ => return Err(FrankenError::FunctionError(NON_TEXT_FILENAME.to_owned())),
+    };
+    validate_vacuum_into_target(source_path, &target_path)?;
+    Ok(target_path)
+}
+
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn validate_vacuum_into_target(_source_path: &str, target_path: &Path) -> Result<()> {
     if target_path.as_os_str().is_empty() {
@@ -111,7 +130,12 @@ pub(crate) fn replace_database_file(_target_path: &Path, _rebuilt_path: &Path) -
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::connection::Connection;
+    use fsqlite_types::value::SqliteValue;
+
+    use super::{NON_TEXT_FILENAME, resolve_vacuum_into_target};
 
     #[test]
     fn test_vacuum_rebuilds_file_backed_database_and_preserves_header_metadata() {
@@ -247,6 +271,35 @@ mod tests {
             values,
             vec![(1, "alpha".to_owned()), (3, "gamma".to_owned())]
         );
+    }
+
+    #[test]
+    fn test_resolve_vacuum_into_target_rejects_non_text_values() {
+        for target_value in [
+            SqliteValue::Null,
+            SqliteValue::Integer(7),
+            SqliteValue::Float(1.25),
+            SqliteValue::Blob(Arc::<[u8]>::from(vec![0xAA, 0xBB])),
+        ] {
+            let err = resolve_vacuum_into_target("source.db", &target_value).unwrap_err();
+            assert_eq!(err.to_string(), NON_TEXT_FILENAME);
+        }
+    }
+
+    #[test]
+    fn test_vacuum_into_null_parameter_reports_non_text_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("vacuum-into-null-source.db");
+        let source = source_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&source).unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);")
+            .unwrap();
+
+        let err = conn
+            .execute_with_params("VACUUM INTO ?1;", &[SqliteValue::Null])
+            .unwrap_err();
+        assert_eq!(err.to_string(), NON_TEXT_FILENAME);
     }
 
     #[test]

@@ -380,9 +380,14 @@ impl TableSchema {
     }
 
     /// Find a direct-lookup UNIQUE index that guarantees at most one row for
-    /// an equality probe on `col_name`.
+    /// an equality probe on `col_name` and whose comparison collation matches
+    /// the join predicate.
     #[must_use]
-    pub fn unique_single_column_index_for_column(&self, col_name: &str) -> Option<&IndexSchema> {
+    pub fn unique_single_column_index_for_column(
+        &self,
+        col_name: &str,
+        comparison_collation: Option<&str>,
+    ) -> Option<&IndexSchema> {
         self.indexes.iter().find(|idx| {
             idx.is_unique
                 && idx.columns.len() == 1
@@ -391,6 +396,7 @@ impl TableSchema {
                     .columns
                     .first()
                     .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
+                && direct_lookup_index_collation_matches_join(idx, comparison_collation)
         })
     }
 
@@ -5605,6 +5611,7 @@ fn codegen_grouped_inner_join_count_sum_select(
             let probe_base = b.alloc_regs(2);
             let probe_reg = probe_base;
             let min_rowid_reg = probe_base + 1;
+            let comparison_p4 = direct_lookup_index_comparison_p4(_index);
             emit_join_probe_source(
                 b,
                 left_cursor,
@@ -5642,7 +5649,7 @@ fn codegen_grouped_inner_join_count_sum_select(
                 probe_reg,
                 idx_key_reg,
                 duplicate_run_done,
-                P4::None,
+                comparison_p4,
                 0,
             );
             let rowid_reg = b.alloc_reg();
@@ -5869,7 +5876,14 @@ fn resolve_single_join_lookup_plan<'a>(
         SortKeySource::Rowid => SingleJoinLookupTarget::Rowid,
         SortKeySource::Column(col_idx) => {
             let column_name = &right_table.columns.get(col_idx)?.name;
-            SingleJoinLookupTarget::Index(right_table.index_for_column(column_name)?)
+            let comparison_tables = [(left_table, left_alias), (right_table, right_alias)];
+            let comparison_collation =
+                join_lookup_effective_collation(left, right, &comparison_tables);
+            let index = right_table.index_for_column(column_name)?;
+            if !direct_lookup_index_collation_matches_join(index, comparison_collation) {
+                return None;
+            }
+            SingleJoinLookupTarget::Index(index)
         }
         SortKeySource::Expression(_) => return None,
     };
@@ -5929,6 +5943,28 @@ fn emit_grouped_join_sorter_insert(
         0,
     );
     Ok(())
+}
+
+fn join_lookup_effective_collation<'a>(
+    left: &'a Expr,
+    right: &'a Expr,
+    tables: &[(&'a TableSchema, Option<&'a str>)],
+) -> Option<&'a str> {
+    join_effective_collation(left, tables).or_else(|| join_effective_collation(right, tables))
+}
+
+fn direct_lookup_index_collation_matches_join(
+    index: &IndexSchema,
+    comparison_collation: Option<&str>,
+) -> bool {
+    collation_names_equivalent(comparison_collation, index.key_term_collation(0))
+}
+
+fn direct_lookup_index_comparison_p4(index: &IndexSchema) -> P4 {
+    index
+        .key_term_collation(0)
+        .filter(|collation| !collation.eq_ignore_ascii_case("BINARY"))
+        .map_or(P4::None, |collation| P4::Collation(collation.to_owned()))
 }
 
 fn emit_join_output_or_sort(
@@ -6116,6 +6152,7 @@ fn codegen_single_join_lookup_select(
             let probe_base = b.alloc_regs(2);
             let probe_reg = probe_base;
             let min_rowid_reg = probe_base + 1;
+            let comparison_p4 = direct_lookup_index_comparison_p4(_index);
             emit_join_probe_source(
                 b,
                 left_cursor,
@@ -6153,7 +6190,7 @@ fn codegen_single_join_lookup_select(
                 probe_reg,
                 idx_key_reg,
                 duplicate_run_done,
-                P4::None,
+                comparison_p4,
                 0,
             );
             let rowid_reg = b.alloc_reg();
@@ -6378,6 +6415,12 @@ fn resolve_multi_join_lookup_plan<'a>(
         }
 
         let (probe_table_index, probe_source, lookup_source) = found?;
+        let comparison_tables = tables
+            .iter()
+            .copied()
+            .chain(std::iter::once((*right_table, right_alias)))
+            .collect::<Vec<_>>();
+        let comparison_collation = join_lookup_effective_collation(left, right, &comparison_tables);
 
         let lookup_target = match lookup_source {
             SortKeySource::Rowid => SingleJoinLookupTarget::Rowid,
@@ -6389,7 +6432,8 @@ fn resolve_multi_join_lookup_plan<'a>(
                 // first leftmost-column index; otherwise a preceding non-unique
                 // sibling index would disable the fast path even when a safe
                 // unique lookup exists.
-                let index = right_table.unique_single_column_index_for_column(column_name)?;
+                let index = right_table
+                    .unique_single_column_index_for_column(column_name, comparison_collation)?;
                 SingleJoinLookupTarget::Index(index)
             }
             SortKeySource::Expression(_) => return None,
@@ -6604,9 +6648,10 @@ fn codegen_multi_join_lookup_select(
                     0,
                 );
             }
-            SingleJoinLookupTarget::Index(_) => {
+            SingleJoinLookupTarget::Index(index) => {
                 let idx_cursor =
                     index_cursors[i].expect("index lookup step must have an index cursor");
+                let comparison_p4 = direct_lookup_index_comparison_p4(index);
                 // Probe the secondary index for `probe = X`, then
                 // SeekRowid on the data cursor using the resulting
                 // rowid.  The resolver guarantees non-unique indexes
@@ -6644,7 +6689,14 @@ fn codegen_multi_join_lookup_select(
                 );
                 let idx_key_reg = b.alloc_reg();
                 b.emit_op(Opcode::Column, idx_cursor, 0, idx_key_reg, P4::None, 0);
-                b.emit_jump_to_label(Opcode::Ne, probe_base, idx_key_reg, miss_label, P4::None, 0);
+                b.emit_jump_to_label(
+                    Opcode::Ne,
+                    probe_base,
+                    idx_key_reg,
+                    miss_label,
+                    comparison_p4,
+                    0,
+                );
                 let rowid_reg = b.alloc_reg();
                 b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
                 b.emit_jump_to_label(
@@ -24959,6 +25011,431 @@ mod tests {
             prog.ops().iter().any(|op| op.opcode == Opcode::IdxRowid),
             "the multi-join fast path should fetch rowids from the qualifying unique index"
         );
+    }
+
+    fn test_schema_multi_join_prefers_collation_matching_unique_lookup() -> Vec<TableSchema> {
+        vec![
+            TableSchema {
+                name: "messages".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("conversation_id", 'D', false),
+                ],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+            TableSchema {
+                name: "conversations".to_owned(),
+                root_page: 3,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("tenant_name", 'B', false),
+                ],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+            TableSchema {
+                name: "agents".to_owned(),
+                root_page: 4,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo {
+                        collation: Some("NOCASE".to_owned()),
+                        ..ColumnInfo::basic("tenant_name", 'B', false)
+                    },
+                    ColumnInfo::basic("label", 'B', false),
+                ],
+                indexes: vec![
+                    IndexSchema {
+                        name: "agents_tenant_unique_binary".to_owned(),
+                        root_page: 5,
+                        columns: vec!["tenant_name".to_owned()],
+                        key_expressions: vec!["tenant_name".to_owned()],
+                        key_sort_directions: vec![],
+                        where_clause: None,
+                        is_unique: true,
+                        key_collations: vec![],
+                    },
+                    IndexSchema {
+                        name: "agents_tenant_unique_nocase".to_owned(),
+                        root_page: 6,
+                        columns: vec!["tenant_name".to_owned()],
+                        key_expressions: vec!["tenant_name".to_owned()],
+                        key_sort_directions: vec![],
+                        where_clause: None,
+                        is_unique: true,
+                        key_collations: vec![Some("NOCASE".to_owned())],
+                    },
+                ],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+        ]
+    }
+
+    fn collation_matching_unique_single_column_lookup_multi_join_stmt() -> SelectStatement {
+        let on_m_c = Expr::BinaryOp {
+            left: Box::new(Expr::Column(
+                ColumnRef::qualified("m", "conversation_id"),
+                Span::ZERO,
+            )),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::qualified("c", "id"), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        let on_c_a = Expr::BinaryOp {
+            left: Box::new(Expr::Column(
+                ColumnRef::qualified("c", "tenant_name"),
+                Span::ZERO,
+            )),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(
+                ColumnRef::qualified("a", "tenant_name"),
+                Span::ZERO,
+            )),
+            span: Span::ZERO,
+        };
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::qualified("m", "id"), Span::ZERO),
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::qualified("a", "label"), Span::ZERO),
+                            alias: None,
+                        },
+                    ],
+                    from: Some(FromClause {
+                        source: TableOrSubquery::Table {
+                            name: QualifiedName::bare("messages"),
+                            alias: Some("m".to_owned()),
+                            index_hint: None,
+                            time_travel: None,
+                        },
+                        joins: vec![
+                            fsqlite_ast::JoinClause {
+                                join_type: fsqlite_ast::JoinType {
+                                    kind: fsqlite_ast::JoinKind::Inner,
+                                    natural: false,
+                                },
+                                table: TableOrSubquery::Table {
+                                    name: QualifiedName::bare("conversations"),
+                                    alias: Some("c".to_owned()),
+                                    index_hint: None,
+                                    time_travel: None,
+                                },
+                                constraint: Some(fsqlite_ast::JoinConstraint::On(on_m_c)),
+                            },
+                            fsqlite_ast::JoinClause {
+                                join_type: fsqlite_ast::JoinType {
+                                    kind: fsqlite_ast::JoinKind::Inner,
+                                    natural: false,
+                                },
+                                table: TableOrSubquery::Table {
+                                    name: QualifiedName::bare("agents"),
+                                    alias: Some("a".to_owned()),
+                                    index_hint: None,
+                                    time_travel: None,
+                                },
+                                constraint: Some(fsqlite_ast::JoinConstraint::On(on_c_a)),
+                            },
+                        ],
+                    }),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
+    #[test]
+    fn test_codegen_multi_join_prefers_collation_matching_unique_lookup() {
+        let stmt = collation_matching_unique_single_column_lookup_multi_join_stmt();
+        let schema = test_schema_multi_join_prefers_collation_matching_unique_lookup();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let rewind_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Rewind)
+            .count();
+
+        assert_eq!(
+            rewind_count, 1,
+            "a matching-collation unique index should keep the multi-join fast path enabled even if a mismatched unique sibling appears first"
+        );
+        let lookup_cmp = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Ne)
+            .expect("multi-join unique lookup should recheck the landed index key");
+        assert_eq!(lookup_cmp.p4, P4::Collation("NOCASE".to_owned()));
+    }
+
+    fn test_schema_multi_join_prefers_nocase_unique_lookup() -> Vec<TableSchema> {
+        vec![
+            TableSchema {
+                name: "messages".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("conversation_id", 'D', false),
+                ],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+            TableSchema {
+                name: "conversations".to_owned(),
+                root_page: 3,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("tenant_name", 'B', false),
+                ],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+            TableSchema {
+                name: "agents".to_owned(),
+                root_page: 4,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo {
+                        collation: Some("NOCASE".to_owned()),
+                        ..ColumnInfo::basic("tenant_name", 'B', false)
+                    },
+                    ColumnInfo::basic("label", 'B', false),
+                ],
+                indexes: vec![
+                    IndexSchema {
+                        name: "agents_tenant_idx".to_owned(),
+                        root_page: 5,
+                        columns: vec!["tenant_name".to_owned()],
+                        key_expressions: vec!["tenant_name".to_owned()],
+                        key_sort_directions: vec![],
+                        where_clause: None,
+                        is_unique: false,
+                        key_collations: vec![],
+                    },
+                    IndexSchema {
+                        name: "agents_tenant_unique_nocase".to_owned(),
+                        root_page: 6,
+                        columns: vec!["tenant_name".to_owned()],
+                        key_expressions: vec!["tenant_name".to_owned()],
+                        key_sort_directions: vec![],
+                        where_clause: None,
+                        is_unique: true,
+                        key_collations: vec![Some("NOCASE".to_owned())],
+                    },
+                ],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+        ]
+    }
+
+    fn nocase_unique_single_column_lookup_multi_join_stmt() -> SelectStatement {
+        let on_m_c = Expr::BinaryOp {
+            left: Box::new(Expr::Column(
+                ColumnRef::qualified("m", "conversation_id"),
+                Span::ZERO,
+            )),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::qualified("c", "id"), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        let on_c_a = Expr::BinaryOp {
+            left: Box::new(Expr::Column(
+                ColumnRef::qualified("c", "tenant_name"),
+                Span::ZERO,
+            )),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(
+                ColumnRef::qualified("a", "tenant_name"),
+                Span::ZERO,
+            )),
+            span: Span::ZERO,
+        };
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::qualified("m", "id"), Span::ZERO),
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::qualified("a", "label"), Span::ZERO),
+                            alias: None,
+                        },
+                    ],
+                    from: Some(FromClause {
+                        source: TableOrSubquery::Table {
+                            name: QualifiedName::bare("messages"),
+                            alias: Some("m".to_owned()),
+                            index_hint: None,
+                            time_travel: None,
+                        },
+                        joins: vec![
+                            fsqlite_ast::JoinClause {
+                                join_type: fsqlite_ast::JoinType {
+                                    kind: fsqlite_ast::JoinKind::Inner,
+                                    natural: false,
+                                },
+                                table: TableOrSubquery::Table {
+                                    name: QualifiedName::bare("conversations"),
+                                    alias: Some("c".to_owned()),
+                                    index_hint: None,
+                                    time_travel: None,
+                                },
+                                constraint: Some(fsqlite_ast::JoinConstraint::On(on_m_c)),
+                            },
+                            fsqlite_ast::JoinClause {
+                                join_type: fsqlite_ast::JoinType {
+                                    kind: fsqlite_ast::JoinKind::Inner,
+                                    natural: false,
+                                },
+                                table: TableOrSubquery::Table {
+                                    name: QualifiedName::bare("agents"),
+                                    alias: Some("a".to_owned()),
+                                    index_hint: None,
+                                    time_travel: None,
+                                },
+                                constraint: Some(fsqlite_ast::JoinConstraint::On(on_c_a)),
+                            },
+                        ],
+                    }),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
+    #[test]
+    fn test_codegen_multi_join_unique_lookup_threads_nocase_collation() {
+        let stmt = nocase_unique_single_column_lookup_multi_join_stmt();
+        let schema = test_schema_multi_join_prefers_nocase_unique_lookup();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let rewind_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Rewind)
+            .count();
+        assert_eq!(
+            rewind_count, 1,
+            "the restored multi-join unique lookup fast path should stay enabled for NOCASE indexes"
+        );
+
+        let lookup_cmp = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Ne)
+            .expect("multi-join unique lookup should recheck the landed index key");
+        assert_eq!(lookup_cmp.p4, P4::Collation("NOCASE".to_owned()));
+    }
+
+    #[test]
+    fn test_codegen_multi_join_rejects_unique_lookup_with_collation_mismatch() {
+        let mut stmt = nocase_unique_single_column_lookup_multi_join_stmt();
+        let SelectCore::Select {
+            from: Some(from_clause),
+            ..
+        } = &mut stmt.body.select
+        else {
+            panic!("fixture should include a FROM clause");
+        };
+        let joins = &mut from_clause.joins;
+        let Some(fsqlite_ast::JoinConstraint::On(Expr::BinaryOp { left, .. })) =
+            joins[1].constraint.as_mut()
+        else {
+            panic!("fixture should include the second ON equality");
+        };
+        let original_left =
+            std::mem::replace(left, Box::new(Expr::Literal(Literal::Null, Span::ZERO)));
+        **left = Expr::Collate {
+            expr: original_left,
+            collation: "BINARY".to_owned(),
+            span: Span::ZERO,
+        };
+
+        let schema = test_schema_multi_join_prefers_nocase_unique_lookup();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let result = codegen_select(&mut b, &stmt, &schema, &ctx);
+
+        match result {
+            Ok(()) => {
+                let prog = b.finish().unwrap();
+                let rewind_count = prog
+                    .ops()
+                    .iter()
+                    .filter(|op| op.opcode == Opcode::Rewind)
+                    .count();
+                assert!(
+                    rewind_count >= 2,
+                    "a COLLATE BINARY join must not take the NOCASE unique-index fast path"
+                );
+                assert!(
+                    !prog.ops().iter().any(|op| op.opcode == Opcode::IdxRowid),
+                    "collation-mismatched joins should fall back to the scan path instead of using direct index lookups"
+                );
+            }
+            Err(CodegenError::Unsupported(_)) => {
+                // Also acceptable today: once the fast path is rejected, the
+                // fallback JOIN codegen still refuses explicit COLLATE in the
+                // ON clause and lets the connection-level interpreter handle it.
+            }
+            Err(other) => panic!(
+                "collation-mismatched join should reject the unique-index fast path, got {other:?}"
+            ),
+        }
     }
 
     #[test]

@@ -4796,6 +4796,7 @@ mod tests {
             prepared_direct_insert_change_tracking_time_ns: 0,
             prepared_direct_insert_autocommit_resolve_time_ns: 0,
             prepared_direct_insert_autocommit_executions: 0,
+            window_func_partitions_total: 0,
             btree_copy_kernels: BtreeCopyProfileSnapshot {
                 local_payload_copy_calls: 2,
                 local_payload_copy_bytes: 96,

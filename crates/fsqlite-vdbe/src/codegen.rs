@@ -379,16 +379,17 @@ impl TableSchema {
         })
     }
 
-    /// Find a direct-lookup index for `col_name` whose comparison collation
-    /// matches the join predicate.
+    /// Find a single-column direct-lookup index for `col_name` whose
+    /// comparison collation matches the join predicate.
     #[must_use]
-    pub fn index_for_column_with_collation(
+    pub fn single_column_index_for_column_with_collation(
         &self,
         col_name: &str,
         comparison_collation: Option<&str>,
     ) -> Option<&IndexSchema> {
         self.indexes.iter().find(|idx| {
             idx.supports_direct_column_lookup()
+                && idx.columns.len() == 1
                 && idx
                     .columns
                     .first()
@@ -5897,8 +5898,11 @@ fn resolve_single_join_lookup_plan<'a>(
             let comparison_tables = [(left_table, left_alias), (right_table, right_alias)];
             let comparison_collation =
                 join_lookup_effective_collation(left, right, &comparison_tables);
-            let index =
-                right_table.index_for_column_with_collation(column_name, comparison_collation)?;
+            // The single-join direct-lookup path only materializes the join key
+            // plus a rowid sentinel. Composite indexes need values for their
+            // trailing key terms, so reusing them here can skip valid rows.
+            let index = right_table
+                .single_column_index_for_column_with_collation(column_name, comparison_collation)?;
             SingleJoinLookupTarget::Index(index)
         }
         SortKeySource::Expression(_) => return None,
@@ -25160,6 +25164,50 @@ mod tests {
         ]
     }
 
+    fn test_schema_single_join_rejects_composite_lookup_index() -> Vec<TableSchema> {
+        vec![
+            TableSchema {
+                name: "customers".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("name", 'B', false),
+                    ColumnInfo::basic("region", 'B', false),
+                ],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+            TableSchema {
+                name: "orders".to_owned(),
+                root_page: 3,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("region", 'B', false),
+                    ColumnInfo::basic("amount", 'E', false),
+                ],
+                indexes: vec![IndexSchema {
+                    name: "idx_orders_region_amount".to_owned(),
+                    root_page: 4,
+                    columns: vec!["region".to_owned(), "amount".to_owned()],
+                    key_expressions: vec!["region".to_owned(), "amount".to_owned()],
+                    key_sort_directions: vec![],
+                    where_clause: None,
+                    is_unique: false,
+                    key_collations: vec![],
+                }],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+        ]
+    }
+
     fn collation_matching_single_join_lookup_stmt() -> SelectStatement {
         SelectStatement {
             with: None,
@@ -25720,6 +25768,34 @@ mod tests {
                 .iter()
                 .any(|op| op.opcode == Opcode::Ne && op.p4 == P4::Collation("NOCASE".to_owned())),
             "single-join lookup should recheck landed keys with the join collation"
+        );
+    }
+
+    #[test]
+    fn test_codegen_single_join_rejects_composite_lookup_index() {
+        let stmt = collation_matching_single_join_lookup_stmt();
+        let schema = test_schema_single_join_rejects_composite_lookup_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let rewind_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Rewind)
+            .count();
+
+        assert_eq!(
+            rewind_count, 2,
+            "single-join lookup fast path must reject composite indexes because it only emits a single-key seek record"
+        );
+        assert!(
+            !prog
+                .ops()
+                .iter()
+                .any(|op| matches!(&op.p4, P4::Index(name) if name == "idx_orders_region_amount")),
+            "falling back to the generic nested-loop join must avoid opening the composite sibling index as a direct lookup cursor"
         );
     }
 

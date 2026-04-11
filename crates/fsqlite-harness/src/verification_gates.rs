@@ -2005,6 +2005,49 @@ mod tests {
     }
 
     #[test]
+    fn test_phase9_gate_inventory_complete() {
+        let plan = phase_7_to_9_gate_plan();
+        let phase9_gate_ids = plan
+            .iter()
+            .filter(|gate| gate.scope == GateScope::Phase9)
+            .map(|gate| gate.gate_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            phase9_gate_ids,
+            vec![
+                "phase9.conformance_golden",
+                "phase9.time_travel_mvcc",
+                "phase9.benchmark_3x",
+                "phase9.no_regression",
+                "phase9.replication_loss",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_phase9_gate_conformance_golden() {
+        let plan = phase_7_to_9_gate_plan();
+        let gate = find_gate(&plan, "phase9.conformance_golden");
+        let command = gate.command.join(" ");
+
+        assert_eq!(gate.scope, GateScope::Phase9);
+        assert!(command.contains("bd_1lsfu_2_core_sql_golden_checksums"));
+        assert!(command.contains("test_bd_1lsfu_2_core_sql_golden_checksums"));
+    }
+
+    #[test]
+    fn test_phase9_gate_no_regression() {
+        let plan = phase_7_to_9_gate_plan();
+        let gate = find_gate(&plan, "phase9.no_regression");
+        let command = gate.command.join(" ");
+
+        assert_eq!(gate.scope, GateScope::Phase9);
+        assert!(command.contains("bd_mblr_7_3_2_regression_detector"));
+        assert!(!command.contains("test_phase9_gate_"));
+    }
+
+    #[test]
     fn test_phase9_gate_replication_loss() {
         let plan = phase_7_to_9_gate_plan();
         let gate = find_gate(&plan, "phase9.replication_loss");

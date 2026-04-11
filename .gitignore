@@ -145,7 +145,7 @@ SESSION_*.md
 /verify_*.sh
 !/scripts/verify_*.sh
 newfile.txt
-repro_*.rs
+/repro_*.rs
 
 # Nested crate build artifacts
 crates/*/target/

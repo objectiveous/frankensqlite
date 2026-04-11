@@ -2063,20 +2063,26 @@ fn has_rowid_equality(terms: &[WhereTerm<'_>]) -> bool {
         .any(|t| matches!(t.kind, WhereTermKind::RowidEquality))
 }
 
-/// Extract a constant prefix from a GLOB pattern (e.g. `'abc*'` → `"abc"`).
+/// Extract a pure trailing-wildcard prefix from a GLOB pattern (e.g.
+/// `'abc*'` → `"abc"`).
 ///
-/// Returns `None` if the pattern has no constant prefix (starts with `*`, `?`,
-/// or `[`), or is not a string literal.
+/// Returns `None` unless the pattern is a string literal whose only wildcard
+/// region is one or more trailing `*` characters. Shapes such as `abc*def`,
+/// `abc[0-9]`, or exact-match `abc` require either residual filtering or
+/// equality handling, so the current prefix-range lowering refuses them.
 fn extract_glob_prefix(pattern: &Expr) -> Option<String> {
     if let Expr::Literal(Literal::String(s), _) = pattern {
         let mut prefix = String::new();
+        let mut saw_trailing_star = false;
         for ch in s.chars() {
-            if matches!(ch, '*' | '?' | '[') {
-                break;
+            match ch {
+                '*' => saw_trailing_star = true,
+                '?' | '[' => return None,
+                _ if saw_trailing_star => return None,
+                _ => prefix.push(ch),
             }
-            prefix.push(ch);
         }
-        if prefix.is_empty() {
+        if prefix.is_empty() || !saw_trailing_star {
             None
         } else {
             Some(prefix)
@@ -2086,31 +2092,52 @@ fn extract_glob_prefix(pattern: &Expr) -> Option<String> {
     }
 }
 
-/// Extract a constant prefix from a LIKE pattern (e.g. `'abc%'` → `"abc"`).
+/// Extract a pure trailing-wildcard prefix from a LIKE pattern (e.g.
+/// `'abc%'` → `"abc"`).
 ///
 /// Returns `None` if:
-/// - The pattern has no constant prefix (starts with `%` or `_`)
+/// - The pattern has no trailing `%` wildcard
 /// - The pattern is not a string literal
-/// - The pattern uses escape sequences (which complicate prefix extraction)
+/// - The `ESCAPE` expression is not a literal single character
+/// - The pattern contains an unescaped `_` or any non-trailing wildcard/text
+///   after the first unescaped `%`
 ///
 /// bd-wwqen.6: This enables the LIKE prefix-to-range optimization when
 /// collation makes it safe (BINARY collation or case_sensitive_like = ON).
 fn extract_like_prefix(pattern: &Expr, escape: Option<&Expr>) -> Option<String> {
-    // Escape characters complicate prefix extraction; bail out for now.
-    // Future: handle escaped `%` and `_` in the prefix portion.
-    if escape.is_some() {
-        return None;
-    }
+    let escape_char = match escape {
+        None => None,
+        Some(Expr::Literal(Literal::String(s), _)) => {
+            let mut chars = s.chars();
+            let ch = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            Some(ch)
+        }
+        Some(_) => return None,
+    };
 
     if let Expr::Literal(Literal::String(s), _) = pattern {
         let mut prefix = String::new();
-        for ch in s.chars() {
-            if matches!(ch, '%' | '_') {
-                break;
+        let mut saw_trailing_percent = false;
+        let mut chars = s.chars();
+        while let Some(ch) = chars.next() {
+            if escape_char.is_some_and(|esc| esc == ch) {
+                if saw_trailing_percent {
+                    return None;
+                }
+                prefix.push(chars.next()?);
+                continue;
             }
-            prefix.push(ch);
+            match ch {
+                '%' => saw_trailing_percent = true,
+                '_' => return None,
+                _ if saw_trailing_percent => return None,
+                _ => prefix.push(ch),
+            }
         }
-        if prefix.is_empty() {
+        if prefix.is_empty() || !saw_trailing_percent {
             None
         } else {
             Some(prefix)
@@ -6697,16 +6724,18 @@ mod tests {
 
     #[test]
     fn test_extract_glob_prefix_star_wildcard() {
-        // "abc*def" → prefix = "abc" (star is wildcard)
-        let pat = Expr::Literal(Literal::String("abc*def".to_owned()), Span::ZERO);
+        // "abc*" → prefix = "abc" (pure trailing-star prefix)
+        let pat = Expr::Literal(Literal::String("abc*".to_owned()), Span::ZERO);
         assert_eq!(extract_glob_prefix(&pat), Some("abc".to_owned()));
     }
 
     #[test]
-    fn test_extract_glob_prefix_char_class_wildcard() {
-        // "abc[0-9]" → prefix = "abc" (char class starts wildcard region)
-        let pat = Expr::Literal(Literal::String("abc[0-9]".to_owned()), Span::ZERO);
-        assert_eq!(extract_glob_prefix(&pat), Some("abc".to_owned()));
+    fn test_extract_glob_prefix_rejects_non_terminal_wildcards() {
+        let embedded_star = Expr::Literal(Literal::String("abc*def".to_owned()), Span::ZERO);
+        assert_eq!(extract_glob_prefix(&embedded_star), None);
+
+        let char_class = Expr::Literal(Literal::String("abc[0-9]".to_owned()), Span::ZERO);
+        assert_eq!(extract_glob_prefix(&char_class), None);
     }
 
     #[test]
@@ -6722,16 +6751,18 @@ mod tests {
 
     #[test]
     fn test_extract_like_prefix_percent_wildcard() {
-        // "abc%def" → prefix = "abc" (percent is wildcard)
-        let pat = Expr::Literal(Literal::String("abc%def".to_owned()), Span::ZERO);
+        // "abc%" → prefix = "abc" (pure trailing-percent prefix)
+        let pat = Expr::Literal(Literal::String("abc%".to_owned()), Span::ZERO);
         assert_eq!(extract_like_prefix(&pat, None), Some("abc".to_owned()));
     }
 
     #[test]
-    fn test_extract_like_prefix_underscore_wildcard() {
-        // "abc_def" → prefix = "abc" (underscore is single-char wildcard)
-        let pat = Expr::Literal(Literal::String("abc_def".to_owned()), Span::ZERO);
-        assert_eq!(extract_like_prefix(&pat, None), Some("abc".to_owned()));
+    fn test_extract_like_prefix_rejects_non_terminal_or_single_char_wildcards() {
+        let embedded_percent = Expr::Literal(Literal::String("abc%def".to_owned()), Span::ZERO);
+        assert_eq!(extract_like_prefix(&embedded_percent, None), None);
+
+        let underscore = Expr::Literal(Literal::String("abc_def".to_owned()), Span::ZERO);
+        assert_eq!(extract_like_prefix(&underscore, None), None);
     }
 
     #[test]
@@ -6761,9 +6792,9 @@ mod tests {
 
     #[test]
     fn test_extract_like_prefix_exact_match() {
-        // "abc" (no wildcards) → full string as prefix
+        // "abc" (no wildcards) is not a prefix-range probe.
         let pat = Expr::Literal(Literal::String("abc".to_owned()), Span::ZERO);
-        assert_eq!(extract_like_prefix(&pat, None), Some("abc".to_owned()));
+        assert_eq!(extract_like_prefix(&pat, None), None);
     }
 
     // ===================================================================

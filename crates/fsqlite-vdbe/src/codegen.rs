@@ -1720,7 +1720,7 @@ pub fn codegen_select(
     } else {
         extract_column_range_target(where_clause.as_deref(), table, table_alias).and_then(
             |(col_name, range)| {
-                if !index_range_fast_path_is_safe(table, table_alias, schema, &col_name, range) {
+                if !index_range_fast_path_is_safe(table, table_alias, schema, &col_name, &range) {
                     return None;
                 }
                 table
@@ -1880,7 +1880,7 @@ pub fn codegen_select(
                                         done_label,
                                         end_label,
                                         idx_schema,
-                                        *range_target,
+                                        range_target.clone(),
                                     );
                                 }
                             } else {
@@ -2534,13 +2534,28 @@ struct RowidRangeTarget<'a> {
     upper: Option<RowidRangeBound<'a>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
+enum ColumnRangeExpr<'a> {
+    Borrowed(&'a Expr),
+    Owned(Expr),
+}
+
+#[derive(Clone)]
 struct ColumnRangeBound<'a> {
-    expr: &'a Expr,
+    expr: ColumnRangeExpr<'a>,
     inclusive: bool,
 }
 
-#[derive(Clone, Copy, Default)]
+impl ColumnRangeBound<'_> {
+    fn expr(&self) -> &Expr {
+        match &self.expr {
+            ColumnRangeExpr::Borrowed(expr) => expr,
+            ColumnRangeExpr::Owned(expr) => expr,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
 struct ColumnRangeTarget<'a> {
     lower: Option<ColumnRangeBound<'a>>,
     upper: Option<ColumnRangeBound<'a>>,
@@ -2768,21 +2783,23 @@ fn codegen_select_index_range_scan(
         emit_limit_zero_guard(b, lim_r, done_label);
     }
 
-    let lower_probe = index_range.lower.map(|bound| {
+    let lower_probe = index_range.lower.as_ref().map(|bound| {
         let base = b.alloc_regs(2);
-        emit_expr(b, bound.expr, base, None);
+        emit_expr(b, bound.expr(), base, None);
         b.emit_jump_to_label(Opcode::IsNull, base, 0, done_label, P4::None, 0);
         b.emit_op(Opcode::Int64, 0, base + 1, 0, P4::Int64(i64::MIN), 0);
-        (base, bound)
+        (base, bound.clone())
     });
-    let upper_reg = index_range.upper.map(|bound| {
+    let upper_reg = index_range.upper.as_ref().map(|bound| {
         let reg = b.alloc_reg();
-        emit_expr(b, bound.expr, reg, None);
+        emit_expr(b, bound.expr(), reg, None);
         b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
         reg
     });
     let current_key_reg = (upper_reg.is_some()
-        || lower_probe.is_some_and(|(_, bound)| !bound.inclusive))
+        || lower_probe
+            .as_ref()
+            .is_some_and(|(_, bound)| !bound.inclusive))
     .then(|| b.alloc_reg());
     let covering_output = resolve_covering_output_sources(columns, table, table_alias, idx_schema);
     let needs_table_lookup = covering_output.is_none();
@@ -2806,11 +2823,11 @@ fn codegen_select_index_range_scan(
         0,
     );
 
-    if let Some((lower_reg, _)) = lower_probe {
+    if let Some((lower_reg, _)) = lower_probe.as_ref() {
         let probe_record_reg = b.alloc_reg();
         b.emit_op(
             Opcode::MakeRecord,
-            lower_reg,
+            *lower_reg,
             2,
             probe_record_reg,
             P4::None,
@@ -2838,12 +2855,12 @@ fn codegen_select_index_range_scan(
         }
     }
 
-    if let Some((lower_reg, bound)) = lower_probe
+    if let Some((lower_reg, bound)) = lower_probe.as_ref()
         && !bound.inclusive
     {
         b.emit_jump_to_label(
             Opcode::Le,
-            lower_reg,
+            *lower_reg,
             current_key_reg.expect("exclusive lower bound should read current key"),
             skip_label,
             P4::None,
@@ -2851,7 +2868,7 @@ fn codegen_select_index_range_scan(
         );
     }
 
-    if let Some(bound) = index_range.upper {
+    if let Some(bound) = index_range.upper.as_ref() {
         let stop_opcode = if bound.inclusive {
             Opcode::Gt
         } else {
@@ -2918,9 +2935,9 @@ fn index_range_fast_path_is_safe(
     table_alias: Option<&str>,
     schema: &[TableSchema],
     column_name: &str,
-    range: ColumnRangeTarget<'_>,
+    range: &ColumnRangeTarget<'_>,
 ) -> bool {
-    [range.lower, range.upper]
+    [range.lower.as_ref(), range.upper.as_ref()]
         .into_iter()
         .flatten()
         .all(|bound| {
@@ -2929,7 +2946,7 @@ fn index_range_fast_path_is_safe(
                 table_alias,
                 schema,
                 column_name,
-                bound.expr,
+                bound.expr(),
             );
             (comparison.cmp_p5 & !0x80) == 0 && matches!(comparison.collation_p4, P4::None)
         })
@@ -14262,6 +14279,105 @@ fn extract_column_range_target<'a>(
     }
 }
 
+fn borrowed_column_range_bound(expr: &Expr, inclusive: bool) -> ColumnRangeBound<'_> {
+    ColumnRangeBound {
+        expr: ColumnRangeExpr::Borrowed(expr),
+        inclusive,
+    }
+}
+
+fn owned_string_column_range_bound<'a>(value: String, inclusive: bool) -> ColumnRangeBound<'a> {
+    ColumnRangeBound {
+        expr: ColumnRangeExpr::Owned(Expr::Literal(Literal::String(value), Span::ZERO)),
+        inclusive,
+    }
+}
+
+fn extract_pure_glob_prefix(pattern: &Expr) -> Option<String> {
+    let Expr::Literal(Literal::String(pattern), _) = pattern else {
+        return None;
+    };
+
+    let mut prefix = String::new();
+    let mut saw_trailing_star = false;
+    for ch in pattern.chars() {
+        match ch {
+            '*' => saw_trailing_star = true,
+            '?' | '[' => return None,
+            _ if saw_trailing_star => return None,
+            _ => prefix.push(ch),
+        }
+    }
+
+    (!prefix.is_empty() && saw_trailing_star).then_some(prefix)
+}
+
+fn extract_pure_like_prefix(pattern: &Expr, escape: Option<&Expr>) -> Option<String> {
+    if escape.is_some() {
+        return None;
+    }
+
+    let Expr::Literal(Literal::String(pattern), _) = pattern else {
+        return None;
+    };
+
+    let mut prefix = String::new();
+    let mut saw_trailing_percent = false;
+    for ch in pattern.chars() {
+        match ch {
+            '%' => saw_trailing_percent = true,
+            '_' => return None,
+            _ if saw_trailing_percent => return None,
+            _ => prefix.push(ch),
+        }
+    }
+
+    (!prefix.is_empty() && saw_trailing_percent).then_some(prefix)
+}
+
+fn is_case_stable_like_prefix(prefix: &str) -> bool {
+    prefix.chars().all(|ch| !ch.is_ascii_alphabetic())
+}
+
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    for idx in (0..chars.len()).rev() {
+        let codepoint = u32::from(chars[idx]);
+        if codepoint == u32::from(char::MAX) {
+            continue;
+        }
+        if let Some(next) = char::from_u32(codepoint + 1) {
+            chars[idx] = next;
+            chars.truncate(idx + 1);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
+fn extract_like_glob_prefix_range<'a>(
+    operand: &'a Expr,
+    pattern: &'a Expr,
+    op: fsqlite_ast::LikeOp,
+    escape: Option<&'a Expr>,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<(String, ColumnRangeBound<'a>, ColumnRangeBound<'a>)> {
+    let column_name = column_name(operand, table, table_alias)?;
+    let prefix = match op {
+        fsqlite_ast::LikeOp::Glob => extract_pure_glob_prefix(pattern),
+        fsqlite_ast::LikeOp::Like => extract_pure_like_prefix(pattern, escape)
+            .filter(|prefix| is_case_stable_like_prefix(prefix)),
+        fsqlite_ast::LikeOp::Match | fsqlite_ast::LikeOp::Regexp => None,
+    }?;
+    let upper_bound = prefix_upper_bound(&prefix)?;
+    Some((
+        column_name,
+        owned_string_column_range_bound(prefix, true),
+        owned_string_column_range_bound(upper_bound, false),
+    ))
+}
+
 fn collect_column_range_bounds<'a>(
     expr: &'a Expr,
     table: &TableSchema,
@@ -14299,22 +14415,46 @@ fn collect_column_range_bounds<'a>(
                     target,
                     column_name.clone(),
                     ColumnRangeSlot::Lower,
-                    ColumnRangeBound {
-                        expr: low,
-                        inclusive: true,
-                    },
+                    borrowed_column_range_bound(low, true),
                 ) && assign_column_range_bound(
                     target_column,
                     target,
                     column_name,
                     ColumnRangeSlot::Upper,
-                    ColumnRangeBound {
-                        expr: high,
-                        inclusive: true,
-                    },
+                    borrowed_column_range_bound(high, true),
                 )
             })
         }
+        Expr::Like {
+            expr: operand,
+            pattern,
+            op,
+            not: false,
+            escape,
+            ..
+        } => extract_like_glob_prefix_range(
+            operand,
+            pattern,
+            *op,
+            escape.as_deref(),
+            table,
+            table_alias,
+        )
+        .is_some_and(|(column_name, lower, upper)| {
+            assign_column_range_bound(
+                target_column,
+                target,
+                column_name.clone(),
+                ColumnRangeSlot::Lower,
+                lower,
+            ) && assign_column_range_bound(
+                target_column,
+                target,
+                column_name,
+                ColumnRangeSlot::Upper,
+                upper,
+            )
+        }),
         _ => false,
     }
 }
@@ -14333,34 +14473,22 @@ fn extract_column_range_bound<'a>(
             fsqlite_ast::BinaryOp::Ge => Some((
                 column_name,
                 ColumnRangeSlot::Lower,
-                ColumnRangeBound {
-                    expr: right,
-                    inclusive: true,
-                },
+                borrowed_column_range_bound(right, true),
             )),
             fsqlite_ast::BinaryOp::Gt => Some((
                 column_name,
                 ColumnRangeSlot::Lower,
-                ColumnRangeBound {
-                    expr: right,
-                    inclusive: false,
-                },
+                borrowed_column_range_bound(right, false),
             )),
             fsqlite_ast::BinaryOp::Le => Some((
                 column_name,
                 ColumnRangeSlot::Upper,
-                ColumnRangeBound {
-                    expr: right,
-                    inclusive: true,
-                },
+                borrowed_column_range_bound(right, true),
             )),
             fsqlite_ast::BinaryOp::Lt => Some((
                 column_name,
                 ColumnRangeSlot::Upper,
-                ColumnRangeBound {
-                    expr: right,
-                    inclusive: false,
-                },
+                borrowed_column_range_bound(right, false),
             )),
             _ => None,
         };
@@ -14373,34 +14501,22 @@ fn extract_column_range_bound<'a>(
             fsqlite_ast::BinaryOp::Le => Some((
                 column_name,
                 ColumnRangeSlot::Lower,
-                ColumnRangeBound {
-                    expr: left,
-                    inclusive: true,
-                },
+                borrowed_column_range_bound(left, true),
             )),
             fsqlite_ast::BinaryOp::Lt => Some((
                 column_name,
                 ColumnRangeSlot::Lower,
-                ColumnRangeBound {
-                    expr: left,
-                    inclusive: false,
-                },
+                borrowed_column_range_bound(left, false),
             )),
             fsqlite_ast::BinaryOp::Ge => Some((
                 column_name,
                 ColumnRangeSlot::Upper,
-                ColumnRangeBound {
-                    expr: left,
-                    inclusive: true,
-                },
+                borrowed_column_range_bound(left, true),
             )),
             fsqlite_ast::BinaryOp::Gt => Some((
                 column_name,
                 ColumnRangeSlot::Upper,
-                ColumnRangeBound {
-                    expr: left,
-                    inclusive: false,
-                },
+                borrowed_column_range_bound(left, false),
             )),
             _ => None,
         };
@@ -21282,6 +21398,89 @@ mod tests {
             .find(|op| op.opcode == Opcode::Next)
             .expect("index range should advance through index entries");
         assert_eq!(next.p1, 1, "Next should advance the index cursor");
+    }
+
+    #[test]
+    fn test_codegen_select_with_index_like_pure_prefix_uses_range_scan() {
+        let stmt = simple_select(
+            &["a"],
+            "t",
+            Some(Box::new(Expr::Like {
+                expr: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+                pattern: Box::new(Expr::Literal(
+                    Literal::String("123%".to_owned()),
+                    Span::ZERO,
+                )),
+                escape: None,
+                op: fsqlite_ast::LikeOp::Like,
+                not: false,
+                span: Span::ZERO,
+            })),
+        );
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "pure trailing-percent LIKE prefixes should lower to indexed range seeks"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::Ge),
+            "LIKE prefix range should stop once the current key reaches the derived upper bound"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::OpenRead
+                && matches!(&op.p4, P4::Index(name) if name == "idx_t_b")),
+            "LIKE prefix range should open the matching index"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
+            "LIKE prefix range should not fall back to a table rewind"
+        );
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::LikeConstFast),
+            "pure prefix LIKE lowered as an index range should not keep the full-scan LIKE filter path"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_with_index_like_embedded_wildcard_stays_on_filter_path() {
+        let stmt = simple_select(
+            &["a"],
+            "t",
+            Some(Box::new(Expr::Like {
+                expr: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+                pattern: Box::new(Expr::Literal(
+                    Literal::String("123%tail".to_owned()),
+                    Span::ZERO,
+                )),
+                escape: None,
+                op: fsqlite_ast::LikeOp::Like,
+                not: false,
+                span: Span::ZERO,
+            })),
+        );
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "embedded-wildcard LIKE patterns should not be mis-lowered as exact range scans"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
+            "unsupported LIKE shapes should stay on the ordinary scan path"
+        );
     }
 
     #[test]

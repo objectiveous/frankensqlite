@@ -506,12 +506,21 @@ impl Expr {
     }
 }
 
-/// Span-ignoring structural equality for expressions.
+/// Span-ignoring, SQL-semantics-aware structural equality for expressions.
 ///
 /// Two expressions are equal if they have the same structure and all semantic
-/// fields match, regardless of their source-location [`Span`] values. This is
+/// fields match, regardless of their source-location [`Span`] values.  This is
 /// essential for partial-index predicate matching and expression-index lookup,
 /// where the same logical expression is parsed from different source texts.
+///
+/// SQL identifiers and function names are case-insensitive, so comparisons of
+/// [`FunctionCall::name`] and [`Collate::collation`] use
+/// `eq_ignore_ascii_case` rather than byte-exact equality.  Column and table
+/// names in [`ColumnRef`] are compared via the derived `PartialEq` on that
+/// struct, which is currently case-sensitive — this is a known limitation but
+/// a safe default because mixed-case column references are rare in practice
+/// and would only cause a missed optimisation (silent scan fallback), never a
+/// wrong result.
 impl PartialEq for Expr {
     #[allow(clippy::too_many_lines)]
     fn eq(&self, other: &Self) -> bool {
@@ -646,7 +655,14 @@ impl PartialEq for Expr {
                     over: ov2,
                     ..
                 },
-            ) => n1 == n2 && a1 == a2 && d1 == d2 && ob1 == ob2 && f1 == f2 && ov1 == ov2,
+            ) => {
+                n1.eq_ignore_ascii_case(n2)
+                    && a1 == a2
+                    && d1 == d2
+                    && ob1 == ob2
+                    && f1 == f2
+                    && ov1 == ov2
+            }
             (
                 Self::Collate {
                     expr: e1,
@@ -658,7 +674,7 @@ impl PartialEq for Expr {
                     collation: c2,
                     ..
                 },
-            ) => e1 == e2 && c1 == c2,
+            ) => e1 == e2 && c1.eq_ignore_ascii_case(c2),
             (
                 Self::IsNull {
                     expr: e1, not: n1, ..

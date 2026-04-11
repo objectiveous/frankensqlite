@@ -108,6 +108,11 @@ echo "artifact_dir=${ARTIFACT_DIR}"
 emit_event "bootstrap" "running" "verification started"
 
 run_compile_step \
+    "wal_unit" \
+    "running bead-scoped WAL lane-stager unit coverage" \
+    cargo test -p fsqlite-wal lane_stager -- --nocapture
+
+run_compile_step \
     "pager_unit" \
     "running bead-scoped pager unit coverage" \
     cargo test -p fsqlite-pager bd_3wop3_1_2 -- --nocapture

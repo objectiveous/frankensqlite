@@ -6,7 +6,7 @@ Miscellaneous extensions for FrankenSQLite: generate_series, decimal arithmetic,
 
 This crate bundles three independent extension families that do not warrant their own crates:
 
-1. **generate_series(START, STOP [, STEP])**: A table-valued function (virtual table) that generates a sequence of integers, commonly used in joins and CTEs for generating test data or numeric ranges.
+1. **generate_series(START [, STOP [, STEP]])**: A table-valued function (virtual table) that generates a sequence of integers, commonly used in joins and CTEs for generating test data or numeric ranges. `START` is required, `STOP` defaults to `4294967295`, and `STEP=0` is treated as `1` to match SQLite.
 
 2. **Decimal arithmetic**: Exact string-based decimal operations that avoid floating-point precision loss. Functions include `decimal` (normalize), `decimal_add`, `decimal_sub`, `decimal_mul`, and `decimal_cmp`.
 

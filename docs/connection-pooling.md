@@ -43,7 +43,8 @@ carry that pattern over unchanged here.
 
 Use `PRAGMA fsqlite.connection_stats;` from any connection attached to the same
 database path to inspect the live shared pool state that FrankenSQLite can see
-inside this process:
+inside this process. The measurement window begins when this process first
+opened that database path:
 
 ```sql
 PRAGMA fsqlite.connection_stats;
@@ -52,9 +53,13 @@ PRAGMA fsqlite_connection_stats;
 
 The PRAGMA reports:
 
+- `measurement_window_ms` so you know how long the retained peak counters have
+  been accumulating
 - `pool_size_estimate` and `open_connections` for the currently tracked pool
+- `peak_open_connections` and `peak_active_transactions` so you can size pools
+  from observed peak demand instead of only the current instant
 - `idle_connections` and `active_transactions` so you can spot stuck snapshot
-  holders quickly
+  holders quickly right now
 - `connection_age_max_ms` and `idle_ms_max` to distinguish healthy reuse from
   long-idle leak patterns
 - `queries_executed_total`, `prepare_calls_total`, and
@@ -64,7 +69,8 @@ The PRAGMA reports:
 
 This is intentionally a lightweight live diagnostic surface, not a replacement
 for `validate_connection_pool()` or `simulate_connection_pool()`. Use the
-PRAGMA to capture raw pool behavior, then feed representative samples into the
+PRAGMA to capture both the current pool shape and the retained peak demand over
+the current measurement window, then feed representative samples into the
 observability helpers when you want recommendations.
 
 ## Validator Example

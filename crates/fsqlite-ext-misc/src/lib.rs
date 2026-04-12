@@ -2,8 +2,8 @@
 //!
 //! Provides three independent extension families:
 //!
-//! 1. **generate_series(START, STOP \[, STEP\])**: virtual table that generates
-//!    a sequence of integers, commonly used in joins and CTEs.
+//! 1. **generate_series(START \[, STOP [, STEP]])**: virtual table that
+//!    generates a sequence of integers, commonly used in joins and CTEs.
 //!
 //! 2. **Decimal arithmetic**: exact string-based decimal operations that avoid
 //!    floating-point precision loss. Functions: `decimal`, `decimal_add`,
@@ -36,8 +36,15 @@ pub const fn extension_name() -> &'static str {
 /// Virtual table that generates a sequence of integers.
 ///
 /// Usage: `SELECT value FROM generate_series(1, 10)` produces rows 1..=10.
-/// Optional third argument specifies step (default 1).
+/// `START` is required, `STOP` defaults to `4294967295`, `STEP` defaults to
+/// `1`, and `STEP=0` is treated as `1` to match SQLite.
 pub struct GenerateSeriesTable;
+
+const GENERATE_SERIES_DEFAULT_STOP: i64 = u32::MAX as i64;
+
+const fn normalize_generate_series_step(step: i64) -> i64 {
+    if step == 0 { 1 } else { step }
+}
 
 impl VirtualTable for GenerateSeriesTable {
     type Cursor = GenerateSeriesCursor;
@@ -51,7 +58,7 @@ impl VirtualTable for GenerateSeriesTable {
     }
 
     fn best_index(&self, info: &mut IndexInfo) -> Result<()> {
-        // generate_series accepts 2-3 equality constraints on hidden columns
+        // generate_series accepts 1-3 equality constraints on hidden columns
         // start (col=1), stop (col=2), step (col=3)
         info.estimated_cost = 1.0;
         info.estimated_rows = 1000;
@@ -82,11 +89,7 @@ impl GenerateSeriesCursor {
     /// Initialize the cursor from explicit start/stop/step values.
     #[allow(clippy::similar_names)]
     pub fn init(&mut self, start: i64, stop: i64, step: i64) -> Result<()> {
-        if step == 0 {
-            return Err(FrankenError::internal(
-                "generate_series: step cannot be zero",
-            ));
-        }
+        let step = normalize_generate_series_step(step);
         self.start = start;
         self.current = start;
         self.stop = stop;
@@ -105,10 +108,16 @@ impl VirtualTableCursor for GenerateSeriesCursor {
         _idx_str: Option<&str>,
         args: &[SqliteValue],
     ) -> Result<()> {
-        #[allow(clippy::similar_names)]
-        let start = args.first().and_then(SqliteValue::as_integer).unwrap_or(0);
-        let end = args.get(1).and_then(SqliteValue::as_integer).unwrap_or(0);
-        let step = args.get(2).and_then(SqliteValue::as_integer).unwrap_or(1);
+        let start = args
+            .first()
+            .map(SqliteValue::to_integer)
+            .ok_or_else(|| FrankenError::internal("generate_series: start argument is required"))?;
+        let end = args
+            .get(1)
+            .map_or(GENERATE_SERIES_DEFAULT_STOP, SqliteValue::to_integer);
+        let step = args.get(2).map_or(1, |value| {
+            normalize_generate_series_step(value.to_integer())
+        });
         self.init(start, end, step)
     }
 
@@ -147,10 +156,10 @@ impl VirtualTableCursor for GenerateSeriesCursor {
         }
 
         let val = match col {
-            0 => SqliteValue::Integer(self.current), // value
-            1 => SqliteValue::Integer(self.start),   // start
-            2 => SqliteValue::Integer(self.stop),    // stop
-            3 => SqliteValue::Integer(self.step),    // step
+            0 => SqliteValue::Integer(self.current),
+            1 => SqliteValue::Integer(self.start),
+            2 => SqliteValue::Integer(self.stop),
+            3 => SqliteValue::Integer(self.step),
             _ => SqliteValue::Null,
         };
         ctx.set_value(val);
@@ -161,11 +170,9 @@ impl VirtualTableCursor for GenerateSeriesCursor {
         Ok(if self.done { 0 } else { self.current })
     }
 }
-
 // ══════════════════════════════════════════════════════════════════════
 // Decimal extension — exact string-based arithmetic
 // ══════════════════════════════════════════════════════════════════════
-
 /// Normalize a decimal string to canonical form.
 ///
 /// Strips leading zeros (except the one before the decimal point),
@@ -996,10 +1003,18 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_series_step_zero_error() {
+    fn test_generate_series_step_zero_defaults_to_one() {
         let table = GenerateSeriesTable;
         let mut cursor = table.open().unwrap();
-        assert!(cursor.init(1, 10, 0).is_err());
+        cursor.init(1, 3, 0).unwrap();
+
+        let mut values = Vec::new();
+        let cx = Cx::new();
+        while !cursor.eof() {
+            values.push(cursor.current);
+            cursor.next(&cx).unwrap();
+        }
+        assert_eq!(values, vec![1, 2, 3]);
     }
 
     #[test]
@@ -1032,6 +1047,33 @@ mod tests {
         assert_eq!(values, vec![1, 2, 3]);
     }
 
+    #[test]
+    fn test_generate_series_filter_requires_start_argument() {
+        let table = GenerateSeriesTable;
+        let mut cursor = table.open().unwrap();
+        let error = cursor.filter(&Cx::new(), 0, None, &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("generate_series: start argument is required"),
+            "unexpected error: {error}",
+        );
+    }
+
+    #[test]
+    fn test_generate_series_filter_defaults_stop_and_step() {
+        let table = GenerateSeriesTable;
+        let mut cursor = table.open().unwrap();
+        cursor
+            .filter(&Cx::new(), 0, None, &[SqliteValue::Integer(5)])
+            .unwrap();
+
+        assert_eq!(cursor.current, 5);
+        assert_eq!(cursor.start, 5);
+        assert_eq!(cursor.stop, GENERATE_SERIES_DEFAULT_STOP);
+        assert_eq!(cursor.step, 1);
+        assert!(!cursor.eof());
+    }
     // ── decimal ──────────────────────────────────────────────────────
 
     #[test]

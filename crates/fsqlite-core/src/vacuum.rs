@@ -176,15 +176,8 @@ pub(crate) fn temp_rebuild_path(source_path: &Path) -> PathBuf {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn replace_database_file(target_path: &Path, rebuilt_path: &Path) -> Result<()> {
-    let bytes = match host_fs::read(rebuilt_path) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            drop(host_fs::remove_file(rebuilt_path));
-            return Err(err);
-        }
-    };
-    match host_fs::write(target_path, bytes) {
-        Ok(()) => {
+    match host_fs::copy_file(rebuilt_path, target_path) {
+        Ok(_) => {
             host_fs::remove_file(rebuilt_path)?;
             Ok(())
         }
@@ -479,6 +472,27 @@ mod tests {
         assert!(
             err.to_string().contains("Is a directory") || err.to_string().contains("directory"),
             "unexpected replacement failure: {err}"
+        );
+    }
+
+    #[test]
+    fn test_replace_database_file_replaces_target_contents_without_buffering_entire_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_path = dir.path().join("vacuum-target.db");
+        let rebuilt_path = dir.path().join("vacuum-target.db.fsqlite-vacuum-2.tmp");
+
+        fsqlite_vfs::host_fs::write(&target_path, b"old target bytes").unwrap();
+        fsqlite_vfs::host_fs::write(&rebuilt_path, b"rebuilt database bytes").unwrap();
+
+        super::replace_database_file(&target_path, &rebuilt_path).unwrap();
+
+        assert_eq!(
+            fsqlite_vfs::host_fs::read(&target_path).unwrap(),
+            b"rebuilt database bytes"
+        );
+        assert!(
+            !rebuilt_path.exists(),
+            "successful replacements must remove the rebuild temp file"
         );
     }
 

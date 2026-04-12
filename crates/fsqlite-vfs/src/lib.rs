@@ -56,14 +56,13 @@ pub mod host_fs {
         Ok(())
     }
 
-    pub fn copy_file(from: &Path, to: &Path) -> Result<()> {
+    pub fn copy_file(from: &Path, to: &Path) -> Result<u64> {
         if let Some(parent) = to.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        std::fs::copy(from, to)?;
-        Ok(())
+        Ok(std::fs::copy(from, to)?)
     }
 
     pub fn remove_file(path: &Path) -> Result<()> {

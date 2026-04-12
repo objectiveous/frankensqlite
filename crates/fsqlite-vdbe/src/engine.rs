@@ -5408,6 +5408,8 @@ impl ErasedVtabCursor for FuncVtabCursorBridge {
 struct VtabCursorState {
     /// The type-erased cursor.
     cursor: Box<dyn ErasedVtabCursor>,
+    /// Synthetic NULL-row state forced by `OP_NullRow`.
+    null_row: bool,
 }
 
 /// A set of rowids for RowSetAdd/RowSetRead/RowSetTest opcodes.
@@ -6585,7 +6587,13 @@ impl VdbeEngine {
     pub fn register_vtab_cursor(&mut self, cursor_id: i32, cursor: Box<dyn ErasedVtabCursor>) {
         self.ensure_cold_state_for(StatementColdState::VTAB_CURSORS)
             .vtab_cursors
-            .insert(cursor_id, VtabCursorState { cursor });
+            .insert(
+                cursor_id,
+                VtabCursorState {
+                    cursor,
+                    null_row: false,
+                },
+            );
     }
 
     /// Register a virtual table instance for lifecycle and cursor operations.
@@ -8417,7 +8425,8 @@ impl VdbeEngine {
                 Opcode::NullRow => {
                     // Set cursor p1 to a null row. Subsequent Column/Rowid
                     // reads will return NULL (storage cursor via eof(),
-                    // mem cursor via position=None).
+                    // mem cursor via position=None, vtab cursor via
+                    // synthetic null-row state).
                     if let Some(cursor) = self.storage_cursors.get_mut(&op.p1) {
                         // Move storage cursor past the last entry so eof()
                         // returns true for subsequent Column/Rowid reads.
@@ -8425,6 +8434,12 @@ impl VdbeEngine {
                     }
                     if let Some(cursor) = self.cursors.get_mut(&op.p1) {
                         cursor.position = None;
+                    }
+                    if let Some(state) = self
+                        .cold_state_mut()
+                        .and_then(|cold_state| cold_state.vtab_cursors.get_mut(&op.p1))
+                    {
+                        state.null_row = true;
                     }
                     pc += 1;
                 }
@@ -9979,6 +9994,11 @@ impl VdbeEngine {
                     // C SQLite also sets register P3 to NULL before jumping.
                     let is_null = if let Some(cursor) = self.storage_cursors.get(&op.p1) {
                         cursor.cursor.eof()
+                    } else if let Some(state) = self
+                        .cold_state()
+                        .and_then(|cold_state| cold_state.vtab_cursors.get(&op.p1))
+                    {
+                        state.null_row || state.cursor.eof()
                     } else {
                         self.cursors
                             .get(&op.p1)
@@ -11168,34 +11188,39 @@ impl VdbeEngine {
                     // Apply filter to virtual table cursor and begin scan.
                     // P1 = cursor number
                     // P2 = jump address if cursor is empty after filter
-                    // P3 = register with first filter argument
-                    // P4 = number of filter arguments (via P4::Int)
+                    // P3 = register holding idx_num; P3+1 = argc; P3+2.. = argv
+                    // P4 = optional idx_str
                     let cursor_id = op.p1;
                     let jump_if_empty = op.p2;
                     let cx = self.derive_execution_cx();
-                    let n_args = match &op.p4 {
-                        P4::Int(n) => *n as usize,
-                        _ => 0,
-                    };
+                    let idx_num_reg = self.get_reg(op.p3).to_integer();
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                    let idx_num = idx_num_reg as i32;
+                    let argc = self.get_reg(op.p3 + 1).to_integer();
+                    let n_args = usize::try_from(argc).unwrap_or(0);
                     let args: Vec<SqliteValue> = (0..n_args)
                         .map(|i| {
                             #[allow(clippy::cast_possible_wrap)]
                             self.registers
-                                .get((op.p3 + i as i32) as usize)
+                                .get((op.p3 + 2 + i as i32) as usize)
                                 .cloned()
                                 .unwrap_or(SqliteValue::Null)
                         })
                         .collect();
-                    let idx_num = op.p5 as i32;
+                    let idx_str = match &op.p4 {
+                        P4::Str(s) => Some(s.as_str()),
+                        _ => None,
+                    };
 
                     if let Some(state) = self
                         .cold_state_mut()
                         .and_then(|cold_state| cold_state.vtab_cursors.get_mut(&cursor_id))
                     {
                         observe_execution_cancellation(&cx)?;
-                        if let Err(e) = state.cursor.filter(&cx, idx_num, None, &args) {
+                        if let Err(e) = state.cursor.filter(&cx, idx_num, idx_str, &args) {
                             break vtab_exec_outcome("VFilter", e)?;
                         }
+                        state.null_row = false;
                         observe_execution_cancellation(&cx)?;
                         if state.cursor.eof() {
                             #[allow(clippy::cast_sign_loss)]
@@ -11204,6 +11229,12 @@ impl VdbeEngine {
                             }
                             continue;
                         }
+                    } else {
+                        #[allow(clippy::cast_sign_loss)]
+                        {
+                            pc = jump_if_empty as usize;
+                        }
+                        continue;
                     }
                     pc += 1;
                 }
@@ -11221,19 +11252,21 @@ impl VdbeEngine {
                         .cold_state()
                         .and_then(|cold_state| cold_state.vtab_cursors.get(&cursor_id))
                     {
-                        observe_execution_cancellation(&self.execution_cx)?;
-                        let mut ctx = ColumnContext::new();
-                        if let Err(e) = state.cursor.column(&mut ctx, col) {
-                            break vtab_exec_outcome("VColumn", e)?;
+                        if state.null_row || state.cursor.eof() {
+                            SqliteValue::Null
+                        } else {
+                            observe_execution_cancellation(&self.execution_cx)?;
+                            let mut ctx = ColumnContext::new();
+                            if let Err(e) = state.cursor.column(&mut ctx, col) {
+                                break vtab_exec_outcome("VColumn", e)?;
+                            }
+                            observe_execution_cancellation(&self.execution_cx)?;
+                            ctx.take_value().unwrap_or(SqliteValue::Null)
                         }
-                        observe_execution_cancellation(&self.execution_cx)?;
-                        Some(ctx.take_value().unwrap_or(SqliteValue::Null))
                     } else {
-                        None
+                        SqliteValue::Null
                     };
-                    if let Some(column_value) = column_value {
-                        self.set_reg(dest, column_value);
-                    }
+                    self.set_reg(dest, column_value);
                     pc += 1;
                 }
 
@@ -11249,6 +11282,10 @@ impl VdbeEngine {
                         .cold_state_mut()
                         .and_then(|cold_state| cold_state.vtab_cursors.get_mut(&cursor_id))
                     {
+                        if state.null_row {
+                            pc += 1;
+                            continue;
+                        }
                         observe_execution_cancellation(&cx)?;
                         if let Err(e) = state.cursor.next(&cx) {
                             break vtab_exec_outcome("VNext", e)?;
@@ -11330,8 +11367,10 @@ impl VdbeEngine {
 
                 Opcode::VCheck => {
                     // Check virtual table integrity.
-                    // P3 = destination register for error message (NULL if OK).
-                    let dest_reg = op.p3;
+                    // P2 = destination register for error message (NULL if OK).
+                    // P3 carries the integer xIntegrity() argument and must
+                    // not be clobbered by this stub implementation.
+                    let dest_reg = op.p2;
                     #[allow(clippy::cast_sign_loss)]
                     if let Some(reg) = self.registers.get_mut(dest_reg as usize) {
                         *reg = SqliteValue::Null;
@@ -12811,6 +12850,16 @@ impl VdbeEngine {
                 return Ok(SqliteValue::Null);
             }
             return Ok(SqliteValue::Integer(cursor.cursor.rowid(&cursor.cx)?));
+        }
+
+        if let Some(state) = self
+            .cold_state()
+            .and_then(|cold_state| cold_state.vtab_cursors.get(&cursor_id))
+        {
+            if state.null_row || state.cursor.eof() {
+                return Ok(SqliteValue::Null);
+            }
+            return Ok(SqliteValue::Integer(state.cursor.rowid()?));
         }
 
         if let Some(cursor) = self.cursors.get(&cursor_id)
@@ -15266,7 +15315,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::ProgramBuilder;
+    use crate::{Label, ProgramBuilder};
     use fsqlite_func::vtab::{IndexInfo, VirtualTable, VirtualTableCursor};
     use fsqlite_func::{FunctionRegistry, ScalarFunction, register_builtins};
     use fsqlite_mvcc::ConcurrentRegistry;
@@ -27223,8 +27272,12 @@ mod tests {
 
         assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
     }
-
-    // ── Virtual Table opcodes ──────────────────────────────────
+    #[derive(Debug, Clone, PartialEq)]
+    struct RecordedFilterCall {
+        idx_num: i32,
+        idx_str: Option<String>,
+        args: Vec<SqliteValue>,
+    }
 
     /// Mock virtual table cursor for testing VTable opcodes.
     #[derive(Clone)]
@@ -27232,6 +27285,7 @@ mod tests {
         rows: Vec<Vec<SqliteValue>>,
         pos: usize,
         filtered: bool,
+        filter_capture: Option<Arc<std::sync::Mutex<Option<RecordedFilterCall>>>>,
         cancel_on_filter: bool,
         interrupt_on_filter: bool,
         cancel_on_column: Option<Cx>,
@@ -27243,6 +27297,22 @@ mod tests {
                 rows,
                 pos: 0,
                 filtered: false,
+                filter_capture: None,
+                cancel_on_filter: false,
+                interrupt_on_filter: false,
+                cancel_on_column: None,
+            }
+        }
+
+        fn with_filter_capture(
+            rows: Vec<Vec<SqliteValue>>,
+            filter_capture: Arc<std::sync::Mutex<Option<RecordedFilterCall>>>,
+        ) -> Self {
+            Self {
+                rows,
+                pos: 0,
+                filtered: false,
+                filter_capture: Some(filter_capture),
                 cancel_on_filter: false,
                 interrupt_on_filter: false,
                 cancel_on_column: None,
@@ -27254,6 +27324,7 @@ mod tests {
                 rows,
                 pos: 0,
                 filtered: false,
+                filter_capture: None,
                 cancel_on_filter: true,
                 interrupt_on_filter: false,
                 cancel_on_column: None,
@@ -27265,6 +27336,7 @@ mod tests {
                 rows,
                 pos: 0,
                 filtered: false,
+                filter_capture: None,
                 cancel_on_filter: false,
                 interrupt_on_filter: true,
                 cancel_on_column: None,
@@ -27276,6 +27348,7 @@ mod tests {
                 rows,
                 pos: 0,
                 filtered: false,
+                filter_capture: None,
                 cancel_on_filter: false,
                 interrupt_on_filter: false,
                 cancel_on_column: Some(cancel_cx),
@@ -27287,15 +27360,23 @@ mod tests {
         fn filter(
             &mut self,
             cx: &Cx,
-            _idx_num: i32,
-            _idx_str: Option<&str>,
-            _args: &[SqliteValue],
+            idx_num: i32,
+            idx_str: Option<&str>,
+            args: &[SqliteValue],
         ) -> Result<()> {
             if self.interrupt_on_filter {
                 return Err(FrankenError::Abort);
             }
             if self.cancel_on_filter {
                 cx.cancel();
+            }
+            if let Some(filter_capture) = &self.filter_capture {
+                *filter_capture.lock().expect("filter capture lock poisoned") =
+                    Some(RecordedFilterCall {
+                        idx_num,
+                        idx_str: idx_str.map(str::to_owned),
+                        args: args.to_vec(),
+                    });
             }
             self.pos = 0;
             self.filtered = true;
@@ -27408,6 +27489,22 @@ mod tests {
         )
     }
 
+    fn emit_vfilter_noargs(b: &mut ProgramBuilder, cursor_id: i32, jump_label: Label) {
+        let r_idx_num = b.alloc_reg();
+        let r_argc = b.alloc_reg();
+        debug_assert_eq!(r_argc, r_idx_num + 1);
+        b.emit_op(Opcode::Integer, 0, r_idx_num, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 0, r_argc, 0, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::VFilter,
+            cursor_id,
+            r_idx_num,
+            jump_label,
+            P4::None,
+            0,
+        );
+    }
+
     #[test]
     fn test_vopen_is_noop() {
         let rows = run_program(|b| {
@@ -27466,20 +27563,24 @@ mod tests {
         });
         assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
     }
-
     #[test]
-    fn test_vcheck_stores_null() {
+    fn test_vcheck_stores_null_in_p2_without_clobbering_p3_argument() {
         let rows = run_program(|b| {
             let end = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             let r_out = b.alloc_reg();
+            let r_arg = b.alloc_reg();
             b.emit_op(Opcode::Integer, 99, r_out, 0, P4::None, 0);
-            b.emit_op(Opcode::VCheck, 0, 0, r_out, P4::None, 0);
-            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 123, r_arg, 0, P4::None, 0);
+            b.emit_op(Opcode::VCheck, 0, r_out, r_arg, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 2, 0, P4::None, 0);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        assert_eq!(rows, vec![vec![SqliteValue::Null]]);
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Null, SqliteValue::Integer(123)]]
+        );
     }
 
     #[test]
@@ -27529,7 +27630,7 @@ mod tests {
             let r_out = b.alloc_reg();
             b.emit_op(Opcode::VOpen, 0, 0, 0, P4::None, 0);
             let after_scan = b.emit_label();
-            b.emit_jump_to_label(Opcode::VFilter, 0, 0, after_scan, P4::Int(0), 0);
+            emit_vfilter_noargs(b, 0, after_scan);
             b.emit_op(Opcode::Integer, 999, r_out, 0, P4::None, 0);
             b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
             b.resolve_label(after_scan);
@@ -27543,6 +27644,86 @@ mod tests {
     }
 
     #[test]
+    fn test_vfilter_jumps_when_cursor_is_missing() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_out = b.alloc_reg();
+            let after_scan = b.emit_label();
+            emit_vfilter_noargs(b, 99, after_scan);
+            b.emit_op(Opcode::Integer, 999, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.resolve_label(after_scan);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(0)]]);
+    }
+
+    #[test]
+    fn test_vfilter_reads_idx_num_idx_str_and_args_from_registers() {
+        let capture = Arc::new(std::sync::Mutex::new(None));
+        let cursor = MockVtabCursor::with_filter_capture(
+            vec![vec![SqliteValue::Integer(1)]],
+            Arc::clone(&capture),
+        );
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        let done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let r_idx_num = b.alloc_reg();
+        let r_argc = b.alloc_reg();
+        let r_arg0 = b.alloc_reg();
+        let r_arg1 = b.alloc_reg();
+        debug_assert_eq!(r_argc, r_idx_num + 1);
+        debug_assert_eq!(r_arg0, r_idx_num + 2);
+        debug_assert_eq!(r_arg1, r_idx_num + 3);
+        b.emit_op(Opcode::VOpen, 0, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 7, r_idx_num, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 2, r_argc, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 42, r_arg0, 0, P4::None, 0);
+        b.emit_op(
+            Opcode::String8,
+            0,
+            r_arg1,
+            0,
+            P4::Str("needle".to_owned()),
+            0,
+        );
+        b.emit_jump_to_label(
+            Opcode::VFilter,
+            0,
+            r_idx_num,
+            done,
+            P4::Str("range:eq".to_owned()),
+            0,
+        );
+        b.resolve_label(done);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let prog = b.finish().expect("program should build");
+
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.register_vtab_instance(0, Box::new(MockVtab::new(cursor)));
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(
+            capture
+                .lock()
+                .expect("filter capture lock poisoned")
+                .clone(),
+            Some(RecordedFilterCall {
+                idx_num: 7,
+                idx_str: Some("range:eq".to_owned()),
+                args: vec![SqliteValue::Integer(42), SqliteValue::Text("needle".into()),],
+            })
+        );
+    }
+
+    #[test]
     fn test_execute_observes_execution_cx_cancellation_immediately_after_vfilter_opcode() {
         let root_cx = Cx::new();
 
@@ -27552,7 +27733,7 @@ mod tests {
         b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
         let r_out = b.alloc_reg();
         b.emit_op(Opcode::VOpen, 0, 0, 0, P4::None, 0);
-        b.emit_jump_to_label(Opcode::VFilter, 0, 0, done, P4::Int(0), 0);
+        emit_vfilter_noargs(&mut b, 0, done);
         b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
         b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
         b.resolve_label(done);
@@ -27584,7 +27765,7 @@ mod tests {
         b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
         let r_out = b.alloc_reg();
         b.emit_op(Opcode::VOpen, 0, 0, 0, P4::None, 0);
-        b.emit_jump_to_label(Opcode::VFilter, 0, 0, done, P4::Int(0), 0);
+        emit_vfilter_noargs(&mut b, 0, done);
         b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
         b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
         b.resolve_label(done);
@@ -27620,7 +27801,7 @@ mod tests {
             let done_label = b.emit_label();
             let loop_label = b.emit_label();
             b.emit_op(Opcode::VOpen, 0, 0, 0, P4::None, 0);
-            b.emit_jump_to_label(Opcode::VFilter, 0, 0, done_label, P4::Int(0), 0);
+            emit_vfilter_noargs(b, 0, done_label);
             b.resolve_label(loop_label);
             b.emit_op(Opcode::VColumn, 0, 0, r1, P4::None, 0);
             b.emit_op(Opcode::VColumn, 0, 1, r2, P4::None, 0);
@@ -27742,7 +27923,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vcolumn_no_cursor_is_noop() {
+    fn test_vcolumn_no_cursor_stores_null() {
         let rows = run_program(|b| {
             let end = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
@@ -27753,7 +27934,125 @@ mod tests {
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        assert_eq!(rows, vec![vec![SqliteValue::Integer(55)]]);
+        assert_eq!(rows, vec![vec![SqliteValue::Null]]);
+    }
+
+    #[test]
+    fn test_rowid_reads_from_vtab_cursor() {
+        let cursor = MockVtabCursor::new(vec![vec![SqliteValue::Integer(10)]]);
+        let (rows, outcome) = run_vtab_program(0, cursor, |b| {
+            let end = b.emit_label();
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::VOpen, 0, 0, 0, P4::None, 0);
+            emit_vfilter_noargs(b, 0, done);
+            b.emit_op(Opcode::Rowid, 0, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+    }
+
+    #[test]
+    fn test_rowid_on_vtab_cursor_at_eof_stores_null() {
+        let cursor = MockVtabCursor::new(vec![vec![SqliteValue::Integer(10)]]);
+        let (rows, outcome) = run_vtab_program(0, cursor, |b| {
+            let end = b.emit_label();
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::VOpen, 0, 0, 0, P4::None, 0);
+            emit_vfilter_noargs(b, 0, done);
+            b.emit_jump_to_label(Opcode::VNext, 0, 0, done, P4::None, 0);
+            b.emit_op(Opcode::Rowid, 0, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(rows, vec![vec![SqliteValue::Null]]);
+    }
+
+    #[test]
+    fn test_nullrow_on_vtab_cursor_forces_vcolumn_and_rowid_to_null() {
+        let cursor = MockVtabCursor::new(vec![vec![SqliteValue::Integer(10)]]);
+        let (rows, outcome) = run_vtab_program(0, cursor, |b| {
+            let end = b.emit_label();
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_col = b.alloc_reg();
+            let r_rowid = b.alloc_reg();
+            b.emit_op(Opcode::VOpen, 0, 0, 0, P4::None, 0);
+            emit_vfilter_noargs(b, 0, done);
+            b.emit_op(Opcode::NullRow, 0, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::VColumn, 0, 0, r_col, P4::None, 0);
+            b.emit_op(Opcode::Rowid, 0, r_rowid, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_col, 2, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(rows, vec![vec![SqliteValue::Null, SqliteValue::Null]]);
+    }
+
+    #[test]
+    fn test_ifnullrow_jumps_for_vtab_nullrow() {
+        let cursor = MockVtabCursor::new(vec![vec![SqliteValue::Integer(10)]]);
+        let (rows, outcome) = run_vtab_program(0, cursor, |b| {
+            let end = b.emit_label();
+            let skip = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::VOpen, 0, 0, 0, P4::None, 0);
+            emit_vfilter_noargs(b, 0, skip);
+            b.emit_op(Opcode::NullRow, 0, 0, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::IfNullRow, 0, 0, skip, P4::None, 0);
+            b.emit_op(Opcode::Integer, 999, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.resolve_label(skip);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(0)]]);
+    }
+
+    #[test]
+    fn test_vnext_on_vtab_nullrow_falls_through() {
+        let cursor = MockVtabCursor::new(vec![
+            vec![SqliteValue::Integer(10)],
+            vec![SqliteValue::Integer(20)],
+        ]);
+        let (rows, outcome) = run_vtab_program(0, cursor, |b| {
+            let end = b.emit_label();
+            let loop_body = b.emit_label();
+            let after_loop = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::VOpen, 0, 0, 0, P4::None, 0);
+            emit_vfilter_noargs(b, 0, after_loop);
+            b.emit_op(Opcode::NullRow, 0, 0, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::VNext, 0, 0, loop_body, P4::None, 0);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, after_loop, P4::None, 0);
+            b.resolve_label(loop_body);
+            b.emit_op(Opcode::Integer, 999, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.resolve_label(after_loop);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
     }
 
     #[test]
@@ -27766,7 +28065,7 @@ mod tests {
         b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
         let r_out = b.alloc_reg();
         b.emit_op(Opcode::VOpen, 0, 0, 0, P4::None, 0);
-        b.emit_jump_to_label(Opcode::VFilter, 0, 0, done, P4::Int(0), 0);
+        emit_vfilter_noargs(&mut b, 0, done);
         b.emit_op(Opcode::VColumn, 0, 0, r_out, P4::None, 0);
         b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
         b.resolve_label(done);

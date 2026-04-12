@@ -265,24 +265,24 @@ impl PlannerSelectAccessKind {
     }
 }
 
-/// Planner-facing description of a single bound in an index range probe.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlannerIndexRangeBound {
-    /// Human-readable rendering of the bound expression.
-    pub label: String,
-    /// Whether the bound is inclusive (<= / >=) or exclusive (< / >).
+    /// Bound expression evaluated once before the scan begins.
+    pub expr: Expr,
+    /// Whether the bound is inclusive.
     pub inclusive: bool,
 }
 
-/// Planner-facing description of an index range probe target.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PlannerIndexRangeTarget {
+    /// Optional lower bound (`>=` / `>` / `BETWEEN` low).
     pub lower: Option<PlannerIndexRangeBound>,
+    /// Optional upper bound (`<=` / `<` / `BETWEEN` high).
     pub upper: Option<PlannerIndexRangeBound>,
 }
 
 /// Planner-produced directive for a single-table SELECT lowering path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SelectPlannerDirective {
     /// Deterministic planner artifact identity.
     pub plan_id: String,
@@ -294,15 +294,16 @@ pub struct SelectPlannerDirective {
     pub table_name: String,
     /// Index to use when the access path is index-backed.
     pub index_name: Option<String>,
-    /// Leading index column the planner expects to drive the probe.
-    pub index_column: Option<String>,
-    /// Label for the probe key (column name or expression label).
+    /// Human-readable leading key term that drives the probe. For plain
+    /// indexes this is the leading column name; for expression indexes it is
+    /// the indexed expression text.
     pub index_key_label: Option<String>,
-    /// Whether the planner expects the index key to be an expression.
+    /// Whether the leading key term is an expression rather than a plain
+    /// column reference.
     pub index_key_is_expression: bool,
-    /// Equality probe target (if any).
-    pub index_equality_target: Option<PlannerIndexRangeBound>,
-    /// Range probe target (if any).
+    /// Optional equality probe payload that lowering can emit directly.
+    pub index_equality_target: Option<Expr>,
+    /// Optional range probe payload that lowering can emit directly.
     pub index_range_target: Option<PlannerIndexRangeTarget>,
     /// Whether the planner expects a covering-index lowering.
     pub covering: bool,
@@ -1222,7 +1223,7 @@ fn emit_upsert_expr(
 }
 
 /// Configuration for the code generator.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CodegenContext {
     /// Whether we're in `BEGIN CONCURRENT` mode.
     /// When true, `OP_NewRowid` uses the snapshot-independent allocator.
@@ -1292,18 +1293,15 @@ fn directive_index_contract_bypass_reason(
     table: &TableSchema,
     table_alias: Option<&str>,
     columns: &[ResultColumn],
-    actual_index_column: &str,
 ) -> Option<&'static str> {
-    let Some(expected_index_column) = directive.index_column.as_deref() else {
-        return Some("missing_index_column");
+    let Some(expected_index_key_label) = directive.index_key_label.as_deref() else {
+        return Some("missing_index_key_label");
     };
-    let Some(leading_column) = idx_schema.columns.first() else {
-        return Some("index_has_no_leading_column");
+    let Some(actual_index_key_label) = idx_schema.key_term_sql(0) else {
+        return Some("index_has_no_key_term");
     };
-    if !leading_column.eq_ignore_ascii_case(actual_index_column)
-        || !leading_column.eq_ignore_ascii_case(expected_index_column)
-    {
-        return Some("index_column_mismatch");
+    if !actual_index_key_label.eq_ignore_ascii_case(expected_index_key_label) {
+        return Some("index_key_label_mismatch");
     }
     if directive.covering
         && resolve_covering_output_sources(columns, table, table_alias, idx_schema).is_none()
@@ -1327,7 +1325,7 @@ fn log_planner_select_directive_outcome(
     let trace_id = env::var("TRACE_ID").unwrap_or_else(|_| "(none)".to_owned());
     let scenario_id = env::var("SCENARIO_ID").unwrap_or_else(|_| "(none)".to_owned());
     let index_name = directive.index_name.as_deref().unwrap_or("(none)");
-    let index_column = directive.index_column.as_deref().unwrap_or("(none)");
+    let index_key_label = directive.index_key_label.as_deref().unwrap_or("(none)");
 
     tracing::info!(
         target: "fsqlite.planner_runtime",
@@ -1339,7 +1337,7 @@ fn log_planner_select_directive_outcome(
         planner_surface = %directive.planner_surface,
         table = %directive.table_name,
         index = %index_name,
-        index_column = %index_column,
+        index_key = %index_key_label,
         access_kind = %directive.access_kind.label(),
         covering = directive.covering,
         honor_mode = %honor_mode,
@@ -1820,17 +1818,61 @@ pub fn codegen_select(
                 },
                 PlannerSelectAccessKind::IndexEquality => {
                     if let Some(index_name) = directive.index_name.as_deref() {
-                        if let Some((index_column_name, target_expr)) = index_eq.as_ref() {
-                            if let Some(idx_schema) = find_index_named(table, index_name) {
-                                if let Some(reason) = directive_index_contract_bypass_reason(
-                                    directive,
-                                    idx_schema,
-                                    table,
-                                    table_alias,
-                                    columns,
-                                    index_column_name,
-                                ) {
-                                    Some(reason)
+                        if let Some(idx_schema) = find_index_named(table, index_name) {
+                            if let Some(reason) = directive_index_contract_bypass_reason(
+                                directive,
+                                idx_schema,
+                                table,
+                                table_alias,
+                                columns,
+                            ) {
+                                Some(reason)
+                            } else if directive.index_key_is_expression {
+                                if let Some(directive_target_expr) =
+                                    directive.index_equality_target.as_ref()
+                                {
+                                    match extract_expression_index_equality_expr(
+                                        where_clause.as_deref(),
+                                        idx_schema,
+                                    ) {
+                                        Some(actual_target_expr)
+                                            if actual_target_expr == directive_target_expr =>
+                                        {
+                                            log_planner_select_directive_outcome(
+                                                directive,
+                                                "honored",
+                                                "none",
+                                                "index_equality_probe",
+                                            );
+                                            return codegen_select_index_equality_scan(
+                                                b,
+                                                cursor,
+                                                table,
+                                                table_alias,
+                                                schema,
+                                                columns,
+                                                where_clause.as_deref(),
+                                                stmt.limit.as_ref(),
+                                                out_regs,
+                                                out_col_count,
+                                                done_label,
+                                                end_label,
+                                                idx_schema,
+                                                directive_target_expr,
+                                            );
+                                        }
+                                        Some(_) => Some("index_equality_target_mismatch"),
+                                        None => Some("index_equality_target_missing"),
+                                    }
+                                } else {
+                                    Some("index_equality_target_missing")
+                                }
+                            } else if let Some((index_column_name, target_expr)) = index_eq.as_ref()
+                            {
+                                if directive.index_key_label.as_deref().is_none_or(|label| {
+                                    !label.eq_ignore_ascii_case(index_column_name)
+                                }) {
+                                    Some("index_key_label_mismatch")
                                 } else {
                                     log_planner_select_directive_outcome(
                                         directive,
@@ -1856,10 +1898,10 @@ pub fn codegen_select(
                                     );
                                 }
                             } else {
-                                Some("index_not_found")
+                                Some("index_equality_target_missing")
                             }
                         } else {
-                            Some("index_equality_target_missing")
+                            Some("index_not_found")
                         }
                     } else {
                         Some("missing_index_name")
@@ -1867,23 +1909,64 @@ pub fn codegen_select(
                 }
                 PlannerSelectAccessKind::IndexRange => {
                     if let Some(index_name) = directive.index_name.as_deref() {
-                        if let Some((index_column_name, _candidate_idx, range_target)) =
-                            index_range.as_ref()
-                        {
-                            if let Some(idx_schema) = find_index_named(table, index_name) {
-                                if idx_schema.key_term_count() != 1
-                                    || idx_schema.key_term_descending(0)
+                        if let Some(idx_schema) = find_index_named(table, index_name) {
+                            if idx_schema.key_term_count() != 1 || idx_schema.key_term_descending(0)
+                            {
+                                Some("index_shape_unsupported")
+                            } else if let Some(reason) = directive_index_contract_bypass_reason(
+                                directive,
+                                idx_schema,
+                                table,
+                                table_alias,
+                                columns,
+                            ) {
+                                Some(reason)
+                            } else if directive.index_key_is_expression {
+                                if let Some(directive_range_target) =
+                                    directive.index_range_target.as_ref()
                                 {
-                                    Some("index_shape_unsupported")
-                                } else if let Some(reason) = directive_index_contract_bypass_reason(
-                                    directive,
-                                    idx_schema,
-                                    table,
-                                    table_alias,
-                                    columns,
-                                    index_column_name,
-                                ) {
-                                    Some(reason)
+                                    match extract_expression_index_range_target(
+                                        where_clause.as_deref(),
+                                        idx_schema,
+                                    ) {
+                                        Some(actual_range_target)
+                                            if &actual_range_target == directive_range_target =>
+                                        {
+                                            log_planner_select_directive_outcome(
+                                                directive,
+                                                "honored",
+                                                "none",
+                                                "index_range_scan",
+                                            );
+                                            return codegen_select_index_range_scan(
+                                                b,
+                                                cursor,
+                                                table,
+                                                table_alias,
+                                                schema,
+                                                columns,
+                                                stmt.limit.as_ref(),
+                                                out_regs,
+                                                out_col_count,
+                                                done_label,
+                                                end_label,
+                                                idx_schema,
+                                                directive_range_target.clone(),
+                                            );
+                                        }
+                                        Some(_) => Some("index_range_target_mismatch"),
+                                        None => Some("index_range_target_missing"),
+                                    }
+                                } else {
+                                    Some("index_range_target_missing")
+                                }
+                            } else if let Some((index_column_name, _candidate_idx, range_target)) =
+                                index_range.as_ref()
+                            {
+                                if directive.index_key_label.as_deref().is_none_or(|label| {
+                                    !label.eq_ignore_ascii_case(index_column_name)
+                                }) {
+                                    Some("index_key_label_mismatch")
                                 } else {
                                     log_planner_select_directive_outcome(
                                         directive,
@@ -1904,14 +1987,14 @@ pub fn codegen_select(
                                         done_label,
                                         end_label,
                                         idx_schema,
-                                        range_target.clone(),
+                                        planner_index_range_target_from_column_range(range_target),
                                     );
                                 }
                             } else {
-                                Some("index_not_found")
+                                Some("index_range_target_missing")
                             }
                         } else {
-                            Some("index_range_target_missing")
+                            Some("index_not_found")
                         }
                     } else {
                         Some("missing_index_name")
@@ -1990,7 +2073,7 @@ pub fn codegen_select(
             done_label,
             end_label,
             idx_schema,
-            index_range,
+            planner_index_range_target_from_column_range(&index_range),
         )
     } else if let Some((col_name, target_expr)) = index_eq.filter(|_| stmt.order_by.is_empty()) {
         // --- Index-seek SELECT (only when no ORDER BY, since the index
@@ -2585,6 +2668,21 @@ struct ColumnRangeTarget<'a> {
     upper: Option<ColumnRangeBound<'a>>,
 }
 
+fn planner_index_range_target_from_column_range(
+    range: &ColumnRangeTarget<'_>,
+) -> PlannerIndexRangeTarget {
+    PlannerIndexRangeTarget {
+        lower: range.lower.as_ref().map(|bound| PlannerIndexRangeBound {
+            expr: bound.expr().clone(),
+            inclusive: bound.inclusive,
+        }),
+        upper: range.upper.as_ref().map(|bound| PlannerIndexRangeBound {
+            expr: bound.expr().clone(),
+            inclusive: bound.inclusive,
+        }),
+    }
+}
+
 /// Generate VDBE bytecode for a bounded rowid/IPK scan.
 ///
 /// This specializes the common `rowid >= low AND rowid < high` shape into a
@@ -2787,7 +2885,7 @@ fn codegen_select_index_range_scan(
     done_label: crate::Label,
     end_label: crate::Label,
     idx_schema: &IndexSchema,
-    index_range: ColumnRangeTarget<'_>,
+    index_range: PlannerIndexRangeTarget,
 ) -> Result<(), CodegenError> {
     let idx_cursor = cursor + 1;
     let limit_reg = limit_clause.map(|lc| {
@@ -2809,14 +2907,14 @@ fn codegen_select_index_range_scan(
 
     let lower_probe = index_range.lower.as_ref().map(|bound| {
         let base = b.alloc_regs(2);
-        emit_expr(b, bound.expr(), base, None);
+        emit_expr(b, &bound.expr, base, None);
         b.emit_jump_to_label(Opcode::IsNull, base, 0, done_label, P4::None, 0);
         b.emit_op(Opcode::Int64, 0, base + 1, 0, P4::Int64(i64::MIN), 0);
         (base, bound.clone())
     });
     let upper_reg = index_range.upper.as_ref().map(|bound| {
         let reg = b.alloc_reg();
-        emit_expr(b, bound.expr(), reg, None);
+        emit_expr(b, &bound.expr, reg, None);
         b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
         reg
     });
@@ -13435,17 +13533,8 @@ fn resolve_sort_key(
     table_alias: Option<&str>,
     columns: &[ResultColumn],
 ) -> SortKeySource {
-    // Handle numeric column index (ORDER BY 1, ORDER BY 2, etc.).
-    if let Expr::Literal(Literal::Integer(n), _) = expr {
-        let idx = usize::try_from(*n).unwrap_or(0);
-        if idx >= 1 && idx <= columns.len() {
-            let result_col = &columns[idx - 1];
-            // Extract the underlying expression from the result column and
-            // recursively resolve it as a sort key.
-            if let ResultColumn::Expr { expr: col_expr, .. } = result_col {
-                return resolve_sort_key(col_expr, table, table_alias, columns);
-            }
-        }
+    if let Some(output_expr) = resolve_order_by_output_expr(expr, columns) {
+        return resolve_sort_key(output_expr, table, table_alias, columns);
     }
 
     if let Expr::Column(col_ref, _) = expr {
@@ -13460,23 +13549,55 @@ fn resolve_sort_key(
         if table.resolves_to_hidden_rowid(&col_ref.column) {
             return SortKeySource::Rowid;
         }
-        // Check if the unqualified name matches a result column alias
-        // (e.g. `ORDER BY total` where `total` is `price * qty AS total`).
-        if col_ref.table.is_none() {
-            for col in columns {
-                if let ResultColumn::Expr {
-                    alias: Some(alias),
-                    expr: col_expr,
-                } = col
-                {
-                    if alias.eq_ignore_ascii_case(&col_ref.column) {
-                        return resolve_sort_key(col_expr, table, table_alias, columns);
-                    }
-                }
-            }
-        }
     }
     SortKeySource::Expression(expr.clone())
+}
+
+fn resolve_order_by_output_expr<'a>(
+    expr: &'a Expr,
+    columns: &'a [ResultColumn],
+) -> Option<&'a Expr> {
+    if let Expr::Literal(Literal::Integer(n), _) = expr {
+        let idx = usize::try_from(*n).ok()?;
+        if idx == 0 || idx > columns.len() {
+            return None;
+        }
+        return match &columns[idx - 1] {
+            ResultColumn::Expr {
+                expr: output_expr, ..
+            } => Some(output_expr),
+            ResultColumn::Star | ResultColumn::TableStar(_) => None,
+        };
+    }
+
+    let Expr::Column(col_ref, _) = expr else {
+        return None;
+    };
+    if col_ref.table.is_some() {
+        return None;
+    }
+
+    columns.iter().find_map(|column| {
+        let ResultColumn::Expr {
+            alias: Some(alias),
+            expr: output_expr,
+        } = column
+        else {
+            return None;
+        };
+        if !alias.eq_ignore_ascii_case(&col_ref.column) {
+            return None;
+        }
+        match output_expr {
+            Expr::Column(output_col_ref, _)
+                if output_col_ref.table.is_none()
+                    && output_col_ref.column.eq_ignore_ascii_case(&col_ref.column) =>
+            {
+                None
+            }
+            _ => Some(output_expr),
+        }
+    })
 }
 
 /// Resolve a column reference expression to either a column index or rowid.
@@ -13668,18 +13789,7 @@ fn resolve_order_by_rowid_direction(
         return None;
     }
 
-    let resolved_expr = if let Expr::Literal(Literal::Integer(n), _) = &term.expr {
-        let idx = usize::try_from(*n).ok()?;
-        if idx == 0 || idx > columns.len() {
-            return None;
-        }
-        match &columns[idx - 1] {
-            ResultColumn::Expr { expr, .. } => expr,
-            ResultColumn::Star | ResultColumn::TableStar(_) => return None,
-        }
-    } else {
-        &term.expr
-    };
+    let resolved_expr = resolve_order_by_output_expr(&term.expr, columns).unwrap_or(&term.expr);
 
     matches!(
         resolve_column_ref(resolved_expr, table, table_alias),
@@ -13716,22 +13826,7 @@ fn resolve_order_by_index_plan(
             direction = Some(term_direction);
         }
 
-        // Resolve numeric column indices (e.g., ORDER BY 2) to the
-        // corresponding result column expression before checking for column refs.
-        let resolved_expr = if let Expr::Literal(Literal::Integer(n), _) = &term.expr {
-            let idx = usize::try_from(*n).unwrap_or(0);
-            if idx >= 1 && idx <= columns.len() {
-                if let ResultColumn::Expr { expr, .. } = &columns[idx - 1] {
-                    expr
-                } else {
-                    return None;
-                }
-            } else {
-                return None;
-            }
-        } else {
-            &term.expr
-        };
+        let resolved_expr = resolve_order_by_output_expr(&term.expr, columns).unwrap_or(&term.expr);
 
         let Expr::Column(col_ref, _) = resolved_expr else {
             return None;
@@ -14117,6 +14212,204 @@ fn extract_column_eq_target<'a>(
         }
     }
     None
+}
+
+#[allow(dead_code)]
+fn extract_expression_index_equality_expr<'a>(
+    where_clause: Option<&'a Expr>,
+    index: &IndexSchema,
+) -> Option<&'a Expr> {
+    let expr = where_clause?;
+    let key_expr = parse_sql_expr(index.key_term_sql(0)?).ok()?;
+    let Expr::BinaryOp {
+        left,
+        op: fsqlite_ast::BinaryOp::Eq,
+        right,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+
+    if **left == key_expr && is_simple_constant(right) {
+        return Some(right);
+    }
+    if **right == key_expr && is_simple_constant(left) {
+        return Some(left);
+    }
+    None
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum PlannerIndexRangeSlot {
+    Lower,
+    Upper,
+}
+
+#[allow(dead_code)]
+fn extract_expression_index_range_target(
+    where_clause: Option<&Expr>,
+    index: &IndexSchema,
+) -> Option<PlannerIndexRangeTarget> {
+    let expr = where_clause?;
+    let key_expr = parse_sql_expr(index.key_term_sql(0)?).ok()?;
+    let mut target = PlannerIndexRangeTarget::default();
+    if collect_expression_index_range_bounds(expr, &key_expr, &mut target)
+        && (target.lower.is_some() || target.upper.is_some())
+    {
+        Some(target)
+    } else {
+        None
+    }
+}
+
+#[allow(dead_code)]
+fn collect_expression_index_range_bounds(
+    expr: &Expr,
+    key_expr: &Expr,
+    target: &mut PlannerIndexRangeTarget,
+) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::And,
+            right,
+            ..
+        } => {
+            collect_expression_index_range_bounds(left, key_expr, target)
+                && collect_expression_index_range_bounds(right, key_expr, target)
+        }
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => extract_expression_index_range_bound(left, *op, right, key_expr)
+            .is_some_and(|(slot, bound)| assign_expression_index_range_bound(target, slot, bound)),
+        Expr::Between {
+            expr: operand,
+            low,
+            high,
+            not: false,
+            ..
+        } if **operand == *key_expr
+            && is_index_range_constant(low)
+            && is_index_range_constant(high) =>
+        {
+            assign_expression_index_range_bound(
+                target,
+                PlannerIndexRangeSlot::Lower,
+                PlannerIndexRangeBound {
+                    expr: low.as_ref().clone(),
+                    inclusive: true,
+                },
+            ) && assign_expression_index_range_bound(
+                target,
+                PlannerIndexRangeSlot::Upper,
+                PlannerIndexRangeBound {
+                    expr: high.as_ref().clone(),
+                    inclusive: true,
+                },
+            )
+        }
+        _ => false,
+    }
+}
+
+#[allow(dead_code)]
+fn extract_expression_index_range_bound(
+    left: &Expr,
+    op: fsqlite_ast::BinaryOp,
+    right: &Expr,
+    key_expr: &Expr,
+) -> Option<(PlannerIndexRangeSlot, PlannerIndexRangeBound)> {
+    use fsqlite_ast::BinaryOp::{Ge, Gt, Le, Lt};
+
+    if left == key_expr && is_index_range_constant(right) {
+        return match op {
+            Ge => Some((
+                PlannerIndexRangeSlot::Lower,
+                PlannerIndexRangeBound {
+                    expr: right.clone(),
+                    inclusive: true,
+                },
+            )),
+            Gt => Some((
+                PlannerIndexRangeSlot::Lower,
+                PlannerIndexRangeBound {
+                    expr: right.clone(),
+                    inclusive: false,
+                },
+            )),
+            Le => Some((
+                PlannerIndexRangeSlot::Upper,
+                PlannerIndexRangeBound {
+                    expr: right.clone(),
+                    inclusive: true,
+                },
+            )),
+            Lt => Some((
+                PlannerIndexRangeSlot::Upper,
+                PlannerIndexRangeBound {
+                    expr: right.clone(),
+                    inclusive: false,
+                },
+            )),
+            _ => None,
+        };
+    }
+
+    if right == key_expr && is_index_range_constant(left) {
+        return match op {
+            Le => Some((
+                PlannerIndexRangeSlot::Lower,
+                PlannerIndexRangeBound {
+                    expr: left.clone(),
+                    inclusive: true,
+                },
+            )),
+            Lt => Some((
+                PlannerIndexRangeSlot::Lower,
+                PlannerIndexRangeBound {
+                    expr: left.clone(),
+                    inclusive: false,
+                },
+            )),
+            Ge => Some((
+                PlannerIndexRangeSlot::Upper,
+                PlannerIndexRangeBound {
+                    expr: left.clone(),
+                    inclusive: true,
+                },
+            )),
+            Gt => Some((
+                PlannerIndexRangeSlot::Upper,
+                PlannerIndexRangeBound {
+                    expr: left.clone(),
+                    inclusive: false,
+                },
+            )),
+            _ => None,
+        };
+    }
+
+    None
+}
+
+#[allow(dead_code)]
+fn assign_expression_index_range_bound(
+    target: &mut PlannerIndexRangeTarget,
+    slot: PlannerIndexRangeSlot,
+    bound: PlannerIndexRangeBound,
+) -> bool {
+    let target_slot = match slot {
+        PlannerIndexRangeSlot::Lower => &mut target.lower,
+        PlannerIndexRangeSlot::Upper => &mut target.upper,
+    };
+    if target_slot.is_some() {
+        false
+    } else {
+        *target_slot = Some(bound);
+        true
+    }
 }
 
 enum CountIndexedInTarget<'a> {
@@ -18024,6 +18317,32 @@ mod tests {
         }]
     }
 
+    fn test_schema_with_expression_index() -> Vec<TableSchema> {
+        vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("a", 'd', false),
+                ColumnInfo::basic("name", 'B', false),
+            ],
+            indexes: vec![IndexSchema {
+                name: "idx_t_lower_name".to_owned(),
+                root_page: 3,
+                columns: Vec::new(),
+                key_expressions: vec!["lower(name)".to_owned()],
+                key_sort_directions: vec![],
+                where_clause: None,
+                is_unique: false,
+                key_collations: vec![],
+            }],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }]
+    }
+
     fn test_small_bench_schema() -> Vec<TableSchema> {
         vec![TableSchema {
             name: "bench".to_owned(),
@@ -18544,6 +18863,20 @@ mod tests {
         })
     }
 
+    fn expr_sql(sql: &str) -> Expr {
+        parse_sql_expr(sql).expect("test expression SQL should parse")
+    }
+
+    fn lower_name_eq_param(n: u32) -> Box<Expr> {
+        Box::new(expr_sql(&format!("lower(name) = ?{n}")))
+    }
+
+    fn lower_name_range_params(lower: u32, upper: u32) -> Box<Expr> {
+        Box::new(expr_sql(&format!(
+            "lower(name) >= ?{lower} AND lower(name) < ?{upper}"
+        )))
+    }
+
     fn col_eq_param(col: &str, n: u32) -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare(col), Span::ZERO)),
@@ -18781,6 +19114,44 @@ mod tests {
         }]
     }
 
+    fn schema_with_visible_rowid_column_and_a_indexes() -> Vec<TableSchema> {
+        vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("a", 'd', false),
+                ColumnInfo::basic("rowid", 'C', false),
+            ],
+            indexes: vec![
+                IndexSchema {
+                    name: "idx_t_a".to_owned(),
+                    root_page: 3,
+                    columns: vec!["a".to_owned()],
+                    key_expressions: vec!["a".to_owned()],
+                    key_sort_directions: vec![],
+                    where_clause: None,
+                    is_unique: false,
+                    key_collations: vec![],
+                },
+                IndexSchema {
+                    name: "idx_t_rowid".to_owned(),
+                    root_page: 4,
+                    columns: vec!["rowid".to_owned()],
+                    key_expressions: vec!["rowid".to_owned()],
+                    key_sort_directions: vec![],
+                    where_clause: None,
+                    is_unique: false,
+                    key_collations: vec![],
+                },
+            ],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }]
+    }
+
     // === Test 1: SELECT by rowid ===
     #[test]
     fn test_codegen_select_by_rowid() {
@@ -18793,7 +19164,6 @@ mod tests {
                 planner_surface: "single_table_access_path_v1".to_owned(),
                 table_name: "messages".to_owned(),
                 index_name: Some("sqlite_autoindex_messages_1".to_owned()),
-                index_column: Some("conversation_id".to_owned()),
                 index_key_label: Some("conversation_id".to_owned()),
                 index_key_is_expression: false,
                 index_equality_target: None,
@@ -20872,7 +21242,6 @@ mod tests {
                 planner_surface: "single_table_access_path_v1".to_owned(),
                 table_name: "t".to_owned(),
                 index_name: None,
-                index_column: None,
                 index_key_label: None,
                 index_key_is_expression: false,
                 index_equality_target: None,
@@ -20916,7 +21285,6 @@ mod tests {
                 planner_surface: "single_table_access_path_v1".to_owned(),
                 table_name: "t".to_owned(),
                 index_name: None,
-                index_column: None,
                 index_key_label: None,
                 index_key_is_expression: false,
                 index_equality_target: None,
@@ -20955,7 +21323,6 @@ mod tests {
                 planner_surface: "single_table_access_path_v1".to_owned(),
                 table_name: "t".to_owned(),
                 index_name: Some("idx_t_b".to_owned()),
-                index_column: Some("b".to_owned()),
                 index_key_label: Some("b".to_owned()),
                 index_key_is_expression: false,
                 index_equality_target: None,
@@ -20996,6 +21363,141 @@ mod tests {
                 op.opcode == Opcode::OpenRead && matches!(&op.p4, P4::Table(name) if name == "t")
             }),
             "covering equality fast path should retain a lazy table-open fallback"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_honors_expression_planner_index_equality_directive() {
+        let stmt = simple_select(&["name"], "t", Some(lower_name_eq_param(1)));
+        let schema = test_schema_with_expression_index();
+        let ctx = CodegenContext {
+            planner_select_directive: Some(SelectPlannerDirective {
+                plan_id: "plan-expression-equality".to_owned(),
+                plan_generation: 1,
+                planner_surface: "single_table_access_path_v1".to_owned(),
+                table_name: "t".to_owned(),
+                index_name: Some("idx_t_lower_name".to_owned()),
+                index_key_label: Some("lower(name)".to_owned()),
+                index_key_is_expression: true,
+                index_equality_target: Some(placeholder(1)),
+                index_range_target: None,
+                covering: false,
+                access_kind: PlannerSelectAccessKind::IndexEquality,
+            }),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Index(name) if name == "idx_t_lower_name")
+            }),
+            "expression planner directive should open the chosen expression index"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "expression equality directive should lower to an index probe"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_honors_expression_planner_index_range_directive() {
+        let stmt = simple_select(&["name"], "t", Some(lower_name_range_params(1, 2)));
+        let schema = test_schema_with_expression_index();
+        let ctx = CodegenContext {
+            planner_select_directive: Some(SelectPlannerDirective {
+                plan_id: "plan-expression-range".to_owned(),
+                plan_generation: 1,
+                planner_surface: "single_table_access_path_v1".to_owned(),
+                table_name: "t".to_owned(),
+                index_name: Some("idx_t_lower_name".to_owned()),
+                index_key_label: Some("lower(name)".to_owned()),
+                index_key_is_expression: true,
+                index_equality_target: None,
+                index_range_target: Some(PlannerIndexRangeTarget {
+                    lower: Some(PlannerIndexRangeBound {
+                        expr: placeholder(1),
+                        inclusive: true,
+                    }),
+                    upper: Some(PlannerIndexRangeBound {
+                        expr: placeholder(2),
+                        inclusive: false,
+                    }),
+                }),
+                covering: false,
+                access_kind: PlannerSelectAccessKind::IndexRange,
+            }),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Index(name) if name == "idx_t_lower_name")
+            }),
+            "expression range directive should open the chosen expression index"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "expression range directive should lower to an index range probe"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_bypasses_expression_planner_index_directive_with_residual_filter() {
+        let stmt = simple_select(
+            &["name"],
+            "t",
+            Some(and_expr(
+                lower_name_eq_param(1),
+                col_cmp_param("a", AstBinaryOp::Eq, 2),
+            )),
+        );
+        let schema = test_schema_with_expression_index();
+        let ctx = CodegenContext {
+            planner_select_directive: Some(SelectPlannerDirective {
+                plan_id: "plan-expression-residual".to_owned(),
+                plan_generation: 1,
+                planner_surface: "single_table_access_path_v1".to_owned(),
+                table_name: "t".to_owned(),
+                index_name: Some("idx_t_lower_name".to_owned()),
+                index_key_label: Some("lower(name)".to_owned()),
+                index_key_is_expression: true,
+                index_equality_target: Some(placeholder(1)),
+                index_range_target: None,
+                covering: false,
+                access_kind: PlannerSelectAccessKind::IndexEquality,
+            }),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            !ops.iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Index(name) if name == "idx_t_lower_name")
+            }),
+            "residual predicates should bypass the expression-index directive fast path"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
+            "bypassed expression directive should fall back to a scan"
+        );
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "bypassed expression directive must not emit an index seek"
         );
     }
 
@@ -22452,6 +22954,119 @@ mod tests {
                 )
             }),
             "descending index-assisted ORDER BY should bypass sorter"
+        );
+    }
+
+    #[test]
+    fn test_resolve_sort_key_prefers_result_alias_named_rowid_over_visible_column() {
+        let order_by_expr = Expr::Column(ColumnRef::bare("rowid"), Span::ZERO);
+        let columns = vec![ResultColumn::Expr {
+            expr: Expr::Column(ColumnRef::bare("a"), Span::ZERO),
+            alias: Some("rowid".to_owned()),
+        }];
+        let schema = schema_with_visible_rowid_column_and_a_indexes();
+
+        assert!(matches!(
+            resolve_sort_key(&order_by_expr, &schema[0], None, &columns),
+            SortKeySource::Column(0)
+        ));
+    }
+
+    #[test]
+    fn test_codegen_select_order_by_alias_named_rowid_uses_sorter_not_hidden_rowid_scan() {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::bare("a"), Span::ZERO),
+                        alias: Some("rowid".to_owned()),
+                    }],
+                    from: Some(from_table("t")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![OrderingTerm {
+                expr: Expr::Column(ColumnRef::bare("rowid"), Span::ZERO),
+                direction: None,
+                nulls: None,
+            }],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::SorterOpen),
+            "ORDER BY alias named rowid should sort by the output expression, not stream hidden rowid order"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_order_by_alias_named_rowid_prefers_alias_index() {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::bare("a"), Span::ZERO),
+                        alias: Some("rowid".to_owned()),
+                    }],
+                    from: Some(from_table("t")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![OrderingTerm {
+                expr: Expr::Column(ColumnRef::bare("rowid"), Span::ZERO),
+                direction: None,
+                nulls: None,
+            }],
+            limit: None,
+        };
+        let schema = schema_with_visible_rowid_column_and_a_indexes();
+        let ctx = CodegenContext {
+            index_ordered_scan_reliable: true,
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::OpenRead
+                && matches!(&op.p4, P4::Index(name) if name == "idx_t_a")),
+            "ORDER BY alias should use the aliased expression's index"
+        );
+        assert!(
+            !prog.ops().iter().any(|op| op.opcode == Opcode::OpenRead
+                && matches!(&op.p4, P4::Index(name) if name == "idx_t_rowid")),
+            "visible rowid column index must not override SELECT-list alias precedence"
+        );
+        assert!(
+            !prog.ops().iter().any(|op| {
+                matches!(
+                    op.opcode,
+                    Opcode::SorterOpen
+                        | Opcode::SorterInsert
+                        | Opcode::SorterSort
+                        | Opcode::SorterData
+                        | Opcode::SorterNext
+                )
+            }),
+            "aliased-column index ORDER BY should bypass the sorter"
         );
     }
 

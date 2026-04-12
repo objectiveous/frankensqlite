@@ -710,7 +710,8 @@ impl VirtualTableCursor for JsonEachCursor {
             ctx.set_value(SqliteValue::Null);
             return Ok(());
         };
-        write_json_table_column(row, ctx, col)
+        write_json_table_column(row, ctx, col);
+        Ok(())
     }
 
     fn rowid(&self) -> Result<i64> {
@@ -776,7 +777,8 @@ impl VirtualTableCursor for JsonTreeCursor {
             ctx.set_value(SqliteValue::Null);
             return Ok(());
         };
-        write_json_table_column(row, ctx, col)
+        write_json_table_column(row, ctx, col);
+        Ok(())
     }
 
     fn rowid(&self) -> Result<i64> {
@@ -1370,8 +1372,7 @@ fn parse_json_table_filter_args(args: &[SqliteValue]) -> Result<(Value, Option<&
 
     Ok((input_value, path))
 }
-
-fn write_json_table_column(row: &JsonTableRow, ctx: &mut ColumnContext, col: i32) -> Result<()> {
+fn write_json_table_column(row: &JsonTableRow, ctx: &mut ColumnContext, col: i32) {
     let value = match col {
         0 => row.key.clone(),
         1 => row.value.clone(),
@@ -1384,7 +1385,6 @@ fn write_json_table_column(row: &JsonTableRow, ctx: &mut ColumnContext, col: i32
         _ => SqliteValue::Null,
     };
     ctx.set_value(value);
-    Ok(())
 }
 
 fn json_type_name(value: &Value) -> &'static str {

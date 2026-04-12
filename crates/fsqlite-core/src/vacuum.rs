@@ -2,22 +2,22 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Mutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
 };
 
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_types::DatabaseHeader;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::value::SqliteValue;
-use fsqlite_types::DatabaseHeader;
 use fsqlite_vdbe::codegen::TableSchema;
 use fsqlite_vdbe::engine::MemDatabase;
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_vfs::host_fs;
 
+use crate::compat_persist::SqliteMasterEntry;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::compat_persist::persist_to_sqlite_with_header_and_master_entries;
-use crate::compat_persist::SqliteMasterEntry;
 
 pub(crate) const ATTACHED_SCHEMA_UNSUPPORTED: &str = "VACUUM on attached schemas";
 pub(crate) const NON_TEXT_FILENAME: &str = "non-text filename";
@@ -210,7 +210,7 @@ mod tests {
     use fsqlite_types::value::SqliteValue;
 
     use super::{
-        resolve_vacuum_into_target, take_temp_vacuum_into_discard_target, NON_TEXT_FILENAME,
+        NON_TEXT_FILENAME, resolve_vacuum_into_target, take_temp_vacuum_into_discard_target,
     };
 
     #[test]

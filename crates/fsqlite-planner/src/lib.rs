@@ -2511,13 +2511,13 @@ fn analyze_skip_scan_candidate(
 
         match &term.kind {
             WhereTermKind::Equality => second_column_summary.has_equality = true,
-            WhereTermKind::InList { count } if *count > 0 => {
-                if second_column_summary
-                    .first_in_probe_count
-                    .is_none_or(|existing| *count < existing)
-                {
-                    second_column_summary.first_in_probe_count = Some(*count);
-                }
+            WhereTermKind::InList { count }
+                if *count > 0
+                    && second_column_summary
+                        .first_in_probe_count
+                        .is_none_or(|existing| *count < existing) =>
+            {
+                second_column_summary.first_in_probe_count = Some(*count);
             }
             WhereTermKind::Range | WhereTermKind::Between | WhereTermKind::LikePrefix { .. } => {
                 second_column_summary.has_range = true;

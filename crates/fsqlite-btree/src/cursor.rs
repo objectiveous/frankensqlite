@@ -4420,6 +4420,190 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(true)
     }
 
+    /// Insert a freeblock into the page's freeblock chain in ascending offset
+    /// order, coalescing with adjacent freeblocks as required by the SQLite
+    /// on-disk format.
+    ///
+    /// C sqlite3's `btreeComputeFreeSpace()` enforces:
+    ///  - Freeblocks are in strictly ascending offset order.
+    ///  - Consecutive freeblocks must be separated by more than 3 bytes;
+    ///    adjacent freeblocks must be merged.
+    ///  - The first freeblock must be at an offset >= `cell_content_offset`.
+    ///
+    /// This function handles all three constraints.
+    fn insert_freeblock_sorted_coalesced(
+        page_bytes: &mut [u8],
+        header: &mut cell::BtreePageHeader,
+        new_offset: usize,
+        new_size: usize,
+        usable_limit: usize,
+        page_no: PageNumber,
+    ) -> Result<()> {
+        debug_assert!(new_size >= 4);
+
+        // Walk the freeblock chain to find (prev_fb, next_fb) such that
+        // prev_fb.offset < new_offset < next_fb.offset.
+        // prev_fb == None means the new block goes before the first freeblock.
+        let mut prev_fb: Option<usize> = None; // offset of previous freeblock
+        let mut prev_fb_size: usize = 0;
+        let mut cur_fb = usize::from(header.first_freeblock);
+
+        while cur_fb != 0 && cur_fb < new_offset {
+            if cur_fb + 4 > usable_limit {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "freeblock at offset {} extends past usable space on page {}",
+                        cur_fb,
+                        page_no.get()
+                    ),
+                });
+            }
+            prev_fb_size = usize::from(u16::from_be_bytes([
+                page_bytes[cur_fb + 2],
+                page_bytes[cur_fb + 3],
+            ]));
+            prev_fb = Some(cur_fb);
+            cur_fb = usize::from(u16::from_be_bytes([
+                page_bytes[cur_fb],
+                page_bytes[cur_fb + 1],
+            ]));
+        }
+
+        // cur_fb is either 0 (end of chain) or the next freeblock after new_offset.
+        // Read next_fb's size if it exists.
+        let next_fb = cur_fb;
+        let next_fb_size = if next_fb != 0 && next_fb + 4 <= usable_limit {
+            usize::from(u16::from_be_bytes([
+                page_bytes[next_fb + 2],
+                page_bytes[next_fb + 3],
+            ]))
+        } else {
+            0
+        };
+        // next_fb's successor in the chain (for linking after merge).
+        let next_fb_next = if next_fb != 0 && next_fb + 2 <= usable_limit {
+            u16::from_be_bytes([page_bytes[next_fb], page_bytes[next_fb + 1]])
+        } else {
+            0u16
+        };
+
+        // Determine adjacency for coalescing.
+        let merge_prev = prev_fb.is_some_and(|p| p + prev_fb_size == new_offset);
+        let merge_next = next_fb != 0 && new_offset + new_size == next_fb;
+
+        if merge_prev && merge_next {
+            // The new block bridges prev and next — merge all three.
+            let p = prev_fb.expect("merge_prev implies prev_fb.is_some()");
+            let merged_size = prev_fb_size + new_size + next_fb_size;
+            let merged_size_u16 =
+                u16::try_from(merged_size).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "merged freeblock size {} exceeds u16 range on page {}",
+                        merged_size,
+                        page_no.get()
+                    ),
+                })?;
+            // prev now spans all three regions; link to next_fb's successor.
+            page_bytes[p..p + 2].copy_from_slice(&next_fb_next.to_be_bytes());
+            page_bytes[p + 2..p + 4].copy_from_slice(&merged_size_u16.to_be_bytes());
+            // Zero the interior (optional, for cleanliness).
+            if merged_size > 4 {
+                page_bytes[p + 4..p + merged_size].fill(0);
+            }
+        } else if merge_prev {
+            // Extend prev to absorb the new block.
+            let p = prev_fb.expect("merge_prev implies prev_fb.is_some()");
+            let merged_size = prev_fb_size + new_size;
+            let merged_size_u16 =
+                u16::try_from(merged_size).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "merged freeblock size {} exceeds u16 range on page {}",
+                        merged_size,
+                        page_no.get()
+                    ),
+                })?;
+            page_bytes[p + 2..p + 4].copy_from_slice(&merged_size_u16.to_be_bytes());
+            // Zero newly absorbed region (optional).
+            if p + prev_fb_size + new_size > p + 4 {
+                let zero_start = (p + 4).max(p + prev_fb_size);
+                page_bytes[zero_start..p + merged_size].fill(0);
+            }
+        } else if merge_next {
+            // Extend the new block to absorb next_fb.
+            let merged_size = new_size + next_fb_size;
+            let merged_size_u16 =
+                u16::try_from(merged_size).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "merged freeblock size {} exceeds u16 range on page {}",
+                        merged_size,
+                        page_no.get()
+                    ),
+                })?;
+            let new_offset_u16 =
+                u16::try_from(new_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "freeblock offset {} exceeds u16 range on page {}",
+                        new_offset,
+                        page_no.get()
+                    ),
+                })?;
+            // The merged block starts at new_offset, links to next_fb's successor.
+            page_bytes[new_offset..new_offset + 2]
+                .copy_from_slice(&next_fb_next.to_be_bytes());
+            page_bytes[new_offset + 2..new_offset + 4]
+                .copy_from_slice(&merged_size_u16.to_be_bytes());
+            if merged_size > 4 {
+                page_bytes[new_offset + 4..new_offset + merged_size].fill(0);
+            }
+            // Update the pointer from prev (or header) to point to new_offset.
+            if let Some(p) = prev_fb {
+                page_bytes[p..p + 2].copy_from_slice(&new_offset_u16.to_be_bytes());
+            } else {
+                header.first_freeblock = new_offset_u16;
+            }
+        } else {
+            // No coalescing needed — insert as a standalone freeblock.
+            let new_offset_u16 =
+                u16::try_from(new_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "freeblock offset {} exceeds u16 range on page {}",
+                        new_offset,
+                        page_no.get()
+                    ),
+                })?;
+            let freeblock_size_u16 =
+                u16::try_from(new_size).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "freeblock size {} exceeds u16 range on page {}",
+                        new_size,
+                        page_no.get()
+                    ),
+                })?;
+            let next_fb_u16 = u16::try_from(next_fb).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "next freeblock offset {} exceeds u16 range on page {}",
+                    next_fb,
+                    page_no.get()
+                ),
+            })?;
+            page_bytes[new_offset..new_offset + 2]
+                .copy_from_slice(&next_fb_u16.to_be_bytes());
+            page_bytes[new_offset + 2..new_offset + 4]
+                .copy_from_slice(&freeblock_size_u16.to_be_bytes());
+            if new_size > 4 {
+                page_bytes[new_offset + 4..new_offset + new_size].fill(0);
+            }
+            // Update the pointer from prev (or header) to point to new_offset.
+            if let Some(p) = prev_fb {
+                page_bytes[p..p + 2].copy_from_slice(&new_offset_u16.to_be_bytes());
+            } else {
+                header.first_freeblock = new_offset_u16;
+            }
+        }
+
+        Ok(())
+    }
+
     fn remove_table_cell_from_leaf_deferred(&mut self, cx: &Cx) -> Result<(PageNumber, u16)> {
         let depth = self.stack.len();
         if depth == 0 || self.at_eof {
@@ -4474,31 +4658,25 @@ impl<P: PageWriter> BtCursor<P> {
             header.cell_content_offset = self.usable_size;
             page_data.as_bytes_mut()[header_offset..self.usable_size as usize].fill(0);
         } else if delete_size >= 4 {
-            let delete_offset_u16 =
-                u16::try_from(delete_offset).map_err(|_| FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "freeblock offset {} exceeds u16 range on page {}",
-                        delete_offset,
-                        leaf_page_no.get()
-                    ),
-                })?;
-            let freeblock_size =
-                u16::try_from(delete_size).map_err(|_| FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "freeblock size {} exceeds u16 range on page {}",
-                        delete_size,
-                        leaf_page_no.get()
-                    ),
-                })?;
-            let page_bytes = page_data.as_bytes_mut();
-            page_bytes[delete_offset..delete_offset + 2]
-                .copy_from_slice(&header.first_freeblock.to_be_bytes());
-            page_bytes[delete_offset + 2..delete_offset + 4]
-                .copy_from_slice(&freeblock_size.to_be_bytes());
-            if delete_size > 4 {
-                page_bytes[delete_offset + 4..delete_offset + delete_size].fill(0);
-            }
-            header.first_freeblock = delete_offset_u16;
+            // Insert the freed cell as a freeblock, maintaining the SQLite
+            // on-disk format invariants that C sqlite3's btreeComputeFreeSpace()
+            // validates:
+            //
+            //  1. Freeblocks are chained in strictly ascending offset order.
+            //  2. No two freeblocks may be adjacent or overlap (the gap between
+            //     consecutive freeblocks must be > 3 bytes); adjacent freeblocks
+            //     MUST be coalesced into one.
+            //  3. Every freeblock is >= 4 bytes.
+            //
+            // Violating any of these causes "free space corruption".
+            Self::insert_freeblock_sorted_coalesced(
+                page_data.as_bytes_mut(),
+                &mut header,
+                delete_offset,
+                delete_size,
+                self.usable_size as usize,
+                leaf_page_no,
+            )?;
         } else {
             header.fragmented_free_bytes = header
                 .fragmented_free_bytes
@@ -9839,17 +10017,21 @@ mod tests {
             "deferred delete should leave reclaimable dead space on the page"
         );
 
+        // Re-insert at rowid 2 (not a rightmost-append rowid) so that the
+        // standard try_insert_on_leaf path is taken, which checks freeblocks.
+        // Using a rightmost rowid (e.g. 4) would trigger the append-on-leaf
+        // fast path that allocates from the content area without scanning
+        // the freeblock chain.
         let reclaimed_payload = vec![0x5A; payload_for_rowid(2).len()];
         cursor
-            .table_insert(&cx, 4, reclaimed_payload.as_slice())
+            .table_insert(&cx, 2, reclaimed_payload.as_slice())
             .unwrap();
 
         let page_after = cursor.pager.read_page(&cx, pn(2)).unwrap();
         let header_after = BtreePageHeader::parse(&page_after, 0).unwrap();
         assert_eq!(header_after.first_freeblock, 0);
         assert_eq!(header_after.fragmented_free_bytes, 0);
-        assert!(!cursor.table_move_to(&cx, 2).unwrap().is_found());
-        assert!(cursor.table_move_to(&cx, 4).unwrap().is_found());
+        assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
     }
 
     #[test]

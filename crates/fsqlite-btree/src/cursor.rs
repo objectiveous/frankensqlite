@@ -4548,8 +4548,7 @@ impl<P: PageWriter> BtCursor<P> {
                     ),
                 })?;
             // The merged block starts at new_offset, links to next_fb's successor.
-            page_bytes[new_offset..new_offset + 2]
-                .copy_from_slice(&next_fb_next.to_be_bytes());
+            page_bytes[new_offset..new_offset + 2].copy_from_slice(&next_fb_next.to_be_bytes());
             page_bytes[new_offset + 2..new_offset + 4]
                 .copy_from_slice(&merged_size_u16.to_be_bytes());
             if merged_size > 4 {
@@ -4579,15 +4578,15 @@ impl<P: PageWriter> BtCursor<P> {
                         page_no.get()
                     ),
                 })?;
-            let next_fb_u16 = u16::try_from(next_fb).map_err(|_| FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "next freeblock offset {} exceeds u16 range on page {}",
-                    next_fb,
-                    page_no.get()
-                ),
-            })?;
-            page_bytes[new_offset..new_offset + 2]
-                .copy_from_slice(&next_fb_u16.to_be_bytes());
+            let next_fb_u16 =
+                u16::try_from(next_fb).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "next freeblock offset {} exceeds u16 range on page {}",
+                        next_fb,
+                        page_no.get()
+                    ),
+                })?;
+            page_bytes[new_offset..new_offset + 2].copy_from_slice(&next_fb_u16.to_be_bytes());
             page_bytes[new_offset + 2..new_offset + 4]
                 .copy_from_slice(&freeblock_size_u16.to_be_bytes());
             if new_size > 4 {

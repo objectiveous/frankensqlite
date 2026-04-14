@@ -10448,7 +10448,14 @@ impl VdbeEngine {
                 }
 
                 Opcode::Destroy => {
-                    // Remove a table. p1 = root page.
+                    // Remove a table/index. p1 = root page.
+                    //
+                    // NOTE: This only removes the in-memory MemDatabase entry.
+                    // Page-level freelist reclamation is handled by
+                    // `Connection::execute_drop` → `free_btree_pages` which is
+                    // the primary DDL path. If VDBE-driven DROP is ever used
+                    // for pager-backed databases, this must also walk the B-tree
+                    // and call `txn_page_io.free_page()` for every page.
                     if let Some(db) = self.db.as_mut() {
                         db.destroy_table(op.p1);
                     }

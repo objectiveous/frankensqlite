@@ -271,3 +271,9 @@ evidence/
 # Bare test binary at repo root
 /test
 .bench-history/
+
+# Codex CLI config directory
+.codex/
+
+# Heaptrack profiling dumps
+heaptrack.*.zst

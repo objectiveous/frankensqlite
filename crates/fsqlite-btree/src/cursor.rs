@@ -2907,15 +2907,32 @@ enum BinarySearchResult {
 
 impl<P: PageWriter> BtCursor<P> {
     /// Recursively free all pages in the B-tree rooted at `page_no`,
-    /// including `page_no` itself and any overflow chains attached to
-    /// leaf cells. Used by DROP TABLE / DROP INDEX to return every page
-    /// of the dropped object to the pager freelist.
+    /// including `page_no` itself, any overflow chains attached to cells,
+    /// and all child subtrees. Used by DROP TABLE / DROP INDEX to return
+    /// every page of the dropped object to the pager freelist.
     pub fn free_subtree_pages(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
         let page_data = self.pager.read_page_data(cx, page_no)?;
         let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
         let ptrs = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
 
+        // Free overflow chains on ALL cells (both interior and leaf).
+        // Interior cells of index B-trees carry key payloads that can overflow;
+        // table B-tree interior cells only carry rowids (no overflow possible)
+        // but checking is harmless since overflow_page will be None.
+        for ptr in &ptrs {
+            let cell = CellRef::parse(
+                page_data.as_bytes(),
+                usize::from(*ptr),
+                header.page_type,
+                self.usable_size,
+            )?;
+            if let Some(first_overflow) = cell.overflow_page {
+                self.free_overflow_chain(cx, first_overflow)?;
+            }
+        }
+
+        // For interior pages, recursively free child subtrees.
         if header.page_type.is_interior() {
             for ptr in &ptrs {
                 let cell = CellRef::parse(
@@ -2941,19 +2958,6 @@ impl<P: PageWriter> BtCursor<P> {
                     detail: format!("interior page {} is missing right child", page_no.get()),
                 })?;
             self.free_subtree_pages(cx, right_child)?;
-        } else {
-            // Leaf page — free any overflow chains attached to cells.
-            for ptr in &ptrs {
-                let cell = CellRef::parse(
-                    page_data.as_bytes(),
-                    usize::from(*ptr),
-                    header.page_type,
-                    self.usable_size,
-                )?;
-                if let Some(first_overflow) = cell.overflow_page {
-                    self.free_overflow_chain(cx, first_overflow)?;
-                }
-            }
         }
 
         self.pager.free_page(cx, page_no)

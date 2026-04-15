@@ -461,7 +461,7 @@ impl TableSchema {
     }
 
     fn resolves_to_hidden_rowid(&self, name: &str) -> bool {
-        self.column_index(name).is_none() && is_hidden_rowid_alias_name(name)
+        !self.without_rowid && self.column_index(name).is_none() && is_hidden_rowid_alias_name(name)
     }
 }
 
@@ -19114,6 +19114,23 @@ mod tests {
         }]
     }
 
+    fn schema_with_without_rowid_ipk() -> Vec<TableSchema> {
+        vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("a", 'd', true),
+                ColumnInfo::basic("b", 'C', false),
+            ],
+            indexes: vec![],
+            strict: false,
+            without_rowid: true,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }]
+    }
+
     fn schema_with_visible_rowid_column_and_a_indexes() -> Vec<TableSchema> {
         vec![TableSchema {
             name: "t".to_owned(),
@@ -19595,6 +19612,23 @@ mod tests {
         assert!(
             !ops.contains(&Opcode::Column),
             "hidden rowid alias should not read the visible shadowing column"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_hidden_rowid_alias_on_without_rowid_table_errors() {
+        let stmt = simple_select(&["_rowid_"], "t", None);
+        let schema = schema_with_without_rowid_ipk();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_select(&mut b, &stmt, &schema, &ctx).unwrap_err();
+
+        assert_eq!(
+            err,
+            CodegenError::ColumnNotFound {
+                table: "t".to_owned(),
+                column: "_rowid_".to_owned(),
+            }
         );
     }
 

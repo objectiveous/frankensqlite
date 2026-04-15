@@ -149,6 +149,62 @@ The best current estimate is:
    lane and statement family. That is the missing evidence needed before
    building a shared/background compile system.
 
+## F1.3 Go/No-Go Memo
+
+This section is the explicit closure memo for `bd-db300.6.1.3`.
+
+### Decision Summary
+
+| Candidate | Decision | Why |
+| --- | --- | --- |
+| Per-lane / lane-local compiled cache | **GO** | The measured reuse window is short, warmed-hit savings are material, and repeat-heavy workloads already realize most of the benefit without cross-lane coordination. |
+| Shared cross-lane compiled cache | **NO-GO for now** | The current evidence does not show enough cross-lane reuse to justify extra coordination, invalidation scope, or ownership complexity. |
+| Background compile cache / speculative shared compile service | **NO-GO for F3 right now** | The c1 bottleneck is schema refresh, not compile time. Adding a shared background compile system now would optimize the wrong cost center. |
+
+### Explicit Recommendation For F2
+
+F2 should assume **locality-first compiled reuse**, not a shared cache.
+
+That means:
+
+- keep compiled/program reuse scoped to the current connection or lane,
+- prefer small lane-local structures and cheap invalidation,
+- avoid new shared synchronization on the current statement-execution path,
+- treat cross-lane reuse as opportunistic evidence gathering, not as a design
+  requirement.
+
+### Explicit Recommendation For F3
+
+F3 should treat the shared/background compile cache as **rejected pending new
+evidence**.
+
+That means:
+
+- do not build a shared compiled-cache service yet,
+- do not add coordination solely to chase hypothetical cross-lane reuse,
+- reopen the decision only after fresh reruns prove that cross-lane reuse is
+  both common and large enough to dominate the remaining front-end cost after
+  schema-refresh work lands.
+
+### Reopen Conditions
+
+This memo should be revisited only if one of the following becomes true:
+
+1. fresh F1.1 reruns show a large cross-lane reuse share by statement family,
+2. schema-refresh costs fall far enough that compile cost becomes the next
+   dominant c1 front-end component,
+3. a later workload family shows repeated misses that a shared cache would
+   clearly eliminate without increasing contention on the execute path.
+
+### Net Call
+
+The correct call from the current evidence is:
+
+- **GO** on lane-local compiled caching and reuse as the default mental model
+  for F2.
+- **NO-GO** on shared/background compile caching for F3 until new locality data
+  proves that the added coordination is worth paying for.
+
 ## Fresh Rerun Status
 
 I attempted a fresh trace rerun with:

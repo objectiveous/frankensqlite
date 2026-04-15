@@ -532,6 +532,52 @@ BEAD_ID=bd-db300.8.1.2 \
 bash scripts/verify_bd_db300_8_1_1_matched_artifact_packs.sh
 ```
 
+For the H2.3 shared-placement validation rerun, keep the same steering row and
+fixture, rerun the declared shared-placement profiles, and let the collector
+compare the refreshed packs against the latest `bd-db300.8.1.2` report while it
+also proves MVCC-by-default is still intact through the existing default-guard
+test:
+
+```bash
+BEAD_ID=bd-db300.8.2.3 \
+ROW_IDS=mixed_read_write_c4 \
+FIXTURE_IDS=frankensqlite \
+PLACEMENT_PROFILE_IDS=recommended_pinned,adversarial_cross_node \
+STORAGE_PROFILE_IDS=file_backed,memory \
+WARMUP=0 \
+REPEAT=1 \
+bash scripts/verify_bd_db300_8_1_1_matched_artifact_packs.sh
+```
+
+When `BEAD_ID=bd-db300.8.2.3`, the collector also emits:
+
+- `validation.json`
+- `validation.md`
+- `mvcc_default_guard.log`
+
+`validation.json` compares the refreshed `recommended_pinned` and
+`adversarial_cross_node` packs against the latest shared-placement follow-on
+report from `bd-db300.8.1.2`, with per-profile deltas for single-writer median
+throughput, single-writer versus MVCC ratio, and retry deltas. The same run
+also executes `cargo test -p fsqlite-e2e --test bd_2yqp6_6_5_concurrent_mode_defaults`
+through `rch exec` and records the guard log beside the validation report so
+the bead can prove the cleanup did not flip FrankenSQLite's MVCC-by-default
+contract.
+
+If you already have the refreshed pack manifests and only need to regenerate
+the report plus validation after script updates, reuse the existing output
+directory:
+
+```bash
+POSTPROCESS_ONLY=1 \
+OUTPUT_DIR=artifacts/perf/bd-db300.8.2.3/<run_id> \
+BEAD_ID=bd-db300.8.2.3 \
+bash scripts/verify_bd_db300_8_1_1_matched_artifact_packs.sh
+```
+
+Override `PREVIOUS_SHARED_PLACEMENT_REPORT_JSON` when you need to compare
+against a specific earlier H1.2 report instead of the latest discovered one.
+
 ### Persistent Phase-Attribution Packs
 
 `bd-db300.1.7.2` uses the persistent Criterion harness, not `realdb-e2e bench`.

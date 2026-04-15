@@ -25,6 +25,9 @@ REPORT_JSON="${OUTPUT_DIR}/report.json"
 SUMMARY_MD="${OUTPUT_DIR}/summary.md"
 CLASSIFICATION_JSON="${OUTPUT_DIR}/classification.json"
 CLASSIFICATION_MD="${OUTPUT_DIR}/classification.md"
+VALIDATION_JSON="${OUTPUT_DIR}/validation.json"
+VALIDATION_MD="${OUTPUT_DIR}/validation.md"
+MVCC_DEFAULT_GUARD_LOG="${OUTPUT_DIR}/mvcc_default_guard.log"
 ROW_IDS="${ROW_IDS:-mixed_read_write_c4}"
 FIXTURE_IDS="${FIXTURE_IDS:-}"
 PLACEMENT_PROFILE_IDS="${PLACEMENT_PROFILE_IDS:-baseline_unpinned}"
@@ -39,6 +42,8 @@ EMIT_SINGLE_WRITER_CLASSIFICATION="${EMIT_SINGLE_WRITER_CLASSIFICATION:-0}"
 BEADS_DATA_PATH="${WORKSPACE_ROOT}/.beads/issues.jsonl"
 SOURCE_REVISION="${SOURCE_REVISION:-$(git -C "${WORKSPACE_ROOT}" rev-parse HEAD)}"
 BEADS_HASH="${BEADS_HASH:-$(sha256sum "${BEADS_DATA_PATH}" | awk '{print $1}')}"
+MVCC_DEFAULT_GUARD_TEST="${MVCC_DEFAULT_GUARD_TEST:-bd_2yqp6_6_5_concurrent_mode_defaults}"
+MVCC_DEFAULT_GUARD_TARGET_DIR="${MVCC_DEFAULT_GUARD_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_${RUN_ID_SAFE}_mvcc_defaults}"
 MODES=("sqlite_reference" "fsqlite_mvcc" "fsqlite_single_writer")
 
 mkdir -p "${PACKS_DIR}"
@@ -95,6 +100,10 @@ latest_report_file() {
 
 should_emit_single_writer_classification() {
     [[ "${BEAD_ID}" == "bd-db300.8.1.2" || "${EMIT_SINGLE_WRITER_CLASSIFICATION}" == "1" ]]
+}
+
+should_emit_single_writer_validation() {
+    [[ "${BEAD_ID}" == "bd-db300.8.2.3" || "${EMIT_SINGLE_WRITER_VALIDATION:-0}" == "1" ]]
 }
 
 ensure_row_exists() {
@@ -791,6 +800,191 @@ build_single_writer_classification() {
     ' "${CLASSIFICATION_JSON}" > "${CLASSIFICATION_MD}"
 }
 
+run_mvcc_default_guard() {
+    local -a command=(
+        rch exec --
+        env "CARGO_TARGET_DIR=${MVCC_DEFAULT_GUARD_TARGET_DIR}"
+        cargo test -p fsqlite-e2e --test "${MVCC_DEFAULT_GUARD_TEST}" -- --nocapture
+    )
+    local rendered_command
+    rendered_command="$(shell_join "${command[@]}")"
+    log_event "INFO" "mvcc-default-guard" "running ${rendered_command}"
+    if ! "${command[@]}" > "${MVCC_DEFAULT_GUARD_LOG}" 2>&1; then
+        fail "mvcc-default-guard" "MVCC default guard failed; see ${MVCC_DEFAULT_GUARD_LOG}"
+    fi
+}
+
+build_single_writer_validation() {
+    local previous_report_json="${PREVIOUS_SHARED_PLACEMENT_REPORT_JSON:-$(latest_report_file "${WORKSPACE_ROOT}/artifacts/perf/bd-db300.8.1.2")}"
+    [[ -n "${previous_report_json}" ]] || fail "validation" "failed to resolve a previous shared-placement report.json"
+    require_nonempty_file "${previous_report_json}"
+    require_nonempty_file "${REPORT_JSON}"
+    require_nonempty_file "${MVCC_DEFAULT_GUARD_LOG}"
+
+    local default_guard_command
+    default_guard_command="$(shell_join \
+        rch exec -- \
+        env "CARGO_TARGET_DIR=${MVCC_DEFAULT_GUARD_TARGET_DIR}" \
+        cargo test -p fsqlite-e2e --test "${MVCC_DEFAULT_GUARD_TEST}" -- --nocapture \
+    )"
+
+    jq -n \
+        --arg schema_version "fsqlite-e2e.db300.single_writer_cleanup_validation.v1" \
+        --arg bead_id "${BEAD_ID}" \
+        --arg run_id "${RUN_ID}" \
+        --arg generated_at "${GENERATED_AT}" \
+        --arg previous_report_json "${previous_report_json}" \
+        --arg current_report_json "${REPORT_JSON}" \
+        --arg mvcc_default_guard_test "${MVCC_DEFAULT_GUARD_TEST}" \
+        --arg mvcc_default_guard_log "${MVCC_DEFAULT_GUARD_LOG}" \
+        --arg mvcc_default_guard_command "${default_guard_command}" \
+        --slurpfile previous "${previous_report_json}" \
+        --slurpfile current "${REPORT_JSON}" \
+        '
+        def pack($doc; $placement; $storage):
+            $doc[0].packs[]
+            | select(
+                .fixture_id == "frankensqlite"
+                and .row_id == "mixed_read_write_c4"
+                and .placement_profile_id == $placement
+                and .storage_profile_id == $storage
+            );
+        def comparison($placement; $storage):
+            (pack($previous; $placement; $storage)) as $previous_pack |
+            (pack($current; $placement; $storage)) as $current_pack |
+            {
+              placement_profile_id: $placement,
+              storage_profile_id: $storage,
+              previous_comparability_status: $previous_pack.comparability_status,
+              current_comparability_status: $current_pack.comparability_status,
+              previous_single_writer_median_ops_per_sec: $previous_pack.mode_results.fsqlite_single_writer.throughput.median_ops_per_sec,
+              current_single_writer_median_ops_per_sec: $current_pack.mode_results.fsqlite_single_writer.throughput.median_ops_per_sec,
+              single_writer_median_ops_delta: (
+                $current_pack.mode_results.fsqlite_single_writer.throughput.median_ops_per_sec
+                - $previous_pack.mode_results.fsqlite_single_writer.throughput.median_ops_per_sec
+              ),
+              previous_single_writer_vs_mvcc_median_ops_ratio: $previous_pack.deltas.single_writer_vs_mvcc_median_ops_ratio,
+              current_single_writer_vs_mvcc_median_ops_ratio: $current_pack.deltas.single_writer_vs_mvcc_median_ops_ratio,
+              single_writer_vs_mvcc_ratio_delta: (
+                $current_pack.deltas.single_writer_vs_mvcc_median_ops_ratio
+                - $previous_pack.deltas.single_writer_vs_mvcc_median_ops_ratio
+              ),
+              previous_single_writer_minus_mvcc_mean_retries: $previous_pack.deltas.single_writer_minus_mvcc_mean_retries,
+              current_single_writer_minus_mvcc_mean_retries: $current_pack.deltas.single_writer_minus_mvcc_mean_retries,
+              single_writer_minus_mvcc_mean_retry_delta: (
+                $current_pack.deltas.single_writer_minus_mvcc_mean_retries
+                - $previous_pack.deltas.single_writer_minus_mvcc_mean_retries
+              ),
+              validation_status: (
+                if (
+                    $current_pack.mode_results.fsqlite_single_writer.throughput.median_ops_per_sec
+                    >= $previous_pack.mode_results.fsqlite_single_writer.throughput.median_ops_per_sec
+                ) and (
+                    $current_pack.deltas.single_writer_vs_mvcc_median_ops_ratio
+                    >= $previous_pack.deltas.single_writer_vs_mvcc_median_ops_ratio
+                ) and (
+                    $current_pack.deltas.single_writer_minus_mvcc_mean_retries
+                    <= $previous_pack.deltas.single_writer_minus_mvcc_mean_retries
+                ) then
+                    "improved_or_held"
+                elif (
+                    $current_pack.mode_results.fsqlite_single_writer.throughput.median_ops_per_sec
+                    >= $previous_pack.mode_results.fsqlite_single_writer.throughput.median_ops_per_sec
+                ) or (
+                    $current_pack.deltas.single_writer_vs_mvcc_median_ops_ratio
+                    >= $previous_pack.deltas.single_writer_vs_mvcc_median_ops_ratio
+                ) then
+                    "mixed"
+                else
+                    "regressed"
+                end
+              )
+            };
+        {
+          schema_version: $schema_version,
+          bead_id: $bead_id,
+          run_id: $run_id,
+          generated_at: $generated_at,
+          previous_report_json: $previous_report_json,
+          current_report_json: $current_report_json,
+          evidence_scope: {
+            fixture_id: "frankensqlite",
+            workload_row: "mixed_read_write_c4",
+            placement_profiles: [
+              "recommended_pinned",
+              "adversarial_cross_node"
+            ],
+            storage_profiles: [
+              "file_backed",
+              "memory"
+            ]
+          },
+          mvcc_default_guard: {
+            test_target: $mvcc_default_guard_test,
+            command: $mvcc_default_guard_command,
+            log_file: $mvcc_default_guard_log,
+            status: "passed"
+          },
+          comparisons: [
+            comparison("recommended_pinned"; "file_backed"),
+            comparison("recommended_pinned"; "memory"),
+            comparison("adversarial_cross_node"; "file_backed"),
+            comparison("adversarial_cross_node"; "memory")
+          ]
+        }
+        | .summary = {
+            overall_status: (
+              if ([.comparisons[].validation_status] | all(. == "improved_or_held")) then
+                "passed"
+              elif ([.comparisons[].validation_status] | all(. == "regressed")) then
+                "regressed"
+              elif ([.comparisons[].validation_status] | any(. == "regressed")) then
+                "mixed"
+              else
+                "improved_with_caveats"
+              end
+            ),
+            shared_file_backed_status: (
+              if ([.comparisons[] | select(.storage_profile_id == "file_backed") | .validation_status] | all(. == "improved_or_held")) then
+                "passed"
+              elif ([.comparisons[] | select(.storage_profile_id == "file_backed") | .validation_status] | any(. == "regressed")) then
+                "regressed"
+              else
+                "mixed"
+              end
+            ),
+            mvcc_default_guard_status: .mvcc_default_guard.status
+          }
+        ' > "${VALIDATION_JSON}"
+
+    jq -r '
+        [
+            "# H2.3 Single-Writer Cleanup Validation",
+            "",
+            "- run_id: `\(.run_id)`",
+            "- previous_report_json: `\(.previous_report_json)`",
+            "- current_report_json: `\(.current_report_json)`",
+            "- mvcc_default_guard: `\(.mvcc_default_guard.status)` via `\(.mvcc_default_guard.test_target)`",
+            "- mvcc_default_guard_log: `\(.mvcc_default_guard.log_file)`",
+            "",
+            "## Comparison Matrix",
+            "",
+            "| placement_profile_id | storage_profile_id | current single-writer ops/s | previous single-writer ops/s | ops delta | current single/mvcc ratio | previous single/mvcc ratio | ratio delta | retry delta | status |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+            (
+                .comparisons[]
+                | "| \(.placement_profile_id) | \(.storage_profile_id) | \(.current_single_writer_median_ops_per_sec) | \(.previous_single_writer_median_ops_per_sec) | \(.single_writer_median_ops_delta) | \(.current_single_writer_vs_mvcc_median_ops_ratio) | \(.previous_single_writer_vs_mvcc_median_ops_ratio) | \(.single_writer_vs_mvcc_ratio_delta) | \(.single_writer_minus_mvcc_mean_retry_delta) | \(.validation_status) |"
+            ),
+            "",
+            "## Summary",
+            "",
+            "- overall_status: `\(.summary.overall_status)`",
+            "- shared_file_backed_status: `\(.summary.shared_file_backed_status)`",
+            "- mvcc_default_guard_status: `\(.summary.mvcc_default_guard_status)`"
+        ] | join("\n")
+    ' "${VALIDATION_JSON}" > "${VALIDATION_MD}"
+}
+
 main() {
     require_file "${CAMPAIGN_MANIFEST_FILE}"
     require_nonempty_file "${BEADS_DATA_PATH}"
@@ -821,6 +1015,10 @@ main() {
     if should_emit_single_writer_classification; then
         build_single_writer_classification
     fi
+    if should_emit_single_writer_validation; then
+        run_mvcc_default_guard
+        build_single_writer_validation
+    fi
     log_event "INFO" "complete" "matched artifact pack collection completed"
 
     echo "RUN_ID:      ${RUN_ID}"
@@ -830,6 +1028,11 @@ main() {
     if should_emit_single_writer_classification; then
         echo "CLASSIFICATION_JSON: ${CLASSIFICATION_JSON}"
         echo "CLASSIFICATION_MD:   ${CLASSIFICATION_MD}"
+    fi
+    if should_emit_single_writer_validation; then
+        echo "VALIDATION_JSON: ${VALIDATION_JSON}"
+        echo "VALIDATION_MD:   ${VALIDATION_MD}"
+        echo "MVCC_DEFAULT_GUARD_LOG: ${MVCC_DEFAULT_GUARD_LOG}"
     fi
 }
 

@@ -7557,10 +7557,11 @@ mod tests {
         HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1, HOT_PATH_PROFILE_SCHEMA_V1,
         HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA_V1, HotPathAllocatorPressure, HotPathArtifactFile,
         HotPathArtifactManifest, HotPathBtreeCopyKernelProfile, HotPathMvccWriteProfile,
-        HotPathOpcodeProfileEntry, HotPathPageDataMotionProfile, HotPathParserProfile,
-        HotPathProfileReport, HotPathRankingEntry, HotPathRecordDecodeCallsiteBreakdown,
-        HotPathRecordDecodeCallsiteCounters, HotPathRecordDecodeProfile,
-        HotPathRowMaterializationProfile, HotPathTypeProfile, HotPathValueTypeProfile,
+        HotPathOpcodeProfileEntry, HotPathPageBufferPoolProfile, HotPathPageDataMotionProfile,
+        HotPathParserProfile, HotPathProfileReport, HotPathRankingEntry,
+        HotPathRecordDecodeCallsiteBreakdown, HotPathRecordDecodeCallsiteCounters,
+        HotPathRecordDecodeProfile, HotPathRowMaterializationProfile, HotPathTypeProfile,
+        HotPathValueTypeProfile,
     };
     use fsqlite_e2e::report::{CorrectnessReport, EngineRunReport};
     use jsonschema::{Draft, options};
@@ -7824,6 +7825,12 @@ mod tests {
                         "SQLITE_BUSY_SNAPSHOT on page 9".to_owned(),
                     ),
                 },
+            },
+            page_buffer_pool: HotPathPageBufferPoolProfile {
+                page_buffer_pool_hits: 3,
+                page_buffer_pool_misses: 1,
+                page_image_slab_reuse_count: 3,
+                staged_page_copy_bytes: 128,
             },
             page_data_motion: HotPathPageDataMotionProfile {
                 borrowed_write_normalization_calls_total: 1,

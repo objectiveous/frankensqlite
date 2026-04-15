@@ -197,6 +197,8 @@ struct PageBufPoolInner {
     free: Mutex<Vec<(Vec<u8>, usize)>>,
     max_buffers: usize,
     total_buffers: AtomicUsize,
+    acquire_hits: AtomicUsize,
+    acquire_misses: AtomicUsize,
 }
 
 impl PageBufPoolInner {
@@ -220,6 +222,34 @@ pub struct PageBufPool {
     inner: Arc<PageBufPoolInner>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageBufPoolMetricsSnapshot {
+    pub page_buffer_pool_hits: u64,
+    pub page_buffer_pool_misses: u64,
+}
+
+static FSQLITE_PAGE_BUFFER_POOL_HITS_TOTAL: AtomicUsize = AtomicUsize::new(0);
+static FSQLITE_PAGE_BUFFER_POOL_MISSES_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+#[must_use]
+pub fn page_buffer_pool_metrics_snapshot() -> PageBufPoolMetricsSnapshot {
+    PageBufPoolMetricsSnapshot {
+        page_buffer_pool_hits: u64::try_from(
+            FSQLITE_PAGE_BUFFER_POOL_HITS_TOTAL.load(Ordering::Relaxed),
+        )
+        .unwrap_or(u64::MAX),
+        page_buffer_pool_misses: u64::try_from(
+            FSQLITE_PAGE_BUFFER_POOL_MISSES_TOTAL.load(Ordering::Relaxed),
+        )
+        .unwrap_or(u64::MAX),
+    }
+}
+
+pub fn reset_page_buffer_pool_metrics() {
+    FSQLITE_PAGE_BUFFER_POOL_HITS_TOTAL.store(0, Ordering::Relaxed);
+    FSQLITE_PAGE_BUFFER_POOL_MISSES_TOTAL.store(0, Ordering::Relaxed);
+}
+
 impl PageBufPool {
     /// Create a new pool for the given `page_size`.
     ///
@@ -234,6 +264,8 @@ impl PageBufPool {
                 free: Mutex::new(Vec::with_capacity(max_buffers)),
                 max_buffers,
                 total_buffers: AtomicUsize::new(0),
+                acquire_hits: AtomicUsize::new(0),
+                acquire_misses: AtomicUsize::new(0),
             }),
         }
     }
@@ -253,6 +285,8 @@ impl PageBufPool {
         };
 
         if let Some((backing, offset)) = recycled {
+            self.inner.acquire_hits.fetch_add(1, Ordering::Relaxed);
+            FSQLITE_PAGE_BUFFER_POOL_HITS_TOTAL.fetch_add(1, Ordering::Relaxed);
             return Ok(PageBuf {
                 backing: Some(backing),
                 offset,
@@ -276,6 +310,8 @@ impl PageBufPool {
             }
         }
 
+        self.inner.acquire_misses.fetch_add(1, Ordering::Relaxed);
+        FSQLITE_PAGE_BUFFER_POOL_MISSES_TOTAL.fetch_add(1, Ordering::Relaxed);
         let (backing, offset) = allocate_aligned(page_size);
         Ok(PageBuf {
             backing: Some(backing),
@@ -303,6 +339,18 @@ impl PageBufPool {
     #[must_use]
     pub fn capacity(&self) -> usize {
         self.inner.max_buffers
+    }
+
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> PageBufPoolMetricsSnapshot {
+        PageBufPoolMetricsSnapshot {
+            page_buffer_pool_hits: u64::try_from(self.inner.acquire_hits.load(Ordering::Relaxed))
+                .unwrap_or(u64::MAX),
+            page_buffer_pool_misses: u64::try_from(
+                self.inner.acquire_misses.load(Ordering::Relaxed),
+            )
+            .unwrap_or(u64::MAX),
+        }
     }
 }
 
@@ -430,6 +478,14 @@ mod tests {
             "bead_id={BEAD_ID} case=pool_reuse should reuse same allocation"
         );
         assert_eq!(pool.available(), 0);
+        assert_eq!(
+            pool.metrics_snapshot(),
+            PageBufPoolMetricsSnapshot {
+                page_buffer_pool_hits: 1,
+                page_buffer_pool_misses: 1,
+            },
+            "bead_id={BEAD_ID} case=pool_reuse_metrics should count one fresh allocation and one pooled reuse"
+        );
     }
 
     #[test]

@@ -344,6 +344,14 @@ pub struct HotPathPageDataMotionProfile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathPageBufferPoolProfile {
+    pub page_buffer_pool_hits: u64,
+    pub page_buffer_pool_misses: u64,
+    pub page_image_slab_reuse_count: u64,
+    pub staged_page_copy_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HotPathConnectionCeremonyProfile {
     pub background_status_time_ns: u64,
     pub background_status_checks: u64,
@@ -441,6 +449,7 @@ pub struct HotPathSubsystemProfilePack {
     #[serde(default)]
     pub wal: WalHotPathProfile,
     pub mvcc_write: HotPathMvccWriteProfile,
+    pub page_buffer_pool: HotPathPageBufferPoolProfile,
     pub page_data_motion: HotPathPageDataMotionProfile,
     pub connection_ceremony: HotPathConnectionCeremonyProfile,
 }
@@ -633,6 +642,7 @@ pub struct HotPathProfileReport {
     pub record_decode: HotPathRecordDecodeProfile,
     pub row_materialization: HotPathRowMaterializationProfile,
     pub mvcc_write: HotPathMvccWriteProfile,
+    pub page_buffer_pool: HotPathPageBufferPoolProfile,
     pub page_data_motion: HotPathPageDataMotionProfile,
     pub connection_ceremony: HotPathConnectionCeremonyProfile,
     pub opcode_profile: Vec<HotPathOpcodeProfileEntry>,
@@ -1246,6 +1256,12 @@ fn build_hot_path_profile_report(
             .normalized_zero_fill_bytes_total,
         normalized_bytes_total: page_data_normalization_bytes_total,
     };
+    let page_buffer_pool = HotPathPageBufferPoolProfile {
+        page_buffer_pool_hits: snapshot.page_buffer_pool_hits,
+        page_buffer_pool_misses: snapshot.page_buffer_pool_misses,
+        page_image_slab_reuse_count: snapshot.page_buffer_pool_hits,
+        staged_page_copy_bytes: page_data_normalization_bytes_total,
+    };
     let connection_ceremony = HotPathConnectionCeremonyProfile {
         background_status_time_ns: snapshot.background_status_time_ns,
         background_status_checks: snapshot.background_status_checks,
@@ -1407,6 +1423,7 @@ fn build_hot_path_profile_report(
         record_decode,
         row_materialization,
         mvcc_write,
+        page_buffer_pool,
         page_data_motion,
         connection_ceremony,
         opcode_profile,
@@ -1829,6 +1846,25 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
         "- Pending surface clears: {} (time_ns={})",
         report.mvcc_write.pending_commit_surface_clears_total,
         report.mvcc_write.pending_commit_surface_clear_time_ns_total
+    );
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## Page Buffer Pool\n");
+    let _ = writeln!(
+        out,
+        "- `page_buffer_pool_hit` / `page_buffer_pool_miss`: {}/{}",
+        report.page_buffer_pool.page_buffer_pool_hits,
+        report.page_buffer_pool.page_buffer_pool_misses
+    );
+    let _ = writeln!(
+        out,
+        "- `page_image_slab_reuse_count`: {}",
+        report.page_buffer_pool.page_image_slab_reuse_count
+    );
+    let _ = writeln!(
+        out,
+        "- `staged_page_copy_bytes`: {}",
+        report.page_buffer_pool.staged_page_copy_bytes
     );
     let _ = writeln!(out);
 
@@ -2807,8 +2843,8 @@ fn baseline_reuse_implication(surface: &str) -> (&'static str, &'static [&'stati
             &["bd-db300.10.7"],
         ),
         "page_buffer_pool_reuse" => (
-            "J3/J8 target: page-buffer reuse remains opaque in the hot-path report and needs explicit pool-hit evidence.",
-            &["bd-db300.10.3", "bd-db300.10.8"],
+            "J3 target: page-buffer pool hits/misses and staged page-copy bytes are now explicit, so the next cuts should drive miss rate and copied bytes down instead of treating staging churn as opaque.",
+            &["bd-db300.10.3"],
         ),
         "page_data_ownership_reuse" => (
             "J6 target: PageData ownership reuse is now measured directly, so next cuts can use passthrough versus resized-copy evidence instead of treating ownership churn as a blind spot.",
@@ -2965,13 +3001,23 @@ fn build_hot_path_baseline_reuse_ledger(
         HotPathBaselineReuseLedgerEntry {
             rank: 0,
             surface: "page_buffer_pool_reuse".to_owned(),
-            supported: false,
-            hits: 0,
-            misses: 0,
-            hit_rate_basis_points: None,
-            rationale:
-                "pager-side hit counters exist elsewhere, but this hot-path report does not yet expose page-buffer pool reuse directly"
-                    .to_owned(),
+            supported: true,
+            hits: report.page_buffer_pool.page_buffer_pool_hits,
+            misses: report.page_buffer_pool.page_buffer_pool_misses,
+            hit_rate_basis_points: Some(ratio_basis_points(
+                report.page_buffer_pool.page_buffer_pool_hits,
+                report
+                    .page_buffer_pool
+                    .page_buffer_pool_hits
+                    .saturating_add(report.page_buffer_pool.page_buffer_pool_misses),
+            )),
+            rationale: format!(
+                "hot-path artifacts now emit explicit page-buffer pool hits/misses ({hits}/{misses}), plus derived staged copy bytes ({copies}) and slab reuse count ({reuses}) for reusable page-image staging",
+                hits = report.page_buffer_pool.page_buffer_pool_hits,
+                misses = report.page_buffer_pool.page_buffer_pool_misses,
+                copies = report.page_buffer_pool.staged_page_copy_bytes,
+                reuses = report.page_buffer_pool.page_image_slab_reuse_count,
+            ),
             implication: String::new(),
             mapped_beads: Vec::new(),
         },
@@ -4220,6 +4266,7 @@ pub fn build_hot_path_subsystem_profile(
         row_materialization: report.row_materialization.clone(),
         wal: wal_hot_path_profile(report),
         mvcc_write: report.mvcc_write.clone(),
+        page_buffer_pool: report.page_buffer_pool.clone(),
         page_data_motion: report.page_data_motion.clone(),
         connection_ceremony: report.connection_ceremony.clone(),
     }
@@ -4853,6 +4900,8 @@ mod tests {
             arena_alloc_bytes: 2_048,
             arena_reset_count: 3,
             fallback_to_general_allocator_count: 1,
+            page_buffer_pool_hits: 3,
+            page_buffer_pool_misses: 1,
             window_func_partitions_total: 0,
             statement_global_executions: 4,
             statement_reuse_count: 2,
@@ -5355,6 +5404,10 @@ mod tests {
             "btree_overflow_reassembly"
         );
         assert!(report.mvcc_write.page_lock_wait_time_ns_total > 0);
+        assert_eq!(report.page_buffer_pool.page_buffer_pool_hits, 3);
+        assert_eq!(report.page_buffer_pool.page_buffer_pool_misses, 1);
+        assert_eq!(report.page_buffer_pool.page_image_slab_reuse_count, 3);
+        assert_eq!(report.page_buffer_pool.staged_page_copy_bytes, 1_504);
         assert!(report.page_data_motion.normalized_bytes_total > 0);
         assert_eq!(report.connection_ceremony.background_status_time_ns, 750);
         assert_eq!(report.connection_ceremony.prepared_lookup_time_ns, 1_100);
@@ -5507,6 +5560,7 @@ mod tests {
                 > 0
         );
         assert!(subsystem_profile.mvcc_write.page_lock_waits_total > 0);
+        assert_eq!(subsystem_profile.page_buffer_pool, report.page_buffer_pool);
         assert!(subsystem_profile.page_data_motion.normalized_bytes_total > 0);
         assert!(!actionable_ranking.baseline_reuse_ledger.is_empty());
         assert!(!actionable_ranking.baseline_waste_ledger.is_empty());
@@ -5574,6 +5628,26 @@ mod tests {
             std::fs::read_to_string(artifact_dir.join("summary.md"))
                 .unwrap()
                 .contains("## MVCC Write Path")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("## Page Buffer Pool")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("`page_buffer_pool_hit` / `page_buffer_pool_miss`")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("`page_image_slab_reuse_count`")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("`staged_page_copy_bytes`")
         );
         assert!(
             std::fs::read_to_string(artifact_dir.join("summary.md"))
@@ -5828,6 +5902,20 @@ mod tests {
         assert_eq!(
             page_data_reuse.mapped_beads,
             vec!["bd-db300.10.6".to_owned()]
+        );
+
+        let page_buffer_pool_reuse = actionable_ranking
+            .baseline_reuse_ledger
+            .iter()
+            .find(|entry| entry.surface == "page_buffer_pool_reuse")
+            .unwrap();
+        assert!(page_buffer_pool_reuse.supported);
+        assert_eq!(page_buffer_pool_reuse.hits, 3);
+        assert_eq!(page_buffer_pool_reuse.misses, 1);
+        assert_eq!(page_buffer_pool_reuse.hit_rate_basis_points, Some(7_500));
+        assert_eq!(
+            page_buffer_pool_reuse.mapped_beads,
+            vec!["bd-db300.10.3".to_owned()]
         );
 
         let parser_waste = actionable_ranking

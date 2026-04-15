@@ -22,7 +22,10 @@ pub use journal::{
     JournalPageRecord, PENDING_BYTE_OFFSET, checksum_sample_count, journal_checksum,
     lock_byte_page,
 };
-pub use page_buf::{PageBuf, PageBufPool};
+pub use page_buf::{
+    PageBuf, PageBufPool, PageBufPoolMetricsSnapshot, page_buffer_pool_metrics_snapshot,
+    reset_page_buffer_pool_metrics,
+};
 pub use page_cache::{
     DEFAULT_PAGE_BUFFER_MAX, PageCache, PageCacheEvictionPolicy, PageCacheMetricsSnapshot,
     PageCachePageSnapshot, PageCacheQueueKind, ShardedPageCache, resolve_page_buffer_max,

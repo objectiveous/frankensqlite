@@ -150,6 +150,18 @@ impl StatementParseScratch {
     pub fn error_capacity(&self) -> usize {
         self.errors.capacity()
     }
+
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.tokens
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Token>())
+            .saturating_add(
+                self.errors
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ParseError>()),
+            )
+    }
 }
 
 // ---------------------------------------------------------------------------

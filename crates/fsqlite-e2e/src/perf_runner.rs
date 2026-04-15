@@ -380,6 +380,9 @@ pub struct HotPathConnectionCeremonyProfile {
     pub prepared_table_dml_affected_only_runs: u64,
     pub autoincrement_sequence_fast_path_updates: u64,
     pub autoincrement_sequence_scan_refreshes: u64,
+    pub arena_alloc_bytes: u64,
+    pub arena_reset_count: u64,
+    pub fallback_to_general_allocator_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1278,6 +1281,9 @@ fn build_hot_path_profile_report(
         prepared_table_dml_affected_only_runs: snapshot.prepared_table_dml_affected_only_runs,
         autoincrement_sequence_fast_path_updates: snapshot.autoincrement_sequence_fast_path_updates,
         autoincrement_sequence_scan_refreshes: snapshot.autoincrement_sequence_scan_refreshes,
+        arena_alloc_bytes: snapshot.arena_alloc_bytes,
+        arena_reset_count: snapshot.arena_reset_count,
+        fallback_to_general_allocator_count: snapshot.fallback_to_general_allocator_count,
     };
 
     let parser_time_ns = parser
@@ -1687,6 +1693,15 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
         out,
         "- Column-default evaluation passes: {}",
         report.connection_ceremony.column_default_evaluation_passes
+    );
+    let _ = writeln!(
+        out,
+        "- Statement lookaside alloc/reset/fallback: {}/{}/{}",
+        report.connection_ceremony.arena_alloc_bytes,
+        report.connection_ceremony.arena_reset_count,
+        report
+            .connection_ceremony
+            .fallback_to_general_allocator_count
     );
     let _ = writeln!(
         out,
@@ -4796,7 +4811,22 @@ mod tests {
             prepared_direct_insert_change_tracking_time_ns: 0,
             prepared_direct_insert_autocommit_resolve_time_ns: 0,
             prepared_direct_insert_autocommit_executions: 0,
+            arena_alloc_bytes: 2_048,
+            arena_reset_count: 3,
+            fallback_to_general_allocator_count: 1,
             window_func_partitions_total: 0,
+            statement_global_executions: 4,
+            statement_reuse_count: 2,
+            statement_reuse_distance_sum: 3,
+            statement_max_reuse_distance: 2,
+            statement_lane_local_reuses: 2,
+            statement_cross_lane_reuses: 0,
+            statement_first_hit_count: 1,
+            statement_first_hit_time_ns: 1_200,
+            statement_warmed_hit_count: 3,
+            statement_warmed_hit_time_ns: 2_100,
+            background_compile_interference_count: 0,
+            background_compile_interference_time_ns: 0,
             btree_copy_kernels: BtreeCopyProfileSnapshot {
                 local_payload_copy_calls: 2,
                 local_payload_copy_bytes: 96,
@@ -5311,6 +5341,14 @@ mod tests {
             report.connection_ceremony.finalize_post_publish_time_ns,
             1_250
         );
+        assert_eq!(report.connection_ceremony.arena_alloc_bytes, 2_048);
+        assert_eq!(report.connection_ceremony.arena_reset_count, 3);
+        assert_eq!(
+            report
+                .connection_ceremony
+                .fallback_to_general_allocator_count,
+            1
+        );
 
         let artifact_dir = tempdir.path().join("artifacts");
         let counter_capture_summary = HotPathCounterCaptureManifestSummary {
@@ -5452,6 +5490,16 @@ mod tests {
             std::fs::read_to_string(artifact_dir.join("summary.md"))
                 .unwrap()
                 .contains("## B-Tree Copy Kernel Targets")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("## Connection Ceremony")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("Statement lookaside alloc/reset/fallback")
         );
         assert!(
             std::fs::read_to_string(artifact_dir.join("summary.md"))

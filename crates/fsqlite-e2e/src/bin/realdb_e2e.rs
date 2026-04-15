@@ -7871,6 +7871,9 @@ mod tests {
                 prepared_table_dml_affected_only_runs: 0,
                 autoincrement_sequence_fast_path_updates: 1,
                 autoincrement_sequence_scan_refreshes: 0,
+                arena_alloc_bytes: 0,
+                arena_reset_count: 0,
+                fallback_to_general_allocator_count: 0,
             },
             opcode_profile: vec![HotPathOpcodeProfileEntry {
                 opcode: "Column".to_owned(),

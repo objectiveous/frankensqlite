@@ -11,6 +11,7 @@
 //! contents are replayed into a fresh `MemDatabase` + schema vector.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
@@ -186,14 +187,14 @@ pub fn persist_to_sqlite_with_header(
 /// provided database header template.
 #[allow(clippy::too_many_lines)]
 #[cfg(not(target_arch = "wasm32"))]
-pub fn persist_to_sqlite_with_header_and_master_entries(
+pub fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
     cx: &Cx,
     path: &Path,
     schema: &[TableSchema],
     db: &MemDatabase,
     header_template: &DatabaseHeader,
     extra_master_entries: &[SqliteMasterEntry],
-    original_ddl: &HashMap<String, String>,
+    original_ddl: &HashMap<String, String, S>,
 ) -> Result<()> {
     // Remove existing file so the pager creates a fresh one.
     if path.exists() {

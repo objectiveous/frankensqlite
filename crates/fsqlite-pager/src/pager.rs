@@ -97,6 +97,7 @@ const PUBLISHED_SEQUENCE_WAIT_PATH_MODE: WaitPathMode = WaitPathMode::KeyedEvent
 const GROUP_COMMIT_WAIT_TIMEOUT_FALLBACK: Duration = Duration::from_millis(200);
 const LEGACY_GROUP_COMMIT_ARRIVAL_WAIT: Duration = Duration::from_micros(20);
 const GROUP_COMMIT_ARRIVAL_WAIT_POLICY: &str = "fill_age_tail_safe_v1";
+const PHYSICAL_WRITER_LANE_RUN_ID: &str = "physical-writer-batching-lane";
 // Flush busy handoff: retry on-CPU with a bounded spin budget and yield only
 // every `FLUSH_BUSY_HANDOFF_YIELD_EVERY` attempts. The owner-handoff rule is
 // that a losing flusher yields rarely and otherwise stays hot so the current
@@ -156,6 +157,7 @@ struct ArrivalWaitObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ArrivalWaitDecision {
     wait_budget: Duration,
+    max_wait: Duration,
     policy: &'static str,
     reason: &'static str,
     fill_age: Duration,
@@ -163,9 +165,10 @@ struct ArrivalWaitDecision {
 }
 
 impl ArrivalWaitDecision {
-    fn skip(reason: &'static str, fill_age: Duration) -> Self {
+    fn skip(reason: &'static str, fill_age: Duration, max_wait: Duration) -> Self {
         Self {
             wait_budget: Duration::ZERO,
+            max_wait,
             policy: GROUP_COMMIT_ARRIVAL_WAIT_POLICY,
             reason,
             fill_age,
@@ -173,9 +176,10 @@ impl ArrivalWaitDecision {
         }
     }
 
-    fn legacy_fallback(fill_age: Duration) -> Self {
+    fn legacy_fallback(fill_age: Duration, max_wait: Duration) -> Self {
         Self {
             wait_budget: LEGACY_GROUP_COMMIT_ARRIVAL_WAIT,
+            max_wait,
             policy: GROUP_COMMIT_ARRIVAL_WAIT_POLICY,
             reason: "legacy_fallback",
             fill_age,
@@ -190,22 +194,81 @@ impl ArrivalWaitDecision {
     fn fill_age_us(self) -> u64 {
         self.fill_age.as_micros() as u64
     }
+
+    fn target_wait_ns(self) -> u64 {
+        self.wait_budget.as_nanos() as u64
+    }
+
+    fn max_wait_ns(self) -> u64 {
+        self.max_wait.as_nanos() as u64
+    }
+
+    fn queue_delay_ns(self) -> u64 {
+        self.fill_age.as_nanos() as u64
+    }
 }
 
 fn decide_group_commit_arrival_wait(
     observation: Option<ArrivalWaitObservation>,
+    max_wait: Duration,
 ) -> ArrivalWaitDecision {
     match observation {
-        None => ArrivalWaitDecision::skip("promoted_follow_on", Duration::ZERO),
+        None => ArrivalWaitDecision::skip("promoted_follow_on", Duration::ZERO, max_wait),
         Some(observation) => {
             if observation.pending_batch_count > 1 || observation.should_flush_now {
-                return ArrivalWaitDecision::skip("queue_already_flushable", observation.fill_age);
+                return ArrivalWaitDecision::skip(
+                    "queue_already_flushable",
+                    observation.fill_age,
+                    max_wait,
+                );
             }
             if observation.fill_age >= LEGACY_GROUP_COMMIT_ARRIVAL_WAIT {
-                return ArrivalWaitDecision::skip("fill_age_exhausted", observation.fill_age);
+                return ArrivalWaitDecision::skip(
+                    "fill_age_exhausted",
+                    observation.fill_age,
+                    max_wait,
+                );
             }
-            ArrivalWaitDecision::legacy_fallback(observation.fill_age)
+            ArrivalWaitDecision::legacy_fallback(observation.fill_age, max_wait)
         }
+    }
+}
+
+fn physical_writer_batch_membership(batches: &[TransactionFrameBatch]) -> String {
+    batches
+        .iter()
+        .map(|batch| batch.context.batch_id.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn physical_writer_primary_batch_id(batches: &[TransactionFrameBatch]) -> u64 {
+    batches
+        .first()
+        .map(|batch| batch.context.batch_id)
+        .unwrap_or_default()
+}
+
+fn physical_writer_rollback_mode_active(
+    mode: ParallelWalOperatingMode,
+    fallback_reason: Option<ParallelWalFallbackReason>,
+) -> bool {
+    matches!(mode, ParallelWalOperatingMode::Conservative) || fallback_reason.is_some()
+}
+
+fn physical_writer_fsync_boundary(sync_policy: WalCommitSyncPolicy) -> &'static str {
+    if sync_policy.should_sync_on_commit() {
+        "commit_sync"
+    } else {
+        "deferred_sync"
+    }
+}
+
+fn physical_writer_ordering_phase(arrival_wait_reason: &'static str) -> &'static str {
+    if arrival_wait_reason == "promoted_follow_on" {
+        "promoted_follow_on_flush"
+    } else {
+        "group_flush"
     }
 }
 
@@ -5616,10 +5679,32 @@ where
             }
         }
 
+        let queue_submit_max_wait = {
+            let consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            consolidator.max_group_delay()
+        };
+        let queue_submit_batch_membership = batch.context.batch_id.to_string();
+        let queue_submit_rollback_mode_active = physical_writer_rollback_mode_active(
+            parallel_wal_control.mode,
+            staging_fallback_reason,
+        );
         tracing::debug!(
             target: "fsqlite::wal::lane_staging",
             trace_id = cx.trace_id(),
+            run_id = PHYSICAL_WRITER_LANE_RUN_ID,
             scenario_id = PARALLEL_WAL_STAGE_SCENARIO_ID,
+            batch_id = batch.context.batch_id,
+            batch_membership = queue_submit_batch_membership.as_str(),
+            queue_delay_ns = 0_u64,
+            target_wait_ns = 0_u64,
+            max_wait_ns =
+                u64::try_from(queue_submit_max_wait.as_nanos()).unwrap_or(u64::MAX),
+            fsync_boundary = physical_writer_fsync_boundary(sync_policy),
+            ordering_phase = "queue_submit",
+            rollback_mode_active = queue_submit_rollback_mode_active,
             wal_lane_id = lane_id,
             lane_backlog,
             staged_frame_count = batch.context.staged_frame_count,
@@ -5667,21 +5752,24 @@ where
                                 mut prefetched_flush: Option<(Vec<TransactionFrameBatch>, u64)>|
          -> Result<()> {
             'flusher_loop: loop {
-                let arrival_wait_decision = if prefetched_flush.is_none() && needs_arrival_wait {
-                    let observation = {
+                let arrival_wait_decision = {
+                    let (observation, max_wait) = {
                         let consolidator = queue
                             .consolidator
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        ArrivalWaitObservation {
-                            pending_batch_count: consolidator.pending_batch_count(),
-                            should_flush_now: consolidator.should_flush_now(),
-                            fill_age: consolidator.fill_age(),
-                        }
+                        let observation = if prefetched_flush.is_none() && needs_arrival_wait {
+                            Some(ArrivalWaitObservation {
+                                pending_batch_count: consolidator.pending_batch_count(),
+                                should_flush_now: consolidator.should_flush_now(),
+                                fill_age: consolidator.fill_age(),
+                            })
+                        } else {
+                            None
+                        };
+                        (observation, consolidator.max_group_delay())
                     };
-                    decide_group_commit_arrival_wait(Some(observation))
-                } else {
-                    decide_group_commit_arrival_wait(None)
+                    decide_group_commit_arrival_wait(observation, max_wait)
                 };
                 let arrival_wait_us = if !arrival_wait_decision.wait_budget.is_zero() {
                     let t_arrival_wait_start = Instant::now();
@@ -5728,6 +5816,13 @@ where
                     };
                     flush
                 };
+                let flush_batch_membership = physical_writer_batch_membership(&batches);
+                let flush_batch_id = physical_writer_primary_batch_id(&batches);
+                let queue_delay_ns = arrival_wait_decision.queue_delay_ns();
+                let target_wait_ns = arrival_wait_decision.target_wait_ns();
+                let max_wait_ns = arrival_wait_decision.max_wait_ns();
+                let fsync_boundary = physical_writer_fsync_boundary(sync_policy);
+                let ordering_phase = physical_writer_ordering_phase(arrival_wait_decision.reason);
 
                 let conflicting_pages = conflicting_pages_across_group_commit_batches(&batches);
                 if !conflicting_pages.is_empty() {
@@ -5743,6 +5838,24 @@ where
                         epoch = flush_epoch,
                         conflicting_pages = ?conflicting_pages,
                         "aborting group-commit epoch with cross-batch same-page overlap"
+                    );
+                    tracing::warn!(
+                        target: "fsqlite::wal::lane_staging",
+                        trace_id = cx.trace_id(),
+                        run_id = PHYSICAL_WRITER_LANE_RUN_ID,
+                        scenario_id = PARALLEL_WAL_FLUSH_SCENARIO_ID,
+                        batch_id = flush_batch_id,
+                        batch_membership = flush_batch_membership.as_str(),
+                        queue_delay_ns,
+                        target_wait_ns,
+                        max_wait_ns,
+                        fsync_boundary,
+                        ordering_phase = "overlap_abort",
+                        rollback_mode_active =
+                            physical_writer_rollback_mode_active(parallel_wal_control.mode, None),
+                        failure_context = "cross_batch_page_overlap",
+                        conflicting_pages = ?conflicting_pages,
+                        "aborting physical writer flush because batch membership overlaps on the same page"
                     );
                     let (abort_result, wake_next_epoch) = {
                         let mut consolidator = queue
@@ -6042,11 +6155,24 @@ where
                              (append={wal_append_us}us sync={wal_sync_us}us) \
                              frames={frame_count}"
                         );
+                        let flush_rollback_mode_active = physical_writer_rollback_mode_active(
+                            parallel_wal_control.mode,
+                            fallback_reason,
+                        );
                         for (lane_id, lane_backlog, staged_frame_count, elapsed_ns) in &lane_stats {
                             tracing::debug!(
                                 target: "fsqlite::wal::lane_staging",
                                 trace_id = cx.trace_id(),
+                                run_id = PHYSICAL_WRITER_LANE_RUN_ID,
                                 scenario_id = PARALLEL_WAL_FLUSH_SCENARIO_ID,
+                                batch_id = flush_batch_id,
+                                batch_membership = flush_batch_membership.as_str(),
+                                queue_delay_ns,
+                                target_wait_ns,
+                                max_wait_ns,
+                                fsync_boundary,
+                                ordering_phase,
+                                rollback_mode_active = flush_rollback_mode_active,
                                 wal_lane_id = *lane_id,
                                 lane_backlog = *lane_backlog,
                                 staged_frame_count = *staged_frame_count,
@@ -6078,6 +6204,29 @@ where
                         }
                     }
                     Err(error) => {
+                        tracing::warn!(
+                            target: "fsqlite::wal::lane_staging",
+                            trace_id = cx.trace_id(),
+                            run_id = PHYSICAL_WRITER_LANE_RUN_ID,
+                            scenario_id = PARALLEL_WAL_FLUSH_SCENARIO_ID,
+                            batch_id = flush_batch_id,
+                            batch_membership = flush_batch_membership.as_str(),
+                            queue_delay_ns,
+                            target_wait_ns,
+                            max_wait_ns,
+                            fsync_boundary,
+                            ordering_phase = "flush_error",
+                            rollback_mode_active = physical_writer_rollback_mode_active(
+                                parallel_wal_control.mode,
+                                fallback_reason,
+                            ),
+                            shadow_verdict =
+                                parallel_wal_shadow_verdict_name(shadow_verdict),
+                            fallback_reason =
+                                parallel_wal_fallback_reason_name(fallback_reason),
+                            failure_context = %error,
+                            "physical writer flush failed"
+                        );
                         let (abort_result, wake_next_epoch) = {
                             let mut consolidator = queue
                                 .consolidator
@@ -14445,11 +14594,15 @@ mod tests {
 
     #[test]
     fn test_arrival_wait_policy_fresh_epoch_uses_legacy_fallback() {
-        let decision = decide_group_commit_arrival_wait(Some(ArrivalWaitObservation {
-            pending_batch_count: 1,
-            should_flush_now: false,
-            fill_age: Duration::from_micros(3),
-        }));
+        let max_wait = Duration::from_micros(250);
+        let decision = decide_group_commit_arrival_wait(
+            Some(ArrivalWaitObservation {
+                pending_batch_count: 1,
+                should_flush_now: false,
+                fill_age: Duration::from_micros(3),
+            }),
+            max_wait,
+        );
 
         assert_eq!(
             decision.wait_budget, LEGACY_GROUP_COMMIT_ARRIVAL_WAIT,
@@ -14463,15 +14616,23 @@ mod tests {
             decision.used_legacy_fallback,
             "bead_id=bd-db300.3.8.5 case=arrival_wait_fresh_epoch_marks_fallback"
         );
+        assert_eq!(
+            decision.max_wait, max_wait,
+            "bead_id=bd-1dp9.6.7.9.1 case=arrival_wait_fresh_epoch_preserves_max_wait"
+        );
     }
 
     #[test]
     fn test_arrival_wait_policy_skips_after_legacy_window_is_already_spent() {
-        let decision = decide_group_commit_arrival_wait(Some(ArrivalWaitObservation {
-            pending_batch_count: 1,
-            should_flush_now: false,
-            fill_age: LEGACY_GROUP_COMMIT_ARRIVAL_WAIT,
-        }));
+        let max_wait = Duration::from_micros(250);
+        let decision = decide_group_commit_arrival_wait(
+            Some(ArrivalWaitObservation {
+                pending_batch_count: 1,
+                should_flush_now: false,
+                fill_age: LEGACY_GROUP_COMMIT_ARRIVAL_WAIT,
+            }),
+            max_wait,
+        );
 
         assert_eq!(
             decision.wait_budget,
@@ -14490,7 +14651,8 @@ mod tests {
 
     #[test]
     fn test_arrival_wait_policy_skips_promoted_follow_on_flushes() {
-        let decision = decide_group_commit_arrival_wait(None);
+        let max_wait = Duration::from_micros(250);
+        let decision = decide_group_commit_arrival_wait(None, max_wait);
 
         assert_eq!(
             decision.wait_budget,
@@ -14500,6 +14662,98 @@ mod tests {
         assert_eq!(
             decision.reason, "promoted_follow_on",
             "bead_id=bd-db300.3.8.5 case=arrival_wait_promoted_follow_on_reason"
+        );
+        assert_eq!(
+            decision.max_wait, max_wait,
+            "bead_id=bd-1dp9.6.7.9.1 case=arrival_wait_promoted_follow_on_preserves_max_wait"
+        );
+    }
+
+    #[test]
+    fn test_arrival_wait_policy_records_wait_contract_metadata() {
+        let max_wait = Duration::from_micros(250);
+        let fill_age = Duration::from_micros(3);
+        let decision = decide_group_commit_arrival_wait(
+            Some(ArrivalWaitObservation {
+                pending_batch_count: 1,
+                should_flush_now: false,
+                fill_age,
+            }),
+            max_wait,
+        );
+
+        assert_eq!(
+            decision.target_wait_ns(),
+            u64::try_from(LEGACY_GROUP_COMMIT_ARRIVAL_WAIT.as_nanos()).unwrap_or(u64::MAX),
+            "bead_id=bd-1dp9.6.7.9.1 case=arrival_wait_metadata_target_wait_ns"
+        );
+        assert_eq!(
+            decision.max_wait_ns(),
+            u64::try_from(max_wait.as_nanos()).unwrap_or(u64::MAX),
+            "bead_id=bd-1dp9.6.7.9.1 case=arrival_wait_metadata_max_wait_ns"
+        );
+        assert_eq!(
+            decision.queue_delay_ns(),
+            u64::try_from(fill_age.as_nanos()).unwrap_or(u64::MAX),
+            "bead_id=bd-1dp9.6.7.9.1 case=arrival_wait_metadata_queue_delay_ns"
+        );
+    }
+
+    #[test]
+    fn test_physical_writer_batch_membership_preserves_submission_order() {
+        let batches = vec![
+            TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 2,
+                page_data: sample_page(0x55),
+                db_size_if_commit: 2,
+            }])
+            .with_context(TransactionFrameBatchContext {
+                batch_id: 41,
+                lane_id: 0,
+                staged_frame_count: 1,
+                staging_elapsed_ns: 17,
+            }),
+            TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 3,
+                page_data: sample_page(0x66),
+                db_size_if_commit: 3,
+            }])
+            .with_context(TransactionFrameBatchContext {
+                batch_id: 42,
+                lane_id: 1,
+                staged_frame_count: 1,
+                staging_elapsed_ns: 19,
+            }),
+        ];
+
+        assert_eq!(
+            physical_writer_primary_batch_id(&batches),
+            41,
+            "bead_id=bd-1dp9.6.7.9.1 case=physical_writer_primary_batch_id_tracks_head"
+        );
+        assert_eq!(
+            physical_writer_batch_membership(&batches),
+            "41,42",
+            "bead_id=bd-1dp9.6.7.9.1 case=physical_writer_batch_membership_tracks_order"
+        );
+    }
+
+    #[test]
+    fn test_physical_writer_rollback_mode_active_tracks_disable_paths() {
+        assert!(
+            physical_writer_rollback_mode_active(ParallelWalOperatingMode::Conservative, None),
+            "bead_id=bd-1dp9.6.7.9.1 case=physical_writer_rollback_mode_active_operator_forced"
+        );
+        assert!(
+            physical_writer_rollback_mode_active(
+                ParallelWalOperatingMode::Auto,
+                Some(ParallelWalFallbackReason::LaneOverflow),
+            ),
+            "bead_id=bd-1dp9.6.7.9.1 case=physical_writer_rollback_mode_active_runtime_fallback"
+        );
+        assert!(
+            !physical_writer_rollback_mode_active(ParallelWalOperatingMode::Auto, None),
+            "bead_id=bd-1dp9.6.7.9.1 case=physical_writer_rollback_mode_active_clean_auto_mode"
         );
     }
 

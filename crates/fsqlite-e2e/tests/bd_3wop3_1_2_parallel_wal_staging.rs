@@ -185,7 +185,16 @@ fn summarize_lane_logs(
     let mut control_modes = BTreeSet::new();
     let mut required_fields = BTreeMap::from([
         ("trace_id".to_owned(), false),
+        ("run_id".to_owned(), false),
         ("scenario_id".to_owned(), false),
+        ("batch_id".to_owned(), false),
+        ("batch_membership".to_owned(), false),
+        ("queue_delay_ns".to_owned(), false),
+        ("target_wait_ns".to_owned(), false),
+        ("max_wait_ns".to_owned(), false),
+        ("fsync_boundary".to_owned(), false),
+        ("ordering_phase".to_owned(), false),
+        ("rollback_mode_active".to_owned(), false),
         ("wal_lane_id".to_owned(), false),
         ("lane_backlog".to_owned(), false),
         ("staged_frame_count".to_owned(), false),

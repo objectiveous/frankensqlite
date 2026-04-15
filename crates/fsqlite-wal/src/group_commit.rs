@@ -1083,6 +1083,12 @@ impl GroupCommitConsolidator {
         self.epoch
     }
 
+    /// Maximum time a batch may remain in the filling epoch before flush.
+    #[must_use]
+    pub const fn max_group_delay(&self) -> Duration {
+        self.config.max_group_delay
+    }
+
     /// Number of pending frames in the current FILLING phase.
     #[must_use]
     pub const fn pending_frame_count(&self) -> usize {

@@ -96,7 +96,10 @@ const GROUP_COMMIT_WAIT_PATH_MODE: WaitPathMode = WaitPathMode::KeyedEventcount;
 const PUBLISHED_SEQUENCE_WAIT_PATH_MODE: WaitPathMode = WaitPathMode::KeyedEventcount;
 const GROUP_COMMIT_WAIT_TIMEOUT_FALLBACK: Duration = Duration::from_millis(200);
 const LEGACY_GROUP_COMMIT_ARRIVAL_WAIT: Duration = Duration::from_micros(20);
-const GROUP_COMMIT_ARRIVAL_WAIT_POLICY: &str = "fill_age_tail_safe_v1";
+const GROUP_COMMIT_SPARSE_ARRIVAL_WAIT: Duration = Duration::from_micros(8);
+const GROUP_COMMIT_BALANCED_ARRIVAL_WAIT: Duration = LEGACY_GROUP_COMMIT_ARRIVAL_WAIT;
+const GROUP_COMMIT_BURST_ARRIVAL_WAIT: Duration = Duration::from_micros(40);
+const GROUP_COMMIT_ARRIVAL_WAIT_POLICY: &str = "bounded_fair_commit_v1";
 const PHYSICAL_WRITER_LANE_RUN_ID: &str = "physical-writer-batching-lane";
 const PHYSICAL_WRITER_CHECKPOINT_RUN_ID: &str = "physical-writer-checkpoint-decoupling";
 const PHYSICAL_WRITER_CHECKPOINT_SCENARIO_ID: &str = "parallel_wal_checkpoint_coordination";
@@ -157,35 +160,139 @@ struct ArrivalWaitObservation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ArrivalWaitDecision {
-    wait_budget: Duration,
-    max_wait: Duration,
-    policy: &'static str,
-    reason: &'static str,
-    fill_age: Duration,
-    used_legacy_fallback: bool,
+enum CommitServiceMode {
+    LowLatency,
+    Balanced,
+    Throughput,
 }
 
-impl ArrivalWaitDecision {
-    fn skip(reason: &'static str, fill_age: Duration, max_wait: Duration) -> Self {
-        Self {
-            wait_budget: Duration::ZERO,
-            max_wait,
-            policy: GROUP_COMMIT_ARRIVAL_WAIT_POLICY,
-            reason,
-            fill_age,
-            used_legacy_fallback: false,
+impl CommitServiceMode {
+    const fn as_u8(self) -> u8 {
+        match self {
+            Self::LowLatency => 0,
+            Self::Balanced => 1,
+            Self::Throughput => 2,
         }
     }
 
-    fn legacy_fallback(fill_age: Duration, max_wait: Duration) -> Self {
+    const fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::LowLatency,
+            2 => Self::Throughput,
+            _ => Self::Balanced,
+        }
+    }
+}
+
+fn commit_service_mode_name(mode: CommitServiceMode) -> &'static str {
+    match mode {
+        CommitServiceMode::LowLatency => "low_latency",
+        CommitServiceMode::Balanced => "balanced",
+        CommitServiceMode::Throughput => "throughput",
+    }
+}
+
+fn duration_from_nanos_saturating(nanos: u128) -> Duration {
+    Duration::from_nanos(u64::try_from(nanos.min(u128::from(u64::MAX))).unwrap_or(u64::MAX))
+}
+
+fn duration_fraction(duration: Duration, numerator: u32, denominator: u32) -> Duration {
+    debug_assert!(denominator > 0);
+    duration_from_nanos_saturating(
+        duration.as_nanos().saturating_mul(u128::from(numerator)) / u128::from(denominator.max(1)),
+    )
+}
+
+fn commit_service_fairness_budget(
+    control: &ParallelWalControlSurface,
+    max_wait: Duration,
+) -> Duration {
+    let configured_budget = control
+        .max_flush_delay_ms
+        .map(Duration::from_millis)
+        .unwrap_or(max_wait);
+    std::cmp::min(configured_budget, max_wait)
+}
+
+fn recent_queue_age_p95(fill_age: Duration) -> Duration {
+    let recent_arrival_wait_p95 = Duration::from_micros(
+        GLOBAL_CONSOLIDATION_METRICS
+            .snapshot()
+            .hist_arrival_wait
+            .p95,
+    );
+    std::cmp::max(fill_age, recent_arrival_wait_p95)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArrivalWaitDecision {
+    control_epoch: u64,
+    wait_budget: Duration,
+    fairness_budget: Duration,
+    max_wait: Duration,
+    mode: CommitServiceMode,
+    policy: &'static str,
+    reason: &'static str,
+    mode_switch_reason: &'static str,
+    queue_age_p95: Duration,
+    fill_age: Duration,
+    used_legacy_fallback: bool,
+    starvation_prevented: bool,
+}
+
+impl ArrivalWaitDecision {
+    #[allow(clippy::too_many_arguments)]
+    fn skip(
+        control_epoch: u64,
+        reason: &'static str,
+        fill_age: Duration,
+        queue_age_p95: Duration,
+        fairness_budget: Duration,
+        max_wait: Duration,
+        mode: CommitServiceMode,
+        starvation_prevented: bool,
+    ) -> Self {
         Self {
-            wait_budget: LEGACY_GROUP_COMMIT_ARRIVAL_WAIT,
+            control_epoch,
+            wait_budget: Duration::ZERO,
+            fairness_budget,
             max_wait,
+            mode,
             policy: GROUP_COMMIT_ARRIVAL_WAIT_POLICY,
-            reason: "legacy_fallback",
+            reason,
+            mode_switch_reason: reason,
+            queue_age_p95,
             fill_age,
-            used_legacy_fallback: true,
+            used_legacy_fallback: false,
+            starvation_prevented,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn wait(
+        control_epoch: u64,
+        wait_budget: Duration,
+        reason: &'static str,
+        fill_age: Duration,
+        queue_age_p95: Duration,
+        fairness_budget: Duration,
+        max_wait: Duration,
+        mode: CommitServiceMode,
+        used_legacy_fallback: bool,
+    ) -> Self {
+        Self {
+            control_epoch,
+            wait_budget,
+            fairness_budget,
+            max_wait,
+            mode,
+            policy: GROUP_COMMIT_ARRIVAL_WAIT_POLICY,
+            reason,
+            mode_switch_reason: reason,
+            queue_age_p95,
+            fill_age,
+            used_legacy_fallback,
+            starvation_prevented: false,
         }
     }
 
@@ -205,6 +312,14 @@ impl ArrivalWaitDecision {
         self.max_wait.as_nanos() as u64
     }
 
+    fn fairness_budget_ns(self) -> u64 {
+        self.fairness_budget.as_nanos() as u64
+    }
+
+    fn queue_age_p95_ns(self) -> u64 {
+        self.queue_age_p95.as_nanos() as u64
+    }
+
     fn queue_delay_ns(self) -> u64 {
         self.fill_age.as_nanos() as u64
     }
@@ -213,25 +328,125 @@ impl ArrivalWaitDecision {
 fn decide_group_commit_arrival_wait(
     observation: Option<ArrivalWaitObservation>,
     max_wait: Duration,
+    fairness_budget: Duration,
+    queue_age_p95: Duration,
+    previous_mode: CommitServiceMode,
+    control_epoch: u64,
 ) -> ArrivalWaitDecision {
+    let fairness_budget = std::cmp::min(fairness_budget, max_wait);
     match observation {
-        None => ArrivalWaitDecision::skip("promoted_follow_on", Duration::ZERO, max_wait),
+        None => ArrivalWaitDecision::skip(
+            control_epoch,
+            "promoted_follow_on",
+            Duration::ZERO,
+            queue_age_p95,
+            fairness_budget,
+            max_wait,
+            previous_mode,
+            false,
+        ),
         Some(observation) => {
-            if observation.pending_batch_count > 1 || observation.should_flush_now {
+            if observation.should_flush_now {
+                let mode = if matches!(previous_mode, CommitServiceMode::Throughput)
+                    || observation.pending_batch_count >= 3
+                {
+                    CommitServiceMode::Throughput
+                } else {
+                    CommitServiceMode::Balanced
+                };
+                let reason = if matches!(mode, CommitServiceMode::Throughput)
+                    && matches!(previous_mode, CommitServiceMode::Throughput)
+                {
+                    "throughput_hysteresis"
+                } else {
+                    "queue_flushable"
+                };
                 return ArrivalWaitDecision::skip(
-                    "queue_already_flushable",
+                    control_epoch,
+                    reason,
                     observation.fill_age,
+                    queue_age_p95,
+                    fairness_budget,
                     max_wait,
+                    mode,
+                    false,
                 );
             }
-            if observation.fill_age >= LEGACY_GROUP_COMMIT_ARRIVAL_WAIT {
+
+            if fairness_budget.is_zero()
+                || observation.fill_age >= fairness_budget
+                || queue_age_p95 >= fairness_budget
+            {
+                let reason = if fairness_budget.is_zero() || observation.fill_age >= fairness_budget
+                {
+                    "fairness_budget_exhausted"
+                } else {
+                    "tail_latency_pressure"
+                };
                 return ArrivalWaitDecision::skip(
-                    "fill_age_exhausted",
+                    control_epoch,
+                    reason,
                     observation.fill_age,
+                    queue_age_p95,
+                    fairness_budget,
                     max_wait,
+                    CommitServiceMode::LowLatency,
+                    true,
                 );
             }
-            ArrivalWaitDecision::legacy_fallback(observation.fill_age, max_wait)
+
+            let remaining_budget = fairness_budget.saturating_sub(observation.fill_age);
+
+            if observation.pending_batch_count >= 3
+                || (matches!(previous_mode, CommitServiceMode::Throughput)
+                    && observation.pending_batch_count >= 2
+                    && queue_age_p95 <= duration_fraction(fairness_budget, 1, 2))
+            {
+                let reason = if matches!(previous_mode, CommitServiceMode::Throughput)
+                    && observation.pending_batch_count >= 2
+                {
+                    "throughput_hysteresis"
+                } else {
+                    "burst_backlog"
+                };
+                return ArrivalWaitDecision::wait(
+                    control_epoch,
+                    std::cmp::min(remaining_budget, GROUP_COMMIT_BURST_ARRIVAL_WAIT),
+                    reason,
+                    observation.fill_age,
+                    queue_age_p95,
+                    fairness_budget,
+                    max_wait,
+                    CommitServiceMode::Throughput,
+                    false,
+                );
+            }
+
+            if observation.pending_batch_count >= 2 {
+                return ArrivalWaitDecision::wait(
+                    control_epoch,
+                    std::cmp::min(remaining_budget, GROUP_COMMIT_BALANCED_ARRIVAL_WAIT),
+                    "mixed_backlog",
+                    observation.fill_age,
+                    queue_age_p95,
+                    fairness_budget,
+                    max_wait,
+                    CommitServiceMode::Balanced,
+                    false,
+                );
+            }
+
+            ArrivalWaitDecision::wait(
+                control_epoch,
+                std::cmp::min(remaining_budget, GROUP_COMMIT_SPARSE_ARRIVAL_WAIT),
+                "sparse_queue",
+                observation.fill_age,
+                queue_age_p95,
+                fairness_budget,
+                max_wait,
+                CommitServiceMode::LowLatency,
+                true,
+            )
         }
     }
 }
@@ -313,6 +528,7 @@ fn checkpoint_coordination_queue_snapshot(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn log_checkpoint_coordination(
     cx: &Cx,
     queue: &GroupCommitQueueRef,
@@ -466,6 +682,10 @@ struct GroupCommitQueue {
     failed_epochs: Mutex<HashMap<u64, GroupCommitEpochFailure>>,
     /// Narrow per-target-epoch wake slots for waiter coordination.
     epoch_waiters: KeyedWaitRegistry,
+    /// Monotonic control-decision epoch for service-policy traces.
+    commit_service_control_epoch: AtomicU64,
+    /// Last applied bounded-latency service mode for hysteresis.
+    commit_service_mode: AtomicU8,
     /// WAL-owned lane-local staging state for prepared batches.
     parallel_wal_lanes: ParallelWalLaneStager<traits::PreparedWalFrameBatch>,
 }
@@ -557,6 +777,8 @@ impl GroupCommitQueue {
             completed_epoch: AtomicU64::new(0),
             failed_epochs: Mutex::new(HashMap::new()),
             epoch_waiters: KeyedWaitRegistry::new(),
+            commit_service_control_epoch: AtomicU64::new(0),
+            commit_service_mode: AtomicU8::new(CommitServiceMode::Balanced.as_u8()),
             parallel_wal_lanes: ParallelWalLaneStager::new(parallel_wal_control),
         }
     }
@@ -575,6 +797,21 @@ impl GroupCommitQueue {
 
     fn current_lane_backlog(&self, lane_id: u16) -> usize {
         self.parallel_wal_lanes.current_lane_backlog(lane_id)
+    }
+
+    fn current_commit_service_mode(&self) -> CommitServiceMode {
+        CommitServiceMode::from_u8(self.commit_service_mode.load(AtomicOrdering::Relaxed))
+    }
+
+    fn next_commit_service_control_epoch(&self) -> u64 {
+        self.commit_service_control_epoch
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            .saturating_add(1)
+    }
+
+    fn store_commit_service_mode(&self, mode: CommitServiceMode) {
+        self.commit_service_mode
+            .store(mode.as_u8(), AtomicOrdering::Relaxed);
     }
 
     fn record_prepared_batch(&self, prepared_batch: LaneStagedPreparedBatch) -> usize {
@@ -5859,7 +6096,22 @@ where
                         };
                         (observation, consolidator.max_group_delay())
                     };
-                    decide_group_commit_arrival_wait(observation, max_wait)
+                    let fairness_budget =
+                        commit_service_fairness_budget(queue.parallel_wal_control(), max_wait);
+                    let queue_age_p95 = observation
+                        .map_or(Duration::ZERO, |obs| recent_queue_age_p95(obs.fill_age));
+                    let previous_mode = queue.current_commit_service_mode();
+                    let control_epoch = queue.next_commit_service_control_epoch();
+                    let decision = decide_group_commit_arrival_wait(
+                        observation,
+                        max_wait,
+                        fairness_budget,
+                        queue_age_p95,
+                        previous_mode,
+                        control_epoch,
+                    );
+                    queue.store_commit_service_mode(decision.mode);
+                    decision
                 };
                 let arrival_wait_us = if !arrival_wait_decision.wait_budget.is_zero() {
                     let t_arrival_wait_start = Instant::now();
@@ -5883,6 +6135,9 @@ where
                 } else {
                     0
                 };
+                let actual_wait_ns =
+                    u64::try_from(Duration::from_micros(arrival_wait_us).as_nanos())
+                        .unwrap_or(u64::MAX);
 
                 let (batches, flush_epoch) = if let Some(prefetched) = prefetched_flush.take() {
                     prefetched
@@ -5938,7 +6193,15 @@ where
                         batch_membership = flush_batch_membership.as_str(),
                         queue_delay_ns,
                         target_wait_ns,
+                        actual_wait_ns,
                         max_wait_ns,
+                        control_epoch = arrival_wait_decision.control_epoch,
+                        queue_age_p95_ns = arrival_wait_decision.queue_age_p95_ns(),
+                        batch_size = batches.len(),
+                        fairness_budget_ns = arrival_wait_decision.fairness_budget_ns(),
+                        starvation_prevented = arrival_wait_decision.starvation_prevented,
+                        mode_switch_reason = arrival_wait_decision.mode_switch_reason,
+                        service_policy_mode = commit_service_mode_name(arrival_wait_decision.mode),
                         fsync_boundary,
                         ordering_phase = "overlap_abort",
                         rollback_mode_active =
@@ -6238,6 +6501,14 @@ where
                             arrival_wait_reason = arrival_wait_decision.reason,
                             arrival_wait_budget_us = arrival_wait_decision.wait_budget_us(),
                             arrival_wait_fill_age_us = arrival_wait_decision.fill_age_us(),
+                            service_policy_mode =
+                                commit_service_mode_name(arrival_wait_decision.mode),
+                            service_policy_control_epoch = arrival_wait_decision.control_epoch,
+                            queue_age_p95_us =
+                                arrival_wait_decision.queue_age_p95.as_micros() as u64,
+                            fairness_budget_us =
+                                arrival_wait_decision.fairness_budget.as_micros() as u64,
+                            starvation_prevented = arrival_wait_decision.starvation_prevented,
                             arrival_wait_used_legacy_fallback =
                                 arrival_wait_decision.used_legacy_fallback,
                             "WAL backend commit: lock_wait={lock_wait_total_us}us \
@@ -6259,7 +6530,16 @@ where
                                 batch_membership = flush_batch_membership.as_str(),
                                 queue_delay_ns,
                                 target_wait_ns,
+                                actual_wait_ns,
                                 max_wait_ns,
+                                control_epoch = arrival_wait_decision.control_epoch,
+                                queue_age_p95_ns = arrival_wait_decision.queue_age_p95_ns(),
+                                batch_size = batch_count,
+                                fairness_budget_ns = arrival_wait_decision.fairness_budget_ns(),
+                                starvation_prevented = arrival_wait_decision.starvation_prevented,
+                                mode_switch_reason = arrival_wait_decision.mode_switch_reason,
+                                service_policy_mode =
+                                    commit_service_mode_name(arrival_wait_decision.mode),
                                 fsync_boundary,
                                 ordering_phase,
                                 rollback_mode_active = flush_rollback_mode_active,
@@ -6303,7 +6583,16 @@ where
                             batch_membership = flush_batch_membership.as_str(),
                             queue_delay_ns,
                             target_wait_ns,
+                            actual_wait_ns,
                             max_wait_ns,
+                            control_epoch = arrival_wait_decision.control_epoch,
+                            queue_age_p95_ns = arrival_wait_decision.queue_age_p95_ns(),
+                            batch_size = batch_count,
+                            fairness_budget_ns = arrival_wait_decision.fairness_budget_ns(),
+                            starvation_prevented = arrival_wait_decision.starvation_prevented,
+                            mode_switch_reason = arrival_wait_decision.mode_switch_reason,
+                            service_policy_mode =
+                                commit_service_mode_name(arrival_wait_decision.mode),
                             fsync_boundary,
                             ordering_phase = "flush_error",
                             rollback_mode_active = physical_writer_rollback_mode_active(
@@ -8423,6 +8712,7 @@ mod tests {
     const BEAD_ID: &str = "bd-bca.1";
     const TRACK_U_BEAD_ID: &str = "bd-c9pxw";
     const CHECKPOINT_DECOUPLING_BEAD_ID: &str = "bd-1dp9.6.7.9.2";
+    const COMMIT_SERVICE_POLICY_BEAD_ID: &str = "bd-1dp9.6.7.9.4";
     type ObservedLockLevel = Arc<Mutex<LockLevel>>;
     type ObservedUnlockTraceIds = Arc<Mutex<Vec<u64>>>;
     type ObservedCleanupUnlockHarness = (
@@ -8461,6 +8751,10 @@ mod tests {
             *byte = reduced ^ seed;
         }
         page
+    }
+
+    fn default_commit_service_fairness_budget(max_wait: Duration) -> Duration {
+        commit_service_fairness_budget(&ParallelWalControlSurface::default(), max_wait)
     }
 
     fn track_u_log_counts(
@@ -14922,86 +15216,10 @@ mod tests {
     }
 
     #[test]
-    fn test_arrival_wait_policy_fresh_epoch_uses_legacy_fallback() {
-        let max_wait = Duration::from_micros(250);
-        let decision = decide_group_commit_arrival_wait(
-            Some(ArrivalWaitObservation {
-                pending_batch_count: 1,
-                should_flush_now: false,
-                fill_age: Duration::from_micros(3),
-            }),
-            max_wait,
-        );
-
-        assert_eq!(
-            decision.wait_budget, LEGACY_GROUP_COMMIT_ARRIVAL_WAIT,
-            "bead_id=bd-db300.3.8.5 case=arrival_wait_fresh_epoch_legacy_fallback"
-        );
-        assert_eq!(
-            decision.reason, "legacy_fallback",
-            "bead_id=bd-db300.3.8.5 case=arrival_wait_fresh_epoch_reason"
-        );
-        assert!(
-            decision.used_legacy_fallback,
-            "bead_id=bd-db300.3.8.5 case=arrival_wait_fresh_epoch_marks_fallback"
-        );
-        assert_eq!(
-            decision.max_wait, max_wait,
-            "bead_id=bd-1dp9.6.7.9.1 case=arrival_wait_fresh_epoch_preserves_max_wait"
-        );
-    }
-
-    #[test]
-    fn test_arrival_wait_policy_skips_after_legacy_window_is_already_spent() {
-        let max_wait = Duration::from_micros(250);
-        let decision = decide_group_commit_arrival_wait(
-            Some(ArrivalWaitObservation {
-                pending_batch_count: 1,
-                should_flush_now: false,
-                fill_age: LEGACY_GROUP_COMMIT_ARRIVAL_WAIT,
-            }),
-            max_wait,
-        );
-
-        assert_eq!(
-            decision.wait_budget,
-            Duration::ZERO,
-            "bead_id=bd-db300.3.8.5 case=arrival_wait_fill_age_exhausted_budget"
-        );
-        assert_eq!(
-            decision.reason, "fill_age_exhausted",
-            "bead_id=bd-db300.3.8.5 case=arrival_wait_fill_age_exhausted_reason"
-        );
-        assert!(
-            !decision.used_legacy_fallback,
-            "bead_id=bd-db300.3.8.5 case=arrival_wait_fill_age_exhausted_not_fallback"
-        );
-    }
-
-    #[test]
-    fn test_arrival_wait_policy_skips_promoted_follow_on_flushes() {
-        let max_wait = Duration::from_micros(250);
-        let decision = decide_group_commit_arrival_wait(None, max_wait);
-
-        assert_eq!(
-            decision.wait_budget,
-            Duration::ZERO,
-            "bead_id=bd-db300.3.8.5 case=arrival_wait_promoted_follow_on_budget"
-        );
-        assert_eq!(
-            decision.reason, "promoted_follow_on",
-            "bead_id=bd-db300.3.8.5 case=arrival_wait_promoted_follow_on_reason"
-        );
-        assert_eq!(
-            decision.max_wait, max_wait,
-            "bead_id=bd-1dp9.6.7.9.1 case=arrival_wait_promoted_follow_on_preserves_max_wait"
-        );
-    }
-
-    #[test]
-    fn test_arrival_wait_policy_records_wait_contract_metadata() {
+    fn test_commit_service_policy_sparse_queue_prefers_low_latency_mode() {
         let max_wait = Duration::from_micros(250);
         let fill_age = Duration::from_micros(3);
+        let fairness_budget = default_commit_service_fairness_budget(max_wait);
         let decision = decide_group_commit_arrival_wait(
             Some(ArrivalWaitObservation {
                 pending_batch_count: 1,
@@ -15009,23 +15227,291 @@ mod tests {
                 fill_age,
             }),
             max_wait,
+            fairness_budget,
+            fill_age,
+            CommitServiceMode::Balanced,
+            1,
         );
 
         assert_eq!(
+            decision.mode,
+            CommitServiceMode::LowLatency,
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=sparse_queue_prefers_low_latency_mode"
+        );
+        assert_eq!(
+            decision.wait_budget, GROUP_COMMIT_SPARSE_ARRIVAL_WAIT,
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=sparse_queue_uses_low_latency_budget"
+        );
+        assert_eq!(
+            decision.reason, "sparse_queue",
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=sparse_queue_reason"
+        );
+        assert!(
+            decision.used_legacy_fallback,
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=sparse_queue_marks_sparse_fallback"
+        );
+    }
+
+    #[test]
+    fn test_commit_service_policy_throughput_hysteresis_stays_enabled_for_bursty_backlog() {
+        let max_wait = Duration::from_micros(250);
+        let fill_age = Duration::from_micros(7);
+        let fairness_budget = default_commit_service_fairness_budget(max_wait);
+        let queue_age_p95 = Duration::from_micros(30);
+        let decision = decide_group_commit_arrival_wait(
+            Some(ArrivalWaitObservation {
+                pending_batch_count: 3,
+                should_flush_now: false,
+                fill_age,
+            }),
+            max_wait,
+            fairness_budget,
+            queue_age_p95,
+            CommitServiceMode::Throughput,
+            2,
+        );
+
+        assert_eq!(
+            decision.mode,
+            CommitServiceMode::Throughput,
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=bursty_backlog_stays_in_throughput_mode"
+        );
+        assert_eq!(
+            decision.reason, "throughput_hysteresis",
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=bursty_backlog_hysteresis_reason"
+        );
+        assert!(
+            decision.wait_budget <= GROUP_COMMIT_BURST_ARRIVAL_WAIT,
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=bursty_backlog_wait_budget_is_bounded"
+        );
+        assert!(
+            !decision.starvation_prevented,
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=bursty_backlog_does_not_trip_starvation_guard"
+        );
+    }
+
+    #[test]
+    fn test_commit_service_policy_starvation_guard_skips_wait_under_tail_pressure() {
+        let max_wait = Duration::from_micros(120);
+        let fill_age = Duration::from_micros(40);
+        let fairness_budget = default_commit_service_fairness_budget(max_wait);
+        let decision = decide_group_commit_arrival_wait(
+            Some(ArrivalWaitObservation {
+                pending_batch_count: 2,
+                should_flush_now: false,
+                fill_age,
+            }),
+            max_wait,
+            fairness_budget,
+            Duration::from_micros(180),
+            CommitServiceMode::Throughput,
+            3,
+        );
+
+        assert_eq!(
+            decision.wait_budget,
+            Duration::ZERO,
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=tail_pressure_zeroes_wait_budget"
+        );
+        assert_eq!(
+            decision.mode,
+            CommitServiceMode::LowLatency,
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=tail_pressure_falls_back_to_low_latency"
+        );
+        assert_eq!(
+            decision.reason, "tail_latency_pressure",
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=tail_pressure_reason"
+        );
+        assert!(
+            decision.starvation_prevented,
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=tail_pressure_sets_starvation_guard"
+        );
+    }
+
+    #[test]
+    fn test_commit_service_policy_skips_promoted_follow_on_flushes() {
+        let max_wait = Duration::from_micros(250);
+        let fairness_budget = default_commit_service_fairness_budget(max_wait);
+        let decision = decide_group_commit_arrival_wait(
+            None,
+            max_wait,
+            fairness_budget,
+            Duration::ZERO,
+            CommitServiceMode::Balanced,
+            4,
+        );
+
+        assert_eq!(
+            decision.wait_budget,
+            Duration::ZERO,
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=promoted_follow_on_budget"
+        );
+        assert_eq!(
+            decision.reason, "promoted_follow_on",
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=promoted_follow_on_reason"
+        );
+        assert_eq!(
+            decision.max_wait, max_wait,
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=promoted_follow_on_preserves_max_wait"
+        );
+    }
+
+    #[test]
+    fn test_commit_service_policy_records_wait_contract_metadata() {
+        let max_wait = Duration::from_micros(250);
+        let fill_age = Duration::from_micros(3);
+        let fairness_budget = default_commit_service_fairness_budget(max_wait);
+        let queue_age_p95 = Duration::from_micros(11);
+        let decision = decide_group_commit_arrival_wait(
+            Some(ArrivalWaitObservation {
+                pending_batch_count: 1,
+                should_flush_now: false,
+                fill_age,
+            }),
+            max_wait,
+            fairness_budget,
+            queue_age_p95,
+            CommitServiceMode::Balanced,
+            9,
+        );
+
+        assert_eq!(
+            decision.control_epoch, 9,
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=metadata_control_epoch"
+        );
+        assert_eq!(
             decision.target_wait_ns(),
-            u64::try_from(LEGACY_GROUP_COMMIT_ARRIVAL_WAIT.as_nanos()).unwrap_or(u64::MAX),
-            "bead_id=bd-1dp9.6.7.9.1 case=arrival_wait_metadata_target_wait_ns"
+            u64::try_from(GROUP_COMMIT_SPARSE_ARRIVAL_WAIT.as_nanos()).unwrap_or(u64::MAX),
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=metadata_target_wait_ns"
         );
         assert_eq!(
             decision.max_wait_ns(),
             u64::try_from(max_wait.as_nanos()).unwrap_or(u64::MAX),
-            "bead_id=bd-1dp9.6.7.9.1 case=arrival_wait_metadata_max_wait_ns"
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=metadata_max_wait_ns"
+        );
+        assert_eq!(
+            decision.fairness_budget_ns(),
+            u64::try_from(fairness_budget.as_nanos()).unwrap_or(u64::MAX),
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=metadata_fairness_budget_ns"
+        );
+        assert_eq!(
+            decision.queue_age_p95_ns(),
+            u64::try_from(queue_age_p95.as_nanos()).unwrap_or(u64::MAX),
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=metadata_queue_age_p95_ns"
         );
         assert_eq!(
             decision.queue_delay_ns(),
             u64::try_from(fill_age.as_nanos()).unwrap_or(u64::MAX),
-            "bead_id=bd-1dp9.6.7.9.1 case=arrival_wait_metadata_queue_delay_ns"
+            "bead_id={COMMIT_SERVICE_POLICY_BEAD_ID} case=metadata_queue_delay_ns"
         );
+    }
+
+    #[test]
+    fn test_commit_service_policy_logs_sparse_queue_metadata() {
+        let _guard = PARALLEL_WAL_LANE_TEST_LOCK.lock().unwrap();
+        GLOBAL_CONSOLIDATION_METRICS.reset();
+        init_publication_test_tracing();
+
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/commit_service_policy_sparse_queue.db");
+        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+        let observed_lock_level = Arc::new(Mutex::new(LockLevel::Reserved));
+        let (
+            backend,
+            _frames,
+            _append_frames_calls,
+            _append_prepared_calls,
+            _prepare_lock_levels,
+            _append_lock_levels,
+        ) = PreparedBatchObservedWalBackend::new(observed_lock_level);
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        let inner = Arc::clone(&pager.inner);
+        let wal_backend = Arc::clone(&pager.wal_backend);
+        let queue = Arc::new(GroupCommitQueue::with_parallel_wal_control(
+            GroupCommitConfig::default(),
+            ParallelWalControlSurface {
+                mode: ParallelWalOperatingMode::Auto,
+                lane_count_override: Some(2),
+                ..ParallelWalControlSurface::default()
+            },
+        ));
+        let page_two = PageNumber::new(2).unwrap();
+        let mut write_set = HashMap::new();
+        write_set.insert(
+            page_two,
+            StagedPage::from_bytes(&pager.pool, &sample_page(0x71)).unwrap(),
+        );
+
+        SimpleTransaction::<MemoryVfs>::commit_wal_group_commit(
+            &cx,
+            &wal_backend,
+            &inner,
+            &write_set,
+            &[page_two],
+            &queue,
+        )
+        .unwrap();
+
+        GLOBAL_CONSOLIDATION_METRICS.reset();
+    }
+
+    #[test]
+    fn test_commit_service_policy_logs_tail_guard_metadata() {
+        let _guard = PARALLEL_WAL_LANE_TEST_LOCK.lock().unwrap();
+        GLOBAL_CONSOLIDATION_METRICS.reset();
+        for _ in 0..8 {
+            GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(0, 0, 0, true, 2_000, 0, 0, 0, 0, 0);
+        }
+        init_publication_test_tracing();
+
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/commit_service_policy_tail_guard.db");
+        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+        let observed_lock_level = Arc::new(Mutex::new(LockLevel::Reserved));
+        let (
+            backend,
+            _frames,
+            _append_frames_calls,
+            _append_prepared_calls,
+            _prepare_lock_levels,
+            _append_lock_levels,
+        ) = PreparedBatchObservedWalBackend::new(observed_lock_level);
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        let inner = Arc::clone(&pager.inner);
+        let wal_backend = Arc::clone(&pager.wal_backend);
+        let queue = Arc::new(GroupCommitQueue::with_parallel_wal_control(
+            GroupCommitConfig::default(),
+            ParallelWalControlSurface {
+                mode: ParallelWalOperatingMode::Auto,
+                lane_count_override: Some(2),
+                max_flush_delay_ms: Some(1),
+                ..ParallelWalControlSurface::default()
+            },
+        ));
+        let page_two = PageNumber::new(2).unwrap();
+        let mut write_set = HashMap::new();
+        write_set.insert(
+            page_two,
+            StagedPage::from_bytes(&pager.pool, &sample_page(0x83)).unwrap(),
+        );
+
+        SimpleTransaction::<MemoryVfs>::commit_wal_group_commit(
+            &cx,
+            &wal_backend,
+            &inner,
+            &write_set,
+            &[page_two],
+            &queue,
+        )
+        .unwrap();
+
+        GLOBAL_CONSOLIDATION_METRICS.reset();
     }
 
     #[test]

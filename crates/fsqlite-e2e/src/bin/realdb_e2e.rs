@@ -7699,6 +7699,11 @@ mod tests {
                 compiled_cache_misses: 1,
                 prepared_cache_hits: 0,
                 prepared_cache_misses: 1,
+                statement_cache_hits: 0,
+                statement_cache_misses: 1,
+                plan_cache_hits: 0,
+                plan_cache_misses: 1,
+                compile_reuse_count: 0,
                 compile_time_ns: 10,
             },
             btree_copy_kernels: HotPathBtreeCopyKernelProfile {

@@ -239,6 +239,11 @@ pub struct HotPathParserProfile {
     pub compiled_cache_misses: u64,
     pub prepared_cache_hits: u64,
     pub prepared_cache_misses: u64,
+    pub statement_cache_hits: u64,
+    pub statement_cache_misses: u64,
+    pub plan_cache_hits: u64,
+    pub plan_cache_misses: u64,
+    pub compile_reuse_count: u64,
     pub compile_time_ns: u64,
 }
 
@@ -825,6 +830,13 @@ fn parser_profile(snapshot: ParserHotPathProfileSnapshot) -> HotPathParserProfil
         compiled_cache_misses: snapshot.compiled_cache_misses,
         prepared_cache_hits: snapshot.prepared_cache_hits,
         prepared_cache_misses: snapshot.prepared_cache_misses,
+        statement_cache_hits: snapshot.prepared_cache_hits,
+        statement_cache_misses: snapshot.prepared_cache_misses,
+        plan_cache_hits: snapshot.compiled_cache_hits,
+        plan_cache_misses: snapshot.compiled_cache_misses,
+        compile_reuse_count: snapshot
+            .compiled_cache_hits
+            .saturating_add(snapshot.prepared_cache_hits),
         compile_time_ns: snapshot.compile_time_ns,
     }
 }
@@ -1596,6 +1608,33 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
     if let Some(diagnostic) = &report.engine_report.first_failure_diagnostic {
         let _ = writeln!(out, "- First failure diagnostic: `{diagnostic}`");
     }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## Parser Reuse\n");
+    let _ = writeln!(
+        out,
+        "- Parse cache hits/misses: {}/{}",
+        report.parser.parse_cache_hits, report.parser.parse_cache_misses
+    );
+    let _ = writeln!(
+        out,
+        "- `plan_cache_hit` / `plan_cache_miss`: {}/{}",
+        report.parser.plan_cache_hits, report.parser.plan_cache_misses
+    );
+    let _ = writeln!(
+        out,
+        "- `statement_cache_hit` / `statement_cache_miss`: {}/{}",
+        report.parser.statement_cache_hits, report.parser.statement_cache_misses
+    );
+    let _ = writeln!(
+        out,
+        "- `compile_reuse_count`: {}",
+        report.parser.compile_reuse_count
+    );
+    let _ = writeln!(
+        out,
+        "- `invalidation_reason`: emitted by `fsqlite.statement_reuse` telemetry for cache invalidations such as `schema_cookie_changed` and `explicit_invalidate`."
+    );
     let _ = writeln!(out);
 
     let _ = writeln!(out, "## Connection Ceremony\n");
@@ -5490,6 +5529,31 @@ mod tests {
             std::fs::read_to_string(artifact_dir.join("summary.md"))
                 .unwrap()
                 .contains("## B-Tree Copy Kernel Targets")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("## Parser Reuse")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("`compile_reuse_count`")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("`statement_cache_hit` / `statement_cache_miss`")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("`plan_cache_hit` / `plan_cache_miss`")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("`invalidation_reason`")
         );
         assert!(
             std::fs::read_to_string(artifact_dir.join("summary.md"))

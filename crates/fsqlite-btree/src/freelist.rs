@@ -150,10 +150,18 @@ impl Freelist {
     /// Allocate a page from the freelist.
     ///
     /// Prefers pages from the freelist. If the freelist is empty,
-    /// extends the database file by one page.
+    /// extends the database file by one page. Skips any freelist
+    /// entries that reference pages beyond the current database size
+    /// (defensive against stale/corrupt freelist state).
     pub fn allocate(&mut self) -> Result<PageNumber> {
-        if let Some(pgno) = self.free_pages.pop() {
-            return Ok(pgno);
+        while let Some(pgno) = self.free_pages.pop() {
+            if pgno.get() <= self.db_page_count {
+                return Ok(pgno);
+            }
+            // Silently skip freelist entries that point beyond the database
+            // file — these indicate stale or corrupt freelist state and
+            // would cause "freelist leaf page N exceeds db_size M" errors
+            // if returned to callers.
         }
         // Extend the database file.
         if self.db_page_count >= MAX_PAGE_COUNT {
@@ -176,8 +184,13 @@ impl Freelist {
     }
 
     /// Return a page to the freelist.
+    ///
+    /// Rejects pages that reference beyond the current database size,
+    /// which would corrupt the freelist on flush.
     pub fn deallocate(&mut self, page: PageNumber) {
-        self.free_pages.push(page);
+        if page.get() <= self.db_page_count {
+            self.free_pages.push(page);
+        }
     }
 
     /// Current total page count (including allocated pages beyond original).

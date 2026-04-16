@@ -5907,12 +5907,15 @@ impl VdbeEngine {
         }
         if !preserve_runtime_setup {
             self.func_registry = None;
-            // W1: Only clear function caches when not preserving runtime setup.
-            // When preserving, caches are cleared conditionally in
-            // apply_reusable_table_execution_state if func_registry changed.
-            self.scalar_function_cache.clear();
-            self.aggregate_function_cache.clear();
         }
+        // Function caches are keyed by program counter (PC), so they are
+        // only valid for a single program. Always clear them on reset
+        // because the next execution may load a different program with
+        // different functions at the same PCs. (The old code skipped this
+        // when preserving runtime setup, but that caused SUM/AVG/TOTAL
+        // cross-contamination when the cached engine ran different programs.)
+        self.scalar_function_cache.clear();
+        self.aggregate_function_cache.clear();
         // Keep the existing collation_registry Arc — don't allocate a new one.
         self.clear_statement_cold_state();
         if !preserve_runtime_setup {

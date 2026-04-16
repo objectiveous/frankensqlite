@@ -1170,6 +1170,15 @@ impl FastPageArray {
         removed
     }
 
+    /// Drop all resident pages and release oversized sparse indexing storage.
+    fn cold_reset(&mut self) -> usize {
+        let removed = self.count;
+        self.count = 0;
+        self.pages = Vec::with_capacity(FAST_ARRAY_INITIAL_CAPACITY);
+        self.evictions = self.evictions.saturating_add(removed as u64);
+        removed
+    }
+
     /// Number of cached pages (O(1)).
     #[inline]
     fn len(&self) -> usize {
@@ -1872,7 +1881,7 @@ impl ShardedPageCache {
         }
         if !self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
-                fast.lock().clear();
+                fast.lock().cold_reset();
             }
             self.flat_slots.clear();
             for shard in self.shards.iter() {
@@ -1891,7 +1900,14 @@ impl ShardedPageCache {
     /// changes.
     pub fn disable_fast_path(&mut self) {
         if self.use_fast_path.load(Ordering::Relaxed) {
-            self.clear();
+            if let Some(ref fast) = self.fast_array {
+                fast.lock().cold_reset();
+            }
+            self.flat_slots.clear();
+            for shard in self.shards.iter() {
+                shard.lock().clear();
+            }
+            self.clear_eviction_history();
         }
         self.use_fast_path.store(false, Ordering::Release);
     }
@@ -5379,6 +5395,36 @@ mod tests {
     }
 
     #[test]
+    fn test_fast_page_array_cold_reset_releases_sparse_index_storage() {
+        let mut arr = FastPageArray::new();
+        let pool = PageBufPool::new(PageSize::DEFAULT, 2);
+        let sparse_page = PageNumber::new(4096).unwrap();
+
+        arr.insert(sparse_page, pool.acquire().unwrap());
+        assert!(
+            arr.pages.len() > FAST_ARRAY_INITIAL_CAPACITY,
+            "bead_id={BEAD_FZR07} case=sparse_insert_grows_backing_storage"
+        );
+
+        arr.cold_reset();
+
+        assert_eq!(
+            arr.len(),
+            0,
+            "bead_id={BEAD_FZR07} case=cold_reset_clears_entries"
+        );
+        assert_eq!(
+            arr.pages.len(),
+            0,
+            "bead_id={BEAD_FZR07} case=cold_reset_releases_sparse_index_storage"
+        );
+        assert_eq!(
+            arr.evictions, 1,
+            "bead_id={BEAD_FZR07} case=cold_reset_tracks_eviction"
+        );
+    }
+
+    #[test]
     fn test_fast_page_array_metrics() {
         let mut arr = FastPageArray::new();
         let pool = PageBufPool::new(PageSize::DEFAULT, 8);
@@ -5600,6 +5646,34 @@ mod tests {
             cache.len(),
             1,
             "bead_id={BEAD_FZR07} case=disable_idempotent_preserves_sharded_len"
+        );
+    }
+
+    #[test]
+    fn test_disable_fast_path_releases_sparse_fast_array_storage() {
+        let mut cache = ShardedPageCache::new(PageSize::DEFAULT);
+        let sparse_page = PageNumber::new(4096).unwrap();
+
+        cache.enable_fast_path();
+        cache
+            .insert_fresh(sparse_page, |data| data[0] = 0xA5)
+            .unwrap();
+        assert!(
+            cache.fast_array.as_ref().unwrap().lock().pages.len() > FAST_ARRAY_INITIAL_CAPACITY,
+            "bead_id={BEAD_FZR07} case=sparse_fast_insert_grows_backing_storage"
+        );
+
+        cache.disable_fast_path();
+
+        assert_eq!(
+            cache.fast_array.as_ref().unwrap().lock().pages.len(),
+            0,
+            "bead_id={BEAD_FZR07} case=disable_releases_sparse_fast_storage"
+        );
+        assert_eq!(
+            cache.fast_array.as_ref().unwrap().lock().len(),
+            0,
+            "bead_id={BEAD_FZR07} case=disable_releases_sparse_fast_entries"
         );
     }
 

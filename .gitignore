@@ -278,3 +278,6 @@ evidence/
 
 # Heaptrack profiling dumps
 heaptrack.*.zst
+
+# Beads recovery artifacts (timestamped directories at repo root)
+.beads.recovery_*/

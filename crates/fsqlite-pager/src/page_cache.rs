@@ -2560,7 +2560,7 @@ impl ShardedPageCache {
     /// Evict all pages from the cache.
     pub fn clear(&self) {
         if let Some(ref fast) = self.fast_array {
-            fast.lock().clear();
+            fast.lock().cold_reset();
         }
         self.flat_slots.clear();
         for shard in self.shards.iter() {
@@ -5674,6 +5674,34 @@ mod tests {
             cache.fast_array.as_ref().unwrap().lock().len(),
             0,
             "bead_id={BEAD_FZR07} case=disable_releases_sparse_fast_entries"
+        );
+    }
+
+    #[test]
+    fn test_sharded_cache_clear_releases_sparse_fast_path_storage() {
+        let mut cache = ShardedPageCache::new(PageSize::DEFAULT);
+        let sparse_page = PageNumber::new(4096).unwrap();
+
+        cache.enable_fast_path();
+        cache
+            .insert_fresh(sparse_page, |data| data[0] = 0x7C)
+            .unwrap();
+        assert!(
+            cache.fast_array.as_ref().unwrap().lock().pages.len() > FAST_ARRAY_INITIAL_CAPACITY,
+            "bead_id={BEAD_FZR07} case=clear_sparse_fast_insert_grows_backing_storage"
+        );
+
+        cache.clear();
+
+        assert_eq!(
+            cache.fast_array.as_ref().unwrap().lock().pages.len(),
+            0,
+            "bead_id={BEAD_FZR07} case=clear_releases_sparse_fast_storage"
+        );
+        assert_eq!(
+            cache.fast_array.as_ref().unwrap().lock().len(),
+            0,
+            "bead_id={BEAD_FZR07} case=clear_releases_sparse_fast_entries"
         );
     }
 

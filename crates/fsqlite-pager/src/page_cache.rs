@@ -1863,23 +1863,37 @@ impl ShardedPageCache {
     /// Enable the single-connection fast path (bd-fzr07).
     ///
     /// Once enabled, all page operations will use the flat array instead of
-    /// the sharded cache. This is safe to call at any time, but should be
-    /// called early before significant cache population.
+    /// the sharded cache. Switching into fast-path mode performs a cold reset
+    /// of every cache tier so that hidden pages from a previous mode cannot
+    /// later reappear and overwrite newer data.
     pub fn enable_fast_path(&mut self) {
         if self.fast_array.is_none() {
             self.fast_array = Some(Mutex::new(FastPageArray::new()));
-            self.use_fast_path.store(true, Ordering::Release);
         }
+        if !self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                fast.lock().clear();
+            }
+            self.flat_slots.clear();
+            for shard in self.shards.iter() {
+                shard.lock().clear();
+            }
+            self.clear_eviction_history();
+        }
+        self.use_fast_path.store(true, Ordering::Release);
     }
 
     /// Disable the fast path and switch back to sharded cache.
     ///
-    /// Note: Pages in the fast array are NOT migrated to the sharded cache.
-    /// This should only be called when switching to multi-connection mode.
+    /// Switching out of fast-path mode is a cold reset: fast-array residents
+    /// are not migrated into the sharded cache, and keeping them hidden would
+    /// only waste memory and risk stale pages surfacing after later mode
+    /// changes.
     pub fn disable_fast_path(&mut self) {
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            self.clear();
+        }
         self.use_fast_path.store(false, Ordering::Release);
-        // Keep the fast_array around to avoid dropping cached pages.
-        // They'll be re-read from VFS if needed.
     }
 
     /// Check if fast path is enabled.
@@ -2529,13 +2543,8 @@ impl ShardedPageCache {
 
     /// Evict all pages from the cache.
     pub fn clear(&self) {
-        // Fast path (bd-fzr07)
-        if self.use_fast_path.load(Ordering::Relaxed) {
-            if let Some(ref fast) = self.fast_array {
-                fast.lock().clear();
-                self.clear_eviction_history();
-                return;
-            }
+        if let Some(ref fast) = self.fast_array {
+            fast.lock().clear();
         }
         self.flat_slots.clear();
         for shard in self.shards.iter() {
@@ -5521,6 +5530,11 @@ mod tests {
         // Insert some data while in fast path mode
         let p1 = PageNumber::ONE;
         cache.insert_fresh(p1, |data| data[0] = 0xEE).unwrap();
+        assert_eq!(
+            cache.fast_array.as_ref().unwrap().lock().len(),
+            1,
+            "bead_id={BEAD_FZR07} case=fast_array_contains_inserted_page_before_disable"
+        );
 
         // Disable fast path
         cache.disable_fast_path();
@@ -5528,12 +5542,143 @@ mod tests {
             !cache.is_fast_path_enabled(),
             "bead_id={BEAD_FZR07} case=disabled"
         );
+        assert_eq!(
+            cache.fast_array.as_ref().unwrap().lock().len(),
+            0,
+            "bead_id={BEAD_FZR07} case=disable_clears_hidden_fast_array_pages"
+        );
 
-        // Data in fast array is still there (not migrated)
-        // But operations now go through sharded path
+        // Operations now go through the sharded path with a cold cache.
         assert!(
             !cache.contains(p1),
-            "bead_id={BEAD_FZR07} case=disabled_no_migrate - fast array data not visible in sharded mode"
+            "bead_id={BEAD_FZR07} case=disabled_cold_reset_no_hidden_fast_page"
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "bead_id={BEAD_FZR07} case=disabled_len_reset"
+        );
+
+        cache.enable_fast_path();
+        assert!(
+            cache.is_fast_path_enabled(),
+            "bead_id={BEAD_FZR07} case=re_enabled"
+        );
+        assert!(
+            !cache.contains(p1),
+            "bead_id={BEAD_FZR07} case=re_enabled_cold_resets_fast_array_visibility"
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "bead_id={BEAD_FZR07} case=re_enabled_len_reset"
+        );
+    }
+
+    #[test]
+    fn test_disable_fast_path_is_idempotent_for_sharded_cache() {
+        let mut cache = ShardedPageCache::new(PageSize::DEFAULT);
+        let p1 = PageNumber::ONE;
+
+        cache.insert_fresh(p1, |data| data[0] = 0x5A).unwrap();
+        assert!(
+            cache.contains(p1),
+            "bead_id={BEAD_FZR07} case=pre_disable_sharded_page_visible"
+        );
+
+        cache.disable_fast_path();
+
+        assert!(
+            !cache.is_fast_path_enabled(),
+            "bead_id={BEAD_FZR07} case=disable_idempotent_stays_off"
+        );
+        assert!(
+            cache.contains(p1),
+            "bead_id={BEAD_FZR07} case=disable_idempotent_preserves_sharded_page"
+        );
+        assert_eq!(
+            cache.len(),
+            1,
+            "bead_id={BEAD_FZR07} case=disable_idempotent_preserves_sharded_len"
+        );
+    }
+
+    #[test]
+    fn test_enable_fast_path_clears_now_inactive_sharded_tiers() {
+        let mut cache = ShardedPageCache::new(PageSize::DEFAULT);
+        let p1 = PageNumber::ONE;
+
+        cache.insert_fresh(p1, |data| data[0] = 0xCD).unwrap();
+        assert!(
+            cache.contains(p1),
+            "bead_id={BEAD_FZR07} case=pre_enable_contains"
+        );
+
+        cache.enable_fast_path();
+        assert!(
+            cache.is_empty(),
+            "bead_id={BEAD_FZR07} case=enable_clears_inactive_sharded_tiers"
+        );
+
+        cache.disable_fast_path();
+        assert!(
+            !cache.contains(p1),
+            "bead_id={BEAD_FZR07} case=disabled_does_not_resurrect_old_sharded_pages"
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "bead_id={BEAD_FZR07} case=enable_then_disable_keeps_old_sharded_tiers_cleared"
+        );
+    }
+
+    #[test]
+    fn test_enable_fast_path_drops_stale_fast_array_pages() {
+        let mut cache = ShardedPageCache::new(PageSize::DEFAULT);
+        let p1 = PageNumber::ONE;
+
+        cache.enable_fast_path();
+        cache.insert_fresh(p1, |data| data[0] = 0x11).unwrap();
+        cache.disable_fast_path();
+
+        cache.insert_fresh(p1, |data| data[0] = 0x22).unwrap();
+        assert!(
+            cache.contains(p1),
+            "bead_id={BEAD_FZR07} case=sharded_write_visible"
+        );
+
+        cache.enable_fast_path();
+        assert!(
+            !cache.contains(p1),
+            "bead_id={BEAD_FZR07} case=re_enable_discards_old_fast_array_state"
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "bead_id={BEAD_FZR07} case=re_enable_after_sharded_write_is_cold_reset"
+        );
+    }
+
+    #[test]
+    fn test_sharded_cache_clear_removes_inactive_fast_path_pages() {
+        let mut cache = ShardedPageCache::new(PageSize::DEFAULT);
+        cache.enable_fast_path();
+
+        let p1 = PageNumber::ONE;
+        cache.insert_fresh(p1, |data| data[0] = 0xAB).unwrap();
+        cache.disable_fast_path();
+
+        cache.clear();
+        cache.enable_fast_path();
+
+        assert!(
+            !cache.contains(p1),
+            "bead_id={BEAD_FZR07} case=clear_removes_hidden_fast_array_pages"
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "bead_id={BEAD_FZR07} case=clear_resets_all_tiers"
         );
     }
 

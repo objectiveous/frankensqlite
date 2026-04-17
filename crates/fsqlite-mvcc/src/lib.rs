@@ -24,6 +24,7 @@ pub mod deterministic_rebase;
 pub mod differential_privacy;
 pub mod ebr;
 pub mod flat_combining;
+pub mod flat_combining_page_locks;
 pub mod gc;
 pub mod history_compression;
 pub mod hot_witness_index;
@@ -254,6 +255,7 @@ pub use flat_combining::{
     FcHandle, FlatCombiner, FlatCombiningMetrics, MAX_FC_SHARDS, MAX_FC_THREADS, OP_ADD, OP_READ,
     ShardedFcHandle, ShardedFlatCombiner, flat_combining_metrics, reset_flat_combining_metrics,
 };
+pub use flat_combining_page_locks::{FcPageLockShard, MAX_FC_SLOTS};
 pub use gc::{
     GC_F_MAX_HZ, GC_F_MIN_HZ, GC_PAGES_BUDGET, GC_TARGET_CHAIN_LENGTH, GC_VERSIONS_BUDGET,
     GcScheduler, GcTickResult, GcTodo, PruneResult, gc_tick, prune_page_chain,

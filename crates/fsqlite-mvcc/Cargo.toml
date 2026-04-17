@@ -12,6 +12,13 @@ default = ["native"]
 native = ["fsqlite-btree/native", "fsqlite-pager/native", "fsqlite-wal/native"]
 wasm = ["fsqlite-btree/wasm", "fsqlite-pager/wasm", "fsqlite-wal/wasm"]
 linux-asupersync-uring = ["fsqlite-pager/linux-asupersync-uring"]
+# Opt-in: route the sharded fallback (pages > FAST_LOCK_ARRAY_SIZE) in
+# `InProcessPageLockTable` through a flat-combining publication list per shard
+# instead of `parking_lot::Mutex<HashMap>`. Intended for workloads that
+# generate high-page-number contention at 8+ concurrent writers. Off by
+# default: the fast path (pages 1..=65536) is already lock-free CAS and the
+# sharded tail is rarely the bottleneck.
+mvcc-flat-combining = []
 
 [dependencies]
 blake3 = { workspace = true }

@@ -351,6 +351,12 @@ const FAST_LOCK_ARRAY_SIZE: usize = 65536;
 /// A single cache-line-aligned lock table shard.
 type LockShard = CacheAligned<Mutex<HashMap<PageNumber, TxnId, PageNumberBuildHasher>>>;
 
+/// A flat-combining shard used for the sharded tail when the
+/// `mvcc-flat-combining` feature is enabled. See
+/// [`crate::flat_combining_page_locks`] for the protocol.
+#[cfg(feature = "mvcc-flat-combining")]
+type FcLockShard = CacheAligned<crate::flat_combining_page_locks::FcPageLockShard>;
+
 /// Per-page waiter queue for targeted wakeups (D4, bd-3wop3.4).
 /// `SmallVec<[Thread; 2]>` avoids heap allocation for typical 1-2 waiters/page.
 type WaiterQueue = SmallVec<[Thread; 2]>;
@@ -378,8 +384,24 @@ pub struct InProcessPageLockTable {
     /// Lock-free fast path: flat atomic array for pages 1..=65536.
     /// Slot value 0 = unlocked; non-zero = TxnId.get() of the holder.
     fast_locks: Box<[AtomicU64]>,
-    /// Sharded fallback for pages > 65536.
+    /// Sharded fallback for pages > 65536. When the `mvcc-flat-combining`
+    /// feature is enabled, the active fallback path routes through
+    /// [`Self::fc_shards`] instead; this field remains as the storage backing
+    /// for rolling-rebuild draining-table rotation (a rare maintenance
+    /// operation) and for the feature-off baseline.
     shards: Box<[LockShard; LOCK_TABLE_SHARDS]>,
+    /// Flat-combining shards used for the sharded-fallback hot path when the
+    /// `mvcc-flat-combining` feature is enabled. Each shard serialises
+    /// `try_acquire` / `release` / `holder` requests through a
+    /// publication-list + combiner design, eliminating the
+    /// `parking_lot::Mutex<HashMap>` contention under 8+ concurrent writers
+    /// that all land in the same shard.
+    ///
+    /// Cancellation-correct (caller never blocks on an external condvar —
+    /// they spin on their own cache-line slot); preserves INV-2 (only the
+    /// combiner mutates the backing map).
+    #[cfg(feature = "mvcc-flat-combining")]
+    fc_shards: Box<[FcLockShard; LOCK_TABLE_SHARDS]>,
     /// During rolling rebuild: the old shards being drained. Protected by
     /// `Mutex` for synchronization. `None` when no rebuild is in progress.
     draining: Mutex<Option<DrainingState>>,
@@ -485,6 +507,18 @@ impl InProcessPageLockTable {
         }))
     }
 
+    /// Allocate the flat-combining sharded fallback, one `FcPageLockShard`
+    /// per shard index. Only used when the `mvcc-flat-combining` feature is
+    /// enabled.
+    #[cfg(feature = "mvcc-flat-combining")]
+    fn alloc_fc_shards() -> Box<[FcLockShard; LOCK_TABLE_SHARDS]> {
+        Box::new(std::array::from_fn(|i| {
+            CacheAligned::new(crate::flat_combining_page_locks::FcPageLockShard::new(
+                u32::try_from(i).unwrap_or(u32::MAX),
+            ))
+        }))
+    }
+
     /// Create a new empty lock table with no observer.
     #[must_use]
     pub fn new() -> Self {
@@ -495,6 +529,8 @@ impl InProcessPageLockTable {
                     PageNumberBuildHasher::default(),
                 )))
             })),
+            #[cfg(feature = "mvcc-flat-combining")]
+            fc_shards: Self::alloc_fc_shards(),
             draining: Mutex::new(None),
             has_draining: std::sync::atomic::AtomicBool::new(false),
             change_epoch: AtomicU64::new(0),
@@ -517,6 +553,8 @@ impl InProcessPageLockTable {
                     PageNumberBuildHasher::default(),
                 )))
             })),
+            #[cfg(feature = "mvcc-flat-combining")]
+            fc_shards: Self::alloc_fc_shards(),
             draining: Mutex::new(None),
             has_draining: std::sync::atomic::AtomicBool::new(false),
             change_epoch: AtomicU64::new(0),
@@ -608,19 +646,41 @@ impl InProcessPageLockTable {
             }
         }
 
-        // Step 2 (fallback): Pages > 65536 use the sharded Mutex+HashMap.
-        let shard = &self.shards[Self::shard_index_static(page)];
-        let mut map = shard.lock();
-        if let Some(&holder) = map.get(&page) {
-            if holder == txn {
-                return Ok(()); // already held by this txn
+        // Step 2 (fallback): Pages > 65536 use the sharded fallback.
+        //
+        // When `mvcc-flat-combining` is enabled, route through the
+        // publication-list combiner; otherwise use the sharded Mutex+HashMap.
+        #[cfg(feature = "mvcc-flat-combining")]
+        {
+            let shard_idx = Self::shard_index_static(page);
+            match self.fc_shards[shard_idx].try_acquire(page, txn) {
+                Ok(()) => Ok(()),
+                Err(holder) => {
+                    crate::observability::emit_page_lock_contention(
+                        &self.observer,
+                        page,
+                        txn,
+                        holder,
+                    );
+                    Err(holder)
+                }
             }
-            crate::observability::emit_page_lock_contention(&self.observer, page, txn, holder);
-            return Err(holder);
         }
-        map.insert(page, txn);
-        drop(map);
-        Ok(())
+        #[cfg(not(feature = "mvcc-flat-combining"))]
+        {
+            let shard = &self.shards[Self::shard_index_static(page)];
+            let mut map = shard.lock();
+            if let Some(&holder) = map.get(&page) {
+                if holder == txn {
+                    return Ok(()); // already held by this txn
+                }
+                crate::observability::emit_page_lock_contention(&self.observer, page, txn, holder);
+                return Err(holder);
+            }
+            map.insert(page, txn);
+            drop(map);
+            Ok(())
+        }
     }
 
     /// Release the lock on `page` held by `txn`.
@@ -653,15 +713,25 @@ impl InProcessPageLockTable {
         // use fast_locks for new acquisitions).
         if pgno > FAST_LOCK_ARRAY_SIZE {
             let shard_idx = Self::shard_index_static(page);
-            let shard = &self.shards[shard_idx];
-            let mut map = shard.lock();
-            if map.get(&page) == Some(&txn) {
-                map.remove(&page);
-                drop(map);
-                self.notify_waiters_for_page(page);
-                return true;
+            #[cfg(feature = "mvcc-flat-combining")]
+            {
+                if self.fc_shards[shard_idx].release(page, txn) {
+                    self.notify_waiters_for_page(page);
+                    return true;
+                }
             }
-            drop(map);
+            #[cfg(not(feature = "mvcc-flat-combining"))]
+            {
+                let shard = &self.shards[shard_idx];
+                let mut map = shard.lock();
+                if map.get(&page) == Some(&txn) {
+                    map.remove(&page);
+                    drop(map);
+                    self.notify_waiters_for_page(page);
+                    return true;
+                }
+                drop(map);
+            }
         }
 
         // Try draining table (sharded pages only) — only if a rebuild is in progress.
@@ -700,11 +770,22 @@ impl InProcessPageLockTable {
             }
         }
         // Scan sharded tables for pages > 65536.
-        for shard in self.shards.iter() {
-            let mut map = shard.lock();
-            let before = map.len();
-            map.retain(|_, &mut v| v != txn);
-            released_any |= map.len() != before;
+        #[cfg(feature = "mvcc-flat-combining")]
+        {
+            for shard in self.fc_shards.iter() {
+                if shard.release_all(txn) > 0 {
+                    released_any = true;
+                }
+            }
+        }
+        #[cfg(not(feature = "mvcc-flat-combining"))]
+        {
+            for shard in self.shards.iter() {
+                let mut map = shard.lock();
+                let before = map.len();
+                map.retain(|_, &mut v| v != txn);
+                released_any |= map.len() != before;
+            }
         }
         // Also release from draining table (only if rebuild in progress).
         if self.has_draining.load(std::sync::atomic::Ordering::Relaxed) {
@@ -749,13 +830,23 @@ impl InProcessPageLockTable {
             }
             // Fallback for pages > 65536.
             let shard_idx = Self::shard_index_static(page);
-            let mut map = self.shards[shard_idx].lock();
-            if map.get(&page) == Some(&txn) {
-                map.remove(&page);
-                released_any = true;
-                continue;
+            #[cfg(feature = "mvcc-flat-combining")]
+            {
+                if self.fc_shards[shard_idx].release(page, txn) {
+                    released_any = true;
+                    continue;
+                }
             }
-            drop(map);
+            #[cfg(not(feature = "mvcc-flat-combining"))]
+            {
+                let mut map = self.shards[shard_idx].lock();
+                if map.get(&page) == Some(&txn) {
+                    map.remove(&page);
+                    released_any = true;
+                    continue;
+                }
+                drop(map);
+            }
             if has_drain {
                 let guard = draining_guard.get_or_insert_with(|| self.draining.lock());
                 if let Some(ref draining) = **guard {
@@ -796,12 +887,21 @@ impl InProcessPageLockTable {
 
         // Pages > 65536: check sharded active table.
         let shard_idx = Self::shard_index_static(page);
-        let shard = &self.shards[shard_idx];
-        let map = shard.lock();
-        if let Some(&holder) = map.get(&page) {
-            return Some(holder);
+        #[cfg(feature = "mvcc-flat-combining")]
+        {
+            if let Some(h) = self.fc_shards[shard_idx].holder(page) {
+                return Some(h);
+            }
         }
-        drop(map);
+        #[cfg(not(feature = "mvcc-flat-combining"))]
+        {
+            let shard = &self.shards[shard_idx];
+            let map = shard.lock();
+            if let Some(&holder) = map.get(&page) {
+                return Some(holder);
+            }
+            drop(map);
+        }
 
         // Check draining table (only if rebuild in progress).
         if self.has_draining.load(std::sync::atomic::Ordering::Relaxed) {
@@ -934,6 +1034,9 @@ impl InProcessPageLockTable {
             .iter()
             .filter(|s| s.load(Ordering::Relaxed) != 0)
             .count();
+        #[cfg(feature = "mvcc-flat-combining")]
+        let shard_count: usize = self.fc_shards.iter().map(|s| s.len()).sum();
+        #[cfg(not(feature = "mvcc-flat-combining"))]
         let shard_count: usize = self.shards.iter().map(|s| s.lock().len()).sum();
         fast_count + shard_count
     }
@@ -957,7 +1060,14 @@ impl InProcessPageLockTable {
     /// Distribution of locks across shards (for birthday-problem analysis).
     #[must_use]
     pub fn shard_distribution(&self) -> Vec<usize> {
-        self.shards.iter().map(|s| s.lock().len()).collect()
+        #[cfg(feature = "mvcc-flat-combining")]
+        {
+            self.fc_shards.iter().map(|s| s.len()).collect()
+        }
+        #[cfg(not(feature = "mvcc-flat-combining"))]
+        {
+            self.shards.iter().map(|s| s.lock().len()).collect()
+        }
     }
 
     /// Whether a rolling rebuild is currently in progress.
@@ -990,7 +1100,30 @@ impl InProcessPageLockTable {
             drop(guard);
         }
 
+        // Under the flat-combining feature, snapshot the current fc_shards
+        // state into `self.shards` so the existing draining pipeline can
+        // handle it. Then reset the fc_shards in place so new acquisitions
+        // go to an empty active table. This preserves the rebuild API
+        // contract (rotate → drain → finalize).
+        #[cfg(feature = "mvcc-flat-combining")]
+        let initial_count: usize = {
+            let mut count = 0usize;
+            for (i, fc) in self.fc_shards.iter().enumerate() {
+                let mut snapshot: HashMap<PageNumber, TxnId, PageNumberBuildHasher> =
+                    HashMap::with_hasher(PageNumberBuildHasher::default());
+                fc.for_each(|page, txn| {
+                    snapshot.insert(page, txn);
+                });
+                // Clear the FC shard so new acquisitions go to a fresh map.
+                let _ = fc.retain(|_, _| false);
+                count += snapshot.len();
+                *self.shards[i].lock() = snapshot;
+            }
+            count
+        };
+        #[cfg(not(feature = "mvcc-flat-combining"))]
         let initial_count: usize = self.shards.iter().map(|s| s.lock().len()).sum();
+
         let epoch = 1; // First rebuild epoch; would be tracked externally in production.
 
         tracing::info!(

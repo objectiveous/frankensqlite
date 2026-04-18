@@ -36,14 +36,8 @@ fn cancelled_cx() -> Cx {
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {
-    struct NoopWaker;
-
-    impl std::task::Wake for NoopWaker {
-        fn wake(self: Arc<Self>) {}
-    }
-
-    let waker = Waker::from(Arc::new(NoopWaker));
-    let mut context = Context::from_waker(&waker);
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
     let mut pinned = Box::pin(future);
 
     loop {

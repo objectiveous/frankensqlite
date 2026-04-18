@@ -3,7 +3,7 @@ mod commit_pipeline;
 
 use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::task::{Context, Poll, Waker};
 use std::thread;
 
@@ -44,14 +44,8 @@ fn cancelled_cx() -> Cx {
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {
-    struct NoopWaker;
-
-    impl std::task::Wake for NoopWaker {
-        fn wake(self: Arc<Self>) {}
-    }
-
-    let waker = Waker::from(Arc::new(NoopWaker));
-    let mut context = Context::from_waker(&waker);
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
     let mut pinned = Box::pin(future);
 
     loop {

@@ -25,8 +25,7 @@ use fsqlite_types::SqliteValue;
 fn union_with_view_does_not_corrupt_existing_index() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("union_view_collision.db");
-    let conn =
-        Connection::open(db_path.to_str().expect("db path utf8")).expect("open file db");
+    let conn = Connection::open(db_path.to_str().expect("db path utf8")).expect("open file db");
 
     // Real persistent tables + indexes — these allocate pager root pages.
     conn.execute(
@@ -72,10 +71,8 @@ fn union_with_view_does_not_corrupt_existing_index() {
     }
 
     // The VIEW that triggers materialization.
-    conn.execute(
-        "CREATE VIEW dep_edges AS SELECT from_block AS src, to_block AS dst FROM deps",
-    )
-    .expect("create view");
+    conn.execute("CREATE VIEW dep_edges AS SELECT from_block AS src, to_block AS dst FROM deps")
+        .expect("create view");
 
     // The UNION query — same shape that broke beads_rust `get_blocks_dep_edges`.
     // The arm referencing `dep_edges` forces view materialization, and pre-fix

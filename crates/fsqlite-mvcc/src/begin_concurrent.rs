@@ -23,8 +23,18 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use fsqlite_types::{
-    CommitSeq, PageData, PageNumber, Snapshot, TxnEpoch, TxnId, TxnToken, WitnessKey,
+    CommitSeq, PageData, PageNumber, PageNumberBuildHasher, Snapshot, TxnEpoch, TxnId, TxnToken,
+    WitnessKey,
 };
+
+/// HashMap keyed by [`PageNumber`] with identity hashing.
+///
+/// Per §M5.2: PageNumber keys are already well-distributed u32 values; using
+/// std `RandomState` (SipHash13) on PageNumber lookups costs ~70 cycles per
+/// probe and shows up at 3-5% of wall time in UPDATE/DELETE hot paths.
+/// `PageNumberBuildHasher` reduces this to a single mov+finish.
+type PageMap<V> = HashMap<PageNumber, V, PageNumberBuildHasher>;
+type PageSet = HashSet<PageNumber, PageNumberBuildHasher>;
 use parking_lot::{Mutex, MutexGuard};
 
 use crate::core_types::{CommitIndex, InProcessPageLockTable, TransactionMode, TransactionState};
@@ -73,18 +83,18 @@ pub struct ConcurrentHandle {
     snapshot: Snapshot,
     /// Per-page transactional state for staged writes, frees, synthetic
     /// conflict tracking, and held page locks.
-    page_states: HashMap<PageNumber, PageTxnState>,
+    page_states: PageMap<PageTxnState>,
     /// Transaction state (Active / Committed / Aborted).
     state: TransactionState,
     /// Pages read by this transaction (for SSI rw-antidependency detection).
-    read_set: HashSet<PageNumber>,
+    read_set: PageSet,
     /// Granular read witnesses bucketed by page for O(1) page-level lookup.
     /// Uses SmallVec to avoid allocations for the common case of 1-4 witnesses per page.
-    read_index: HashMap<PageNumber, smallvec::SmallVec<[WitnessKey; 4]>>,
+    read_index: PageMap<smallvec::SmallVec<[WitnessKey; 4]>>,
     /// Witnesses that are not bound to a specific page (global or custom).
     global_read_witnesses: Vec<WitnessKey>,
     /// Granular write witnesses bucketed by page.
-    write_index: HashMap<PageNumber, smallvec::SmallVec<[WitnessKey; 4]>>,
+    write_index: PageMap<smallvec::SmallVec<[WitnessKey; 4]>>,
     /// Global write witnesses.
     global_write_witnesses: Vec<WitnessKey>,
     /// Transaction token for SSI tracking.
@@ -128,7 +138,7 @@ impl PageTxnState {
 }
 
 pub struct WriteSetView<'a> {
-    page_states: &'a HashMap<PageNumber, PageTxnState>,
+    page_states: &'a PageMap<PageTxnState>,
 }
 
 impl WriteSetView<'_> {
@@ -156,7 +166,7 @@ impl WriteSetView<'_> {
 }
 
 pub struct HeldLocksView<'a> {
-    page_states: &'a HashMap<PageNumber, PageTxnState>,
+    page_states: &'a PageMap<PageTxnState>,
 }
 
 impl HeldLocksView<'_> {
@@ -217,12 +227,12 @@ impl ConcurrentHandle {
     pub fn new(snapshot: Snapshot, txn_token: TxnToken) -> Self {
         Self {
             snapshot,
-            page_states: HashMap::new(),
+            page_states: PageMap::default(),
             state: TransactionState::Active,
-            read_set: HashSet::new(),
-            read_index: HashMap::new(),
+            read_set: PageSet::default(),
+            read_index: PageMap::default(),
             global_read_witnesses: Vec::new(),
-            write_index: HashMap::new(),
+            write_index: PageMap::default(),
             global_write_witnesses: Vec::new(),
             txn_token,
             has_in_rw: Cell::new(false),
@@ -417,7 +427,7 @@ impl ConcurrentHandle {
 
     /// Returns the set of pages that were read.
     #[must_use]
-    pub fn read_set(&self) -> &HashSet<PageNumber> {
+    pub fn read_set(&self) -> &PageSet {
         &self.read_set
     }
 
@@ -3019,11 +3029,12 @@ pub fn concurrent_rollback_to_savepoint(
         }
     }
 
-    let mut restored = HashMap::with_capacity(
+    let mut restored: PageMap<PageTxnState> = PageMap::with_capacity_and_hasher(
         handle
             .page_states
             .len()
             .max(savepoint.page_states_snapshot.len()),
+        PageNumberBuildHasher::default(),
     );
 
     for (&page, snapshot_state) in &savepoint.page_states_snapshot {

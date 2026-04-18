@@ -1431,6 +1431,116 @@ where
     debug_assert_eq!(body_offset, total_size);
 }
 
+/// Vectorized two-pass batch encoder for the SQLite record format.
+///
+/// MonetDB/X100-style columnar encoding: pass 1 computes per-row header and
+/// body sizes (driving the varint-header/payload layout decisions), pass 2
+/// writes all header varints and all payload bytes into `out` with no
+/// per-row allocation. Each row's starting byte offset inside `out` is
+/// recorded in `offsets`, allowing callers to slice out individual records.
+///
+/// **Byte-identical guarantee.** For any row `r`, the bytes in
+/// `out[offsets[i]..offsets[i+1]]` (or `out[offsets[i]..]` for the final row)
+/// are exactly what [`serialize_record`] would produce when invoked on
+/// `rows[i]` alone.  This is enforced by a proptest and by the callers'
+/// expectations for the SQLite record format — the on-disk layout is not
+/// allowed to change.
+///
+/// The function never fails for valid input (the `Result` return type exists
+/// for forward-compatibility with encoder backends that might reject oversize
+/// headers; today all rows are accepted unconditionally).
+///
+/// # Parameters
+///
+/// - `rows`: a slice of row views, each row a slice of values.
+/// - `out`: destination buffer. **Cleared** at entry and resized to hold all
+///   records contiguously. Capacity is preserved.
+/// - `offsets`: destination for per-row starting offsets.  **Cleared** at
+///   entry. `offsets[i]` is the byte index of row `i` inside `out`.  The
+///   total byte length of `out` after the call gives the record boundary for
+///   the final row.
+///
+/// # Errors
+///
+/// Reserved for future backends; today always returns `Ok(())`.
+pub fn encode_batch(
+    rows: &[&[SqliteValue]],
+    out: &mut Vec<u8>,
+    offsets: &mut Vec<usize>,
+) -> fsqlite_error::Result<()> {
+    out.clear();
+    offsets.clear();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    offsets.reserve(rows.len());
+
+    // ── Pass 1: measure header + body sizes per row, compute total size ─
+    //
+    // We store (header_size, body_size) per row in a column-oriented scratch
+    // so pass 2 can stream writes without re-measuring. header_size already
+    // includes the leading header-size varint.
+    let mut sizes: Vec<(usize, usize)> = Vec::with_capacity(rows.len());
+    let mut total_size: usize = 0;
+    for row in rows {
+        let mut header_content_size = 0usize;
+        let mut body_size = 0usize;
+        for value in row.iter() {
+            let (serial_type, payload_len) = serialized_value_layout(value);
+            header_content_size += varint_len(serial_type);
+            body_size += payload_len;
+        }
+        let header_size = compute_header_size(header_content_size);
+        sizes.push((header_size, body_size));
+        total_size = total_size
+            .checked_add(header_size)
+            .and_then(|t| t.checked_add(body_size))
+            .unwrap_or(usize::MAX);
+    }
+
+    // Resize exactly once. Already-allocated capacity is preserved.
+    out.resize(total_size, 0);
+
+    // ── Pass 2: write header varints and payload bytes row-by-row ──────
+    //
+    // We keep two running cursors (header_offset, body_offset) per row, but
+    // unlike the scalar path these live in a shared buffer whose layout was
+    // pre-decided in pass 1. This is the X100-style "materialize after the
+    // plan is fixed" pattern; in hot INSERT workloads it removes per-row
+    // Vec growth from `resize` and lets the inner encoder loop issue a
+    // single large write to `out` rather than touching the allocator.
+    let mut row_start: usize = 0;
+    for (row, &(header_size, body_size)) in rows.iter().zip(sizes.iter()) {
+        offsets.push(row_start);
+        let row_total = header_size + body_size;
+        let row_slice = &mut out[row_start..row_start + row_total];
+
+        // Write the leading header-size varint (sized to describe the whole
+        // header including itself, just like the scalar encoder).
+        let mut header_offset =
+            write_varint(row_slice, u64::try_from(header_size).unwrap_or(u64::MAX));
+        let mut body_offset = header_size;
+
+        for value in row.iter() {
+            let (serial_type, payload_len) = serialized_value_layout(value);
+            header_offset += write_varint(&mut row_slice[header_offset..], serial_type);
+            encode_serialized_value(
+                value,
+                payload_len,
+                &mut row_slice[body_offset..body_offset + payload_len],
+            );
+            body_offset += payload_len;
+        }
+
+        debug_assert_eq!(header_offset, header_size);
+        debug_assert_eq!(body_offset, row_total);
+        row_start += row_total;
+    }
+    debug_assert_eq!(row_start, total_size);
+
+    Ok(())
+}
+
 /// Decode a value from its serial type and raw bytes.
 ///
 /// Public so that [`RecordOffsetTable`] consumers can perform lazy
@@ -2763,6 +2873,140 @@ mod tests {
                 fresh,
                 "bead_id=bd-gieaf scenario=SCRATCH-MATCHES-FRESH scratch and fresh allocation must produce identical bytes"
             );
+        }
+    }
+
+    // ── encode_batch byte-identical guarantee ─────────────────────────────
+    //
+    // encode_batch must produce the exact concatenation of per-row scalar
+    // encodings for *any* mix of rows (heterogeneous arity, mixed types,
+    // empty rows, nested extremes). If the output drifts by even one byte
+    // the on-disk record format is violated, so this is a hard requirement,
+    // not an optimization knob.
+
+    fn concat_scalar_encodings(rows: &[Vec<SqliteValue>]) -> (Vec<u8>, Vec<usize>) {
+        let mut bytes = Vec::new();
+        let mut offsets = Vec::with_capacity(rows.len());
+        for row in rows {
+            offsets.push(bytes.len());
+            let encoded = serialize_record(row);
+            bytes.extend_from_slice(&encoded);
+        }
+        (bytes, offsets)
+    }
+
+    fn assert_encode_batch_matches_scalar(rows: &[Vec<SqliteValue>]) {
+        let row_refs: Vec<&[SqliteValue]> = rows.iter().map(Vec::as_slice).collect();
+        let mut out = Vec::new();
+        let mut offsets = Vec::new();
+        encode_batch(&row_refs, &mut out, &mut offsets).expect("encode_batch must succeed");
+
+        let (expected_bytes, expected_offsets) = concat_scalar_encodings(rows);
+        assert_eq!(
+            out, expected_bytes,
+            "encode_batch payload must match concat of scalar encodings"
+        );
+        assert_eq!(
+            offsets, expected_offsets,
+            "encode_batch offsets must match per-row scalar start offsets"
+        );
+
+        // Per-row slice property: each offset range round-trips through
+        // parse_record just like the scalar output.
+        for (i, row) in rows.iter().enumerate() {
+            let end = offsets.get(i + 1).copied().unwrap_or(out.len());
+            let slice = &out[offsets[i]..end];
+            let parsed = parse_record(slice).expect("each batch slice must be a valid record");
+            assert_eq!(parsed.len(), row.len());
+            for (orig, got) in row.iter().zip(parsed.iter()) {
+                assert!(
+                    values_bitwise_eq(orig, got),
+                    "encode_batch row {i} value mismatch: orig={orig:?} got={got:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encode_batch_empty_batch_clears_outputs() {
+        let mut out = vec![0xAA_u8; 32];
+        let mut offsets = vec![999_usize, 1_234];
+        encode_batch(&[], &mut out, &mut offsets).expect("empty batch must succeed");
+        assert!(out.is_empty(), "empty batch must clear out buffer");
+        assert!(offsets.is_empty(), "empty batch must clear offsets");
+    }
+
+    #[test]
+    fn encode_batch_single_row_matches_scalar() {
+        let rows = vec![vec![
+            SqliteValue::Integer(42),
+            SqliteValue::Text("hello".into()),
+            SqliteValue::Null,
+            SqliteValue::Float(3.14),
+        ]];
+        assert_encode_batch_matches_scalar(&rows);
+    }
+
+    #[test]
+    fn encode_batch_heterogeneous_rows_preserve_offsets() {
+        let rows = vec![
+            vec![SqliteValue::Integer(0)],
+            vec![],
+            vec![
+                SqliteValue::Null,
+                SqliteValue::Blob(Arc::from([1_u8, 2, 3, 4, 5].as_slice())),
+            ],
+            vec![
+                SqliteValue::Integer(i64::MAX),
+                SqliteValue::Integer(i64::MIN),
+                SqliteValue::Float(-0.0),
+            ],
+        ];
+        assert_encode_batch_matches_scalar(&rows);
+    }
+
+    #[test]
+    fn encode_batch_thousand_row_batch_matches_scalar() {
+        // 1000 rows, 4 columns each, rotating types.
+        let mut rows = Vec::with_capacity(1000);
+        for i in 0_i64..1000 {
+            rows.push(vec![
+                SqliteValue::Integer(i),
+                SqliteValue::Integer(i.wrapping_mul(31).wrapping_sub(7)),
+                match i % 4 {
+                    0 => SqliteValue::Null,
+                    1 => SqliteValue::Text(format!("row-{i}").into()),
+                    2 => SqliteValue::Float(f64::from(i32::try_from(i).unwrap_or(0)) * 0.5),
+                    _ => SqliteValue::Blob(Arc::from(format!("blob-{i}").as_bytes())),
+                },
+                SqliteValue::Integer(-i),
+            ]);
+        }
+        assert_encode_batch_matches_scalar(&rows);
+    }
+
+    #[test]
+    fn encode_batch_preserves_caller_capacity() {
+        let rows = vec![vec![SqliteValue::Integer(7)]];
+        let row_refs: Vec<&[SqliteValue]> = rows.iter().map(Vec::as_slice).collect();
+        let mut out = Vec::with_capacity(4096);
+        let initial_cap = out.capacity();
+        let mut offsets = Vec::with_capacity(32);
+        encode_batch(&row_refs, &mut out, &mut offsets).expect("encode must succeed");
+        assert!(out.capacity() >= initial_cap, "capacity must not shrink");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn encode_batch_matches_naive_concat_for_arbitrary_batches(
+            rows in proptest::collection::vec(
+                proptest::collection::vec(arb_sqlite_value(), 0..12),
+                0..20,
+            )
+        ) {
+            assert_encode_batch_matches_scalar(&rows);
         }
     }
 }

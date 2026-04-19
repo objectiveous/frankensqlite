@@ -319,6 +319,52 @@ pub struct TableStatistics {
 }
 
 // ---------------------------------------------------------------------------
+// sqlite_stat1 parsing (PLANNER-1)
+// ---------------------------------------------------------------------------
+
+/// Parsed representation of a single row of the `sqlite_stat1` `stat` column.
+///
+/// SQLite's ANALYZE records one row per (table, index) pair in `sqlite_stat1`
+/// with a whitespace-separated `stat` string. The first integer is the
+/// approximate total row count for the table. Subsequent integers are the
+/// approximate number of rows per distinct value of each indexed column,
+/// computed cumulatively from the leading column.
+///
+/// For rows where `idx` is NULL (table-level stats), only the row count is
+/// recorded and `per_column_distinct` is empty.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Stat1Summary {
+    /// Total row count for the table.
+    pub n_rows: u64,
+    /// Approximate number of distinct values per indexed column, expressed as
+    /// "rows per distinct value". Empty for table-only stats rows.
+    pub per_column_distinct: Vec<u64>,
+}
+
+/// Parse the `stat` column text from a `sqlite_stat1` row.
+///
+/// The format is whitespace-separated integers:
+/// - First integer: total table row count.
+/// - Subsequent integers: approximate rows-per-distinct-value for each indexed
+///   column (cumulative from left).
+///
+/// Returns `None` if the string is empty, contains no parseable integer in the
+/// first position, or the leading row count overflows `u64`. Unparseable
+/// trailing tokens are silently dropped (they are advisory) and non-numeric
+/// garbage after the first token is ignored.
+#[must_use]
+pub fn parse_stat1(stat: &str) -> Option<Stat1Summary> {
+    let mut parts = stat.split_ascii_whitespace();
+    let first = parts.next()?;
+    let n_rows: u64 = first.parse().ok()?;
+    let per_column_distinct: Vec<u64> = parts.filter_map(|t| t.parse::<u64>().ok()).collect();
+    Some(Stat1Summary {
+        n_rows,
+        per_column_distinct,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Sampling-based cardinality estimation (bd-1as.1)
 // ---------------------------------------------------------------------------
 
@@ -644,5 +690,46 @@ mod tests {
         // With sample, should prefer sampling over NDV
         assert_eq!(est.method, EstimationMethod::Sampling);
         assert!((est.selectivity - 1.0).abs() < 0.01);
+    }
+
+    // ── sqlite_stat1 parsing (PLANNER-1) ──
+
+    #[test]
+    fn parse_stat1_table_only_row() {
+        // Table-only row (idx IS NULL in sqlite_stat1): just the row count.
+        let parsed = parse_stat1("12345").unwrap();
+        assert_eq!(parsed.n_rows, 12345);
+        assert!(parsed.per_column_distinct.is_empty());
+    }
+
+    #[test]
+    fn parse_stat1_index_row_with_distinct_counts() {
+        // Typical index-row: "N k1 k2 ..." where N is row count and
+        // k_i is rows-per-distinct-value for the i-th leading column.
+        let parsed = parse_stat1("1000 10 1").unwrap();
+        assert_eq!(parsed.n_rows, 1000);
+        assert_eq!(parsed.per_column_distinct, vec![10, 1]);
+    }
+
+    #[test]
+    fn parse_stat1_tolerates_extra_whitespace() {
+        let parsed = parse_stat1("  500\t 20   5 ").unwrap();
+        assert_eq!(parsed.n_rows, 500);
+        assert_eq!(parsed.per_column_distinct, vec![20, 5]);
+    }
+
+    #[test]
+    fn parse_stat1_rejects_empty_and_non_numeric() {
+        assert!(parse_stat1("").is_none());
+        assert!(parse_stat1("   ").is_none());
+        assert!(parse_stat1("not-a-number 1 2").is_none());
+    }
+
+    #[test]
+    fn parse_stat1_drops_trailing_garbage() {
+        // Unparseable trailing tokens are advisory; drop them silently.
+        let parsed = parse_stat1("42 7 foo 3").unwrap();
+        assert_eq!(parsed.n_rows, 42);
+        assert_eq!(parsed.per_column_distinct, vec![7, 3]);
     }
 }

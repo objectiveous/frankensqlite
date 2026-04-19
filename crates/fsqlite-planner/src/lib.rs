@@ -798,19 +798,76 @@ impl fmt::Display for QueryPlan {
 /// - Index scan (equality): `log2(idx_pages) + log2(tbl_pages)`
 /// - Covering index scan: `log2(idx_pages) + selectivity * idx_pages`
 /// - Rowid lookup: `log2(tbl_pages)`
+///
+/// This is the legacy entry point that ignores row-count statistics; it is a
+/// thin wrapper around [`estimate_cost_ext`] with `n_rows = 0` (i.e. no row
+/// statistics available). When `sqlite_stat1` data has been loaded, prefer
+/// [`estimate_cost_ext`] so per-row decode/access costs participate in the
+/// score.
 #[must_use]
 pub fn estimate_cost(kind: &AccessPathKind, table_pages: u64, index_pages: u64) -> f64 {
+    estimate_cost_ext(kind, table_pages, index_pages, 0)
+}
+
+/// Per-row cost added on top of page-level cost for a full table scan.
+///
+/// Reflects the VDBE/record-decode overhead per emitted row, tuned to keep
+/// the scan cost of a tiny page-count table proportional to its row count
+/// so that ANALYZE-populated stats change the plan meaningfully.
+const ROW_DECODE_COST: f64 = 0.01;
+
+/// Per-row cost added to each table visit from an indexed access path
+/// (one rowid dereference + row decode).
+const ROW_ACCESS_COST: f64 = 0.02;
+
+/// Estimate the cost (in page reads) for a given access path, optionally
+/// incorporating the table row count (PLANNER-2).
+///
+/// When `n_rows == 0`, this is equivalent to the legacy [`estimate_cost`]
+/// formulas and the cost is computed purely from page counts. When `n_rows`
+/// is available (e.g. from `sqlite_stat1` after `ANALYZE`), per-row terms are
+/// added so that two tables with the same page count but wildly different row
+/// counts are ranked differently:
+///
+/// - Full table scan: `tbl_pages + n_rows * ROW_DECODE_COST`
+/// - Index equality / range / covering / rowid: the legacy page-level cost
+///   plus `selectivity * n_rows * ROW_ACCESS_COST` (for equality we use
+///   `1 / max(1, n_rows)` as the selectivity floor; rowid lookups yield
+///   exactly one row).
+#[must_use]
+pub fn estimate_cost_ext(
+    kind: &AccessPathKind,
+    table_pages: u64,
+    index_pages: u64,
+    n_rows: u64,
+) -> f64 {
     let tp = table_pages.max(1) as f64;
     let ip = index_pages.max(1) as f64;
+    let nr = n_rows as f64;
 
     let cost = match kind {
-        AccessPathKind::FullTableScan => tp,
+        AccessPathKind::FullTableScan => nr.mul_add(ROW_DECODE_COST, tp),
         AccessPathKind::IndexScanRange { selectivity } => {
-            ip.log2() + selectivity * ip + selectivity * tp
+            let page_cost = ip.log2() + selectivity * ip + selectivity * tp;
+            (selectivity * nr).mul_add(ROW_ACCESS_COST, page_cost)
         }
-        AccessPathKind::IndexScanEquality => ip.log2() + tp.log2(),
-        AccessPathKind::CoveringIndexScan { selectivity } => ip.log2() + selectivity * ip,
-        AccessPathKind::RowidLookup => tp.log2(),
+        AccessPathKind::IndexScanEquality => {
+            // Equality: selectivity ≈ 1 / n_rows (unique) or floor at 1 row.
+            let page_cost = ip.log2() + tp.log2();
+            let matched_rows: f64 = if nr > 0.0 { 1.0 } else { 0.0 };
+            matched_rows.mul_add(ROW_ACCESS_COST, page_cost)
+        }
+        AccessPathKind::CoveringIndexScan { selectivity } => {
+            let page_cost = ip.log2() + selectivity * ip;
+            // Covering scan still pays per-row decode but avoids the table
+            // dereference, so use ROW_DECODE_COST (cheaper than ROW_ACCESS).
+            (selectivity * nr).mul_add(ROW_DECODE_COST, page_cost)
+        }
+        AccessPathKind::RowidLookup => {
+            let page_cost = tp.log2();
+            let matched_rows: f64 = if nr > 0.0 { 1.0 } else { 0.0 };
+            matched_rows.mul_add(ROW_ACCESS_COST, page_cost)
+        }
     };
 
     FSQLITE_PLANNER_COST_ESTIMATES_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -819,6 +876,7 @@ pub fn estimate_cost(kind: &AccessPathKind, table_pages: u64, index_pages: u64) 
         target: "fsqlite.planner",
         table_pages,
         index_pages,
+        n_rows,
         estimated_cost = cost,
         actual_method = %access_path_metric_label(kind),
         "cost_estimate"
@@ -1133,7 +1191,12 @@ fn best_access_path_internal(
         estimated_cost: if explicit_indexed_by.is_some() {
             f64::INFINITY
         } else {
-            estimate_cost(&AccessPathKind::FullTableScan, table.n_pages, 0)
+            estimate_cost_ext(
+                &AccessPathKind::FullTableScan,
+                table.n_pages,
+                0,
+                table.n_rows,
+            )
         },
         estimated_rows: table.n_rows as f64,
         time_travel: None,
@@ -1329,7 +1392,8 @@ fn best_access_path_internal(
             est_rows = (est_rows * probe_multiplier).min(table.n_rows.max(1) as f64);
         }
 
-        let mut cost = estimate_cost(&kind, table.n_pages, idx.n_pages) * cost_multiplier;
+        let mut cost =
+            estimate_cost_ext(&kind, table.n_pages, idx.n_pages, table.n_rows) * cost_multiplier;
 
         if let Some(hinted_name) = explicit_indexed_by {
             if idx.name.eq_ignore_ascii_case(hinted_name) {
@@ -1359,7 +1423,7 @@ fn best_access_path_internal(
     // Check rowid lookup.
     if !not_indexed && explicit_indexed_by.is_none() && has_rowid_equality(where_terms) {
         let kind = AccessPathKind::RowidLookup;
-        let cost = estimate_cost(&kind, table.n_pages, 0);
+        let cost = estimate_cost_ext(&kind, table.n_pages, 0, table.n_rows);
         if cost < best.estimated_cost {
             best = AccessPath {
                 table: table.name.clone(),
@@ -1377,7 +1441,12 @@ fn best_access_path_internal(
             table: table.name.clone(),
             kind: AccessPathKind::FullTableScan,
             index: None,
-            estimated_cost: estimate_cost(&AccessPathKind::FullTableScan, table.n_pages, 0),
+            estimated_cost: estimate_cost_ext(
+                &AccessPathKind::FullTableScan,
+                table.n_pages,
+                0,
+                table.n_rows,
+            ),
             estimated_rows: table.n_rows as f64,
             time_travel: None,
         };
@@ -4904,6 +4973,66 @@ mod tests {
         assert!((cost - expected).abs() < 1e-10);
     }
 
+    // ===================================================================
+    // PLANNER-2: estimate_cost_ext should react monotonically to n_rows
+    // ===================================================================
+
+    #[test]
+    fn test_estimate_cost_ext_zero_rows_matches_legacy() {
+        // With n_rows == 0 the ext function must match the legacy formulas.
+        let legacy = estimate_cost(&AccessPathKind::FullTableScan, 1000, 0);
+        let ext = estimate_cost_ext(&AccessPathKind::FullTableScan, 1000, 0, 0);
+        assert!((ext - legacy).abs() < f64::EPSILON);
+
+        let legacy = estimate_cost(&AccessPathKind::IndexScanEquality, 1000, 100);
+        let ext = estimate_cost_ext(&AccessPathKind::IndexScanEquality, 1000, 100, 0);
+        assert!((ext - legacy).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_estimate_cost_ext_full_scan_monotonic_in_n_rows() {
+        // Full table scan: same pages, growing rows -> cost must grow.
+        let c_small = estimate_cost_ext(&AccessPathKind::FullTableScan, 100, 0, 1_000);
+        let c_mid = estimate_cost_ext(&AccessPathKind::FullTableScan, 100, 0, 100_000);
+        let c_big = estimate_cost_ext(&AccessPathKind::FullTableScan, 100, 0, 10_000_000);
+        assert!(
+            c_small < c_mid && c_mid < c_big,
+            "expected monotonic growth with n_rows, got {c_small} < {c_mid} < {c_big}"
+        );
+    }
+
+    #[test]
+    fn test_estimate_cost_ext_range_scan_monotonic_in_n_rows() {
+        // Index range scan: fixed selectivity, growing rows -> cost must grow.
+        let kind = AccessPathKind::IndexScanRange { selectivity: 0.1 };
+        let c_small = estimate_cost_ext(&kind, 1000, 100, 1_000);
+        let c_big = estimate_cost_ext(&kind, 1000, 100, 1_000_000);
+        assert!(c_big > c_small);
+    }
+
+    #[test]
+    fn test_estimate_cost_ext_scales_full_vs_index_preference() {
+        // Scenario: two tables with the same (small) page count but very
+        // different row counts. For a moderately selective index scan the
+        // large-row table should prefer the index over the full scan.
+        let small_rows = 100_u64;
+        let big_rows = 10_000_000_u64;
+        let kind = AccessPathKind::IndexScanRange { selectivity: 0.01 };
+        let full_small = estimate_cost_ext(&AccessPathKind::FullTableScan, 10, 0, small_rows);
+        let idx_small = estimate_cost_ext(&kind, 10, 5, small_rows);
+        let full_big = estimate_cost_ext(&AccessPathKind::FullTableScan, 10, 0, big_rows);
+        let idx_big = estimate_cost_ext(&kind, 10, 5, big_rows);
+
+        // Index vs full gap should widen when n_rows blows up (full scan cost
+        // grows linearly in rows, index cost grows as selectivity * rows).
+        let gap_small = full_small - idx_small;
+        let gap_big = full_big - idx_big;
+        assert!(
+            gap_big > gap_small,
+            "expected bigger index advantage at high n_rows: small_gap={gap_small}, big_gap={gap_big}"
+        );
+    }
+
     #[test]
     fn test_cost_comparison_table_scan_vs_index() {
         // For low selectivity, index should be cheaper than full scan.
@@ -5658,7 +5787,9 @@ mod tests {
         let tables = [table_stats("t1", 100, 1000)];
         let plan = order_joins(&tables, &[], &[], None, &[]);
         assert_eq!(plan.join_order, vec!["t1"]);
-        assert!((plan.total_cost - 100.0).abs() < f64::EPSILON); // full table scan
+        // PLANNER-2: full scan cost = n_pages + n_rows * ROW_DECODE_COST.
+        let expected = estimate_cost_ext(&AccessPathKind::FullTableScan, 100, 0, 1000);
+        assert!((plan.total_cost - expected).abs() < 1e-9);
     }
 
     #[test]
@@ -6155,7 +6286,8 @@ mod tests {
         let table = table_stats("t1", 100, 1000);
         let ap = best_access_path(&table, &[], &[], None);
         assert!(matches!(ap.kind, AccessPathKind::FullTableScan));
-        assert!((ap.estimated_cost - 100.0).abs() < f64::EPSILON);
+        let expected = estimate_cost_ext(&AccessPathKind::FullTableScan, 100, 0, 1000);
+        assert!((ap.estimated_cost - expected).abs() < 1e-9);
     }
 
     #[test]
@@ -6227,7 +6359,9 @@ mod tests {
         let term = classify_where_term(expr);
         let ap = best_access_path(&table, &[], &[term], None);
         assert!(matches!(ap.kind, AccessPathKind::RowidLookup));
-        assert!((ap.estimated_cost - 10.0).abs() < f64::EPSILON); // log2(1024) = 10
+        // PLANNER-2: rowid lookup cost = log2(n_pages) + 1 * ROW_ACCESS_COST.
+        let expected = estimate_cost_ext(&AccessPathKind::RowidLookup, 1024, 0, 50000);
+        assert!((ap.estimated_cost - expected).abs() < 1e-9);
     }
 
     #[test]
@@ -6242,7 +6376,8 @@ mod tests {
         assert_eq!(table.source, StatsSource::Analyze);
         let ap = best_access_path(&table, &[], &[], None);
         assert!(matches!(ap.kind, AccessPathKind::FullTableScan));
-        assert!((ap.estimated_cost - 500.0).abs() < f64::EPSILON);
+        let expected = estimate_cost_ext(&AccessPathKind::FullTableScan, 500, 0, 10000);
+        assert!((ap.estimated_cost - expected).abs() < 1e-9);
     }
 
     #[test]

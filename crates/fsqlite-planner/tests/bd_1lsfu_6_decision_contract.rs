@@ -91,7 +91,8 @@ fn single_table_plan_produces_contract() {
 
     let plan = order_joins(&tables, &indexes, &[], None, &[]);
     assert_eq!(plan.join_order, vec!["t"]);
-    assert!((plan.total_cost - 10.0).abs() < 0.01); // Full scan of 10 pages.
+    // Full scan of 10 pages + 100 rows * ROW_DECODE_COST (PLANNER-2).
+    assert!((plan.total_cost - 11.0).abs() < 0.01);
 
     let contract = build_contract(
         "SELECT * FROM t",

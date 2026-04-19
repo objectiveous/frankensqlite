@@ -8,7 +8,7 @@
 //! - [`CheckpointTargetAdapterRef`] wraps `CheckpointPageWriter` to satisfy the
 //!   WAL executor's [`CheckpointTarget`] trait (WAL -> pager direction).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
@@ -26,8 +26,8 @@ use fsqlite_vfs::VfsFile;
 use fsqlite_wal::checksum::{SqliteWalChecksum, WAL_FRAME_HEADER_SIZE, WalChecksumTransform};
 use fsqlite_wal::wal::WalAppendFrameRef;
 use fsqlite_wal::{
-    CheckpointMode as WalCheckpointMode, CheckpointState, CheckpointTarget, WalFile,
-    WalGenerationIdentity, execute_checkpoint,
+    CheckpointMode as WalCheckpointMode, CheckpointState, CheckpointTarget,
+    TransactionConflictSnapshot, WalFile, WalGenerationIdentity, execute_checkpoint,
 };
 use tracing::debug;
 #[cfg(not(target_arch = "wasm32"))]
@@ -1211,6 +1211,65 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         }
 
         Ok(committed_txns_after_page)
+    }
+
+    fn conflicting_pages_since_snapshot(
+        &mut self,
+        cx: &Cx,
+        snapshot: TransactionConflictSnapshot,
+        page_numbers: &[u32],
+    ) -> Result<Vec<u32>> {
+        if page_numbers.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut candidates = page_numbers
+            .iter()
+            .copied()
+            .filter(|page| *page != 0)
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
+        candidates.dedup();
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.wal.refresh(cx)?;
+        self.publish_latest_committed_snapshot(cx, "conflicting_pages_since_snapshot")?;
+        let latest = self.published_snapshot();
+        if latest.commit_count <= snapshot.commit_count
+            && latest.generation == snapshot.generation
+            && latest.last_commit_frame <= snapshot.last_commit_frame
+        {
+            return Ok(Vec::new());
+        }
+
+        if latest.generation != snapshot.generation {
+            return Ok(candidates);
+        }
+
+        let Some(latest_last_commit_frame) = latest.last_commit_frame else {
+            return Ok(Vec::new());
+        };
+        let start_frame = snapshot
+            .last_commit_frame
+            .map_or(0, |frame| frame.saturating_add(1));
+        if start_frame > latest_last_commit_frame {
+            return Ok(Vec::new());
+        }
+
+        let candidate_set = candidates.iter().copied().collect::<HashSet<_>>();
+        let mut conflicts = HashSet::<u32>::new();
+        for frame_index in start_frame..=latest_last_commit_frame {
+            let header = self.wal.read_frame_header(cx, frame_index)?;
+            if candidate_set.contains(&header.page_number) {
+                conflicts.insert(header.page_number);
+            }
+        }
+
+        let mut conflicts = conflicts.into_iter().collect::<Vec<_>>();
+        conflicts.sort_unstable();
+        Ok(conflicts)
     }
 
     fn committed_txn_count(&mut self, cx: &Cx) -> Result<u64> {

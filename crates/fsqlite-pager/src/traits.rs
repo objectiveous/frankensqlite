@@ -25,7 +25,9 @@ use fsqlite_vfs::MemoryVfs;
 use fsqlite_vfs::UnixVfs;
 #[cfg(target_os = "windows")]
 use fsqlite_vfs::WindowsVfs;
-use fsqlite_wal::{WalGenerationIdentity, checksum::WalChecksumTransform};
+use fsqlite_wal::{
+    TransactionConflictSnapshot, WalGenerationIdentity, checksum::WalChecksumTransform,
+};
 
 // ---------------------------------------------------------------------------
 // Sealed trait discipline
@@ -292,6 +294,23 @@ pub trait WalBackend: Send + Sync {
     /// 0 when they cannot provide a more precise answer.
     fn committed_txns_since_page(&mut self, _cx: &Cx, _page_number: u32) -> Result<u64> {
         Ok(0)
+    }
+
+    /// Return conflict pages that were committed after `snapshot`.
+    ///
+    /// This is the cross-process half of first-committer-wins. The
+    /// connection-local MVCC registry protects writers in one process, but a
+    /// WAL flusher can also receive batches from transactions whose stale page
+    /// images race with commits made by another process. Implementations that
+    /// can inspect the WAL frame stream should reject those stale batches
+    /// before append.
+    fn conflicting_pages_since_snapshot(
+        &mut self,
+        _cx: &Cx,
+        _snapshot: TransactionConflictSnapshot,
+        _page_numbers: &[u32],
+    ) -> Result<Vec<u32>> {
+        Ok(Vec::new())
     }
 
     /// Count committed transactions visible in the current WAL snapshot.

@@ -74,8 +74,9 @@ pub use checksum::{
 pub use group_commit::{
     ConsolidationMetrics, ConsolidationMetricsSnapshot, ConsolidationPhase, FrameSubmission,
     GLOBAL_CONSOLIDATION_METRICS, GroupCommitConfig, GroupCommitConsolidator, PhaseHistogram,
-    PhasePercentiles, SubmitOutcome, TransactionFrameBatch, TransactionFrameBatchContext,
-    WakeReasonCounters, WakeReasonSnapshot, write_consolidated_frames,
+    PhasePercentiles, SubmitOutcome, TransactionConflictSnapshot, TransactionFrameBatch,
+    TransactionFrameBatchContext, WakeReasonCounters, WakeReasonSnapshot,
+    write_consolidated_frames,
 };
 pub use metrics::{
     GLOBAL_GROUP_COMMIT_METRICS, GLOBAL_WAL_FEC_REPAIR_METRICS, GLOBAL_WAL_METRICS,

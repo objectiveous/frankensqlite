@@ -34,6 +34,7 @@
 //! - `max_group_delay`: Maximum time to wait for additional writers before
 //!   flushing (default: 1ms). Bounded to ensure tail latency.
 
+use crate::WalGenerationIdentity;
 use fsqlite_types::sync_primitives::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -118,8 +119,29 @@ pub struct FrameSubmission {
 pub struct TransactionFrameBatch {
     /// Frames belonging to this transaction, in write order.
     pub frames: Vec<FrameSubmission>,
+    /// Pages that must obey first-committer-wins against committed WAL frames
+    /// newer than this transaction's read snapshot.
+    ///
+    /// The process-local MVCC registry catches conflicts between connections
+    /// in the same process. These fields carry the same commit intent through
+    /// the process-global WAL group-commit queue so the eventual flusher can
+    /// also reject stale cross-process commits under the WAL append gate.
+    pub conflict_pages: Vec<u32>,
+    /// WAL visibility snapshot pinned when the submitting transaction began.
+    /// If another process has committed any of `conflict_pages` after this
+    /// horizon, the batch must fail with BUSY_SNAPSHOT instead of appending a
+    /// stale page image that could hide the other writer's committed rows.
+    pub conflict_snapshot: Option<TransactionConflictSnapshot>,
     /// Lane-local staging context captured before group-commit submission.
     pub context: TransactionFrameBatchContext,
+}
+
+/// WAL conflict horizon captured by a submitting transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionConflictSnapshot {
+    pub generation: WalGenerationIdentity,
+    pub last_commit_frame: Option<usize>,
+    pub commit_count: u64,
 }
 
 /// Lane-local staging context attached to a transaction batch.
@@ -141,8 +163,22 @@ impl TransactionFrameBatch {
     pub fn new(frames: Vec<FrameSubmission>) -> Self {
         Self {
             frames,
+            conflict_pages: Vec::new(),
+            conflict_snapshot: None,
             context: TransactionFrameBatchContext::default(),
         }
+    }
+
+    /// Attach cross-process conflict metadata for the submitting transaction.
+    #[must_use]
+    pub fn with_conflict_snapshot(
+        mut self,
+        conflict_pages: Vec<u32>,
+        conflict_snapshot: Option<TransactionConflictSnapshot>,
+    ) -> Self {
+        self.conflict_pages = conflict_pages;
+        self.conflict_snapshot = conflict_snapshot;
+        self
     }
 
     /// Attach lane-local staging context to this batch.

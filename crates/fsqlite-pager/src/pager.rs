@@ -38,10 +38,10 @@ use fsqlite_wal::{
     GroupCommitConsolidator, PARALLEL_WAL_COMPATIBILITY_SELECTOR, PARALLEL_WAL_FLUSH_SCENARIO_ID,
     PARALLEL_WAL_LANE_POLICY_VERSION, PARALLEL_WAL_STAGE_SCENARIO_ID, ParallelWalControlSurface,
     ParallelWalFallbackReason, ParallelWalLaneBatch, ParallelWalLaneStager,
-    ParallelWalOperatingMode, ParallelWalShadowVerdict, SubmitOutcome, TransactionFrameBatch,
-    TransactionFrameBatchContext, WalFile, parallel_wal_fallback_reason_name,
-    parallel_wal_mode_name, parallel_wal_shadow_verdict_name, parallel_wal_should_shadow_compare,
-    resolve_parallel_wal_control_surface_from_env,
+    ParallelWalOperatingMode, ParallelWalShadowVerdict, SubmitOutcome, TransactionConflictSnapshot,
+    TransactionFrameBatch, TransactionFrameBatchContext, WalFile,
+    parallel_wal_fallback_reason_name, parallel_wal_mode_name, parallel_wal_shadow_verdict_name,
+    parallel_wal_should_shadow_compare, resolve_parallel_wal_control_surface_from_env,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -2054,6 +2054,49 @@ fn build_group_commit_batch(
     }
 
     Ok(Some((TransactionFrameBatch::new(frames), new_db_size)))
+}
+
+fn transaction_conflict_snapshot_from_wal(
+    snapshot: traits::WalPublicationSnapshot,
+) -> TransactionConflictSnapshot {
+    TransactionConflictSnapshot {
+        generation: snapshot.generation,
+        last_commit_frame: snapshot.last_commit_frame,
+        commit_count: snapshot.commit_count,
+    }
+}
+
+fn attach_group_commit_conflict_metadata(
+    mut batch: TransactionFrameBatch,
+    conflict_pages: &[PageNumber],
+    conflict_snapshot: Option<traits::WalPublicationSnapshot>,
+) -> TransactionFrameBatch {
+    let conflict_pages = conflict_pages
+        .iter()
+        .map(|page| page.get())
+        .collect::<Vec<_>>();
+    let conflict_snapshot = conflict_snapshot.map(transaction_conflict_snapshot_from_wal);
+    batch = batch.with_conflict_snapshot(conflict_pages, conflict_snapshot);
+    batch
+}
+
+fn conflicting_pages_since_batch_snapshots(
+    cx: &Cx,
+    wal: &mut dyn WalBackend,
+    batches: &[TransactionFrameBatch],
+) -> Result<Vec<u32>> {
+    let mut conflicts = Vec::<u32>::new();
+    for batch in batches {
+        let Some(snapshot) = batch.conflict_snapshot else {
+            continue;
+        };
+        let batch_conflicts =
+            wal.conflicting_pages_since_snapshot(cx, snapshot, &batch.conflict_pages)?;
+        conflicts.extend(batch_conflicts);
+    }
+    conflicts.sort_unstable();
+    conflicts.dedup();
+    Ok(conflicts)
 }
 
 fn flatten_group_commit_batches<'a>(
@@ -6021,6 +6064,7 @@ where
         inner_arc: &Arc<Mutex<PagerInner<V::File>>>,
         write_set: &HashMap<PageNumber, StagedPage>,
         write_pages_sorted: &[PageNumber],
+        conflict_pages: &[PageNumber],
         queue: &GroupCommitQueueRef,
     ) -> Result<()> {
         // ── Phase timing instrumentation ──
@@ -6040,6 +6084,9 @@ where
                 Some(b) => b,
                 None => return Ok(()), // Nothing to commit
             };
+        let conflict_snapshot =
+            with_wal_backend_read(wal_backend, |wal| Ok(wal.pinned_read_snapshot()))?;
+        let batch = attach_group_commit_conflict_metadata(batch, conflict_pages, conflict_snapshot);
 
         let parallel_wal_control = queue.parallel_wal_control().clone();
         let batch_id = queue.next_parallel_wal_batch_id();
@@ -6445,13 +6492,30 @@ where
                             .as_micros() as u64;
 
                         let t_excl_start = Instant::now();
-                        inner.db_file.lock(cx, LockLevel::Exclusive)?;
+                        // WAL appends need a cross-process writer gate, but
+                        // they must not wait for every concurrent reader or
+                        // writer transaction that already holds SHARED on the
+                        // main database file. SQLite's RESERVED byte is the
+                        // narrow lock for this: one appender at a time, while
+                        // peer SHARED holders keep running.
+                        inner.db_file.lock(cx, LockLevel::Reserved)?;
                         exclusive_lock_us =
                             Instant::now().duration_since(t_excl_start).as_micros() as u64;
 
                         let t_append_start = Instant::now();
                         let flush_io_result = (|| -> Result<()> {
                             with_wal_backend(wal_backend, |wal| {
+                                let stale_conflict_pages =
+                                    conflicting_pages_since_batch_snapshots(cx, wal, &batches)?;
+                                if !stale_conflict_pages.is_empty() {
+                                    return Err(FrankenError::BusySnapshot {
+                                        conflicting_pages: stale_conflict_pages
+                                            .iter()
+                                            .map(u32::to_string)
+                                            .collect::<Vec<_>>()
+                                            .join(","),
+                                    });
+                                }
                                 if let Some(prepared) = prepared_batch.as_mut() {
                                     wal.append_prepared_frames(cx, prepared)
                                 } else {
@@ -6475,13 +6539,13 @@ where
                             Ok(())
                         })();
 
-                        let restore_result = inner.db_file.unlock(cx, LockLevel::Reserved);
+                        let restore_result = inner.db_file.unlock(cx, LockLevel::Shared);
                         match (flush_io_result, restore_result) {
                             (Ok(()), Ok(())) => Ok(()),
                             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
                             (Err(flush_error), Err(restore_error)) => {
                                 Err(FrankenError::internal(format!(
-                                    "flush failed and could not restore RESERVED lock: flush={flush_error}; restore={restore_error}"
+                                    "flush failed and could not restore SHARED lock: flush={flush_error}; restore={restore_error}"
                                 )))
                             }
                         }
@@ -7434,6 +7498,7 @@ where
         // Declared outside the block so it survives to Phase C where freed
         // pages are promoted into inner.freelist after successful WAL commit.
         let pending_freed: Vec<PageNumber>;
+        let cross_process_conflict_pages: Vec<PageNumber>;
         {
             // ShardedPageCache uses per-shard internal locking
             //
@@ -7528,6 +7593,11 @@ where
                     StagedPage::from_buf(page1),
                 );
             }
+            cross_process_conflict_pages = if self.journal_mode == JournalMode::Wal {
+                self.predicted_conflict_pages_with_inner(&inner)
+            } else {
+                Vec::new()
+            };
         }
 
         let t_phase_a_done = Instant::now();
@@ -7550,6 +7620,7 @@ where
                 &self.inner,
                 &self.write_set,
                 &self.write_pages_sorted,
+                &cross_process_conflict_pages,
                 &self.group_commit_queue,
             );
 
@@ -7602,12 +7673,13 @@ where
             if self.journal_mode != JournalMode::Wal {
                 inner.db_size = committed_db_size;
             }
-            // Evict stale beyond-db_size freelist entries that were not
-            // serialized to disk.  These originate from rolled-back EOF
-            // allocations and are not durable — keeping them would diverge
-            // the in-memory freelist from the on-disk state.
-            let effective_db_size = inner.db_size;
-            inner.freelist.retain(|p| p.get() <= effective_db_size);
+            // Keep volatile EOF lease pages in the in-memory freelist even
+            // when they are above the durable page_count. They are deliberately
+            // filtered out by serialize_freelist_to_write_set(), so page 1
+            // stays SQLite-compatible on disk. But next_page has already
+            // advanced past those page numbers; dropping them here creates
+            // permanent in-process holes that later commits can expose as
+            // "Page N: never used" once page_count grows past the gap.
             inner.commit_seq = inner.commit_seq.next();
             if let Ok(file_size) = inner.db_file.file_size(cx) {
                 inner.committed_db_file_size_bytes = file_size;
@@ -7857,6 +7929,11 @@ where
                     StagedPage::from_buf(page1),
                 );
             }
+            let cross_process_conflict_pages = if self.journal_mode == JournalMode::Wal {
+                self.predicted_conflict_pages_with_inner(&inner)
+            } else {
+                Vec::new()
+            };
 
             if self.journal_mode == JournalMode::Wal {
                 drop(inner);
@@ -7866,6 +7943,7 @@ where
                     &self.inner,
                     &self.write_set,
                     &self.write_pages_sorted,
+                    &cross_process_conflict_pages,
                     &self.group_commit_queue,
                 );
                 inner = match self
@@ -7926,9 +8004,7 @@ where
             if self.journal_mode != JournalMode::Wal {
                 inner.db_size = committed_db_size;
             }
-            // Evict stale beyond-db_size freelist entries (see Phase C1 above).
-            let effective_db_size = inner.db_size;
-            inner.freelist.retain(|p| p.get() <= effective_db_size);
+            // Keep volatile EOF lease pages in memory; see commit() Phase C1.
             inner.commit_seq = inner.commit_seq.next();
             // B3.4: :memory: derives file size from db_size * page_size — skip VFS roundtrip
             if self.vfs.is_memory() {
@@ -13505,7 +13581,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_preparation_happens_before_exclusive_publish_lock() {
+    fn test_wal_preparation_happens_before_reserved_publish_lock() {
         let (pager, observed_lock_level) = observed_lock_pager();
         let cx = Cx::new();
         let ps = PageSize::DEFAULT.as_usize();
@@ -13541,12 +13617,12 @@ mod tests {
         assert_eq!(
             prepare_lock_levels.lock().unwrap().as_slice(),
             &[LockLevel::Reserved],
-            "bead_id=bd-db300.3.2 case=prepare_runs_before_exclusive_publish"
+            "bead_id=bd-db300.3.2 case=prepare_runs_before_reserved_publish"
         );
         assert_eq!(
             append_lock_levels.lock().unwrap().as_slice(),
-            &[LockLevel::Exclusive],
-            "bead_id=bd-db300.3.2 case=prepared_append_runs_inside_exclusive_publish"
+            &[LockLevel::Reserved],
+            "bead_id=bd-db300.3.2 case=prepared_append_runs_inside_reserved_publish"
         );
 
         let frames = frames.lock().unwrap();
@@ -13672,6 +13748,7 @@ mod tests {
                         &inner,
                         &write_set,
                         &write_pages_sorted,
+                        &[],
                         &queue,
                     )
                 })
@@ -13805,6 +13882,7 @@ mod tests {
                         &inner,
                         &write_set,
                         &write_pages_sorted,
+                        &[],
                         &queue,
                     )
                 })
@@ -13930,6 +14008,7 @@ mod tests {
                         &inner,
                         &write_set,
                         &write_pages_sorted,
+                        &[],
                         &queue,
                     )
                 })
@@ -14563,6 +14642,7 @@ mod tests {
                 &inner,
                 &write_set,
                 &[page_two, page_three],
+                &[],
                 &queue,
             )
             .unwrap();
@@ -14613,6 +14693,7 @@ mod tests {
             &inner,
             &write_set,
             &[page_two],
+            &[],
             &queue,
         )
         .unwrap();
@@ -14677,6 +14758,7 @@ mod tests {
             &inner,
             &write_set,
             &[page_two],
+            &[],
             &queue,
         )
         .unwrap();
@@ -14762,6 +14844,7 @@ mod tests {
                         &inner,
                         &write_set,
                         &[page_no],
+                        &[],
                         &queue,
                     ),
                 )
@@ -15574,6 +15657,7 @@ mod tests {
             &inner,
             &write_set,
             &[page_two],
+            &[],
             &queue,
         )
         .unwrap();
@@ -15630,6 +15714,7 @@ mod tests {
             &inner,
             &write_set,
             &[page_two],
+            &[],
             &queue,
         )
         .unwrap();
@@ -17118,7 +17203,7 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_filters_beyond_db_size_freelist_entries_from_durable_state() {
+    fn test_commit_keeps_beyond_db_size_freelist_entries_volatile_only() {
         let (pager, _) = test_pager();
         let cx = Cx::new();
         let ps = PageSize::DEFAULT.as_usize();
@@ -17154,6 +17239,14 @@ mod tests {
             0x22,
             "bead_id={BEAD_ID} case=durable_refresh_survives_filtered_beyond_db_size_freelist"
         );
+        let page_one = reader.get_page(&cx, PageNumber::ONE).unwrap().into_vec();
+        let hdr_bytes: [u8; DATABASE_HEADER_SIZE] =
+            page_one[..DATABASE_HEADER_SIZE].try_into().unwrap();
+        let hdr = DatabaseHeader::from_bytes(&hdr_bytes).unwrap();
+        assert_eq!(
+            hdr.freelist_count, 1,
+            "bead_id={BEAD_ID} case=durable_freelist_header_excludes_volatile_eof_page"
+        );
         reader.commit(&cx).unwrap();
 
         let inner = pager.inner.lock().unwrap();
@@ -17162,9 +17255,48 @@ mod tests {
             "bead_id={BEAD_ID} case=durable_freelist_keeps_committed_free_page"
         );
         assert!(
-            !inner.freelist.contains(&p4),
-            "bead_id={BEAD_ID} case=durable_freelist_drops_beyond_db_size_page"
+            inner.freelist.contains(&p4),
+            "bead_id={BEAD_ID} case=volatile_freelist_keeps_beyond_db_size_page_for_reuse"
         );
+    }
+
+    #[test]
+    fn test_committed_concurrent_page_lease_pages_are_reused_before_eof_growth() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut seed = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let first = seed.allocate_page(&cx).unwrap();
+        seed.write_page(&cx, first, &vec![0x11; ps]).unwrap();
+        let second = seed.allocate_page(&cx).unwrap();
+        seed.write_page(&cx, second, &vec![0x22; ps]).unwrap();
+        assert!(
+            !seed.page_lease.is_empty(),
+            "bead_id={BEAD_ID} case=page_lease_test_must_exercise_batch_allocator"
+        );
+        let leased_lowest = *seed
+            .page_lease
+            .iter()
+            .min()
+            .expect("batch allocator should leave unused lease pages");
+        seed.commit(&cx).unwrap();
+
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert!(
+                inner.freelist.contains(&leased_lowest),
+                "bead_id={BEAD_ID} case=commit_retains_unused_lease_page_in_volatile_freelist"
+            );
+        }
+
+        let mut reuse = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let reused = reuse.allocate_page(&cx).unwrap();
+        assert_eq!(
+            reused, leased_lowest,
+            "bead_id={BEAD_ID} case=allocator_reuses_volatile_lease_page_before_eof_growth"
+        );
+        reuse.rollback(&cx).unwrap();
     }
 
     #[test]

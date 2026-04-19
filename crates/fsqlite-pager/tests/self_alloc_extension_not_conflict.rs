@@ -1,10 +1,59 @@
 use std::path::Path;
 
-use fsqlite_pager::traits::{JournalMode, MvccPager, TransactionHandle, TransactionMode};
-use fsqlite_pager::SimplePager;
+use fsqlite_error::Result;
+use fsqlite_pager::traits::{
+    CheckpointPageWriter, CheckpointResult, JournalMode, MvccPager, TransactionHandle,
+    TransactionMode, WalBackend,
+};
+use fsqlite_pager::{CheckpointMode, SimplePager};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::PageSize;
 use fsqlite_vfs::MemoryVfs;
+
+#[derive(Default)]
+struct NoopWalBackend;
+
+impl WalBackend for NoopWalBackend {
+    fn append_frame(
+        &mut self,
+        _cx: &Cx,
+        _page_number: u32,
+        _page_data: &[u8],
+        _db_size_if_commit: u32,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn read_page(&mut self, _cx: &Cx, _page_number: u32) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    fn sync(&mut self, _cx: &Cx) -> Result<()> {
+        Ok(())
+    }
+
+    fn frame_count(&self) -> usize {
+        0
+    }
+
+    fn checkpoint(
+        &mut self,
+        _cx: &Cx,
+        mode: CheckpointMode,
+        _writer: &mut dyn CheckpointPageWriter,
+        _backfilled_frames: u32,
+        _oldest_reader_frame: Option<u32>,
+    ) -> Result<CheckpointResult> {
+        Ok(CheckpointResult {
+            total_frames: 0,
+            frames_backfilled: 0,
+            completed: true,
+            wal_was_reset: matches!(mode, CheckpointMode::Restart | CheckpointMode::Truncate),
+            requested_mode: mode,
+            effective_mode: mode,
+        })
+    }
+}
 
 #[test]
 fn self_allocated_eof_page_stays_out_of_conflict_surface() {
@@ -16,6 +65,9 @@ fn self_allocated_eof_page_stays_out_of_conflict_surface() {
         PageSize::DEFAULT,
     )
     .expect("pager should open");
+    pager
+        .set_wal_backend(Box::new(NoopWalBackend))
+        .expect("no-op WAL backend should install");
     pager
         .set_journal_mode(&cx, JournalMode::Wal)
         .expect("WAL mode should be available");

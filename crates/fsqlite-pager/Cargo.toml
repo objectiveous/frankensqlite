@@ -13,6 +13,11 @@ native = ["fsqlite-types/native", "fsqlite-vfs/native", "fsqlite-wal/native"]
 wasm = ["fsqlite-types/wasm", "fsqlite-vfs/wasm", "fsqlite-wal/wasm"]
 linux-asupersync-uring = ["fsqlite-vfs/linux-asupersync-uring"]
 fault-injection = ["fsqlite-wal/fault-injection"]
+# Bayesian-mixture e-value eviction scoring (IMPL-19 / AAC-P5).
+# When enabled, ShardedPageCache records accesses into an EValueEvictor and
+# prefers the lowest-e page for eviction. Falls back to the existing policy
+# when disabled (compile-out).
+evalue-eviction = []
 
 [dependencies]
 foldhash = "0.1"

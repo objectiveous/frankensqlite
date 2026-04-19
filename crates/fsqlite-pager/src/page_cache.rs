@@ -1819,6 +1819,20 @@ pub struct ShardedPageCache {
     eviction_policy_enabled: AtomicBool,
     /// Shared eviction-policy tracker used by [`Self::evict_any`].
     eviction_policy: Mutex<PageCacheEvictionTracker>,
+    /// Bayesian-mixture e-value evictor (IMPL-19 / AAC-P5).
+    ///
+    /// Present only when the `evalue-eviction` cargo feature is enabled.
+    /// When present, [`Self::get`] / `read_cached_page` routes feed
+    /// `record_access`, and [`Self::evalue_choose_victim`] can be consulted
+    /// to pick the lowest-e page among a candidate set. When the feature is
+    /// disabled this field is compiled out and all integration code is
+    /// no-opped.
+    #[cfg(feature = "evalue-eviction")]
+    evalue_evictor: crate::evalue_eviction::EValueEvictor,
+    /// Accesses observed since the last automatic e-value tick. When this
+    /// crosses `DEFAULT_TICK_INTERVAL`, a single decay scan is issued.
+    #[cfg(feature = "evalue-eviction")]
+    evalue_accesses_since_tick: AtomicU64,
 }
 
 impl ShardedPageCache {
@@ -1913,6 +1927,10 @@ impl ShardedPageCache {
             use_fast_path: AtomicBool::new(false),
             eviction_policy_enabled: AtomicBool::new(false),
             eviction_policy: Mutex::new(PageCacheEvictionTracker::default()),
+            #[cfg(feature = "evalue-eviction")]
+            evalue_evictor: crate::evalue_eviction::EValueEvictor::new(),
+            #[cfg(feature = "evalue-eviction")]
+            evalue_accesses_since_tick: AtomicU64::new(0),
         }
     }
 
@@ -1990,6 +2008,8 @@ impl ShardedPageCache {
         if self.eviction_tracking_enabled() {
             self.eviction_policy.lock().record_access(page_no);
         }
+        #[cfg(feature = "evalue-eviction")]
+        self.evalue_record_access(page_no);
     }
 
     #[inline]
@@ -1997,6 +2017,8 @@ impl ShardedPageCache {
         if self.eviction_tracking_enabled() {
             self.eviction_policy.lock().record_admit(page_no);
         }
+        #[cfg(feature = "evalue-eviction")]
+        self.evalue_record_access(page_no);
     }
 
     #[inline]
@@ -2004,6 +2026,8 @@ impl ShardedPageCache {
         if self.eviction_tracking_enabled() {
             self.eviction_policy.lock().forget(page_no);
         }
+        #[cfg(feature = "evalue-eviction")]
+        self.evalue_evictor.forget(page_no);
     }
 
     #[inline]
@@ -2011,6 +2035,52 @@ impl ShardedPageCache {
         if self.eviction_tracking_enabled() {
             self.eviction_policy.lock().clear_history();
         }
+        #[cfg(feature = "evalue-eviction")]
+        self.evalue_evictor.clear();
+    }
+
+    /// Feed an access into the e-value evictor and perform periodic decay.
+    ///
+    /// Only compiled in when the `evalue-eviction` feature is enabled.
+    #[cfg(feature = "evalue-eviction")]
+    #[inline]
+    fn evalue_record_access(&self, page_no: PageNumber) {
+        self.evalue_evictor.record_access(page_no);
+        let observed = self
+            .evalue_accesses_since_tick
+            .fetch_add(1, Ordering::Relaxed);
+        if observed + 1 >= crate::evalue_eviction::DEFAULT_TICK_INTERVAL {
+            self.evalue_accesses_since_tick.store(0, Ordering::Relaxed);
+            self.evalue_evictor.tick();
+        }
+    }
+
+    /// Query the Ville p-value for a page tracked by the e-value evictor.
+    ///
+    /// Returns `1.0` for untracked pages (no evidence against the null).
+    /// Only available when the `evalue-eviction` feature is enabled.
+    #[cfg(feature = "evalue-eviction")]
+    #[must_use]
+    pub fn evalue_ville_pvalue(&self, page_no: PageNumber) -> f64 {
+        self.evalue_evictor.ville_pvalue(page_no)
+    }
+
+    /// Pick the lowest-e candidate according to the e-value evictor.
+    ///
+    /// Returns `None` if `candidates` is empty. Untracked candidates are
+    /// treated as if they had the initial e-value (the null boundary).
+    /// Only available when the `evalue-eviction` feature is enabled.
+    #[cfg(feature = "evalue-eviction")]
+    #[must_use]
+    pub fn evalue_choose_victim(&self, candidates: &[PageNumber]) -> Option<PageNumber> {
+        self.evalue_evictor.choose_victim(candidates)
+    }
+
+    /// Access the underlying `EValueEvictor` for inspection or test hooks.
+    #[cfg(feature = "evalue-eviction")]
+    #[must_use]
+    pub fn evalue_evictor(&self) -> &crate::evalue_eviction::EValueEvictor {
+        &self.evalue_evictor
     }
 
     fn note_page_access_without_metrics(&self, page_no: PageNumber) {

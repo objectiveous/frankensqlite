@@ -3,6 +3,8 @@
 
 pub mod arc_cache;
 pub mod encrypt;
+#[cfg(feature = "evalue-eviction")]
+pub mod evalue_eviction;
 #[cfg(any(test, feature = "fault-injection"))]
 pub mod fault_hooks;
 pub mod journal;
@@ -16,6 +18,11 @@ pub use arc_cache::{ArcCache, ArcCacheInner, CacheKey, CacheLookup, CachedPage};
 pub use encrypt::{
     Argon2Params, DATABASE_ID_SIZE, DatabaseId, ENCRYPTION_RESERVED_BYTES, EncryptError, KEY_SIZE,
     KeyManager, NONCE_SIZE, PageEncryptor, TAG_SIZE, validate_reserved_bytes,
+};
+#[cfg(feature = "evalue-eviction")]
+pub use evalue_eviction::{
+    DEFAULT_INITIAL_E, DEFAULT_R_HIT, DEFAULT_R_TICK, DEFAULT_TICK_INTERVAL, E_VALUE_CEIL,
+    E_VALUE_FLOOR, EValueEvictor,
 };
 pub use journal::{
     CHECKSUM_STRIDE, JOURNAL_HEADER_SIZE, JOURNAL_MAGIC, JournalError, JournalHeader,

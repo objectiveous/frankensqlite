@@ -9,6 +9,7 @@ pub mod glossary;
 pub mod limits;
 pub mod obligation;
 pub mod opcode;
+pub mod qsbr;
 pub mod record;
 pub mod serial_type;
 pub mod sync_primitives;

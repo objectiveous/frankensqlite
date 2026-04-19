@@ -1555,6 +1555,157 @@ pub fn encode_batch(
     Ok(())
 }
 
+/// Minimum batch size for the homogeneous fast path. Below this, the
+/// existing `encode_batch` is already cheap enough that the homogeneity
+/// probe overhead is not amortized.
+const ENCODE_BATCH_HOMOGENEOUS_MIN_ROWS: usize = 16;
+
+/// Cheap homogeneity probe — O(R·C) equality check of each row's
+/// (serial_type, payload_len) tuple against the first row.
+///
+/// Returns `true` iff all rows have identical column counts and identical
+/// `(serial_type, payload_len)` at every column position. The SQLite
+/// record format encodes TEXT/BLOB length into the serial type itself, so
+/// identical serial types already imply identical payload lengths for
+/// those classes; we return the pair for clarity and to keep the fast
+/// path honest if the layout definition ever shifts.
+///
+/// Returns `false` for fewer than two rows (no comparison possible —
+/// callers should use the slow path, which handles degenerate sizes
+/// uniformly).
+#[must_use]
+pub fn rows_have_identical_serial_types(rows: &[&[SqliteValue]]) -> bool {
+    if rows.len() < 2 {
+        return false;
+    }
+    let first = rows[0];
+    for row in &rows[1..] {
+        if row.len() != first.len() {
+            return false;
+        }
+        for (a, b) in first.iter().zip(row.iter()) {
+            if serialized_value_layout(a) != serialized_value_layout(b) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Homogeneous-batch fast path for `encode_batch`.
+///
+/// Returns `None` if the batch is heterogeneous, empty, or below the
+/// size threshold [`ENCODE_BATCH_HOMOGENEOUS_MIN_ROWS`]. Otherwise
+/// computes the record header ONCE and `memcpy`s it into every row
+/// slot, then writes each row's body bytes in a tight loop amenable
+/// to auto-vectorization.
+///
+/// Byte-identical to `encode_batch`'s `out` payload.
+///
+/// # Invariant
+///
+/// SQLite serial types for TEXT (`>= 13`, odd) and BLOB (`>= 12`, even)
+/// encode their byte length directly. Two rows with "same TEXT column
+/// but different string lengths" therefore have DIFFERENT serial types
+/// and [`rows_have_identical_serial_types`] correctly returns `false`.
+/// This fast path is only valid when every row's payload layout is
+/// bit-for-bit identical in shape.
+#[must_use]
+pub fn encode_batch_homogeneous(rows: &[&[SqliteValue]]) -> Option<Vec<u8>> {
+    if rows.len() < ENCODE_BATCH_HOMOGENEOUS_MIN_ROWS {
+        return None;
+    }
+    if !rows_have_identical_serial_types(rows) {
+        return None;
+    }
+
+    let template_row = rows[0];
+
+    // Compute header content size and body size once.
+    let mut header_content_size = 0usize;
+    let mut body_size = 0usize;
+    for value in template_row.iter() {
+        let (serial_type, payload_len) = serialized_value_layout(value);
+        header_content_size = header_content_size.checked_add(varint_len(serial_type))?;
+        body_size = body_size.checked_add(payload_len)?;
+    }
+    let header_size = compute_header_size(header_content_size);
+    let row_total = header_size.checked_add(body_size)?;
+    let total_size = row_total.checked_mul(rows.len())?;
+
+    // Build the single reusable header template.
+    let mut header_template = vec![0_u8; header_size];
+    let mut hoff = write_varint(
+        &mut header_template,
+        u64::try_from(header_size).unwrap_or(u64::MAX),
+    );
+    for value in template_row.iter() {
+        let (serial_type, _) = serialized_value_layout(value);
+        hoff += write_varint(&mut header_template[hoff..], serial_type);
+    }
+    debug_assert_eq!(hoff, header_size);
+
+    // Allocate the full output, memcpy the header into each row slot,
+    // then write bodies in a tight loop.
+    let mut out = vec![0_u8; total_size];
+    for (i, row) in rows.iter().enumerate() {
+        let row_start = i * row_total;
+        let header_end = row_start + header_size;
+        out[row_start..header_end].copy_from_slice(&header_template);
+
+        let mut body_offset = header_end;
+        for value in row.iter() {
+            let (_, payload_len) = serialized_value_layout(value);
+            let end = body_offset + payload_len;
+            encode_serialized_value(value, payload_len, &mut out[body_offset..end]);
+            body_offset = end;
+        }
+        debug_assert_eq!(body_offset, row_start + row_total);
+    }
+
+    Some(out)
+}
+
+/// Auto-probing variant of `encode_batch`: tries the homogeneous fast
+/// path first, falls back to the generic `encode_batch` otherwise.
+///
+/// The probe is intentionally cheap — it only compares the first three
+/// rows' layouts up front. `encode_batch_homogeneous` re-validates all
+/// rows before committing to the fast path, so a false-positive probe
+/// just wastes one re-scan, never produces wrong output.
+///
+/// Returns a freshly allocated `Vec<u8>` matching `encode_batch`'s
+/// `out` payload byte-for-byte. Row offsets can be reconstructed
+/// trivially when the batch is homogeneous (every row has width
+/// `out.len() / rows.len()`); callers that need them alongside a
+/// heterogeneous batch should call `encode_batch` directly.
+///
+/// # Errors
+///
+/// Propagates any error from the fallback `encode_batch` (today none).
+pub fn encode_batch_auto(rows: &[&[SqliteValue]]) -> fsqlite_error::Result<Vec<u8>> {
+    // Cheap probe: if the first three rows don't match, it's almost
+    // certainly heterogeneous — skip the full homogeneity scan.
+    let probe_ok = if rows.len() < ENCODE_BATCH_HOMOGENEOUS_MIN_ROWS {
+        false
+    } else {
+        let probe_len = rows.len().min(3);
+        let probe: &[&[SqliteValue]] = &rows[..probe_len];
+        rows_have_identical_serial_types(probe)
+    };
+
+    if probe_ok {
+        if let Some(bytes) = encode_batch_homogeneous(rows) {
+            return Ok(bytes);
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut offsets = Vec::new();
+    encode_batch(rows, &mut out, &mut offsets)?;
+    Ok(out)
+}
+
 /// Decode a value from its serial type and raw bytes.
 ///
 /// Public so that [`RecordOffsetTable`] consumers can perform lazy
@@ -3021,6 +3172,206 @@ mod tests {
             )
         ) {
             assert_encode_batch_matches_scalar(&rows);
+        }
+    }
+
+    // ── Homogeneous batch fast path (encode_batch_homogeneous) ─────────────
+
+    fn encode_batch_as_vec(rows: &[Vec<SqliteValue>]) -> Vec<u8> {
+        let row_refs: Vec<&[SqliteValue]> = rows.iter().map(Vec::as_slice).collect();
+        let mut out = Vec::new();
+        let mut offsets = Vec::new();
+        encode_batch(&row_refs, &mut out, &mut offsets).expect("encode_batch must succeed");
+        out
+    }
+
+    #[test]
+    fn encode_batch_homogeneous_1000_rows_matches_scalar() {
+        // 1000 rows of (i64, i64, TEXT[20]). Integer serial types vary with
+        // magnitude (and values 0/1 have special zero-payload types), so we
+        // bias both integer columns into the large-magnitude 8-byte serial
+        // class (serial type 6, u64 magnitude > 0x7FFF_FFFF_FFFF) to keep
+        // layout identical across rows. All text values have length 20.
+        let mut rows: Vec<Vec<SqliteValue>> = Vec::with_capacity(1000);
+        let large_base: i64 = 0x1_0000_0000_0000; // forces serial_type == 6
+        for i in 0_i64..1000 {
+            // Format as fixed 20-character string.
+            let text = format!("{i:020}");
+            assert_eq!(text.len(), 20);
+            rows.push(vec![
+                SqliteValue::Integer(large_base + i),
+                SqliteValue::Integer(large_base + i.wrapping_mul(31)),
+                SqliteValue::Text(text.into()),
+            ]);
+        }
+
+        let row_refs: Vec<&[SqliteValue]> = rows.iter().map(Vec::as_slice).collect();
+        assert!(
+            rows_have_identical_serial_types(&row_refs),
+            "rows must be detected as homogeneous"
+        );
+
+        let fast = encode_batch_homogeneous(&row_refs)
+            .expect("homogeneous fast path must succeed for 1000-row i64/i64/TEXT20 batch");
+        let slow = encode_batch_as_vec(&rows);
+        assert_eq!(
+            fast, slow,
+            "homogeneous fast-path output must be byte-identical to encode_batch"
+        );
+    }
+
+    #[test]
+    fn encode_batch_homogeneous_heterogeneous_returns_none() {
+        // Build 32 rows (above threshold) but rotate types so serial types
+        // differ row-to-row.
+        let mut rows: Vec<Vec<SqliteValue>> = Vec::with_capacity(32);
+        for i in 0_i64..32 {
+            rows.push(vec![
+                SqliteValue::Integer(i),
+                match i % 3 {
+                    0 => SqliteValue::Null,
+                    1 => SqliteValue::Text("hi".into()),
+                    _ => SqliteValue::Float(1.5),
+                },
+            ]);
+        }
+        let row_refs: Vec<&[SqliteValue]> = rows.iter().map(Vec::as_slice).collect();
+        assert!(
+            !rows_have_identical_serial_types(&row_refs),
+            "mixed-type rows must NOT probe as homogeneous"
+        );
+        assert!(
+            encode_batch_homogeneous(&row_refs).is_none(),
+            "heterogeneous batch must refuse the fast path"
+        );
+    }
+
+    #[test]
+    fn encode_batch_homogeneous_below_threshold_returns_none() {
+        // 10 rows, perfectly homogeneous, but below the 16-row threshold.
+        let rows: Vec<Vec<SqliteValue>> = (0_i64..10)
+            .map(|i| vec![SqliteValue::Integer(i), SqliteValue::Integer(i * 2)])
+            .collect();
+        let row_refs: Vec<&[SqliteValue]> = rows.iter().map(Vec::as_slice).collect();
+        assert!(
+            encode_batch_homogeneous(&row_refs).is_none(),
+            "N=10 batch must fall back (below threshold)"
+        );
+        // encode_batch_auto must still produce correct output via the fallback.
+        let auto = encode_batch_auto(&row_refs).expect("encode_batch_auto fallback must succeed");
+        let slow = encode_batch_as_vec(&rows);
+        assert_eq!(auto, slow, "auto fallback must match encode_batch bytes");
+    }
+
+    #[test]
+    fn encode_batch_homogeneous_varying_text_lengths_returns_none() {
+        // INVARIANT: SQLite TEXT serial types are `2*N + 13` where N is the
+        // byte length of the text. Two rows with text of different lengths
+        // therefore have DIFFERENT serial types, so the layout-equality
+        // prober correctly classifies them as heterogeneous.
+        let mut rows: Vec<Vec<SqliteValue>> = Vec::with_capacity(32);
+        for i in 0_i64..32 {
+            // Alternate between length-3 and length-7 text.
+            let text = if i % 2 == 0 {
+                "abc".to_owned()
+            } else {
+                "abcdefg".to_owned()
+            };
+            rows.push(vec![
+                SqliteValue::Integer(i),
+                SqliteValue::Text(text.into()),
+            ]);
+        }
+        let row_refs: Vec<&[SqliteValue]> = rows.iter().map(Vec::as_slice).collect();
+        assert!(
+            !rows_have_identical_serial_types(&row_refs),
+            "varying-length TEXT rows must be classified heterogeneous (different serial types)"
+        );
+        assert!(
+            encode_batch_homogeneous(&row_refs).is_none(),
+            "varying TEXT length rows must refuse the fast path"
+        );
+        // And auto fallback must still produce correct bytes.
+        let auto = encode_batch_auto(&row_refs).expect("encode_batch_auto must succeed");
+        let slow = encode_batch_as_vec(&rows);
+        assert_eq!(auto, slow);
+    }
+
+    #[test]
+    fn encode_batch_homogeneous_fuzz_100_random_batches() {
+        use proptest::prelude::*;
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::TestRunner;
+
+        // For each trial, pick a random column-type signature and fill 16..64
+        // rows with that exact signature. We use a deterministic runner so the
+        // test is reproducible but still exercises a wide variety of layouts.
+        let mut runner = TestRunner::deterministic();
+        for trial in 0..100 {
+            // Strategy: pick column count 1..=6, and for each column pick a
+            // "type kind" (Null, small-int, large-int, float, fixed-text,
+            // fixed-blob). Then generate N=16..48 rows matching that signature.
+            let signature_strategy = proptest::collection::vec(0_u8..6_u8, 1..=6);
+            let signature_tree = signature_strategy
+                .new_tree(&mut runner)
+                .expect("strategy must produce a value");
+            let signature: Vec<u8> = signature_tree.current();
+
+            let n_rows: usize = 16 + (trial % 32);
+            let mut rows: Vec<Vec<SqliteValue>> = Vec::with_capacity(n_rows);
+            for r in 0..n_rows {
+                let mut row: Vec<SqliteValue> = Vec::with_capacity(signature.len());
+                for (c, kind) in signature.iter().enumerate() {
+                    // Same kind in same column ⇒ same serial_type; vary values
+                    // within the kind's serial-type class so bodies differ.
+                    let seed = (trial as i64) * 1_000 + (r as i64) * 17 + (c as i64) * 3;
+                    // Keep values away from 0 and 1 (special serial types
+                    // 8 and 9) so the 1-byte-int class is stable. The
+                    // large-int branch forces serial type 6 (8-byte signed).
+                    let small_iv = 2_i64 + (seed.rem_euclid(100));
+                    let large_iv = 0x0010_0000_0000_0000_i64 + seed.rem_euclid(1_000);
+                    #[allow(clippy::cast_precision_loss)]
+                    let fv = (seed as f64).mul_add(0.125, 1.0);
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let blob_bytes: [u8; 4] = [
+                        (seed & 0xFF) as u8,
+                        ((seed >> 8) & 0xFF) as u8,
+                        ((seed >> 16) & 0xFF) as u8,
+                        ((seed >> 24) & 0xFF) as u8,
+                    ];
+                    let val = match kind {
+                        0 => SqliteValue::Null,
+                        1 => SqliteValue::Integer(small_iv),
+                        2 => SqliteValue::Integer(large_iv),
+                        3 => SqliteValue::Float(fv),
+                        4 => SqliteValue::Text(
+                            format!("{:05}", seed.unsigned_abs() % 100_000).into(),
+                        ),
+                        _ => SqliteValue::Blob(Arc::from(blob_bytes.as_slice())),
+                    };
+                    row.push(val);
+                }
+                rows.push(row);
+            }
+
+            let row_refs: Vec<&[SqliteValue]> = rows.iter().map(Vec::as_slice).collect();
+            assert!(
+                rows_have_identical_serial_types(&row_refs),
+                "trial {trial}: generator must produce homogeneous rows"
+            );
+            let fast = encode_batch_homogeneous(&row_refs).unwrap_or_else(|| {
+                panic!("trial {trial}: homogeneous encode must succeed (N={n_rows})")
+            });
+            let slow = encode_batch_as_vec(&rows);
+            assert_eq!(
+                fast, slow,
+                "trial {trial}: fast/slow mismatch for signature {signature:?}"
+            );
+
+            // encode_batch_auto must also match.
+            let auto = encode_batch_auto(&row_refs)
+                .expect("encode_batch_auto must succeed on homogeneous");
+            assert_eq!(auto, slow, "trial {trial}: encode_batch_auto mismatch");
         }
     }
 }

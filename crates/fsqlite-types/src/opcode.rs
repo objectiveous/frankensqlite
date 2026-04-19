@@ -526,11 +526,29 @@ pub enum Opcode {
     /// P1 = cursor, P2 = root page number, P3 = column count, P5 = flags.
     /// Opens a write cursor and navigates to the last entry for append.
     FusedOpenWriteLast = 195,
+
+    /// Fused `Integer(p1=lit, p2=reg) + ResultRow(p1=reg, p2=1)` pair.
+    ///
+    /// Emits a single-column result row whose only value is the literal
+    /// integer `p1`, then clears register `p2` (matching the post-`ResultRow`
+    /// side effect of `take_reg_range`, which drains the source register).
+    ///
+    /// P1 = integer literal value
+    /// P2 = source register (written with the literal, then consumed)
+    /// P3 = unused (reserved; must be 0)
+    /// P4 = `P4::None`
+    /// P5 = 0
+    ///
+    /// Correctness contract: byte-equivalent to the unfused pair. Only the
+    /// peephole codegen pass emits this opcode; it MUST verify that the
+    /// immediately-following `ResultRow` consumes exactly the register
+    /// written by `Integer` and outputs exactly one column.
+    FusedLiteralResultRow = 196,
 }
 
 impl Opcode {
     /// Total number of opcodes defined.
-    pub const COUNT: usize = 196;
+    pub const COUNT: usize = 197;
 
     /// Get the opcode name as a static string slice.
     #[allow(clippy::too_many_lines)]
@@ -731,6 +749,7 @@ impl Opcode {
             Self::CountIndexEqRun => "CountIndexEqRun",
             Self::FusedAppendInsert => "FusedAppendInsert",
             Self::FusedOpenWriteLast => "FusedOpenWriteLast",
+            Self::FusedLiteralResultRow => "FusedLiteralResultRow",
         }
     }
 
@@ -1342,6 +1361,83 @@ impl ProgramBuilder {
         self.regs.count()
     }
 
+    // ── Peephole Passes (IMPL-13) ───────────────────────────────────────
+
+    /// Fuse `Integer(lit, reg) + ResultRow(reg, 1)` pairs into
+    /// `FusedLiteralResultRow(lit, reg)` + `Noop`.
+    ///
+    /// Rewrites in-place so program counters, jump targets, and the label
+    /// tables remain valid without rewiring. The `ResultRow` is replaced by a
+    /// `Noop` rather than removed so no following instruction shifts.
+    ///
+    /// Conservative preconditions per fusion site:
+    /// - The `Integer`'s target register equals the `ResultRow`'s start
+    ///   register.
+    /// - The `ResultRow` emits exactly one column (`p2 == 1`).
+    /// - The `ResultRow` is NOT a resolved jump target from any prior jump
+    ///   in this program (a mid-pair jump would otherwise skip the Integer
+    ///   write and run `ResultRow` against an unrelated register value).
+    /// - Neither instruction carries a non-`None` P4 payload (Integer/ResultRow
+    ///   don't use P4 in their canonical form).
+    /// - Both instructions carry P5 == 0 and P3 == 0.
+    ///
+    /// Returns the number of fusions performed.
+    pub fn apply_fuse_literal_result_row(&mut self) -> usize {
+        // Collect the set of resolved jump targets. Any address that is the
+        // target of some jump instruction's `p2` is ineligible to be the
+        // second half of a fusion pair.
+        let mut jump_targets: std::collections::HashSet<i32> = std::collections::HashSet::new();
+        for op in &self.ops {
+            if op.opcode.is_jump() {
+                jump_targets.insert(op.p2);
+            }
+        }
+
+        let mut fused = 0usize;
+        let len = self.ops.len();
+        let mut i = 0;
+        while i + 1 < len {
+            let is_int = matches!(self.ops[i].opcode, Opcode::Integer)
+                && self.ops[i].p3 == 0
+                && self.ops[i].p5 == 0
+                && matches!(self.ops[i].p4, P4::None);
+            let is_row = matches!(self.ops[i + 1].opcode, Opcode::ResultRow)
+                && self.ops[i + 1].p2 == 1
+                && self.ops[i + 1].p3 == 0
+                && self.ops[i + 1].p5 == 0
+                && matches!(self.ops[i + 1].p4, P4::None);
+            let same_reg = is_int && is_row && self.ops[i].p2 == self.ops[i + 1].p1;
+            let row_addr = i32::try_from(i + 1).ok();
+            let row_is_target = row_addr.is_some_and(|a| jump_targets.contains(&a));
+
+            if same_reg && !row_is_target {
+                let lit = self.ops[i].p1;
+                let reg = self.ops[i].p2;
+                self.ops[i] = VdbeOp {
+                    opcode: Opcode::FusedLiteralResultRow,
+                    p1: lit,
+                    p2: reg,
+                    p3: 0,
+                    p4: P4::None,
+                    p5: 0,
+                };
+                self.ops[i + 1] = VdbeOp {
+                    opcode: Opcode::Noop,
+                    p1: 0,
+                    p2: 0,
+                    p3: 0,
+                    p4: P4::None,
+                    p5: 0,
+                };
+                fused += 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        fused
+    }
+
     // ── Finalization ────────────────────────────────────────────────────
 
     /// Validate all labels are resolved and return the finished program.
@@ -1466,7 +1562,7 @@ mod tests {
 
     #[test]
     fn opcode_count() {
-        assert_eq!(Opcode::COUNT, 196);
+        assert_eq!(Opcode::COUNT, 197);
     }
 
     #[test]

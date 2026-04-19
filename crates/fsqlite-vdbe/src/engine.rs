@@ -11857,6 +11857,57 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            // IMPL-13: Fused `Integer(p1=lit, p2=reg) + ResultRow(p1=reg, p2=1)`.
+            // Emits a single-column result row whose only value is the literal
+            // integer `p1`, then clears the source register to mirror the
+            // drain semantics of `ResultRow` (`take_reg_range`).
+            //
+            // Correctness: byte-equivalent to the unfused sequence. The
+            // codegen-side peephole pass is responsible for verifying that
+            // the `ResultRow` consumes exactly the register written by the
+            // preceding `Integer` and emits exactly one column.
+            Opcode::FusedLiteralResultRow => {
+                let lit = i64::from(op.p1);
+                let reg = op.p2;
+                // Preserve Integer's write-then-ResultRow-drain side effects:
+                // the register ends up cleared after `take_reg_range`.
+                self.set_reg_int(reg, lit);
+
+                let should_retain_row = self.collect_result_rows
+                    && match self.max_collected_result_rows {
+                        Some(limit) => self.results.len() < limit,
+                        None => true,
+                    };
+                if row_handler.is_some() || should_retain_row {
+                    let materialize_start = collect_vdbe_metrics.then(Instant::now);
+                    // Single-column row: drain the register just like
+                    // `take_reg_range(reg, 1)` would.
+                    let mut row: smallvec::SmallVec<[SqliteValue; 16]> =
+                        smallvec::SmallVec::with_capacity(1);
+                    row.push(self.take_reg(reg));
+                    if collect_vdbe_metrics {
+                        if let Some(materialize_start) = materialize_start {
+                            FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.fetch_add(
+                                u64::try_from(materialize_start.elapsed().as_nanos())
+                                    .unwrap_or(u64::MAX),
+                                AtomicOrdering::Relaxed,
+                            );
+                        }
+                        record_result_row_metrics(&row);
+                    }
+                    if let Some(handler) = row_handler.as_mut() {
+                        (*handler)(row)?;
+                    } else {
+                        self.results.push(row);
+                    }
+                } else {
+                    // No retention: still drain the register to match the
+                    // unfused ResultRow's `discard_reg_range` behavior.
+                    let _ = self.take_reg(reg);
+                }
+                *pc += 1;
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }
@@ -30137,5 +30188,152 @@ mod tests {
             vec![vec![SqliteValue::Integer(1)]],
             "second execution should observe no inherited bloom filter"
         );
+    }
+
+    // ── IMPL-13: Fused Integer + ResultRow ──────────────────────────────
+    //
+    // Verifies the `FusedLiteralResultRow` opcode and the peephole pass
+    // that rewrites `Integer(lit, reg) + ResultRow(reg, 1)` pairs into the
+    // fused form. The test compiles the unfused program, executes it, then
+    // compiles+peephole-fuses the same program and byte-compares the
+    // emitted result rows.
+
+    fn opcode_fusion_build_unfused_program(literal: i32) -> crate::VdbeProgram {
+        let mut b = ProgramBuilder::new();
+        let r = b.alloc_reg();
+        b.emit_op(Opcode::Integer, literal, r, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.finish().expect("unfused program should build")
+    }
+
+    fn opcode_fusion_build_fused_program(literal: i32) -> (crate::VdbeProgram, usize) {
+        let mut b = ProgramBuilder::new();
+        let r = b.alloc_reg();
+        b.emit_op(Opcode::Integer, literal, r, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let fused_count = b.apply_fuse_literal_result_row();
+        (b.finish().expect("fused program should build"), fused_count)
+    }
+
+    #[test]
+    fn opcode_fusion_literal_result_row_peephole_rewrites_pair() {
+        let (program, fused_count) = opcode_fusion_build_fused_program(42);
+        assert_eq!(fused_count, 1, "exactly one fusion site should match");
+        let ops = program.ops();
+        assert_eq!(
+            ops[0].opcode,
+            Opcode::FusedLiteralResultRow,
+            "first op should be the fused opcode"
+        );
+        assert_eq!(ops[0].p1, 42);
+        assert_eq!(
+            ops[1].opcode,
+            Opcode::Noop,
+            "second op should be Noop to preserve program length"
+        );
+        assert_eq!(ops[2].opcode, Opcode::Halt);
+    }
+
+    #[test]
+    fn opcode_fusion_literal_result_row_byte_equivalent_to_unfused() {
+        let literal = 42;
+
+        let unfused = opcode_fusion_build_unfused_program(literal);
+        let mut eng_unfused = VdbeEngine::new(unfused.register_count());
+        assert_eq!(
+            eng_unfused.execute(&unfused).expect("unfused exec"),
+            ExecOutcome::Done
+        );
+        let unfused_rows: Vec<Vec<SqliteValue>> = eng_unfused
+            .take_results()
+            .into_iter()
+            .map(|row| row.into_vec())
+            .collect();
+
+        let (fused, fused_count) = opcode_fusion_build_fused_program(literal);
+        assert_eq!(fused_count, 1);
+        let mut eng_fused = VdbeEngine::new(fused.register_count());
+        assert_eq!(
+            eng_fused.execute(&fused).expect("fused exec"),
+            ExecOutcome::Done
+        );
+        let fused_rows: Vec<Vec<SqliteValue>> = eng_fused
+            .take_results()
+            .into_iter()
+            .map(|row| row.into_vec())
+            .collect();
+
+        assert_eq!(
+            fused_rows, unfused_rows,
+            "fused program must emit byte-equivalent rows"
+        );
+        assert_eq!(
+            fused_rows,
+            vec![vec![SqliteValue::Integer(i64::from(literal))]]
+        );
+    }
+
+    #[test]
+    fn opcode_fusion_peephole_skips_multi_column_result_row() {
+        // `ResultRow(reg, 2)` emits two columns — the single-column fast
+        // path must not fuse here because the following register value
+        // participates in the row.
+        let mut b = ProgramBuilder::new();
+        let r = b.alloc_reg();
+        let _r2 = b.alloc_reg();
+        b.emit_op(Opcode::Integer, 7, r, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+        let count = b.apply_fuse_literal_result_row();
+        assert_eq!(count, 0, "multi-column ResultRow must not fuse");
+
+        let program = b.finish().expect("program should build");
+        assert_eq!(program.ops()[0].opcode, Opcode::Integer);
+        assert_eq!(program.ops()[1].opcode, Opcode::ResultRow);
+    }
+
+    #[test]
+    fn opcode_fusion_peephole_skips_register_mismatch() {
+        // Integer writes reg A, ResultRow reads reg B — not a fusion.
+        let mut b = ProgramBuilder::new();
+        let r_a = b.alloc_reg();
+        let r_b = b.alloc_reg();
+        b.emit_op(Opcode::Integer, 7, r_a, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 9, r_b, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r_b, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+        let count = b.apply_fuse_literal_result_row();
+        // The second Integer + ResultRow pair has matching registers and
+        // can fuse; the first Integer (writes r_a) cannot.
+        assert_eq!(count, 1);
+
+        let program = b.finish().expect("program should build");
+        assert_eq!(program.ops()[0].opcode, Opcode::Integer);
+        assert_eq!(program.ops()[1].opcode, Opcode::FusedLiteralResultRow);
+        assert_eq!(program.ops()[2].opcode, Opcode::Noop);
+    }
+
+    #[test]
+    fn opcode_fusion_peephole_skips_jump_target_on_result_row() {
+        // Goto lands on the ResultRow mid-pair — fusion would change
+        // behavior (Noop can't do the ResultRow work), so the peephole
+        // must refuse this site.
+        let mut b = ProgramBuilder::new();
+        let r = b.alloc_reg();
+        // 0: Goto -> 2 (the ResultRow address)
+        b.emit_op(Opcode::Goto, 0, 2, 0, P4::None, 0);
+        // 1: Integer 5 -> r
+        b.emit_op(Opcode::Integer, 5, r, 0, P4::None, 0);
+        // 2: ResultRow(r, 1)  <-- jump target
+        b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+        // 3: Halt
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+        let count = b.apply_fuse_literal_result_row();
+        assert_eq!(count, 0, "ResultRow that is a jump target must not fuse");
     }
 }

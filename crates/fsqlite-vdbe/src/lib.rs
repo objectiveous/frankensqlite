@@ -240,6 +240,13 @@ pub(crate) fn opcode_register_spans(op: &VdbeOp) -> OpcodeRegisterSpans {
             let (read_start, read_len) = register_range(op.p1, op.p2);
             (read_start, read_len, -1, 0)
         }
+        // IMPL-13: Fused Integer+ResultRow. P2 is the (write+drain) register.
+        Opcode::FusedLiteralResultRow => {
+            let (start, len) = register_range(op.p2, 1);
+            // The opcode writes the literal into `p2`, then drains it. From a
+            // liveness standpoint it both reads and writes that single slot.
+            (start, len, start, len)
+        }
         Opcode::Add
         | Opcode::Subtract
         | Opcode::Multiply
@@ -676,6 +683,81 @@ impl ProgramBuilder {
                 .or_default()
                 .extend(indexes);
         }
+    }
+
+    // ── Peephole Passes (IMPL-13) ───────────────────────────────────────
+
+    /// Fuse `Integer(lit, reg) + ResultRow(reg, 1)` pairs into
+    /// `FusedLiteralResultRow(lit, reg)` + `Noop`.
+    ///
+    /// Rewrites in place so program counters, jump targets, and the label
+    /// tables remain valid without rewiring. The `ResultRow` is replaced
+    /// with a `Noop` rather than removed so no following instruction
+    /// shifts.
+    ///
+    /// Conservative preconditions per fusion site:
+    /// - The `Integer`'s target register equals the `ResultRow`'s start
+    ///   register.
+    /// - The `ResultRow` emits exactly one column (`p2 == 1`).
+    /// - The `ResultRow` is NOT a resolved jump target from any prior jump
+    ///   in this program (a mid-pair jump would otherwise skip the
+    ///   `Integer` write and run `ResultRow` against an unrelated register
+    ///   value).
+    /// - Neither instruction carries a non-`None` P4 payload.
+    /// - Both instructions carry P5 == 0 and P3 == 0.
+    ///
+    /// Returns the number of fusions performed.
+    pub fn apply_fuse_literal_result_row(&mut self) -> usize {
+        let mut jump_targets: HashSet<i32> = HashSet::new();
+        for op in self.ops.iter() {
+            if op.opcode.is_jump() {
+                jump_targets.insert(op.p2);
+            }
+        }
+
+        let mut fused = 0usize;
+        let len = self.ops.len();
+        let mut i = 0;
+        while i + 1 < len {
+            let is_int = matches!(self.ops[i].opcode, Opcode::Integer)
+                && self.ops[i].p3 == 0
+                && self.ops[i].p5 == 0
+                && matches!(self.ops[i].p4, P4::None);
+            let is_row = matches!(self.ops[i + 1].opcode, Opcode::ResultRow)
+                && self.ops[i + 1].p2 == 1
+                && self.ops[i + 1].p3 == 0
+                && self.ops[i + 1].p5 == 0
+                && matches!(self.ops[i + 1].p4, P4::None);
+            let same_reg = is_int && is_row && self.ops[i].p2 == self.ops[i + 1].p1;
+            let row_addr = i32::try_from(i + 1).ok();
+            let row_is_target = row_addr.is_some_and(|a| jump_targets.contains(&a));
+
+            if same_reg && !row_is_target {
+                let lit = self.ops[i].p1;
+                let reg = self.ops[i].p2;
+                self.ops[i] = VdbeOp {
+                    opcode: Opcode::FusedLiteralResultRow,
+                    p1: lit,
+                    p2: reg,
+                    p3: 0,
+                    p4: P4::None,
+                    p5: 0,
+                };
+                self.ops[i + 1] = VdbeOp {
+                    opcode: Opcode::Noop,
+                    p1: 0,
+                    p2: 0,
+                    p3: 0,
+                    p4: P4::None,
+                    p5: 0,
+                };
+                fused += 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        fused
     }
 
     // ── Finalization ────────────────────────────────────────────────────

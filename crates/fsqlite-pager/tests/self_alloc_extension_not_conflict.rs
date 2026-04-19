@@ -6,8 +6,8 @@ use fsqlite_pager::traits::{
     TransactionMode, WalBackend,
 };
 use fsqlite_pager::{CheckpointMode, SimplePager};
-use fsqlite_types::cx::Cx;
 use fsqlite_types::PageSize;
+use fsqlite_types::cx::Cx;
 use fsqlite_vfs::MemoryVfs;
 
 #[derive(Default)]
@@ -75,7 +75,9 @@ fn self_allocated_eof_page_stays_out_of_conflict_surface() {
     let mut txn = pager
         .begin(&cx, TransactionMode::Concurrent)
         .expect("concurrent transaction should begin");
-    let page = txn.allocate_page(&cx).expect("allocation should extend EOF");
+    let page = txn
+        .allocate_page(&cx)
+        .expect("allocation should extend EOF");
     assert_eq!(
         page.get(),
         2,
@@ -83,6 +85,14 @@ fn self_allocated_eof_page_stays_out_of_conflict_surface() {
     );
     txn.write_page(&cx, page, &[0xA5; 64])
         .expect("newly allocated page should accept writes");
+    let read_back = txn
+        .get_page(&cx, page)
+        .expect("same transaction should be able to read its own newly allocated page");
+    assert_eq!(
+        read_back.as_ref()[0],
+        0xA5,
+        "self-allocated extension page should remain readable inside the allocating transaction"
+    );
 
     let pending_commit = txn
         .pending_commit_pages()

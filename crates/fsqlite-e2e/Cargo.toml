@@ -116,3 +116,7 @@ path = "src/bin/comprehensive_bench.rs"
 [[bin]]
 name = "microbatch-bench"
 path = "src/bin/microbatch_bench.rs"
+
+[[bin]]
+name = "swarm-multiprocess"
+path = "src/bin/swarm_multiprocess.rs"

@@ -3500,13 +3500,14 @@ impl<P: PageWriter> BtCursor<P> {
         let mut cell_bytes = Vec::with_capacity(saved_entry.cell_pointers.len());
         for &off in &saved_entry.cell_pointers {
             let ptr = usize::from(off);
-            let cell = CellRef::parse(
+            // OPT-A3: size-only fast path for compaction — we only need
+            // each cell's byte extent, not its logical structure.
+            let size = cell::cell_on_page_size_fast(
                 saved_entry.page_data.as_bytes(),
                 ptr,
                 saved_entry.header.page_type,
                 self.usable_size,
             )?;
-            let size = crate::payload::cell_on_page_size(&cell, ptr);
             cell_bytes.push(saved_entry.page_data.as_bytes()[ptr..ptr + size].to_vec());
         }
 
@@ -4611,14 +4612,16 @@ impl<P: PageWriter> BtCursor<P> {
         let mut cells_to_move = Vec::with_capacity(ptrs.len());
         for (i, &off) in ptrs.iter().enumerate() {
             let ptr = off as usize;
-            let cell = CellRef::parse(
+            // OPT-A3: compute on-page size directly from the cell's
+            // varints — we're defragmenting, so we only need the byte
+            // extent of the cell, not a full CellRef. This avoids the
+            // overflow-page PageNumber::new validation on every cell.
+            let size = cell::cell_on_page_size_fast(
                 page_data.as_bytes(),
                 ptr,
                 header.page_type,
                 self.usable_size,
             )?;
-            // Full on-page size: header varints (payload_offset - ptr) + local payload + overflow ptr.
-            let size = crate::payload::cell_on_page_size(&cell, ptr);
             cells_to_move.push((ptr, size, i));
         }
 
@@ -4958,13 +4961,13 @@ impl<P: PageWriter> BtCursor<P> {
         let mut cells_to_move = Vec::with_capacity(ptrs.len());
         for (i, &off) in ptrs.iter().enumerate() {
             let ptr = usize::from(off);
-            let cell_ref = CellRef::parse(
+            // OPT-A3: size-only fast path, same as replace_interior_cell defrag.
+            let size = cell::cell_on_page_size_fast(
                 page_data.as_bytes(),
                 ptr,
                 header.page_type,
                 self.usable_size,
             )?;
-            let size = crate::payload::cell_on_page_size(&cell_ref, ptr);
             cells_to_move.push((ptr, size, i));
         }
         // OPT-7 follow-up: size-dispatched sort for typical small N here too.
@@ -5107,14 +5110,15 @@ impl<P: PageWriter> BtCursor<P> {
         let mut cells_to_move = Vec::with_capacity(ptrs.len());
         for (i, &off) in ptrs.iter().enumerate() {
             let ptr = off as usize;
-            let cell = CellRef::parse(
+            // OPT-A3: defragmentation only needs the byte extent of each
+            // cell, so compute size directly from its varints instead of
+            // building a full CellRef.
+            let size = cell::cell_on_page_size_fast(
                 page_data.as_bytes(),
                 ptr,
                 header.page_type,
                 self.usable_size,
             )?;
-            // Full on-page size: header varints (payload_offset - ptr) + local payload + overflow ptr.
-            let size = crate::payload::cell_on_page_size(&cell, ptr);
             cells_to_move.push((ptr, size, i));
         }
 
@@ -5305,13 +5309,13 @@ impl<P: PageWriter> BtCursor<P> {
         let mut cells_to_move = Vec::with_capacity(ptrs.len());
         for (i, &off) in ptrs.iter().enumerate() {
             let ptr = usize::from(off);
-            let cell = CellRef::parse(
+            // OPT-A3: size-only fast path for the separator-repair defrag.
+            let size = cell::cell_on_page_size_fast(
                 page_data.as_bytes(),
                 ptr,
                 header.page_type,
                 self.usable_size,
             )?;
-            let size = crate::payload::cell_on_page_size(&cell, ptr);
             cells_to_move.push((ptr, size, i));
         }
         // OPT-7 follow-up: same size-dispatched sort as above.
@@ -5760,19 +5764,19 @@ impl<P: PageWriter> BtCursor<P> {
             self.clear_rightmost_leaf_cache();
             return Ok(None);
         };
-        let actual_last_rowid = match CellRef::parse(
+        // OPT-A3: skip full CellRef::parse — we only need the last cell's
+        // rowid to confirm the hint is still valid. Read just the two
+        // leading varints (payload_size, rowid) which avoids parsing the
+        // local payload bounds / overflow pointer validation on every
+        // append.
+        let Some(actual_last_rowid) = cell::read_table_leaf_rowid_at_offset(
             page_data.as_bytes(),
             usize::from(last_ptr),
-            header.page_type,
-            self.usable_size,
-        ) {
-            Ok(cell) => cell.rowid,
-            Err(_) => {
-                self.clear_rightmost_leaf_cache();
-                return Ok(None);
-            }
+        ) else {
+            self.clear_rightmost_leaf_cache();
+            return Ok(None);
         };
-        if actual_last_rowid != Some(hinted_last_rowid) {
+        if actual_last_rowid != hinted_last_rowid {
             self.clear_rightmost_leaf_cache();
             return Ok(None);
         }
@@ -10922,6 +10926,71 @@ mod tests {
         for expected_rowid in 1..=256_i64 {
             assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
             if expected_rowid < 256 {
+                assert!(cursor.next(&cx).unwrap());
+            }
+        }
+        assert!(!cursor.next(&cx).unwrap());
+    }
+
+    #[test]
+    /// OPT-A3: verify the lightweight last-rowid read on the append hint path
+    /// correctly rejects a mismatched hint and the cursor falls back cleanly.
+    ///
+    /// The stored `hinted_last_rowid` is deliberately wrong (off by one) so
+    /// the fast-path check must fail and return `Ok(None)`, after which the
+    /// caller can retry with the real `table_insert_rightmost_hint` and
+    /// produce identical on-disk state to a fresh insert.
+    fn test_table_try_append_rightmost_leaf_hint_known_last_rowid_rejects_mismatched_hint() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        // Seed the table with two rows so there IS a "last rowid" to mismatch.
+        cursor
+            .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
+            .unwrap();
+        cursor
+            .table_insert_rightmost_hint(&cx, 2, payload_for_rowid(2).as_slice())
+            .unwrap();
+        let hinted_leaf = cursor
+            .current_page()
+            .expect("append should leave cursor on a concrete leaf");
+
+        // Now pass a DELIBERATELY WRONG hinted_last_rowid (1 instead of 2).
+        // The OPT-A3 fast path reads the last cell's rowid from the page
+        // directly and must notice the mismatch, returning Ok(None).
+        let wrong_hinted_last_rowid = 1_i64;
+        let result = cursor
+            .table_try_append_rightmost_leaf_hint_known_last_rowid(
+                &cx,
+                hinted_leaf,
+                wrong_hinted_last_rowid,
+                3,
+                payload_for_rowid(3).as_slice(),
+            )
+            .expect("mismatch path must not error");
+        assert!(
+            result.is_none(),
+            "mismatched hinted_last_rowid should force fallback, got {result:?}"
+        );
+
+        // Cache should have been cleared on the mismatch.
+        assert!(
+            cursor.rightmost_leaf_cache.is_none(),
+            "mismatched hint should clear the rightmost-leaf cache"
+        );
+
+        // The caller can now recover via the generic rightmost-hint path and
+        // observe the same end-state as if the fast path had never been tried.
+        cursor
+            .table_insert_rightmost_hint(&cx, 3, payload_for_rowid(3).as_slice())
+            .unwrap();
+
+        assert!(cursor.first(&cx).unwrap());
+        for expected_rowid in 1..=3_i64 {
+            assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
+            if expected_rowid < 3 {
                 assert!(cursor.next(&cx).unwrap());
             }
         }

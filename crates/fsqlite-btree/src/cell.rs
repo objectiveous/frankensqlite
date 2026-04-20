@@ -572,6 +572,139 @@ pub const fn header_offset_for_page(page_no: PageNumber) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Lightweight cell helpers (OPT-A3)
+// ---------------------------------------------------------------------------
+
+/// Read a table-leaf cell's rowid without constructing a full [`CellRef`].
+///
+/// Table-leaf cells begin with two varints: `payload_size` then `rowid`.
+/// This helper reads just those two varints and returns the rowid, skipping
+/// all the overflow-chain / local-size / bounds-check work that
+/// [`CellRef::parse`] performs.
+///
+/// Caller MUST have already verified that `page[cell_offset..]` is a
+/// table-leaf cell (page type flag 0x0D) and that `cell_offset` is within
+/// `page.len()`. This is intended for the INSERT append fast path after the
+/// page header has been checked.
+///
+/// Returns `None` when the varints are truncated.
+#[must_use]
+pub fn read_table_leaf_rowid_at_offset(page: &[u8], cell_offset: usize) -> Option<i64> {
+    if cell_offset >= page.len() {
+        return None;
+    }
+    let cell = &page[cell_offset..];
+    let (_, payload_varint_len) = read_varint(cell)?;
+    if payload_varint_len >= cell.len() {
+        return None;
+    }
+    let (rowid_raw, _) = read_varint(&cell[payload_varint_len..])?;
+    #[allow(clippy::cast_possible_wrap)]
+    Some(rowid_raw as i64)
+}
+
+/// Compute the on-page size of a cell without constructing a full [`CellRef`].
+///
+/// The on-page size is the total number of bytes the cell occupies in the
+/// cell-content area, which equals:
+///
+///   `(payload_offset - cell_start) + local_size + (4 if overflow else 0)`
+///
+/// Unlike [`CellRef::parse`] + [`crate::payload::cell_on_page_size`], this
+/// helper reads only the varints it needs and avoids the overflow-page
+/// `PageNumber::new` validation (we already know the cell layout is on-page
+/// because the page header's `content_offset` covers it; if the payload
+/// ever overflows we just add 4 for the trailing pointer without decoding it).
+///
+/// Used by defragmentation loops in `replace_interior_cell`,
+/// `remove_cell_from_leaf`, and the separator-repair / table-leaf-delete
+/// paths, which only need the cell's on-page size and don't care about the
+/// logical payload contents.
+///
+/// Returns `Err(DatabaseCorrupt)` when the cell header varints are
+/// truncated or extend past the page.
+pub fn cell_on_page_size_fast(
+    page: &[u8],
+    cell_offset: usize,
+    page_type: BtreePageType,
+    usable_size: u32,
+) -> Result<usize> {
+    if cell_offset >= page.len() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: "cell offset past end of page".to_owned(),
+        });
+    }
+    let mut pos = cell_offset;
+
+    // Interior pages: 4-byte left child pointer prefix.
+    if page_type.is_interior() {
+        if pos + 4 > page.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "cell extends past page (left child)".to_owned(),
+            });
+        }
+        pos += 4;
+    }
+
+    // Interior-table cells: left_child (4) + rowid varint. Nothing else.
+    if page_type == BtreePageType::InteriorTable {
+        let (_rowid, rowid_len) =
+            read_varint(&page[pos..]).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "truncated varint in interior table cell (rowid)".to_owned(),
+            })?;
+        return Ok(pos + rowid_len - cell_offset);
+    }
+
+    // All other cell types: payload_size varint.
+    let (payload_size_raw, ps_len) =
+        read_varint(&page[pos..]).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "truncated varint in cell (payload size)".to_owned(),
+        })?;
+    let payload_size =
+        u32::try_from(payload_size_raw).map_err(|_| FrankenError::DatabaseCorrupt {
+            detail: "cell payload size exceeds 32-bit range".to_owned(),
+        })?;
+    pos += ps_len;
+
+    // Table-leaf cells: rowid varint after payload size.
+    if page_type.is_table() {
+        let (_rowid, rowid_len) =
+            read_varint(&page[pos..]).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "truncated varint in table cell (rowid)".to_owned(),
+            })?;
+        pos += rowid_len;
+    }
+
+    let local_size = local_payload_size(payload_size, usable_size, page_type) as usize;
+    let local_end = pos
+        .checked_add(local_size)
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "cell payload offset overflow".to_owned(),
+        })?;
+    if local_end > page.len() || local_end > usable_size as usize {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: "cell extends past usable page size (payload bytes)".to_owned(),
+        });
+    }
+
+    let total = if (local_size as u32) < payload_size {
+        // Cell has an overflow pointer (4 bytes trailing the local payload).
+        // We don't need to validate its contents here — the defragmentation
+        // copy is a byte-for-byte move, not a logical dereference.
+        if local_end + 4 > page.len() || local_end + 4 > usable_size as usize {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "cell extends past usable page size (overflow pointer)".to_owned(),
+            });
+        }
+        local_end + 4 - cell_offset
+    } else {
+        local_end - cell_offset
+    };
+
+    Ok(total)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -976,6 +1109,184 @@ mod tests {
         assert_eq!(header_offset_for_page(PageNumber::ONE), 100);
         assert_eq!(header_offset_for_page(PageNumber::new(2).unwrap()), 0);
         assert_eq!(header_offset_for_page(PageNumber::new(100).unwrap()), 0);
+    }
+
+    // -- OPT-A3 lightweight cell helpers --
+
+    #[test]
+    fn test_read_table_leaf_rowid_at_offset_single_byte() {
+        let mut page = vec![0u8; 4096];
+        let cell_offset = 3900;
+        page[cell_offset] = 10; // payload_size varint (1 byte)
+        page[cell_offset + 1] = 42; // rowid varint (1 byte)
+        let rowid = read_table_leaf_rowid_at_offset(&page, cell_offset).unwrap();
+        assert_eq!(rowid, 42);
+    }
+
+    #[test]
+    fn test_read_table_leaf_rowid_at_offset_multi_byte_varints() {
+        let mut page = vec![0u8; 4096];
+        let cell_offset = 100;
+        let mut pos = cell_offset;
+        // payload_size = 1000 (2-byte varint)
+        let mut buf = [0u8; 9];
+        let ps_len = fsqlite_types::serial_type::write_varint(&mut buf, 1000);
+        page[pos..pos + ps_len].copy_from_slice(&buf[..ps_len]);
+        pos += ps_len;
+        // rowid = 0xDEAD_BEEF (5-byte varint)
+        let rid_len = fsqlite_types::serial_type::write_varint(&mut buf, 0xDEAD_BEEF);
+        page[pos..pos + rid_len].copy_from_slice(&buf[..rid_len]);
+
+        let rowid = read_table_leaf_rowid_at_offset(&page, cell_offset).unwrap();
+        #[allow(clippy::cast_possible_wrap)]
+        let expected = 0xDEAD_BEEFu64 as i64;
+        assert_eq!(rowid, expected);
+    }
+
+    #[test]
+    fn test_read_table_leaf_rowid_at_offset_out_of_range() {
+        let page = vec![0u8; 16];
+        assert!(read_table_leaf_rowid_at_offset(&page, 17).is_none());
+    }
+
+    #[test]
+    fn test_cell_on_page_size_fast_matches_cellref_leaf_table_no_overflow() {
+        // Build a leaf-table cell, compare sizes.
+        let mut page = vec![0u8; 4096];
+        let cell_offset = 3900;
+        let mut pos = cell_offset;
+        page[pos] = 10; // payload_size
+        pos += 1;
+        page[pos] = 42; // rowid
+        pos += 1;
+        for i in 0..10 {
+            page[pos + i] = (i + 1) as u8;
+        }
+
+        let cell =
+            CellRef::parse(&page, cell_offset, BtreePageType::LeafTable, 4096).unwrap();
+        let expected = crate::payload::cell_on_page_size(&cell, cell_offset);
+        let fast =
+            cell_on_page_size_fast(&page, cell_offset, BtreePageType::LeafTable, 4096).unwrap();
+        assert_eq!(fast, expected);
+        assert_eq!(fast, 1 + 1 + 10);
+    }
+
+    #[test]
+    fn test_cell_on_page_size_fast_matches_cellref_leaf_table_with_overflow() {
+        let mut page = vec![0u8; 4096];
+        let cell_offset = 0;
+        let payload_size: u32 = 5000;
+        let usable_size: u32 = 4096;
+
+        let mut buf = [0u8; 9];
+        let ps_len = fsqlite_types::serial_type::write_varint(&mut buf, u64::from(payload_size));
+        page[cell_offset..cell_offset + ps_len].copy_from_slice(&buf[..ps_len]);
+        let rowid_offset = cell_offset + ps_len;
+        page[rowid_offset] = 1;
+        let rowid_len = 1;
+        let payload_offset = rowid_offset + rowid_len;
+        let local = local_payload_size(payload_size, usable_size, BtreePageType::LeafTable);
+
+        for i in 0..local as usize {
+            if payload_offset + i < page.len() {
+                page[payload_offset + i] = (i & 0xFF) as u8;
+            }
+        }
+        let overflow_ptr_offset = payload_offset + local as usize;
+        if overflow_ptr_offset + 4 <= page.len() {
+            page[overflow_ptr_offset..overflow_ptr_offset + 4]
+                .copy_from_slice(&99u32.to_be_bytes());
+        }
+
+        let cell =
+            CellRef::parse(&page, cell_offset, BtreePageType::LeafTable, usable_size).unwrap();
+        let expected = crate::payload::cell_on_page_size(&cell, cell_offset);
+        let fast =
+            cell_on_page_size_fast(&page, cell_offset, BtreePageType::LeafTable, usable_size)
+                .unwrap();
+        assert_eq!(fast, expected);
+    }
+
+    #[test]
+    fn test_cell_on_page_size_fast_matches_cellref_interior_table() {
+        let mut page = vec![0u8; 4096];
+        let cell_offset = 2000;
+        page[cell_offset..cell_offset + 4].copy_from_slice(&7u32.to_be_bytes());
+        page[cell_offset + 4] = 100; // rowid
+
+        let cell =
+            CellRef::parse(&page, cell_offset, BtreePageType::InteriorTable, 4096).unwrap();
+        let expected = crate::payload::cell_on_page_size(&cell, cell_offset);
+        let fast =
+            cell_on_page_size_fast(&page, cell_offset, BtreePageType::InteriorTable, 4096)
+                .unwrap();
+        assert_eq!(fast, expected);
+        assert_eq!(fast, 4 + 1);
+    }
+
+    #[test]
+    fn test_cell_on_page_size_fast_matches_cellref_interior_index() {
+        let mut page = vec![0u8; 4096];
+        let cell_offset = 2500;
+        page[cell_offset..cell_offset + 4].copy_from_slice(&15u32.to_be_bytes());
+        page[cell_offset + 4] = 8; // payload_size
+        for i in 0..8 {
+            page[cell_offset + 5 + i] = (i + 20) as u8;
+        }
+
+        let cell =
+            CellRef::parse(&page, cell_offset, BtreePageType::InteriorIndex, 4096).unwrap();
+        let expected = crate::payload::cell_on_page_size(&cell, cell_offset);
+        let fast =
+            cell_on_page_size_fast(&page, cell_offset, BtreePageType::InteriorIndex, 4096)
+                .unwrap();
+        assert_eq!(fast, expected);
+        assert_eq!(fast, 4 + 1 + 8);
+    }
+
+    #[test]
+    fn test_cell_on_page_size_fast_matches_cellref_leaf_index() {
+        let mut page = vec![0u8; 4096];
+        let cell_offset = 3500;
+        page[cell_offset] = 5;
+        for i in 0..5 {
+            page[cell_offset + 1 + i] = (i + 10) as u8;
+        }
+        let cell =
+            CellRef::parse(&page, cell_offset, BtreePageType::LeafIndex, 4096).unwrap();
+        let expected = crate::payload::cell_on_page_size(&cell, cell_offset);
+        let fast =
+            cell_on_page_size_fast(&page, cell_offset, BtreePageType::LeafIndex, 4096).unwrap();
+        assert_eq!(fast, expected);
+        assert_eq!(fast, 1 + 5);
+    }
+
+    #[test]
+    fn test_cell_on_page_size_fast_rejects_out_of_bounds() {
+        let page = vec![0u8; 16];
+        let err = cell_on_page_size_fast(&page, 17, BtreePageType::LeafTable, 4096).unwrap_err();
+        assert!(matches!(err, FrankenError::DatabaseCorrupt { .. }));
+    }
+
+    #[test]
+    fn test_cell_on_page_size_fast_rejects_truncated_interior_child() {
+        let page = vec![0u8; 3]; // 3 bytes, can't hold 4-byte left_child.
+        let err =
+            cell_on_page_size_fast(&page, 0, BtreePageType::InteriorTable, 4096).unwrap_err();
+        assert!(matches!(err, FrankenError::DatabaseCorrupt { .. }));
+    }
+
+    #[test]
+    fn test_cell_on_page_size_fast_rejects_payload_past_page() {
+        let mut page = vec![0u8; 64];
+        let cell_offset = 60;
+        page[cell_offset] = 10;
+        page[cell_offset + 1] = 1;
+        // Leaf-table cell claims 10 bytes but only 2 bytes remain.
+        let err =
+            cell_on_page_size_fast(&page, cell_offset, BtreePageType::LeafTable, 64).unwrap_err();
+        assert!(matches!(err, FrankenError::DatabaseCorrupt { .. }));
     }
 
     // -- Various page sizes --

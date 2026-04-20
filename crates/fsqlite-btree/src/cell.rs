@@ -29,7 +29,6 @@ use fsqlite_types::limits::{
     BTREE_INTERIOR_HEADER_SIZE, BTREE_LEAF_HEADER_SIZE, CELL_POINTER_SIZE, DB_HEADER_SIZE,
 };
 use fsqlite_types::serial_type::read_varint;
-use tracing::debug;
 
 // ---------------------------------------------------------------------------
 // Page type
@@ -240,11 +239,35 @@ pub fn parse_page_header(page: &[u8], page_no: PageNumber) -> Result<BtreePageHe
 ///
 /// Returns a vector of byte offsets into the page where each cell starts.
 /// `header_offset` is 0 for most pages, 100 for page 1.
+///
+/// This allocates a fresh `Vec<u16>` on every call. Hot callers that parse
+/// the same page repeatedly (or that already own a `Vec<u16>` buffer) should
+/// prefer [`read_cell_pointers_into`], which reuses caller-provided storage.
 pub fn read_cell_pointers(
     page: &[u8],
     header: &BtreePageHeader,
     header_offset: usize,
 ) -> Result<Vec<u16>> {
+    let mut buf = Vec::new();
+    read_cell_pointers_into(page, header, header_offset, &mut buf)?;
+    Ok(buf)
+}
+
+/// Read the cell pointer array into a caller-owned buffer.
+///
+/// Clears `buf` and fills it with the cell pointer offsets for the given
+/// page header. The buffer's existing allocation is reused when possible
+/// (when `buf.capacity() >= cell_count`), eliminating an allocation on the
+/// cursor hot path.
+///
+/// This is the low-level primitive; [`read_cell_pointers`] is a thin
+/// convenience wrapper that allocates a fresh `Vec`.
+pub fn read_cell_pointers_into(
+    page: &[u8],
+    header: &BtreePageHeader,
+    header_offset: usize,
+    buf: &mut Vec<u16>,
+) -> Result<()> {
     let ptr_array_start = header_offset + header.page_type.header_size() as usize;
     let count = header.cell_count as usize;
     let ptr_array_end = ptr_array_start + count * CELL_POINTER_SIZE as usize;
@@ -267,13 +290,20 @@ pub fn read_cell_pointers(
         });
     }
 
-    let mut pointers = Vec::with_capacity(count);
-    for i in 0..count {
-        let off = ptr_array_start + i * CELL_POINTER_SIZE as usize;
-        let ptr = u16::from_be_bytes([page[off], page[off + 1]]);
-        pointers.push(ptr);
-    }
-    Ok(pointers)
+    buf.clear();
+    buf.reserve(count);
+
+    // Single bounds-checked slice + chunks_exact(2) lets LLVM eliminate the
+    // per-byte bounds checks and autovectorize the big-endian decode loop.
+    // Profiling (OPT-4) showed the previous explicit loop with page[off] /
+    // page[off + 1] was 7.84% self-time on the INSERT hot path.
+    let ptr_bytes = &page[ptr_array_start..ptr_array_end];
+    buf.extend(
+        ptr_bytes
+            .chunks_exact(CELL_POINTER_SIZE as usize)
+            .map(|c| u16::from_be_bytes([c[0], c[1]])),
+    );
+    Ok(())
 }
 
 /// Write the cell pointer array into a page.
@@ -420,12 +450,6 @@ impl CellRef {
                 })?;
             #[allow(clippy::cast_possible_wrap)]
             let rowid = rowid_raw as i64;
-            debug!(
-                cell_type = ?page_type,
-                payload_len = 0_u32,
-                overflow = false,
-                "decoded btree cell boundary"
-            );
             return Ok(Self {
                 left_child,
                 rowid: Some(rowid),
@@ -498,13 +522,6 @@ impl CellRef {
         } else {
             None
         };
-
-        debug!(
-            cell_type = ?page_type,
-            payload_len = payload_size,
-            overflow = overflow_page.is_some(),
-            "decoded btree cell boundary"
-        );
 
         Ok(Self {
             left_child,

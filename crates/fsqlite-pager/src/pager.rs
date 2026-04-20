@@ -23,7 +23,7 @@ use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_types::{
     BTreePageHeader, CommitSeq, DATABASE_HEADER_MAGIC, DATABASE_HEADER_SIZE, DatabaseHeader,
     DatabaseHeaderError, FRANKENSQLITE_SQLITE_VERSION_NUMBER, LockLevel, PageData, PageNumber,
-    PageSize,
+    PageNumberBuildHasher, PageSize,
 };
 use fsqlite_vfs::{Vfs, VfsFile};
 use smallvec::SmallVec;
@@ -32,6 +32,14 @@ use crate::journal::{JournalHeader, JournalPageRecord};
 use crate::page_buf::{PageBuf, PageBufPool};
 use crate::page_cache::{PageCacheMetricsSnapshot, PageCachePageSnapshot, ShardedPageCache};
 use crate::traits::{self, JournalMode, MvccPager, TransactionHandle, TransactionMode, WalBackend};
+
+/// Identity-hashed `HashMap<PageNumber, V>` used on the INSERT hot path.
+///
+/// Profile showed `RandomState::hash_one::<&PageNumber>` at ~1.0% self-time.
+/// `PageNumberBuildHasher` bypasses SipHash-1-3 — `PageNumber::Hash` already
+/// delegates to `write_u32`, so the identity hasher makes lookups a single
+/// shift+mask.
+type PagePageMap<V> = HashMap<PageNumber, V, PageNumberBuildHasher>;
 
 use fsqlite_wal::{
     ConsolidationPhase, FrameSubmission, GLOBAL_CONSOLIDATION_METRICS, GroupCommitConfig,
@@ -1802,13 +1810,13 @@ fn load_freelist_from_committed_state<F: VfsFile>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serialize_freelist_to_write_set<F: VfsFile>(
+fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     cx: &Cx,
     inner: &mut PagerInner<F>,
     cache: &ShardedPageCache,
     wal_backend: &SharedWalBackend,
     pool: &PageBufPool,
-    write_set: &mut HashMap<PageNumber, StagedPage>,
+    write_set: &mut HashMap<PageNumber, StagedPage, S>,
     write_pages_sorted: &mut Vec<PageNumber>,
     committed_db_size: u32,
     pending_freed_pages: &[PageNumber],
@@ -1902,13 +1910,13 @@ fn serialize_freelist_to_write_set<F: VfsFile>(
     Ok(())
 }
 
-fn ensure_page_one_in_write_set<F: VfsFile>(
+fn ensure_page_one_in_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     cx: &Cx,
     inner: &mut PagerInner<F>,
     cache: &ShardedPageCache,
     wal_backend: &SharedWalBackend,
     pool: &PageBufPool,
-    write_set: &mut HashMap<PageNumber, StagedPage>,
+    write_set: &mut HashMap<PageNumber, StagedPage, S>,
 ) -> Result<PageBuf> {
     if let Some(staged) = write_set.remove(&PageNumber::ONE) {
         return Ok(staged.into_buf(pool));
@@ -1933,8 +1941,8 @@ fn remove_page_sorted(pages: &mut Vec<PageNumber>, page_no: PageNumber) {
     }
 }
 
-fn insert_staged_page(
-    write_set: &mut HashMap<PageNumber, StagedPage>,
+fn insert_staged_page<S: std::hash::BuildHasher>(
+    write_set: &mut HashMap<PageNumber, StagedPage, S>,
     write_pages_sorted: &mut Vec<PageNumber>,
     page_no: PageNumber,
     staged: StagedPage,
@@ -1979,9 +1987,9 @@ struct WalCommitBatch<'a> {
 }
 
 #[cfg(test)]
-fn collect_wal_commit_batch<'a>(
+fn collect_wal_commit_batch<'a, S: std::hash::BuildHasher>(
     current_db_size: u32,
-    write_set: &'a HashMap<PageNumber, StagedPage>,
+    write_set: &'a HashMap<PageNumber, StagedPage, S>,
     write_pages_sorted: &[PageNumber],
 ) -> Result<Option<WalCommitBatch<'a>>> {
     if write_pages_sorted.is_empty() {
@@ -2027,9 +2035,9 @@ fn collect_wal_commit_batch<'a>(
 /// flusher to write all batched frames.
 ///
 /// Returns `(batch, new_db_size)` or `None` if there are no pages to commit.
-fn build_group_commit_batch(
+fn build_group_commit_batch<S: std::hash::BuildHasher>(
     current_db_size: u32,
-    write_set: &HashMap<PageNumber, StagedPage>,
+    write_set: &HashMap<PageNumber, StagedPage, S>,
     write_pages_sorted: &[PageNumber],
 ) -> Result<Option<(TransactionFrameBatch, u32)>> {
     if write_pages_sorted.is_empty() {
@@ -3289,11 +3297,11 @@ impl PublishedPagerState {
     }
 
     /// Publish commit: retain pages up to db_size, then bulk insert from write_set.
-    fn publish_commit(
+    fn publish_commit<S: std::hash::BuildHasher>(
         &self,
         cx: &Cx,
         update: PublishedPagerUpdate,
-        write_set: &HashMap<PageNumber, StagedPage>,
+        write_set: &HashMap<PageNumber, StagedPage, S>,
     ) {
         let _publish_guard = self
             .publish_lock
@@ -3401,11 +3409,11 @@ impl PublishedPagerState {
 
     /// Publish commit by draining staged pages when the caller no longer needs
     /// the write set after publication.
-    fn publish_commit_draining_write_set(
+    fn publish_commit_draining_write_set<S: std::hash::BuildHasher>(
         &self,
         cx: &Cx,
         update: PublishedPagerUpdate,
-        write_set: &mut HashMap<PageNumber, StagedPage>,
+        write_set: &mut HashMap<PageNumber, StagedPage, S>,
     ) {
         if write_set.len() == 1
             && let Some((&page_no, _)) = write_set.iter().next()
@@ -3998,7 +4006,7 @@ where
                 shared_connection_count: self.shared_connection_count.get().cloned(),
                 published_visible_commit_seq: Cell::new(published_snapshot.visible_commit_seq),
                 published_db_size: Cell::new(published_snapshot.db_size),
-                write_set: HashMap::new(),
+                write_set: PagePageMap::default(),
                 write_pages_sorted: Vec::new(),
                 freed_pages: Vec::new(),
                 allocated_from_freelist: Vec::new(),
@@ -4015,7 +4023,7 @@ where
                 page_lease: Vec::new(),
                 memory_db_bump_alloc,
                 rolled_back_pages: HashSet::new(),
-                txn_read_cache: RefCell::new(HashMap::new()),
+                txn_read_cache: RefCell::new(PagePageMap::default()),
                 retained_memory_overlay_dirty_pages: BTreeSet::new(),
                 scratch_arena: bumpalo::Bump::new(),
             });
@@ -4164,7 +4172,7 @@ where
             shared_connection_count: self.shared_connection_count.get().cloned(),
             published_visible_commit_seq: Cell::new(published_snapshot.visible_commit_seq),
             published_db_size: Cell::new(published_snapshot.db_size),
-            write_set: HashMap::new(),
+            write_set: PagePageMap::default(),
             write_pages_sorted: Vec::new(),
             freed_pages: Vec::new(),
             allocated_from_freelist: Vec::new(),
@@ -4181,7 +4189,7 @@ where
             page_lease: Vec::new(),
             memory_db_bump_alloc,
             rolled_back_pages: HashSet::new(),
-            txn_read_cache: RefCell::new(HashMap::new()),
+            txn_read_cache: RefCell::new(PagePageMap::default()),
             retained_memory_overlay_dirty_pages: BTreeSet::new(),
             scratch_arena: bumpalo::Bump::new(),
         })
@@ -5491,7 +5499,7 @@ pub struct SimpleTransaction<V: Vfs> {
     /// `Cell` so the snapshot can be refreshed during reads when concurrent
     /// writers commit new pages.
     published_db_size: Cell<u32>,
-    write_set: HashMap<PageNumber, StagedPage>,
+    write_set: PagePageMap<StagedPage>,
     write_pages_sorted: Vec<PageNumber>,
     freed_pages: Vec<PageNumber>,
     allocated_from_freelist: Vec<PageNumber>,
@@ -5529,7 +5537,7 @@ pub struct SimpleTransaction<V: Vfs> {
     /// ~80,000 inner.lock acquisitions at 16 threads (reduces to ~80).
     /// Only used in WAL mode where the published snapshot fast path is
     /// defeated by constant commit_seq advancement.
-    txn_read_cache: RefCell<HashMap<PageNumber, PageData>>,
+    txn_read_cache: RefCell<PagePageMap<PageData>>,
     /// Committed page images whose backing-store flush was intentionally
     /// deferred for the private `:memory:` retained-autocommit fast path.
     /// These pages stay authoritative in `txn_read_cache` until a real
@@ -6087,12 +6095,12 @@ where
 
     /// Commit using the rollback journal protocol.
     #[allow(clippy::too_many_lines)]
-    fn commit_journal(
+    fn commit_journal<S: std::hash::BuildHasher>(
         cx: &Cx,
         vfs: &Arc<V>,
         journal_path: &Path,
         inner: &mut PagerInner<V::File>,
-        write_set: &HashMap<PageNumber, StagedPage>,
+        write_set: &HashMap<PageNumber, StagedPage, S>,
         original_db_size: u32,
     ) -> Result<()> {
         if !write_set.is_empty() {
@@ -6187,10 +6195,10 @@ where
         Ok(())
     }
 
-    fn flush_write_set_to_db_file_batch(
+    fn flush_write_set_to_db_file_batch<S: std::hash::BuildHasher>(
         cx: &Cx,
         inner: &mut PagerInner<V::File>,
-        write_set: &HashMap<PageNumber, StagedPage>,
+        write_set: &HashMap<PageNumber, StagedPage, S>,
         write_pages_sorted: &[PageNumber],
     ) -> Result<()> {
         if write_pages_sorted.is_empty() {
@@ -6242,11 +6250,11 @@ where
     /// The CALLER drops their inner.lock() before calling this function, allowing
     /// other transactions to start their prepare phase while we wait/batch.
     #[allow(clippy::too_many_lines)]
-    fn commit_wal_group_commit(
+    fn commit_wal_group_commit<S: std::hash::BuildHasher>(
         cx: &Cx,
         wal_backend: &SharedWalBackend,
         inner_arc: &Arc<Mutex<PagerInner<V::File>>>,
-        write_set: &HashMap<PageNumber, StagedPage>,
+        write_set: &HashMap<PageNumber, StagedPage, S>,
         write_pages_sorted: &[PageNumber],
         conflict_pages: &[PageNumber],
         queue: &GroupCommitQueueRef,
@@ -8591,7 +8599,7 @@ where
                     StagedPage::from_page_data_for_pool(&self.pool, v.clone())?,
                 ))
             })
-            .collect::<Result<HashMap<_, _>>>()?;
+            .collect::<Result<PagePageMap<_>>>()?;
 
         // Track pages that were allocated after the savepoint so that get_page
         // can return zeros for them instead of BusySnapshot error.

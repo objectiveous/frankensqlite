@@ -4463,7 +4463,11 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         // Sort by ptr descending so we can shift right safely without overwriting unread data.
-        cells_to_move.sort_unstable_by_key(|k| std::cmp::Reverse(k.0));
+        // OPT-7 follow-up: reuse the size-dispatched helper used by
+        // `remove_cell_from_leaf`; the typical N here is also small (cells
+        // per interior page), so insertion sort wins on the fast path and
+        // falls through to std above the crossover.
+        sort_cells_desc_by_ptr(&mut cells_to_move);
 
         for (ptr, size, i) in cells_to_move {
             new_content_offset = new_content_offset.checked_sub(size).ok_or_else(|| {
@@ -4803,7 +4807,8 @@ impl<P: PageWriter> BtCursor<P> {
             let size = crate::payload::cell_on_page_size(&cell_ref, ptr);
             cells_to_move.push((ptr, size, i));
         }
-        cells_to_move.sort_unstable_by_key(|(ptr, ..)| std::cmp::Reverse(*ptr));
+        // OPT-7 follow-up: size-dispatched sort for typical small N here too.
+        sort_cells_desc_by_ptr(&mut cells_to_move);
 
         let mut new_content_offset = self.usable_size as usize;
         for (ptr, size, i) in cells_to_move {
@@ -5149,7 +5154,8 @@ impl<P: PageWriter> BtCursor<P> {
             let size = crate::payload::cell_on_page_size(&cell, ptr);
             cells_to_move.push((ptr, size, i));
         }
-        cells_to_move.sort_unstable_by_key(|(ptr, _, _)| std::cmp::Reverse(*ptr));
+        // OPT-7 follow-up: same size-dispatched sort as above.
+        sort_cells_desc_by_ptr(&mut cells_to_move);
 
         let mut new_content_offset = self.usable_size as usize;
         for (ptr, size, i) in cells_to_move {

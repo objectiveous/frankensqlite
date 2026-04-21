@@ -4032,6 +4032,7 @@ where
                 freed_pages: Vec::new(),
                 allocated_from_freelist: Vec::new(),
                 allocated_from_eof: Vec::new(),
+                writes_observed: false,
                 mode,
                 is_writer: eager_writer,
                 committed: false,
@@ -4223,6 +4224,7 @@ where
             freed_pages: Vec::new(),
             allocated_from_freelist: Vec::new(),
             allocated_from_eof: Vec::new(),
+            writes_observed: false,
             mode,
             is_writer: eager_writer,
             committed: false,
@@ -5550,6 +5552,16 @@ pub struct SimpleTransaction<V: Vfs> {
     freed_pages: Vec<PageNumber>,
     allocated_from_freelist: Vec<PageNumber>,
     allocated_from_eof: Vec<PageNumber>,
+    /// #70 BUG-A / ghost-commit guard: set true as soon as any write-staging
+    /// entry-point (`write_page`, `write_page_data`, `allocate_page`, or
+    /// savepoint-driven commit reshuffle) runs on this transaction. Cleared
+    /// only on explicit rollback. At commit entry we assert that writes_
+    /// observed + !has_pending_writes is never true, which would indicate a
+    /// silent state-loss path (the symptom behind the swarm ghost-commit
+    /// diagnostic: commit returns Ok but neither the INSERT nor the same-
+    /// txn progress UPDATE land on disk). Turns that class of bug into a
+    /// retryable error instead of silent data loss.
+    writes_observed: bool,
     mode: TransactionMode,
     is_writer: bool,
     committed: bool,
@@ -7510,6 +7522,9 @@ where
 
     fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
         self.ensure_writer(cx)?;
+        // #70 ghost-commit guard: record that a write was staged on this
+        // transaction. Checked at commit entry to detect silent state loss.
+        self.writes_observed = true;
 
         // If we are writing to a page that was previously freed in this transaction,
         // we must "un-free" it.
@@ -7542,6 +7557,8 @@ where
 
     fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
         self.ensure_writer(cx)?;
+        // #70 ghost-commit guard: see `write_page` for rationale.
+        self.writes_observed = true;
 
         if let Some(pos) = self.freed_pages.iter().position(|&p| p == page_no) {
             self.freed_pages.swap_remove(pos);
@@ -7764,6 +7781,21 @@ where
             self.materialize_retained_memory_overlay_into_write_set()?;
         }
         if !self.has_pending_writes() {
+            // #70 BUG-A ghost-commit guard: if writes were staged earlier on
+            // this transaction (write_page / write_page_data / allocate_page)
+            // but the write_set and freelist-dirty are BOTH empty now,
+            // something dropped the staged state without rolling the
+            // transaction back. Silently returning Ok here is what produced
+            // the swarm's "INSERT and same-txn UPDATE both atomically
+            // disappear, commit returns Ok" failure mode. Surface as a
+            // retryable Busy instead so retry_fsqlite can reissue the
+            // transaction rather than claiming success for lost writes.
+            if self.writes_observed {
+                return Err(FrankenError::internal(
+                    "transaction committed with observed writes but empty write_set; \
+                     state was dropped between staging and commit",
+                ));
+            }
             let mut inner = self
                 .inner
                 .lock()

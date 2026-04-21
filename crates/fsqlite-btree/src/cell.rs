@@ -1163,8 +1163,7 @@ mod tests {
             page[pos + i] = (i + 1) as u8;
         }
 
-        let cell =
-            CellRef::parse(&page, cell_offset, BtreePageType::LeafTable, 4096).unwrap();
+        let cell = CellRef::parse(&page, cell_offset, BtreePageType::LeafTable, 4096).unwrap();
         let expected = crate::payload::cell_on_page_size(&cell, cell_offset);
         let fast =
             cell_on_page_size_fast(&page, cell_offset, BtreePageType::LeafTable, 4096).unwrap();
@@ -1215,12 +1214,10 @@ mod tests {
         page[cell_offset..cell_offset + 4].copy_from_slice(&7u32.to_be_bytes());
         page[cell_offset + 4] = 100; // rowid
 
-        let cell =
-            CellRef::parse(&page, cell_offset, BtreePageType::InteriorTable, 4096).unwrap();
+        let cell = CellRef::parse(&page, cell_offset, BtreePageType::InteriorTable, 4096).unwrap();
         let expected = crate::payload::cell_on_page_size(&cell, cell_offset);
         let fast =
-            cell_on_page_size_fast(&page, cell_offset, BtreePageType::InteriorTable, 4096)
-                .unwrap();
+            cell_on_page_size_fast(&page, cell_offset, BtreePageType::InteriorTable, 4096).unwrap();
         assert_eq!(fast, expected);
         assert_eq!(fast, 4 + 1);
     }
@@ -1235,12 +1232,10 @@ mod tests {
             page[cell_offset + 5 + i] = (i + 20) as u8;
         }
 
-        let cell =
-            CellRef::parse(&page, cell_offset, BtreePageType::InteriorIndex, 4096).unwrap();
+        let cell = CellRef::parse(&page, cell_offset, BtreePageType::InteriorIndex, 4096).unwrap();
         let expected = crate::payload::cell_on_page_size(&cell, cell_offset);
         let fast =
-            cell_on_page_size_fast(&page, cell_offset, BtreePageType::InteriorIndex, 4096)
-                .unwrap();
+            cell_on_page_size_fast(&page, cell_offset, BtreePageType::InteriorIndex, 4096).unwrap();
         assert_eq!(fast, expected);
         assert_eq!(fast, 4 + 1 + 8);
     }
@@ -1253,8 +1248,7 @@ mod tests {
         for i in 0..5 {
             page[cell_offset + 1 + i] = (i + 10) as u8;
         }
-        let cell =
-            CellRef::parse(&page, cell_offset, BtreePageType::LeafIndex, 4096).unwrap();
+        let cell = CellRef::parse(&page, cell_offset, BtreePageType::LeafIndex, 4096).unwrap();
         let expected = crate::payload::cell_on_page_size(&cell, cell_offset);
         let fast =
             cell_on_page_size_fast(&page, cell_offset, BtreePageType::LeafIndex, 4096).unwrap();
@@ -1272,8 +1266,7 @@ mod tests {
     #[test]
     fn test_cell_on_page_size_fast_rejects_truncated_interior_child() {
         let page = vec![0u8; 3]; // 3 bytes, can't hold 4-byte left_child.
-        let err =
-            cell_on_page_size_fast(&page, 0, BtreePageType::InteriorTable, 4096).unwrap_err();
+        let err = cell_on_page_size_fast(&page, 0, BtreePageType::InteriorTable, 4096).unwrap_err();
         assert!(matches!(err, FrankenError::DatabaseCorrupt { .. }));
     }
 

@@ -804,13 +804,13 @@ fn count_progress_last_id(conn: &Connection, worker_id: usize) -> HarnessResult<
             &[SqliteValue::Integer(worker)],
         )
         .map_err(|err| format!("progress last_id query failed for worker={worker_id}: {err}"))?;
-    if rows.len() != 1 {
-        return Err(format!(
-            "progress last_id query for worker={worker_id} returned {} rows",
-            rows.len()
-        ));
+    match rows.len() {
+        0 => Ok(None),
+        1 => value_i64(&rows[0], 0).map(Some),
+        n => Err(format!(
+            "progress last_id query for worker={worker_id} returned {n} rows"
+        )),
     }
-    value_i64(&rows[0], 0).map(Some)
 }
 
 fn with_consistent_read_transaction<T, F>(

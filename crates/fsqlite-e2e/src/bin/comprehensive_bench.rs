@@ -1947,9 +1947,7 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                                 panic!("fsqlite BEGIN failed after retries: {e}");
                             }
                             let stmt = conn
-                                .prepare(
-                                    "INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7))",
-                                )
+                                .prepare("INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7))")
                                 .unwrap();
                             #[allow(clippy::cast_possible_wrap)]
                             for i in 0..CONCURRENT_ROWS_PER_THREAD as i64 {

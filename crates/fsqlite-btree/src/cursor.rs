@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// allocates a `HashMap<String, Arc<dyn CollationFunction>>`. Doing that
 /// inside `BtCursor::new` — fired for every INSERT/UPDATE/DELETE — showed
 /// up in the INSERT flamegraph at ~1.3% self-time (0.9% `HashMap::insert`
-/// + 0.39% `Arc::drop_slow`). Callers that need custom collations still
+/// and 0.39% `Arc::drop_slow`). Callers that need custom collations still
 /// override via `set_index_collation_context`; the overwhelming majority
 /// of cursor constructions (table cursors, all the direct-simple DML
 /// paths) never mutate the registry at all, so they can safely share this
@@ -168,7 +168,10 @@ fn sort_cells_desc_by_ptr(v: &mut [(usize, usize, usize)]) {
     } else {
         // sort_unstable_by avoids the Reverse<usize> wrapper allocation that
         // sort_unstable_by_key materialises on every comparison.
-        v.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        #[allow(clippy::unnecessary_sort_by)]
+        {
+            v.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        }
     }
 }
 
@@ -4186,6 +4189,7 @@ impl<P: PageWriter> BtCursor<P> {
     /// contract; this wrapper additionally stages the mutated page image
     /// through the pager.
     #[allow(dead_code)] // wired in follow-up commit; primitive landed ahead of caller
+    #[allow(clippy::too_many_arguments)]
     fn try_append_table_leaf_payload_in_place_no_overflow_with_writer<W>(
         &mut self,
         cx: &Cx,
@@ -5112,12 +5116,8 @@ impl<P: PageWriter> BtCursor<P> {
         // buffer before filling, so passing in our retained `defrag_ptrs_
         // scratch` preserves the max capacity seen across all prior deletes.
         let mut ptrs = std::mem::take(&mut self.defrag_ptrs_scratch);
-        let ptrs_read = cell::read_cell_pointers_into(
-            page_data.as_bytes(),
-            &header,
-            header_offset,
-            &mut ptrs,
-        );
+        let ptrs_read =
+            cell::read_cell_pointers_into(page_data.as_bytes(), &header, header_offset, &mut ptrs);
         let cell_operation_error = ptrs_read.err();
         if let Some(err) = cell_operation_error {
             self.defrag_ptrs_scratch = ptrs;
@@ -5830,10 +5830,9 @@ impl<P: PageWriter> BtCursor<P> {
         // leading varints (payload_size, rowid) which avoids parsing the
         // local payload bounds / overflow pointer validation on every
         // append.
-        let Some(actual_last_rowid) = cell::read_table_leaf_rowid_at_offset(
-            page_data.as_bytes(),
-            usize::from(last_ptr),
-        ) else {
+        let Some(actual_last_rowid) =
+            cell::read_table_leaf_rowid_at_offset(page_data.as_bytes(), usize::from(last_ptr))
+        else {
             self.clear_rightmost_leaf_cache();
             return Ok(None);
         };

@@ -1112,7 +1112,7 @@ mod tests {
         let row_sel: Vec<u16> = values
             .iter()
             .enumerate()
-            .filter(|&(_, v)| v.as_bytes() < b"delta")
+            .filter(|&(_, v)| v.as_bytes() < b"delta".as_slice())
             .map(|(i, _)| i as u16)
             .collect();
 

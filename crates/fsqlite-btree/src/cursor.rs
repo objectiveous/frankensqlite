@@ -713,6 +713,22 @@ pub struct BtCursor<P> {
     /// The Vec capacity is preserved across the take/put cycle so repeated
     /// inserts reuse the same allocation.
     cell_buf: Vec<u8>,
+    /// OPT-A4: reusable cell-pointer array for the DELETE defrag path.
+    ///
+    /// `remove_cell_from_leaf` re-reads the cell-pointer array after the
+    /// stack entry has been reshaped by cell removal. Using
+    /// `cell::read_cell_pointers_into` with this caller-owned buffer reuses
+    /// its allocation across repeated deletes instead of allocating a fresh
+    /// `Vec<u16>` every time. Take/put via `std::mem::take` so the same
+    /// capacity survives across the borrow boundary.
+    defrag_ptrs_scratch: Vec<u16>,
+    /// OPT-A4: reusable `(ptr, size, i)` triple array for defragmentation.
+    ///
+    /// Same take/put pattern as `defrag_ptrs_scratch`: sized to the number
+    /// of cells on the page being defragged, cleared before each use, and
+    /// repopulated from the live cell pointer array. Eliminates the per-
+    /// `remove_cell_from_leaf` allocation (N * 24 bytes for N cells).
+    defrag_cells_scratch: Vec<(usize, usize, usize)>,
     /// Last rowid successfully inserted via `table_insert`.
     ///
     /// Set on successful leaf insert or balance-for-insert.  Used by the VDBE
@@ -1207,6 +1223,8 @@ impl<P: PageReader> BtCursor<P> {
             read_witnesses: Vec::new(),
             active_op_stats: None,
             cell_buf: Vec::new(),
+            defrag_ptrs_scratch: Vec::new(),
+            defrag_cells_scratch: Vec::new(),
             last_insert_rowid: None,
             rightmost_leaf_cache: None,
             last_known_depth: None,
@@ -5089,16 +5107,34 @@ impl<P: PageWriter> BtCursor<P> {
         let mut page_data = self.pager.read_page_data(cx, leaf_page_no)?;
         let header_offset = cell::header_offset_for_page(leaf_page_no);
         let mut header = cell::parse_page_header(page_data.as_bytes(), leaf_page_no)?;
-        let mut ptrs = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
+        // OPT-A4: reuse the cursor-owned defrag scratch buffers so repeated
+        // DELETEs don't pay per-call `Vec::with_capacity` + allocator round-
+        // trips. `read_cell_pointers_into` clears + reserves its caller's
+        // buffer before filling, so passing in our retained `defrag_ptrs_
+        // scratch` preserves the max capacity seen across all prior deletes.
+        let mut ptrs = std::mem::take(&mut self.defrag_ptrs_scratch);
+        let ptrs_read = cell::read_cell_pointers_into(
+            page_data.as_bytes(),
+            &header,
+            header_offset,
+            &mut ptrs,
+        );
+        let cell_operation_error = ptrs_read.err();
+        if let Some(err) = cell_operation_error {
+            self.defrag_ptrs_scratch = ptrs;
+            return Err(err);
+        }
         if delete_idx >= ptrs.len() {
-            return Err(FrankenError::DatabaseCorrupt {
+            let err = FrankenError::DatabaseCorrupt {
                 detail: format!(
                     "delete_idx {} out of bounds for page {} with {} cells",
                     delete_idx,
                     leaf_page_no,
                     ptrs.len()
                 ),
-            });
+            };
+            self.defrag_ptrs_scratch = ptrs;
+            return Err(err);
         }
         ptrs.remove(delete_idx);
 
@@ -5107,43 +5143,68 @@ impl<P: PageWriter> BtCursor<P> {
         let ptr_array_end =
             header_offset + usize::from(header.page_type.header_size()) + ptrs.len() * 2;
 
-        let mut cells_to_move = Vec::with_capacity(ptrs.len());
+        // OPT-A4: reuse the cursor-owned cells-to-move scratch; clear keeps
+        // the backing allocation.
+        let mut cells_to_move = std::mem::take(&mut self.defrag_cells_scratch);
+        cells_to_move.clear();
+        cells_to_move.reserve(ptrs.len());
         for (i, &off) in ptrs.iter().enumerate() {
             let ptr = off as usize;
             // OPT-A3: defragmentation only needs the byte extent of each
             // cell, so compute size directly from its varints instead of
             // building a full CellRef.
-            let size = cell::cell_on_page_size_fast(
+            let size = match cell::cell_on_page_size_fast(
                 page_data.as_bytes(),
                 ptr,
                 header.page_type,
                 self.usable_size,
-            )?;
+            ) {
+                Ok(size) => size,
+                Err(err) => {
+                    self.defrag_ptrs_scratch = ptrs;
+                    self.defrag_cells_scratch = cells_to_move;
+                    return Err(err);
+                }
+            };
             cells_to_move.push((ptr, size, i));
         }
 
         // Sort by ptr descending so we can shift right safely without overwriting unread data.
         // N is typically 1..~80 (capped by cells-per-page); `sort_cells_desc_by_ptr`
         // uses a specialized insertion sort with an already-sorted fast path for small N
-        // and falls through to `sort_unstable_by_key` above the empirical crossover.
+        // and falls through to `sort_unstable_by` above the empirical crossover.
         sort_cells_desc_by_ptr(&mut cells_to_move);
 
         let mut new_content_offset = self.usable_size as usize;
-        for (ptr, size, i) in cells_to_move {
-            new_content_offset = new_content_offset.checked_sub(size).ok_or_else(|| {
-                FrankenError::DatabaseCorrupt {
-                    detail: "cell size overflow during defragmentation".to_owned(),
+        let mut defrag_err: Option<FrankenError> = None;
+        for &(ptr, size, i) in cells_to_move.iter() {
+            match new_content_offset.checked_sub(size) {
+                Some(candidate) if candidate >= ptr_array_end => {
+                    new_content_offset = candidate;
+                    page_data
+                        .as_bytes_mut()
+                        .copy_within(ptr..ptr + size, new_content_offset);
+                    ptrs[i] = new_content_offset as u16;
                 }
-            })?;
-            if new_content_offset < ptr_array_end {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: "cell content overlaps pointer array during defragmentation".to_owned(),
-                });
+                Some(_) => {
+                    defrag_err = Some(FrankenError::DatabaseCorrupt {
+                        detail: "cell content overlaps pointer array during defragmentation"
+                            .to_owned(),
+                    });
+                    break;
+                }
+                None => {
+                    defrag_err = Some(FrankenError::DatabaseCorrupt {
+                        detail: "cell size overflow during defragmentation".to_owned(),
+                    });
+                    break;
+                }
             }
-            page_data
-                .as_bytes_mut()
-                .copy_within(ptr..ptr + size, new_content_offset);
-            ptrs[i] = new_content_offset as u16;
+        }
+        if let Some(err) = defrag_err {
+            self.defrag_ptrs_scratch = ptrs;
+            self.defrag_cells_scratch = cells_to_move;
+            return Err(err);
         }
 
         // Fill the now-unused space with zeros for cleanliness (optional, but good for reproducibility/debugging).
@@ -5164,7 +5225,10 @@ impl<P: PageWriter> BtCursor<P> {
             header.write(page_bytes, header_offset);
             cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
         }
-        self.pager.write_page_data(cx, leaf_page_no, page_data)?;
+        let write_result = self.pager.write_page_data(cx, leaf_page_no, page_data);
+        self.defrag_ptrs_scratch = ptrs;
+        self.defrag_cells_scratch = cells_to_move;
+        write_result?;
 
         // Refresh the stack entry.
         let mut refreshed = self.reload_page_fresh(cx, leaf_page_no)?;

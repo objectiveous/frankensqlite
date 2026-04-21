@@ -4665,9 +4665,11 @@ impl<P: PageWriter> BtCursor<P> {
                     detail: "cell content overlaps pointer array during defragmentation".to_owned(),
                 });
             }
-            page_data
-                .as_bytes_mut()
-                .copy_within(ptr..ptr + size, new_content_offset);
+            if new_content_offset != ptr {
+                page_data
+                    .as_bytes_mut()
+                    .copy_within(ptr..ptr + size, new_content_offset);
+            }
             ptrs[i] = new_content_offset as u16;
         }
 
@@ -5011,7 +5013,9 @@ impl<P: PageWriter> BtCursor<P> {
                             .to_owned(),
                     });
                 }
-                page_bytes.copy_within(ptr..ptr + size, new_content_offset);
+                if new_content_offset != ptr {
+                    page_bytes.copy_within(ptr..ptr + size, new_content_offset);
+                }
                 ptrs[i] = u16::try_from(new_content_offset).map_err(|_| {
                     FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -5182,7 +5186,9 @@ impl<P: PageWriter> BtCursor<P> {
                 match new_content_offset.checked_sub(size) {
                     Some(candidate) if candidate >= ptr_array_end => {
                         new_content_offset = candidate;
-                        page_bytes.copy_within(ptr..ptr + size, new_content_offset);
+                        if new_content_offset != ptr {
+                            page_bytes.copy_within(ptr..ptr + size, new_content_offset);
+                        }
                         ptrs[i] = new_content_offset as u16;
                     }
                     Some(_) => {
@@ -5394,9 +5400,11 @@ impl<P: PageWriter> BtCursor<P> {
                     detail: "separator repair would overlap the pointer array".to_owned(),
                 });
             }
-            page_data
-                .as_bytes_mut()
-                .copy_within(ptr..ptr + size, new_content_offset);
+            if new_content_offset != ptr {
+                page_data
+                    .as_bytes_mut()
+                    .copy_within(ptr..ptr + size, new_content_offset);
+            }
             ptrs[i] =
                 u16::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
                     detail: "separator repair cell offset exceeds u16 range".to_owned(),

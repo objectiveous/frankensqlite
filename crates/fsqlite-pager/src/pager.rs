@@ -15367,6 +15367,286 @@ mod tests {
         );
     }
 
+    /// Stress test for the in-process Waiter path of group commit.
+    ///
+    /// The cross-process `swarm_multiprocess` binary mostly exercises the
+    /// Flusher path because each process has its own `GroupCommitQueue`
+    /// (the consolidator is process-local). This test drives many threads
+    /// through a single shared `GroupCommitQueue` under contention so the
+    /// merge/flush path is hit with batches of varying sizes and concurrent
+    /// Waiter wakes. It would have failed prior to `04812db3` because a
+    /// merged batch with N input commits would leave N byte-level commit
+    /// markers — the invariant below is "at most one commit marker per
+    /// flushed prepared batch" at both meta and byte levels.
+    #[test]
+    fn test_concurrent_commits_in_process_waiter_path_no_ghost_commits_stress() {
+        type BatchMarkerCounts = StdArc<StdMutex<Vec<(usize, usize, usize)>>>;
+
+        struct WaiterStressBackend {
+            // Per-call tuples: (meta_commits, byte_commits, frame_count).
+            per_batch: BatchMarkerCounts,
+            total_frames: SharedCounter,
+            append_prepared_calls: SharedCounter,
+        }
+
+        impl crate::traits::WalBackend for WaiterStressBackend {
+            fn append_frame(
+                &mut self,
+                _cx: &Cx,
+                _page_number: u32,
+                _page_data: &[u8],
+                _db_size_if_commit: u32,
+            ) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn append_frames(
+                &mut self,
+                _cx: &Cx,
+                frames: &[crate::traits::WalFrameRef<'_>],
+            ) -> fsqlite_error::Result<()> {
+                // Non-prepared fallback path: count meta-only (no frame bytes to inspect).
+                let meta_commits = frames
+                    .iter()
+                    .filter(|f| f.db_size_if_commit != 0)
+                    .count();
+                self.per_batch
+                    .lock()
+                    .unwrap()
+                    .push((meta_commits, meta_commits, frames.len()));
+                *self.total_frames.lock().unwrap() += frames.len();
+                Ok(())
+            }
+
+            fn prepare_append_frames(
+                &self,
+                frames: &[crate::traits::WalFrameRef<'_>],
+            ) -> fsqlite_error::Result<Option<crate::traits::PreparedWalFrameBatch>> {
+                if frames.is_empty() {
+                    return Ok(None);
+                }
+                let frame_size =
+                    fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE + frames[0].page_data.len();
+                let mut frame_bytes = Vec::with_capacity(frame_size * frames.len());
+                let mut frame_metas = Vec::with_capacity(frames.len());
+                let mut checksum_transforms = Vec::with_capacity(frames.len());
+                let mut last_commit: Option<usize> = None;
+                for (i, frame) in frames.iter().enumerate() {
+                    frame_metas.push(crate::traits::PreparedWalFrameMeta {
+                        page_number: frame.page_number,
+                        db_size_if_commit: frame.db_size_if_commit,
+                    });
+                    checksum_transforms.push(crate::traits::PreparedWalChecksumTransform {
+                        a11: 0,
+                        a12: 0,
+                        a21: 0,
+                        a22: 0,
+                        c1: 0,
+                        c2: 0,
+                    });
+                    let mut header = [0_u8; fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE];
+                    header[0..4].copy_from_slice(&frame.page_number.to_be_bytes());
+                    header[4..8].copy_from_slice(&frame.db_size_if_commit.to_be_bytes());
+                    frame_bytes.extend_from_slice(&header);
+                    frame_bytes.extend_from_slice(frame.page_data);
+                    if frame.db_size_if_commit != 0 {
+                        last_commit = Some(i);
+                    }
+                }
+                Ok(Some(crate::traits::PreparedWalFrameBatch {
+                    frame_size,
+                    page_data_offset: fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE,
+                    big_endian_checksum: false,
+                    frame_metas,
+                    checksum_transforms,
+                    frame_bytes,
+                    last_commit_frame_offset: last_commit,
+                    finalized_for: None,
+                    finalized_running_checksum: None,
+                }))
+            }
+
+            fn append_prepared_frames(
+                &mut self,
+                _cx: &Cx,
+                prepared: &mut crate::traits::PreparedWalFrameBatch,
+            ) -> fsqlite_error::Result<()> {
+                *self.append_prepared_calls.lock().unwrap() += 1;
+                let meta_commits = prepared
+                    .frame_metas
+                    .iter()
+                    .filter(|meta| meta.db_size_if_commit != 0)
+                    .count();
+                let mut byte_commits = 0_usize;
+                for i in 0..prepared.frame_count() {
+                    let slice = prepared.frame_slice(i);
+                    let byte_db_size =
+                        u32::from_be_bytes([slice[4], slice[5], slice[6], slice[7]]);
+                    if byte_db_size != 0 {
+                        byte_commits += 1;
+                    }
+                }
+                self.per_batch
+                    .lock()
+                    .unwrap()
+                    .push((meta_commits, byte_commits, prepared.frame_count()));
+                *self.total_frames.lock().unwrap() += prepared.frame_count();
+                Ok(())
+            }
+
+            fn read_page(
+                &mut self,
+                _cx: &Cx,
+                _page_number: u32,
+            ) -> fsqlite_error::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+
+            fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn frame_count(&self) -> usize {
+                *self.total_frames.lock().unwrap()
+            }
+
+            fn checkpoint(
+                &mut self,
+                _cx: &Cx,
+                mode: crate::traits::CheckpointMode,
+                _writer: &mut dyn crate::traits::CheckpointPageWriter,
+                _backfilled_frames: u32,
+                _oldest_reader_frame: Option<u32>,
+            ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
+                Ok(crate::traits::CheckpointResult {
+                    total_frames: 0,
+                    frames_backfilled: 0,
+                    completed: true,
+                    wal_was_reset: false,
+                    requested_mode: mode,
+                    effective_mode: mode,
+                })
+            }
+        }
+
+        let _guard = PARALLEL_WAL_LANE_TEST_LOCK.lock().unwrap();
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/waiter_path_stress.db");
+        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+
+        let per_batch: BatchMarkerCounts = StdArc::new(StdMutex::new(Vec::new()));
+        let total_frames: SharedCounter = StdArc::new(StdMutex::new(0));
+        let append_prepared_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+        let backend = WaiterStressBackend {
+            per_batch: StdArc::clone(&per_batch),
+            total_frames: StdArc::clone(&total_frames),
+            append_prepared_calls: StdArc::clone(&append_prepared_calls),
+        };
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        let inner = Arc::clone(&pager.inner);
+        let wal_backend = Arc::clone(&pager.wal_backend);
+        let queue = Arc::new(GroupCommitQueue::with_parallel_wal_control(
+            GroupCommitConfig::default(),
+            ParallelWalControlSurface::default(),
+        ));
+        let pool = pager.pool.clone();
+
+        const WORKERS: u32 = 8;
+        const ITERS: u32 = 50;
+        let start = StdArc::new(std::sync::Barrier::new(WORKERS as usize));
+        let mut handles = Vec::with_capacity(WORKERS as usize);
+
+        for worker_id in 0..WORKERS {
+            let inner = Arc::clone(&inner);
+            let wal_backend = Arc::clone(&wal_backend);
+            let queue = Arc::clone(&queue);
+            let pool = pool.clone();
+            let start = StdArc::clone(&start);
+            let handle = std::thread::spawn(move || {
+                let cx = Cx::new();
+                start.wait();
+                for iter in 0..ITERS {
+                    // Each (worker, iter) owns two disjoint page numbers so
+                    // concurrent batches never conflict on pages.
+                    let page_base = 2 + worker_id * ITERS * 2 + iter * 2;
+                    let page_a = PageNumber::new(page_base).unwrap();
+                    let page_b = PageNumber::new(page_base + 1).unwrap();
+                    let fill_a = u8::try_from((worker_id * 31 + iter) & 0xff).unwrap();
+                    let fill_b = u8::try_from((worker_id * 47 + iter) & 0xff).unwrap();
+                    let mut write_set = HashMap::new();
+                    write_set.insert(
+                        page_a,
+                        StagedPage::from_bytes(&pool, &sample_page(fill_a)).unwrap(),
+                    );
+                    write_set.insert(
+                        page_b,
+                        StagedPage::from_bytes(&pool, &sample_page(fill_b)).unwrap(),
+                    );
+                    SimpleTransaction::<MemoryVfs>::commit_wal_group_commit(
+                        &cx,
+                        &wal_backend,
+                        &inner,
+                        &write_set,
+                        &[page_a, page_b],
+                        &[],
+                        &queue,
+                    )
+                    .expect("commit_wal_group_commit succeeded under contention");
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("worker thread joined cleanly");
+        }
+
+        let per_batch = per_batch.lock().unwrap().clone();
+        // Per-batch invariants: at most one commit marker in meta AND bytes,
+        // and meta/bytes must agree. A regression that re-introduces the
+        // pre-04812db3 ghost-commit behavior would leave intermediate
+        // commit markers in `frame_bytes` and fail the byte-level check.
+        //
+        // Total marker count may be *less* than submitted txns when batches
+        // merge (which is precisely the Waiter-path coverage this test adds);
+        // we assert `merged_batches >= 1` so the merge path actually fires.
+        let mut merged_batches = 0_usize;
+        for (i, (meta_commits, byte_commits, n)) in per_batch.iter().enumerate() {
+            assert!(
+                *meta_commits <= 1,
+                "bead_id=bd-3wop3.8 case=waiter_stress_batch_{i}_meta_commits_exceed_one meta={meta_commits} frames={n}"
+            );
+            assert!(
+                *byte_commits <= 1,
+                "bead_id=bd-3wop3.8 case=waiter_stress_batch_{i}_byte_commits_exceed_one byte={byte_commits} frames={n}"
+            );
+            assert_eq!(
+                meta_commits, byte_commits,
+                "bead_id=bd-3wop3.8 case=waiter_stress_batch_{i}_meta_byte_disagree meta={meta_commits} byte={byte_commits} frames={n}"
+            );
+            // A batch that contains >2 frames (more than one txn's contribution
+            // of 2 pages) is evidence that merge happened on this call.
+            if *n > 2 {
+                merged_batches += 1;
+            }
+        }
+        assert!(
+            merged_batches >= 1,
+            "bead_id=bd-3wop3.8 case=waiter_stress_no_merge_observed_test_did_not_exercise_waiter_path per_batch_len={} batches={:?}",
+            per_batch.len(),
+            per_batch
+        );
+        let expected_frames = (WORKERS * ITERS * 2) as usize;
+        assert_eq!(
+            *total_frames.lock().unwrap(),
+            expected_frames,
+            "bead_id=bd-3wop3.8 case=waiter_stress_total_frames_equals_submitted"
+        );
+    }
+
     #[test]
     fn test_group_commit_overlap_abort_discards_stale_prepared_batches() {
         let queue = GroupCommitQueue::with_parallel_wal_control(

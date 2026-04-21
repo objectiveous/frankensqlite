@@ -688,6 +688,12 @@ struct GroupCommitQueue {
     /// Failure outcomes by epoch. Kept so late-scheduled waiters cannot miss
     /// a failed flush after a newer epoch completes successfully.
     failed_epochs: Mutex<HashMap<u64, GroupCommitEpochFailure>>,
+    /// Trace-only persisted membership by completed epoch.
+    ///
+    /// This stays empty unless `FSQLITE_TRACE_GROUP_COMMIT=1` is set. The
+    /// waiter path uses it to prove that an epoch wake actually includes the
+    /// waiter's batch before treating the commit as durable.
+    persisted_epochs: Mutex<HashMap<u64, PersistedGroupCommitEpoch>>,
     /// Narrow per-target-epoch wake slots for waiter coordination.
     epoch_waiters: KeyedWaitRegistry,
     /// Monotonic control-decision epoch for service-policy traces.
@@ -699,6 +705,32 @@ struct GroupCommitQueue {
 }
 
 type LaneStagedPreparedBatch = ParallelWalLaneBatch<traits::PreparedWalFrameBatch>;
+
+static GROUP_COMMIT_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+static GROUP_COMMIT_TRACE_FSYNC_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn group_commit_trace_enabled() -> bool {
+    *GROUP_COMMIT_TRACE_ENABLED.get_or_init(|| {
+        std::env::var_os("FSQLITE_TRACE_GROUP_COMMIT").is_some_and(|value| {
+            let value = value.to_string_lossy();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        })
+    })
+}
+
+fn trace_group_commit(args: std::fmt::Arguments<'_>) {
+    if group_commit_trace_enabled() {
+        eprintln!("[fsqlite_group_commit] {args}");
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PersistedGroupCommitEpoch {
+    members: HashSet<u64>,
+    frames_start: u64,
+    frames_end: u64,
+    fsync_seq: u64,
+}
 
 #[derive(Debug)]
 enum WaitForEpochOutcome {
@@ -784,6 +816,7 @@ impl GroupCommitQueue {
             flush_complete: Condvar::new(),
             completed_epoch: AtomicU64::new(0),
             failed_epochs: Mutex::new(HashMap::new()),
+            persisted_epochs: Mutex::new(HashMap::new()),
             epoch_waiters: KeyedWaitRegistry::new(),
             commit_service_control_epoch: AtomicU64::new(0),
             commit_service_mode: AtomicU8::new(CommitServiceMode::Balanced.as_u8()),
@@ -843,6 +876,55 @@ impl GroupCommitQueue {
             .map(|batch| batch.context)
             .collect::<Vec<_>>();
         self.parallel_wal_lanes.discard_batches_for_flush(&contexts)
+    }
+
+    fn record_persisted_epoch(
+        &self,
+        epoch: u64,
+        batches: &[TransactionFrameBatch],
+        frames_start: u64,
+        frames_end: u64,
+        fsync_seq: u64,
+    ) {
+        if !group_commit_trace_enabled() {
+            return;
+        }
+
+        let members = batches
+            .iter()
+            .map(|batch| batch.context.batch_id)
+            .collect::<HashSet<_>>();
+        let mut members_display = members.iter().copied().collect::<Vec<_>>();
+        members_display.sort_unstable();
+        let members_display = members_display
+            .into_iter()
+            .map(|member| member.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let record = PersistedGroupCommitEpoch {
+            members,
+            frames_start,
+            frames_end,
+            fsync_seq,
+        };
+        self.persisted_epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(epoch, record);
+        trace_group_commit(format_args!(
+            "batch epoch={epoch} members=[{members_display}] frames_written_range={frames_start}..={frames_end} fsync_seq={fsync_seq}"
+        ));
+    }
+
+    fn persisted_epoch_for(&self, epoch: u64) -> Option<PersistedGroupCommitEpoch> {
+        if !group_commit_trace_enabled() {
+            return None;
+        }
+        self.persisted_epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&epoch)
+            .cloned()
     }
 
     /// Publish a completed epoch and wake all waiters.
@@ -2325,6 +2407,9 @@ fn merge_prepared_group_commit_batches(
         merged.frame_bytes.extend_from_slice(&prepared.frame_bytes);
     }
 
+    for frame_index in 0..merged.frame_count() {
+        merged.set_db_size_if_commit(frame_index, 0);
+    }
     if saw_commit {
         let last_frame_index = merged.frame_metas.len().saturating_sub(1);
         merged.last_commit_frame_offset = Some(last_frame_index);
@@ -3306,8 +3391,7 @@ impl PublishedPagerState {
         // is the only publisher permitted to shrink the authoritative db_size:
         // the checkpoint lock guarantees no concurrent writer will clobber
         // this store with a stale larger value.
-        self.db_size
-            .store(update.db_size, AtomicOrdering::Release);
+        self.db_size.store(update.db_size, AtomicOrdering::Release);
     }
 
     /// Publish commit: retain pages up to db_size, then bulk insert from write_set.
@@ -4132,11 +4216,16 @@ where
         }
 
         let published_snapshot = self.published.snapshot();
-        let publication_lagged = published_snapshot.visible_commit_seq < inner.commit_seq
-            || published_snapshot.db_size < inner.db_size
-            || published_snapshot.journal_mode != inner.journal_mode
-            || published_snapshot.freelist_count != inner.freelist.len()
-            || published_snapshot.checkpoint_active != inner.checkpoint_active;
+        let commit_seq_lagged = published_snapshot.visible_commit_seq < inner.commit_seq;
+        let db_size_lagged = published_snapshot.db_size < inner.db_size;
+        let journal_mode_lagged = published_snapshot.journal_mode != inner.journal_mode;
+        let freelist_lagged = published_snapshot.freelist_count != inner.freelist.len();
+        let checkpoint_lagged = published_snapshot.checkpoint_active != inner.checkpoint_active;
+        let publication_lagged = commit_seq_lagged
+            || db_size_lagged
+            || journal_mode_lagged
+            || freelist_lagged
+            || checkpoint_lagged;
         if publication_lagged {
             let publication_update = PublishedPagerUpdate {
                 visible_commit_seq: std::cmp::max(
@@ -6456,6 +6545,8 @@ where
 
         let t_prepare_done = Instant::now();
         let prepare_us = t_prepare_done.duration_since(t_start).as_micros() as u64;
+        let waiter_id = batch.context.batch_id;
+        let waiter_frames_contributed = batch.frames.len();
 
         // Step 2: Submit batch to consolidator, get Flusher or Waiter role.
         // If phase is FLUSHING, wait for current flush to complete before submitting.
@@ -6482,6 +6573,10 @@ where
             let outcome = consolidator.submit_batch(batch)?;
             (outcome, epoch, lock_wait_us, flushing_wait)
         };
+        let target_epoch = our_epoch.saturating_add(1);
+        trace_group_commit(format_args!(
+            "waiter waiter_id={waiter_id} role={outcome:?} epoch_at_queue={our_epoch} target_epoch={target_epoch} frames_i_contributed={waiter_frames_contributed}"
+        ));
 
         let run_flusher_loop = |mut record_initial_metrics: bool,
                                 mut needs_arrival_wait: bool,
@@ -6795,6 +6890,9 @@ where
                 let mut exclusive_lock_us: u64 = 0;
                 let mut wal_append_us: u64 = 0;
                 let mut wal_sync_us: u64 = 0;
+                let mut frames_written_start: u64 = 0;
+                let mut frames_written_end: u64 = 0;
+                let mut fsync_seq: u64 = 0;
 
                 for attempt in 0..MAX_FLUSH_RETRIES {
                     let t_inner_lock_start = Instant::now();
@@ -6830,6 +6928,9 @@ where
                         let t_append_start = Instant::now();
                         let flush_io_result = (|| -> Result<()> {
                             with_wal_backend(wal_backend, |wal| {
+                                frames_written_start = u64::try_from(wal.frame_count())
+                                    .unwrap_or(u64::MAX)
+                                    .saturating_add(1);
                                 let stale_conflict_pages =
                                     conflicting_pages_since_batch_snapshots(cx, wal, &batches)?;
                                 if !stale_conflict_pages.is_empty() {
@@ -6842,10 +6943,13 @@ where
                                     });
                                 }
                                 if let Some(prepared) = prepared_batch.as_mut() {
-                                    wal.append_prepared_frames(cx, prepared)
+                                    wal.append_prepared_frames(cx, prepared)?;
                                 } else {
-                                    wal.append_frames(cx, &frame_refs)
+                                    wal.append_frames(cx, &frame_refs)?;
                                 }
+                                frames_written_end =
+                                    u64::try_from(wal.frame_count()).unwrap_or(u64::MAX);
+                                Ok(())
                             })?;
                             wal_append_us =
                                 Instant::now().duration_since(t_append_start).as_micros() as u64;
@@ -6855,6 +6959,9 @@ where
                                 with_wal_backend(wal_backend, |wal| wal.sync(cx))?;
                                 wal_sync_us =
                                     Instant::now().duration_since(t_sync_start).as_micros() as u64;
+                                fsync_seq = GROUP_COMMIT_TRACE_FSYNC_SEQ
+                                    .fetch_add(1, AtomicOrdering::Relaxed)
+                                    .saturating_add(1);
                                 GLOBAL_CONSOLIDATION_METRICS
                                     .fsyncs_total
                                     .fetch_add(1, AtomicOrdering::Relaxed);
@@ -7035,6 +7142,13 @@ where
                                 "flushed lane-local WAL staging candidate"
                             );
                         }
+                        queue.record_persisted_epoch(
+                            flush_epoch,
+                            &batches,
+                            frames_written_start,
+                            frames_written_end,
+                            fsync_seq,
+                        );
 
                         let (completed_epoch, has_promoted) = {
                             let mut consolidator = queue
@@ -7125,8 +7239,6 @@ where
                 // - Call complete_flush() which sets completed_epoch = N+1
                 //
                 // So we wait for completed_epoch >= N+1.
-                let target_epoch = our_epoch + 1;
-
                 let t_waiter_start = Instant::now();
                 let guard = queue
                     .consolidator
@@ -7138,6 +7250,25 @@ where
 
                 match wait_outcome {
                     WaitForEpochOutcome::Completed => {
+                        if group_commit_trace_enabled() {
+                            let completed_epoch =
+                                queue.completed_epoch.load(AtomicOrdering::Acquire);
+                            let persisted = queue.persisted_epoch_for(target_epoch);
+                            let persisted_contains_waiter = persisted
+                                .as_ref()
+                                .is_some_and(|record| record.members.contains(&waiter_id));
+                            let (frames_start, frames_end, fsync_seq) =
+                                persisted.as_ref().map_or((0, 0, 0), |record| {
+                                    (record.frames_start, record.frames_end, record.fsync_seq)
+                                });
+                            trace_group_commit(format_args!(
+                                "waiter_wake waiter_id={waiter_id} epoch_at_queue={our_epoch} target_epoch={target_epoch} completed_epoch_when_woken={completed_epoch} frames_i_contributed={waiter_frames_contributed} persisted_contains_waiter={persisted_contains_waiter} frames_written_range={frames_start}..={frames_end} fsync_seq={fsync_seq}"
+                            ));
+                            assert!(
+                                target_epoch <= completed_epoch && persisted_contains_waiter,
+                                "group commit waiter {waiter_id} woke for completed_epoch={completed_epoch}, target_epoch={target_epoch}, epoch_at_queue={our_epoch}, but its frames were not recorded in the persisted epoch"
+                            );
+                        }
                         // Record phase timing for waiter
                         GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
                             prepare_us,
@@ -15185,6 +15316,54 @@ mod tests {
             queue.current_lane_backlog(0),
             0,
             "bead_id=bd-3wop3.1.2 case=raw_fallback_discard_clears_stale_lane_backlog"
+        );
+    }
+
+    #[test]
+    fn test_parallel_wal_prepared_merge_clears_intermediate_commit_headers() {
+        let page_a = sample_page(0xC3);
+        let page_b = sample_page(0xD4);
+        let frame_refs_a = [crate::traits::WalFrameRef {
+            page_number: 2,
+            page_data: &page_a,
+            db_size_if_commit: 2,
+        }];
+        let frame_refs_b = [crate::traits::WalFrameRef {
+            page_number: 3,
+            page_data: &page_b,
+            db_size_if_commit: 3,
+        }];
+        let staged = vec![
+            lane_staged_batch_for_test(10, 0, &frame_refs_a),
+            lane_staged_batch_for_test(11, 1, &frame_refs_b),
+        ];
+
+        let merged = merge_prepared_group_commit_batches(&staged, 3).unwrap();
+        let db_size_headers = (0..merged.frame_count())
+            .map(|index| {
+                let frame = merged.frame_slice(index);
+                u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]])
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            merged
+                .frame_metas
+                .iter()
+                .map(|meta| meta.db_size_if_commit)
+                .collect::<Vec<_>>(),
+            vec![0, 3],
+            "bead_id=bd-3wop3.8 case=prepared_merge_metadata_has_single_group_commit_marker"
+        );
+        assert_eq!(
+            db_size_headers,
+            vec![0, 3],
+            "bead_id=bd-3wop3.8 case=prepared_merge_bytes_clear_hidden_intermediate_commit_marker"
+        );
+        assert_eq!(
+            merged.last_commit_frame_offset,
+            Some(1),
+            "bead_id=bd-3wop3.8 case=prepared_merge_last_commit_points_to_group_tail"
         );
     }
 

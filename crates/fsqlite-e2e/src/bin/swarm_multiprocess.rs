@@ -11,6 +11,7 @@ use std::fs::{self, File};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output, Stdio};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -31,13 +32,24 @@ const HOT_ROW_BASE: i64 = -1_000_000;
 const START_DELAY_MS: u64 = 1_500;
 const PARENT_TIMEOUT_GRACE_MS: u64 = 20_000;
 const MAX_WORKERS: usize = 1_024;
+static GROUP_COMMIT_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 
 type HarnessResult<T> = Result<T, String>;
+
+fn group_commit_trace_enabled() -> bool {
+    *GROUP_COMMIT_TRACE_ENABLED.get_or_init(|| {
+        env::var_os("FSQLITE_TRACE_GROUP_COMMIT").is_some_and(|value| {
+            let value = value.to_string_lossy();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        })
+    })
+}
 
 #[derive(Debug, Clone)]
 struct RunConfig {
     workers: usize,
     seconds: u64,
+    iters: Option<u64>,
     busy_timeout_ms: u64,
     seed: u64,
     db_path: Option<PathBuf>,
@@ -50,6 +62,7 @@ impl Default for RunConfig {
         Self {
             workers: DEFAULT_WORKERS,
             seconds: DEFAULT_SECONDS,
+            iters: None,
             busy_timeout_ms: DEFAULT_BUSY_TIMEOUT_MS,
             seed: DEFAULT_SEED,
             db_path: None,
@@ -85,6 +98,7 @@ enum Mode {
 struct ReportConfig {
     workers: usize,
     seconds: u64,
+    iters: Option<u64>,
     busy_timeout_ms: u64,
     seed: u64,
     db_path: String,
@@ -323,6 +337,7 @@ fn run_parent(config: RunConfig) -> HarnessResult<bool> {
         config: ReportConfig {
             workers: config.workers,
             seconds: config.seconds,
+            iters: config.iters,
             busy_timeout_ms: config.busy_timeout_ms,
             seed: config.seed,
             db_path: db_path.to_string_lossy().into_owned(),
@@ -419,7 +434,8 @@ fn run_child_workload(
     };
     let deadline = Instant::now() + Duration::from_secs(config.seconds);
 
-    while Instant::now() < deadline {
+    while config.iters.is_none_or(|limit| counters.iterations < limit) && Instant::now() < deadline
+    {
         let committed =
             commit_mixed_transaction(&conn, config, child, &mut state, counters, &mut rng)?;
         counters.iterations = counters.iterations.saturating_add(1);
@@ -539,6 +555,7 @@ fn commit_mixed_transaction(
         }
         result
     })?;
+    trace_swarm_post_commit_visibility(conn, config, child.worker_id, id, seq, &payload);
 
     counters.transactions_committed = counters.transactions_committed.saturating_add(1);
     counters.inserts = counters.inserts.saturating_add(1);
@@ -735,6 +752,67 @@ fn query_progress(
     progress_row(&rows[0])
 }
 
+fn trace_swarm_post_commit_visibility(
+    conn: &Connection,
+    config: &RunConfig,
+    worker_id: usize,
+    id: i64,
+    seq: i64,
+    payload: &str,
+) {
+    if !group_commit_trace_enabled() {
+        return;
+    }
+
+    let same_conn_count = count_rows_by_id(conn, id);
+    let progress_last_id = count_progress_last_id(conn, worker_id);
+    let fresh_conn_count = if let Some(db_path) = config.db_path.as_ref() {
+        (|| -> HarnessResult<i64> {
+            let fresh = open_fsqlite(db_path)?;
+            configure_fsqlite(&fresh, config)?;
+            count_rows_by_id(&fresh, id)
+        })()
+    } else {
+        Err("missing db path".to_owned())
+    };
+    eprintln!(
+        "[fsqlite_swarm_commit] worker_id={worker_id} seq={seq} id={id} payload={payload} same_conn_count={same_conn_count:?} progress_last_id={progress_last_id:?} fresh_conn_count={fresh_conn_count:?}"
+    );
+}
+
+fn count_rows_by_id(conn: &Connection, id: i64) -> HarnessResult<i64> {
+    let rows = conn
+        .query_with_params(
+            "SELECT COUNT(*) FROM swarm_rows WHERE id = ?1",
+            &[SqliteValue::Integer(id)],
+        )
+        .map_err(|err| format!("count by id failed for id={id}: {err}"))?;
+    if rows.len() != 1 {
+        return Err(format!(
+            "count by id for id={id} returned {} rows",
+            rows.len()
+        ));
+    }
+    value_i64(&rows[0], 0)
+}
+
+fn count_progress_last_id(conn: &Connection, worker_id: usize) -> HarnessResult<Option<i64>> {
+    let worker = i64::try_from(worker_id).map_err(|err| format!("worker id overflow: {err}"))?;
+    let rows = conn
+        .query_with_params(
+            "SELECT last_id FROM worker_progress WHERE worker_id = ?1",
+            &[SqliteValue::Integer(worker)],
+        )
+        .map_err(|err| format!("progress last_id query failed for worker={worker_id}: {err}"))?;
+    if rows.len() != 1 {
+        return Err(format!(
+            "progress last_id query for worker={worker_id} returned {} rows",
+            rows.len()
+        ));
+    }
+    value_i64(&rows[0], 0).map(Some)
+}
+
 fn with_consistent_read_transaction<T, F>(
     conn: &Connection,
     config: &RunConfig,
@@ -887,15 +965,23 @@ fn spawn_workers(
     start_at_ms: u64,
 ) -> HarnessResult<Vec<RunningWorker>> {
     let exe = env::current_exe().map_err(|err| format!("failed to resolve current exe: {err}"))?;
+    let direct_output = group_commit_trace_enabled();
     let mut workers = Vec::with_capacity(config.workers);
     for worker_id in 0..config.workers {
         let report_path = run_dir.join(format!("worker_{worker_id}.json"));
-        let child = Command::new(&exe)
+        let stdout_path = run_dir.join(format!("worker_{worker_id}.stdout.txt"));
+        let stderr_path = run_dir.join(format!("worker_{worker_id}.stderr.txt"));
+        let mut command = Command::new(&exe);
+        command
             .arg("--child")
             .arg("--workers")
             .arg(config.workers.to_string())
             .arg("--seconds")
-            .arg(config.seconds.to_string())
+            .arg(config.seconds.to_string());
+        if let Some(iters) = config.iters {
+            command.arg("--iters").arg(iters.to_string());
+        }
+        command
             .arg("--busy-timeout-ms")
             .arg(config.busy_timeout_ms.to_string())
             .arg("--seed")
@@ -907,14 +993,27 @@ fn spawn_workers(
             .arg("--start-at-ms")
             .arg(start_at_ms.to_string())
             .arg("--child-report")
-            .arg(&report_path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .arg(&report_path);
+        if direct_output {
+            let stdout_file = File::create(&stdout_path)
+                .map_err(|err| format!("failed to create `{}`: {err}", stdout_path.display()))?;
+            let stderr_file = File::create(&stderr_path)
+                .map_err(|err| format!("failed to create `{}`: {err}", stderr_path.display()))?;
+            command
+                .stdout(Stdio::from(stdout_file))
+                .stderr(Stdio::from(stderr_file));
+        } else {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
+        let child = command
             .spawn()
             .map_err(|err| format!("failed to spawn worker {worker_id}: {err}"))?;
         workers.push(RunningWorker {
             worker_id,
             report_path,
+            stdout_path,
+            stderr_path,
+            direct_output,
             child,
             started: Instant::now(),
         });
@@ -925,6 +1024,9 @@ fn spawn_workers(
 struct RunningWorker {
     worker_id: usize,
     report_path: PathBuf,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    direct_output: bool,
     child: std::process::Child,
     started: Instant,
 }
@@ -977,20 +1079,35 @@ fn collect_worker(
         thread::sleep(Duration::from_millis(50));
     }
 
-    let output = worker.child.wait_with_output().map_err(|err| {
-        format!(
-            "failed to collect worker {} output: {err}",
-            worker.worker_id
+    let (exit_code, stdout, stderr) = if worker.direct_output {
+        let status = worker.child.wait().map_err(|err| {
+            format!(
+                "failed to collect worker {} status: {err}",
+                worker.worker_id
+            )
+        })?;
+        let stdout = read_lossy_file(&worker.stdout_path)?;
+        let stderr = read_lossy_file(&worker.stderr_path)?;
+        (status.code(), stdout, stderr)
+    } else {
+        let output = worker.child.wait_with_output().map_err(|err| {
+            format!(
+                "failed to collect worker {} output: {err}",
+                worker.worker_id
+            )
+        })?;
+        write_worker_process_output(run_dir, worker.worker_id, &output)?;
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
         )
-    })?;
-    write_worker_process_output(run_dir, worker.worker_id, &output)?;
+    };
     let duration_ms = duration_to_u64_ms(worker.started.elapsed());
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let (report, report_error) = read_worker_report(&worker.report_path);
     Ok(WorkerProcessReport {
         worker_id: worker.worker_id,
-        exit_code: output.status.code(),
+        exit_code,
         killed_for_timeout: killed,
         duration_ms,
         report_path: worker.report_path.to_string_lossy().into_owned(),
@@ -999,6 +1116,12 @@ fn collect_worker(
         report,
         report_error,
     })
+}
+
+fn read_lossy_file(path: &Path) -> HarnessResult<String> {
+    let bytes =
+        fs::read(path).map_err(|err| format!("failed to read `{}`: {err}", path.display()))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn read_worker_report(path: &Path) -> (Option<WorkerReport>, Option<String>) {
@@ -1520,6 +1643,10 @@ fn parse_args() -> HarnessResult<Mode> {
                 index = index.saturating_add(1);
                 config.seconds = parse_required(&args, index, "--seconds")?;
             }
+            "--iters" => {
+                index = index.saturating_add(1);
+                config.iters = Some(parse_required(&args, index, "--iters")?);
+            }
             "--busy-timeout-ms" => {
                 index = index.saturating_add(1);
                 config.busy_timeout_ms = parse_required(&args, index, "--busy-timeout-ms")?;
@@ -1562,6 +1689,9 @@ fn parse_args() -> HarnessResult<Mode> {
             }
             _ if arg.starts_with("--seconds=") => {
                 config.seconds = parse_value(arg, "--seconds=")?;
+            }
+            _ if arg.starts_with("--iters=") => {
+                config.iters = Some(parse_value(arg, "--iters=")?);
             }
             _ if arg.starts_with("--busy-timeout-ms=") => {
                 config.busy_timeout_ms = parse_value(arg, "--busy-timeout-ms=")?;
@@ -1626,6 +1756,9 @@ fn validate_parent_config(config: &RunConfig) -> HarnessResult<()> {
     if config.seconds == 0 {
         return Err("--seconds must be greater than zero".to_owned());
     }
+    if config.iters == Some(0) {
+        return Err("--iters must be greater than zero when provided".to_owned());
+    }
     if config.busy_timeout_ms == 0 {
         return Err("--busy-timeout-ms must be greater than zero".to_owned());
     }
@@ -1637,7 +1770,7 @@ fn validate_parent_config(config: &RunConfig) -> HarnessResult<()> {
 
 fn usage() -> String {
     "usage: swarm-multiprocess [--workers=N] [--seconds=N] \
-     [--busy-timeout-ms=N] [--seed=N] [--db PATH] [--artifact-root PATH]"
+     [--iters=N] [--busy-timeout-ms=N] [--seed=N] [--db PATH] [--artifact-root PATH]"
         .to_owned()
 }
 

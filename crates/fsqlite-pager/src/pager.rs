@@ -7625,6 +7625,10 @@ where
         data: PageData,
     ) -> Result<()> {
         self.ensure_writer(cx)?;
+        // #70 ghost-commit guard: restoring staged page data re-enters the
+        // write_set, so mark writes_observed for the same reason as
+        // write_page / write_page_data.
+        self.writes_observed = true;
         let staged = StagedPage::from_page_data_for_pool(&self.pool, data)?;
         insert_staged_page(
             &mut self.write_set,

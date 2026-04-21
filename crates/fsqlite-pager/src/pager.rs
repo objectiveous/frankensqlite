@@ -1585,9 +1585,16 @@ impl<F: VfsFile> PagerInner<F> {
             )?
         };
 
-        self.db_size = db_size;
-        self.next_page = if db_size >= 2 {
-            db_size.saturating_add(1)
+        // Cross-process monotonicity (#70): never shrink self.db_size from a
+        // stale page-1 header we just happened to read from WAL. Another
+        // connection (or our own flusher) may already know about a larger
+        // committed extent; overwriting back to the header value turns those
+        // pages into phantom reads and causes `page N > snapshot db_size`
+        // BusySnapshot errors in peer readers.
+        self.db_size = self.db_size.max(db_size);
+        let effective_db_size = self.db_size;
+        self.next_page = if effective_db_size >= 2 {
+            effective_db_size.saturating_add(1)
         } else {
             2
         };
@@ -3294,6 +3301,13 @@ impl PublishedPagerState {
         let page_set_size = self.pages.len();
 
         self.finalize_publish(cx, update, page_set_size, start, true);
+        // finalize_publish keeps db_size strictly monotonic to guard against
+        // cross-process stale-publish regressions (#70). Truncate-checkpoint
+        // is the only publisher permitted to shrink the authoritative db_size:
+        // the checkpoint lock guarantees no concurrent writer will clobber
+        // this store with a stale larger value.
+        self.db_size
+            .store(update.db_size, AtomicOrdering::Release);
     }
 
     /// Publish commit: retain pages up to db_size, then bulk insert from write_set.
@@ -3494,20 +3508,19 @@ impl PublishedPagerState {
     ) {
         self.publication_write_count
             .fetch_add(1, AtomicOrdering::Relaxed);
-        let previous_visible_commit_seq = self.visible_commit_seq.load(AtomicOrdering::Acquire);
-        // Monotonic max: commit_seq must never regress under group commit.
         self.visible_commit_seq
             .fetch_max(update.visible_commit_seq.get(), AtomicOrdering::Release);
-        // Stale older publications must not shrink the visible db_size out from
-        // under a newer larger commit, but newer-or-equal publications are
-        // allowed to publish the real size, including legitimate shrink/
-        // truncate operations.
-        if update.visible_commit_seq.get() < previous_visible_commit_seq {
-            self.db_size
-                .fetch_max(update.db_size, AtomicOrdering::Release);
-        } else {
-            self.db_size.store(update.db_size, AtomicOrdering::Release);
-        }
+        // Cross-process correctness (#70): a publisher whose visible_commit_seq
+        // advanced past the previous one may still carry a stale local db_size
+        // (e.g. a non-extending commit following a peer's EOF extension whose
+        // page 1 header we have not yet observed). Using `store` here clobbers
+        // the peer's larger published db_size, leaving readers with
+        // `page N > snapshot db_size (N-1)` BusySnapshot errors. Keep this
+        // atomic strictly monotonic and let the explicit truncate-checkpoint
+        // path (`publish_truncate_checkpoint`) restore the authoritative
+        // shrunken db_size after finalize_publish returns.
+        self.db_size
+            .fetch_max(update.db_size, AtomicOrdering::Release);
         self.journal_mode.store(
             encode_journal_mode(update.journal_mode),
             AtomicOrdering::Release,
@@ -3548,15 +3561,14 @@ impl PublishedPagerState {
         // published page plane. Any subsequent page read will skip the stale
         // plane because `page_plane_visible_commit_seq` intentionally remains
         // behind `visible_commit_seq`.
-        let previous_visible_commit_seq = self.visible_commit_seq.load(AtomicOrdering::Acquire);
         self.visible_commit_seq
             .fetch_max(update.visible_commit_seq.get(), AtomicOrdering::Release);
-        if update.visible_commit_seq.get() < previous_visible_commit_seq {
-            self.db_size
-                .fetch_max(update.db_size, AtomicOrdering::Release);
-        } else {
-            self.db_size.store(update.db_size, AtomicOrdering::Release);
-        }
+        // See finalize_publish for why db_size is always monotonic here — the
+        // same cross-process shrinking bug applies on the single-connection
+        // metadata-only path. publish_truncate_checkpoint is the only place
+        // permitted to shrink the published db_size.
+        self.db_size
+            .fetch_max(update.db_size, AtomicOrdering::Release);
         self.journal_mode.store(
             encode_journal_mode(update.journal_mode),
             AtomicOrdering::Release,
@@ -7947,9 +7959,14 @@ where
             // the deferred half of the Phase A fix — freed pages are only
             // visible to other transactions after the WAL commit is durable.
             return_pages_to_freelist(&mut inner.freelist, pending_freed);
-            if self.journal_mode != JournalMode::Wal {
-                inner.db_size = committed_db_size;
-            }
+            // Cross-process #70: the group-commit flusher already set
+            // inner.db_size to final_db_size in WAL mode, but with concurrent
+            // peer commits extending the same file, our flusher's view of
+            // the consolidated db_size can lag the actual max committed page.
+            // Use fetch_max semantics so inner.db_size never regresses below
+            // what we just committed, and so peer extensions we subsequently
+            // observe in refresh_committed_state keep monotonic visibility.
+            inner.db_size = inner.db_size.max(committed_db_size);
             // Keep volatile EOF lease pages in the in-memory freelist even
             // when they are above the durable page_count. They are deliberately
             // filtered out by serialize_freelist_to_write_set(), so page 1
@@ -8289,9 +8306,10 @@ where
             // For WAL mode with group commit, the flusher already set inner.db_size
             // to the consolidated max across all batched transactions - don't revert it.
             return_pages_to_freelist(&mut inner.freelist, pending_freed);
-            if self.journal_mode != JournalMode::Wal {
-                inner.db_size = committed_db_size;
-            }
+            // See commit() Phase C1: keep inner.db_size monotonic across
+            // concurrent cross-process commits so we never publish a db_size
+            // smaller than a peer's just-committed extent.
+            inner.db_size = inner.db_size.max(committed_db_size);
             // Keep volatile EOF lease pages in memory; see commit() Phase C1.
             inner.commit_seq = inner.commit_seq.next();
             // B3.4: :memory: derives file size from db_size * page_size — skip VFS roundtrip

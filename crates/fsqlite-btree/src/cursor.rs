@@ -4991,57 +4991,56 @@ impl<P: PageWriter> BtCursor<P> {
         // OPT-7 follow-up: size-dispatched sort for typical small N here too.
         sort_cells_desc_by_ptr(&mut cells_to_move);
 
-        let mut new_content_offset = self.usable_size as usize;
-        for (ptr, size, i) in cells_to_move {
-            new_content_offset = new_content_offset.checked_sub(size).ok_or_else(|| {
-                FrankenError::DatabaseCorrupt {
-                    detail: "table leaf cell size overflow during delete defragmentation"
-                        .to_owned(),
+        {
+            let page_bytes = page_data.as_bytes_mut();
+            let mut new_content_offset = self.usable_size as usize;
+            for (ptr, size, i) in cells_to_move {
+                new_content_offset = new_content_offset.checked_sub(size).ok_or_else(|| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: "table leaf cell size overflow during delete defragmentation"
+                            .to_owned(),
+                    }
+                })?;
+                if new_content_offset < ptr_array_end {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "table leaf cell content overlaps pointer array during delete defragmentation"
+                            .to_owned(),
+                    });
                 }
-            })?;
-            if new_content_offset < ptr_array_end {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: "table leaf cell content overlaps pointer array during delete defragmentation"
-                        .to_owned(),
-                });
+                page_bytes.copy_within(ptr..ptr + size, new_content_offset);
+                ptrs[i] = u16::try_from(new_content_offset).map_err(|_| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table leaf cell offset {} exceeds u16 range on page {}",
+                            new_content_offset,
+                            leaf_page_no.get()
+                        ),
+                    }
+                })?;
             }
-            page_data
-                .as_bytes_mut()
-                .copy_within(ptr..ptr + size, new_content_offset);
-            ptrs[i] =
-                u16::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+
+            if new_content_offset > ptr_array_end {
+                page_bytes[ptr_array_end..new_content_offset].fill(0);
+            }
+            header.first_freeblock = 0;
+            header.fragmented_free_bytes = 0;
+            header.cell_content_offset =
+                u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
                     detail: format!(
-                        "table leaf cell offset {} exceeds u16 range on page {}",
+                        "table leaf cell content offset {} exceeds u32 range on page {}",
                         new_content_offset,
                         leaf_page_no.get()
                     ),
                 })?;
-        }
 
-        if new_content_offset > ptr_array_end {
-            page_data.as_bytes_mut()[ptr_array_end..new_content_offset].fill(0);
-        }
-        header.first_freeblock = 0;
-        header.fragmented_free_bytes = 0;
-        header.cell_content_offset =
-            u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "table leaf cell content offset {} exceeds u32 range on page {}",
-                    new_content_offset,
-                    leaf_page_no.get()
-                ),
-            })?;
+            header.cell_count =
+                u16::try_from(ptrs.len()).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table leaf page {} cell count exceeds u16 range during delete",
+                        leaf_page_no.get()
+                    ),
+                })?;
 
-        header.cell_count =
-            u16::try_from(ptrs.len()).map_err(|_| FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "table leaf page {} cell count exceeds u16 range during delete",
-                    leaf_page_no.get()
-                ),
-            })?;
-
-        {
-            let page_bytes = page_data.as_bytes_mut();
             header.write(page_bytes, header_offset);
             cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
         }
@@ -5175,53 +5174,51 @@ impl<P: PageWriter> BtCursor<P> {
         // and falls through to `sort_unstable_by` above the empirical crossover.
         sort_cells_desc_by_ptr(&mut cells_to_move);
 
-        let mut new_content_offset = self.usable_size as usize;
-        let mut defrag_err: Option<FrankenError> = None;
-        for &(ptr, size, i) in cells_to_move.iter() {
-            match new_content_offset.checked_sub(size) {
-                Some(candidate) if candidate >= ptr_array_end => {
-                    new_content_offset = candidate;
-                    page_data
-                        .as_bytes_mut()
-                        .copy_within(ptr..ptr + size, new_content_offset);
-                    ptrs[i] = new_content_offset as u16;
-                }
-                Some(_) => {
-                    defrag_err = Some(FrankenError::DatabaseCorrupt {
-                        detail: "cell content overlaps pointer array during defragmentation"
-                            .to_owned(),
-                    });
-                    break;
-                }
-                None => {
-                    defrag_err = Some(FrankenError::DatabaseCorrupt {
-                        detail: "cell size overflow during defragmentation".to_owned(),
-                    });
-                    break;
+        {
+            let mut new_content_offset = self.usable_size as usize;
+            let mut defrag_err: Option<FrankenError> = None;
+            let page_bytes = page_data.as_bytes_mut();
+            for &(ptr, size, i) in &cells_to_move {
+                match new_content_offset.checked_sub(size) {
+                    Some(candidate) if candidate >= ptr_array_end => {
+                        new_content_offset = candidate;
+                        page_bytes.copy_within(ptr..ptr + size, new_content_offset);
+                        ptrs[i] = new_content_offset as u16;
+                    }
+                    Some(_) => {
+                        defrag_err = Some(FrankenError::DatabaseCorrupt {
+                            detail: "cell content overlaps pointer array during defragmentation"
+                                .to_owned(),
+                        });
+                        break;
+                    }
+                    None => {
+                        defrag_err = Some(FrankenError::DatabaseCorrupt {
+                            detail: "cell size overflow during defragmentation".to_owned(),
+                        });
+                        break;
+                    }
                 }
             }
-        }
-        if let Some(err) = defrag_err {
-            self.defrag_ptrs_scratch = ptrs;
-            self.defrag_cells_scratch = cells_to_move;
-            return Err(err);
-        }
+            if let Some(err) = defrag_err {
+                self.defrag_ptrs_scratch = ptrs;
+                self.defrag_cells_scratch = cells_to_move;
+                return Err(err);
+            }
 
-        // Fill the now-unused space with zeros for cleanliness (optional, but good for reproducibility/debugging).
-        if new_content_offset > ptr_array_end {
-            page_data.as_bytes_mut()[ptr_array_end..new_content_offset].fill(0);
-        }
+            // Fill the now-unused space with zeros for cleanliness (optional, but good for reproducibility/debugging).
+            if new_content_offset > ptr_array_end {
+                page_bytes[ptr_array_end..new_content_offset].fill(0);
+            }
 
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            header.cell_count = ptrs.len() as u16;
-            header.cell_content_offset = new_content_offset as u32;
-        }
-        header.fragmented_free_bytes = 0;
-        header.first_freeblock = 0;
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                header.cell_count = ptrs.len() as u16;
+                header.cell_content_offset = new_content_offset as u32;
+            }
+            header.fragmented_free_bytes = 0;
+            header.first_freeblock = 0;
 
-        {
-            let page_bytes = page_data.as_bytes_mut();
             header.write(page_bytes, header_offset);
             cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
         }

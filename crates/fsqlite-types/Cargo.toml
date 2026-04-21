@@ -20,6 +20,7 @@ fsqlite-error = { workspace = true }
 smallvec = { workspace = true }
 serde = { workspace = true }
 memchr = { workspace = true }
+simdutf8 = { workspace = true }
 tracing = { workspace = true }
 xxhash-rust = { workspace = true }
 

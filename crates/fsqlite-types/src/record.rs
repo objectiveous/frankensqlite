@@ -1946,7 +1946,12 @@ fn decode_value_into(
                 // Bytes differ: validate the incoming bytes as UTF-8 once,
                 // then overwrite the slot reusing its heap allocation when
                 // possible.
-                let text = std::str::from_utf8(bytes).ok()?;
+                //
+                // OPT-UTF8: simdutf8::basic::from_utf8 is a SIMD-accelerated
+                // drop-in for std::str::from_utf8, typically 3-10x faster on
+                // ASCII/majority-ASCII payloads which dominate TEXT columns
+                // in real workloads.
+                let text = simdutf8::basic::from_utf8(bytes).ok()?;
                 existing.overwrite(text);
                 if profile_enabled {
                     note_decoded_value(slot);
@@ -1955,7 +1960,7 @@ fn decode_value_into(
             }
             // Slot did not hold a TEXT value — validate once and construct
             // a fresh `SqliteValue::Text`.
-            let text = std::str::from_utf8(bytes).ok()?;
+            let text = simdutf8::basic::from_utf8(bytes).ok()?;
             replace_decoded_slot(slot, SqliteValue::Text(text.into()));
         }
         SerialTypeClass::Blob => {

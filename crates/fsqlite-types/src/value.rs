@@ -308,10 +308,18 @@ impl SmallText {
     }
 
     /// Get the string as a slice.
+    ///
+    /// OPT-UTF8: the inline buffer is always valid UTF-8 by construction (see
+    /// the constructors and [`Self::overwrite`]), but because
+    /// `forbid(unsafe_code)` prevents `from_utf8_unchecked` we must run a
+    /// validator. `simdutf8::basic::from_utf8` is a drop-in for
+    /// `std::str::from_utf8` that uses runtime-dispatched SIMD and is
+    /// ~3-10x faster on the ASCII-dominant TEXT payloads that make up the
+    /// majority of real SQL workloads.
     #[inline]
     pub fn as_str(&self) -> &str {
         match &self.repr {
-            SmallTextRepr::Inline { len, buf } => std::str::from_utf8(&buf[..*len as usize])
+            SmallTextRepr::Inline { len, buf } => simdutf8::basic::from_utf8(&buf[..*len as usize])
                 .expect("SmallText inline representation must always contain valid UTF-8"),
             SmallTextRepr::HeapOwned { text, .. } => text.as_str(),
             SmallTextRepr::HeapShared(text) => text,
@@ -368,7 +376,8 @@ impl SmallText {
     pub fn into_arc(self) -> Arc<str> {
         match self.repr {
             SmallTextRepr::Inline { len, buf } => {
-                let s = std::str::from_utf8(&buf[..len as usize])
+                // See `as_str` for the simdutf8 rationale.
+                let s = simdutf8::basic::from_utf8(&buf[..len as usize])
                     .expect("SmallText inline representation must always contain valid UTF-8");
                 Arc::from(s)
             }

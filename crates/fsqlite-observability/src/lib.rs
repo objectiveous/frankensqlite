@@ -139,6 +139,8 @@ pub struct IoUringLatencySnapshot {
     pub read_samples_total: u64,
     pub write_samples_total: u64,
     pub unix_fallbacks_total: u64,
+    pub read_unix_fallbacks_total: u64,
+    pub write_unix_fallbacks_total: u64,
     pub read_tail_violations_total: u64,
     pub write_tail_violations_total: u64,
     pub window_capacity: usize,
@@ -190,6 +192,8 @@ pub struct IoUringLatencyMetrics {
     pub read_samples_total: AtomicU64,
     pub write_samples_total: AtomicU64,
     pub unix_fallbacks_total: AtomicU64,
+    pub read_unix_fallbacks_total: AtomicU64,
+    pub write_unix_fallbacks_total: AtomicU64,
     pub read_tail_violations_total: AtomicU64,
     pub write_tail_violations_total: AtomicU64,
     sample_capacity: usize,
@@ -203,6 +207,8 @@ impl IoUringLatencyMetrics {
             read_samples_total: AtomicU64::new(0),
             write_samples_total: AtomicU64::new(0),
             unix_fallbacks_total: AtomicU64::new(0),
+            read_unix_fallbacks_total: AtomicU64::new(0),
+            write_unix_fallbacks_total: AtomicU64::new(0),
             read_tail_violations_total: AtomicU64::new(0),
             write_tail_violations_total: AtomicU64::new(0),
             sample_capacity,
@@ -251,6 +257,18 @@ impl IoUringLatencyMetrics {
         self.unix_fallbacks_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_read_unix_fallback(&self) {
+        self.read_unix_fallbacks_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.record_unix_fallback();
+    }
+
+    pub fn record_write_unix_fallback(&self) {
+        self.write_unix_fallbacks_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.record_unix_fallback();
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> IoUringLatencySnapshot {
         let window = self.window.lock();
@@ -259,6 +277,8 @@ impl IoUringLatencyMetrics {
             read_samples_total: self.read_samples_total.load(Ordering::Relaxed),
             write_samples_total: self.write_samples_total.load(Ordering::Relaxed),
             unix_fallbacks_total: self.unix_fallbacks_total.load(Ordering::Relaxed),
+            read_unix_fallbacks_total: self.read_unix_fallbacks_total.load(Ordering::Relaxed),
+            write_unix_fallbacks_total: self.write_unix_fallbacks_total.load(Ordering::Relaxed),
             read_tail_violations_total: self.read_tail_violations_total.load(Ordering::Relaxed),
             write_tail_violations_total: self.write_tail_violations_total.load(Ordering::Relaxed),
             window_capacity: self.sample_capacity,
@@ -279,6 +299,8 @@ impl IoUringLatencyMetrics {
         self.read_samples_total.store(0, Ordering::Relaxed);
         self.write_samples_total.store(0, Ordering::Relaxed);
         self.unix_fallbacks_total.store(0, Ordering::Relaxed);
+        self.read_unix_fallbacks_total.store(0, Ordering::Relaxed);
+        self.write_unix_fallbacks_total.store(0, Ordering::Relaxed);
         self.read_tail_violations_total.store(0, Ordering::Relaxed);
         self.write_tail_violations_total.store(0, Ordering::Relaxed);
         let mut window = self.window.lock();
@@ -303,6 +325,14 @@ pub fn record_io_uring_write_latency(latency: Duration) -> bool {
 
 pub fn record_io_uring_unix_fallback() {
     GLOBAL_IO_URING_LATENCY_METRICS.record_unix_fallback();
+}
+
+pub fn record_io_uring_read_unix_fallback() {
+    GLOBAL_IO_URING_LATENCY_METRICS.record_read_unix_fallback();
+}
+
+pub fn record_io_uring_write_unix_fallback() {
+    GLOBAL_IO_URING_LATENCY_METRICS.record_write_unix_fallback();
 }
 
 #[must_use]
@@ -1512,12 +1542,15 @@ mod tests {
         record_io_uring_read_latency(Duration::from_micros(40));
         record_io_uring_read_latency(Duration::from_micros(125));
         record_io_uring_write_latency(Duration::from_micros(55));
-        record_io_uring_unix_fallback();
+        record_io_uring_read_unix_fallback();
+        record_io_uring_write_unix_fallback();
 
         let snapshot = io_uring_latency_snapshot();
         assert_eq!(snapshot.read_samples_total, 2);
         assert_eq!(snapshot.write_samples_total, 1);
-        assert_eq!(snapshot.unix_fallbacks_total, 1);
+        assert_eq!(snapshot.unix_fallbacks_total, 2);
+        assert_eq!(snapshot.read_unix_fallbacks_total, 1);
+        assert_eq!(snapshot.write_unix_fallbacks_total, 1);
         assert!(snapshot.read_tail_violations_total <= snapshot.read_samples_total);
         assert!(snapshot.write_tail_violations_total <= snapshot.write_samples_total);
         assert!(snapshot.read_p99_latency_us >= 125);
@@ -1530,6 +1563,8 @@ mod tests {
         assert_eq!(reset.read_samples_total, 0);
         assert_eq!(reset.write_samples_total, 0);
         assert_eq!(reset.unix_fallbacks_total, 0);
+        assert_eq!(reset.read_unix_fallbacks_total, 0);
+        assert_eq!(reset.write_unix_fallbacks_total, 0);
         assert_eq!(reset.read_tail_violations_total, 0);
         assert_eq!(reset.write_tail_violations_total, 0);
         assert_eq!(reset.read_window_len, 0);

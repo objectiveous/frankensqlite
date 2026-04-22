@@ -25,8 +25,8 @@ use std::os::fd::AsRawFd;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_observability::{
-    io_uring_latency_snapshot, record_io_uring_read_latency, record_io_uring_unix_fallback,
-    record_io_uring_write_latency,
+    io_uring_latency_snapshot, record_io_uring_read_latency, record_io_uring_read_unix_fallback,
+    record_io_uring_write_latency, record_io_uring_write_unix_fallback,
 };
 use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
@@ -764,7 +764,7 @@ impl VfsFile for IoUringFile {
                 }
             }
         }
-        record_io_uring_unix_fallback();
+        record_io_uring_read_unix_fallback();
         self.inner.read(cx, buf, offset)
     }
 
@@ -798,7 +798,7 @@ impl VfsFile for IoUringFile {
                 }
             }
         }
-        record_io_uring_unix_fallback();
+        record_io_uring_write_unix_fallback();
         self.inner.write(cx, buf, offset)
     }
 
@@ -948,11 +948,11 @@ mod tests {
         let snapshot = io_uring_latency_snapshot();
         if vfs.is_available() {
             assert!(
-                snapshot.write_samples_total >= 1 || snapshot.unix_fallbacks_total >= 1,
+                snapshot.write_samples_total >= 1 || snapshot.write_unix_fallbacks_total >= 1,
                 "write path should either record io_uring latency or fallback"
             );
             assert!(
-                snapshot.read_samples_total >= 1 || snapshot.unix_fallbacks_total >= 1,
+                snapshot.read_samples_total >= 1 || snapshot.read_unix_fallbacks_total >= 1,
                 "read path should either record io_uring latency or fallback"
             );
         }
@@ -983,6 +983,14 @@ mod tests {
         assert!(
             snapshot.unix_fallbacks_total >= 2,
             "disabled runtime should record fallback for both write/read ops"
+        );
+        assert!(
+            snapshot.write_unix_fallbacks_total >= 1,
+            "disabled runtime should record write fallback"
+        );
+        assert!(
+            snapshot.read_unix_fallbacks_total >= 1,
+            "disabled runtime should record read fallback"
         );
     }
 

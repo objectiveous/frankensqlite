@@ -1375,8 +1375,8 @@ impl TransactionManager {
         }
 
         // Publish: allocate commit_seq and publish versions.
-        let commit_seq = match self.publish_write_set(txn, &pages) {
-            Ok(commit_seq) => commit_seq,
+        let (commit_seq, chain_lens) = match self.publish_write_set(txn, &pages) {
+            Ok(result) => result,
             Err(err) => {
                 self.abort(txn);
                 return Err(err);
@@ -1386,7 +1386,7 @@ impl TransactionManager {
         self.publish_shared_snapshot(commit_seq);
         txn.commit();
         self.release_all_resources(txn);
-        self.post_commit_version_maintenance(&pages, snapshot_high);
+        self.post_commit_version_maintenance(&pages, snapshot_high, &chain_lens);
 
         tracing::info!(
             txn_id = %txn.txn_id,
@@ -1507,8 +1507,8 @@ impl TransactionManager {
         }
 
         // Step 4: Publish.
-        let commit_seq = match self.publish_write_set(txn, &pages) {
-            Ok(commit_seq) => commit_seq,
+        let (commit_seq, chain_lens) = match self.publish_write_set(txn, &pages) {
+            Ok(result) => result,
             Err(err) => {
                 self.abort(txn);
                 return Err(err);
@@ -1518,7 +1518,7 @@ impl TransactionManager {
         self.publish_shared_snapshot(commit_seq);
         txn.commit();
         self.release_all_resources(txn);
-        self.post_commit_version_maintenance(&pages, snapshot_high);
+        self.post_commit_version_maintenance(&pages, snapshot_high, &chain_lens);
 
         tracing::info!(
             txn_id = %txn.txn_id,
@@ -1641,14 +1641,18 @@ impl TransactionManager {
 
     /// Publish a transaction's write set into the version store and commit index.
     ///
-    /// Returns the assigned `CommitSeq`.
+    /// Returns the assigned `CommitSeq` and per-page pre-publish chain
+    /// lengths (from `enforce_chain_bound_for_page`).  Callers can feed
+    /// the cached lengths into `post_commit_version_maintenance` to skip
+    /// a redundant `chain_length()` traversal per page.
     fn publish_write_set(
         &self,
         txn: &mut Transaction,
         pages: &[PageNumber],
-    ) -> Result<CommitSeq, MvccError> {
+    ) -> Result<(CommitSeq, SmallVec<[usize; 8]>), MvccError> {
+        let mut cached_chain_lens: SmallVec<[usize; 8]> = SmallVec::with_capacity(pages.len());
         for &pgno in pages {
-            self.enforce_chain_bound_for_page(pgno)?;
+            cached_chain_lens.push(self.enforce_chain_bound_for_page(pgno)?);
         }
 
         let commit_seq = self.txn_manager.alloc_commit_seq();
@@ -1687,15 +1691,29 @@ impl TransactionManager {
         // Clear structural pages tracking now that commit is complete
         txn.clear_structural_pages();
 
-        Ok(commit_seq)
+        Ok((commit_seq, cached_chain_lens))
     }
 
-    fn post_commit_version_maintenance(&self, pages: &[PageNumber], snapshot_high: CommitSeq) {
+    /// `pre_publish_chain_lens` are the per-page chain lengths collected
+    /// before publish (from `enforce_chain_bound_for_page`).  After publish
+    /// each chain is 1 longer, so we use `len + 1` for the pruning threshold
+    /// decision — avoids re-traversing every chain.
+    fn post_commit_version_maintenance(
+        &self,
+        pages: &[PageNumber],
+        snapshot_high: CommitSeq,
+        pre_publish_chain_lens: &[usize],
+    ) {
         let horizon = self.eager_gc_horizon();
         let eager_cleanup = horizon >= snapshot_high;
         let compact_threshold = self.adaptive_compact_threshold();
-        let maybe_prune = |pgno: PageNumber| {
-            let chain_len = self.version_store.chain_length(pgno);
+        let maybe_prune = |i: usize, pgno: PageNumber| {
+            let chain_len = pre_publish_chain_lens
+                .get(i)
+                .map_or_else(
+                    || self.version_store.chain_length(pgno),
+                    |&cached| cached.saturating_add(1),
+                );
             self.record_chain_length_sample(chain_len);
             if eager_cleanup || chain_len > compact_threshold {
                 let freed = self.version_store.prune_page_chain_eager(pgno, horizon);
@@ -1707,16 +1725,14 @@ impl TransactionManager {
         };
 
         if eager_cleanup {
-            for &pgno in pages {
-                maybe_prune(pgno);
+            for (i, &pgno) in pages.iter().enumerate() {
+                maybe_prune(i, pgno);
             }
         } else {
-            for &pgno in pages.iter().take(16) {
-                maybe_prune(pgno);
+            for (i, &pgno) in pages.iter().enumerate().take(16) {
+                maybe_prune(i, pgno);
             }
         }
-
-        let _ = self.version_store.advance_epoch();
     }
 
     /// Release all resources held by a transaction.

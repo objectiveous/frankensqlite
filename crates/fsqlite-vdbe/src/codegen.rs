@@ -10630,7 +10630,7 @@ fn codegen_insert_values(
                         existing_regs,
                         n_cols_i32,
                         update_rec,
-                        P4::Affinity(aff_str.clone()),
+                        make_insert_record_p4(table, &aff_str),
                         0,
                     );
                     b.emit_op(
@@ -10678,7 +10678,7 @@ fn codegen_insert_values(
                         existing_regs,
                         n_cols_i32,
                         update_rec,
-                        P4::Affinity(aff_str.clone()),
+                        make_insert_record_p4(table, &aff_str),
                         0,
                     );
                     b.emit_op(
@@ -29197,6 +29197,56 @@ mod tests {
                     && header.slots[0].kind == PrecomputedSerialTypeKind::NullPlaceholder
                     && header.slots[1].kind == PrecomputedSerialTypeKind::RealOrNull),
             "expected a precomputed header for IPK + STRICT REAL schema"
+        );
+    }
+
+    #[test]
+    fn test_codegen_upsert_update_known_schema_uses_precomputed_header() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![UpsertClause {
+                target: None,
+                action: UpsertAction::Update {
+                    assignments: vec![Assignment {
+                        target: AssignmentTarget::Column("score".to_owned()),
+                        value: Expr::Column(ColumnRef::qualified("excluded", "score"), Span::ZERO),
+                    }],
+                    where_clause: None,
+                },
+            }],
+            returning: vec![],
+        };
+        let schema = schema_with_ipk_and_strict_real_notnull();
+        let ctx = CodegenContext {
+            concurrent_mode: false,
+            rowid_alias_col_idx: Some(0),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let table_record_headers = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::MakeRecord)
+            .filter(|op| {
+                matches!(&op.p4, P4::PrecomputedHeader(header)
+                    if header.template == vec![3, 0, 0]
+                        && header.slots.len() == 2
+                        && header.slots[0].kind == PrecomputedSerialTypeKind::NullPlaceholder
+                        && header.slots[1].kind == PrecomputedSerialTypeKind::RealOrNull)
+            })
+            .count();
+
+        assert_eq!(
+            table_record_headers, 2,
+            "UPSERT DO UPDATE should use precomputed headers for both conflict-update and insert table records"
         );
     }
 

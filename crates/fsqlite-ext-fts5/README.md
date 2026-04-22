@@ -28,6 +28,8 @@ The target-architecture document defines the intended runtime object model, MVCC
 
 The proof-artifact contract defines the required unit/integration/e2e coverage shape, structured logging fields, replay requirements, manifest conventions, and artifact-bundle expectations for the whole shadow-backed program.
 
+The reusable baseline harness for current FrankenSQLite versus stock SQLite FTS5 lives in `fsqlite-harness::fts5_baseline` and is replayed by `scripts/verify_bd_2nzo8_1_3_fts5_baseline.sh`. It records today’s materialized-path catalog and behavior deltas as machine-readable evidence for `bd-2nzo8.1.3`, including manifest, JSONL events, diff report, benchmark summary, memory/IO summary, replay metadata, and artifact hashes.
+
 ## Key Types
 
 - `Fts5Config` - Configuration for an FTS5 virtual table: content mode, secure-delete, and contentless-delete settings

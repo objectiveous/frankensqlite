@@ -39,6 +39,7 @@ pub mod fixture_discovery;
 pub mod fixture_root_contract;
 pub mod forensics_navigator;
 pub mod fslab;
+pub mod fts5_baseline;
 pub mod impact_graph;
 pub mod isomorphism_proof;
 pub mod lane_selector;

@@ -1547,13 +1547,14 @@ mod tests {
         record_io_uring_read_latency(Duration::from_micros(40));
         record_io_uring_read_latency(Duration::from_micros(125));
         record_io_uring_write_latency(Duration::from_micros(55));
+        record_io_uring_unix_fallback();
         record_io_uring_read_unix_fallback();
         record_io_uring_write_unix_fallback();
 
         let snapshot = io_uring_latency_snapshot();
         assert_eq!(snapshot.read_samples_total, 2);
         assert_eq!(snapshot.write_samples_total, 1);
-        assert_eq!(snapshot.unix_fallbacks_total, 2);
+        assert_eq!(snapshot.unix_fallbacks_total, 3);
         assert_eq!(snapshot.read_unix_fallbacks_total, 1);
         assert_eq!(snapshot.write_unix_fallbacks_total, 1);
         assert!(snapshot.read_tail_violations_total <= snapshot.read_samples_total);

@@ -478,6 +478,24 @@ pub enum AccessPathKind {
     RowidLookup,
 }
 
+/// Probe expressions extracted from the WHERE clause during access-path
+/// selection.  Carried forward so downstream consumers (connection seam, VDBE
+/// codegen) do not re-extract from the AST.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+pub enum AccessPathProbe {
+    /// `WHERE rowid = <target>`
+    RowidEquality { target: Expr },
+    /// `WHERE <column> = <target>` backed by an index.
+    Equality { column: String, target: Expr },
+    /// `WHERE <column> {>|>=} <lo> AND <column> {<|<=} <hi>` backed by an index.
+    Range {
+        column: String,
+        lower: Option<(Expr, bool)>,
+        upper: Option<(Expr, bool)>,
+    },
+}
+
 /// A concrete access path chosen by the planner.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -494,6 +512,9 @@ pub struct AccessPath {
     pub estimated_rows: f64,
     /// Time-travel clause (SQL:2011 temporal query) — `FOR SYSTEM_TIME AS OF ...`.
     pub time_travel: Option<fsqlite_ast::TimeTravelClause>,
+    /// Probe expressions extracted during path selection — avoids downstream
+    /// re-extraction from the WHERE clause.
+    pub probe: Option<AccessPathProbe>,
 }
 
 /// The final output of the query planner: an ordered access plan.
@@ -1401,6 +1422,7 @@ fn best_access_path_internal(
         },
         estimated_rows: table.n_rows as f64,
         time_travel: None,
+        probe: None,
     };
 
     let mut candidates_considered: usize = 0;
@@ -1617,6 +1639,7 @@ fn best_access_path_internal(
                 estimated_cost: cost,
                 estimated_rows: est_rows,
                 time_travel: None,
+                probe: None,
             };
         }
     }
@@ -1633,6 +1656,7 @@ fn best_access_path_internal(
                 estimated_cost: cost,
                 estimated_rows: 1.0,
                 time_travel: None,
+                probe: None,
             };
         }
     }
@@ -1650,6 +1674,7 @@ fn best_access_path_internal(
             ),
             estimated_rows: table.n_rows as f64,
             time_travel: None,
+            probe: None,
         };
     }
 

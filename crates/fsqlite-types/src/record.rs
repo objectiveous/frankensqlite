@@ -1301,6 +1301,7 @@ where
             return false;
         };
         if slot.kind.needs_runtime_patch() {
+            debug_assert!(slot.header_offset < header_size);
             buf[slot.header_offset] = serial_byte;
         }
         append_serialized_value(value, payload_len, buf);

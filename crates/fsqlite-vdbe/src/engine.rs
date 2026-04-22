@@ -7487,24 +7487,8 @@ impl VdbeEngine {
 
                 // ── Register Operations ─────────────────────────────────
                 Opcode::Move => {
-                    // Move p3 registers from p1 to p2.
-                    // To handle potential overlap correctly, we collect all source
-                    // values into a temporary buffer before writing them to the destination.
-                    // SmallVec avoids heap allocation for typical 1-16 register moves.
                     let count = usize::try_from(op.p3).unwrap_or(0);
-                    let mut temp: smallvec::SmallVec<[SqliteValue; 16]> =
-                        smallvec::SmallVec::with_capacity(count);
-
-                    for offset in 0..count {
-                        let value = Self::reg_with_offset(op.p1, offset)
-                            .map(|reg| self.take_reg(reg))
-                            .unwrap_or(SqliteValue::Null);
-                        temp.push(value);
-                    }
-
-                    for (i, val) in temp.into_iter().enumerate() {
-                        self.set_reg_fast(op.p2 + (i as i32), val);
-                    }
+                    self.move_reg_range(op.p1, op.p2, count);
                     pc += 1;
                 }
 
@@ -12539,6 +12523,55 @@ impl VdbeEngine {
             row.push(val);
         }
         row
+    }
+
+    #[inline]
+    fn positive_register_ranges_overlap(left_start: i32, right_start: i32, count: usize) -> bool {
+        let Ok(count) = i64::try_from(count) else {
+            return true;
+        };
+        let left_start = i64::from(left_start);
+        let right_start = i64::from(right_start);
+        let left_end = left_start + count;
+        let right_end = right_start + count;
+        left_start < right_end && right_start < left_end
+    }
+
+    #[inline]
+    fn move_reg_range(&mut self, src_start: i32, dst_start: i32, count: usize) {
+        if count == 0 {
+            return;
+        }
+
+        let can_stream_directly = count == 1
+            || (src_start > 0
+                && dst_start > 0
+                && !Self::positive_register_ranges_overlap(src_start, dst_start, count));
+
+        if can_stream_directly {
+            for offset in 0..count {
+                let value = Self::reg_with_offset(src_start, offset)
+                    .map_or_else(|| SqliteValue::Null, |reg| self.take_reg(reg));
+                if let Some(dst) = Self::reg_with_offset(dst_start, offset) {
+                    self.set_reg_fast(dst, value);
+                }
+            }
+            return;
+        }
+
+        let mut temp: smallvec::SmallVec<[SqliteValue; 16]> =
+            smallvec::SmallVec::with_capacity(count);
+        for offset in 0..count {
+            let value = Self::reg_with_offset(src_start, offset)
+                .map_or_else(|| SqliteValue::Null, |reg| self.take_reg(reg));
+            temp.push(value);
+        }
+
+        for (offset, value) in temp.into_iter().enumerate() {
+            if let Some(dst) = Self::reg_with_offset(dst_start, offset) {
+                self.set_reg_fast(dst, value);
+            }
+        }
     }
 
     #[inline]
@@ -18210,6 +18243,23 @@ mod tests {
     }
 
     #[test]
+    fn test_opcode_register_spans_for_copy_range() {
+        let op = VdbeOp {
+            opcode: Opcode::Copy,
+            p1: 4,
+            p2: 9,
+            p3: 2,
+            p4: P4::None,
+            p5: 0,
+        };
+        let spans = opcode_register_spans(&op);
+        assert_eq!(spans.read_start, 4);
+        assert_eq!(spans.read_len, 3);
+        assert_eq!(spans.write_start, 9);
+        assert_eq!(spans.write_len, 3);
+    }
+
+    #[test]
     fn test_variable_uses_bound_parameter_value() {
         let rows = run_program_with_bindings(
             |b| {
@@ -19874,6 +19924,58 @@ mod tests {
         });
         assert_eq!(rows[0], vec![SqliteValue::Integer(77)]);
         assert_eq!(rows[1], vec![SqliteValue::Null]);
+    }
+
+    #[test]
+    fn test_move_register_range_preserves_forward_overlap() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            let r3 = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 11, r1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 22, r2, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 33, r3, 0, P4::None, 0);
+            b.emit_op(Opcode::Move, r1, r2, 2, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r1, 3, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(
+            rows[0],
+            vec![
+                SqliteValue::Null,
+                SqliteValue::Integer(11),
+                SqliteValue::Integer(22),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_move_register_range_preserves_backward_overlap() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            let r3 = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 11, r1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 22, r2, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 33, r3, 0, P4::None, 0);
+            b.emit_op(Opcode::Move, r2, r1, 2, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r1, 3, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(
+            rows[0],
+            vec![
+                SqliteValue::Integer(22),
+                SqliteValue::Integer(33),
+                SqliteValue::Null,
+            ]
+        );
     }
 
     #[test]

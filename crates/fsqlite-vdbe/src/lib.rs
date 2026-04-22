@@ -231,7 +231,13 @@ pub(crate) fn opcode_register_spans(op: &VdbeOp) -> OpcodeRegisterSpans {
             let (write_start, write_len) = register_range(op.p2, op.p3);
             (read_start, read_len, write_start, write_len)
         }
-        Opcode::Copy | Opcode::SCopy | Opcode::IntCopy | Opcode::BitNot | Opcode::Not => {
+        Opcode::Copy => {
+            let copy_len = op.p3.saturating_add(1);
+            let (read_start, read_len) = register_range(op.p1, copy_len);
+            let (write_start, write_len) = register_range(op.p2, copy_len);
+            (read_start, read_len, write_start, write_len)
+        }
+        Opcode::SCopy | Opcode::IntCopy | Opcode::BitNot | Opcode::Not => {
             let (read_start, read_len) = register_range(op.p1, 1);
             let (write_start, write_len) = register_range(op.p2, 1);
             (read_start, read_len, write_start, write_len)

@@ -1981,4 +1981,256 @@ mod tests {
         f2.unlock(&cx, LockLevel::Shared).unwrap();
         assert_eq!(f2.lock_level, LockLevel::Shared);
     }
+
+    // =========================================================================
+    // bd-3u7.4 VFS contract tests: systematic trait method coverage
+    // =========================================================================
+
+    const VFS_BEAD: &str = "bd-3u7.4";
+
+    #[test]
+    fn test_vfs_contract_sync_idempotency() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs
+            .open(&cx, Some(Path::new("sync_idem.db")), flags)
+            .unwrap();
+
+        file.write(&cx, b"data", 0).unwrap();
+        file.sync(&cx, SyncFlags::NORMAL).unwrap();
+        file.sync(&cx, SyncFlags::NORMAL).unwrap();
+        file.sync(&cx, SyncFlags::FULL).unwrap();
+
+        let mut buf = [0u8; 4];
+        let n = file.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&buf, b"data", "bead_id={VFS_BEAD} case=sync_idempotency");
+    }
+
+    #[test]
+    fn test_vfs_contract_write_page_batch() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs
+            .open(&cx, Some(Path::new("batch_write.db")), flags)
+            .unwrap();
+
+        let page_a = vec![0xAA_u8; 4096];
+        let page_b = vec![0xBB_u8; 4096];
+        let page_c = vec![0xCC_u8; 4096];
+
+        let writes: Vec<(u64, &[u8])> = vec![(0, &page_a), (4096, &page_b), (8192, &page_c)];
+        file.write_page_batch(&cx, &writes).unwrap();
+
+        assert_eq!(
+            file.file_size(&cx).unwrap(),
+            12288,
+            "bead_id={VFS_BEAD} case=batch_write_file_size"
+        );
+
+        for (offset, expected_fill) in [(0_u64, 0xAA), (4096, 0xBB), (8192, 0xCC)] {
+            let mut buf = [0_u8; 4096];
+            file.read(&cx, &mut buf, offset).unwrap();
+            assert!(
+                buf.iter().all(|&b| b == expected_fill),
+                "bead_id={VFS_BEAD} case=batch_write_content offset={offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_vfs_contract_lock_escalation_full_ladder() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs
+            .open(&cx, Some(Path::new("lock_ladder.db")), flags)
+            .unwrap();
+
+        for level in [LockLevel::Shared, LockLevel::Reserved, LockLevel::Exclusive] {
+            file.lock(&cx, level).unwrap();
+        }
+
+        for level in [LockLevel::Reserved, LockLevel::Shared, LockLevel::None] {
+            file.unlock(&cx, level).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_vfs_contract_close_reopen_persistence() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let path = Path::new("persist.db");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+
+        {
+            let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+            file.write(&cx, b"persisted data", 0).unwrap();
+            file.close(&cx).unwrap();
+        }
+
+        {
+            let (file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+            let mut buf = [0u8; 14];
+            let n = file.read(&cx, &mut buf, 0).unwrap();
+            assert_eq!(n, 14);
+            assert_eq!(
+                &buf, b"persisted data",
+                "bead_id={VFS_BEAD} case=close_reopen_persistence"
+            );
+        }
+    }
+
+    #[test]
+    fn test_vfs_contract_access_checks() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let path = Path::new("access_check.db");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+
+        assert!(
+            !vfs.access(&cx, path, AccessFlags::EXISTS).unwrap(),
+            "bead_id={VFS_BEAD} case=access_before_create"
+        );
+
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        file.write(&cx, b"x", 0).unwrap();
+        file.close(&cx).unwrap();
+
+        assert!(
+            vfs.access(&cx, path, AccessFlags::EXISTS).unwrap(),
+            "bead_id={VFS_BEAD} case=access_after_create"
+        );
+        assert!(
+            vfs.access(&cx, path, AccessFlags::READWRITE).unwrap(),
+            "bead_id={VFS_BEAD} case=access_readwrite"
+        );
+    }
+
+    #[test]
+    fn test_vfs_contract_full_pathname() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let result = vfs.full_pathname(&cx, Path::new("relative.db")).unwrap();
+        assert!(
+            !result.as_os_str().is_empty(),
+            "bead_id={VFS_BEAD} case=full_pathname_non_empty"
+        );
+    }
+
+    #[test]
+    fn test_vfs_contract_randomness_determinism() {
+        let cx = Cx::new();
+        let vfs_a = make_vfs();
+        let vfs_b = make_vfs();
+
+        let mut buf_a = [0u8; 32];
+        let mut buf_b = [0u8; 32];
+        vfs_a.randomness(&cx, &mut buf_a);
+        vfs_b.randomness(&cx, &mut buf_b);
+
+        assert_ne!(
+            buf_a, buf_b,
+            "bead_id={VFS_BEAD} case=randomness_unique — \
+             sequential calls must produce different output"
+        );
+        assert!(
+            buf_a.iter().any(|&b| b != 0),
+            "bead_id={VFS_BEAD} case=randomness_nonzero"
+        );
+    }
+
+    #[test]
+    fn test_vfs_contract_overwrite_in_place() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs
+            .open(&cx, Some(Path::new("overwrite.db")), flags)
+            .unwrap();
+
+        file.write(&cx, b"AAAA", 0).unwrap();
+        file.write(&cx, b"BB", 1).unwrap();
+
+        let mut buf = [0u8; 4];
+        file.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(&buf, b"ABBA", "bead_id={VFS_BEAD} case=overwrite_in_place");
+    }
+
+    #[test]
+    fn test_vfs_contract_sector_size_and_characteristics() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (file, _) = vfs.open(&cx, Some(Path::new("props.db")), flags).unwrap();
+
+        assert!(
+            file.sector_size() > 0,
+            "bead_id={VFS_BEAD} case=sector_size_positive"
+        );
+        let _ = file.device_characteristics();
+    }
+
+    #[test]
+    fn test_vfs_contract_is_memory() {
+        let vfs = make_vfs();
+        assert!(
+            vfs.is_memory(),
+            "bead_id={VFS_BEAD} case=is_memory_true_for_memory_vfs"
+        );
+    }
+
+    #[test]
+    fn test_vfs_contract_truncate_then_read_zeros() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs
+            .open(&cx, Some(Path::new("trunc_zero.db")), flags)
+            .unwrap();
+
+        file.write(&cx, &[0xFF; 8192], 0).unwrap();
+        file.truncate(&cx, 4096).unwrap();
+
+        let size = file.file_size(&cx).unwrap();
+        assert_eq!(size, 4096, "bead_id={VFS_BEAD} case=truncate_size");
+
+        let mut buf = [0xFF_u8; 4096];
+        let n = file.read(&cx, &mut buf, 4096).unwrap();
+        assert_eq!(
+            n, 0,
+            "bead_id={VFS_BEAD} case=read_past_truncation_returns_zero_bytes"
+        );
+    }
+
+    #[test]
+    fn test_vfs_contract_vfs_name() {
+        let vfs = make_vfs();
+        let name = vfs.name();
+        assert!(
+            !name.is_empty(),
+            "bead_id={VFS_BEAD} case=vfs_name_non_empty"
+        );
+    }
+
+    #[test]
+    fn test_vfs_contract_delete_then_access_is_gone() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let path = Path::new("delete_then_access.db");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        file.write(&cx, b"data", 0).unwrap();
+        file.close(&cx).unwrap();
+
+        assert!(vfs.access(&cx, path, AccessFlags::EXISTS).unwrap());
+        vfs.delete(&cx, path, false).unwrap();
+        assert!(
+            !vfs.access(&cx, path, AccessFlags::EXISTS).unwrap(),
+            "bead_id={VFS_BEAD} case=delete_then_access_is_gone"
+        );
+    }
 }

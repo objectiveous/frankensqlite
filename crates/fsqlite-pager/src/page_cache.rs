@@ -1495,6 +1495,9 @@ impl FlatPageSlots {
             return Err(buf); // Probe chain exhausted with no available slot.
         };
 
+        // Hold the payload lock before publishing pgno: readers that observe
+        // the new page number must block until the page bytes are installed.
+        let mut data_guard = self.slots[avail_idx].data.lock();
         match self.slots[avail_idx].pgno.compare_exchange(
             expected,
             pgno,
@@ -1502,7 +1505,7 @@ impl FlatPageSlots {
             Ordering::Relaxed,
         ) {
             Ok(_) => {
-                *self.slots[avail_idx].data.lock() = Some(CachedPageEntry::new(buf));
+                *data_guard = Some(CachedPageEntry::new(buf));
                 self.count.fetch_add(1, Ordering::Relaxed);
                 self.admits.fetch_add(1, Ordering::Relaxed);
                 Ok(true)
@@ -3106,6 +3109,7 @@ mod tests {
     const BEAD_ID: &str = "bd-22n.2";
     const BEAD_TRACK_F: &str = "bd-pm1zd";
     const BEAD_TRACK_Q: &str = "bd-aztlm";
+    const BEAD_TZLZB: &str = "bd-tzlzb";
     const BEAD_CACHE_MONITOR: &str = "bd-t6sv2.8";
 
     fn elapsed_ns(duration: Duration) -> u64 {
@@ -4965,6 +4969,52 @@ mod tests {
         assert_eq!(
             snapshot.page_no, new_page,
             "snapshot must not pair a stale page number with a newer slot entry"
+        );
+    }
+
+    #[test]
+    fn test_atomic_slot_publish_waits_for_payload_install() {
+        let slots = std::sync::Arc::new(FlatPageSlots::new(8));
+        let page_no = PageNumber::ONE;
+        let slot_idx = slots.hash_pgno(page_no.get());
+        let slot = &slots.slots[slot_idx];
+        let guard = slot.data.lock();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let thread_slots = std::sync::Arc::clone(&slots);
+        let thread_start = std::sync::Arc::clone(&start);
+
+        let handle = std::thread::spawn(move || {
+            thread_start.wait();
+            let mut buf = PageBuf::new(PageSize::DEFAULT);
+            buf.as_mut_slice().fill(page_pattern(page_no));
+            thread_slots
+                .try_insert(page_no, buf)
+                .expect("atomic slot insert should stay in flat slots")
+        });
+
+        start.wait();
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(20) {
+            assert_ne!(
+                slot.pgno.load(Ordering::Acquire),
+                page_no.get(),
+                "bead_id={BEAD_TZLZB} case=publish_after_payload_install"
+            );
+            std::thread::yield_now();
+        }
+
+        drop(guard);
+        assert!(
+            handle.join().expect("slot insert thread must not panic"),
+            "bead_id={BEAD_TZLZB} case=insert_new_after_payload_lock_released"
+        );
+        let copy = slots
+            .get_copy(page_no)
+            .expect("published page should be readable after payload install");
+        assert_eq!(
+            copy[0],
+            page_pattern(page_no),
+            "bead_id={BEAD_TZLZB} case=published_payload_matches"
         );
     }
 

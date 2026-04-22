@@ -14237,7 +14237,6 @@ fn test_conformance_collate_nocase_ops_s69cj() {
 // ── s69cj2: COLLATE NOCASE MIN/MAX aggregates ──
 
 #[test]
-#[ignore = "VDBE aggregate path does not propagate column collation to MIN/MAX comparison opcodes"]
 fn test_conformance_collate_nocase_min_max_s69cj2() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();

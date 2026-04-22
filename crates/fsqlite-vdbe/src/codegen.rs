@@ -8254,7 +8254,9 @@ fn parse_aggregate_columns(
                             // Resolve collation for the aggregate argument column.
                             // Explicit COLLATE in the expression takes priority,
                             // otherwise inherit from the column's schema definition.
-                            let agg_coll = if *distinct {
+                            let needs_collation =
+                                *distinct || canon_name == "MIN" || canon_name == "MAX";
+                            let agg_coll = if needs_collation {
                                 expr_collation_for_agg(&exprs[0], col_idx, table)
                             } else {
                                 None

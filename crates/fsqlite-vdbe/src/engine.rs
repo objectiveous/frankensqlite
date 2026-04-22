@@ -10688,7 +10688,21 @@ impl VdbeEngine {
 
                     observe_execution_cancellation(&execution_cx)?;
                     if should_step {
-                        ctx.func.step(&mut ctx.state, &args)?;
+                        let fn_lower = func_name.to_ascii_lowercase();
+                        if agg_collation.is_some()
+                            && (fn_lower == "min" || fn_lower == "max")
+                            && !args.is_empty()
+                            && !args[0].is_null()
+                        {
+                            agg_step_min_max_collated(
+                                &mut ctx.state,
+                                &args[0],
+                                fn_lower == "max",
+                                agg_collation.unwrap_or("BINARY"),
+                            );
+                        } else {
+                            ctx.func.step(&mut ctx.state, &args)?;
+                        }
                     }
                     observe_execution_cancellation(&execution_cx)?;
                     pc += 1;
@@ -13881,6 +13895,34 @@ fn builtin_collation_compare_text(left: &str, right: &str, coll_name: &str) -> O
         );
     }
     None
+}
+
+fn cmp_sqlite_values_collated(a: &SqliteValue, b: &SqliteValue, coll: &str) -> Ordering {
+    match (a, b) {
+        (SqliteValue::Text(l), SqliteValue::Text(r)) => builtin_collation_compare_text(l, r, coll)
+            .unwrap_or_else(|| l.as_bytes().cmp(r.as_bytes())),
+        _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+    }
+}
+
+fn agg_step_min_max_collated(
+    state: &mut Box<dyn Any + Send>,
+    candidate: &SqliteValue,
+    is_max: bool,
+    coll: &str,
+) {
+    let current: &mut Option<SqliteValue> = state
+        .downcast_mut()
+        .expect("MIN/MAX aggregate state must be Option<SqliteValue>");
+    match current {
+        None => *current = Some(candidate.clone()),
+        &mut Some(ref cur) => {
+            let ord = cmp_sqlite_values_collated(candidate, cur, coll);
+            if (is_max && ord == Ordering::Greater) || (!is_max && ord == Ordering::Less) {
+                *current = Some(candidate.clone());
+            }
+        }
+    }
 }
 
 fn compare_ascii_nocase_bytes(left: &[u8], right: &[u8]) -> Ordering {

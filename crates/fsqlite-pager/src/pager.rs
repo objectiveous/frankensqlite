@@ -18912,6 +18912,18 @@ mod tests {
         let pager = SimplePager::open(vfs, Path::new("/:memory:"), PageSize::DEFAULT).unwrap();
         let cx = Cx::new();
 
+        // Concurrent rollback keeps `next_page` advanced (see the comment at
+        // the "Concurrent: next_page is NOT reset" branch of rollback) so a
+        // later writer in bump-only mode cannot drift into the freelist. The
+        // test relies on that invariant specifically — Immediate rollback
+        // rewinds next_page, so it would be a weaker check.
+        //
+        // The second allocate in Concurrent mode batches
+        // PAGE_LEASE_BATCH_SIZE pages (one returned, the rest leased). After
+        // rollback the bump counter has advanced by exactly
+        // PAGE_LEASE_BATCH_SIZE past the first alloc's page, so the next
+        // alloc lands at page_one + PAGE_LEASE_BATCH_SIZE + 1 (the
+        // "already_allocated" branch also applied on the second call).
         let abandoned_pages = {
             let mut abandoned = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
             let page_one = abandoned.allocate_page(&cx).unwrap();
@@ -18927,7 +18939,10 @@ mod tests {
             "bead_id={BEAD_ID} case=memory_db_post_rollback_allocate_skips_page_one_conflict_tracking"
         );
         let allocated = txn.allocate_page(&cx).unwrap();
-        let expected = PageNumber::new(abandoned_pages[1].get() + 1).unwrap();
+        // next_page after rollback = page_one + 1 (first alloc, batch=1)
+        //                           + PAGE_LEASE_BATCH_SIZE (second alloc, batch=lease_size).
+        let expected_next_page = abandoned_pages[0].get() + 1 + PAGE_LEASE_BATCH_SIZE;
+        let expected = PageNumber::new(expected_next_page).unwrap();
         assert!(
             !abandoned_pages.contains(&allocated),
             "bead_id={BEAD_ID} case=memory_db_allocator_skips_freelist_after_rollback allocated={} abandoned=({}, {})",
@@ -21054,16 +21069,21 @@ mod tests {
             final_bytes.as_slice(),
             "bead_id={TRACK_U_BEAD_ID} case=double_write_keeps_last_page_image"
         );
+        // bd-3wop3.8 (0a3e90fb): db_growth no longer emits a synthetic Page-1
+        // metadata frame unless the transaction explicitly dirties Page 1
+        // (schema change, VACUUM, etc.). A pure-data double-write allocates
+        // only non-Page-1 pages, so Page 1 must NOT appear in the WAL frame
+        // stream.
         assert_eq!(
             written
                 .iter()
                 .filter(|(page_no, _, _)| *page_no == PageNumber::ONE.get())
                 .count(),
-            1,
-            "bead_id={TRACK_U_BEAD_ID} case=double_write_emits_single_page_one_metadata_frame"
+            0,
+            "bead_id={TRACK_U_BEAD_ID} case=double_write_emits_no_synthetic_page_one_frame"
         );
 
-        track_u_log_counts("dirty_bitmap_double_write", 1, 1, page_frames.len());
+        track_u_log_counts("dirty_bitmap_double_write", 1, 0, page_frames.len());
     }
 
     #[test]
@@ -21112,13 +21132,17 @@ mod tests {
             flushed_pages, expected_pages,
             "bead_id={TRACK_U_BEAD_ID} case=commit_flushes_every_dirty_page_once"
         );
+        // bd-3wop3.8 (0a3e90fb): db_growth no longer emits a synthetic Page-1
+        // metadata frame. The test commits 100 non-Page-1 page writes with no
+        // schema changes, so Page 1 stays clean and MUST NOT appear in the
+        // WAL frame stream.
         assert_eq!(
             written
                 .iter()
                 .filter(|(page_no, _, _)| *page_no == PageNumber::ONE.get())
                 .count(),
-            1,
-            "bead_id={TRACK_U_BEAD_ID} case=commit_flush_emits_single_page_one_metadata_frame"
+            0,
+            "bead_id={TRACK_U_BEAD_ID} case=commit_flush_emits_no_synthetic_page_one_frame"
         );
 
         track_u_log_counts(

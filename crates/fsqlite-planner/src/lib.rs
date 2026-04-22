@@ -9632,6 +9632,7 @@ mod probe_tests {
             left: col(col_name),
             op: AstBinaryOp::Eq,
             right: lit_int(val),
+            span: Span::ZERO,
         }
     }
 
@@ -9674,9 +9675,13 @@ mod probe_tests {
         }];
         let indexes = [IndexInfo {
             name: "idx_name".to_owned(),
+            table: "t".to_owned(),
             columns: vec!["name".to_owned()],
-            is_unique: false,
-            expressions: vec![],
+            unique: false,
+            n_pages: 1,
+            source: StatsSource::Heuristic,
+            partial_where: None,
+            expression_columns: vec![],
         }];
         let ap = AccessPath {
             table: "t".to_owned(),
@@ -9703,11 +9708,13 @@ mod probe_tests {
             left: col("age"),
             op: AstBinaryOp::Gt,
             right: lit_int(18),
+            span: Span::ZERO,
         };
         let lt_expr = Expr::BinaryOp {
             left: col("age"),
             op: AstBinaryOp::Le,
             right: lit_int(65),
+            span: Span::ZERO,
         };
         let terms = [
             WhereTerm {
@@ -9729,9 +9736,13 @@ mod probe_tests {
         ];
         let indexes = [IndexInfo {
             name: "idx_age".to_owned(),
+            table: "t".to_owned(),
             columns: vec!["age".to_owned()],
-            is_unique: false,
-            expressions: vec![],
+            unique: false,
+            n_pages: 1,
+            source: StatsSource::Heuristic,
+            partial_where: None,
+            expression_columns: vec![],
         }];
         let ap = AccessPath {
             table: "t".to_owned(),

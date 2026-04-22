@@ -19766,6 +19766,198 @@ mod tests {
     }
 
     #[test]
+    fn test_preformatted_insert_record_stores_null_for_ipk_payload() {
+        let schema = schema_with_ipk_alias();
+        let table = &schema[0];
+        let row_values = vec![
+            Expr::Literal(Literal::Integer(42), Span::ZERO),
+            Expr::Literal(Literal::String("payload".to_owned()), Span::ZERO),
+        ];
+
+        let record = try_build_preformatted_insert_record(&row_values, table, None)
+            .expect("literal IPK row should preformat");
+        let parsed = fsqlite_types::record::parse_record(&record)
+            .expect("preformatted record should decode");
+
+        assert_eq!(
+            parsed,
+            vec![
+                SqliteValue::Null,
+                SqliteValue::Text(SmallText::new("payload")),
+            ],
+            "INTEGER PRIMARY KEY aliases must remain rowid keys, not payload values"
+        );
+    }
+
+    #[test]
+    fn test_preformatted_insert_record_honors_lowercase_affinity_chars() {
+        let schema = vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![ColumnInfo::basic("a", 'd', false)],
+            indexes: vec![],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }];
+        let row_values = vec![Expr::Literal(Literal::String("42".to_owned()), Span::ZERO)];
+
+        let record = try_build_preformatted_insert_record(&row_values, &schema[0], None)
+            .expect("literal row should preformat");
+        let parsed = fsqlite_types::record::parse_record(&record)
+            .expect("preformatted record should decode");
+
+        assert_eq!(
+            parsed,
+            vec![SqliteValue::Integer(42)],
+            "lowercase INTEGER affinity must not silently fall back to BLOB affinity"
+        );
+    }
+
+    #[test]
+    fn test_preformatted_insert_record_omitted_default_column_falls_back() {
+        let schema = vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("a", 'D', false),
+                ColumnInfo {
+                    name: "b".to_owned(),
+                    affinity: 'D',
+                    is_ipk: false,
+                    type_name: None,
+                    notnull: false,
+                    unique: false,
+                    default_value: Some("7".to_owned()),
+                    strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                },
+            ],
+            indexes: vec![],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }];
+        let row_values = vec![Expr::Literal(Literal::Integer(1), Span::ZERO)];
+        let mapping = [Some(0), None];
+
+        assert!(
+            try_build_preformatted_insert_record(&row_values, &schema[0], Some(&mapping)).is_none(),
+            "omitted non-IPK columns must stay on the runtime DEFAULT path"
+        );
+    }
+
+    #[test]
+    fn test_preformatted_insert_record_distinguishes_explicit_null_from_omitted_column() {
+        let schema = vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("a", 'D', false),
+                ColumnInfo {
+                    name: "b".to_owned(),
+                    affinity: 'D',
+                    is_ipk: false,
+                    type_name: None,
+                    notnull: false,
+                    unique: false,
+                    default_value: Some("7".to_owned()),
+                    strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                },
+            ],
+            indexes: vec![],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }];
+        let explicit_null_values = vec![
+            Expr::Literal(Literal::Integer(1), Span::ZERO),
+            Expr::Literal(Literal::Null, Span::ZERO),
+        ];
+        let omitted_values = vec![Expr::Literal(Literal::Integer(1), Span::ZERO)];
+        let omitted_mapping = [Some(0), None];
+
+        let record = try_build_preformatted_insert_record(&explicit_null_values, &schema[0], None)
+            .expect("explicit NULL is a fully determined stored value");
+        let parsed = fsqlite_types::record::parse_record(&record)
+            .expect("preformatted record should decode");
+        assert_eq!(parsed, vec![SqliteValue::Integer(1), SqliteValue::Null]);
+        assert!(
+            try_build_preformatted_insert_record(
+                &omitted_values,
+                &schema[0],
+                Some(&omitted_mapping),
+            )
+            .is_none(),
+            "omitted columns must not be treated as explicit NULL literals"
+        );
+    }
+
+    #[test]
+    fn test_codegen_insert_mixed_preformatable_rows_keeps_runtime_fallback() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![
+                vec![
+                    Expr::Literal(Literal::Integer(1), Span::ZERO),
+                    Expr::Literal(Literal::String("literal".to_owned()), Span::ZERO),
+                ],
+                vec![
+                    Expr::BinaryOp {
+                        left: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                        op: AstBinaryOp::Add,
+                        right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                        span: Span::ZERO,
+                    },
+                    Expr::Literal(Literal::String("runtime".to_owned()), Span::ZERO),
+                ],
+            ]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let preformatted_inserts = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Insert && matches!(op.p4, P4::Blob(_)))
+            .count();
+        let runtime_records = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::MakeRecord)
+            .count();
+
+        assert_eq!(
+            preformatted_inserts, 1,
+            "only the literal row should carry a baked record"
+        );
+        assert_eq!(
+            runtime_records, 1,
+            "the non-literal row must still use runtime MakeRecord"
+        );
+    }
+
+    #[test]
     fn test_emit_limit_expr_large_integer_literal_uses_int64_opcode() {
         let big = 4_102_444_800_000_000_i64;
         let mut b = ProgramBuilder::new();
@@ -29153,13 +29345,25 @@ mod tests {
         codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
         let ops = opcode_sequence(&prog);
+        let insert = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Insert)
+            .expect("IPK literal INSERT should emit Insert");
 
         assert!(ops.contains(&Opcode::IsNull));
         assert!(ops.contains(&Opcode::Copy));
-        assert!(ops.contains(&Opcode::Blob));
+        assert!(
+            !ops.contains(&Opcode::Blob),
+            "IPK preformatted record should be carried by Insert.p4, not a Blob register"
+        );
         assert!(
             !ops.contains(&Opcode::MakeRecord),
             "IPK literal INSERT should still preformat the table record payload"
+        );
+        assert!(
+            matches!(&insert.p4, P4::Blob(record) if !record.is_empty()),
+            "IPK literal Insert should carry the preformatted payload in P4"
         );
     }
 

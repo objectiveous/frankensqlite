@@ -833,6 +833,7 @@ fn init_leaf_table_page(
     txn.write_page(cx, page_no, &page)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn init_leaf_index_page(
     cx: &Cx,
     txn: &mut impl TransactionHandle,

@@ -10,7 +10,7 @@ Usage:
 
 Environment:
   FSQLITE_WASM_TARGET     wasm-pack target: bundler | web | nodejs | deno | no-modules
-                          default: bundler
+                          default: web
   FSQLITE_WASM_MODE       wasm-pack install mode: normal | no-install | force
                           default: normal
   FSQLITE_WASM_SCOPE      temporary wasm-pack npm scope before normalization
@@ -50,7 +50,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 crate_dir="${repo_root}/crates/fsqlite-wasm"
 out_dir_input="${1:-${repo_root}/target/fsqlite-wasm-pkg}"
 out_dir="$(realpath -m "${out_dir_input}")"
-target="${FSQLITE_WASM_TARGET:-bundler}"
+target="${FSQLITE_WASM_TARGET:-web}"
 mode="${FSQLITE_WASM_MODE:-normal}"
 scope="${FSQLITE_WASM_SCOPE:-frankensqlite}"
 package_name="${FSQLITE_WASM_PKG_NAME:-@frankensqlite/core}"

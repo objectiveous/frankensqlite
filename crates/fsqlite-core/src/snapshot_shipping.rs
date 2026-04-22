@@ -356,34 +356,41 @@ impl SnapshotSender {
             }
             data
         } else {
-            // Repair symbol: use RaptorQ SystematicEncoder from asupersync.
-            // NOTE: Encoder is rebuilt per-symbol (expensive for large K).
-            // See replication_sender.rs for the same pattern and caching note.
-            use asupersync::raptorq::systematic::SystematicEncoder;
-
             let seed = derive_seed_from_changeset_id(&changeset_id);
-            let source_symbols: Vec<Vec<u8>> = (0..k_source as usize)
-                .map(|i| {
-                    let start = i * t;
-                    let end = (start + t).min(changeset.len());
-                    let mut sym = vec![0_u8; t];
-                    let available = end.saturating_sub(start);
-                    if available > 0 {
-                        sym[..available].copy_from_slice(&changeset[start..end]);
-                    }
-                    sym
-                })
-                .collect();
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                // Repair symbol: use RaptorQ SystematicEncoder from asupersync.
+                // NOTE: Encoder is rebuilt per-symbol (expensive for large K).
+                // See replication_sender.rs for the same pattern and caching note.
+                use asupersync::raptorq::systematic::SystematicEncoder;
 
-            match SystematicEncoder::new(&source_symbols, t, seed) {
-                Some(encoder) => {
-                    let repair_esi = isi - k_source;
-                    encoder.repair_symbol(repair_esi)
+                let source_symbols: Vec<Vec<u8>> = (0..k_source as usize)
+                    .map(|i| {
+                        let start = i * t;
+                        let end = (start + t).min(changeset.len());
+                        let mut sym = vec![0_u8; t];
+                        let available = end.saturating_sub(start);
+                        if available > 0 {
+                            sym[..available].copy_from_slice(&changeset[start..end]);
+                        }
+                        sym
+                    })
+                    .collect();
+
+                match SystematicEncoder::new(&source_symbols, t, seed) {
+                    Some(encoder) => {
+                        let repair_esi = isi - k_source;
+                        encoder.repair_symbol(repair_esi)
+                    }
+                    None => {
+                        // Fallback for degenerate parameters.
+                        crate::replication_sender::generate_deterministic_placeholder(seed, isi, t)
+                    }
                 }
-                None => {
-                    // Fallback for degenerate parameters.
-                    crate::replication_sender::generate_deterministic_placeholder(seed, isi, t)
-                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                crate::replication_sender::generate_deterministic_placeholder(seed, isi, t)
             }
         };
 

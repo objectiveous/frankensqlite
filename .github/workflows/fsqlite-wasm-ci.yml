@@ -91,7 +91,7 @@ jobs:
             echo "- cargo_package: \`fsqlite-wasm\`"
             echo "- npm_package_name: \`${package_name}\`"
             echo "- npm_package_dir: \`${pkg_dir}\`"
-            echo "- build_target: \`${FSQLITE_WASM_TARGET:-bundler}\`"
+            echo "- build_target: \`${FSQLITE_WASM_TARGET:-web}\`"
             echo "- packed_archive: \`${packed_file}\`"
             echo
             echo "## Generated files"

@@ -1292,43 +1292,56 @@ impl ReplicationSender {
             // Remaining bytes are zero-padded (per RFC 6330 symbol alignment).
             data
         } else {
-            // Repair symbol: use asupersync's RaptorQ SystematicEncoder.
-            //
-            // IMPORTANT: The encoder is rebuilt for each repair symbol call.
-            // SystematicEncoder::new() solves a constraint matrix, which is
-            // O(K^2) or worse. For production use with many repair symbols per
-            // shard, the encoder should be cached in EncodingSession (requires
-            // making EncodingSession non-Debug or wrapping the encoder).
-            // This is correct but slow for large K_source values.
-            use asupersync::raptorq::systematic::SystematicEncoder;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                // Repair symbol: use asupersync's RaptorQ SystematicEncoder.
+                //
+                // IMPORTANT: The encoder is rebuilt for each repair symbol call.
+                // SystematicEncoder::new() solves a constraint matrix, which is
+                // O(K^2) or worse. For production use with many repair symbols per
+                // shard, the encoder should be cached in EncodingSession (requires
+                // making EncodingSession non-Debug or wrapping the encoder).
+                // This is correct but slow for large K_source values.
+                use asupersync::raptorq::systematic::SystematicEncoder;
 
-            let source_symbols: Vec<Vec<u8>> = (0..shard.k_source as usize)
-                .map(|i| {
-                    let start = i * t;
-                    let end = (start + t).min(shard.changeset_bytes.len());
-                    let mut sym = vec![0_u8; t];
-                    let available = end.saturating_sub(start);
-                    if available > 0 {
-                        sym[..available].copy_from_slice(&shard.changeset_bytes[start..end]);
+                let source_symbols: Vec<Vec<u8>> = (0..shard.k_source as usize)
+                    .map(|i| {
+                        let start = i * t;
+                        let end = (start + t).min(shard.changeset_bytes.len());
+                        let mut sym = vec![0_u8; t];
+                        let available = end.saturating_sub(start);
+                        if available > 0 {
+                            sym[..available].copy_from_slice(&shard.changeset_bytes[start..end]);
+                        }
+                        sym
+                    })
+                    .collect();
+
+                match SystematicEncoder::new(&source_symbols, t, shard.seed) {
+                    Some(encoder) => {
+                        let repair_esi = isi - shard.k_source;
+                        encoder.repair_symbol(repair_esi)
                     }
-                    sym
-                })
-                .collect();
-
-            match SystematicEncoder::new(&source_symbols, t, shard.seed) {
-                Some(encoder) => {
-                    let repair_esi = isi - shard.k_source;
-                    encoder.repair_symbol(repair_esi)
+                    None => {
+                        warn!(
+                            bead_id = BEAD_ID,
+                            isi,
+                            shard_index = session.current_shard,
+                            "RaptorQ encoder construction failed; using placeholder repair symbol"
+                        );
+                        generate_deterministic_placeholder(shard.seed, isi, t)
+                    }
                 }
-                None => {
-                    warn!(
-                        bead_id = BEAD_ID,
-                        isi,
-                        shard_index = session.current_shard,
-                        "RaptorQ encoder construction failed; using placeholder repair symbol"
-                    );
-                    generate_deterministic_placeholder(shard.seed, isi, t)
-                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                warn!(
+                    bead_id = BEAD_ID,
+                    isi,
+                    shard_index = session.current_shard,
+                    "RaptorQ encoder is native-only; using placeholder repair symbol"
+                );
+                generate_deterministic_placeholder(shard.seed, isi, t)
             }
         };
 

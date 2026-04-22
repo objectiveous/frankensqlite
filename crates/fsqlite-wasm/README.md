@@ -9,7 +9,7 @@ APIs implemented in [`src/lib.rs`](./src/lib.rs).
 
 ## Package Build
 
-Build a publishable package into `target/fsqlite-wasm-pkg/`:
+Build the primary browser ES module package into `target/fsqlite-wasm-pkg/`:
 
 ```bash
 ./scripts/build_fsqlite_wasm_package.sh
@@ -18,7 +18,7 @@ Build a publishable package into `target/fsqlite-wasm-pkg/`:
 Choose a different output directory or `wasm-pack` target:
 
 ```bash
-FSQLITE_WASM_TARGET=web ./scripts/build_fsqlite_wasm_package.sh target/fsqlite-wasm-web
+FSQLITE_WASM_TARGET=bundler ./scripts/build_fsqlite_wasm_package.sh target/fsqlite-wasm-bundler
 FSQLITE_WASM_TARGET=nodejs ./scripts/build_fsqlite_wasm_package.sh target/fsqlite-wasm-node
 ```
 

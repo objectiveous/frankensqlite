@@ -1479,7 +1479,8 @@ fn wasm_linear_memory_bytes() -> Option<usize> {
     let memory = wasm_bindgen::memory()
         .dyn_into::<js_sys::WebAssembly::Memory>()
         .ok()?;
-    usize::try_from(memory.buffer().byte_length()).ok()
+    let buffer = memory.buffer().dyn_into::<js_sys::ArrayBuffer>().ok()?;
+    usize::try_from(buffer.byte_length()).ok()
 }
 
 #[cfg(not(target_arch = "wasm32"))]

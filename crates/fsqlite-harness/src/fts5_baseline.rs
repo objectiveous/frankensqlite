@@ -192,7 +192,7 @@ pub struct StatementReport {
 }
 
 /// Normalized statement outcome.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BaselineOutcome {
     /// Statement returned rows.
@@ -279,14 +279,53 @@ struct ScenarioSpec {
     tokenizer: &'static str,
     detail_mode: &'static str,
     columnsize_mode: &'static str,
-    locale_enabled: bool,
-    tokendata_enabled: bool,
     rootpage_mode: &'static str,
     command_surface: Vec<&'static str>,
-    file_backed: bool,
-    reopen_before_workload: bool,
+    flags: ScenarioFlags,
     setup: Vec<SqlStep>,
     workload: Vec<SqlStep>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ScenarioFlags(u8);
+
+impl ScenarioFlags {
+    const FILE_BACKED: u8 = 0b0001;
+    const LOCALE_ENABLED: u8 = 0b0010;
+    const REOPEN_BEFORE_WORKLOAD: u8 = 0b0100;
+    const TOKENDATA_ENABLED: u8 = 0b1000;
+
+    const fn empty() -> Self {
+        Self(0)
+    }
+
+    const fn file_backed(self) -> Self {
+        Self(self.0 | Self::FILE_BACKED)
+    }
+
+    const fn reopen_before_workload(self) -> Self {
+        Self(self.0 | Self::REOPEN_BEFORE_WORKLOAD)
+    }
+
+    const fn has(self, flag: u8) -> bool {
+        self.0 & flag != 0
+    }
+
+    const fn is_file_backed(self) -> bool {
+        self.has(Self::FILE_BACKED)
+    }
+
+    const fn is_locale_enabled(self) -> bool {
+        self.has(Self::LOCALE_ENABLED)
+    }
+
+    const fn is_reopen_before_workload(self) -> bool {
+        self.has(Self::REOPEN_BEFORE_WORKLOAD)
+    }
+
+    const fn is_tokendata_enabled(self) -> bool {
+        self.has(Self::TOKENDATA_ENABLED)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -319,8 +358,8 @@ impl BackendKind {
 }
 
 enum Engine {
-    FrankenSqlite(fsqlite::Connection),
-    StockSqlite(rusqlite::Connection),
+    FrankenSqlite(Box<fsqlite::Connection>),
+    StockSqlite(Box<rusqlite::Connection>),
 }
 
 impl Engine {
@@ -331,14 +370,17 @@ impl Engine {
                     .map(path_to_string)
                     .unwrap_or_else(|| ":memory:".to_owned());
                 fsqlite::Connection::open(target)
+                    .map(Box::new)
                     .map(Self::FrankenSqlite)
                     .map_err(|error| error.to_string())
             }
             BackendKind::StockSqlite => match path {
                 Some(path) => rusqlite::Connection::open(path)
+                    .map(Box::new)
                     .map(Self::StockSqlite)
                     .map_err(|error| error.to_string()),
                 None => rusqlite::Connection::open_in_memory()
+                    .map(Box::new)
                     .map(Self::StockSqlite)
                     .map_err(|error| error.to_string()),
             },
@@ -526,12 +568,9 @@ fn scenario_specs() -> Vec<ScenarioSpec> {
             tokenizer: "porter",
             detail_mode: "full",
             columnsize_mode: "table",
-            locale_enabled: false,
-            tokendata_enabled: false,
             rootpage_mode: "stock_zero_vs_current_materialized",
             command_surface: vec!["match", "highlight", "schema-rootpage"],
-            file_backed: false,
-            reopen_before_workload: false,
+            flags: ScenarioFlags::empty(),
             setup: vec![
                 step(
                     "create_docs",
@@ -585,12 +624,11 @@ fn scenario_specs() -> Vec<ScenarioSpec> {
             tokenizer: "unicode61",
             detail_mode: "full",
             columnsize_mode: "table",
-            locale_enabled: false,
-            tokendata_enabled: false,
             rootpage_mode: "stock_zero_vs_current_materialized",
             command_surface: vec!["open", "reopen", "match", "schema-shadow-table-list"],
-            file_backed: true,
-            reopen_before_workload: true,
+            flags: ScenarioFlags::empty()
+                .file_backed()
+                .reopen_before_workload(),
             setup: vec![
                 step(
                     "create_docs",
@@ -635,12 +673,9 @@ fn scenario_specs() -> Vec<ScenarioSpec> {
             tokenizer: "porter",
             detail_mode: "full",
             columnsize_mode: "table",
-            locale_enabled: false,
-            tokendata_enabled: false,
             rootpage_mode: "stock_zero_vs_current_materialized",
             command_surface: vec!["match", "optimize", "count"],
-            file_backed: false,
-            reopen_before_workload: false,
+            flags: ScenarioFlags::empty(),
             setup: vec![
                 step(
                     "create_docs",
@@ -680,12 +715,9 @@ fn scenario_specs() -> Vec<ScenarioSpec> {
             tokenizer: "unicode61",
             detail_mode: "full",
             columnsize_mode: "table",
-            locale_enabled: false,
-            tokendata_enabled: false,
             rootpage_mode: "stock_zero_vs_current_materialized",
             command_surface: vec!["rebuild", "match", "schema-shadow-table-list"],
-            file_backed: false,
-            reopen_before_workload: false,
+            flags: ScenarioFlags::empty(),
             setup: vec![
                 step(
                     "create_content_table",
@@ -739,8 +771,6 @@ fn scenario_specs() -> Vec<ScenarioSpec> {
             tokenizer: "unicode61",
             detail_mode: "full",
             columnsize_mode: "table",
-            locale_enabled: false,
-            tokendata_enabled: false,
             rootpage_mode: "stock_zero_vs_current_materialized",
             command_surface: vec![
                 "insert",
@@ -750,8 +780,7 @@ fn scenario_specs() -> Vec<ScenarioSpec> {
                 "integrity-check",
                 "optimize",
             ],
-            file_backed: false,
-            reopen_before_workload: false,
+            flags: ScenarioFlags::empty(),
             setup: vec![
                 step(
                     "create_docs",
@@ -842,8 +871,8 @@ fn run_scenario(
         tokenizer: scenario.tokenizer.to_owned(),
         detail_mode: scenario.detail_mode.to_owned(),
         columnsize_mode: scenario.columnsize_mode.to_owned(),
-        locale_enabled: scenario.locale_enabled,
-        tokendata_enabled: scenario.tokendata_enabled,
+        locale_enabled: scenario.flags.is_locale_enabled(),
+        tokendata_enabled: scenario.flags.is_tokendata_enabled(),
         rootpage_mode: scenario.rootpage_mode.to_owned(),
         command_surface: scenario
             .command_surface
@@ -862,7 +891,8 @@ fn run_backend(
     backend: BackendKind,
 ) -> Result<BackendReport, String> {
     let database_path = scenario
-        .file_backed
+        .flags
+        .is_file_backed()
         .then(|| backend_db_path(bundle_dir, scenario, backend));
     if let Some(parent) = database_path.as_ref().and_then(|path| path.parent()) {
         fs::create_dir_all(parent).map_err(|error| {
@@ -895,7 +925,7 @@ fn run_backend(
     );
     let mut reopen_elapsed_us = None;
 
-    if setup_ok && scenario.reopen_before_workload {
+    if setup_ok && scenario.flags.is_reopen_before_workload() {
         drop(engine);
         let reopen_start = Instant::now();
         let reopened = Engine::open(backend, database_path.as_deref());
@@ -1387,8 +1417,8 @@ fn scenario_context(scenario: &ScenarioSpec, extra: Value) -> Value {
         "prefix_config": "none",
         "detail_mode": scenario.detail_mode,
         "columnsize_mode": scenario.columnsize_mode,
-        "locale_enabled": scenario.locale_enabled,
-        "tokendata_enabled": scenario.tokendata_enabled,
+        "locale_enabled": scenario.flags.is_locale_enabled(),
+        "tokendata_enabled": scenario.flags.is_tokendata_enabled(),
         "command_name": scenario.command_surface.join(","),
         "command_args": "canonical-small-corpus",
         "invariant_ids": ["FTS5-S1.3-STOCK-ORACLE", "FTS5-S1.3-MATERIALIZED-BASELINE"],

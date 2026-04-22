@@ -687,6 +687,7 @@ mod tests {
                 },
             ],
             comparison: None,
+            aggregated_hot_path: None,
         };
         let comparison = BenchmarkComparisonMetadata::anonymous(&summary, mode_id);
         summary.comparison = Some(comparison);

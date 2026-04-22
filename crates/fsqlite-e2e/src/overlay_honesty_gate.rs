@@ -1843,6 +1843,7 @@ mod tests {
                 error: None,
             }],
             comparison: None,
+            aggregated_hot_path: None,
         };
         summary.comparison = Some(BenchmarkComparisonMetadata::anonymous(&summary, mode_id));
         summary

@@ -8218,6 +8218,7 @@ mod tests {
                 peak_ops_per_sec: 100.0,
             },
             comparison: None,
+            aggregated_hot_path: None,
             iterations: vec![IterationRecord {
                 iteration: 0,
                 wall_time_ms,
@@ -8308,6 +8309,7 @@ mod tests {
                 peak_ops_per_sec: median_ops_per_sec,
             },
             comparison: None,
+            aggregated_hot_path: None,
             iterations: vec![IterationRecord {
                 iteration: 0,
                 wall_time_ms: 10,

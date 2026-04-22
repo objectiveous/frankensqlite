@@ -24,7 +24,7 @@ use crate::methodology::{
     EnvironmentMeta, MEASUREMENT_TIME_SECS, MIN_MEASUREMENT_ITERATIONS, MethodologyMeta,
     WARMUP_ITERATIONS,
 };
-use crate::report::EngineRunReport;
+use crate::report::{EngineRunReport, FsqliteHotPathProfile};
 
 // ── Configuration ──────────────────────────────────────────────────────
 
@@ -122,6 +122,13 @@ pub struct BenchmarkSummary {
     /// forced single-writer rows under one mechanically comparable schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comparison: Option<BenchmarkComparisonMetadata>,
+    /// Aggregated FrankenSQLite hot-path profile from the last measurement
+    /// iteration.  Present only for FrankenSQLite runs that capture profiling
+    /// data; always `None` for the SQLite reference engine.  Used by
+    /// [`BenchmarkCounterSchema::from_summary`] to populate `mode_specific`
+    /// counters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregated_hot_path: Option<FsqliteHotPathProfile>,
     /// Per-iteration raw data for downstream analysis.
     pub iterations: Vec<IterationRecord>,
 }
@@ -558,9 +565,120 @@ impl BenchmarkCounterSchema {
                     summary.total_iteration_aborts(),
                 ),
             ],
-            mode_specific: Vec::new(),
+            mode_specific: summary
+                .aggregated_hot_path
+                .as_ref()
+                .map_or_else(Vec::new, mode_specific_counters_from_hot_path),
         }
     }
+}
+
+/// Counter ids emitted as mode-specific advisory detail for FrankenSQLite runs.
+pub const MODE_SPECIFIC_COUNTER_VDBE_OPCODES: &str = "fsqlite.vdbe_opcodes_executed_total";
+pub const MODE_SPECIFIC_COUNTER_VDBE_STATEMENTS: &str = "fsqlite.vdbe_statements_total";
+pub const MODE_SPECIFIC_COUNTER_PARSER_CALLS: &str = "fsqlite.parser_tokenize_calls_total";
+pub const MODE_SPECIFIC_COUNTER_WAL_FRAMES: &str = "fsqlite.wal_frames_written_total";
+pub const MODE_SPECIFIC_COUNTER_WAL_GROUP_COMMITS: &str = "fsqlite.wal_group_commits_total";
+pub const MODE_SPECIFIC_COUNTER_BTREE_SEEKS: &str = "fsqlite.btree_seek_total";
+pub const MODE_SPECIFIC_COUNTER_BTREE_INSERTS: &str = "fsqlite.btree_insert_total";
+pub const MODE_SPECIFIC_COUNTER_BTREE_SPLITS: &str = "fsqlite.btree_page_splits_total";
+pub const MODE_SPECIFIC_COUNTER_VFS_READ_OPS: &str = "fsqlite.vfs_read_ops";
+pub const MODE_SPECIFIC_COUNTER_VFS_WRITE_OPS: &str = "fsqlite.vfs_write_ops";
+pub const MODE_SPECIFIC_COUNTER_RETRY_BUSY: &str = "fsqlite.retry_kind_busy";
+pub const MODE_SPECIFIC_COUNTER_RETRY_BUSY_SNAPSHOT: &str = "fsqlite.retry_kind_busy_snapshot";
+
+fn mode_specific_counters_from_hot_path(
+    profile: &FsqliteHotPathProfile,
+) -> Vec<BenchmarkCounterMetric> {
+    let mut counters = vec![
+        integer_counter(
+            MODE_SPECIFIC_COUNTER_VDBE_OPCODES,
+            "count",
+            "VDBE opcodes executed during profiled run",
+            "sum",
+            profile.vdbe.actual_opcodes_executed_total,
+        ),
+        integer_counter(
+            MODE_SPECIFIC_COUNTER_VDBE_STATEMENTS,
+            "count",
+            "VDBE statements executed during profiled run",
+            "sum",
+            profile.vdbe.actual_statements_total,
+        ),
+        integer_counter(
+            MODE_SPECIFIC_COUNTER_PARSER_CALLS,
+            "count",
+            "parser tokenize calls during profiled run",
+            "sum",
+            profile.parser.tokenize_calls_total,
+        ),
+        integer_counter(
+            MODE_SPECIFIC_COUNTER_WAL_FRAMES,
+            "count",
+            "WAL frames written during profiled run",
+            "sum",
+            profile.wal.frames_written_total,
+        ),
+        integer_counter(
+            MODE_SPECIFIC_COUNTER_WAL_GROUP_COMMITS,
+            "count",
+            "WAL group commits during profiled run",
+            "sum",
+            profile.wal.group_commits_total,
+        ),
+        integer_counter(
+            MODE_SPECIFIC_COUNTER_VFS_READ_OPS,
+            "count",
+            "VFS read operations during profiled run",
+            "sum",
+            profile.vfs.read_ops,
+        ),
+        integer_counter(
+            MODE_SPECIFIC_COUNTER_VFS_WRITE_OPS,
+            "count",
+            "VFS write operations during profiled run",
+            "sum",
+            profile.vfs.write_ops,
+        ),
+        integer_counter(
+            MODE_SPECIFIC_COUNTER_RETRY_BUSY,
+            "count",
+            "BUSY retries by kind during profiled run",
+            "sum",
+            profile.runtime_retry.kind.busy,
+        ),
+        integer_counter(
+            MODE_SPECIFIC_COUNTER_RETRY_BUSY_SNAPSHOT,
+            "count",
+            "BUSY_SNAPSHOT retries by kind during profiled run",
+            "sum",
+            profile.runtime_retry.kind.busy_snapshot,
+        ),
+    ];
+    if let Some(ref btree) = profile.btree {
+        counters.push(integer_counter(
+            MODE_SPECIFIC_COUNTER_BTREE_SEEKS,
+            "count",
+            "B-tree seek operations during profiled run",
+            "sum",
+            btree.seek_total,
+        ));
+        counters.push(integer_counter(
+            MODE_SPECIFIC_COUNTER_BTREE_INSERTS,
+            "count",
+            "B-tree insert operations during profiled run",
+            "sum",
+            btree.insert_total,
+        ));
+        counters.push(integer_counter(
+            MODE_SPECIFIC_COUNTER_BTREE_SPLITS,
+            "count",
+            "B-tree page splits during profiled run",
+            "sum",
+            btree.page_splits_total,
+        ));
+    }
+    counters
 }
 
 /// Build grouped causal scorecards from aligned benchmark rows.
@@ -1198,6 +1316,7 @@ where
     let mut iterations: Vec<IterationRecord> = Vec::with_capacity(config.min_iterations as usize);
     let measurement_start = std::time::Instant::now();
     let time_floor = std::time::Duration::from_secs(config.measurement_time_secs);
+    let mut last_hot_path: Option<FsqliteHotPathProfile> = None;
 
     let mut measurement_idx: u32 = 0;
     loop {
@@ -1206,15 +1325,20 @@ where
         let iter_elapsed = iter_start.elapsed();
 
         let record = match result {
-            Ok(report) => IterationRecord {
-                iteration: measurement_idx,
-                wall_time_ms: duration_to_u64_ms(iter_elapsed),
-                ops_per_sec: report.ops_per_sec,
-                ops_total: report.ops_total,
-                retries: report.retries,
-                aborts: report.aborts,
-                error: report.error.clone(),
-            },
+            Ok(report) => {
+                if let Some(profile) = report.hot_path_profile {
+                    last_hot_path = Some(profile);
+                }
+                IterationRecord {
+                    iteration: measurement_idx,
+                    wall_time_ms: duration_to_u64_ms(iter_elapsed),
+                    ops_per_sec: report.ops_per_sec,
+                    ops_total: report.ops_total,
+                    retries: report.retries,
+                    aborts: report.aborts,
+                    error: report.error.clone(),
+                }
+            }
             Err(e) => IterationRecord {
                 iteration: measurement_idx,
                 wall_time_ms: duration_to_u64_ms(iter_elapsed),
@@ -1264,6 +1388,7 @@ where
         latency,
         throughput,
         comparison: None,
+        aggregated_hot_path: last_hot_path,
         iterations,
     }
 }

@@ -1581,8 +1581,6 @@ pub fn validate_first_committer_wins(
         );
         FcwResult::Clean
     } else {
-        // Sort for deterministic output.
-        conflicting_pages.sort_unstable();
         tracing::warn!(
             conflicting_page_count = conflicting_pages.len(),
             max_conflicting_seq = max_conflicting_seq.get(),

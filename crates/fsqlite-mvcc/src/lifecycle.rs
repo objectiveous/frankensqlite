@@ -924,7 +924,9 @@ impl TransactionManager {
         threshold
     }
 
-    fn enforce_chain_bound_for_page(&self, pgno: PageNumber) -> Result<(), MvccError> {
+    /// Returns the post-enforcement chain length on success so callers can
+    /// skip a redundant `chain_length()` traversal later.
+    fn enforce_chain_bound_for_page(&self, pgno: PageNumber) -> Result<usize, MvccError> {
         let mut chain_len = self.version_store.chain_length(pgno);
         self.record_chain_length_sample(chain_len);
 
@@ -939,7 +941,7 @@ impl TransactionManager {
         }
 
         if chain_len < self.max_chain_length {
-            return Ok(());
+            return Ok(chain_len);
         }
 
         // C7 (bd-l9k8e.7): Opportunistic cleanup instead of blocking.
@@ -970,7 +972,7 @@ impl TransactionManager {
 
         // Below soft threshold: proceed normally.
         if chain_len < self.max_chain_length {
-            return Ok(());
+            return Ok(chain_len);
         }
 
         // Soft bound: proceed even if chain exceeds max_chain_length,
@@ -985,7 +987,7 @@ impl TransactionManager {
                 gc_horizon = horizon.get(),
                 "chain_soft_bound_exceeded_proceeding"
             );
-            return Ok(());
+            return Ok(chain_len);
         }
 
         // Hard limit exceeded: record metric and return Busy.

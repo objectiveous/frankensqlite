@@ -672,7 +672,7 @@ mod tests {
     fn leaf_reuse_profile_tracks_reuse_fallback_and_rebuilds() {
         let _guard = super::LEAF_REUSE_TEST_LOCK
             .lock()
-            .expect("leaf-reuse test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = btree_leaf_reuse_snapshot();
 
         record_no_split_reuse_hit();

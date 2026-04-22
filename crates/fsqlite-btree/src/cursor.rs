@@ -1762,17 +1762,25 @@ impl<P: PageReader> BtCursor<P> {
 
     /// Parse a cell at the given index on the top-of-stack page.
     fn parse_cell_at(&self, entry: &StackEntry, idx: u16) -> Result<CellRef> {
-        let idx_usize = idx as usize;
-        if idx_usize >= entry.cell_pointers.len() {
+        if idx >= entry.header.cell_count {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
                     "cell index {} out of bounds ({})",
-                    idx,
-                    entry.cell_pointers.len()
+                    idx, entry.header.cell_count
                 ),
             });
         }
-        let offset = entry.cell_pointers[idx_usize] as usize;
+        let idx_usize = idx as usize;
+        // Prefer the cached pointer when the stack entry has it materialised
+        // (the common case after `load_page`). Descent-only paths may skip
+        // materialising `cell_pointers` to save work; fall back to reading
+        // the pointer inline from page bytes so we never mis-bound against a
+        // cleared scratch Vec.
+        let offset = if idx_usize < entry.cell_pointers.len() {
+            usize::from(entry.cell_pointers[idx_usize])
+        } else {
+            usize::from(Self::read_stack_entry_cell_pointer_inline(entry, idx)?)
+        };
         CellRef::parse(
             entry.page_data.as_bytes(),
             offset,
@@ -10057,7 +10065,15 @@ mod tests {
     }
 
     #[test]
-    fn test_cursor_delete_after_root_split_defers_root_collapse() {
+    fn test_cursor_delete_after_root_split_preserves_right_subtree_rows() {
+        // After commit 5eed5a0a, table-leaf DELETE uses the defragment-on-delete
+        // strategy (instead of maintaining a freeblock chain) for SQLite
+        // `btreeComputeFreeSpace()` compatibility. Deleting every rowid in the
+        // leftmost leaf of a split root may therefore trigger an eager merge
+        // + balance_shallower that collapses the tree back to a single leaf.
+        // The correctness invariant this test protects is that the
+        // surviving right-subtree rows remain reachable and the cursor
+        // positions cleanly on the successor.
         let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
@@ -10100,19 +10116,12 @@ mod tests {
             cursor.delete(&cx).unwrap();
         }
 
-        let root_data = cursor.pager.read_page(&cx, pn(2)).unwrap();
-        let root_header = BtreePageHeader::parse(&root_data, 0).unwrap();
-        assert!(
-            root_header.page_type.is_interior(),
-            "deferred delete should keep the split root in place, got {:?}",
-            root_header.page_type
-        );
         assert!(cursor.first(&cx).unwrap());
         assert_eq!(cursor.rowid(&cx).unwrap(), leftmost_max_rowid + 1);
     }
 
     #[test]
-    fn test_cursor_delete_defers_rebalance_of_empty_leftmost_leaf() {
+    fn test_cursor_delete_of_empty_leftmost_leaf_keeps_right_subtree_reachable() {
         let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
@@ -10155,13 +10164,9 @@ mod tests {
             cursor.delete(&cx).unwrap();
         }
 
-        let root_data = cursor.pager.read_page(&cx, pn(2)).unwrap();
-        let root_header = BtreePageHeader::parse(&root_data, 0).unwrap();
-        assert!(
-            root_header.page_type.is_interior(),
-            "deferred delete should leave the root interior, got {:?}",
-            root_header.page_type
-        );
+        // DELETE is now eager (commit 5eed5a0a) — the tree may have collapsed
+        // back to a single leaf if the empty left sibling merged with the
+        // right. The correctness invariant: surviving rowids remain reachable.
         assert!(cursor.first(&cx).unwrap());
         assert_eq!(cursor.rowid(&cx).unwrap(), leftmost_max_rowid + 1);
     }
@@ -10301,7 +10306,11 @@ mod tests {
     }
 
     #[test]
-    fn test_table_delete_defers_empty_leaf_rebalance_until_later_cleanup() {
+    fn test_table_delete_all_from_left_leaf_preserves_right_subtree() {
+        // DELETE is eager post-5eed5a0a; after deleting every rowid from the
+        // left leaf, the tree may merge + collapse. The correctness check:
+        // right-subtree rows are still reachable and the cursor lands on the
+        // first surviving rowid.
         let mut store = MemPageStore::new(USABLE);
         store
             .pages
@@ -10322,25 +10331,14 @@ mod tests {
             cursor.delete(&cx).unwrap();
         }
 
-        let root_data = cursor.pager.read_page(&cx, pn(2)).unwrap();
-        let root_header = BtreePageHeader::parse(&root_data, 0).unwrap();
-        assert!(
-            root_header.page_type.is_interior(),
-            "deferred delete should not immediately collapse the root"
-        );
-
-        let left_leaf = cursor.pager.read_page(&cx, pn(3)).unwrap();
-        let left_header = BtreePageHeader::parse(&left_leaf, 0).unwrap();
-        assert_eq!(
-            left_header.cell_count, 0,
-            "left leaf should be logically empty"
-        );
-
         assert!(
             cursor.first(&cx).unwrap(),
             "remaining right subtree should still be reachable"
         );
         assert_eq!(cursor.rowid(&cx).unwrap(), 20);
+        assert!(cursor.next(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 25);
+        assert!(!cursor.next(&cx).unwrap());
     }
 
     #[test]
@@ -10397,7 +10395,13 @@ mod tests {
     }
 
     #[test]
-    fn test_table_delete_reclaims_dead_space_on_next_insert_rewrite() {
+    fn test_table_delete_leaves_compact_leaf_that_insert_fills_back_in() {
+        // DELETE now defragments the leaf immediately (commit 5eed5a0a) for
+        // SQLite `btreeComputeFreeSpace()` compatibility, so the old
+        // freeblock-chain dead-space invariant was intentionally dropped. The
+        // correctness check after a middle-rowid delete is that the leaf is
+        // already compact (no freeblocks, no fragmented bytes) AND a
+        // subsequent insert at the deleted rowid continues to work.
         let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
@@ -10415,16 +10419,18 @@ mod tests {
 
         let page_before = cursor.pager.read_page(&cx, pn(2)).unwrap();
         let header_before = BtreePageHeader::parse(&page_before, 0).unwrap();
-        assert!(
-            header_before.first_freeblock != 0 || header_before.fragmented_free_bytes != 0,
-            "deferred delete should leave reclaimable dead space on the page"
+        assert_eq!(
+            header_before.first_freeblock, 0,
+            "eager defrag on DELETE should leave no freeblock chain"
+        );
+        assert_eq!(
+            header_before.fragmented_free_bytes, 0,
+            "eager defrag on DELETE should leave no fragmented bytes"
         );
 
-        // Re-insert at rowid 2 (not a rightmost-append rowid) so that the
-        // standard try_insert_on_leaf path is taken, which checks freeblocks.
-        // Using a rightmost rowid (e.g. 4) would trigger the append-on-leaf
-        // fast path that allocates from the content area without scanning
-        // the freeblock chain.
+        // Re-insert at rowid 2 and confirm the leaf still reaches it. This
+        // guards against a hypothetical regression where defrag corrupts
+        // surrounding cells' offsets.
         let reclaimed_payload = vec![0x5A; payload_for_rowid(2).len()];
         cursor
             .table_insert(&cx, 2, reclaimed_payload.as_slice())
@@ -10438,7 +10444,12 @@ mod tests {
     }
 
     #[test]
-    fn test_table_delete_explicit_compaction_clears_reclaimable_space() {
+    fn test_table_delete_leaves_no_work_for_explicit_compaction() {
+        // Post-5eed5a0a: DELETE compacts immediately, so
+        // `compact_current_table_leaf` has nothing left to do and returns
+        // `Ok(false)`. Keep the test as a lightweight regression guard that
+        // (a) the leaf is already compact after DELETE, and (b) the cursor
+        // still points at the correct successor rowid.
         let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
@@ -10454,8 +10465,8 @@ mod tests {
         assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
         cursor.delete(&cx).unwrap();
         assert!(
-            cursor.compact_current_table_leaf(&cx).unwrap(),
-            "explicit compaction should rewrite leaves with reclaimable dead space"
+            !cursor.compact_current_table_leaf(&cx).unwrap(),
+            "eager delete leaves the leaf already compact; explicit compaction should be a no-op"
         );
 
         let page = cursor.pager.read_page(&cx, pn(2)).unwrap();
@@ -11268,10 +11279,10 @@ mod tests {
     fn test_table_try_append_cached_rightmost_leaf_hint_handles_split_fallback() {
         let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
             .lock()
-            .expect("leaf-reuse cursor test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
             .lock()
-            .expect("leaf-reuse shared test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         const SMALL_USABLE: u32 = 256;
 
         let cx = Cx::new();
@@ -11328,10 +11339,10 @@ mod tests {
     fn test_table_try_append_cached_rightmost_leaf_hint_split_reads_only_parent_after_root_split() {
         let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
             .lock()
-            .expect("leaf-reuse cursor test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
             .lock()
-            .expect("leaf-reuse shared test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         const SMALL_USABLE: u32 = 256;
 
         let cx = Cx::new();
@@ -11455,8 +11466,45 @@ mod tests {
             "test requires an interior root so the uncached path would revisit it"
         );
 
+        // The rightmost-leaf cache has variable headroom after 128 sequential
+        // inserts (depends on split cadence); continue inserting until we
+        // land right after a split so at least 3 appends fit before the next
+        // split. This keeps the test's core claim — "sequential appends land
+        // in the cached leaf with zero page reads" — independent of the
+        // specific split policy and page-packing invariants.
+        let mut next_rowid = 129_i64;
+        while next_rowid < 512 {
+            let mut probe_cell = Vec::new();
+            cursor
+                .encode_table_leaf_cell_into(&cx, next_rowid, &payload, &mut probe_cell)
+                .unwrap();
+            let cached = cursor
+                .rightmost_leaf_cache
+                .clone()
+                .expect("sequential inserts should seed the rightmost-leaf cache");
+            let header_offset = cell::header_offset_for_page(cached.page_no);
+            let content_offset = cached.header.content_offset(cursor.usable_size);
+            let header_size = usize::from(cached.header.page_type.header_size());
+            let cells_needed_for_assert = 3_usize;
+            let has_room = content_offset
+                .checked_sub(probe_cell.len() * cells_needed_for_assert)
+                .is_some_and(|after_three| {
+                    let ptr_array_after =
+                        header_offset
+                            + header_size
+                            + (usize::from(cached.header.cell_count) + cells_needed_for_assert) * 2;
+                    ptr_array_after <= after_three
+                });
+            if has_room {
+                break;
+            }
+            cursor.table_insert(&cx, next_rowid, &payload).unwrap();
+            next_rowid += 1;
+        }
+
         let mut appended = 0_u32;
-        for rowid in 129..=256_i64 {
+        let start_rowid = next_rowid;
+        for rowid in start_rowid..start_rowid + 128 {
             let cached = cursor
                 .rightmost_leaf_cache
                 .clone()
@@ -11488,23 +11536,26 @@ mod tests {
 
         assert!(
             appended >= 3,
-            "test setup should admit several zero-read cached appends before the next split"
+            "test setup should admit several zero-read cached appends before the next split, got {appended}"
         );
         let cached_after = cursor
             .rightmost_leaf_cache
             .as_ref()
             .expect("successful append should preserve the rightmost-leaf cache");
-        assert_eq!(cached_after.rowid, 128 + i64::from(appended));
+        assert_eq!(
+            cached_after.rowid,
+            start_rowid - 1 + i64::from(appended)
+        );
     }
 
     #[test]
     fn test_table_insert_sequential_fast_path_records_append_metrics_without_reloads() {
         let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
             .lock()
-            .expect("leaf-reuse cursor test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
             .lock()
-            .expect("leaf-reuse shared test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         crate::instrumentation::reset_btree_copy_profile();
         crate::instrumentation::set_btree_copy_profile_enabled(true);
@@ -11525,9 +11576,44 @@ mod tests {
             "test requires an interior root so the fast path would otherwise revisit it"
         );
 
+        // See `test_table_insert_reuses_rightmost_leaf_cache_for_multiple_sequential_appends`
+        // for the rationale; keep inserting until the rightmost leaf has room
+        // for at least 3 more cells so this test's metric assertion is not
+        // hostage to split-cadence implementation detail.
+        let mut next_rowid = 129_i64;
+        while next_rowid < 512 {
+            let mut probe_cell = Vec::new();
+            cursor
+                .encode_table_leaf_cell_into(&cx, next_rowid, &payload, &mut probe_cell)
+                .unwrap();
+            let cached = cursor
+                .rightmost_leaf_cache
+                .clone()
+                .expect("sequential inserts should seed the rightmost-leaf cache");
+            let header_offset = cell::header_offset_for_page(cached.page_no);
+            let content_offset = cached.header.content_offset(cursor.usable_size);
+            let header_size = usize::from(cached.header.page_type.header_size());
+            let cells_needed_for_assert = 3_usize;
+            let has_room = content_offset
+                .checked_sub(probe_cell.len() * cells_needed_for_assert)
+                .is_some_and(|after_three| {
+                    let ptr_array_after =
+                        header_offset
+                            + header_size
+                            + (usize::from(cached.header.cell_count) + cells_needed_for_assert) * 2;
+                    ptr_array_after <= after_three
+                });
+            if has_room {
+                break;
+            }
+            cursor.table_insert(&cx, next_rowid, &payload).unwrap();
+            next_rowid += 1;
+        }
+
         let before = crate::instrumentation::btree_leaf_reuse_snapshot();
         let mut appended = 0_u64;
-        for rowid in 129..=256_i64 {
+        let start_rowid = next_rowid;
+        for rowid in start_rowid..start_rowid + 128 {
             let cached = cursor
                 .rightmost_leaf_cache
                 .clone()
@@ -11708,10 +11794,10 @@ mod tests {
     fn test_table_insert_from_current_position_reuses_leaf_state_without_reload() {
         let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
             .lock()
-            .expect("leaf-reuse cursor test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
             .lock()
-            .expect("leaf-reuse shared test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cx = Cx::new();
         let root = pn(2);
         let store = MemPageStore::with_empty_table(root, USABLE);
@@ -11765,10 +11851,10 @@ mod tests {
     fn test_index_insert_from_current_position_reuses_leaf_state_without_reload() {
         let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
             .lock()
-            .expect("leaf-reuse cursor test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
             .lock()
-            .expect("leaf-reuse shared test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cx = Cx::new();
         let root = pn(2);
         let store = MemPageStore::with_empty_index(root, USABLE);
@@ -11822,10 +11908,10 @@ mod tests {
     fn test_table_insert_from_current_position_after_delete_reuses_leaf_state() {
         let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
             .lock()
-            .expect("leaf-reuse cursor test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
             .lock()
-            .expect("leaf-reuse shared test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cx = Cx::new();
         let root = pn(2);
         let store = MemPageStore::with_empty_table(root, USABLE);
@@ -11888,10 +11974,10 @@ mod tests {
     fn test_table_insert_from_current_position_records_fallback_when_balance_needed() {
         let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
             .lock()
-            .expect("leaf-reuse cursor test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
             .lock()
-            .expect("leaf-reuse shared test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         const SMALL_USABLE: u32 = 256;
 
         let cx = Cx::new();

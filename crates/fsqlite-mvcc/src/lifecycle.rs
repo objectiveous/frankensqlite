@@ -1649,8 +1649,9 @@ impl TransactionManager {
         &self,
         txn: &mut Transaction,
         pages: &[PageNumber],
-    ) -> Result<(CommitSeq, SmallVec<[usize; 8]>), MvccError> {
-        let mut cached_chain_lens: SmallVec<[usize; 8]> = SmallVec::with_capacity(pages.len());
+    ) -> Result<(CommitSeq, smallvec::SmallVec<[usize; 8]>), MvccError> {
+        let mut cached_chain_lens: smallvec::SmallVec<[usize; 8]> =
+            smallvec::SmallVec::with_capacity(pages.len());
         for &pgno in pages {
             cached_chain_lens.push(self.enforce_chain_bound_for_page(pgno)?);
         }

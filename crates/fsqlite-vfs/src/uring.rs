@@ -62,6 +62,8 @@ static FORCE_ASUPERSYNC_INIT_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(all(test, feature = "linux-asupersync-uring"))]
 static FORCE_ASUPERSYNC_READ_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(all(test, feature = "linux-asupersync-uring"))]
+static FORCE_ASUPERSYNC_READ_ABORT: AtomicBool = AtomicBool::new(false);
+#[cfg(all(test, feature = "linux-asupersync-uring"))]
 static FORCE_ASUPERSYNC_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(all(test, feature = "linux-asupersync-uring"))]
 static FORCE_ASUPERSYNC_WRITE_ABORT: AtomicBool = AtomicBool::new(false);
@@ -486,6 +488,10 @@ impl IoUringFile {
                 return Err(FrankenError::Io(io::Error::other(
                     "forced asupersync read failure",
                 )));
+            }
+            #[cfg(test)]
+            if FORCE_ASUPERSYNC_READ_ABORT.load(Ordering::Acquire) {
+                return Err(FrankenError::Abort);
             }
 
             let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1204,13 +1210,53 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "linux-asupersync-uring")]
+    #[test]
+    fn test_read_abort_propagates_without_disabling_runtime_or_fallback() -> Result<()> {
+        let _guard = io_uring_test_guard();
+        reset_io_uring_latency_metrics();
+
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        if !vfs.is_available() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir().map_err(FrankenError::Io)?;
+        let path = dir.path().join("asupersync_read_abort_propagation.db");
+        let (file, _) = vfs.open(&cx, Some(&path), open_flags_create_unlocked())?;
+        reset_io_uring_latency_metrics();
+
+        let _force_abort = ScopedAtomicFlag::enable(&FORCE_ASUPERSYNC_READ_ABORT);
+        let mut buf = [0_u8; 4];
+        let err = match file.read(&cx, &mut buf, 0) {
+            Ok(bytes) => {
+                return Err(FrankenError::Io(io::Error::other(format!(
+                    "read should propagate abort, read {bytes} bytes"
+                ))));
+            }
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, FrankenError::Abort));
+        assert!(vfs.is_available(), "abort should not disable io_uring");
+        assert!(!vfs.runtime.is_disabled());
+
+        let snapshot = io_uring_latency_snapshot();
+        assert_eq!(
+            snapshot.unix_fallbacks_total, 0,
+            "abort should not fall back to unix or record fallback metrics"
+        );
+        Ok(())
+    }
+
     #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
     #[test]
     fn test_lock_mutex_or_io_handles_poison_without_panicking() {
         let mutex = Mutex::new(7_u8);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
-            panic!("poison mutex");
+            std::panic::panic_any("poison mutex");
         }));
         let err = lock_mutex_or_io(&mutex).expect_err("lock should fail");
         assert_eq!(err.kind(), io::ErrorKind::Other);
@@ -1234,7 +1280,7 @@ mod tests {
         if let Some(ring_mutex) = file.runtime.ring.as_ref() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _guard = ring_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                panic!("poison io_uring runtime lock");
+                std::panic::panic_any("poison io_uring runtime lock");
             }));
         }
 

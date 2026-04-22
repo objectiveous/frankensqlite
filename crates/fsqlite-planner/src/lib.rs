@@ -2453,6 +2453,25 @@ fn extract_access_path_probe(
                         target: Box::new(target),
                     });
                 }
+                if let WhereTermKind::LikePrefix {
+                    prefix,
+                    upper_bound,
+                } = &term.kind
+                {
+                    let lo = Expr::Literal(Literal::String(prefix.clone()), Span::ZERO);
+                    let lo_bound = Some((Box::new(lo), true));
+                    let hi_bound = upper_bound.as_ref().map(|ub| {
+                        (
+                            Box::new(Expr::Literal(Literal::String(ub.clone()), Span::ZERO)),
+                            false,
+                        )
+                    });
+                    return Some(AccessPathProbe::Range {
+                        column: col.column.clone(),
+                        lower: lo_bound,
+                        upper: hi_bound,
+                    });
+                }
                 if !matches!(term.kind, WhereTermKind::Range) {
                     continue;
                 }
@@ -9912,6 +9931,73 @@ mod probe_tests {
             matches!(&probe, Some(AccessPathProbe::Equality { .. })),
             "equality should be preferred when both equality and IN terms exist"
         );
+    }
+
+    #[test]
+    fn extract_probe_like_prefix_as_range() {
+        let like_expr = Expr::Like {
+            expr: col("name"),
+            pattern: Box::new(Expr::Literal(
+                Literal::String("abc%".to_owned()),
+                Span::ZERO,
+            )),
+            escape: None,
+            not: false,
+            op: fsqlite_ast::LikeOp::Like,
+        };
+        let terms = [WhereTerm {
+            expr: &like_expr,
+            column: Some(WhereColumn {
+                table: None,
+                column: "name".to_owned(),
+            }),
+            kind: WhereTermKind::LikePrefix {
+                prefix: "abc".to_owned(),
+                upper_bound: Some("abd".to_owned()),
+            },
+        }];
+        let indexes = [IndexInfo {
+            name: "idx_name".to_owned(),
+            table: "t".to_owned(),
+            columns: vec!["name".to_owned()],
+            unique: false,
+            n_pages: 1,
+            source: StatsSource::Heuristic,
+            partial_where: None,
+            expression_columns: vec![],
+        }];
+        let ap = AccessPath {
+            table: "t".to_owned(),
+            kind: AccessPathKind::IndexScanRange { selectivity: 0.1 },
+            index: Some("idx_name".to_owned()),
+            estimated_cost: 10.0,
+            estimated_rows: 100.0,
+            time_travel: None,
+            probe: None,
+        };
+        let probe = extract_access_path_probe(&ap, &indexes, &terms);
+        match &probe {
+            Some(AccessPathProbe::Range {
+                column,
+                lower,
+                upper,
+            }) => {
+                assert_eq!(column, "name");
+                let (lo_expr, lo_inc) = lower.as_ref().expect("expected lower bound");
+                assert_eq!(
+                    **lo_expr,
+                    Expr::Literal(Literal::String("abc".to_owned()), Span::ZERO)
+                );
+                assert!(lo_inc, "LIKE prefix lower bound should be inclusive");
+                let (hi_expr, hi_inc) = upper.as_ref().expect("expected upper bound");
+                assert_eq!(
+                    **hi_expr,
+                    Expr::Literal(Literal::String("abd".to_owned()), Span::ZERO)
+                );
+                assert!(!hi_inc, "LIKE prefix upper bound should be exclusive");
+            }
+            other => panic!("expected Range probe from LikePrefix, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1639,6 +1639,10 @@ pub fn encode_batch(
     }
     offsets.reserve(rows.len());
 
+    if encode_batch_integer_columns(rows, out, offsets) {
+        return Ok(());
+    }
+
     // ── Pass 1: measure header + body sizes per row, compute total size ─
     //
     // We store (header_size, body_size) per row in a column-oriented scratch
@@ -1717,6 +1721,119 @@ pub fn encode_batch(
     debug_assert_eq!(row_start, total_size);
 
     Ok(())
+}
+
+fn encode_batch_integer_columns(
+    rows: &[&[SqliteValue]],
+    out: &mut Vec<u8>,
+    offsets: &mut Vec<usize>,
+) -> bool {
+    if rows.len() < ENCODE_BATCH_HOMOGENEOUS_MIN_ROWS {
+        return false;
+    }
+
+    let Some(first_row) = rows.first() else {
+        return false;
+    };
+    let column_count = first_row.len();
+    if column_count == 0 {
+        return false;
+    }
+    if rows.iter().any(|row| row.len() != column_count) {
+        return false;
+    }
+
+    let layout_count = match rows.len().checked_mul(column_count) {
+        Some(count) => count,
+        None => return false,
+    };
+    let mut body_sizes = vec![0usize; rows.len()];
+    let mut layouts = vec![IntegerEncoding::default(); layout_count];
+    let use_simd = avx2_available();
+
+    for column_idx in 0..column_count {
+        let mut row_idx = 0usize;
+        while row_idx + 4 <= rows.len() {
+            let mut values = [0_i64; 4];
+            for lane in 0..4 {
+                let SqliteValue::Integer(value) = &rows[row_idx + lane][column_idx] else {
+                    return false;
+                };
+                values[lane] = *value;
+            }
+
+            let encoded = classify_integer_block(values, use_simd);
+            for (lane, layout) in encoded.into_iter().enumerate() {
+                let target_row = row_idx + lane;
+                layouts[target_row * column_count + column_idx] = layout;
+                body_sizes[target_row] =
+                    match body_sizes[target_row].checked_add(usize::from(layout.payload_len)) {
+                        Some(size) => size,
+                        None => return false,
+                    };
+            }
+            row_idx += 4;
+        }
+
+        while row_idx < rows.len() {
+            let SqliteValue::Integer(value) = &rows[row_idx][column_idx] else {
+                return false;
+            };
+            let layout = scalar_integer_encoding(*value);
+            layouts[row_idx * column_count + column_idx] = layout;
+            body_sizes[row_idx] =
+                match body_sizes[row_idx].checked_add(usize::from(layout.payload_len)) {
+                    Some(size) => size,
+                    None => return false,
+                };
+            row_idx += 1;
+        }
+    }
+
+    let header_size = compute_header_size(column_count);
+    let mut total_size = 0usize;
+    for body_size in &body_sizes {
+        let Some(row_total) = header_size.checked_add(*body_size) else {
+            return false;
+        };
+        total_size = match total_size.checked_add(row_total) {
+            Some(size) => size,
+            None => return false,
+        };
+    }
+
+    out.resize(total_size, 0);
+    let mut row_start = 0usize;
+    for (row_idx, row) in rows.iter().enumerate() {
+        offsets.push(row_start);
+        let row_total = header_size + body_sizes[row_idx];
+        let row_slice = &mut out[row_start..row_start + row_total];
+        let mut header_offset =
+            write_varint(row_slice, u64::try_from(header_size).unwrap_or(u64::MAX));
+
+        for column_idx in 0..column_count {
+            let layout = layouts[row_idx * column_count + column_idx];
+            row_slice[header_offset] = layout.serial_type;
+            header_offset += 1;
+        }
+
+        let mut body_offset = header_size;
+        for column_idx in 0..column_count {
+            let SqliteValue::Integer(value) = &row[column_idx] else {
+                return false;
+            };
+            let payload_len = usize::from(layouts[row_idx * column_count + column_idx].payload_len);
+            let body_end = body_offset + payload_len;
+            write_integer_payload(*value, payload_len, &mut row_slice[body_offset..body_end]);
+            body_offset = body_end;
+        }
+
+        debug_assert_eq!(header_offset, header_size);
+        debug_assert_eq!(body_offset, row_total);
+        row_start += row_total;
+    }
+    debug_assert_eq!(row_start, total_size);
+    true
 }
 
 /// Minimum batch size for the homogeneous fast path. Below this, the
@@ -3623,6 +3740,40 @@ mod tests {
         ) {
             assert_encode_batch_matches_scalar(&rows);
         }
+
+        #[test]
+        fn prop_encode_batch_integer_columns_matches_scalar(
+            (row_count, column_count, values) in (16usize..64, 1usize..8).prop_flat_map(
+                |(row_count, column_count)| {
+                    proptest::collection::vec(any::<i64>(), row_count * column_count)
+                        .prop_map(move |values| (row_count, column_count, values))
+                }
+            )
+        ) {
+            let rows: Vec<Vec<SqliteValue>> = values
+                .chunks_exact(column_count)
+                .map(|chunk| {
+                    chunk
+                        .iter()
+                        .copied()
+                        .map(SqliteValue::Integer)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            prop_assert_eq!(rows.len(), row_count);
+
+            let row_refs: Vec<&[SqliteValue]> = rows.iter().map(Vec::as_slice).collect();
+            let mut fast = Vec::new();
+            let mut offsets = Vec::new();
+            prop_assert!(
+                encode_batch_integer_columns(&row_refs, &mut fast, &mut offsets),
+                "all-integer batches above threshold must take the column encoder",
+            );
+
+            let (expected_bytes, expected_offsets) = concat_scalar_encodings(&rows);
+            prop_assert_eq!(fast, expected_bytes);
+            prop_assert_eq!(offsets, expected_offsets);
+        }
     }
 
     // ── Homogeneous batch fast path (encode_batch_homogeneous) ─────────────
@@ -3668,6 +3819,57 @@ mod tests {
             fast, slow,
             "homogeneous fast-path output must be byte-identical to encode_batch"
         );
+    }
+
+    #[test]
+    fn encode_batch_integer_columns_varying_varint_widths_matches_scalar() {
+        let boundary_values = [
+            0_i64,
+            1,
+            -1,
+            127,
+            -128,
+            128,
+            32_767,
+            -32_768,
+            32_768,
+            8_388_607,
+            -8_388_608,
+            8_388_608,
+            2_147_483_647,
+            -2_147_483_648,
+            2_147_483_648,
+            140_737_488_355_327,
+            -140_737_488_355_328,
+            140_737_488_355_328,
+            i64::MAX,
+            i64::MIN,
+        ];
+        let mut rows = Vec::with_capacity(64);
+        for i in 0..64usize {
+            rows.push(vec![
+                SqliteValue::Integer(boundary_values[i % boundary_values.len()]),
+                SqliteValue::Integer(boundary_values[(i + 7) % boundary_values.len()]),
+                SqliteValue::Integer(i64::try_from(i).unwrap_or(0).wrapping_mul(31) - 9),
+                SqliteValue::Integer(i64::try_from(i).unwrap_or(0).wrapping_neg()),
+            ]);
+        }
+        let row_refs: Vec<&[SqliteValue]> = rows.iter().map(Vec::as_slice).collect();
+        assert!(
+            !rows_have_identical_serial_types(&row_refs),
+            "varying integer widths should bypass the old homogeneous serial-type path"
+        );
+
+        let mut fast = Vec::new();
+        let mut offsets = Vec::new();
+        assert!(
+            encode_batch_integer_columns(&row_refs, &mut fast, &mut offsets),
+            "all-integer rows should take the SIMD column encoder"
+        );
+
+        let (expected_bytes, expected_offsets) = concat_scalar_encodings(&rows);
+        assert_eq!(fast, expected_bytes);
+        assert_eq!(offsets, expected_offsets);
     }
 
     #[test]

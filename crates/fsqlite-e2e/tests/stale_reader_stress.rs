@@ -329,7 +329,7 @@ fn run_stale_reader_stress(run_duration: Duration) -> StressResult {
 fn bd_wt4uu_stale_reader_stress_no_oom_bounded_chain() {
     let run_id = "bd-wt4uu-stale-reader-stress";
     let scenario_id = "STALE-READER-STRESS";
-    let seed: u64 = 0xBD_4_0042; // deterministic marker for bd-wt4uu
+    let seed: u64 = 0x0BD4_0042; // deterministic marker for bd-wt4uu
     let result = run_stale_reader_stress(Duration::from_secs(2));
 
     assert!(

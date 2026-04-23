@@ -22,7 +22,6 @@
 //! succeeds only if all 20 iterations recover without data loss.
 
 use std::env;
-use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -296,7 +295,7 @@ fn two_process_sigkill_recovery_loses_no_committed_writes() {
     // Deterministic base seed bound to the bead id. Twenty iterations ×
     // different per-iteration seeds covers enough kill points to surface
     // the race reproducibly.
-    let base_seed: u64 = 0x0000_0000_0000_BD6_Fu64;
+    let base_seed: u64 = 0x0000_0000_0000_BD6F_u64;
     let iterations: u32 = 20;
     for i in 0..iterations {
         let seed = base_seed
@@ -327,8 +326,8 @@ fn yfdb6_producer_helper() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(KILL_AFTER_MAX_COMMITS);
 
-    let db_path = PathBuf::from(OsString::from(db_path));
-    let commit_log = PathBuf::from(OsString::from(commit_log));
+    let db_path = PathBuf::from(db_path);
+    let commit_log = PathBuf::from(commit_log);
     match mode.to_string_lossy().as_ref() {
         "producer" => yfdb6_producer_child(&db_path, &commit_log, stop_after),
         other => panic!("unknown yfdb6 helper mode: {other}"),

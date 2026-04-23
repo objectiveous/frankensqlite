@@ -570,7 +570,7 @@ struct StackEntry {
 const TABLE_SEEK_CACHE_SLOTS: usize = 4;
 const CELL_SLOT_CACHE_ENTRIES: usize = 64;
 
-type CachedCellSlots = SmallVec<[CachedCellSlot; 32]>;
+type CachedCellSlots = SmallVec<[Option<CachedCellSlot>; 32]>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CachedCellSlot {
@@ -635,7 +635,7 @@ impl CellSlotCache {
         let slot = self.entries[entry_idx]
             .slots
             .get(usize::from(cell_idx))
-            .copied()?;
+            .and_then(|cached| *cached)?;
         if entry_idx != 0 {
             let entry = self.entries.remove(entry_idx);
             self.entries.insert(0, entry);
@@ -643,20 +643,34 @@ impl CellSlotCache {
         Some(slot)
     }
 
-    fn insert(&mut self, page_no: PageNumber, mutation_counter: u32, slots: CachedCellSlots) {
-        if let Some(existing_idx) = self.entries.iter().position(|entry| {
+    fn insert(
+        &mut self,
+        page_no: PageNumber,
+        mutation_counter: u32,
+        cell_count: u16,
+        cell_idx: u16,
+        slot: CachedCellSlot,
+    ) {
+        let mut entry = if let Some(existing_idx) = self.entries.iter().position(|entry| {
             entry.page_no == page_no && entry.mutation_counter == mutation_counter
         }) {
-            self.entries.remove(existing_idx);
-        }
-        self.entries.insert(
-            0,
+            self.entries.remove(existing_idx)
+        } else {
             CellSlotCacheEntry {
                 page_no,
                 mutation_counter,
-                slots,
-            },
-        );
+                slots: CachedCellSlots::new(),
+            }
+        };
+
+        let slot_idx = usize::from(cell_idx);
+        let required_len = usize::from(cell_count).max(slot_idx.saturating_add(1));
+        if entry.slots.len() < required_len {
+            entry.slots.resize(required_len, None);
+        }
+        entry.slots[slot_idx] = Some(slot);
+
+        self.entries.insert(0, entry);
         self.entries.truncate(CELL_SLOT_CACHE_ENTRIES);
     }
 }
@@ -837,6 +851,11 @@ pub struct BtCursor<P> {
     /// are tied to the loaded page image's mutation signature, so page splits,
     /// merges, defragmentation, and freeblock rewrites naturally miss after the
     /// page bytes change.
+    ///
+    /// The slots are intentionally sparse: a miss for cell `i` parses only
+    /// cell `i`. The previous whole-page fill strategy parsed every cell on
+    /// the page on a single miss, which made point probes pay for unrelated
+    /// cells and left `CellRef::parse` as a top MT 8t hotspot.
     cell_slot_cache: RefCell<CellSlotCache>,
     /// Last rowid successfully inserted via `table_insert`.
     ///
@@ -1887,24 +1906,20 @@ impl<P: PageReader> BtCursor<P> {
         })
     }
 
-    fn build_cached_cell_slots(&self, entry: &StackEntry) -> Result<CachedCellSlots> {
-        let mut slots = CachedCellSlots::with_capacity(usize::from(entry.header.cell_count));
-        for idx in 0..entry.header.cell_count {
-            let idx_usize = usize::from(idx);
-            let offset = if idx_usize < entry.cell_pointers.len() {
-                usize::from(entry.cell_pointers[idx_usize])
-            } else {
-                usize::from(Self::read_stack_entry_cell_pointer_inline(entry, idx)?)
-            };
-            let cell = CellRef::parse(
-                entry.page_data.as_bytes(),
-                offset,
-                entry.header.page_type,
-                self.usable_size,
-            )?;
-            slots.push(CachedCellSlot::from_cell_ref(&cell));
-        }
-        Ok(slots)
+    fn parse_cell_slot_at(&self, entry: &StackEntry, idx: u16) -> Result<CachedCellSlot> {
+        let idx_usize = usize::from(idx);
+        let offset = if idx_usize < entry.cell_pointers.len() {
+            usize::from(entry.cell_pointers[idx_usize])
+        } else {
+            usize::from(Self::read_stack_entry_cell_pointer_inline(entry, idx)?)
+        };
+        let cell = CellRef::parse(
+            entry.page_data.as_bytes(),
+            offset,
+            entry.header.page_type,
+            self.usable_size,
+        )?;
+        Ok(CachedCellSlot::from_cell_ref(&cell))
     }
 
     /// Parse a cell at the given index on the top-of-stack page.
@@ -1926,17 +1941,14 @@ impl<P: PageReader> BtCursor<P> {
             return Ok(slot.into_cell_ref());
         }
 
-        let slots = self.build_cached_cell_slots(entry)?;
-        let slot =
-            slots
-                .get(usize::from(idx))
-                .copied()
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: format!("cached cell index {} out of bounds ({})", idx, slots.len()),
-                })?;
-        self.cell_slot_cache
-            .borrow_mut()
-            .insert(entry.page_no, entry.mutation_counter, slots);
+        let slot = self.parse_cell_slot_at(entry, idx)?;
+        self.cell_slot_cache.borrow_mut().insert(
+            entry.page_no,
+            entry.mutation_counter,
+            entry.header.cell_count,
+            idx,
+            slot,
+        );
         Ok(slot.into_cell_ref())
     }
 

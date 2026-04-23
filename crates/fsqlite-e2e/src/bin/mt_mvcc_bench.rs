@@ -234,7 +234,7 @@ fn percentile_value(mut values: Vec<f64>, percentile: f64) -> f64 {
         return values[lower];
     }
     let fraction = rank - lower as f64;
-    values[lower] + ((values[upper] - values[lower]) * fraction)
+    (values[upper] - values[lower]).mul_add(fraction, values[lower])
 }
 
 // ─── FrankenSQLite workload ──────────────────────────────────────────────

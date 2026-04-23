@@ -405,6 +405,7 @@ fn access_path_selection_logged_in_contract() {
         join_order: vec!["orders".to_owned()],
         access_paths: vec![ap],
         join_segments: vec![],
+        morsel_eligibility: None,
         total_cost: 1000.0,
     };
     let contract = build_contract(

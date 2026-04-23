@@ -594,7 +594,7 @@ impl MorselEligibility {
         }
 
         let est_rows = path.estimated_rows as u64;
-        let workers = u64::from(available_workers.max(1).min(Self::MAX_MORSELS));
+        let workers = u64::from(available_workers.clamp(1, Self::MAX_MORSELS));
         let rows_per_morsel = (est_rows / workers).max(Self::DEFAULT_MORSEL_TARGET_ROWS);
         let morsel_count =
             u16::try_from((est_rows / rows_per_morsel).max(1)).unwrap_or(Self::MAX_MORSELS);

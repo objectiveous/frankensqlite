@@ -148,7 +148,8 @@ fn test_conformance_delete_complex_where_s80b() {
         rconn.execute_batch(s).unwrap();
     }
 
-    for dml in &["DELETE FROM logs WHERE level = 'DEBUG' OR (level = 'INFO' AND ts < 1002)"] {
+    {
+        let dml = "DELETE FROM logs WHERE level = 'DEBUG' OR (level = 'INFO' AND ts < 1002)";
         fconn.execute(dml).unwrap();
         rconn.execute_batch(dml).unwrap();
     }

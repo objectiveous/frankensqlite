@@ -733,6 +733,7 @@ mod tests {
                 reason: "2-way joins stay on pairwise hash join".to_owned(),
             }],
             total_cost: 115.0,
+            morsel_eligibility: None,
         }
     }
 

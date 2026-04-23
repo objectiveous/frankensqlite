@@ -523,6 +523,93 @@ pub struct AccessPath {
     pub probe: Option<AccessPathProbe>,
 }
 
+/// Morsel-parallel SELECT eligibility decision produced by the planner.
+///
+/// When `eligible` is true the executor may split the driving table scan
+/// into `morsel_count` page-range morsels and process them in parallel
+/// under separate snapshot-consistent cursors, merging results afterward.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MorselEligibility {
+    pub eligible: bool,
+    pub driving_table: Option<String>,
+    pub estimated_rows: f64,
+    pub morsel_count: u16,
+    pub rows_per_morsel: u64,
+    pub reason: MorselIneligibleReason,
+}
+
+/// Why a query was deemed ineligible for morsel-parallel execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MorselIneligibleReason {
+    None,
+    TooFewRows,
+    NoFullTableScan,
+    MultiTableJoin,
+    HasLimit,
+    CompoundQuery,
+}
+
+impl MorselEligibility {
+    const MIN_ROWS_FOR_MORSEL: f64 = 4096.0;
+    const DEFAULT_MORSEL_TARGET_ROWS: u64 = 1024;
+    const MAX_MORSELS: u16 = 64;
+
+    fn ineligible(reason: MorselIneligibleReason) -> Self {
+        Self {
+            eligible: false,
+            driving_table: None,
+            estimated_rows: 0.0,
+            morsel_count: 1,
+            rows_per_morsel: 0,
+            reason,
+        }
+    }
+
+    /// Evaluate morsel eligibility for a single-table full-scan query.
+    #[must_use]
+    pub fn evaluate(
+        plan: &QueryPlan,
+        has_limit: bool,
+        is_compound: bool,
+        available_workers: u16,
+    ) -> Self {
+        if is_compound {
+            return Self::ineligible(MorselIneligibleReason::CompoundQuery);
+        }
+        if has_limit {
+            return Self::ineligible(MorselIneligibleReason::HasLimit);
+        }
+        if plan.join_order.len() != 1 {
+            return Self::ineligible(MorselIneligibleReason::MultiTableJoin);
+        }
+        let path = match plan.access_paths.first() {
+            Some(p) => p,
+            None => return Self::ineligible(MorselIneligibleReason::NoFullTableScan),
+        };
+        if !matches!(path.kind, AccessPathKind::FullTableScan) {
+            return Self::ineligible(MorselIneligibleReason::NoFullTableScan);
+        }
+        if path.estimated_rows < Self::MIN_ROWS_FOR_MORSEL {
+            return Self::ineligible(MorselIneligibleReason::TooFewRows);
+        }
+
+        let est_rows = path.estimated_rows as u64;
+        let workers = u64::from(available_workers.max(1).min(Self::MAX_MORSELS));
+        let rows_per_morsel = (est_rows / workers).max(Self::DEFAULT_MORSEL_TARGET_ROWS);
+        let morsel_count =
+            u16::try_from((est_rows / rows_per_morsel).max(1)).unwrap_or(Self::MAX_MORSELS);
+
+        Self {
+            eligible: true,
+            driving_table: Some(path.table.clone()),
+            estimated_rows: path.estimated_rows,
+            morsel_count,
+            rows_per_morsel,
+            reason: MorselIneligibleReason::None,
+        }
+    }
+}
+
 /// The final output of the query planner: an ordered access plan.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryPlan {
@@ -534,6 +621,8 @@ pub struct QueryPlan {
     pub join_segments: Vec<JoinPlanSegment>,
     /// Total estimated cost in page reads.
     pub total_cost: f64,
+    /// Morsel-parallel SELECT eligibility (populated after planning).
+    pub morsel_eligibility: Option<MorselEligibility>,
 }
 
 /// Default number of cached query plans retained by [`QueryPlanner`].
@@ -3795,6 +3884,7 @@ pub fn order_joins_with_hints_and_features(
             access_paths: vec![],
             join_segments: vec![],
             total_cost: 0.0,
+            morsel_eligibility: None,
         };
     }
 
@@ -3812,6 +3902,7 @@ pub fn order_joins_with_hints_and_features(
             access_paths: vec![ap.clone()],
             join_segments: vec![],
             total_cost: ap.estimated_cost,
+            morsel_eligibility: None,
         };
         if let Some(store) = cracking_hints {
             for access_path in &plan.access_paths {
@@ -3856,6 +3947,7 @@ pub fn order_joins_with_hints_and_features(
                 access_paths,
                 join_segments,
                 total_cost,
+                morsel_eligibility: None,
             };
 
             if let Some(store) = cracking_hints {
@@ -4045,6 +4137,7 @@ pub fn order_joins_with_hints_and_features(
         access_paths: best.access_paths,
         join_segments,
         total_cost: best.cost,
+        morsel_eligibility: None,
     };
 
     if let Some(store) = cracking_hints {
@@ -4743,6 +4836,7 @@ mod tests {
             access_paths: vec![],
             join_segments: vec![],
             total_cost: label.len() as f64,
+            morsel_eligibility: None,
         }
     }
 
@@ -6881,6 +6975,7 @@ mod tests {
                 reason: "2-way joins stay on pairwise hash join".to_owned(),
             }],
             total_cost: 115.0,
+            morsel_eligibility: None,
         };
         let display = plan.to_string();
         assert!(display.contains("QUERY PLAN"));
@@ -6902,11 +6997,109 @@ mod tests {
                 reason: "AGM estimate 42.0 beats hash cost 100.0; trie arity 1".to_owned(),
             }],
             total_cost: 42.0,
+            morsel_eligibility: None,
         };
 
         let display = plan.to_string();
         assert!(display.contains("LEAPFROG TRIEJOIN"));
         assert!(display.contains("JOIN OPERATORS"));
+    }
+
+    #[test]
+    fn test_morsel_eligibility_full_scan_large_table() {
+        let plan = QueryPlan {
+            join_order: vec!["big_table".to_owned()],
+            access_paths: vec![AccessPath {
+                table: "big_table".to_owned(),
+                kind: AccessPathKind::FullTableScan,
+                index: None,
+                estimated_cost: 10000.0,
+                estimated_rows: 100_000.0,
+                time_travel: None,
+                probe: None,
+            }],
+            join_segments: vec![],
+            total_cost: 10000.0,
+            morsel_eligibility: None,
+        };
+        let elig = MorselEligibility::evaluate(&plan, false, false, 8);
+        assert!(
+            elig.eligible,
+            "bead_id=bd-b434d case=morsel_eligible_full_scan"
+        );
+        assert_eq!(elig.driving_table.as_deref(), Some("big_table"));
+        assert!(elig.morsel_count > 1);
+        assert!(elig.morsel_count <= 64);
+        eprintln!(
+            "INFO bead_id=bd-b434d case=morsel_eligible morsels={} rows_per={}",
+            elig.morsel_count, elig.rows_per_morsel
+        );
+    }
+
+    #[test]
+    fn test_morsel_eligibility_small_table_ineligible() {
+        let plan = QueryPlan {
+            join_order: vec!["small".to_owned()],
+            access_paths: vec![AccessPath {
+                table: "small".to_owned(),
+                kind: AccessPathKind::FullTableScan,
+                index: None,
+                estimated_cost: 10.0,
+                estimated_rows: 500.0,
+                time_travel: None,
+                probe: None,
+            }],
+            join_segments: vec![],
+            total_cost: 10.0,
+            morsel_eligibility: None,
+        };
+        let elig = MorselEligibility::evaluate(&plan, false, false, 8);
+        assert!(!elig.eligible);
+        assert_eq!(elig.reason, MorselIneligibleReason::TooFewRows);
+    }
+
+    #[test]
+    fn test_morsel_eligibility_index_scan_ineligible() {
+        let plan = QueryPlan {
+            join_order: vec!["t1".to_owned()],
+            access_paths: vec![AccessPath {
+                table: "t1".to_owned(),
+                kind: AccessPathKind::IndexScanEquality,
+                index: Some("idx".to_owned()),
+                estimated_cost: 5.0,
+                estimated_rows: 10000.0,
+                time_travel: None,
+                probe: None,
+            }],
+            join_segments: vec![],
+            total_cost: 5.0,
+            morsel_eligibility: None,
+        };
+        let elig = MorselEligibility::evaluate(&plan, false, false, 8);
+        assert!(!elig.eligible);
+        assert_eq!(elig.reason, MorselIneligibleReason::NoFullTableScan);
+    }
+
+    #[test]
+    fn test_morsel_eligibility_limit_ineligible() {
+        let plan = QueryPlan {
+            join_order: vec!["t1".to_owned()],
+            access_paths: vec![AccessPath {
+                table: "t1".to_owned(),
+                kind: AccessPathKind::FullTableScan,
+                index: None,
+                estimated_cost: 1000.0,
+                estimated_rows: 50000.0,
+                time_travel: None,
+                probe: None,
+            }],
+            join_segments: vec![],
+            total_cost: 1000.0,
+            morsel_eligibility: None,
+        };
+        let elig = MorselEligibility::evaluate(&plan, true, false, 8);
+        assert!(!elig.eligible);
+        assert_eq!(elig.reason, MorselIneligibleReason::HasLimit);
     }
 
     #[test]

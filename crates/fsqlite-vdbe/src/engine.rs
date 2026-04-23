@@ -178,8 +178,8 @@ use crate::{
     TableIndexMetaMap, VdbeProgram, enter_vdbe_decode_profile_stage,
     enter_vdbe_execute_profile_stage,
     jit::{
-        CompiledProgram, ConstantResultRowTemplate, InsertValueSource, SimpleInsertTemplate,
-        try_compile_program,
+        CompiledProgram, ConstantResultRowTemplate, InsertValueSource, RowidLookupSelectTemplate,
+        SimpleInsertTemplate, try_compile_program,
     },
     opcode_register_spans,
 };
@@ -4951,6 +4951,10 @@ fn estimate_compiled_program_size(compiled_program: &CompiledProgram) -> u64 {
         CompiledProgram::SimpleInsert(template) => {
             let value_count = u64::try_from(template.value_sources.len()).unwrap_or(u64::MAX);
             value_count.saturating_mul(32).saturating_add(96)
+        }
+        CompiledProgram::RowidLookupSelect(template) => {
+            let col_count = u64::try_from(template.column_indices.len()).unwrap_or(u64::MAX);
+            col_count.saturating_mul(24).saturating_add(80)
         }
     }
 }
@@ -12118,6 +12122,57 @@ impl VdbeEngine {
         Ok(ExecOutcome::Done)
     }
 
+    fn execute_compiled_rowid_lookup_select(
+        &mut self,
+        template: &RowidLookupSelectTemplate,
+        borrowed_bindings: Option<&[SqliteValue]>,
+        collect_vdbe_metrics: bool,
+        row_handler: &mut Option<&mut ResultRowCallback<'_>>,
+    ) -> Result<ExecOutcome> {
+        if !self.open_storage_cursor(template.cursor_id, template.root_page, false) {
+            return Err(FrankenError::internal(format!(
+                "compiled rowid-lookup SELECT could not open cursor {} on root {}",
+                template.cursor_id, template.root_page
+            )));
+        }
+
+        let rowid_val = match &template.rowid_source {
+            InsertValueSource::Binding(idx) => {
+                let bindings = borrowed_bindings.ok_or_else(|| {
+                    FrankenError::internal("compiled rowid-lookup SELECT: missing bindings")
+                })?;
+                bindings
+                    .get(*idx)
+                    .cloned()
+                    .unwrap_or(SqliteValue::Null)
+                    .to_integer()
+            }
+            InsertValueSource::Constant(v) => v.to_integer(),
+        };
+
+        let found = {
+            let sc = self
+                .storage_cursors
+                .get_mut(&template.cursor_id)
+                .ok_or_else(|| {
+                    FrankenError::internal("compiled rowid-lookup SELECT lost its cursor")
+                })?;
+            sc.cursor.table_move_to(&sc.cx, rowid_val)?.is_found()
+        };
+
+        if found {
+            let mut values = Vec::with_capacity(template.column_indices.len());
+            for &col_idx in &template.column_indices {
+                let val = self.cursor_column(template.cursor_id, col_idx as usize)?;
+                values.push(val);
+            }
+            self.emit_compiled_result_row(&values, collect_vdbe_metrics, row_handler)?;
+        }
+
+        self.storage_cursors.remove(&template.cursor_id);
+        Ok(ExecOutcome::Done)
+    }
+
     fn execute_compiled_program(
         &mut self,
         compiled_program: &CompiledProgram,
@@ -12133,6 +12188,13 @@ impl VdbeEngine {
                 borrowed_bindings,
                 collect_vdbe_metrics,
             ),
+            CompiledProgram::RowidLookupSelect(template) => self
+                .execute_compiled_rowid_lookup_select(
+                    template,
+                    borrowed_bindings,
+                    collect_vdbe_metrics,
+                    row_handler,
+                ),
         }
     }
 

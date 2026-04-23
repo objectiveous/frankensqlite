@@ -23,6 +23,24 @@ pub enum CompiledProgram {
     ConstantResultRow(ConstantResultRowTemplate),
     /// Compiled simple sequential INSERT.
     SimpleInsert(SimpleInsertTemplate),
+    /// Compiled rowid-equality SELECT: `SELECT cols FROM t WHERE rowid = ?`.
+    RowidLookupSelect(RowidLookupSelectTemplate),
+}
+
+/// Template for a compiled rowid-equality SELECT.
+///
+/// Captures the static program shape: cursor, root page, column extraction
+/// indices, and which register/binding holds the rowid key.
+#[derive(Debug, Clone)]
+pub struct RowidLookupSelectTemplate {
+    /// Cursor ID for the source table.
+    pub cursor_id: i32,
+    /// Root page of the source table.
+    pub root_page: i32,
+    /// Column indices to extract (from Column opcodes: p2 values).
+    pub column_indices: Vec<i32>,
+    /// Source of the rowid lookup key.
+    pub rowid_source: InsertValueSource,
 }
 
 /// One compiled column source for a simple INSERT record.
@@ -66,6 +84,7 @@ pub fn try_compile_program(ops: &[VdbeOp]) -> Option<CompiledProgram> {
     try_compile_constant_result_row(ops)
         .map(CompiledProgram::ConstantResultRow)
         .or_else(|| try_compile_insert(ops).map(CompiledProgram::SimpleInsert))
+        .or_else(|| try_compile_rowid_lookup_select(ops).map(CompiledProgram::RowidLookupSelect))
 }
 
 fn ensure_const_register(registers: &mut Vec<Option<SqliteValue>>, reg: i32, value: SqliteValue) {
@@ -393,6 +412,106 @@ fn find_root_page(ops: &[VdbeOp], cursor_id: i32) -> Option<i32> {
         .map(|op| op.p2)
 }
 
+fn find_read_root_page(ops: &[VdbeOp], cursor_id: i32) -> Option<i32> {
+    ops.iter()
+        .find(|op| op.opcode == Opcode::OpenRead && op.p1 == cursor_id)
+        .map(|op| op.p2)
+}
+
+fn try_compile_rowid_lookup_select(ops: &[VdbeOp]) -> Option<RowidLookupSelectTemplate> {
+    for op in ops {
+        match op.opcode {
+            Opcode::Init
+            | Opcode::Transaction
+            | Opcode::Goto
+            | Opcode::Noop
+            | Opcode::OpenRead
+            | Opcode::Close
+            | Opcode::Halt
+            | Opcode::Integer
+            | Opcode::Int64
+            | Opcode::Real
+            | Opcode::String
+            | Opcode::String8
+            | Opcode::Null
+            | Opcode::Variable
+            | Opcode::Copy
+            | Opcode::SCopy
+            | Opcode::Move
+            | Opcode::SeekRowid
+            | Opcode::NotExists
+            | Opcode::Column
+            | Opcode::ResultRow
+            | Opcode::Affinity
+            | Opcode::ReadCookie
+            | Opcode::TableLock
+            | Opcode::RealAffinity => {}
+            _ => return None,
+        }
+    }
+
+    let seek = ops
+        .iter()
+        .find(|op| op.opcode == Opcode::SeekRowid || op.opcode == Opcode::NotExists)?;
+    let cursor_id = seek.p1;
+    let rowid_reg = seek.p3;
+    let root_page = find_read_root_page(ops, cursor_id)?;
+
+    let rowid_source = resolve_register_source(ops, rowid_reg)?;
+
+    let result_row = ops.iter().find(|op| op.opcode == Opcode::ResultRow)?;
+    let first_result_reg = result_row.p1;
+    let result_count = usize::try_from(result_row.p2).ok()?;
+
+    let mut column_indices = Vec::with_capacity(result_count);
+    for offset in 0..i32::try_from(result_count).ok()? {
+        let dest_reg = first_result_reg + offset;
+        let col_op = ops
+            .iter()
+            .find(|op| op.opcode == Opcode::Column && op.p1 == cursor_id && op.p3 == dest_reg)?;
+        column_indices.push(col_op.p2);
+    }
+
+    Some(RowidLookupSelectTemplate {
+        cursor_id,
+        root_page,
+        column_indices,
+        rowid_source,
+    })
+}
+
+fn resolve_register_source(ops: &[VdbeOp], reg: i32) -> Option<InsertValueSource> {
+    for op in ops.iter().rev() {
+        match op.opcode {
+            Opcode::Variable if op.p2 == reg => {
+                let binding_index = usize::try_from(op.p1).ok()?.checked_sub(1)?;
+                return Some(InsertValueSource::Binding(binding_index));
+            }
+            Opcode::Integer if op.p2 == reg => {
+                return Some(InsertValueSource::Constant(SqliteValue::Integer(
+                    i64::from(op.p1),
+                )));
+            }
+            Opcode::Int64 if op.p2 == reg => {
+                let value = match &op.p4 {
+                    P4::Int64(v) => *v,
+                    P4::Int(v) => i64::from(*v),
+                    _ => return None,
+                };
+                return Some(InsertValueSource::Constant(SqliteValue::Integer(value)));
+            }
+            Opcode::SCopy if op.p2 == reg => {
+                return resolve_register_source(ops, op.p1);
+            }
+            Opcode::Copy if op.p2 == reg && op.p3 == 0 => {
+                return resolve_register_source(ops, op.p1);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,5 +635,101 @@ mod tests {
         );
         assert_eq!(template.affinity.as_deref(), Some("DB"));
         assert_eq!(template.insert_flags, 2);
+    }
+
+    #[test]
+    fn try_compile_rowid_lookup_select_from_seek_pattern() {
+        let ops = vec![
+            VdbeOp {
+                opcode: Opcode::Init,
+                p1: 0,
+                p2: 8,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Transaction,
+                p1: 0,
+                p2: 0,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::OpenRead,
+                p1: 0,
+                p2: 5,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Variable,
+                p1: 1,
+                p2: 1,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::SeekRowid,
+                p1: 0,
+                p2: 7,
+                p3: 1,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Column,
+                p1: 0,
+                p2: 0,
+                p3: 2,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Column,
+                p1: 0,
+                p2: 1,
+                p3: 3,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::ResultRow,
+                p1: 2,
+                p2: 2,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Close,
+                p1: 0,
+                p2: 0,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Halt,
+                p1: 0,
+                p2: 0,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+        ];
+
+        let compiled = try_compile_program(&ops);
+        let template = match compiled {
+            Some(CompiledProgram::RowidLookupSelect(t)) => t,
+            other => panic!("expected RowidLookupSelect, got {other:?}"),
+        };
+        assert_eq!(template.cursor_id, 0);
+        assert_eq!(template.root_page, 5);
+        assert_eq!(template.column_indices, vec![0, 1]);
+        assert_eq!(template.rowid_source, InsertValueSource::Binding(0));
     }
 }

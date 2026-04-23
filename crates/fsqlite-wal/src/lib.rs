@@ -34,6 +34,7 @@ pub mod native_commit;
 pub mod parallel_wal;
 pub mod per_core_buffer;
 pub mod recovery_compaction;
+pub mod recovery_fence;
 pub mod telemetry;
 pub mod wal;
 #[cfg(not(target_arch = "wasm32"))]
@@ -102,6 +103,12 @@ pub use per_core_buffer::{
     AppendOutcome, BufferConfig, BufferState, DEFAULT_BUFFER_SLOT_COUNT, EpochConfig,
     EpochFlushBatch, EpochOrderCoordinator, FallbackDecision, OverflowPolicy, PerCoreWalBuffer,
     PerCoreWalBufferPool, WalRecord, thread_buffer_slot,
+};
+pub use recovery_fence::{
+    CheckpointChecksumVerdict, ExpectedPageChecksum, PidOwnedLockEntry, PidOwnedLockRegistry,
+    RECOVERY_FENCE_BACKOFF, RECOVERY_FENCE_MAX_RETRIES, RecoveryFence, RecoveryFenceGuard,
+    ensure_db_fsync_before_wal_truncate, execute_recovery_barrier, fsync_db_file_full,
+    pid_alive_os, verify_checkpoint_checksum_prefix,
 };
 pub use telemetry::{
     NoOpWalObserver, WalTelemetryEvent, WalTelemetryObserver, WalTelemetryRingBuffer,

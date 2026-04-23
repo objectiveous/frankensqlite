@@ -158,8 +158,10 @@ pub fn execute_checkpoint<F: VfsFile>(
         }
     }
 
-    // Post-action: reset or truncate WAL.
-    let wal_was_reset = apply_checkpoint_post_action(cx, wal, plan.post_action)?;
+    // Post-action: reset or truncate WAL. Passes `target` so the
+    // truncate path can issue an explicit fsync(db, FULL) before the
+    // WAL is truncated (bd-yfdb6).
+    let wal_was_reset = apply_checkpoint_post_action(cx, wal, plan.post_action, target)?;
 
     let checkpoint_duration_us = crate::metrics::duration_us_saturating(checkpoint_start.elapsed());
 
@@ -186,6 +188,7 @@ fn apply_checkpoint_post_action<F: VfsFile>(
     cx: &Cx,
     wal: &mut WalFile<F>,
     post_action: CheckpointPostAction,
+    target: &mut impl CheckpointTarget,
 ) -> Result<bool> {
     match post_action {
         CheckpointPostAction::ResetWal | CheckpointPostAction::TruncateWal => {
@@ -195,10 +198,21 @@ fn apply_checkpoint_post_action<F: VfsFile>(
                 salt2: wal.header().salts.salt2.wrapping_add(1),
             };
             let truncate = matches!(post_action, CheckpointPostAction::TruncateWal);
+            if truncate {
+                // bd-yfdb6: enforce fsync(db, FULL) before any WAL
+                // truncate. The earlier backfill loop issues `sync_db`
+                // already, but we re-issue an explicit full sync here to
+                // make the ordering invariant visible at the truncate
+                // call-site and defensive against future changes to the
+                // backfill path. A failure here MUST prevent the truncate;
+                // `?` accomplishes that.
+                crate::recovery_fence::ensure_db_fsync_before_wal_truncate(cx, target)?;
+            }
             wal.reset(cx, new_seq, new_salts, truncate)?;
             info!(
                 new_checkpoint_seq = new_seq,
                 action = ?post_action,
+                truncate,
                 "WAL reset after checkpoint"
             );
             Ok(true)

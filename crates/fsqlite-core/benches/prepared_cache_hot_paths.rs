@@ -109,8 +109,7 @@ fn parse_iterations() -> u64 {
 fn main() {
     let iterations = parse_iterations();
     let prepare_hit_ns = bench_mt_mvcc_prepare_hit(iterations);
-    let prepare_execute_ns =
-        bench_mt_mvcc_prepare_then_execute_cycle(iterations.min(200_000));
+    let prepare_execute_ns = bench_mt_mvcc_prepare_then_execute_cycle(iterations.min(200_000));
 
     println!(
         "prepared_cache_hot_paths mt_mvcc_prepare_hit_ns_per_op={prepare_hit_ns:.2} iterations={iterations}"

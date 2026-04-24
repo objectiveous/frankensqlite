@@ -638,6 +638,9 @@ pub const DEFAULT_PLAN_CACHE_CAPACITY: usize = 128;
 pub struct QueryPlanner {
     plan_cache: LruCache<u64, Rc<QueryPlan>>,
     cached_schema_cookie: Option<u32>,
+    hot_plan_cache_key: Option<u64>,
+    hot_plan_cache_plan: Option<Rc<QueryPlan>>,
+    hot_plan_cache_needs_lru_touch: bool,
 }
 
 impl Default for QueryPlanner {
@@ -662,6 +665,9 @@ impl QueryPlanner {
         Self {
             plan_cache: LruCache::new(normalize_plan_cache_capacity(capacity)),
             cached_schema_cookie: None,
+            hot_plan_cache_key: None,
+            hot_plan_cache_plan: None,
+            hot_plan_cache_needs_lru_touch: false,
         }
     }
 
@@ -681,6 +687,7 @@ impl QueryPlanner {
     pub fn clear_plan_cache(&mut self) {
         self.plan_cache.clear();
         self.cached_schema_cookie = None;
+        self.clear_hot_plan_cache();
     }
 
     /// Return a cached plan for the given SQL template and schema cookie, or compute one.
@@ -699,14 +706,19 @@ impl QueryPlanner {
     {
         self.invalidate_plan_cache_if_schema_cookie_changed(schema_cookie);
         let key = plan_cache_key(sql_template, schema_cookie);
+        self.prepare_plan_cache_lookup(key);
 
-        if let Some(plan) = self.plan_cache.get(&key) {
-            return Rc::clone(plan);
+        if let Some(plan) = self.lookup_hot_plan_cache(key) {
+            return plan;
+        }
+
+        if let Some(plan) = self.plan_cache.get(&key).map(Rc::clone) {
+            return self.record_plan_cache_hit(key, plan);
         }
 
         let plan = Rc::new(build());
         self.plan_cache.put(key, Rc::clone(&plan));
-        plan
+        self.record_plan_cache_hit(key, plan)
     }
 
     /// Cached wrapper around [`order_joins_with_hints_and_features`].
@@ -746,14 +758,14 @@ impl QueryPlanner {
 
         self.invalidate_plan_cache_if_schema_cookie_changed(schema_cookie);
         let key = plan_cache_key_with_feature_flags(sql_template, schema_cookie, feature_flags);
+        self.prepare_plan_cache_lookup(key);
 
-        if let Some(plan) = self.plan_cache.get(&key) {
-            if let Some(store) = cracking_hints {
-                for access_path in &plan.access_paths {
-                    store.record_access_path(access_path);
-                }
-            }
-            return Rc::clone(plan);
+        if let Some(plan) = self.lookup_hot_plan_cache(key) {
+            return plan;
+        }
+
+        if let Some(plan) = self.plan_cache.get(&key).map(Rc::clone) {
+            return self.record_plan_cache_hit(key, plan);
         }
 
         let plan = Rc::new(order_joins_with_hints_and_features(
@@ -767,7 +779,7 @@ impl QueryPlanner {
             feature_flags,
         ));
         self.plan_cache.put(key, Rc::clone(&plan));
-        plan
+        self.record_plan_cache_hit(key, plan)
     }
 
     fn invalidate_plan_cache_if_schema_cookie_changed(&mut self, schema_cookie: u32) {
@@ -776,8 +788,50 @@ impl QueryPlanner {
             .is_some_and(|cached| cached != schema_cookie)
         {
             self.plan_cache.clear();
+            self.clear_hot_plan_cache();
         }
         self.cached_schema_cookie = Some(schema_cookie);
+    }
+
+    fn prepare_plan_cache_lookup(&mut self, key: u64) {
+        if self
+            .hot_plan_cache_key
+            .is_some_and(|hot_key| hot_key != key)
+        {
+            self.flush_hot_plan_cache_lru_touch();
+            self.clear_hot_plan_cache();
+        }
+    }
+
+    fn lookup_hot_plan_cache(&mut self, key: u64) -> Option<Rc<QueryPlan>> {
+        if self.hot_plan_cache_key == Some(key) {
+            self.hot_plan_cache_needs_lru_touch = true;
+            return self.hot_plan_cache_plan.as_ref().map(Rc::clone);
+        }
+        None
+    }
+
+    fn record_plan_cache_hit(&mut self, key: u64, plan: Rc<QueryPlan>) -> Rc<QueryPlan> {
+        self.hot_plan_cache_key = Some(key);
+        self.hot_plan_cache_plan = Some(Rc::clone(&plan));
+        self.hot_plan_cache_needs_lru_touch = false;
+        plan
+    }
+
+    fn flush_hot_plan_cache_lru_touch(&mut self) {
+        if !self.hot_plan_cache_needs_lru_touch {
+            return;
+        }
+        if let Some(key) = self.hot_plan_cache_key {
+            let _ = self.plan_cache.get(&key);
+        }
+        self.hot_plan_cache_needs_lru_touch = false;
+    }
+
+    fn clear_hot_plan_cache(&mut self) {
+        self.hot_plan_cache_key = None;
+        self.hot_plan_cache_plan = None;
+        self.hot_plan_cache_needs_lru_touch = false;
     }
 }
 
@@ -9742,6 +9796,12 @@ mod tests {
         let hottest_plan = planner.cached_plan(hottest_sql, schema_cookie, || {
             panic!("expected hottest cache entry to already exist")
         });
+        for _ in 0..4 {
+            let hottest_plan_again = planner.cached_plan(hottest_sql, schema_cookie, || {
+                panic!("expected hottest entry to stay hot across repeated direct hits")
+            });
+            assert!(Rc::ptr_eq(&hottest_plan, &hottest_plan_again));
+        }
 
         let cold_key = plan_cache_key("SELECT * FROM cached_table WHERE id = ?1", schema_cookie);
         let hot_key = plan_cache_key(hottest_sql, schema_cookie);

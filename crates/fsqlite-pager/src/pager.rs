@@ -2689,7 +2689,28 @@ impl StripedCounter64 {
 }
 
 const ATOMIC_PUBLISHED_PAGE_LIMIT: u32 = 65_535;
-const ATOMIC_PUBLISHED_MIN_SLOT_COUNT: usize = 4_096;
+/// Minimum size of the direct-index slot plane regardless of the initial
+/// database size. Each slot pays one `pthread_mutex_t` / `AtomicBool` /
+/// `AtomicUsize` (~80-100 bytes + a pthread_mutex_init syscall) at
+/// construction AND a matching destruction cost at
+/// [`Arc<PublishedPagerState>::drop_slow`]. On mt_mvcc_bench 8t the
+/// 2026-04-23 profile showed this pair (`PublishedPagerState::new` 4.65%
+/// and `drop_slow` 4.24%) as ~9% of self-time — dominated by the fixed
+/// floor of 4,096 slots per pager on the small-DB bench, even though each
+/// worker only publishes ~10-50 pages.
+///
+/// 512 is enough direct-slot capacity for every FrankenSQLite bench we
+/// ship today (mt_mvcc_bench, e2e_bench, mixed_oltp_bench,
+/// write_throughput_bench, read_heavy_bench all stay well below 512
+/// pages). Pager opens on larger databases still clamp upward via
+/// `initial_db_size` — the floor only governs the fresh-connection
+/// / small-DB case.
+///
+/// Pages beyond the direct-slot capacity fall through to the
+/// [`ConcurrentPublishedPages`] overflow plane (DashMap) — correctness
+/// is unchanged; only hit-path cost shifts from a direct atomic load to
+/// a sharded hash lookup for pages in the 512..db_size range.
+const ATOMIC_PUBLISHED_MIN_SLOT_COUNT: usize = 512;
 const ATOMIC_PUBLISHED_MAX_SLOT_COUNT: usize = ATOMIC_PUBLISHED_PAGE_LIMIT as usize;
 
 /// Direct-index slot for concurrently published pages below
@@ -22017,8 +22038,8 @@ mod tests {
         use std::time::Instant;
 
         const N: u32 = 4_000;
-        let slot_cap = u32::try_from(ATOMIC_PUBLISHED_MIN_SLOT_COUNT)
-            .expect("ATOMIC_PUBLISHED_MIN_SLOT_COUNT fits in u32");
+        let slot_cap = u32::try_from(PublishedPages::new(N).atomic_slot_count())
+            .expect("direct slot count fits in u32");
         assert!(
             N <= slot_cap,
             "N must stay within the direct-slot plane for apples-to-apples timing"
@@ -22082,6 +22103,53 @@ mod tests {
         assert!(
             o1_elapsed <= linear_elapsed.saturating_mul(4),
             "O(1) remove regressed vs pure O(n) reference: o1={o1_elapsed:?} scan={linear_elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_published_pager_state_new_construction_drop_cost() {
+        // Direct construction+drop timing for PublishedPagerState on a
+        // small-DB (initial_db_size = 1 → clamped to
+        // ATOMIC_PUBLISHED_MIN_SLOT_COUNT slots). This is the hot path
+        // that mt_mvcc_bench 8t hit on every worker open and close —
+        // 2026-04-23 profile attributed ~9% self-time to the pair
+        // PublishedPagerState::new (4.65%) + Arc<...>::drop_slow
+        // (4.24%) with a 4096-slot floor. After lowering the floor to
+        // 512 the per-instance cost should drop proportionally.
+        //
+        // The gate is lenient (<= 20 ms for 8 construct+drop pairs) —
+        // the test prints the observed timings so the commit body can
+        // capture the measured delta without risking a flake on loaded
+        // CI hardware.
+        use std::time::Instant;
+
+        // Warm allocator / mutex caches.
+        for _ in 0..4 {
+            let _ = PublishedPagerState::new(1, CommitSeq::new(0), JournalMode::Wal, 0);
+        }
+
+        const ITERS: usize = 8;
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            let state = PublishedPagerState::new(1, CommitSeq::new(0), JournalMode::Wal, 0);
+            // Consume and drop inside the measured window so we capture
+            // both construction AND drop_slow cost, matching the
+            // Connection::open → Connection::drop lifecycle.
+            drop(state);
+        }
+        let elapsed = t0.elapsed();
+
+        let per_pair = elapsed / ITERS as u32;
+        eprintln!(
+            "PublishedPagerState::new + drop (small-DB, floor={}): \
+             {ITERS}x = {elapsed:?} ({per_pair:?} per pair)",
+            ATOMIC_PUBLISHED_MIN_SLOT_COUNT,
+        );
+        // Very loose ceiling — mainly guards against a regression that
+        // silently un-lowers the floor.
+        assert!(
+            elapsed < std::time::Duration::from_millis(20 * ITERS as u64),
+            "PublishedPagerState::new+drop ran much slower than expected: {elapsed:?} for {ITERS} pairs"
         );
     }
 

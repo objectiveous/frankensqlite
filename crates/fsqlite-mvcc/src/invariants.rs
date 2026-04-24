@@ -3164,10 +3164,12 @@ mod tests {
             })
             .collect();
 
+        #[allow(clippy::inline_always)]
         #[inline(always)]
         fn visible_branching(v: &PageVersion, s: &Snapshot) -> bool {
             v.commit_seq.get() != 0 && v.commit_seq <= s.high
         }
+        #[allow(clippy::inline_always)]
         #[inline(always)]
         fn visible_branchless(v: &PageVersion, s: &Snapshot) -> bool {
             v.commit_seq.get().wrapping_sub(1) < s.high.get()

@@ -812,8 +812,8 @@ mod tests {
     }
 
     /// Microbench for the snapshot established/released gate extension.
-    /// Each transaction begin + finalize calls `mvcc_snapshot_established`
-    /// + `mvcc_snapshot_released`; the pre-gate path did one relaxed
+    /// Each transaction begin/finalize calls `mvcc_snapshot_established`
+    /// and `mvcc_snapshot_released`; the pre-gate path did one relaxed
     /// `fetch_add` + a CAS loop on a process-wide contended cache line.
     /// With the gate off (the new production default) both collapse to
     /// one relaxed bool load each.

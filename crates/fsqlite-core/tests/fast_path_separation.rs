@@ -1468,6 +1468,89 @@ fn test_fast_path_count_star_sum_skips_nulls_but_counts_rows() {
 }
 
 #[test]
+fn test_fast_path_count_star_sum_uses_trailing_column_defaults() {
+    let _profile_guard = FastPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t(marker INTEGER, score INTEGER DEFAULT 7)")
+        .unwrap();
+    conn.execute("INSERT INTO t(marker) VALUES (1), (2), (3)")
+        .unwrap();
+
+    let stmt = conn.prepare("SELECT COUNT(*), SUM(score) FROM t").unwrap();
+
+    let before = hot_path_profile_snapshot();
+    let row = stmt.query_row().unwrap();
+    let after = hot_path_profile_snapshot();
+
+    assert_count_star_sum_row(&row, 3, Some(fsqlite_types::SqliteValue::Integer(21)));
+
+    let (fast_delta, slow_delta) = fast_slow_delta(&before.parser, &after.parser);
+    assert!(
+        fast_delta > 0,
+        "COUNT(*)+SUM() should preserve trailing DEFAULT values on the prepared fast path"
+    );
+    assert_eq!(
+        slow_delta, 0,
+        "trailing DEFAULT COUNT(*)+SUM() should not need slow-path execution"
+    );
+}
+
+#[test]
+fn test_fast_path_count_star_sum_text_values_use_sum_registry_fallback() {
+    let _profile_guard = FastPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t(score TEXT)").unwrap();
+    conn.execute("INSERT INTO t VALUES ('1.5'), ('2.5'), (NULL)")
+        .unwrap();
+
+    let stmt = conn.prepare("SELECT COUNT(*), SUM(score) FROM t").unwrap();
+
+    let before = hot_path_profile_snapshot();
+    let row = stmt.query_row().unwrap();
+    let after = hot_path_profile_snapshot();
+
+    assert_count_star_sum_row(&row, 3, Some(fsqlite_types::SqliteValue::Float(4.0)));
+
+    let (fast_delta, slow_delta) = fast_slow_delta(&before.parser, &after.parser);
+    assert!(
+        fast_delta > 0,
+        "COUNT(*)+SUM() should keep prepared execution while using SUM fallback semantics"
+    );
+    assert_eq!(
+        slow_delta, 0,
+        "text SUM fallback should not require slow-path statement execution"
+    );
+}
+
+#[test]
+fn test_fast_path_count_star_sum_rowid_alias_projection() {
+    let _profile_guard = FastPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, score INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+
+    let stmt = conn.prepare("SELECT COUNT(*), SUM(id) FROM t").unwrap();
+
+    let before = hot_path_profile_snapshot();
+    let row = stmt.query_row().unwrap();
+    let after = hot_path_profile_snapshot();
+
+    assert_count_star_sum_row(&row, 3, Some(fsqlite_types::SqliteValue::Integer(6)));
+
+    let (fast_delta, slow_delta) = fast_slow_delta(&before.parser, &after.parser);
+    assert!(
+        fast_delta > 0,
+        "COUNT(*)+SUM() should project INTEGER PRIMARY KEY aliases without slow-path execution"
+    );
+    assert_eq!(
+        slow_delta, 0,
+        "rowid-alias COUNT(*)+SUM() should not leave the prepared fast path"
+    );
+}
+
+#[test]
 fn test_fast_path_count_star_sum_sees_post_insert_visibility() {
     let _profile_guard = FastPathProfileTestGuard::new();
     let conn = Connection::open(":memory:").unwrap();

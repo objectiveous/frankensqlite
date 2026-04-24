@@ -41,6 +41,7 @@ pub use value::{SmallText, SqliteValue};
 
 use std::fmt;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// A page number in the database file.
@@ -282,6 +283,7 @@ impl fmt::Display for PageSize {
 /// `Arc<[u8]>` for shared copy-on-write snapshots.
 pub struct PageData {
     repr: PageDataRepr,
+    image_token: u64,
 }
 
 enum PageDataRepr {
@@ -307,10 +309,12 @@ impl Clone for PageData {
                 );
                 Self {
                     repr: PageDataRepr::Shared(shared),
+                    image_token: self.image_token,
                 }
             }
             PageDataRepr::Shared(bytes) => Self {
                 repr: PageDataRepr::Shared(Arc::clone(bytes)),
+                image_token: self.image_token,
             },
         }
     }
@@ -335,6 +339,15 @@ impl PageDataRepr {
 }
 
 impl PageData {
+    fn next_image_token() -> u64 {
+        static NEXT_IMAGE_TOKEN: AtomicU64 = AtomicU64::new(1);
+        NEXT_IMAGE_TOKEN.fetch_add(1, Ordering::Relaxed).max(1)
+    }
+
+    fn bump_image_token(&mut self) {
+        self.image_token = Self::next_image_token();
+    }
+
     fn invalidate_owned_snapshot_cache_if_needed(&mut self) {
         let reset_owned_snapshot_cache = matches!(
             &self.repr,
@@ -373,6 +386,7 @@ impl PageData {
                 bytes: data,
                 shared: OnceLock::new(),
             },
+            image_token: Self::next_image_token(),
         }
     }
 
@@ -381,6 +395,7 @@ impl PageData {
     pub fn from_shared(bytes: Arc<[u8]>) -> Self {
         Self {
             repr: PageDataRepr::Shared(bytes),
+            image_token: Self::next_image_token(),
         }
     }
 
@@ -390,12 +405,25 @@ impl PageData {
         self.repr.as_bytes()
     }
 
+    /// Cheap identity for this exact immutable page image.
+    ///
+    /// Clones preserve the token because they expose identical bytes. Any
+    /// mutable access assigns a fresh token before returning the mutable slice,
+    /// so caches can key on `(page_no, image_token)` instead of re-hashing the
+    /// whole page to detect page-image changes.
+    #[inline]
+    #[must_use]
+    pub fn image_token(&self) -> u64 {
+        self.image_token
+    }
+
     /// Get the page data as a mutable byte slice.
     ///
     /// This performs a clone if the data is shared (Copy-On-Write).
     #[inline]
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
         self.invalidate_owned_snapshot_cache_if_needed();
+        self.bump_image_token();
         match &mut self.repr {
             PageDataRepr::Owned { bytes, .. } => bytes.as_mut_slice(),
             PageDataRepr::Shared(bytes) => Arc::make_mut(bytes),
@@ -430,6 +458,7 @@ impl PageData {
                     return false;
                 }
                 if bytes.len() < new_len {
+                    self.image_token = Self::next_image_token();
                     bytes.resize(new_len, 0);
                 }
                 true
@@ -1713,13 +1742,51 @@ mod tests {
     }
 
     #[test]
+    fn page_data_image_token_tracks_clone_and_mutation_boundaries() {
+        let mut page = PageData::from_vec(vec![9, 8, 7, 6]);
+        let original_token = page.image_token();
+        let snapshot = page.clone();
+
+        assert_eq!(
+            snapshot.image_token(),
+            original_token,
+            "immutable clones must share the same page-image token"
+        );
+
+        page.as_bytes_mut()[0] = 1;
+        assert_ne!(
+            page.image_token(),
+            original_token,
+            "mutable access must move the owner to a fresh page-image token"
+        );
+        assert_eq!(
+            snapshot.image_token(),
+            original_token,
+            "old snapshots retain the old image token"
+        );
+
+        let second_snapshot = page.clone();
+        assert_eq!(
+            second_snapshot.image_token(),
+            page.image_token(),
+            "new snapshots observe the latest token"
+        );
+    }
+
+    #[test]
     fn page_data_try_zero_extend_owned_to_preserves_owned_bytes_and_invalidates_stale_snapshot() {
         let mut page = PageData::from_vec(vec![9, 8, 7, 6]);
         let snapshot = page.clone();
+        let original_token = page.image_token();
 
         assert!(page.try_zero_extend_owned_to(8));
         assert_eq!(page.as_bytes(), &[9, 8, 7, 6, 0, 0, 0, 0]);
         assert_eq!(snapshot.as_bytes(), &[9, 8, 7, 6]);
+        assert_ne!(
+            page.image_token(),
+            original_token,
+            "zero extension mutates the page image and must bump the token"
+        );
         assert!(
             matches!(page.repr, PageDataRepr::Owned { .. }),
             "zero-extending an owned page should stay on the owned representation"

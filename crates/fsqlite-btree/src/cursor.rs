@@ -36,11 +36,10 @@ use fsqlite_types::serial_type::{
 use fsqlite_types::{PageData, PageNumber, SqliteValue, WitnessKey};
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 #[cfg(target_arch = "x86_64")]
 use std::intrinsics::prefetch_read_data;
 use std::sync::{Arc, Mutex, OnceLock};
-use xxhash_rust::xxh3::xxh3_64;
 
 /// OPT-1: process-wide shared default `CollationRegistry`.
 ///
@@ -555,7 +554,7 @@ struct StackEntry {
     /// Box::from(Vec) reallocation+copy on every page load.
     cell_pointers: Vec<u16>,
     /// Page-image mutation signature for validating cached cell-slot parses.
-    mutation_counter: u32,
+    mutation_counter: u64,
     /// Current cell index. For interior pages, this indicates which child
     /// was descended into. For leaf pages, this is the current position.
     /// A value equal to `cell_count` means "past the right-most child" on
@@ -621,7 +620,7 @@ impl CachedCellSlot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CellSlotCacheEntry {
     page_no: PageNumber,
-    mutation_counter: u32,
+    mutation_counter: u64,
     slots: CachedCellSlots,
 }
 
@@ -719,7 +718,7 @@ impl CellSlotCache {
     fn get(
         &mut self,
         page_no: PageNumber,
-        mutation_counter: u32,
+        mutation_counter: u64,
         cell_idx: u16,
     ) -> Option<CachedCellSlot> {
         use std::sync::atomic::Ordering::Relaxed;
@@ -750,7 +749,7 @@ impl CellSlotCache {
     fn get_slow(
         &mut self,
         page_no: PageNumber,
-        mutation_counter: u32,
+        mutation_counter: u64,
         cell_idx: u16,
         front_page_match: bool,
     ) -> Option<CachedCellSlot> {
@@ -803,7 +802,7 @@ impl CellSlotCache {
     fn insert(
         &mut self,
         page_no: PageNumber,
-        mutation_counter: u32,
+        mutation_counter: u64,
         cell_idx: u16,
         slot: CachedCellSlot,
     ) {
@@ -832,7 +831,7 @@ impl CellSlotCache {
     fn insert_slow(
         &mut self,
         page_no: PageNumber,
-        mutation_counter: u32,
+        mutation_counter: u64,
         cell_idx: u16,
         slot: CachedCellSlot,
     ) {
@@ -864,66 +863,6 @@ struct TableSeekCacheEntry {
     rowid: i64,
     page_no: PageNumber,
     cell_idx: u16,
-}
-
-/// bd-4i4vh.2: 4-slot direct-mapped memo for page-image mutation counters.
-///
-/// Each call to `BtCursor::page_mutation_counter` hashes the full 4 KiB page
-/// image via xxh3. A root-to-leaf descent hits three to four distinct pages,
-/// and the same three to four pages repeat across many inserts in a burst.
-/// The memo remembers the last four `(page_no, bytes_ptr) -> counter` tuples
-/// using the two low bits of `page_no` as the slot index; a pointer-identity
-/// hit skips the 4 KiB hash entirely.
-///
-/// Correctness: the memo only returns a cached counter when both `page_no`
-/// and the `PageData::as_bytes().as_ptr()` address match. Any cursor write
-/// that shifts cells goes through `Arc::make_mut` (multi-owner Shared pages)
-/// or `Vec::resize` (Owned pages that outgrow their buffer) — both change
-/// the underlying pointer, invalidating the memo. Stale-pointer aliasing
-/// after an Arc drop + re-allocation is broken by `page_no` match, since
-/// different pages get different PageData instances from the pager and the
-/// bytes are owned either by distinct Arcs (MVCC snapshots) or distinct
-/// Vecs (owned writes). `clear()` wipes the memo in `invalidate()` and when
-/// `usable_size` changes.
-const MUTATION_COUNTER_MEMO_SLOTS: usize = 4;
-
-#[derive(Debug, Clone, Copy, Default)]
-struct MutationCounterMemoSlot {
-    page_no: u32,
-    bytes_ptr: usize,
-    counter: u32,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct MutationCounterMemo {
-    slots: [MutationCounterMemoSlot; MUTATION_COUNTER_MEMO_SLOTS],
-}
-
-impl MutationCounterMemo {
-    #[inline]
-    fn lookup(&self, page_no: u32, bytes_ptr: usize) -> Option<u32> {
-        let slot = &self.slots[(page_no as usize) & (MUTATION_COUNTER_MEMO_SLOTS - 1)];
-        if slot.page_no == page_no && slot.bytes_ptr == bytes_ptr && slot.counter != 0 {
-            Some(slot.counter)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn record(&mut self, page_no: u32, bytes_ptr: usize, counter: u32) {
-        let idx = (page_no as usize) & (MUTATION_COUNTER_MEMO_SLOTS - 1);
-        self.slots[idx] = MutationCounterMemoSlot {
-            page_no,
-            bytes_ptr,
-            counter,
-        };
-    }
-
-    #[inline]
-    fn clear(&mut self) {
-        *self = Self::default();
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1128,14 +1067,6 @@ pub struct BtCursor<P> {
     /// advances when a successful write keeps the cursor on the same slot but
     /// rewrites the underlying page image.
     row_image_epoch: u64,
-    /// bd-4i4vh.2: tiny per-cursor memo of page-image mutation counters keyed
-    /// by `(page_no, bytes_ptr)`. `page_mutation_counter` hashes the full
-    /// 4 KiB page image via xxh3 on every `load_page` / `reload_page_fresh`
-    /// invocation — with a ~3-level tree that's 3-4 hashes per INSERT at
-    /// ~400 ns each. Whenever we see the same page_no + same underlying
-    /// byte pointer as on a prior call, we short-circuit and reuse the
-    /// cached u32 without rehashing.
-    mutation_counter_memo: Cell<MutationCounterMemo>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1158,7 +1089,6 @@ impl<P> BtCursor<P> {
         self.last_known_depth = None;
         self.seek_cache.fill(None);
         self.cell_slot_cache.get_mut().clear();
-        self.mutation_counter_memo.get_mut().clear();
         self.bump_row_image_epoch();
     }
 
@@ -1217,7 +1147,6 @@ impl<P> BtCursor<P> {
         );
         self.page_size = page_size;
         self.cell_slot_cache.get_mut().clear();
-        self.mutation_counter_memo.get_mut().clear();
     }
 
     fn clear_seek_cache(&mut self) {
@@ -1230,35 +1159,11 @@ impl<P> BtCursor<P> {
 
     fn bump_row_image_epoch(&mut self) {
         self.row_image_epoch = self.row_image_epoch.wrapping_add(1);
-        // Any cursor-driven write can hand the allocator back a freshly-freed
-        // page buffer whose memory address gets recycled by the next
-        // `read_page_data` with different bytes. Drop the whole 4-slot memo
-        // so the next `page_mutation_counter` re-hashes rather than trusting
-        // a possibly-recycled pointer.
-        self.mutation_counter_memo.get_mut().clear();
-    }
-
-    fn page_mutation_counter(&self, page_no: PageNumber, page_data: &PageData) -> u32 {
-        let bytes = page_data.as_bytes();
-        let bytes_ptr = bytes.as_ptr() as usize;
-        let page_key = page_no.get();
-        let mut memo = self.mutation_counter_memo.get();
-        if let Some(counter) = memo.lookup(page_key, bytes_ptr) {
-            return counter;
-        }
-        let counter = Self::compute_page_mutation_counter_from_bytes(bytes, self.usable_size);
-        memo.record(page_key, bytes_ptr, counter);
-        self.mutation_counter_memo.set(memo);
-        counter
     }
 
     #[inline]
-    fn compute_page_mutation_counter_from_bytes(page: &[u8], usable_size: u32) -> u32 {
-        let hash_len = page.len().min(usable_size as usize);
-        let hash = xxh3_64(&page[..hash_len]);
-        #[allow(clippy::cast_possible_truncation)]
-        let folded = (hash ^ (hash >> 32)) as u32;
-        folded.max(1)
+    fn page_mutation_counter(page_data: &PageData) -> u64 {
+        page_data.image_token()
     }
 
     fn is_on_rightmost_insert_edge(&self) -> bool {
@@ -1644,7 +1549,6 @@ impl<P: PageReader> BtCursor<P> {
             last_known_depth: None,
             seek_cache: [None; TABLE_SEEK_CACHE_SLOTS],
             row_image_epoch: 0,
-            mutation_counter_memo: Cell::new(MutationCounterMemo::default()),
         }
     }
 
@@ -2146,7 +2050,7 @@ impl<P: PageReader> BtCursor<P> {
         let header_offset = cell::header_offset_for_page(page_no);
         let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
         let cell_pointers = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
-        let mutation_counter = self.page_mutation_counter(page_no, &page_data);
+        let mutation_counter = Self::page_mutation_counter(&page_data);
 
         Ok(StackEntry {
             page_no,
@@ -2170,7 +2074,7 @@ impl<P: PageReader> BtCursor<P> {
         let header_offset = cell::header_offset_for_page(page_no);
         let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
         let cell_pointers = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
-        let mutation_counter = self.page_mutation_counter(page_no, &page_data);
+        let mutation_counter = Self::page_mutation_counter(&page_data);
         Ok(StackEntry {
             page_no,
             page_data,
@@ -3627,8 +3531,7 @@ impl<P: PageWriter> BtCursor<P> {
             }
 
             if let Some(cell_idx) = cached.header.cell_count.checked_sub(1) {
-                let mutation_counter =
-                    self.page_mutation_counter(cached.page_no, &cached.page_data);
+                let mutation_counter = Self::page_mutation_counter(&cached.page_data);
                 self.stack.clear();
                 self.stack.push(StackEntry {
                     page_no: cached.page_no,
@@ -6024,7 +5927,7 @@ impl<P: PageWriter> BtCursor<P> {
             cached.cell_pointers.push(new_cell_offset);
             let stack_page_data = cached.page_data.clone();
             let stack_cell_pointers = cached.cell_pointers.clone();
-            let mutation_counter = self.page_mutation_counter(cached.page_no, &stack_page_data);
+            let mutation_counter = Self::page_mutation_counter(&stack_page_data);
             self.stack.clear();
             self.stack.push(StackEntry {
                 page_no: cached.page_no,
@@ -6065,7 +5968,7 @@ impl<P: PageWriter> BtCursor<P> {
                 cached.cell_pointers.push(new_cell_offset);
                 let stack_page_data = cached.page_data.clone();
                 let stack_cell_pointers = cached.cell_pointers.clone();
-                let mutation_counter = self.page_mutation_counter(cached.page_no, &stack_page_data);
+                let mutation_counter = Self::page_mutation_counter(&stack_page_data);
                 self.stack.clear();
                 self.stack.push(StackEntry {
                     page_no: cached.page_no,
@@ -6275,7 +6178,7 @@ impl<P: PageWriter> BtCursor<P> {
         )? {
             let cell_pointers =
                 cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
-            let mutation_counter = self.page_mutation_counter(hinted_leaf_page, &page_data);
+            let mutation_counter = Self::page_mutation_counter(&page_data);
             self.last_insert_rowid = Some(rowid);
             self.stack.clear();
             self.stack.push(StackEntry {
@@ -6319,7 +6222,7 @@ impl<P: PageWriter> BtCursor<P> {
             Ok(Some((insert_idx, _))) => {
                 let cell_pointers =
                     cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
-                let mutation_counter = self.page_mutation_counter(hinted_leaf_page, &page_data);
+                let mutation_counter = Self::page_mutation_counter(&page_data);
                 self.cell_buf = cell_data;
                 self.last_insert_rowid = Some(rowid);
                 self.stack.clear();
@@ -14129,13 +14032,13 @@ mod tests {
         }
 
         let hot_page = pn(999);
-        let hot_counter = 0x1234_5678_u32;
+        let hot_counter = 0x1234_5678_u64;
         let slot = sample_slot(32);
 
         let prime_cache = |cache: &mut CellSlotCache| {
             for i in 0..PREFILL {
                 let page = pn(i + 2);
-                cache.insert_slow(page, i.wrapping_add(0xAB00), 0, sample_slot(16));
+                cache.insert_slow(page, u64::from(i.wrapping_add(0xAB00)), 0, sample_slot(16));
             }
             // Promote hot entry to the front so subsequent inserts exercise
             // the front-entry path.
@@ -14205,7 +14108,7 @@ mod tests {
         fn legacy_get_slow(
             cache: &mut CellSlotCache,
             page_no: PageNumber,
-            mutation_counter: u32,
+            mutation_counter: u64,
             cell_idx: u16,
         ) -> Option<CachedCellSlot> {
             let entry_idx = cache.entries.iter().position(|entry| {
@@ -14223,13 +14126,13 @@ mod tests {
         }
 
         let hot_page = pn(999);
-        let hot_counter = 0x1234_5678_u32;
+        let hot_counter = 0x1234_5678_u64;
         let slot = sample_slot(32);
 
         let prime_cache = |cache: &mut CellSlotCache| {
             for i in 0..PREFILL {
                 let page = pn(i + 2);
-                cache.insert_slow(page, i.wrapping_add(0xAB00), 0, sample_slot(16));
+                cache.insert_slow(page, u64::from(i.wrapping_add(0xAB00)), 0, sample_slot(16));
             }
             cache.insert_slow(hot_page, hot_counter, 0, slot);
             for idx in 1..10 {
@@ -14278,63 +14181,21 @@ mod tests {
         );
     }
 
-    /// Micro-benchmark for bd-4i4vh.2: mutation-counter memo vs raw xxh3 hash.
-    ///
-    /// Ignored by default (run with `--release --ignored --nocapture`).
-    /// Simulates repeated `page_mutation_counter` invocations for the same
-    /// (page_no, bytes_ptr) — the common case during a root-to-leaf descent
-    /// and subsequent stack reuse within a single insert burst.
     #[test]
-    #[ignore = "micro-benchmark; run with `--release --ignored --nocapture`"]
-    fn bench_page_mutation_counter_memo() {
-        const USABLE: u32 = 4096;
-        const WARMUP: u32 = 100_000;
-        const ITERS: u32 = 5_000_000;
+    fn page_mutation_counter_uses_page_image_token() {
+        let mut page_data = PageData::from_vec(vec![0; USABLE as usize]);
+        let first = BtCursor::<MemPageStore>::page_mutation_counter(&page_data);
+        let snapshot = page_data.clone();
 
-        // Realistic-ish page image: fill with a mix so xxh3 can't short-circuit
-        // on zero runs.
-        let mut page = vec![0u8; USABLE as usize];
-        for (i, byte) in page.iter_mut().enumerate() {
-            *byte = (i ^ (i >> 3) ^ 0x5a) as u8;
-        }
-        // Embed a plausible btree header prefix so nothing panics downstream.
-        page[3..5].copy_from_slice(&120u16.to_be_bytes()); // cell_count
-        page[5..7].copy_from_slice(&3800u16.to_be_bytes()); // cell_content_offset
-        let page_data = PageData::from_vec(page);
+        assert_eq!(
+            BtCursor::<MemPageStore>::page_mutation_counter(&snapshot),
+            first
+        );
 
-        let store = MemPageStore::new(USABLE);
-        let cursor = BtCursor::new(store, pn(7), USABLE, true);
-        let page_no = pn(7);
-
-        // Warm-up (fast path — memoized lookup).
-        for _ in 0..WARMUP {
-            let c = cursor.page_mutation_counter(page_no, &page_data);
-            std::hint::black_box(c);
-        }
-
-        // Fast path: the second-and-later calls hit the 4-slot memo.
-        let t0 = Instant::now();
-        for _ in 0..ITERS {
-            let c = cursor.page_mutation_counter(page_no, &page_data);
-            std::hint::black_box(c);
-        }
-        let fast_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(ITERS);
-
-        // Slow path: direct xxh3 hash, re-hashed every iteration.
-        let t0 = Instant::now();
-        for _ in 0..ITERS {
-            let c = BtCursor::<MemPageStore>::compute_page_mutation_counter_from_bytes(
-                page_data.as_bytes(),
-                USABLE,
-            );
-            std::hint::black_box(c);
-        }
-        let slow_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(ITERS);
-
-        println!(
-            "[page_mutation_counter memo] memoized={fast_ns:.3}ns  raw_xxh3={slow_ns:.3}ns  \
-             speedup={:.2}x  (usable={USABLE}, iters={ITERS})",
-            slow_ns / fast_ns.max(f64::EPSILON)
+        page_data.as_bytes_mut()[0] = 1;
+        assert_ne!(
+            BtCursor::<MemPageStore>::page_mutation_counter(&page_data),
+            first
         );
     }
 

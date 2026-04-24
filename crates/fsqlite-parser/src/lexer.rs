@@ -6,7 +6,7 @@
 use fsqlite_ast::Span;
 use fsqlite_types::limits::MAX_VARIABLE_NUMBER;
 use memchr::memchr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::Level;
 
@@ -51,6 +51,7 @@ static FSQLITE_TOKENIZE_DURATION_SECONDS_LE_5MS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_TOKENIZE_DURATION_SECONDS_GT_5MS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_TOKENIZE_DURATION_SECONDS_COUNT: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_TOKENIZE_DURATION_SECONDS_SUM_MICROS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_TOKENIZE_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
 
 fn saturating_u64_from_usize(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
@@ -95,6 +96,17 @@ pub fn tokenize_metrics_snapshot() -> TokenizeMetricsSnapshot {
         fsqlite_tokenize_duration_seconds_sum_micros: FSQLITE_TOKENIZE_DURATION_SECONDS_SUM_MICROS
             .load(Ordering::Relaxed),
     }
+}
+
+/// Enable or disable tokenize metrics collection on the hot path.
+pub fn set_tokenize_metrics_enabled(enabled: bool) {
+    FSQLITE_TOKENIZE_METRICS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Return whether tokenize metrics collection is enabled.
+#[must_use]
+pub fn tokenize_metrics_enabled() -> bool {
+    FSQLITE_TOKENIZE_METRICS_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Reset tokenize metrics (used by tests/diagnostics).
@@ -164,16 +176,20 @@ impl<'a> Lexer<'a> {
     /// scratch instead of rebuilding a fresh `Vec<Token>` on every miss.
     pub fn tokenize_into(source: &'a str, tokens: &mut Vec<Token>) {
         let input_bytes = source.len();
-        let span = tracing::span!(
-            target: "fsqlite.parse",
-            Level::TRACE,
-            "tokenize",
-            token_count = tracing::field::Empty,
-            input_bytes,
-            elapsed_us = tracing::field::Empty,
-        );
-        let _guard = span.enter();
-        let started = Instant::now();
+        let collect_tokenize_metrics = tokenize_metrics_enabled();
+        let trace_tokenize = tracing::enabled!(target: "fsqlite.parse", Level::TRACE);
+        let span = trace_tokenize.then(|| {
+            tracing::span!(
+                target: "fsqlite.parse",
+                Level::TRACE,
+                "tokenize",
+                token_count = tracing::field::Empty,
+                input_bytes,
+                elapsed_us = tracing::field::Empty,
+            )
+        });
+        let _guard = span.as_ref().map(|span| span.enter());
+        let started = (collect_tokenize_metrics || trace_tokenize).then(Instant::now);
 
         let mut lexer = Self::new(source);
         let target_capacity = input_bytes / 4 + 1;
@@ -190,11 +206,16 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        let elapsed = started.elapsed();
-        let elapsed_us = saturating_u64_from_u128(elapsed.as_micros());
-        span.record("token_count", saturating_u64_from_usize(tokens.len()));
-        span.record("elapsed_us", elapsed_us);
-        record_tokenize_metrics(tokens.len(), elapsed_us);
+        if let Some(started) = started {
+            let elapsed_us = saturating_u64_from_u128(started.elapsed().as_micros());
+            if let Some(span) = span.as_ref() {
+                span.record("token_count", saturating_u64_from_usize(tokens.len()));
+                span.record("elapsed_us", elapsed_us);
+            }
+            if collect_tokenize_metrics {
+                record_tokenize_metrics(tokens.len(), elapsed_us);
+            }
+        }
     }
 
     /// Expose tokenize metrics as a snapshot.
@@ -1309,13 +1330,14 @@ mod tests {
 
     #[test]
     fn test_tokenize_metrics_accumulate_tokens_and_histogram_samples() {
+        let prev_metrics_enabled = tokenize_metrics_enabled();
         reset_tokenize_metrics();
+        set_tokenize_metrics_enabled(true);
 
         let first = lex("SELECT 1;");
         let second = lex("SELECT 2;");
 
-        let expected_total_tokens =
-            u64::try_from(first.len() + second.len()).expect("small token vectors should fit");
+        let expected_total_tokens = u64::try_from(first.len() + second.len()).unwrap_or(u64::MAX);
         let snap = tokenize_metrics_snapshot();
         assert_eq!(snap.fsqlite_tokenize_tokens_total, expected_total_tokens);
         assert_eq!(snap.fsqlite_tokenize_duration_seconds_count, 2);
@@ -1323,11 +1345,16 @@ mod tests {
             histogram_total(&snap.fsqlite_tokenize_duration_seconds),
             snap.fsqlite_tokenize_duration_seconds_count
         );
+
+        set_tokenize_metrics_enabled(prev_metrics_enabled);
+        reset_tokenize_metrics();
     }
 
     #[test]
     fn test_tokenize_metrics_reset_clears_all_fields() {
+        let prev_metrics_enabled = tokenize_metrics_enabled();
         reset_tokenize_metrics();
+        set_tokenize_metrics_enabled(true);
         let _ = lex("SELECT 42;");
 
         let before = tokenize_metrics_snapshot();
@@ -1340,5 +1367,25 @@ mod tests {
         assert_eq!(after.fsqlite_tokenize_duration_seconds_count, 0);
         assert_eq!(after.fsqlite_tokenize_duration_seconds_sum_micros, 0);
         assert_eq!(histogram_total(&after.fsqlite_tokenize_duration_seconds), 0);
+
+        set_tokenize_metrics_enabled(prev_metrics_enabled);
+    }
+
+    #[test]
+    fn test_tokenize_metrics_can_be_disabled_off_hot_path() {
+        let prev_metrics_enabled = tokenize_metrics_enabled();
+        reset_tokenize_metrics();
+        set_tokenize_metrics_enabled(false);
+
+        let _ = lex("SELECT 99;");
+
+        let snap = tokenize_metrics_snapshot();
+        assert_eq!(snap.fsqlite_tokenize_tokens_total, 0);
+        assert_eq!(snap.fsqlite_tokenize_duration_seconds_count, 0);
+        assert_eq!(snap.fsqlite_tokenize_duration_seconds_sum_micros, 0);
+        assert_eq!(histogram_total(&snap.fsqlite_tokenize_duration_seconds), 0);
+
+        set_tokenize_metrics_enabled(prev_metrics_enabled);
+        reset_tokenize_metrics();
     }
 }

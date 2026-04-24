@@ -16,8 +16,8 @@ use std::hash::BuildHasher;
 use std::path::Path;
 
 use fsqlite_ast::{
-    ColumnConstraintKind, CreateTableBody, DefaultValue, Expr, GeneratedStorage, IndexedColumn,
-    SortDirection, Statement, TableConstraintKind,
+    ColumnConstraintKind, CreateTableBody, CreateTableStatement, DefaultValue, Expr,
+    GeneratedStorage, IndexedColumn, SortDirection, Statement, TableConstraintKind,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_btree::BtreeCursorOps;
@@ -1624,26 +1624,8 @@ pub fn is_strict_table_sql(sql: &str) -> bool {
 /// Return true when CREATE TABLE SQL declares AUTOINCREMENT.
 #[must_use]
 pub fn is_autoincrement_table_sql(sql: &str) -> bool {
-    if let Some(Statement::CreateTable(create)) = parse_single_statement(sql)
-        && let CreateTableBody::Columns { columns, .. } = &create.body
-    {
-        return columns.iter().any(|col| {
-            let is_integer = col
-                .type_name
-                .as_ref()
-                .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
-            is_integer
-                && col.constraints.iter().any(|constraint| {
-                    matches!(
-                        &constraint.kind,
-                        ColumnConstraintKind::PrimaryKey {
-                            autoincrement: true,
-                            direction,
-                            ..
-                        } if *direction != Some(SortDirection::Desc)
-                    )
-                })
-        });
+    if let Some(Statement::CreateTable(create)) = parse_single_statement(sql) {
+        return autoincrement_from_create_table_statement(&create);
     }
 
     let mut token = String::new();
@@ -1660,32 +1642,37 @@ pub fn is_autoincrement_table_sql(sql: &str) -> bool {
     token == "AUTOINCREMENT"
 }
 
+pub(crate) fn autoincrement_from_create_table_statement(create: &CreateTableStatement) -> bool {
+    let CreateTableBody::Columns { columns, .. } = &create.body else {
+        return false;
+    };
+    columns.iter().any(|col| {
+        let is_integer = col
+            .type_name
+            .as_ref()
+            .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
+        is_integer
+            && col.constraints.iter().any(|constraint| {
+                matches!(
+                    &constraint.kind,
+                    ColumnConstraintKind::PrimaryKey {
+                        autoincrement: true,
+                        direction,
+                        ..
+                    } if *direction != Some(SortDirection::Desc)
+                )
+            })
+    })
+}
+
 /// Extract CHECK constraint expressions from a CREATE TABLE SQL string.
 ///
 /// Finds `CHECK(...)` clauses in the column-def body and returns the
 /// expression text (inside the parentheses) for each one.
 #[must_use]
 pub fn extract_check_constraints_from_sql(sql: &str) -> Vec<String> {
-    if let Some(Statement::CreateTable(create)) = parse_single_statement(sql)
-        && let CreateTableBody::Columns {
-            columns,
-            constraints,
-        } = &create.body
-    {
-        let mut checks = Vec::new();
-        for column in columns {
-            for constraint in &column.constraints {
-                if let ColumnConstraintKind::Check(expr) = &constraint.kind {
-                    checks.push(expr.to_string());
-                }
-            }
-        }
-        for constraint in constraints {
-            if let TableConstraintKind::Check(expr) = &constraint.kind {
-                checks.push(expr.to_string());
-            }
-        }
-        return checks;
+    if let Some(Statement::CreateTable(create)) = parse_single_statement(sql) {
+        return check_constraints_from_create_table_statement(&create);
     }
 
     let Some(open) = sql.find('(') else {
@@ -1730,6 +1717,32 @@ pub fn extract_check_constraints_from_sql(sql: &str) -> Vec<String> {
             }
         } else {
             search_from = abs_pos + 5;
+        }
+    }
+    checks
+}
+
+pub(crate) fn check_constraints_from_create_table_statement(
+    create: &CreateTableStatement,
+) -> Vec<String> {
+    let CreateTableBody::Columns {
+        columns,
+        constraints,
+    } = &create.body
+    else {
+        return Vec::new();
+    };
+    let mut checks = Vec::new();
+    for column in columns {
+        for constraint in &column.constraints {
+            if let ColumnConstraintKind::Check(expr) = &constraint.kind {
+                checks.push(expr.to_string());
+            }
+        }
+    }
+    for constraint in constraints {
+        if let TableConstraintKind::Check(expr) = &constraint.kind {
+            checks.push(expr.to_string());
         }
     }
     checks
@@ -1871,6 +1884,12 @@ fn try_parse_columns_from_create_sql_ast(sql: &str) -> Option<Vec<ColumnInfo>> {
     let Statement::CreateTable(create) = parse_single_statement(sql)? else {
         return None;
     };
+    columns_from_create_table_statement(&create)
+}
+
+pub(crate) fn columns_from_create_table_statement(
+    create: &CreateTableStatement,
+) -> Option<Vec<ColumnInfo>> {
     let CreateTableBody::Columns { columns, .. } = &create.body else {
         return None;
     };

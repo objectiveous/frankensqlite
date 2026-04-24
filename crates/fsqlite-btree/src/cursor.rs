@@ -618,27 +618,53 @@ struct CellSlotCache {
     entries: Vec<CellSlotCacheEntry>,
 }
 
-/// bd-yafor.2: cell-slot cache hit/miss accounting.
+/// bd-yafor.2 + bd-o92pn.2: cell-slot cache hit/miss accounting, classified.
 ///
 /// Incremented by `CellSlotCache::get` under `Relaxed` ordering so the cost is
 /// a single uncontended `lock xadd` per lookup — small enough to leave live in
 /// release builds while giving us ground-truth hit-rate data from any
-/// workload. The counters are inert unless read by
-/// `cell_slot_cache_counter_snapshot`.
+/// workload. Misses are split into three kinds so an audit can tell whether a
+/// high overall miss-rate comes from cold starts (no entry for this page in
+/// the cache yet), writer invalidation (entry exists for this `page_no` but a
+/// previous write bumped the `mutation_counter` so the key no longer
+/// matches), or in-entry slot misses (the entry matched but this specific
+/// `cell_idx` has not been parsed yet). The counters are inert unless read
+/// by `cell_slot_cache_counter_snapshot`.
 static CELL_SLOT_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static CELL_SLOT_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CELL_SLOT_CACHE_MISS_COLD: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static CELL_SLOT_CACHE_MISS_INVALIDATED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static CELL_SLOT_CACHE_MISS_SLOT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Snapshot of cell-slot cache counters for audit/tests.
 #[derive(Debug, Clone, Copy)]
 pub struct CellSlotCacheCounters {
     pub hits: u64,
-    pub misses: u64,
+    /// No existing entry in the cache covers this `page_no` (cold start or
+    /// LRU eviction).
+    pub miss_cold: u64,
+    /// Entry exists for this `page_no` but the recorded `mutation_counter`
+    /// differs from the current one — i.e. a writer changed the page image
+    /// since the entry was recorded.
+    pub miss_invalidated: u64,
+    /// The `(page_no, mutation_counter)` entry matched but this specific
+    /// `cell_idx` had not been parsed into the slot list yet.
+    pub miss_slot: u64,
 }
 
 impl CellSlotCacheCounters {
     #[must_use]
+    pub fn misses(self) -> u64 {
+        self.miss_cold
+            .saturating_add(self.miss_invalidated)
+            .saturating_add(self.miss_slot)
+    }
+
+    #[must_use]
     pub fn total(self) -> u64 {
-        self.hits.saturating_add(self.misses)
+        self.hits.saturating_add(self.misses())
     }
 
     #[must_use]
@@ -656,15 +682,21 @@ impl CellSlotCacheCounters {
 }
 
 pub fn cell_slot_cache_counter_snapshot() -> CellSlotCacheCounters {
+    use std::sync::atomic::Ordering::Relaxed;
     CellSlotCacheCounters {
-        hits: CELL_SLOT_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed),
-        misses: CELL_SLOT_CACHE_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+        hits: CELL_SLOT_CACHE_HITS.load(Relaxed),
+        miss_cold: CELL_SLOT_CACHE_MISS_COLD.load(Relaxed),
+        miss_invalidated: CELL_SLOT_CACHE_MISS_INVALIDATED.load(Relaxed),
+        miss_slot: CELL_SLOT_CACHE_MISS_SLOT.load(Relaxed),
     }
 }
 
 pub fn reset_cell_slot_cache_counters() {
-    CELL_SLOT_CACHE_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
-    CELL_SLOT_CACHE_MISSES.store(0, std::sync::atomic::Ordering::Relaxed);
+    use std::sync::atomic::Ordering::Relaxed;
+    CELL_SLOT_CACHE_HITS.store(0, Relaxed);
+    CELL_SLOT_CACHE_MISS_COLD.store(0, Relaxed);
+    CELL_SLOT_CACHE_MISS_INVALIDATED.store(0, Relaxed);
+    CELL_SLOT_CACHE_MISS_SLOT.store(0, Relaxed);
 }
 
 impl CellSlotCache {
@@ -678,31 +710,28 @@ impl CellSlotCache {
         mutation_counter: u32,
         cell_idx: u16,
     ) -> Option<CachedCellSlot> {
+        use std::sync::atomic::Ordering::Relaxed;
         // Binary search probes the same page repeatedly, so the common hit is
         // the already-promoted front entry. Avoid scanning the whole entry LRU
         // just to rediscover the MRU page.
-        if let Some(front) = self.entries.first()
-            && front.page_no == page_no
-            && front.mutation_counter == mutation_counter
-        {
-            let slot = front
-                .slots
-                .iter()
-                .find_map(|(idx, slot)| (*idx == cell_idx).then_some(*slot));
-            if slot.is_some() {
-                CELL_SLOT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                CELL_SLOT_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let front_page_match = if let Some(front) = self.entries.first() {
+            if front.page_no == page_no && front.mutation_counter == mutation_counter {
+                let slot = front
+                    .slots
+                    .iter()
+                    .find_map(|(idx, slot)| (*idx == cell_idx).then_some(*slot));
+                if slot.is_some() {
+                    CELL_SLOT_CACHE_HITS.fetch_add(1, Relaxed);
+                } else {
+                    CELL_SLOT_CACHE_MISS_SLOT.fetch_add(1, Relaxed);
+                }
+                return slot;
             }
-            return slot;
-        }
-        let result = self.get_slow(page_no, mutation_counter, cell_idx);
-        if result.is_some() {
-            CELL_SLOT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            front.page_no == page_no
         } else {
-            CELL_SLOT_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        result
+            false
+        };
+        self.get_slow(page_no, mutation_counter, cell_idx, front_page_match)
     }
 
     #[cold]
@@ -711,25 +740,51 @@ impl CellSlotCache {
         page_no: PageNumber,
         mutation_counter: u32,
         cell_idx: u16,
+        front_page_match: bool,
     ) -> Option<CachedCellSlot> {
-        let entry_idx = self
-            .entries
-            .iter()
-            .enumerate()
-            .skip(1)
-            .find_map(|(idx, entry)| {
-                (entry.page_no == page_no && entry.mutation_counter == mutation_counter)
-                    .then_some(idx)
-            })?;
+        use std::sync::atomic::Ordering::Relaxed;
+        // Scan the rest of the LRU. `front_page_match` carries over the
+        // observation from `get`: if the front entry already matched the
+        // page_no (but had a stale mutation_counter) we know at least one
+        // writer-invalidated image exists, even if this deeper scan finds
+        // nothing.
+        let mut saw_page = front_page_match;
+        let mut matching_idx = None;
+        for (idx, entry) in self.entries.iter().enumerate().skip(1) {
+            if entry.page_no == page_no {
+                saw_page = true;
+                if entry.mutation_counter == mutation_counter {
+                    matching_idx = Some(idx);
+                    break;
+                }
+            }
+        }
+        let Some(entry_idx) = matching_idx else {
+            if saw_page {
+                CELL_SLOT_CACHE_MISS_INVALIDATED.fetch_add(1, Relaxed);
+            } else {
+                CELL_SLOT_CACHE_MISS_COLD.fetch_add(1, Relaxed);
+            }
+            return None;
+        };
         let slot = self.entries[entry_idx]
             .slots
             .iter()
-            .find_map(|(idx, slot)| (*idx == cell_idx).then_some(*slot))?;
-        if entry_idx != 0 {
-            let entry = self.entries.remove(entry_idx);
-            self.entries.insert(0, entry);
+            .find_map(|(idx, slot)| (*idx == cell_idx).then_some(*slot));
+        match slot {
+            Some(found) => {
+                CELL_SLOT_CACHE_HITS.fetch_add(1, Relaxed);
+                if entry_idx != 0 {
+                    let entry = self.entries.remove(entry_idx);
+                    self.entries.insert(0, entry);
+                }
+                Some(found)
+            }
+            None => {
+                CELL_SLOT_CACHE_MISS_SLOT.fetch_add(1, Relaxed);
+                None
+            }
         }
-        Some(slot)
     }
 
     #[inline]
@@ -14371,10 +14426,15 @@ mod tests {
 
         fn run_and_report(label: &str, counters: crate::cursor::CellSlotCacheCounters) {
             let total = counters.total();
+            let misses = counters.misses();
             println!(
-                "[cell_slot_cache audit] {label}: hits={}  misses={}  total={total}  hit_rate={:.4}",
+                "[cell_slot_cache audit] {label}: hits={}  miss_cold={}  miss_invalidated={}  \
+                 miss_slot={}  misses={}  total={total}  hit_rate={:.4}",
                 counters.hits,
-                counters.misses,
+                counters.miss_cold,
+                counters.miss_invalidated,
+                counters.miss_slot,
+                misses,
                 counters.hit_rate()
             );
         }

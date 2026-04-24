@@ -1,6 +1,6 @@
 use std::env;
 use std::hint::black_box;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Instant;
 
 use fsqlite_ast::{BinaryOp as AstBinaryOp, ColumnRef, Expr, Literal, Span};
@@ -64,13 +64,13 @@ fn bench_cached_plan_hit(iterations: u64) -> (f64, u64) {
     let sql = "SELECT * FROM users WHERE email = ?1";
     let schema_cookie = 7;
     let warmed = planner.cached_plan(sql, schema_cookie, sample_query_plan);
-    black_box(Arc::clone(&warmed));
+    black_box(Rc::clone(&warmed));
 
     let mut unexpected_misses = 0;
     let start = Instant::now();
     for _ in 0..iterations {
         let plan = planner.cached_plan(black_box(sql), black_box(schema_cookie), sample_query_plan);
-        unexpected_misses += u64::from(!Arc::ptr_eq(&plan, &warmed));
+        unexpected_misses += u64::from(!Rc::ptr_eq(&plan, &warmed));
         black_box(plan);
     }
     (
@@ -101,7 +101,7 @@ fn bench_order_joins_with_cache_hit(iterations: u64) -> (f64, u64) {
         None,
         feature_flags,
     );
-    black_box(Arc::clone(&warmed));
+    black_box(Rc::clone(&warmed));
 
     let mut unexpected_misses = 0;
     let start = Instant::now();
@@ -118,7 +118,7 @@ fn bench_order_joins_with_cache_hit(iterations: u64) -> (f64, u64) {
             None,
             feature_flags,
         );
-        unexpected_misses += u64::from(!Arc::ptr_eq(&plan, &warmed));
+        unexpected_misses += u64::from(!Rc::ptr_eq(&plan, &warmed));
         black_box(plan);
     }
     (

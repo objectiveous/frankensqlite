@@ -24,8 +24,9 @@ use lru::LruCache;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 // ---------------------------------------------------------------------------
@@ -635,7 +636,7 @@ pub const DEFAULT_PLAN_CACHE_CAPACITY: usize = 128;
 /// and any higher-level SQL parsing remain above this crate's current scope.
 #[derive(Debug)]
 pub struct QueryPlanner {
-    plan_cache: LruCache<u64, Arc<QueryPlan>>,
+    plan_cache: LruCache<u64, Rc<QueryPlan>>,
     cached_schema_cookie: Option<u32>,
 }
 
@@ -692,7 +693,7 @@ impl QueryPlanner {
         sql_template: &str,
         schema_cookie: u32,
         build: F,
-    ) -> Arc<QueryPlan>
+    ) -> Rc<QueryPlan>
     where
         F: FnOnce() -> QueryPlan,
     {
@@ -700,11 +701,11 @@ impl QueryPlanner {
         let key = plan_cache_key(sql_template, schema_cookie);
 
         if let Some(plan) = self.plan_cache.get(&key) {
-            return Arc::clone(plan);
+            return Rc::clone(plan);
         }
 
-        let plan = Arc::new(build());
-        self.plan_cache.put(key, Arc::clone(&plan));
+        let plan = Rc::new(build());
+        self.plan_cache.put(key, Rc::clone(&plan));
         plan
     }
 
@@ -726,12 +727,12 @@ impl QueryPlanner {
         table_index_hints: Option<&BTreeMap<String, IndexHint>>,
         cracking_hints: Option<&mut CrackingHintStore>,
         feature_flags: PlannerFeatureFlags,
-    ) -> Arc<QueryPlan> {
+    ) -> Rc<QueryPlan> {
         // Adaptive cracking hints are mutable runtime state, not schema state.
         // They can legitimately change the preferred index for the same SQL
         // template, so they must not be served from the stable plan cache.
         if cracking_hints.is_some() {
-            return Arc::new(order_joins_with_hints_and_features(
+            return Rc::new(order_joins_with_hints_and_features(
                 tables,
                 indexes,
                 where_terms,
@@ -752,10 +753,10 @@ impl QueryPlanner {
                     store.record_access_path(access_path);
                 }
             }
-            return Arc::clone(plan);
+            return Rc::clone(plan);
         }
 
-        let plan = Arc::new(order_joins_with_hints_and_features(
+        let plan = Rc::new(order_joins_with_hints_and_features(
             tables,
             indexes,
             where_terms,
@@ -765,7 +766,7 @@ impl QueryPlanner {
             cracking_hints,
             feature_flags,
         ));
-        self.plan_cache.put(key, Arc::clone(&plan));
+        self.plan_cache.put(key, Rc::clone(&plan));
         plan
     }
 
@@ -9693,7 +9694,7 @@ mod tests {
 
         assert_eq!(*first, uncached);
         assert_eq!(*second, uncached);
-        assert!(Arc::ptr_eq(&first, &second));
+        assert!(Rc::ptr_eq(&first, &second));
         assert_eq!(planner.plan_cache_len(), 1);
     }
 
@@ -9728,7 +9729,7 @@ mod tests {
         assert_eq!(generic.join_order, vec!["generic-sentinel".to_owned()]);
         assert_eq!(join_plan.join_order, vec!["users".to_owned()]);
         assert!(
-            !Arc::ptr_eq(&generic, &join_plan),
+            !Rc::ptr_eq(&generic, &join_plan),
             "generic cached_plan entries and join-order cache entries must not alias"
         );
         assert_eq!(planner.plan_cache_len(), 2);
@@ -9759,8 +9760,8 @@ mod tests {
         assert_eq!(planner.plan_cache_len(), 1);
         assert_eq!(rebuilt_plan_a.join_order, vec!["t1-v12".to_owned()]);
         assert!(
-            !Arc::ptr_eq(&plan_a, &rebuilt_plan_a),
-            "schema cookie change must discard prior Arc<QueryPlan> entries"
+            !Rc::ptr_eq(&plan_a, &rebuilt_plan_a),
+            "schema cookie change must discard prior Rc<QueryPlan> entries"
         );
     }
 
@@ -9803,7 +9804,7 @@ mod tests {
         let hottest_plan_again = planner.cached_plan(hottest_sql, schema_cookie, || {
             panic!("expected hottest entry to survive eviction")
         });
-        assert!(Arc::ptr_eq(&hottest_plan, &hottest_plan_again));
+        assert!(Rc::ptr_eq(&hottest_plan, &hottest_plan_again));
     }
 
     #[test]
@@ -9862,8 +9863,8 @@ mod tests {
             leapfrog.join_segments
         );
         assert!(
-            !Arc::ptr_eq(&hash_only, &leapfrog),
-            "feature-flag variants must not alias the same cached Arc<QueryPlan>"
+            !Rc::ptr_eq(&hash_only, &leapfrog),
+            "feature-flag variants must not alias the same cached Rc<QueryPlan>"
         );
         assert_eq!(planner.plan_cache_len(), 2);
     }
@@ -9946,7 +9947,7 @@ mod tests {
         assert_eq!(first.access_paths[0].index.as_deref(), Some("idx_a"));
         assert_eq!(second.access_paths[0].index.as_deref(), Some("idx_b"));
         assert_eq!(planner.plan_cache_len(), 0);
-        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(!Rc::ptr_eq(&first, &second));
     }
 }
 #[test]

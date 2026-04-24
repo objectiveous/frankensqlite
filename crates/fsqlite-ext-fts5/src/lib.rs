@@ -925,58 +925,91 @@ fn parse_primary(
             Ok((Fts5Expr::ColumnFilter(col, Box::new(inner)), rest))
         }
         Fts5QueryTokenKind::Near => {
-            // NEAR(term1 term2, N)
-            // Simplified: just parse as AND for now; collect nearby terms
-            let rest = &tokens[1..];
+            // Supported subset: NEAR(term1 term2 ..., N) with bare term operands.
+            let mut rest = &tokens[1..];
             if !rest
                 .first()
                 .is_some_and(|t| t.kind == Fts5QueryTokenKind::LParen)
             {
                 return Err(Fts5QueryError::InvalidNearSyntax);
             }
-            let rest = &rest[1..]; // skip (
+            rest = &rest[1..]; // skip (
             let mut terms = Vec::new();
             let mut distance = 10u32; // default NEAR distance
-            let mut rest = rest;
+            let mut expect_distance = false;
 
             while let Some(t) = rest.first() {
+                if t.kind == Fts5QueryTokenKind::And {
+                    rest = &rest[1..];
+                    continue;
+                }
+
                 if t.kind == Fts5QueryTokenKind::RParen {
+                    if expect_distance || terms.len() < 2 {
+                        return Err(Fts5QueryError::InvalidNearSyntax);
+                    }
                     rest = &rest[1..];
                     break;
                 }
-                if t.kind == Fts5QueryTokenKind::Term {
-                    // Handle NEAR(term1 term2, 5) — the tokenizer treats
-                    // `,` as part of a word, so we may see "term2," and
-                    // then "5" as separate tokens, or ",5" as one token.
-                    if let Some(stripped) = t.lexeme.strip_prefix(',') {
-                        // Token like ",5" — parse as distance.
-                        if let Ok(d) = stripped.parse::<u32>() {
-                            distance = d;
-                        }
-                    } else if t.lexeme.ends_with(',') {
-                        // Token like "term2," — strip trailing comma and
-                        // mark that the next numeric token is the distance.
-                        let clean = t.lexeme.trim_end_matches(',');
-                        if !clean.is_empty() {
-                            terms.push(clean.to_owned());
-                        }
-                        // Peek at the next token for the distance number.
-                        if let Some(next) = rest.get(1) {
-                            if next.kind == Fts5QueryTokenKind::Term {
-                                if let Ok(d) = next.lexeme.parse::<u32>() {
-                                    distance = d;
-                                    rest = &rest[1..]; // consume the distance token
-                                }
-                            }
-                        }
-                    } else {
-                        terms.push(t.lexeme.clone());
-                    }
+
+                if t.kind != Fts5QueryTokenKind::Term {
+                    return Err(Fts5QueryError::InvalidNearSyntax);
                 }
+
+                let lexeme = t.lexeme.trim();
+                if lexeme.is_empty() {
+                    return Err(Fts5QueryError::InvalidNearSyntax);
+                }
+
+                if expect_distance {
+                    let raw_distance = lexeme.strip_prefix(',').unwrap_or(lexeme);
+                    distance = raw_distance
+                        .parse::<u32>()
+                        .map_err(|_| Fts5QueryError::InvalidNearSyntax)?;
+                    expect_distance = false;
+                    rest = &rest[1..];
+                    continue;
+                }
+
+                if lexeme == "," {
+                    if terms.len() < 2 {
+                        return Err(Fts5QueryError::InvalidNearSyntax);
+                    }
+                    expect_distance = true;
+                    rest = &rest[1..];
+                    continue;
+                }
+
+                if let Some((raw_term, raw_distance)) = lexeme.split_once(',') {
+                    let term = raw_term.trim();
+                    let trailing = raw_distance.trim();
+
+                    if term.is_empty() {
+                        if terms.len() < 2 || trailing.is_empty() {
+                            return Err(Fts5QueryError::InvalidNearSyntax);
+                        }
+                        distance = trailing
+                            .parse::<u32>()
+                            .map_err(|_| Fts5QueryError::InvalidNearSyntax)?;
+                    } else {
+                        terms.push(term.to_owned());
+                        if trailing.is_empty() {
+                            expect_distance = true;
+                        } else {
+                            distance = trailing
+                                .parse::<u32>()
+                                .map_err(|_| Fts5QueryError::InvalidNearSyntax)?;
+                        }
+                    }
+                    rest = &rest[1..];
+                    continue;
+                }
+
+                terms.push(lexeme.to_owned());
                 rest = &rest[1..];
             }
 
-            if terms.len() < 2 {
+            if expect_distance || terms.len() < 2 {
                 return Err(Fts5QueryError::InvalidNearSyntax);
             }
 
@@ -3673,6 +3706,52 @@ mod tests {
         let tokens = parse_fts5_query("a OR b c").unwrap();
         let expr = build_expr(&tokens).unwrap();
         assert!(matches!(expr, Fts5Expr::Or(_, _)));
+    }
+
+    #[test]
+    fn test_build_expr_near_default_distance() {
+        let tokens = parse_fts5_query("NEAR(hello world)").unwrap();
+        let expr = build_expr(&tokens).unwrap();
+        match expr {
+            Fts5Expr::Near(terms, distance) => {
+                assert_eq!(terms, vec!["hello".to_owned(), "world".to_owned()]);
+                assert_eq!(distance, 10);
+            }
+            other => panic!("expected NEAR expression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_expr_near_explicit_distance() {
+        let tokens = parse_fts5_query("NEAR(hello world, 5)").unwrap();
+        let expr = build_expr(&tokens).unwrap();
+        match expr {
+            Fts5Expr::Near(terms, distance) => {
+                assert_eq!(terms, vec!["hello".to_owned(), "world".to_owned()]);
+                assert_eq!(distance, 5);
+            }
+            other => panic!("expected NEAR expression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_expr_near_inline_distance_token() {
+        let tokens = parse_fts5_query("NEAR(hello world,5)").unwrap();
+        let expr = build_expr(&tokens).unwrap();
+        match expr {
+            Fts5Expr::Near(terms, distance) => {
+                assert_eq!(terms, vec!["hello".to_owned(), "world".to_owned()]);
+                assert_eq!(distance, 5);
+            }
+            other => panic!("expected NEAR expression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_expr_near_rejects_boolean_operator() {
+        let tokens = parse_fts5_query("NEAR(hello OR world)").unwrap();
+        let err = build_expr(&tokens).unwrap_err();
+        assert_eq!(err, Fts5QueryError::InvalidNearSyntax);
     }
 
     #[test]

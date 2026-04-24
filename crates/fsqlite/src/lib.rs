@@ -380,6 +380,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(inserted, 1);
+
+        let deleted = conn
+            .execute("DELETE FROM sqlite_master WHERE name = 'fake_tbl';")
+            .unwrap();
+        assert_eq!(deleted, 1);
     }
 
     // ── DML affected-row counts (bd-118o) ─────────────────────────────────

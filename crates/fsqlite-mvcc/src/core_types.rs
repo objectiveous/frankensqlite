@@ -10,14 +10,14 @@
 use fsqlite_types::sync_primitives::{Condvar, Mutex, RwLock};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread::{self, Thread};
+use std::sync::Arc;
+use std::thread::{self, Thread, ThreadId};
 use std::time::{Duration, Instant};
 
 use crate::cache_aligned::{
-    CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, CacheAligned, SharedTxnSlot, TAG_CLAIMING,
-    decode_payload, decode_tag, encode_cleaning, is_sentinel, logical_now_millis,
+    decode_payload, decode_tag, encode_cleaning, is_sentinel, logical_now_millis, CacheAligned,
+    SharedTxnSlot, CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, TAG_CLAIMING,
 };
 use crate::ebr::VersionGuardTicket;
 use fsqlite_observability::GLOBAL_TXN_SLOT_METRICS;
@@ -358,8 +358,14 @@ type LockShard = CacheAligned<Mutex<HashMap<PageNumber, TxnId, PageNumberBuildHa
 type FcLockShard = CacheAligned<crate::flat_combining_page_locks::FcPageLockShard>;
 
 /// Per-page waiter queue for targeted wakeups (D4, bd-3wop3.4).
-/// `SmallVec<[Thread; 2]>` avoids heap allocation for typical 1-2 waiters/page.
-type WaiterQueue = SmallVec<[Thread; 2]>;
+/// `SmallVec<[WaiterEntry; 2]>` avoids heap allocation for typical 1-2 waiters/page.
+#[derive(Clone)]
+struct WaiterEntry {
+    id: ThreadId,
+    thread: Thread,
+}
+
+type WaiterQueue = SmallVec<[WaiterEntry; 2]>;
 
 /// Sharded waiter registry indexed by page number.
 type WaiterShard = CacheAligned<Mutex<HashMap<PageNumber, WaiterQueue, PageNumberBuildHasher>>>;
@@ -977,6 +983,8 @@ impl InProcessPageLockTable {
         timeout: Duration,
     ) -> bool {
         let started = Instant::now();
+        let current_thread = thread::current();
+        let current_thread_id = current_thread.id();
 
         loop {
             // Check if holder changed before parking.
@@ -991,14 +999,14 @@ impl InProcessPageLockTable {
             }
 
             // Register as waiter for this specific page.
-            self.register_waiter(page);
+            self.register_waiter(page, &current_thread, current_thread_id);
 
             // Double-check after registration (holder may have released between
             // our check and registration — avoid missed wakeup).
             match self.holder(page) {
                 Some(holder) if holder == observed_holder => {}
                 _ => {
-                    self.unregister_waiter(page);
+                    self.unregister_waiter(page, current_thread_id);
                     return true;
                 }
             }
@@ -1032,7 +1040,7 @@ impl InProcessPageLockTable {
             // thread in the queue.
             match self.holder(page) {
                 Some(holder) if holder == observed_holder => {
-                    self.unregister_waiter(page);
+                    self.unregister_waiter(page, current_thread_id);
                 }
                 _ => return true,
             }
@@ -1392,19 +1400,21 @@ impl InProcessPageLockTable {
     // -----------------------------------------------------------------------
 
     /// Register the current thread as waiting for `page`.
-    fn register_waiter(&self, page: PageNumber) {
+    fn register_waiter(&self, page: PageNumber, current_thread: &Thread, current_id: ThreadId) {
         let shard_idx = Self::shard_index_static(page);
         let mut map = self.waiter_shards[shard_idx].lock();
-        map.entry(page).or_default().push(thread::current());
+        map.entry(page).or_default().push(WaiterEntry {
+            id: current_id,
+            thread: current_thread.clone(),
+        });
     }
 
     /// Unregister the current thread from the waiter queue for `page`.
-    fn unregister_waiter(&self, page: PageNumber) {
-        let current = thread::current();
+    fn unregister_waiter(&self, page: PageNumber, current_id: ThreadId) {
         let shard_idx = Self::shard_index_static(page);
         let mut map = self.waiter_shards[shard_idx].lock();
         if let Some(queue) = map.get_mut(&page) {
-            queue.retain(|t| t.id() != current.id());
+            queue.retain(|waiter| waiter.id != current_id);
             if queue.is_empty() {
                 map.remove(&page);
             }
@@ -1420,8 +1430,8 @@ impl InProcessPageLockTable {
         let mut map = self.waiter_shards[shard_idx].lock();
         if let Some(queue) = map.remove(&page) {
             // Unpark all threads waiting for this specific page.
-            for thread in queue {
-                thread.unpark();
+            for waiter in queue {
+                waiter.thread.unpark();
             }
         }
         drop(map);
@@ -1448,8 +1458,8 @@ impl InProcessPageLockTable {
         for shard in self.waiter_shards.iter() {
             let mut map = shard.lock();
             for (_, queue) in map.drain() {
-                for thread in queue {
-                    thread.unpark();
+                for waiter in queue {
+                    waiter.thread.unpark();
                 }
             }
         }
@@ -3759,8 +3769,8 @@ mod tests {
 
     #[test]
     fn test_commit_index_latest_monotone_under_concurrent_updates() {
-        use std::sync::Barrier;
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::Barrier;
         use std::thread;
 
         const FINAL_SEQ: u64 = 256;
@@ -4783,8 +4793,8 @@ mod tests {
     const BEAD_22N13: &str = "bd-22n.13";
 
     use crate::cache_aligned::{
-        CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, TAG_CLAIMING, TAG_CLEANING,
-        encode_claiming, encode_cleaning,
+        encode_claiming, encode_cleaning, CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS,
+        TAG_CLAIMING, TAG_CLEANING,
     };
 
     /// Helper: create a slot with a real (non-sentinel) TxnId and begin_seq.
@@ -5816,7 +5826,7 @@ mod tests {
 
     #[test]
     fn test_txn_slot_cross_process_visibility_shared_slot() {
-        use std::sync::{Arc, Mutex, mpsc};
+        use std::sync::{mpsc, Arc, Mutex};
         use std::time::Instant;
 
         let scenario_started = Instant::now();
@@ -6170,23 +6180,17 @@ mod tests {
             .unwrap();
 
         // txn_b contends on page 10.
-        assert!(
-            table
-                .try_acquire(PageNumber::new(10).unwrap(), txn_b)
-                .is_err()
-        );
+        assert!(table
+            .try_acquire(PageNumber::new(10).unwrap(), txn_b)
+            .is_err());
         // txn_c contends on page 10.
-        assert!(
-            table
-                .try_acquire(PageNumber::new(10).unwrap(), txn_c)
-                .is_err()
-        );
+        assert!(table
+            .try_acquire(PageNumber::new(10).unwrap(), txn_c)
+            .is_err());
         // txn_b contends on page 20.
-        assert!(
-            table
-                .try_acquire(PageNumber::new(20).unwrap(), txn_b)
-                .is_err()
-        );
+        assert!(table
+            .try_acquire(PageNumber::new(20).unwrap(), txn_b)
+            .is_err());
 
         assert_eq!(
             obs.metrics()
@@ -6334,8 +6338,8 @@ mod tests {
         // bd-3wop3.4: 8 threads each wait for a different page. Release one page.
         // Only the thread waiting for that page should wake quickly; others
         // should remain parked (or wake much later via spurious wakeup).
-        use std::sync::Barrier;
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
 
         const NUM_THREADS: usize = 8;
         let table = Arc::new(InProcessPageLockTable::new());

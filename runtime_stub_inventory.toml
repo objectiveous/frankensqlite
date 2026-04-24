@@ -13,14 +13,16 @@ anchor = "Err(FrankenError::NotImplemented("
 [[runtime_stubs]]
 stub_id = "RSTUB-0009"
 file = "crates/fsqlite-core/src/connection.rs"
-line = 982
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
+line = 4708
+kind = "resolved"
+kind_description = "trigger WHEN clauses now use the connection-level subquery evaluator"
+severity = "resolved"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "Err(FrankenError::NotImplemented(_)) => Ok(true),"
+closure_strategy = "implemented"
+anchor = "trigger_when_matches(connection, when_clause, frame)"
+resolved_date = "2026-04-23"
+resolved_by = "NavyCreek"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-0010"

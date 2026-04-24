@@ -162,20 +162,74 @@ pub fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
         }
     }
 
-    // General case: 3-9 byte varints (rare in practice).
-    let mut value: u64 = u64::from(first & 0x7F);
-    for (i, &byte) in buf.iter().enumerate().skip(1).take(7) {
-        if byte & 0x80 == 0 {
-            value = (value << 7) | u64::from(byte);
-            return Some((value, i + 1));
-        }
-        value = (value << 7) | u64::from(byte & 0x7F);
-    }
+    // General case: 3-9 byte varints. Keep this hand-unrolled like SQLite's
+    // B-tree parser hot path; rowids in real INSERT/seek workloads commonly
+    // live here, and the iterator/enumerate fallback was visible through
+    // `CellRef::parse` in the Wave 5 profiles.
+    let mut value = u64::from(first & 0x7F);
 
-    // 9th byte (if present) uses all 8 bits
+    if buf.len() < 2 {
+        return None;
+    }
+    let byte = buf[1];
+    value = (value << 7) | u64::from(byte & 0x7F);
+
+    if buf.len() < 3 {
+        return None;
+    }
+    let byte = buf[2];
+    if byte & 0x80 == 0 {
+        return Some(((value << 7) | u64::from(byte), 3));
+    }
+    value = (value << 7) | u64::from(byte & 0x7F);
+
+    if buf.len() < 4 {
+        return None;
+    }
+    let byte = buf[3];
+    if byte & 0x80 == 0 {
+        return Some(((value << 7) | u64::from(byte), 4));
+    }
+    value = (value << 7) | u64::from(byte & 0x7F);
+
+    if buf.len() < 5 {
+        return None;
+    }
+    let byte = buf[4];
+    if byte & 0x80 == 0 {
+        return Some(((value << 7) | u64::from(byte), 5));
+    }
+    value = (value << 7) | u64::from(byte & 0x7F);
+
+    if buf.len() < 6 {
+        return None;
+    }
+    let byte = buf[5];
+    if byte & 0x80 == 0 {
+        return Some(((value << 7) | u64::from(byte), 6));
+    }
+    value = (value << 7) | u64::from(byte & 0x7F);
+
+    if buf.len() < 7 {
+        return None;
+    }
+    let byte = buf[6];
+    if byte & 0x80 == 0 {
+        return Some(((value << 7) | u64::from(byte), 7));
+    }
+    value = (value << 7) | u64::from(byte & 0x7F);
+
+    if buf.len() < 8 {
+        return None;
+    }
+    let byte = buf[7];
+    if byte & 0x80 == 0 {
+        return Some(((value << 7) | u64::from(byte), 8));
+    }
+    value = (value << 7) | u64::from(byte & 0x7F);
+
     if buf.len() > 8 {
-        value = (value << 8) | u64::from(buf[8]);
-        return Some((value, 9));
+        return Some(((value << 8) | u64::from(buf[8]), 9));
     }
 
     None

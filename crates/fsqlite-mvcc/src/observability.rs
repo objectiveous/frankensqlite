@@ -148,12 +148,35 @@ fn record_snapshot_read_versions_traversed_slow(versions_traversed: u64) {
 }
 
 /// Increment the `fsqlite_mvcc_active_snapshots` gauge.
+///
+/// No-op when `mvcc_snapshot_metrics_enabled()` is false (the default).
+/// Called from every `TransactionManager::begin` that establishes a read
+/// snapshot, so the gate keeps the hot path to one relaxed bool load
+/// instead of a `fetch_add` on a process-wide contended cache line.
+#[inline]
 pub fn mvcc_snapshot_established() {
+    if !MVCC_SNAPSHOT_METRICS_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
     MVCC_ACTIVE_SNAPSHOTS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Decrement the `fsqlite_mvcc_active_snapshots` gauge (saturating at zero).
+///
+/// No-op when `mvcc_snapshot_metrics_enabled()` is false (the default).
+/// Called from every transaction finalization path, so the gate avoids
+/// the CAS loop on the commit/rollback hot path.
+#[inline]
 pub fn mvcc_snapshot_released() {
+    if !MVCC_SNAPSHOT_METRICS_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    mvcc_snapshot_released_slow();
+}
+
+#[cold]
+#[inline(never)]
+fn mvcc_snapshot_released_slow() {
     loop {
         let current = MVCC_ACTIVE_SNAPSHOTS.load(Ordering::Relaxed);
         if current == 0 {
@@ -786,5 +809,54 @@ mod tests {
             aborts_delta >= 1,
             "expected at least 1 abort delta, got {aborts_delta}"
         );
+    }
+
+    /// Microbench for the snapshot established/released gate extension.
+    /// Each transaction begin + finalize calls `mvcc_snapshot_established`
+    /// + `mvcc_snapshot_released`; the pre-gate path did one relaxed
+    /// `fetch_add` + a CAS loop on a process-wide contended cache line.
+    /// With the gate off (the new production default) both collapse to
+    /// one relaxed bool load each.
+    #[test]
+    #[ignore = "microbench — run manually"]
+    fn bench_snapshot_established_released_gate() {
+        use std::time::Instant;
+
+        const CYCLES_PER_TRIAL: u32 = 4_000_000;
+        const TRIALS: usize = 9;
+
+        fn run_trial(cycles: u32, enabled: bool) -> f64 {
+            set_mvcc_snapshot_metrics_enabled(enabled);
+            let start = Instant::now();
+            for _ in 0..cycles {
+                mvcc_snapshot_established();
+                mvcc_snapshot_released();
+            }
+            start.elapsed().as_nanos() as f64 / f64::from(cycles)
+        }
+
+        run_trial(CYCLES_PER_TRIAL, true);
+        run_trial(CYCLES_PER_TRIAL, false);
+
+        let mut on_samples = Vec::with_capacity(TRIALS);
+        let mut off_samples = Vec::with_capacity(TRIALS);
+        for _ in 0..TRIALS {
+            let on = run_trial(CYCLES_PER_TRIAL, true);
+            let off = run_trial(CYCLES_PER_TRIAL, false);
+            eprintln!("  enabled: {on:.2} ns/cycle   disabled: {off:.2} ns/cycle");
+            on_samples.push(on);
+            off_samples.push(off);
+        }
+        on_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        off_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let on_med = on_samples[TRIALS / 2];
+        let off_med = off_samples[TRIALS / 2];
+        let delta_pct = (off_med - on_med) / on_med * 100.0;
+        eprintln!(
+            "bench_snapshot_established_released_gate: enabled median={on_med:.2} ns/cycle; \
+             disabled median={off_med:.2} ns/cycle; delta={delta_pct:+.1}% \
+             (n={TRIALS}, {CYCLES_PER_TRIAL} est+rel cycles/trial)"
+        );
+        set_mvcc_snapshot_metrics_enabled(false);
     }
 }

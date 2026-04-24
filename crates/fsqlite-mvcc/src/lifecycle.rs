@@ -2155,6 +2155,11 @@ mod tests {
 
     #[test]
     fn test_snapshot_read_span_and_metrics() {
+        // Production gates the snapshot-read histogram + active-snapshots
+        // gauge off (bc4fa6b5 + this commit); flip both on for this test
+        // so `versions_traversed_*` and `fsqlite_mvcc_active_snapshots`
+        // actually update.
+        crate::observability::set_mvcc_snapshot_metrics_enabled(true);
         let m = mgr();
         let pgno = PageNumber::new(44).unwrap();
 

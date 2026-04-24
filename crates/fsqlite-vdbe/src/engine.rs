@@ -2359,6 +2359,7 @@ impl SharedTxnPageIo {
 }
 
 const PAGE_LOCK_WAIT_CANCELLATION_POLL: Duration = Duration::from_millis(5);
+const PAGE_LOCK_WAIT_FULL_CHECKPOINT_POLL: Duration = Duration::from_millis(50);
 
 fn normalize_owned_page_data(page_size: usize, data: &[u8]) -> Result<PageData> {
     let metrics_enabled = vdbe_metrics_enabled();
@@ -2482,19 +2483,22 @@ fn wait_for_page_lock_holder_change(
 
     let metrics_enabled = vdbe_metrics_enabled();
     let started = Instant::now();
+    let mut next_full_checkpoint = PAGE_LOCK_WAIT_FULL_CHECKPOINT_POLL;
     loop {
-        // Per-iteration cancellation check: only probe the local
-        // `cancel_requested` atomic. The wait slice is bounded by
-        // `PAGE_LOCK_WAIT_CANCELLATION_POLL` (5 ms), so even if the e-process
-        // oracle fires during a slice, we'll observe it on the next iteration
-        // via the outer checkpoint at the top of the caller's loop. Running
-        // the full `Cx::checkpoint()` here was 1.58% self-time on the
-        // 2026-04-23 MT 8t DWARF capture (`fsqlite-memmove-dwarf-213322`).
-        if cx.is_cancel_requested() {
+        let elapsed = started.elapsed();
+        // Keep the hot per-slice path cheap, but do not make e-process/native
+        // cancellation wait for the whole busy timeout when the same holder
+        // stays parked on the page. The old code ran a full checkpoint every
+        // 5 ms; this bounds non-local cancellation latency to 50 ms while
+        // preserving most of the perf win from the cheap local check.
+        if elapsed >= next_full_checkpoint {
+            observe_execution_cancellation(cx)?;
+            next_full_checkpoint = elapsed.saturating_add(PAGE_LOCK_WAIT_FULL_CHECKPOINT_POLL);
+        } else if cx.is_cancel_requested() {
             return Err(FrankenError::Abort);
         }
 
-        let wait_budget = remaining.saturating_sub(started.elapsed());
+        let wait_budget = remaining.saturating_sub(elapsed);
         if wait_budget.is_zero() {
             return Ok(false);
         }

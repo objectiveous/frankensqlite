@@ -130,6 +130,13 @@ visible
 # Beads lock files (write/sync/bv/br advisory flocks)
 .beads/*.lock
 
+# Beads transient metadata
+.beads/last-touched
+
+# Multi-agent swarm coordination scratch state
+.swarm/
+.swarm_marching_orders.md
+
 # Ephemeral files (agent-generated, build artifacts, test detritus)
 ci-artifacts/
 proptest-regressions/

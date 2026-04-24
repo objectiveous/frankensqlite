@@ -26,7 +26,7 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use xxhash_rust::xxh3::xxh3_64;
+use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 // ---------------------------------------------------------------------------
 // Compound ORDER BY resolution (§19 quirk: first SELECT wins)
@@ -790,10 +790,7 @@ fn normalize_plan_cache_capacity(capacity: usize) -> NonZeroUsize {
 }
 
 fn plan_cache_key(sql_template: &str, schema_cookie: u32) -> u64 {
-    let mut material = Vec::with_capacity(sql_template.len() + std::mem::size_of::<u32>());
-    material.extend_from_slice(sql_template.as_bytes());
-    material.extend_from_slice(&schema_cookie.to_le_bytes());
-    xxh3_64(&material)
+    xxh3_64_with_seed(sql_template.as_bytes(), u64::from(schema_cookie))
 }
 
 fn plan_cache_key_with_feature_flags(
@@ -801,12 +798,14 @@ fn plan_cache_key_with_feature_flags(
     schema_cookie: u32,
     feature_flags: PlannerFeatureFlags,
 ) -> u64 {
-    let mut material = Vec::with_capacity(sql_template.len() + std::mem::size_of::<u32>() + 2);
-    material.extend_from_slice(sql_template.as_bytes());
-    material.extend_from_slice(&schema_cookie.to_le_bytes());
-    material.push(u8::from(feature_flags.leapfrog_join));
-    material.push(u8::from(feature_flags.dpccp_join));
-    xxh3_64(&material)
+    // Keep the schema cookie in the low 32 bits and pack feature toggles above
+    // it so each plan-cache variant gets a distinct seed without heap work.
+    let feature_mask = (u64::from(u8::from(feature_flags.leapfrog_join)) << 32)
+        | (u64::from(u8::from(feature_flags.dpccp_join)) << 33);
+    xxh3_64_with_seed(
+        sql_template.as_bytes(),
+        u64::from(schema_cookie) | feature_mask,
+    )
 }
 
 /// Planner feature toggles.

@@ -12,7 +12,7 @@
 //! - `corrupt` — Inject corruption into a working copy for recovery testing.
 //! - `compare` — Tiered comparison of two database files (bd-2als.3.2).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
@@ -76,6 +76,25 @@ const HOT_PATH_INLINE_BUNDLE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_inline_bund
 const HOT_PATH_INLINE_BUNDLE_PREFIX: &str = "HOT_PATH_INLINE_BUNDLE_JSON=";
 const HOT_PATH_COMMAND_PACK_SCHEMA_V2: &str = "fsqlite-e2e.hot_path_command_pack.v2";
 const HOT_PATH_COMMAND_PACK_NAME: &str = "command_pack.json";
+const HOT_PATH_VALIDATION_REPORT_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_validation_report.v1";
+const HOT_PATH_VALIDATION_REPORT_NAME: &str = "validation_report.json";
+const HOT_PATH_REQUIRED_ARTIFACT_PATHS: [&str; 6] = [
+    "actionable_ranking.json",
+    HOT_PATH_COMMAND_PACK_NAME,
+    "opcode_profile.json",
+    "profile.json",
+    "subsystem_profile.json",
+    "summary.md",
+];
+const HOT_PATH_CAUSAL_BUCKET_TAXONOMY: [&str; 7] = [
+    "allocation",
+    "io",
+    "mixed",
+    "queueing",
+    "retries",
+    "service",
+    "synchronization",
+];
 const VERIFY_SUITE_PACKAGE_SCHEMA_V2: &str = "fsqlite-e2e.verify_suite_package.v2";
 const VERIFY_SUITE_COUNTEREXAMPLE_SCHEMA_V2: &str = "fsqlite-e2e.verify_suite_counterexample.v2";
 const VERIFY_SUITE_INLINE_BUNDLE_PREFIX: &str = "VERIFY_SUITE_BUNDLE_JSON=";
@@ -1175,6 +1194,33 @@ struct HotPathEvidenceCommand {
     counter_pack: Option<HotPathCounterPackMetadata>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HotPathValidationCheck {
+    check_id: String,
+    passed: bool,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HotPathValidationReport {
+    schema_version: String,
+    bead_id: String,
+    run_id: String,
+    trace_id: String,
+    scenario_id: String,
+    fixture_id: String,
+    workload: String,
+    artifact_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backend_identity: Option<String>,
+    all_checks_passed: bool,
+    required_artifacts: Vec<String>,
+    topology_taxonomy: Vec<String>,
+    topology_sensitive_captures: Vec<String>,
+    artifact_hashes: Vec<HotPathArtifactFile>,
+    checks: Vec<HotPathValidationCheck>,
+}
+
 fn hot_path_override_env(name: &'static str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -1814,6 +1860,254 @@ fn build_hot_path_counter_capture_summary(
         fallback_metric_pack,
         fallback_notes,
         raw_output_relpaths,
+    })
+}
+
+fn hot_path_validation_check(
+    check_id: &str,
+    passed: bool,
+    detail: impl Into<String>,
+) -> HotPathValidationCheck {
+    HotPathValidationCheck {
+        check_id: check_id.to_owned(),
+        passed,
+        detail: detail.into(),
+    }
+}
+
+fn collect_hot_path_validation_hashes(
+    output_dir: &Path,
+    evidence_files: &[HotPathArtifactFile],
+) -> io::Result<Vec<HotPathArtifactFile>> {
+    let mut seen_paths = BTreeSet::new();
+    let mut refreshed = Vec::with_capacity(evidence_files.len());
+    for file in evidence_files {
+        if !seen_paths.insert(file.path.clone()) {
+            continue;
+        }
+        let mut file = file.clone();
+        refresh_hot_path_artifact_metadata(output_dir, &mut file)?;
+        refreshed.push(file);
+    }
+    refreshed.sort_by(|lhs, rhs| lhs.path.cmp(&rhs.path));
+    Ok(refreshed)
+}
+
+fn build_hot_path_validation_report(
+    output_dir: &Path,
+    report: &HotPathProfileReport,
+    manifest: &HotPathArtifactManifest,
+    command_pack: &HotPathEvidenceCommandPack,
+    microarchitectural_context: Option<&HotPathMicroarchitecturalContext>,
+    evidence_files: &[HotPathArtifactFile],
+) -> io::Result<HotPathValidationReport> {
+    let artifact_hashes = collect_hot_path_validation_hashes(output_dir, evidence_files)?;
+    let required_artifacts = HOT_PATH_REQUIRED_ARTIFACT_PATHS
+        .iter()
+        .map(|path| (*path).to_owned())
+        .collect::<Vec<_>>();
+    let topology_taxonomy = HOT_PATH_CAUSAL_BUCKET_TAXONOMY
+        .iter()
+        .map(|bucket| (*bucket).to_owned())
+        .collect::<Vec<_>>();
+    let backend_identity = report
+        .engine_report
+        .storage_wiring
+        .as_ref()
+        .map(|storage| storage.backend_identity.clone())
+        .filter(|identity| !identity.is_empty());
+    let topology_sensitive_captures = manifest
+        .counter_capture_summary
+        .as_ref()
+        .map_or_else(Vec::new, |summary| {
+            summary.topology_sensitive_captures.clone()
+        });
+    let actionable_ranking = build_hot_path_actionable_ranking(
+        report,
+        manifest.counter_capture_summary.as_ref(),
+        microarchitectural_context,
+    );
+    let observed_artifacts = artifact_hashes
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<BTreeSet<_>>();
+    let expected_artifacts = required_artifacts.iter().cloned().collect::<BTreeSet<_>>();
+    let missing_artifacts = expected_artifacts
+        .difference(&observed_artifacts)
+        .cloned()
+        .collect::<Vec<_>>();
+    let replay_modes = command_pack
+        .commands
+        .iter()
+        .map(|command| command.mode.clone())
+        .collect::<BTreeSet<_>>();
+    let expected_replay_command = if report.run_integrity_check {
+        &command_pack.full_validation_replay_command
+    } else {
+        &command_pack.profiler_safe_replay_command
+    };
+    let observed_taxonomy = actionable_ranking
+        .causal_buckets
+        .iter()
+        .map(|entry| entry.bucket.clone())
+        .collect::<BTreeSet<_>>();
+    let expected_taxonomy = topology_taxonomy.iter().cloned().collect::<BTreeSet<_>>();
+    let missing_taxonomy = expected_taxonomy
+        .difference(&observed_taxonomy)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut checks = Vec::with_capacity(5);
+    checks.push(hot_path_validation_check(
+        "artifact_completeness",
+        missing_artifacts.is_empty(),
+        if missing_artifacts.is_empty() {
+            format!(
+                "covered {} required artifacts with SHA-256 hashes: {}",
+                artifact_hashes.len(),
+                observed_artifacts
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else {
+            format!(
+                "missing required artifacts: {}",
+                missing_artifacts.join(", ")
+            )
+        },
+    ));
+    checks.push(hot_path_validation_check(
+        "schema_versions",
+        report.schema_version == fsqlite_e2e::perf_runner::HOT_PATH_PROFILE_SCHEMA_V1
+            && manifest.schema_version
+                == fsqlite_e2e::perf_runner::HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1
+            && command_pack.schema_version == HOT_PATH_COMMAND_PACK_SCHEMA_V2
+            && actionable_ranking.schema_version
+                == fsqlite_e2e::perf_runner::HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V3,
+        format!(
+            "profile={} manifest={} command_pack={} actionable_ranking={}",
+            report.schema_version,
+            manifest.schema_version,
+            command_pack.schema_version,
+            actionable_ranking.schema_version
+        ),
+    ));
+    checks.push(hot_path_validation_check(
+        "structured_id_contract",
+        report.bead_id == manifest.bead_id
+            && report.bead_id == command_pack.bead_id
+            && report.run_id == manifest.run_id
+            && report.run_id == command_pack.run_id
+            && report.trace_id == manifest.trace_id
+            && report.trace_id == command_pack.trace_id
+            && report.scenario_id == manifest.scenario_id
+            && report.scenario_id == command_pack.scenario_id
+            && report.fixture_id == manifest.fixture_id
+            && report.fixture_id == command_pack.fixture_id
+            && report.workload == manifest.workload
+            && report.workload == command_pack.workload
+            && report.concurrency == manifest.concurrency
+            && report.concurrency == command_pack.concurrency,
+        format!(
+            "bead={} run={} trace={} scenario={} fixture={} workload={} concurrency={}",
+            report.bead_id,
+            report.run_id,
+            report.trace_id,
+            report.scenario_id,
+            report.fixture_id,
+            report.workload,
+            report.concurrency
+        ),
+    ));
+    checks.push(hot_path_validation_check(
+        "replayability",
+        report.replay_command == expected_replay_command.as_str()
+            && command_pack.profiler_safe_replay_command.starts_with("rch exec --")
+            && command_pack.full_validation_replay_command.starts_with("rch exec --")
+            && command_pack.full_validation_replay_command.contains("--integrity-check")
+            && replay_modes.contains("profiler_safe")
+            && replay_modes.contains("full_validation")
+            && backend_identity.is_some(),
+        format!(
+            "backend_identity={} profiler_safe_commands={} full_validation_commands={} report_replay_matches_selected_mode={}",
+            backend_identity.as_deref().unwrap_or("missing"),
+            usize::from(replay_modes.contains("profiler_safe")),
+            usize::from(replay_modes.contains("full_validation")),
+            report.replay_command == expected_replay_command.as_str()
+        ),
+    ));
+    checks.push(hot_path_validation_check(
+        "conflict_topology_taxonomy",
+        missing_taxonomy.is_empty()
+            && !topology_sensitive_captures.is_empty()
+            && actionable_ranking
+                .microarchitectural_signatures
+                .iter()
+                .any(|entry| !entry.mapped_beads.is_empty() && !entry.evidence_sources.is_empty()),
+        if missing_taxonomy.is_empty() {
+            format!(
+                "taxonomy={} topology_sensitive_captures={}",
+                topology_taxonomy.join(", "),
+                topology_sensitive_captures.join(", ")
+            )
+        } else {
+            format!(
+                "missing taxonomy buckets: {}; observed={}",
+                missing_taxonomy.join(", "),
+                observed_taxonomy.into_iter().collect::<Vec<_>>().join(", ")
+            )
+        },
+    ));
+    let all_checks_passed = checks.iter().all(|check| check.passed);
+
+    Ok(HotPathValidationReport {
+        schema_version: HOT_PATH_VALIDATION_REPORT_SCHEMA_V1.to_owned(),
+        bead_id: report.bead_id.clone(),
+        run_id: report.run_id.clone(),
+        trace_id: report.trace_id.clone(),
+        scenario_id: report.scenario_id.clone(),
+        fixture_id: report.fixture_id.clone(),
+        workload: report.workload.clone(),
+        artifact_root: output_dir.display().to_string(),
+        backend_identity,
+        all_checks_passed,
+        required_artifacts,
+        topology_taxonomy,
+        topology_sensitive_captures,
+        artifact_hashes,
+        checks,
+    })
+}
+
+fn write_hot_path_validation_report(
+    output_dir: &Path,
+    report: &HotPathProfileReport,
+    manifest: &HotPathArtifactManifest,
+    command_pack: &HotPathEvidenceCommandPack,
+    microarchitectural_context: Option<&HotPathMicroarchitecturalContext>,
+    evidence_files: &[HotPathArtifactFile],
+) -> io::Result<HotPathArtifactFile> {
+    let validation_report = build_hot_path_validation_report(
+        output_dir,
+        report,
+        manifest,
+        command_pack,
+        microarchitectural_context,
+        evidence_files,
+    )?;
+    let validation_json = serde_json::to_string_pretty(&validation_report)
+        .map_err(|error| io::Error::other(format!("validation report JSON: {error}")))?;
+    fs::write(
+        output_dir.join(HOT_PATH_VALIDATION_REPORT_NAME),
+        validation_json.as_bytes(),
+    )?;
+    Ok(HotPathArtifactFile {
+        path: HOT_PATH_VALIDATION_REPORT_NAME.to_owned(),
+        bytes: u64::try_from(validation_json.len()).unwrap_or(u64::MAX),
+        sha256: hot_path_artifact_sha256(validation_json.as_bytes()),
+        description:
+            "deterministic hot-path pack checks for completeness, shared IDs, replayability, and conflict-topology taxonomy"
+                .to_owned(),
     })
 }
 
@@ -6382,11 +6676,32 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
             return 1;
         }
     };
+    let mut validation_evidence_files = manifest
+        .files
+        .iter()
+        .filter(|file| file.path != "manifest.json")
+        .cloned()
+        .collect::<Vec<_>>();
+    validation_evidence_files.push(command_pack_file.clone());
+    let validation_report_file = match write_hot_path_validation_report(
+        &output_dir,
+        &report,
+        &manifest,
+        &command_pack,
+        Some(&microarchitectural_context),
+        &validation_evidence_files,
+    ) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("error: failed to write hot-path validation report: {error}");
+            return 1;
+        }
+    };
     if let Err(error) = finalize_hot_path_manifest(
         &output_dir,
         manifest,
         counter_capture_summary,
-        vec![command_pack_file],
+        vec![command_pack_file, validation_report_file],
     ) {
         eprintln!("error: failed to finalize hot-path manifest: {error}");
         return 1;
@@ -7700,6 +8015,16 @@ mod tests {
 
     fn sample_hot_path_report() -> HotPathProfileReport {
         let decoded_values = sample_value_type_profile();
+        let mut engine_report = sample_engine_report();
+        engine_report.storage_wiring = Some(fsqlite_e2e::report::StorageWiringReport {
+            backend_kind: "unix".to_owned(),
+            backend_mode: "parity_cert_strict".to_owned(),
+            backend_identity: "unix:parity_cert_strict".to_owned(),
+        });
+        engine_report.correctness.notes = Some(
+            "mode=concurrent (MVCC); single-threaded sequential execution; backend_identity=unix:parity_cert_strict"
+                .to_owned(),
+        );
         HotPathProfileReport {
             schema_version: HOT_PATH_PROFILE_SCHEMA_V1.to_owned(),
             bead_id: "bd-db300.4.1".to_owned(),
@@ -7718,7 +8043,7 @@ mod tests {
             replay_command:
                 "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --workload mixed_read_write --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc"
                     .to_owned(),
-            engine_report: sample_engine_report(),
+            engine_report,
             parser: HotPathParserProfile {
                 parse_single_calls: 1,
                 parse_multi_calls: 0,
@@ -9249,6 +9574,127 @@ mod tests {
         assert_ne!(
             stdout_manifest_json,
             serde_json::to_string(&finalized).expect("in-memory manifest should serialize")
+        );
+    }
+
+    #[test]
+    fn hot_path_validation_report_tracks_required_artifacts_and_taxonomy() {
+        let tempdir = tempfile::tempdir().expect("tempdir should succeed");
+        let replay_command = HotProfileReplayCommand {
+            db: "fixture-a",
+            workload: "mixed_read_write",
+            golden_dir: Path::new("/tmp/golden"),
+            working_base: Path::new("/tmp/working"),
+            concurrency: 4,
+            seed: 42,
+            scale: 50,
+            output_dir: tempdir.path(),
+            mvcc: true,
+            run_integrity_check: false,
+        };
+        let mut report = sample_hot_path_report();
+        report.replay_command = format_hot_profile_replay_command(&replay_command);
+        let command_pack = build_hot_path_command_pack(&report, &replay_command);
+        let counter_capture_summary = build_hot_path_counter_capture_summary(&command_pack);
+        let microarchitectural_context = HotPathMicroarchitecturalContext {
+            fixture_id: report.fixture_id.clone(),
+            row_id: "mixed_read_write_c4".to_owned(),
+            mode_id: "fsqlite_mvcc".to_owned(),
+            placement_profile_id: Some("baseline_unpinned".to_owned()),
+            hardware_class_id: Some(HARDWARE_CLASS_LINUX_X86_64_ANY.to_owned()),
+            hardware_signature: Some("linux:x86_64:any".to_owned()),
+        };
+        let manifest = write_hot_path_profile_artifacts(
+            &report,
+            tempdir.path(),
+            counter_capture_summary.clone(),
+            Some(build_hot_path_artifact_provenance(
+                &report,
+                &command_pack,
+                counter_capture_summary.as_ref(),
+                sample_hot_path_provenance_inputs(),
+            )),
+            Some(microarchitectural_context.clone()),
+        )
+        .expect("profile artifacts should be written");
+        let command_pack_file =
+            write_hot_path_command_pack(tempdir.path(), &command_pack).expect("command pack");
+        let mut validation_evidence_files = manifest
+            .files
+            .iter()
+            .filter(|file| file.path != "manifest.json")
+            .cloned()
+            .collect::<Vec<_>>();
+        validation_evidence_files.push(command_pack_file.clone());
+        let validation_report_file = write_hot_path_validation_report(
+            tempdir.path(),
+            &report,
+            &manifest,
+            &command_pack,
+            Some(&microarchitectural_context),
+            &validation_evidence_files,
+        )
+        .expect("validation report should be written");
+        let finalized = finalize_hot_path_manifest(
+            tempdir.path(),
+            manifest,
+            counter_capture_summary,
+            vec![command_pack_file, validation_report_file],
+        )
+        .expect("manifest should finalize with validation report");
+
+        assert!(
+            finalized
+                .files
+                .iter()
+                .any(|file| file.path == HOT_PATH_VALIDATION_REPORT_NAME)
+        );
+
+        let validation: Value = serde_json::from_str(
+            &fs::read_to_string(tempdir.path().join(HOT_PATH_VALIDATION_REPORT_NAME))
+                .expect("validation report should exist"),
+        )
+        .expect("validation report should parse");
+        assert_eq!(
+            validation["schema_version"],
+            HOT_PATH_VALIDATION_REPORT_SCHEMA_V1
+        );
+        assert_eq!(validation["all_checks_passed"], true);
+        assert_eq!(validation["backend_identity"], "unix:parity_cert_strict");
+        assert_eq!(
+            validation["required_artifacts"].as_array().map(Vec::len),
+            Some(HOT_PATH_REQUIRED_ARTIFACT_PATHS.len())
+        );
+        assert_eq!(
+            validation["topology_taxonomy"].as_array().map(Vec::len),
+            Some(HOT_PATH_CAUSAL_BUCKET_TAXONOMY.len())
+        );
+        assert!(
+            validation["artifact_hashes"]
+                .as_array()
+                .is_some_and(|files| files.iter().any(|file| {
+                    file["path"] == HOT_PATH_COMMAND_PACK_NAME
+                        && file["sha256"]
+                            == hot_path_artifact_sha256(
+                                &fs::read(tempdir.path().join(HOT_PATH_COMMAND_PACK_NAME))
+                                    .expect("command pack should be readable"),
+                            )
+                }))
+        );
+        assert!(
+            validation["checks"]
+                .as_array()
+                .is_some_and(|checks| checks.iter().all(|check| check["passed"] == true))
+        );
+        assert!(
+            validation["checks"]
+                .as_array()
+                .is_some_and(|checks| checks.iter().any(|check| {
+                    check["check_id"] == "conflict_topology_taxonomy"
+                        && check["detail"]
+                            .as_str()
+                            .is_some_and(|detail| detail.contains("cache_to_cache"))
+                }))
         );
     }
 

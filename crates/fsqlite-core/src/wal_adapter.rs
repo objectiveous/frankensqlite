@@ -1115,7 +1115,21 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             });
         }
 
-        let data = frame_buf[fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE..].to_vec();
+        // Strip the 24-byte frame header in place rather than
+        // allocating a second page-sized Vec. Mirrors the fix in
+        // `read_page_pinned` (`d9c410bb`): `frame_buf[HEADER..].to_vec()`
+        // allocates a fresh 4 KiB buffer, memcpys the page payload into
+        // it, then drops the original 4 KiB+24 B scratch — an alloc/free
+        // round-trip on the hot WAL read path. Using `copy_within` +
+        // `truncate` reuses the already-populated buffer: one memmove
+        // (over the same bytes `to_vec` would have copied) and no new
+        // allocation. `read_page` is the `&mut self` fallback path taken
+        // when the caller does not hold a pinned snapshot — still hot
+        // under mixed OLTP and write-path conflict resolution.
+        let header_size = fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE;
+        let page_size = self.wal.page_size();
+        frame_buf.copy_within(header_size.., 0);
+        frame_buf.truncate(page_size);
         debug!(
             page_number,
             frame_index,
@@ -1128,7 +1142,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             fallback_reason = resolution.fallback_reason(),
             "WAL adapter: resolved page from current WAL generation"
         );
-        Ok(Some(data))
+        Ok(Some(frame_buf))
     }
 
     // bd-db300.3.8.7: shared-lock read path for pinned snapshots.

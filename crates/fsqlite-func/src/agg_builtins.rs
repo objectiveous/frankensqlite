@@ -170,6 +170,15 @@ pub struct GroupConcatState {
 
 pub struct GroupConcatFunc;
 
+#[inline]
+fn push_group_concat_text(result: &mut String, value: &SqliteValue) {
+    if let Some(text) = value.as_text_str() {
+        result.push_str(text);
+    } else {
+        result.push_str(&value.to_text());
+    }
+}
+
 impl AggregateFunction for GroupConcatFunc {
     type State = GroupConcatState;
 
@@ -184,19 +193,16 @@ impl AggregateFunction for GroupConcatFunc {
         if args[0].is_null() {
             return Ok(());
         }
-        let sep = if args.len() > 1 {
-            if args[1].is_null() {
-                String::new()
-            } else {
-                args[1].to_text()
-            }
-        } else {
-            ",".to_owned()
-        };
         if state.has_value {
-            state.result.push_str(&sep);
+            match args.get(1) {
+                Some(separator) if !separator.is_null() => {
+                    push_group_concat_text(&mut state.result, separator);
+                }
+                Some(_) => {}
+                None => state.result.push(','),
+            }
         }
-        state.result.push_str(&args[0].to_text());
+        push_group_concat_text(&mut state.result, &args[0]);
         state.has_value = true;
         Ok(())
     }
@@ -851,6 +857,46 @@ mod tests {
     fn test_group_concat_single_value() {
         let r = run_agg(&GroupConcatFunc, &[text("only")]);
         assert_eq!(r, SqliteValue::Text("only".into()));
+    }
+
+    #[test]
+    fn test_group_concat_integer_values_coerced_to_text() {
+        let r = run_agg(&GroupConcatFunc, &[int(1), int(2), int(3)]);
+        assert_eq!(r, SqliteValue::Text("1,2,3".into()));
+    }
+
+    #[test]
+    #[ignore = "perf-only benchmark"]
+    fn perf_group_concat_text_rows() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ROWS: usize = 200_000;
+        const REPEATS: usize = 5;
+
+        let rows: Vec<SqliteValue> = (0..ROWS).map(|_| text("payload")).collect();
+        let mut best_ns = u128::MAX;
+        let mut result_len = 0usize;
+
+        for _ in 0..REPEATS {
+            let started = Instant::now();
+            let result = black_box(run_agg(&GroupConcatFunc, black_box(rows.as_slice())));
+            let elapsed_ns = started.elapsed().as_nanos();
+            if elapsed_ns < best_ns {
+                best_ns = elapsed_ns;
+            }
+            result_len = match result {
+                SqliteValue::Text(text) => text.len(),
+                SqliteValue::Null
+                | SqliteValue::Integer(_)
+                | SqliteValue::Float(_)
+                | SqliteValue::Blob(_) => 0,
+            };
+        }
+
+        println!(
+            "group_concat_text_rows rows={ROWS} repeats={REPEATS} best_ns={best_ns} result_len={result_len}"
+        );
     }
 
     // ── max (aggregate) ───────────────────────────────────────────────

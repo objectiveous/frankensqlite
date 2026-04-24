@@ -1085,19 +1085,24 @@ fn window_group_concat_step(state: &mut WindowGroupConcatState, args: &[SqliteVa
     if args.is_empty() || args[0].is_null() {
         return;
     }
-    let sep = if args.len() > 1 {
-        if args[1].is_null() {
-            String::new()
-        } else {
-            args[1].to_text()
-        }
-    } else {
-        ",".to_owned()
-    };
     if state.has_value {
-        state.result.push_str(&sep);
+        match args.get(1) {
+            Some(separator) if !separator.is_null() => {
+                if let Some(text) = separator.as_text_str() {
+                    state.result.push_str(text);
+                } else {
+                    state.result.push_str(&separator.to_text());
+                }
+            }
+            Some(_) => {}
+            None => state.result.push(','),
+        }
     }
-    state.result.push_str(&args[0].to_text());
+    if let Some(text) = args[0].as_text_str() {
+        state.result.push_str(text);
+    } else {
+        state.result.push_str(&args[0].to_text());
+    }
     state.has_value = true;
 }
 

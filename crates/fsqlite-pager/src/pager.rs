@@ -5358,7 +5358,8 @@ where
         let initial_commit_seq = CommitSeq::new(u64::from(header.change_counter));
         let freelist_count = freelist.len();
         let resolved_max = crate::page_cache::resolve_page_buffer_max(page_buffer_max);
-        let cache = ShardedPageCache::with_max_buffers(page_size, resolved_max);
+        let cache =
+            ShardedPageCache::with_max_buffers_for_initial_pages(page_size, resolved_max, db_size);
         let pool = cache.pool().clone();
         Ok(Self {
             vfs,
@@ -5539,7 +5540,8 @@ where
             header.as_ref().map_or(0, |header| header.change_counter),
         ));
         let resolved_max = crate::page_cache::resolve_page_buffer_max(page_buffer_max);
-        let cache = ShardedPageCache::with_max_buffers(page_size, resolved_max);
+        let cache =
+            ShardedPageCache::with_max_buffers_for_initial_pages(page_size, resolved_max, db_size);
         let pool = cache.pool().clone();
         Ok(Self {
             vfs,

@@ -5947,7 +5947,7 @@ mod tests {
         let cache = ShardedPageCache::with_max_buffers_for_initial_pages(
             PageSize::DEFAULT,
             DEFAULT_PAGE_BUFFER_MAX,
-            u32::try_from(FLAT_SLOTS_TARGET_CAPACITY).unwrap(),
+            u32::try_from(FLAT_SLOTS_TARGET_CAPACITY).unwrap_or(u32::MAX),
         );
 
         assert_eq!(

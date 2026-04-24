@@ -28,6 +28,7 @@ This crate sits at the very top of the fsqlite workspace dependency graph. It de
 - `e2e-runner` - Batch E2E test execution
 - `e2e-viewer` - View and inspect E2E test results
 - `corruption-demo` - Demonstrate corruption injection and recovery
+- `mt-mvcc-bench` - Honest shared-file multi-threaded concurrent writer snapshot
 
 ## Benchmarks
 
@@ -36,7 +37,8 @@ This crate sits at the very top of the fsqlite workspace dependency graph. It de
 - `read_heavy_bench` - Read-heavy workload benchmarks
 - `large_txn_bench` - Large transaction benchmarks
 - `mixed_oltp_bench` - Mixed OLTP workload benchmarks
-- `concurrent_write_bench` - Concurrent write benchmarks
+- `concurrent_write_bench` - Sequential-control concurrent write benchmark (not MVCC proof)
+- `concurrent_write_persistent_bench` - File-backed persistent concurrent-writer Criterion benchmark
 - `operation_baseline_bench` - Operation-level baseline benchmarks
 
 ## Benchmark Discipline
@@ -46,7 +48,32 @@ Performance comparisons in this crate must be structurally fair:
 - If the rusqlite side uses a prepared statement in a hot loop, the FrankenSQLite side must do the same.
 - If the rusqlite side uses stable parameterized SQL, the FrankenSQLite side must not use per-iteration `format!()` SQL strings.
 - If a FrankenSQLite benchmark is only a control and does **not** exercise the real persistent concurrent-writer path, its name and comments must say so explicitly.
+- `mt-mvcc-bench` is the canonical 4/8/16-thread shared-file proof path for concurrent-writer claims. Do not cite `concurrent_write_bench` as MVCC win evidence.
 - Benchmark reports should always state whether the path is prepared vs ad hoc, file-backed vs in-memory, and concurrent vs sequential control.
+
+## Canonical Concurrent-Writer Snapshot
+
+Use this command shape when you need the honest shared-file multi-threaded snapshot:
+
+```bash
+rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_<name> \
+  cargo run -p fsqlite-e2e --bin mt-mvcc-bench -- \
+  --threads=4,8,16 \
+  --rows-per-thread=250 \
+  --iters=1 \
+  --json-output tests/artifacts/perf/concurrent-showcase-20260424/mt-mvcc-bench.json \
+  --summary-md tests/artifacts/perf/concurrent-showcase-20260424/mt-mvcc-bench.md
+```
+
+Current blocker snapshot from [tests/artifacts/perf/concurrent-showcase-20260424/mt-mvcc-bench.md](/data/projects/frankensqlite/tests/artifacts/perf/concurrent-showcase-20260424/mt-mvcc-bench.md):
+
+| Threads | fsqlite p50 wps | sqlite p50 wps | Throughput ratio | fsqlite p50 ms | sqlite p50 ms | Time ratio |
+|---------|-----------------:|---------------:|-----------------:|---------------:|--------------:|-----------:|
+| 4 | 3178 | 212016 | 0.01x | 314.68 | 4.72 | 66.72x |
+| 8 | 6125 | 36152 | 0.17x | 326.55 | 55.32 | 5.90x |
+| 16 | 5181 | 6325 | 0.82x | 772.04 | 632.44 | 1.22x |
+
+Those numbers are a blocker, not evidence of an MVCC throughput win yet.
 
 ## Canonical Hot-Profile Workflow
 

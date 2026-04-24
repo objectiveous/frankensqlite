@@ -36,6 +36,7 @@
 //!
 //! ```text
 //! mt-mvcc-bench [--rows-per-thread=1000] [--threads=1,2,4,8,16] [--iters=3]
+//! [--json-output=PATH] [--summary-md=PATH]
 //! ```
 //!
 //! ## Caveats
@@ -54,6 +55,9 @@
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::{fmt::Write as _, fs, path::Path, path::PathBuf};
+
+use serde::Serialize;
 
 // ─── Defaults ─────────────────────────────────────────────────────────────
 
@@ -63,6 +67,7 @@ const DEFAULT_ITERS: usize = 3;
 const ROWID_BASE_STRIDE: i64 = 1_000_000;
 const MAX_RETRIES: usize = 32;
 const RETRY_SLEEP_MS: u64 = 1;
+const REPORT_SCHEMA_V1: &str = "fsqlite-e2e.mt_mvcc_bench_report.v1";
 
 // ─── CLI parsing (manual — no clap in workspace) ─────────────────────────
 
@@ -71,6 +76,8 @@ struct Options {
     rows_per_thread: usize,
     threads: Vec<usize>,
     iters: usize,
+    json_output: Option<PathBuf>,
+    summary_md: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -79,13 +86,16 @@ impl Default for Options {
             rows_per_thread: DEFAULT_ROWS_PER_THREAD,
             threads: DEFAULT_THREADS.to_vec(),
             iters: DEFAULT_ITERS,
+            json_output: None,
+            summary_md: None,
         }
     }
 }
 
 fn print_usage_and_exit(code: i32) -> ! {
     eprintln!(
-        "usage: mt-mvcc-bench [--rows-per-thread=N] [--threads=N,N,...] [--iters=N]\n\
+        "usage: mt-mvcc-bench [--rows-per-thread=N] [--threads=N,N,...] [--iters=N] \\\n\
+         [--json-output=PATH] [--summary-md=PATH]\n\
          \n\
          defaults: --rows-per-thread={DEFAULT_ROWS_PER_THREAD} \
          --threads=1,2,4,8,16 --iters={DEFAULT_ITERS}"
@@ -134,6 +144,12 @@ fn parse_args() -> Options {
                 if opts.iters == 0 {
                     panic!("--iters must be >= 1");
                 }
+            }
+            "--json-output" => {
+                opts.json_output = Some(PathBuf::from(val));
+            }
+            "--summary-md" => {
+                opts.summary_md = Some(PathBuf::from(val));
             }
             other => {
                 eprintln!("unknown argument: {other}");
@@ -216,6 +232,129 @@ impl RunStats {
         let values = self.samples.iter().map(value).collect();
         percentile_value(values, percentile)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct ThreadComparisonReport {
+    threads: usize,
+    fsqlite_wps_p50: f64,
+    fsqlite_wps_p95: f64,
+    fsqlite_wps_p99: f64,
+    sqlite_wps_p50: f64,
+    sqlite_wps_p95: f64,
+    sqlite_wps_p99: f64,
+    throughput_ratio: f64,
+    fsqlite_ms_p50: f64,
+    fsqlite_ms_p95: f64,
+    fsqlite_ms_p99: f64,
+    sqlite_ms_p50: f64,
+    sqlite_ms_p95: f64,
+    sqlite_ms_p99: f64,
+    time_ratio: f64,
+    fsqlite_failed_rows: usize,
+    sqlite_failed_rows: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct MtMvccBenchReport {
+    schema_version: &'static str,
+    rows_per_thread: usize,
+    iterations: usize,
+    thread_results: Vec<ThreadComparisonReport>,
+}
+
+fn build_thread_report(
+    threads: usize,
+    fsqlite: &RunStats,
+    sqlite: &RunStats,
+) -> ThreadComparisonReport {
+    let fsqlite_wps_p50 = fsqlite.p50_writes_per_sec();
+    let sqlite_wps_p50 = sqlite.p50_writes_per_sec();
+    let throughput_ratio = if sqlite_wps_p50 > 0.0 {
+        fsqlite_wps_p50 / sqlite_wps_p50
+    } else {
+        0.0
+    };
+    let fsqlite_ms_p50 = fsqlite.p50_elapsed_ms();
+    let sqlite_ms_p50 = sqlite.p50_elapsed_ms();
+    let time_ratio = if sqlite_ms_p50 > 0.0 {
+        fsqlite_ms_p50 / sqlite_ms_p50
+    } else {
+        0.0
+    };
+
+    ThreadComparisonReport {
+        threads,
+        fsqlite_wps_p50,
+        fsqlite_wps_p95: fsqlite.p95_writes_per_sec(),
+        fsqlite_wps_p99: fsqlite.p99_writes_per_sec(),
+        sqlite_wps_p50,
+        sqlite_wps_p95: sqlite.p95_writes_per_sec(),
+        sqlite_wps_p99: sqlite.p99_writes_per_sec(),
+        throughput_ratio,
+        fsqlite_ms_p50,
+        fsqlite_ms_p95: fsqlite.p95_elapsed_ms(),
+        fsqlite_ms_p99: fsqlite.p99_elapsed_ms(),
+        sqlite_ms_p50,
+        sqlite_ms_p95: sqlite.p95_elapsed_ms(),
+        sqlite_ms_p99: sqlite.p99_elapsed_ms(),
+        time_ratio,
+        fsqlite_failed_rows: fsqlite.total_failed_rows(),
+        sqlite_failed_rows: sqlite.total_failed_rows(),
+    }
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("create parent directory {}: {error}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn render_markdown_summary(report: &MtMvccBenchReport) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "# mt-mvcc-bench Summary\n");
+    let _ = writeln!(out, "- Rows per thread: `{}`", report.rows_per_thread);
+    let _ = writeln!(out, "- Iterations: `{}`", report.iterations);
+    let _ = writeln!(out, "- Schema: `{}`\n", report.schema_version);
+    let _ = writeln!(
+        out,
+        "| Threads | fsqlite p50 wps | sqlite p50 wps | Throughput ratio | fsqlite p50 ms | sqlite p50 ms | Time ratio | fsqlite failed | sqlite failed |"
+    );
+    let _ = writeln!(
+        out,
+        "|---------|-----------------:|---------------:|-----------------:|---------------:|--------------:|-----------:|---------------:|--------------:|"
+    );
+    for row in &report.thread_results {
+        let _ = writeln!(
+            out,
+            "| {} | {:.0} | {:.0} | {:.2}x | {:.2} | {:.2} | {:.2}x | {} | {} |",
+            row.threads,
+            row.fsqlite_wps_p50,
+            row.sqlite_wps_p50,
+            row.throughput_ratio,
+            row.fsqlite_ms_p50,
+            row.sqlite_ms_p50,
+            row.time_ratio,
+            row.fsqlite_failed_rows,
+            row.sqlite_failed_rows
+        );
+    }
+    out
+}
+
+fn write_json_report(path: &Path, report: &MtMvccBenchReport) -> Result<(), String> {
+    ensure_parent_dir(path)?;
+    let json = serde_json::to_vec_pretty(report)
+        .map_err(|error| format!("serialize mt-mvcc bench report: {error}"))?;
+    fs::write(path, json).map_err(|error| format!("write json report {}: {error}", path.display()))
+}
+
+fn write_markdown_summary(path: &Path, report: &MtMvccBenchReport) -> Result<(), String> {
+    ensure_parent_dir(path)?;
+    fs::write(path, render_markdown_summary(report))
+        .map_err(|error| format!("write markdown summary {}: {error}", path.display()))
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -525,6 +664,14 @@ fn collect_samples<F: FnMut() -> RunResult>(iters: usize, mut f: F) -> RunStats 
 
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn main() {
+    if let Err(error) = run() {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
+}
+
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn run() -> Result<(), String> {
     let opts = parse_args();
 
     eprintln!(
@@ -535,34 +682,114 @@ fn main() {
     println!(
         "threads | fsqlite_wps | sqlite_wps | throughput_ratio | fsqlite_wps_p95 | fsqlite_wps_p99 | sqlite_wps_p95 | sqlite_wps_p99 | fsqlite_ms_p50 | fsqlite_ms_p95 | fsqlite_ms_p99 | sqlite_ms_p50 | sqlite_ms_p95 | sqlite_ms_p99 | time_ratio | fsqlite_failed | sqlite_failed"
     );
+    let mut thread_results = Vec::new();
     for &n in &opts.threads {
         if n == 0 {
             continue;
         }
         let fs = collect_samples(opts.iters, || run_fsqlite(n, opts.rows_per_thread));
         let cs = collect_samples(opts.iters, || run_rusqlite(n, opts.rows_per_thread));
-
-        let fs_wps = fs.p50_writes_per_sec();
-        let cs_wps = cs.p50_writes_per_sec();
-        let throughput_ratio = if cs_wps > 0.0 { fs_wps / cs_wps } else { 0.0 };
-        let fs_ms = fs.p50_elapsed_ms();
-        let cs_ms = cs.p50_elapsed_ms();
-        let time_ratio = if cs_ms > 0.0 { fs_ms / cs_ms } else { 0.0 };
+        let report = build_thread_report(n, &fs, &cs);
 
         println!(
-            "{n:>7} | {fs_wps:>11.0} | {cs_wps:>10.0} | {throughput_ratio:>16.2}x | {:>15.0} | {:>15.0} | {:>14.0} | {:>14.0} | {:>14.2} | {:>14.2} | {:>14.2} | {:>13.2} | {:>13.2} | {:>13.2} | {time_ratio:>10.2}x | {:>14} | {:>13}",
-            fs.p95_writes_per_sec(),
-            fs.p99_writes_per_sec(),
-            cs.p95_writes_per_sec(),
-            cs.p99_writes_per_sec(),
-            fs_ms,
-            fs.p95_elapsed_ms(),
-            fs.p99_elapsed_ms(),
-            cs_ms,
-            cs.p95_elapsed_ms(),
-            cs.p99_elapsed_ms(),
-            fs.total_failed_rows(),
-            cs.total_failed_rows()
+            "{n:>7} | {fs_wps:>11.0} | {cs_wps:>10.0} | {throughput_ratio:>16.2}x | {fs_wps_p95:>15.0} | {fs_wps_p99:>15.0} | {sqlite_wps_p95:>14.0} | {sqlite_wps_p99:>14.0} | {fs_ms_p50:>14.2} | {fs_ms_p95:>14.2} | {fs_ms_p99:>14.2} | {sqlite_ms_p50:>13.2} | {sqlite_ms_p95:>13.2} | {sqlite_ms_p99:>13.2} | {time_ratio:>10.2}x | {fs_failed:>14} | {sqlite_failed:>13}",
+            fs_wps = report.fsqlite_wps_p50,
+            cs_wps = report.sqlite_wps_p50,
+            throughput_ratio = report.throughput_ratio,
+            fs_wps_p95 = report.fsqlite_wps_p95,
+            fs_wps_p99 = report.fsqlite_wps_p99,
+            sqlite_wps_p95 = report.sqlite_wps_p95,
+            sqlite_wps_p99 = report.sqlite_wps_p99,
+            fs_ms_p50 = report.fsqlite_ms_p50,
+            fs_ms_p95 = report.fsqlite_ms_p95,
+            fs_ms_p99 = report.fsqlite_ms_p99,
+            sqlite_ms_p50 = report.sqlite_ms_p50,
+            sqlite_ms_p95 = report.sqlite_ms_p95,
+            sqlite_ms_p99 = report.sqlite_ms_p99,
+            time_ratio = report.time_ratio,
+            fs_failed = report.fsqlite_failed_rows,
+            sqlite_failed = report.sqlite_failed_rows
         );
+        thread_results.push(report);
+    }
+
+    let full_report = MtMvccBenchReport {
+        schema_version: REPORT_SCHEMA_V1,
+        rows_per_thread: opts.rows_per_thread,
+        iterations: opts.iters,
+        thread_results,
+    };
+
+    if let Some(path) = opts.json_output.as_deref() {
+        write_json_report(path, &full_report)?;
+        eprintln!("mt-mvcc-bench: wrote json report {}", path.display());
+    }
+    if let Some(path) = opts.summary_md.as_deref() {
+        write_markdown_summary(path, &full_report)?;
+        eprintln!("mt-mvcc-bench: wrote markdown summary {}", path.display());
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_stats(elapsed_ms: u64, total_rows: usize, failed_rows: usize) -> RunStats {
+        RunStats::new(vec![RunResult {
+            best_elapsed: Duration::from_millis(elapsed_ms),
+            total_rows,
+            failed_rows,
+        }])
+    }
+
+    #[test]
+    fn thread_report_computes_expected_ratios() {
+        let fsqlite = sample_stats(200, 1000, 3);
+        let sqlite = sample_stats(100, 1000, 1);
+
+        let report = build_thread_report(4, &fsqlite, &sqlite);
+
+        assert_eq!(report.threads, 4);
+        assert!((report.fsqlite_wps_p50 - 5000.0).abs() < 0.01);
+        assert!((report.sqlite_wps_p50 - 10_000.0).abs() < 0.01);
+        assert!((report.throughput_ratio - 0.5).abs() < 0.0001);
+        assert!((report.time_ratio - 2.0).abs() < 0.0001);
+        assert_eq!(report.fsqlite_failed_rows, 3);
+        assert_eq!(report.sqlite_failed_rows, 1);
+    }
+
+    #[test]
+    fn markdown_summary_renders_thread_rows() {
+        let report = MtMvccBenchReport {
+            schema_version: REPORT_SCHEMA_V1,
+            rows_per_thread: 250,
+            iterations: 1,
+            thread_results: vec![ThreadComparisonReport {
+                threads: 8,
+                fsqlite_wps_p50: 6090.0,
+                fsqlite_wps_p95: 6090.0,
+                fsqlite_wps_p99: 6090.0,
+                sqlite_wps_p50: 55_406.0,
+                sqlite_wps_p95: 55_406.0,
+                sqlite_wps_p99: 55_406.0,
+                throughput_ratio: 0.11,
+                fsqlite_ms_p50: 328.39,
+                fsqlite_ms_p95: 328.39,
+                fsqlite_ms_p99: 328.39,
+                sqlite_ms_p50: 36.10,
+                sqlite_ms_p95: 36.10,
+                sqlite_ms_p99: 36.10,
+                time_ratio: 9.10,
+                fsqlite_failed_rows: 0,
+                sqlite_failed_rows: 0,
+            }],
+        };
+
+        let rendered = render_markdown_summary(&report);
+
+        assert!(rendered.contains("# mt-mvcc-bench Summary"));
+        assert!(rendered.contains("| 8 | 6090 | 55406 | 0.11x |"));
     }
 }

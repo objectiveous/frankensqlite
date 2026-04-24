@@ -33,9 +33,12 @@ and `report.md` to the output directory.
 cargo bench -p fsqlite-e2e
 ```
 
-Runs all six Criterion benchmark harnesses (`e2e_bench`,
+Runs the Criterion benchmark harnesses (`e2e_bench`,
 `write_throughput_bench`, `read_heavy_bench`, `large_txn_bench`,
-`mixed_oltp_bench`, `concurrent_write_bench`).  Results land in
+`mixed_oltp_bench`, `concurrent_write_bench`,
+`concurrent_write_persistent_bench`). `concurrent_write_bench` remains a
+sequential control; use `mt-mvcc-bench` for the honest shared-file
+multi-threaded MVCC snapshot. Results land in
 `target/criterion/`.
 
 ---
@@ -362,9 +365,35 @@ cargo bench -p fsqlite-e2e --bench e2e_bench
 #   read_heavy_bench       Read-dominant workloads
 #   large_txn_bench        Large transaction sizes
 #   mixed_oltp_bench       Mixed OLTP patterns
-#   concurrent_write_bench Concurrent writer scaling
+#   concurrent_write_bench Sequential-control concurrent writer scaling
+#   concurrent_write_persistent_bench File-backed persistent concurrent writers
 ```
 
 Results land in `target/criterion/`.  Criterion generates HTML reports at
 `target/criterion/report/index.html` with comparison charts when baseline
 data exists from a previous run.
+
+### Canonical Honest Concurrent-Writer Snapshot
+
+Use `mt-mvcc-bench` when you need the real shared-file multi-threaded
+FrankenSQLite-vs-sqlite comparison:
+
+```bash
+rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_<name> \
+  cargo run -p fsqlite-e2e --bin mt-mvcc-bench -- \
+  --threads=4,8,16 \
+  --rows-per-thread=250 \
+  --iters=1 \
+  --json-output tests/artifacts/perf/concurrent-showcase-20260424/mt-mvcc-bench.json \
+  --summary-md tests/artifacts/perf/concurrent-showcase-20260424/mt-mvcc-bench.md
+```
+
+Current blocker snapshot:
+
+| Threads | fsqlite p50 wps | sqlite p50 wps | Throughput ratio | fsqlite p50 ms | sqlite p50 ms | Time ratio |
+|---------|-----------------:|---------------:|-----------------:|---------------:|--------------:|-----------:|
+| 4 | 3178 | 212016 | 0.01x | 314.68 | 4.72 | 66.72x |
+| 8 | 6125 | 36152 | 0.17x | 326.55 | 55.32 | 5.90x |
+| 16 | 5181 | 6325 | 0.82x | 772.04 | 632.44 | 1.22x |
+
+Treat that table as a blocker signal, not a benchmark win claim.

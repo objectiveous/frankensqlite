@@ -776,23 +776,26 @@ fn resolve_column_ref(
     sources: &[DifferentialSource],
 ) -> Result<DifferentialColumn, DifferentialPlanError> {
     let binding = if let Some(binding) = &column_ref.table {
-        if !sources.iter().any(|source| source.binding == *binding) {
+        if !sources
+            .iter()
+            .any(|source| source.binding == binding.as_ref())
+        {
             return Err(DifferentialPlanError::UnknownRelationBinding {
-                binding: binding.clone(),
+                binding: binding.to_string(),
             });
         }
-        binding.clone()
+        binding.to_string()
     } else if sources.len() == 1 {
         sources[0].binding.clone()
     } else {
         return Err(DifferentialPlanError::AmbiguousUnqualifiedColumn {
-            column: column_ref.column.clone(),
+            column: column_ref.column.to_string(),
         });
     };
 
     Ok(DifferentialColumn {
         binding,
-        column: column_ref.column.clone(),
+        column: column_ref.column.to_string(),
     })
 }
 

@@ -1379,7 +1379,7 @@ fn emit_column_reads(
                         let col_idx = table.column_index(&col_ref.column).ok_or_else(|| {
                             CodegenError::ColumnNotFound {
                                 table: table.name.clone(),
-                                column: col_ref.column.clone(),
+                                column: col_ref.column.to_string(),
                             }
                         })?;
                         b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
@@ -1451,7 +1451,7 @@ fn extract_column_eq_bind(where_clause: Option<&Expr>) -> Option<(String, i32)> 
 fn column_name(expr: &Expr) -> Option<String> {
     if let Expr::Column(col_ref, _) = expr {
         if !is_rowid_ref(col_ref) {
-            return Some(col_ref.column.clone());
+            return Some(col_ref.column.to_string());
         }
     }
     None

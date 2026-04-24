@@ -4661,7 +4661,7 @@ mod tests {
                 match &assignments[0].value {
                     Expr::Column(col, _) => {
                         assert_eq!(col.table.as_deref(), Some("excluded"));
-                        assert_eq!(col.column, "b");
+                        assert_eq!(col.column.as_ref(), "b");
                     }
                     other => unreachable!("expected Column ref to excluded.b, got {other:?}"),
                 }
@@ -8370,7 +8370,7 @@ mod tests {
                         // Expression should be a qualified column ref: a.name
                         if let Expr::Column(col_ref, _) = expr {
                             assert_eq!(col_ref.table.as_deref(), Some("a"));
-                            assert_eq!(col_ref.column, "name");
+                            assert_eq!(col_ref.column.as_ref(), "name");
                         } else {
                             panic!("expected Column expression, got {expr:?}");
                         }
@@ -8403,7 +8403,7 @@ mod tests {
                         // Expression should be a qualified column ref: a.name
                         if let Expr::Column(col_ref, _) = expr {
                             assert_eq!(col_ref.table.as_deref(), Some("a"));
-                            assert_eq!(col_ref.column, "name");
+                            assert_eq!(col_ref.column.as_ref(), "name");
                         } else {
                             panic!("expected Column expression, got {expr:?}");
                         }

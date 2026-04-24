@@ -10,6 +10,7 @@ mod display;
 pub mod rebase;
 
 use std::fmt;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Span — source location tracking
@@ -216,15 +217,15 @@ pub enum Literal {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ColumnRef {
     /// Optional table (or alias) qualifier.
-    pub table: Option<String>,
+    pub table: Option<Arc<str>>,
     /// Column name.
-    pub column: String,
+    pub column: Arc<str>,
 }
 
 impl ColumnRef {
     /// Create an unqualified column reference.
     #[must_use]
-    pub fn bare(column: impl Into<String>) -> Self {
+    pub fn bare(column: impl Into<Arc<str>>) -> Self {
         Self {
             table: None,
             column: column.into(),
@@ -233,7 +234,7 @@ impl ColumnRef {
 
     /// Create a table-qualified column reference.
     #[must_use]
-    pub fn qualified(table: impl Into<String>, column: impl Into<String>) -> Self {
+    pub fn qualified(table: impl Into<Arc<str>>, column: impl Into<Arc<str>>) -> Self {
         Self {
             table: Some(table.into()),
             column: column.into(),
@@ -3012,11 +3013,11 @@ mod tests {
     fn test_column_ref_constructors() {
         let bare = ColumnRef::bare("col");
         assert!(bare.table.is_none());
-        assert_eq!(bare.column, "col");
+        assert_eq!(bare.column.as_ref(), "col");
 
         let qual = ColumnRef::qualified("tbl", "col");
         assert_eq!(qual.table.as_deref(), Some("tbl"));
-        assert_eq!(qual.column, "col");
+        assert_eq!(qual.column.as_ref(), "col");
     }
 
     #[test]

@@ -118,7 +118,7 @@ pub fn extract_output_aliases(core: &SelectCore) -> Vec<Option<String>> {
                     expr: Expr::Column(col_ref, _),
                     alias: None,
                     ..
-                } => Some(col_ref.column.clone()),
+                } => Some(col_ref.column.to_string()),
                 _ => None,
             })
             .collect(),
@@ -237,7 +237,7 @@ pub fn resolve_single_table_result_columns_with_options(
                 if let Some(qualifier) = &col_ref.table {
                     if !qualifier_matches_table(qualifier, table_name, table_alias) {
                         return Err(SingleTableProjectionError::UnknownTableQualifier {
-                            qualifier: qualifier.clone(),
+                            qualifier: qualifier.to_string(),
                         });
                     }
                 }
@@ -245,7 +245,7 @@ pub fn resolve_single_table_result_columns_with_options(
                     || supports_hidden_rowid && is_rowid_alias_name(&col_ref.column))
                 {
                     return Err(SingleTableProjectionError::ColumnNotFound {
-                        column: col_ref.column.clone(),
+                        column: col_ref.column.to_string(),
                     });
                 }
                 resolved.push(result_col.clone());
@@ -368,7 +368,7 @@ fn resolve_single_term(
                 }
             }
             Err(CompoundOrderByError::ColumnNotFound {
-                name: name.clone(),
+                name: name.to_string(),
                 span: *span,
             })
         }
@@ -2499,8 +2499,8 @@ pub fn classify_where_term(expr: &Expr) -> WhereTerm<'_> {
 fn extract_where_column(expr: &Expr) -> Option<WhereColumn> {
     if let Expr::Column(col_ref, _) = expr {
         Some(WhereColumn {
-            table: col_ref.table.clone(),
-            column: col_ref.column.clone(),
+            table: col_ref.table.as_ref().map(ToString::to_string),
+            column: col_ref.column.to_string(),
         })
     } else {
         None
@@ -4805,7 +4805,7 @@ mod tests {
         OrderingTerm, QualifiedName, ResultColumn, SelectBody, SelectCore, SortDirection, Span,
         TableOrSubquery,
     };
-    use std::{cell::Cell, path::PathBuf, sync::Arc, time::Instant};
+    use std::{cell::Cell, path::PathBuf, time::Instant};
 
     /// Helper: build a SELECT core with named result columns.
     fn select_core_with_aliases(aliases: &[&str]) -> SelectCore {
@@ -4964,23 +4964,11 @@ mod tests {
                     alias: None,
                 },
                 ResultColumn::Expr {
-                    expr: Expr::Column(
-                        ColumnRef {
-                            table: Some("tt".to_owned()),
-                            column: "_rowid_".to_owned(),
-                        },
-                        Span::ZERO,
-                    ),
+                    expr: Expr::Column(ColumnRef::qualified("tt", "_rowid_"), Span::ZERO),
                     alias: None,
                 },
                 ResultColumn::Expr {
-                    expr: Expr::Column(
-                        ColumnRef {
-                            table: Some("t".to_owned()),
-                            column: "oid".to_owned(),
-                        },
-                        Span::ZERO,
-                    ),
+                    expr: Expr::Column(ColumnRef::qualified("t", "oid"), Span::ZERO),
                     alias: None,
                 },
             ],
@@ -5002,13 +4990,7 @@ mod tests {
                     alias: None,
                 },
                 ResultColumn::Expr {
-                    expr: Expr::Column(
-                        ColumnRef {
-                            table: Some("tt".to_owned()),
-                            column: "_rowid_".to_owned(),
-                        },
-                        Span::ZERO,
-                    ),
+                    expr: Expr::Column(ColumnRef::qualified("tt", "_rowid_"), Span::ZERO),
                     alias: None,
                 },
             ],
@@ -9487,10 +9469,7 @@ mod tests {
     fn test_pushdown_qualified_predicate() {
         let expr = Expr::BinaryOp {
             left: Box::new(Expr::Column(
-                ColumnRef {
-                    table: Some("users".to_owned()),
-                    column: "id".to_owned(),
-                },
+                ColumnRef::qualified("users", "id"),
                 Span::ZERO,
             )),
             op: AstBinaryOp::Eq,
@@ -9510,13 +9489,7 @@ mod tests {
     #[test]
     fn test_pushdown_single_table_unqualified() {
         let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Column(
-                ColumnRef {
-                    table: None,
-                    column: "id".to_owned(),
-                },
-                Span::ZERO,
-            )),
+            left: Box::new(Expr::Column(ColumnRef::bare("id"), Span::ZERO)),
             op: AstBinaryOp::Gt,
             right: Box::new(Expr::Literal(Literal::Integer(10), Span::ZERO)),
             span: Span::ZERO,
@@ -9533,13 +9506,7 @@ mod tests {
     #[test]
     fn test_pushdown_unqualified_multi_table_stays() {
         let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Column(
-                ColumnRef {
-                    table: None,
-                    column: "id".to_owned(),
-                },
-                Span::ZERO,
-            )),
+            left: Box::new(Expr::Column(ColumnRef::bare("id"), Span::ZERO)),
             op: AstBinaryOp::Eq,
             right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
             span: Span::ZERO,
@@ -9605,13 +9572,7 @@ mod tests {
 
     #[test]
     fn test_fold_column_ref_not_constant() {
-        let expr = Expr::Column(
-            ColumnRef {
-                table: None,
-                column: "id".to_owned(),
-            },
-            Span::ZERO,
-        );
+        let expr = Expr::Column(ColumnRef::bare("id"), Span::ZERO);
         assert_eq!(try_constant_fold(&expr), FoldResult::NotConstant);
     }
 
@@ -10005,13 +9966,7 @@ mod probe_tests {
     use fsqlite_ast::{BinaryOp as AstBinaryOp, ColumnRef, Expr, Literal, Span};
 
     fn col(name: &str) -> Box<Expr> {
-        Box::new(Expr::Column(
-            ColumnRef {
-                table: None,
-                column: name.to_owned(),
-            },
-            Span::ZERO,
-        ))
+        Box::new(Expr::Column(ColumnRef::bare(name), Span::ZERO))
     }
 
     fn lit_int(v: i64) -> Box<Expr> {

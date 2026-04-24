@@ -20,6 +20,7 @@ use fsqlite_ast::{
     BinaryOp, ColumnRef, Expr, FunctionArgs, InSet, JsonArrow, LikeOp, Literal, PlaceholderType,
     RaiseAction, SelectStatement, Span, TypeName, UnaryOp, WindowSpec,
 };
+use std::sync::Arc;
 
 use crate::parser::{ParseError, Parser, is_nonreserved_kw, kw_to_str};
 use crate::token::{Token, TokenKind};
@@ -107,6 +108,10 @@ impl Parser {
 
     fn peek_token(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
+    }
+
+    fn peek_nth_token(&self, offset: usize) -> Option<&Token> {
+        self.tokens.get(self.pos + offset)
     }
 
     fn advance_token(&mut self) -> Token {
@@ -319,8 +324,7 @@ impl Parser {
 
             // ── Identifier: column ref or function call ─────────────────
             TokenKind::Id(name) | TokenKind::QuotedId(name, _) => {
-                let name = name.to_string();
-                self.parse_ident_expr(name, tok.span)
+                self.parse_ident_expr(Arc::clone(name), tok.span)
             }
 
             // ── Keywords usable as function names ───────────────────────
@@ -344,29 +348,35 @@ impl Parser {
     }
 
     /// Parse `name`, `name.column`, or `name(args)`.
-    fn parse_ident_expr(&mut self, name: String, start: Span) -> Result<Expr, ParseError> {
+    fn parse_ident_expr<S>(&mut self, name: S, start: Span) -> Result<Expr, ParseError>
+    where
+        S: AsRef<str> + Into<Arc<str>>,
+    {
         // Function call: name(...)
         if matches!(self.peek_kind(), TokenKind::LeftParen) {
-            return self.parse_function_call(name, start);
+            return self.parse_function_call(name.as_ref().to_owned(), start);
         }
+        let name = name.into();
         // Table-qualified column: name.column
         if matches!(self.peek_kind(), TokenKind::Dot) {
-            self.advance_token();
-            let col_tok = self.advance_token();
+            let Some(col_tok) = self.peek_nth_token(1) else {
+                return Err(self.err_here("expected column name after '.'"));
+            };
             let col_name = match &col_tok.kind {
-                TokenKind::Id(c) | TokenKind::QuotedId(c, _) => c.to_string(),
-                TokenKind::Star => "*".to_owned(),
+                TokenKind::Id(c) | TokenKind::QuotedId(c, _) => Arc::clone(c),
+                TokenKind::Star => Arc::<str>::from("*"),
                 // After a dot, ANY keyword is a valid column name (SQLite
                 // allows reserved keywords in table-qualified positions).
-                k if k.keyword_str().is_some() => kw_to_str(k),
+                k if k.keyword_str().is_some() => Arc::<str>::from(kw_to_str(k)),
                 _ => {
                     return Err(ParseError::at(
                         format!("expected column name after '.', got {:?}", col_tok.kind),
-                        Some(&col_tok),
+                        Some(col_tok),
                     ));
                 }
             };
             let span = start.merge(col_tok.span);
+            self.pos = self.pos.saturating_add(2);
             return Ok(Expr::Column(ColumnRef::qualified(name, col_name), span));
         }
         Ok(Expr::Column(ColumnRef::bare(name), start))
@@ -1499,7 +1509,7 @@ mod tests {
                     column,
                 },
                 _,
-            ) => assert_eq!(column, "x"),
+            ) => assert_eq!(column.as_ref(), "x"),
             other => unreachable!("expected bare column, got {other:?}"),
         }
     }
@@ -1514,8 +1524,8 @@ mod tests {
                 },
                 _,
             ) => {
-                assert_eq!(t, "t");
-                assert_eq!(column, "x");
+                assert_eq!(t.as_ref(), "t");
+                assert_eq!(column.as_ref(), "x");
             }
             other => unreachable!("expected qualified column, got {other:?}"),
         }

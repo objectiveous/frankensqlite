@@ -1382,8 +1382,8 @@ impl<'a> Resolver<'a> {
                     "unresolvable table reference"
                 );
                 self.push_error(SemanticErrorKind::UnresolvedColumn {
-                    table: col_ref.table.clone(),
-                    column: col_ref.column.clone(),
+                    table: col_ref.table.as_ref().map(ToString::to_string),
+                    column: col_ref.column.to_string(),
                 });
             }
             ResolveResult::ColumnNotFound => {
@@ -1394,8 +1394,8 @@ impl<'a> Resolver<'a> {
                     "unresolvable column reference"
                 );
                 self.push_error(SemanticErrorKind::UnresolvedColumn {
-                    table: col_ref.table.clone(),
-                    column: col_ref.column.clone(),
+                    table: col_ref.table.as_ref().map(ToString::to_string),
+                    column: col_ref.column.to_string(),
                 });
             }
             ResolveResult::Ambiguous(candidates) => {
@@ -1406,7 +1406,7 @@ impl<'a> Resolver<'a> {
                     "ambiguous column reference"
                 );
                 self.push_error(SemanticErrorKind::AmbiguousColumn {
-                    column: col_ref.column.clone(),
+                    column: col_ref.column.to_string(),
                     candidates,
                 });
             }

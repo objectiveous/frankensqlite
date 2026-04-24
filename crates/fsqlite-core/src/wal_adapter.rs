@@ -1161,8 +1161,22 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             });
         }
 
-        let data = frame_buf[fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE..].to_vec();
-        Ok(Some(data))
+        // Strip the 24-byte frame header in place instead of allocating
+        // a fresh page-sized Vec. The pre-existing pattern did
+        // `frame_buf[HEADER..].to_vec()` — on a 4 KiB page that
+        // allocated a second 4 KiB buffer plus a 4 KiB memcpy and then
+        // dropped the original 4 KiB+24 B frame_buf. On an MT pinned-
+        // read workload every page served from the WAL paid that per-
+        // read alloc/free round-trip; `_int_malloc` and `cfree` already
+        // showed up in recent 2-thread profiles. Here we keep the
+        // already-populated `frame_buf`, memmove the page bytes over
+        // the header, truncate to `page_size`, and return it — one
+        // allocation per read instead of two.
+        let header_size = fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE;
+        let page_size = self.wal.page_size();
+        frame_buf.copy_within(header_size.., 0);
+        frame_buf.truncate(page_size);
+        Ok(Some(frame_buf))
     }
 
     fn supports_pinned_reads(&self) -> bool {

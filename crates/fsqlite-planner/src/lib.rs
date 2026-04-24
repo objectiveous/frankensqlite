@@ -1220,8 +1220,62 @@ fn permute_scoring<F>(
 
 const ADAPTIVE_HINT_COST_BIAS: f64 = 0.90;
 
-static INDEX_SELECTION_TOTAL: LazyLock<Mutex<HashMap<&'static str, u64>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+struct AccessPathSelectionCounters {
+    full_table_scan: AtomicU64,
+    index_scan_range: AtomicU64,
+    index_scan_equality: AtomicU64,
+    covering_index_scan: AtomicU64,
+    rowid_lookup: AtomicU64,
+}
+
+impl AccessPathSelectionCounters {
+    const fn new() -> Self {
+        Self {
+            full_table_scan: AtomicU64::new(0),
+            index_scan_range: AtomicU64::new(0),
+            index_scan_equality: AtomicU64::new(0),
+            covering_index_scan: AtomicU64::new(0),
+            rowid_lookup: AtomicU64::new(0),
+        }
+    }
+
+    fn counter_for(&self, kind: &AccessPathKind) -> &AtomicU64 {
+        match kind {
+            AccessPathKind::FullTableScan => &self.full_table_scan,
+            AccessPathKind::IndexScanRange { .. } => &self.index_scan_range,
+            AccessPathKind::IndexScanEquality => &self.index_scan_equality,
+            AccessPathKind::CoveringIndexScan { .. } => &self.covering_index_scan,
+            AccessPathKind::RowidLookup => &self.rowid_lookup,
+        }
+    }
+
+    fn snapshot(&self) -> BTreeMap<String, u64> {
+        [
+            (
+                "covering_index_scan",
+                self.covering_index_scan.load(Ordering::Relaxed),
+            ),
+            (
+                "full_table_scan",
+                self.full_table_scan.load(Ordering::Relaxed),
+            ),
+            (
+                "index_scan_equality",
+                self.index_scan_equality.load(Ordering::Relaxed),
+            ),
+            (
+                "index_scan_range",
+                self.index_scan_range.load(Ordering::Relaxed),
+            ),
+            ("rowid_lookup", self.rowid_lookup.load(Ordering::Relaxed)),
+        ]
+        .into_iter()
+        .map(|(label, count)| (label.to_owned(), count))
+        .collect()
+    }
+}
+
+static INDEX_SELECTION_TOTAL: AccessPathSelectionCounters = AccessPathSelectionCounters::new();
 
 // ---------------------------------------------------------------------------
 // Cost estimation metrics (bd-1as.1)
@@ -1353,28 +1407,15 @@ fn access_path_metric_label(kind: &AccessPathKind) -> &'static str {
 }
 
 fn increment_index_selection_total(kind: &AccessPathKind) -> u64 {
-    let label = access_path_metric_label(kind);
-    let mut counters = INDEX_SELECTION_TOTAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let updated_count = {
-        let entry = counters.entry(label).or_insert(0);
-        *entry += 1;
-        *entry
-    };
-    drop(counters);
-    updated_count
+    INDEX_SELECTION_TOTAL
+        .counter_for(kind)
+        .fetch_add(1, Ordering::Relaxed)
+        + 1
 }
 
 #[must_use]
 pub fn snapshot_index_selection_totals() -> BTreeMap<String, u64> {
-    let counters = INDEX_SELECTION_TOTAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    counters
-        .iter()
-        .map(|(label, count)| ((*label).to_owned(), *count))
-        .collect()
+    INDEX_SELECTION_TOTAL.snapshot()
 }
 
 fn canonical_table_key(table_name: &str) -> String {

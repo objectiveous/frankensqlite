@@ -52,6 +52,23 @@ pub const RECOVERY_FENCE_BACKOFF: Duration = Duration::from_millis(100);
 /// Maximum number of backoff cycles before a waiting connection gives up.
 pub const RECOVERY_FENCE_MAX_RETRIES: u32 = 10;
 
+/// Number of `spin_loop` iterations to try before falling back to the
+/// sleep-backoff cycle.
+///
+/// The common case for the fence is a concurrent-open storm on a warm
+/// database: every waiter holds the fence only for a hot-journal probe
+/// (microseconds), so if we catch the release within a short spin we
+/// avoid the 100 ms sleep penalty. N connections opening the same path
+/// concurrently previously each paid up to `N × 100 ms` of sleep before
+/// a CAS succeeded; now all but the holder typically resolve inside a
+/// few microseconds of `PAUSE`-driven spin.
+///
+/// Sized for ~1–5 µs of total spin on modern x86 (rough estimate — one
+/// `pause` on Intel is 5–100 ns depending on µarch). If the fence is
+/// genuinely held for a long recovery, we fall through to the original
+/// sleep-backoff budget.
+pub const RECOVERY_FENCE_SPIN_ATTEMPTS: u32 = 4096;
+
 /// Single-owner fence that serializes WAL recovery across concurrent
 /// connection-open / checkpoint paths.
 ///
@@ -131,6 +148,20 @@ impl RecoveryFence {
         max_retries: u32,
         backoff: Duration,
     ) -> Result<RecoveryFenceGuard<'_>> {
+        // Fast path — concurrent Connection::open storms all contend on
+        // the same per-path fence but typically hold it for only a
+        // hot-journal probe (microseconds). Spin for a few microseconds
+        // before falling through to the sleep-backoff cycle so that
+        // N-1 of N concurrent openers don't each pay a 100 ms sleep
+        // penalty. `spin_loop` issues `PAUSE` on x86 (hyperthread-
+        // friendly) and resolves to a no-op on architectures without
+        // an equivalent.
+        for _ in 0..RECOVERY_FENCE_SPIN_ATTEMPTS {
+            if let Some(guard) = self.try_acquire_for_recovery() {
+                return Ok(guard);
+            }
+            std::hint::spin_loop();
+        }
         for attempt in 0..=max_retries {
             if let Some(guard) = self.try_acquire_for_recovery() {
                 return Ok(guard);
@@ -601,6 +632,70 @@ mod tests {
         let result = fence.acquire_for_recovery_with(2, Duration::from_millis(5));
         assert!(matches!(result, Err(FrankenError::BusyRecovery)));
         drop(held);
+    }
+
+    #[test]
+    fn fence_concurrent_open_storm_does_not_pay_sleep_penalty() {
+        // Simulates the `mt_mvcc_bench` Connection::open storm: 8 workers
+        // race to acquire the fence but each holder does only a short
+        // (~microsecond) "hot-journal probe" before releasing. Before
+        // the spin-fast-path, N-1 of N workers paid at least one
+        // `backoff` sleep (historically 100 ms) because
+        // acquire_for_recovery_with jumped straight into the sleep loop
+        // after the first CAS miss. After the spin-fast-path, almost
+        // all contenders resolve inside the spin.
+        //
+        // Gate: with backoff = 100 ms × 10 retries, 8 workers each
+        // holding the fence for ~1 µs must finish the full round-robin
+        // in well under `ceil(N/1) × backoff`. We set a generous
+        // ceiling of 50 ms so the test does not flake on loaded CI,
+        // and print the observed latency for the commit body.
+        use std::time::Instant;
+        const THREADS: usize = 8;
+        const ROUNDS_PER_THREAD: usize = 4;
+        let fence = Arc::new(RecoveryFence::new());
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+
+        let started = Instant::now();
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let fence = Arc::clone(&fence);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..ROUNDS_PER_THREAD {
+                        let guard = fence
+                            .acquire_for_recovery_with(
+                                RECOVERY_FENCE_MAX_RETRIES,
+                                RECOVERY_FENCE_BACKOFF,
+                            )
+                            .expect("fence acquire under storm");
+                        // Simulate a hot-journal probe on a warm DB —
+                        // the fence is held for only a few hundred
+                        // nanoseconds of real work.
+                        std::hint::black_box(&guard);
+                        drop(guard);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker join");
+        }
+        let elapsed = started.elapsed();
+
+        eprintln!(
+            "recovery_fence concurrent-open storm: {THREADS} threads × \
+             {ROUNDS_PER_THREAD} rounds = {elapsed:?} \
+             (spin_attempts={RECOVERY_FENCE_SPIN_ATTEMPTS}, \
+              backoff={RECOVERY_FENCE_BACKOFF:?}, \
+              max_retries={RECOVERY_FENCE_MAX_RETRIES})"
+        );
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "concurrent-open storm should resolve inside the spin-fast-path, \
+             not pay the 100ms sleep penalty (elapsed {elapsed:?})",
+        );
     }
 
     // --- PidOwnedLockRegistry --------------------------------------------

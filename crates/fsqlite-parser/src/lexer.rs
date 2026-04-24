@@ -6,6 +6,8 @@
 use fsqlite_ast::Span;
 use fsqlite_types::limits::MAX_VARIABLE_NUMBER;
 use memchr::memchr;
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::Level;
@@ -123,6 +125,25 @@ pub fn reset_tokenize_metrics() {
 }
 
 /// SQL lexer that produces a stream of tokens from source text.
+#[derive(Debug, Default)]
+pub(crate) struct IdentifierInterner {
+    values: HashSet<Arc<str>>,
+}
+
+impl IdentifierInterner {
+    fn intern(&mut self, value: &str) -> Arc<str> {
+        if let Some(existing) = self.values.get(value) {
+            return Arc::clone(existing);
+        }
+
+        let interned: Arc<str> = Arc::from(value);
+        let inserted = Arc::clone(&interned);
+        self.values.insert(interned);
+        inserted
+    }
+}
+
+/// SQL lexer that produces a stream of tokens from source text.
 pub struct Lexer<'a> {
     /// The source bytes (UTF-8).
     src: &'a [u8],
@@ -134,6 +155,8 @@ pub struct Lexer<'a> {
     col: u32,
     /// Whether TRACE character-level logging is enabled.
     trace_chars: bool,
+    /// Per-parse identifier interner reused by scratch callers.
+    interner: IdentifierInterner,
 }
 
 impl<'a> Lexer<'a> {
@@ -158,6 +181,7 @@ impl<'a> Lexer<'a> {
             line: 1,
             col: 1,
             trace_chars: tracing::enabled!(target: "fsqlite.parse", Level::TRACE),
+            interner: IdentifierInterner::default(),
         }
     }
 
@@ -169,12 +193,32 @@ impl<'a> Lexer<'a> {
         tokens
     }
 
+    fn new_with_interner(source: &'a str, interner: IdentifierInterner) -> Self {
+        Self {
+            src: source.as_bytes(),
+            pos: 0,
+            line: 1,
+            col: 1,
+            trace_chars: tracing::enabled!(target: "fsqlite.parse", Level::TRACE),
+            interner,
+        }
+    }
+
     /// Tokenize the entire input into a caller-owned buffer.
     ///
     /// This preserves the buffer's existing heap allocation across repeated
     /// parses so statement-level callers can treat token storage as lookaside
     /// scratch instead of rebuilding a fresh `Vec<Token>` on every miss.
     pub fn tokenize_into(source: &'a str, tokens: &mut Vec<Token>) {
+        let mut interner = IdentifierInterner::default();
+        Self::tokenize_into_with_interner(source, tokens, &mut interner);
+    }
+
+    pub(crate) fn tokenize_into_with_interner(
+        source: &'a str,
+        tokens: &mut Vec<Token>,
+        interner: &mut IdentifierInterner,
+    ) {
         let input_bytes = source.len();
         let collect_tokenize_metrics = tokenize_metrics_enabled();
         let trace_tokenize = tracing::enabled!(target: "fsqlite.parse", Level::TRACE);
@@ -191,7 +235,7 @@ impl<'a> Lexer<'a> {
         let _guard = span.as_ref().map(|span| span.enter());
         let started = (collect_tokenize_metrics || trace_tokenize).then(Instant::now);
 
-        let mut lexer = Self::new(source);
+        let mut lexer = Self::new_with_interner(source, std::mem::take(interner));
         let target_capacity = input_bytes / 4 + 1;
         tokens.clear();
         if target_capacity > tokens.capacity() {
@@ -205,6 +249,8 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
+
+        *interner = lexer.interner;
 
         if let Some(started) = started {
             let elapsed_us = saturating_u64_from_u128(started.elapsed().as_micros());
@@ -525,7 +571,7 @@ impl<'a> Lexer<'a> {
                     value.push('"');
                     self.advance();
                 } else {
-                    return TokenKind::QuotedId(value, true);
+                    return TokenKind::QuotedId(self.interner.intern(&value), true);
                 }
             } else {
                 self.pos = self.src.len();
@@ -556,7 +602,7 @@ impl<'a> Lexer<'a> {
                     value.push('`');
                     self.advance();
                 } else {
-                    return TokenKind::QuotedId(value, false);
+                    return TokenKind::QuotedId(self.interner.intern(&value), false);
                 }
             } else {
                 self.pos = self.src.len();
@@ -581,7 +627,7 @@ impl<'a> Lexer<'a> {
             ));
             self.advance_by(offset);
             self.advance(); // skip ]
-            TokenKind::QuotedId(value, false)
+            TokenKind::QuotedId(self.interner.intern(&value), false)
         } else {
             self.pos = self.src.len();
             TokenKind::Error(format!("unterminated bracket identifier at byte {}", start))
@@ -803,13 +849,14 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        let text = String::from_utf8_lossy(&self.src[start..self.pos]).into_owned();
+        let ident_bytes = &self.src[start..self.pos];
 
         // Check for keyword
-        if let Some(kw) = TokenKind::lookup_keyword(&text) {
+        if let Some(kw) = TokenKind::lookup_keyword_bytes(ident_bytes) {
             kw
         } else {
-            TokenKind::Id(text)
+            let text = String::from_utf8_lossy(ident_bytes);
+            TokenKind::Id(self.interner.intern(&text))
         }
     }
 
@@ -1101,19 +1148,16 @@ mod tests {
     #[test]
     fn test_lex_quoted_identifiers() {
         let tokens = kinds("\"table_name\" [column] `backtick`");
-        assert_eq!(
-            tokens[0],
-            TokenKind::QuotedId("table_name".to_owned(), true)
-        );
-        assert_eq!(tokens[1], TokenKind::QuotedId("column".to_owned(), false));
-        assert_eq!(tokens[2], TokenKind::QuotedId("backtick".to_owned(), false));
+        assert_eq!(tokens[0], TokenKind::QuotedId("table_name".into(), true));
+        assert_eq!(tokens[1], TokenKind::QuotedId("column".into(), false));
+        assert_eq!(tokens[2], TokenKind::QuotedId("backtick".into(), false));
     }
 
     #[test]
     fn test_lex_dqs_flag() {
         let tokens = kinds("\"hello\"");
         // Double-quoted strings produce QuotedId with EP_DblQuoted=true
-        assert_eq!(tokens[0], TokenKind::QuotedId("hello".to_owned(), true));
+        assert_eq!(tokens[0], TokenKind::QuotedId("hello".into(), true));
     }
 
     #[test]
@@ -1204,9 +1248,9 @@ mod tests {
     fn test_lex_whitespace_and_comments_skipped() {
         let tokens = kinds("SELECT -- this is a comment\n  a /* block */ FROM b");
         assert_eq!(tokens[0], TokenKind::KwSelect);
-        assert_eq!(tokens[1], TokenKind::Id("a".to_owned()));
+        assert_eq!(tokens[1], TokenKind::Id("a".into()));
         assert_eq!(tokens[2], TokenKind::KwFrom);
-        assert_eq!(tokens[3], TokenKind::Id("b".to_owned()));
+        assert_eq!(tokens[3], TokenKind::Id("b".into()));
         assert_eq!(tokens[4], TokenKind::Eof);
     }
 

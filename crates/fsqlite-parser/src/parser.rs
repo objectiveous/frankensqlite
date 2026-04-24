@@ -132,6 +132,7 @@ impl Error for ParseError {}
 pub struct StatementParseScratch {
     tokens: Vec<Token>,
     errors: Vec<ParseError>,
+    identifier_interner: crate::lexer::IdentifierInterner,
 }
 
 impl StatementParseScratch {
@@ -426,7 +427,11 @@ impl Parser {
 
     pub(crate) fn parse_identifier(&mut self) -> Result<String, ParseError> {
         match self.peek().clone() {
-            TokenKind::Id(s) | TokenKind::QuotedId(s, _) | TokenKind::String(s) => {
+            TokenKind::Id(s) | TokenKind::QuotedId(s, _) => {
+                self.advance();
+                Ok(s.to_string())
+            }
+            TokenKind::String(s) => {
                 self.advance();
                 Ok(s)
             }
@@ -2182,7 +2187,7 @@ fn parse_statements_with_scratch_inner(
     sql: &str,
     scratch: &mut StatementParseScratch,
 ) -> (Vec<Statement>, Option<ParseError>) {
-    Lexer::tokenize_into(sql, &mut scratch.tokens);
+    Lexer::tokenize_into_with_interner(sql, &mut scratch.tokens, &mut scratch.identifier_interner);
     let mut parser = Parser {
         tokens: std::mem::take(&mut scratch.tokens),
         pos: 0,

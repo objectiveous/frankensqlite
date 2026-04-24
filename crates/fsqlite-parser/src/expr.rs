@@ -319,7 +319,7 @@ impl Parser {
 
             // ── Identifier: column ref or function call ─────────────────
             TokenKind::Id(name) | TokenKind::QuotedId(name, _) => {
-                let name = name.clone();
+                let name = name.to_string();
                 self.parse_ident_expr(name, tok.span)
             }
 
@@ -354,7 +354,7 @@ impl Parser {
             self.advance_token();
             let col_tok = self.advance_token();
             let col_name = match &col_tok.kind {
-                TokenKind::Id(c) | TokenKind::QuotedId(c, _) => c.clone(),
+                TokenKind::Id(c) | TokenKind::QuotedId(c, _) => c.to_string(),
                 TokenKind::Star => "*".to_owned(),
                 // After a dot, ANY keyword is a valid column name (SQLite
                 // allows reserved keywords in table-qualified positions).
@@ -887,7 +887,7 @@ impl Parser {
                 TokenKind::Id(_) | TokenKind::QuotedId(_, _) => {
                     let tok = self.advance_token();
                     if let TokenKind::Id(s) | TokenKind::QuotedId(s, _) = &tok.kind {
-                        parts.push(s.clone());
+                        parts.push(s.to_string());
                     } else {
                         unreachable!();
                     }
@@ -949,9 +949,8 @@ impl Parser {
                     )),
                 }
             }
-            TokenKind::OversizedInt(s) | TokenKind::Id(s) | TokenKind::QuotedId(s, _) => {
-                Ok(s.clone())
-            }
+            TokenKind::OversizedInt(s) => Ok(s.clone()),
+            TokenKind::Id(s) | TokenKind::QuotedId(s, _) => Ok(s.to_string()),
             _ => Err(ParseError::at("expected type argument", Some(&tok))),
         }
     }

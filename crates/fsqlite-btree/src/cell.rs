@@ -533,6 +533,34 @@ impl CellRef {
         })
     }
 
+    /// bd-ah597.3: left-child fast path for interior cells.
+    ///
+    /// Every interior cell (Table or Index) starts with a 4-byte big-endian
+    /// child-page pointer. Callers that only need the child page — descent
+    /// navigation, balance-time child enumeration, separator-replace — can
+    /// read those 4 bytes directly without paying for the full
+    /// `CellRef::parse` (varint decodes, local-size math, overflow checks).
+    /// Identical byte-level shape to the private `read_child_at_offset`
+    /// helper in `BtCursor`; this is the public sibling so `balance.rs` and
+    /// future crates can use it.
+    #[inline]
+    pub fn read_interior_left_child(page: &[u8], cell_offset: usize) -> Result<PageNumber> {
+        if cell_offset.saturating_add(4) > page.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "interior cell extends past page (left child)".to_owned(),
+            });
+        }
+        let pgno = u32::from_be_bytes([
+            page[cell_offset],
+            page[cell_offset + 1],
+            page[cell_offset + 2],
+            page[cell_offset + 3],
+        ]);
+        PageNumber::new(pgno).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "interior cell has zero left-child pointer".to_owned(),
+        })
+    }
+
     /// bd-9e3xf.4: rowid-only fast path for leaf-table cells.
     ///
     /// Callers like `BtCursor::predecessor_idx` on the DELETE rebalance path

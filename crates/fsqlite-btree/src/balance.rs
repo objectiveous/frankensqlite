@@ -880,12 +880,18 @@ fn child_page_number(
 
     match child_idx.cmp(&cell_count) {
         std::cmp::Ordering::Less => {
+            // bd-ah597.3: same "caller only needs left_child" pattern as
+            // commits 4b061dcc (child_page_at), 385591f8 (replace_separator).
+            // Use the public `CellRef::read_interior_left_child` helper
+            // instead of a full `CellRef::parse` — the cell's first 4 bytes
+            // are the child pointer; decoding the rowid varint, local-size
+            // math, and overflow bounds are dead work here. `usable_size`
+            // stays in the signature because the shared-sibling helper
+            // `read_cell_pointers` and the `compute_sibling_range` plumbing
+            // both expect it.
+            let _ = usable_size;
             let ptr = parent_ptrs[child_idx] as usize;
-            let cell = CellRef::parse(parent_data, ptr, parent_header.page_type, usable_size)?;
-            cell.left_child
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: format!("interior cell {} has no left child", child_idx),
-                })
+            CellRef::read_interior_left_child(parent_data, ptr)
         }
         std::cmp::Ordering::Equal => {
             parent_header

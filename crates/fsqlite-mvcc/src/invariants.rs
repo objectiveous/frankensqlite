@@ -3070,4 +3070,89 @@ mod tests {
              (n={TRIALS} trials, {RESOLVES_PER_TRIAL} resolves/trial, pages={PAGES})"
         );
     }
+
+    /// Microbench comparing the branching `commit_seq != 0 && commit_seq <=
+    /// snapshot.high` predicate to the branchless `commit_seq.wrapping_sub(1)
+    /// < snapshot.high` form used by the current `visible()` helper. Both
+    /// forms are inlined through `#[inline]`; this isolates the pure
+    /// visibility-check cost from the resolve / chain-walk / atomic-metric
+    /// overhead. Exercises a mixed population where most versions are
+    /// committed and visible (common case) but some are uncommitted
+    /// (commit_seq = 0) or newer-than-snapshot.
+    #[test]
+    #[ignore = "microbench — run manually"]
+    fn bench_visible_branchless() {
+        use std::time::Instant;
+
+        const SAMPLES: usize = 4096;
+        const ITERS_PER_TRIAL: u32 = 2_000_000;
+        const TRIALS: usize = 9;
+
+        // Synthesise a realistic mix of commit_seqs: ~80% visible, ~10%
+        // uncommitted, ~10% newer than snapshot.
+        let snapshot_high = 10_000_u64;
+        let snapshot = make_snapshot(snapshot_high);
+        let versions: Vec<PageVersion> = (0..SAMPLES)
+            .map(|i| {
+                let kind = i % 10;
+                let seq = match kind {
+                    0 => 0,                     // uncommitted
+                    1 => snapshot_high + 1,     // newer than snapshot
+                    _ => (i as u64 % snapshot_high) + 1, // visible
+                };
+                make_version(1, seq, None)
+            })
+            .collect();
+
+        #[inline(always)]
+        fn visible_branching(v: &PageVersion, s: &Snapshot) -> bool {
+            v.commit_seq.get() != 0 && v.commit_seq <= s.high
+        }
+        #[inline(always)]
+        fn visible_branchless(v: &PageVersion, s: &Snapshot) -> bool {
+            v.commit_seq.get().wrapping_sub(1) < s.high.get()
+        }
+
+        fn run<F: Fn(&PageVersion, &Snapshot) -> bool>(
+            versions: &[PageVersion],
+            snapshot: &Snapshot,
+            iters: u32,
+            f: F,
+        ) -> f64 {
+            let mut count = 0_u64;
+            let start = Instant::now();
+            for i in 0..iters {
+                let v = &versions[(i as usize) % versions.len()];
+                if std::hint::black_box(f(v, snapshot)) {
+                    count += 1;
+                }
+            }
+            std::hint::black_box(count);
+            start.elapsed().as_nanos() as f64 / f64::from(iters)
+        }
+
+        // Warm-up.
+        run(&versions, &snapshot, ITERS_PER_TRIAL, visible_branching);
+        run(&versions, &snapshot, ITERS_PER_TRIAL, visible_branchless);
+
+        let mut br_samples = Vec::with_capacity(TRIALS);
+        let mut nb_samples = Vec::with_capacity(TRIALS);
+        for _ in 0..TRIALS {
+            let br = run(&versions, &snapshot, ITERS_PER_TRIAL, visible_branching);
+            let nb = run(&versions, &snapshot, ITERS_PER_TRIAL, visible_branchless);
+            eprintln!("  branching: {br:.2} ns/call   branchless: {nb:.2} ns/call");
+            br_samples.push(br);
+            nb_samples.push(nb);
+        }
+        br_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        nb_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let br_med = br_samples[TRIALS / 2];
+        let nb_med = nb_samples[TRIALS / 2];
+        let delta_pct = (nb_med - br_med) / br_med * 100.0;
+        eprintln!(
+            "bench_visible_branchless: branching median={br_med:.2} ns/call; \
+             branchless median={nb_med:.2} ns/call; delta={delta_pct:+.1}% \
+             (n={TRIALS} trials, {ITERS_PER_TRIAL} iters/trial, samples={SAMPLES})"
+        );
+    }
 }

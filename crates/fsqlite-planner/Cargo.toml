@@ -31,5 +31,9 @@ proptest = { workspace = true }
 name = "plan_cache_hot_paths"
 harness = false
 
+[[bench]]
+name = "oltp_cost_estimation_hot_paths"
+harness = false
+
 [lints]
 workspace = true

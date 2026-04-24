@@ -7136,6 +7136,41 @@ mod tests {
     }
 
     #[test]
+    fn test_best_access_path_ipk_oltp_shapes_without_schema_context() {
+        let table = table_stats("bench", 128, 5000);
+
+        // The planner crate itself has no schema-aware INTEGER PRIMARY KEY
+        // alias detection, so the mixed-OLTP benchmark's `id = ?1` shape is
+        // still priced as a full scan until fsqlite-core upgrades it to a
+        // rowid fast path after planning.
+        let point = best_access_path(&table, &[], &[eq_term("id")], None);
+        assert!(matches!(point.kind, AccessPathKind::FullTableScan));
+
+        let lower_expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("id"), Span::ZERO)),
+            op: AstBinaryOp::Ge,
+            right: Box::new(Expr::Literal(Literal::Integer(100), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let upper_expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("id"), Span::ZERO)),
+            op: AstBinaryOp::Lt,
+            right: Box::new(Expr::Literal(Literal::Integer(150), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let range = best_access_path(
+            &table,
+            &[],
+            &[classify_where_term(lower_expr), classify_where_term(upper_expr)],
+            None,
+        );
+        assert!(matches!(range.kind, AccessPathKind::FullTableScan));
+
+        let aggregate = best_access_path(&table, &[], &[], None);
+        assert!(matches!(aggregate.kind, AccessPathKind::FullTableScan));
+    }
+
+    #[test]
     fn test_analyze_stats_override() {
         // With ANALYZE stats, the source is recorded.
         let table = TableStats {

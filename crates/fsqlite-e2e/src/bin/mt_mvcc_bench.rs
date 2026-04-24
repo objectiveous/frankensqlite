@@ -442,8 +442,8 @@ fn load_previous_report(path: &Path) -> Result<Option<HistoricalMtMvccBenchRepor
     if !path.exists() {
         return Ok(None);
     }
-    let bytes =
-        fs::read(path).map_err(|error| format!("read history report {}: {error}", path.display()))?;
+    let bytes = fs::read(path)
+        .map_err(|error| format!("read history report {}: {error}", path.display()))?;
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|error| format!("parse history report {}: {error}", path.display()))
@@ -701,12 +701,14 @@ fn run_fsqlite(threads: usize, rows_per_thread: usize) -> Result<RunResult, Stri
 
     let mut startup_failures = Vec::new();
     for _ in 0..threads {
-        let outcome = startup_rx.recv_timeout(STARTUP_COORDINATION_TIMEOUT).map_err(|error| {
-            format!(
-                "fsqlite startup coordination timed out after {:?}: {error}",
-                STARTUP_COORDINATION_TIMEOUT
-            )
-        })?;
+        let outcome = startup_rx
+            .recv_timeout(STARTUP_COORDINATION_TIMEOUT)
+            .map_err(|error| {
+                format!(
+                    "fsqlite startup coordination timed out after {:?}: {error}",
+                    STARTUP_COORDINATION_TIMEOUT
+                )
+            })?;
         if outcome.kind == StartupResultKind::Failed {
             startup_failures.push(StartupFailure {
                 tid: outcome.tid,
@@ -946,8 +948,11 @@ fn run() -> Result<(), String> {
     }
 
     let previous_report = load_previous_report(&opts.history_json)?;
-    let pass_over_pass_gate =
-        build_pass_over_pass_gate(&opts.history_json, previous_report.as_ref(), &thread_results);
+    let pass_over_pass_gate = build_pass_over_pass_gate(
+        &opts.history_json,
+        previous_report.as_ref(),
+        &thread_results,
+    );
 
     let full_report = MtMvccBenchReport {
         schema_version: REPORT_SCHEMA_V2,
@@ -1107,11 +1112,8 @@ mod tests {
             sqlite_failed_rows: 0,
         }];
 
-        let gate = build_pass_over_pass_gate(
-            Path::new(DEFAULT_HISTORY_JSON),
-            Some(&previous),
-            &current,
-        );
+        let gate =
+            build_pass_over_pass_gate(Path::new(DEFAULT_HISTORY_JSON), Some(&previous), &current);
 
         assert_eq!(gate.status, "failed");
         assert_eq!(gate.regressions.len(), 1);

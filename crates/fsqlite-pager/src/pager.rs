@@ -2707,6 +2707,7 @@ struct AtomicPublishedPageSlot {
 #[derive(Debug)]
 struct AtomicPublishedPages {
     slots: Box<[AtomicPublishedPageSlot]>,
+    active_indices: Mutex<Vec<usize>>,
     page_count: AtomicUsize,
 }
 
@@ -2727,6 +2728,7 @@ impl AtomicPublishedPages {
             .into_boxed_slice();
         Self {
             slots,
+            active_indices: Mutex::new(Vec::new()),
             page_count: AtomicUsize::new(0),
         }
     }
@@ -2751,6 +2753,14 @@ impl AtomicPublishedPages {
         self.slots.len()
     }
 
+    #[cfg(test)]
+    fn active_slot_count(&self) -> usize {
+        self.active_indices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
     fn get(&self, page_no: PageNumber) -> Option<PageData> {
         let idx = self.slot_index(page_no)?;
         let slot = &self.slots[idx];
@@ -2767,6 +2777,10 @@ impl AtomicPublishedPages {
         let Some(idx) = self.slot_index(page_no) else {
             return false;
         };
+        let mut active_indices = self
+            .active_indices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let slot = &self.slots[idx];
         let mut guard = slot
             .page
@@ -2774,6 +2788,9 @@ impl AtomicPublishedPages {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let inserted = guard.is_none();
         *guard = Some(page);
+        if inserted {
+            active_indices.push(idx);
+        }
         drop(guard);
         slot.present.store(true, AtomicOrdering::Release);
         if inserted {
@@ -2786,6 +2803,10 @@ impl AtomicPublishedPages {
         let Some(idx) = self.slot_index(page_no) else {
             return false;
         };
+        let mut active_indices = self
+            .active_indices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let slot = &self.slots[idx];
         if !slot.present.swap(false, AtomicOrdering::AcqRel) {
             return false;
@@ -2797,27 +2818,30 @@ impl AtomicPublishedPages {
             .take()
             .is_some();
         if removed {
+            if let Some(pos) = active_indices
+                .iter()
+                .position(|&active_idx| active_idx == idx)
+            {
+                active_indices.swap_remove(pos);
+            }
             self.page_count.fetch_sub(1, AtomicOrdering::Relaxed);
         }
         removed
     }
 
     fn clear(&self) {
-        // Short-circuit: if nothing is published we can skip scanning all
-        // `ATOMIC_PUBLISHED_SLOT_COUNT` slots. Under MT-writer contention the
-        // publication plane is cleared on every transaction rollback/retry,
-        // and the clear was a measurable 14.61% self-time at 8 threads on the
-        // 2026-04-23 post-T1 capture (`fsqlite-mt-post-t1t2t7-184420`).
+        // Under MT-writer contention the publication plane is cleared on
+        // every transaction rollback/retry. Keep clear proportional to the
+        // actually published pages rather than the direct-slot capacity.
         if self.page_count.load(AtomicOrdering::Acquire) == 0 {
             return;
         }
-        for slot in self.slots.iter() {
-            // Pre-filter with a Relaxed load to avoid the AcqRel RMW on
-            // already-empty slots — the common case when only a handful of
-            // the 65,535 slots are actually live.
-            if !slot.present.load(AtomicOrdering::Relaxed) {
-                continue;
-            }
+        let mut active_indices = self
+            .active_indices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for idx in active_indices.drain(..) {
+            let slot = &self.slots[idx];
             if slot.present.swap(false, AtomicOrdering::AcqRel) {
                 let _ = slot
                     .page
@@ -2833,15 +2857,20 @@ impl AtomicPublishedPages {
     where
         F: Fn(&PageNumber) -> bool,
     {
-        let mut retained_total = 0_usize;
-        for (idx, slot) in self.slots.iter().enumerate() {
+        let mut active_indices = self
+            .active_indices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut retained_indices = Vec::with_capacity(active_indices.len());
+        for idx in active_indices.drain(..) {
+            let slot = &self.slots[idx];
             if !slot.present.load(AtomicOrdering::Acquire) {
                 continue;
             }
             let page_no = PageNumber::new(u32::try_from(idx + 1).unwrap_or(u32::MAX))
                 .expect("atomic publication slot index must map to a valid page number");
             if f(&page_no) {
-                retained_total = retained_total.saturating_add(1);
+                retained_indices.push(idx);
                 continue;
             }
             if slot.present.swap(false, AtomicOrdering::AcqRel) {
@@ -2852,8 +2881,43 @@ impl AtomicPublishedPages {
                     .take();
             }
         }
+        let retained_total = retained_indices.len();
+        *active_indices = retained_indices;
         self.page_count
             .store(retained_total, AtomicOrdering::Release);
+    }
+
+    fn insert_batch<I>(&self, pages: I)
+    where
+        I: IntoIterator<Item = (PageNumber, PageData)>,
+    {
+        let mut active_indices = self
+            .active_indices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut total_added = 0_usize;
+        for (page_no, page) in pages {
+            let Some(idx) = self.slot_index(page_no) else {
+                continue;
+            };
+            let slot = &self.slots[idx];
+            let mut guard = slot
+                .page
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let inserted = guard.is_none();
+            *guard = Some(page);
+            if inserted {
+                active_indices.push(idx);
+                total_added = total_added.saturating_add(1);
+            }
+            drop(guard);
+            slot.present.store(true, AtomicOrdering::Release);
+        }
+        if total_added > 0 {
+            self.page_count
+                .fetch_add(total_added, AtomicOrdering::Relaxed);
+        }
     }
 
     fn len(&self) -> usize {
@@ -3017,13 +3081,17 @@ impl PublishedPages {
     where
         I: IntoIterator<Item = (PageNumber, PageData)>,
     {
+        let mut direct_pages = Vec::new();
         let mut overflow_pages = Vec::new();
         for (page_no, page) in pages {
             if self.atomic.accepts(page_no) {
-                let _ = self.atomic.insert(page_no, page);
+                direct_pages.push((page_no, page));
             } else {
                 overflow_pages.push((page_no, page));
             }
+        }
+        if !direct_pages.is_empty() {
+            self.atomic.insert_batch(direct_pages);
         }
         if !overflow_pages.is_empty() {
             self.overflow.insert_batch(overflow_pages);
@@ -3045,6 +3113,11 @@ impl PublishedPages {
     #[cfg(test)]
     fn atomic_slot_count(&self) -> usize {
         self.atomic.slot_count()
+    }
+
+    #[cfg(test)]
+    fn atomic_active_slot_count(&self) -> usize {
+        self.atomic.active_slot_count()
     }
 }
 
@@ -21822,6 +21895,36 @@ mod tests {
             Some(PageData::from_vec(sample_page(0xA2)))
         );
         assert_eq!(published_pages.len(), 2);
+    }
+
+    #[test]
+    fn test_published_pages_direct_active_slots_track_live_pages() {
+        let published_pages = PublishedPages::new(1);
+        let page_one = PageNumber::new(1).unwrap();
+        let page_two = PageNumber::new(2).unwrap();
+
+        assert!(published_pages.insert(page_one, PageData::from_vec(sample_page(0xB1))));
+        assert_eq!(published_pages.atomic_active_slot_count(), 1);
+        assert!(!published_pages.insert(page_one, PageData::from_vec(sample_page(0xB2))));
+        assert_eq!(
+            published_pages.atomic_active_slot_count(),
+            1,
+            "direct replacement must not duplicate the active slot index"
+        );
+
+        assert!(published_pages.insert(page_two, PageData::from_vec(sample_page(0xB3))));
+        assert_eq!(published_pages.atomic_active_slot_count(), 2);
+        assert!(published_pages.remove(page_one));
+        assert_eq!(
+            published_pages.atomic_active_slot_count(),
+            1,
+            "direct remove should drop its active slot index"
+        );
+
+        published_pages.clear();
+        assert_eq!(published_pages.atomic_active_slot_count(), 0);
+        assert_eq!(published_pages.len(), 0);
+        assert!(published_pages.get(page_two).is_none());
     }
 
     #[test]

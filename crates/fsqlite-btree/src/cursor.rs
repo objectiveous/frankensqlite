@@ -5615,15 +5615,17 @@ impl<P: PageWriter> BtCursor<P> {
             .cell_idx
             .checked_sub(1)
             .ok_or_else(|| FrankenError::internal("last leaf cell has no predecessor"))?;
-        let predecessor = self.parse_cell_at(leaf_entry, predecessor_idx)?;
-        let new_rowid = predecessor
-            .rowid
-            .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "table leaf predecessor on page {} is missing a rowid",
-                    leaf_entry.page_no
-                ),
-            })?;
+        // bd-9e3xf.4: predecessor lookup only needs the leaf-table rowid, so
+        // skip the cell-slot cache round-trip and the overflow/local-size
+        // bookkeeping that `CellRef::parse` computes for full cell access.
+        // Same "caller only needs one field" pattern as commits 4b061dcc
+        // (child_page_at) and 385591f8 (replace_separator left-child).
+        let predecessor_offset = usize::from(Self::read_stack_entry_cell_pointer_inline(
+            leaf_entry,
+            predecessor_idx,
+        )?);
+        let new_rowid =
+            CellRef::parse_leaf_table_rowid(leaf_entry.page_data.as_bytes(), predecessor_offset)?;
 
         Ok(Some((separator.page_no, separator.cell_idx, new_rowid)))
     }
@@ -6140,17 +6142,18 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(None);
         }
         let header_offset = cell::header_offset_for_page(hinted_leaf_page);
-        let cell_pointers =
-            match cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset) {
-                Ok(cell_pointers) => cell_pointers,
-                Err(_) => {
-                    self.clear_rightmost_leaf_cache();
-                    return Ok(None);
-                }
-            };
-        let Some(last_ptr) = cell_pointers.last().copied() else {
-            self.clear_rightmost_leaf_cache();
-            return Ok(None);
+        let last_cell_idx = header.cell_count - 1;
+        let last_ptr = match Self::read_cell_pointer_inline(
+            page_data.as_bytes(),
+            hinted_leaf_page,
+            usize::from(header.page_type.header_size()),
+            last_cell_idx,
+        ) {
+            Ok(ptr) => ptr,
+            Err(_) => {
+                self.clear_rightmost_leaf_cache();
+                return Ok(None);
+            }
         };
         // OPT-A3: skip full CellRef::parse — we only need the last cell's
         // rowid to confirm the hint is still valid. Read just the two

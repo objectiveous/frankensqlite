@@ -533,6 +533,29 @@ impl CellRef {
         })
     }
 
+    /// bd-9e3xf.4: rowid-only fast path for leaf-table cells.
+    ///
+    /// Callers like `BtCursor::predecessor_idx` on the DELETE rebalance path
+    /// invoke `CellRef::parse` only to read `cell.rowid`, throwing away the
+    /// `local_size` / `overflow_page` plumbing. A leaf-table cell is
+    /// `[payload_size varint][rowid varint][payload bytes…]`, so the rowid
+    /// is fully determined by two varint reads — no `local_payload_size`
+    /// math, no overflow-pointer materialisation.
+    #[inline]
+    pub fn parse_leaf_table_rowid(page: &[u8], cell_offset: usize) -> Result<i64> {
+        let (_, ps_len) =
+            read_varint(&page[cell_offset..]).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "truncated varint in table cell (payload size)".to_owned(),
+            })?;
+        let rowid_start = cell_offset + ps_len;
+        let (rowid_raw, _) =
+            read_varint(&page[rowid_start..]).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "truncated varint in table cell (rowid)".to_owned(),
+            })?;
+        #[allow(clippy::cast_possible_wrap)]
+        Ok(rowid_raw as i64)
+    }
+
     /// Get the local payload bytes from the page.
     pub fn local_payload<'a>(&self, page: &'a [u8]) -> &'a [u8] {
         &page[self.payload_offset..self.payload_offset + self.local_size as usize]

@@ -23,6 +23,8 @@ use fsqlite_types::sync_primitives::Mutex;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageSize;
 
+const PAGE_BUF_POOL_FREE_LIST_INITIAL_CAPACITY: usize = 64;
+
 // ---------------------------------------------------------------------------
 // PageBuf
 // ---------------------------------------------------------------------------
@@ -258,10 +260,11 @@ impl PageBufPool {
     /// acquisitions fail with [`FrankenError::OutOfMemory`].
     #[must_use]
     pub fn new(page_size: PageSize, max_buffers: usize) -> Self {
+        let free_list_capacity = max_buffers.min(PAGE_BUF_POOL_FREE_LIST_INITIAL_CAPACITY);
         Self {
             inner: Arc::new(PageBufPoolInner {
                 page_size: page_size.as_usize(),
-                free: Mutex::new(Vec::with_capacity(max_buffers)),
+                free: Mutex::new(Vec::with_capacity(free_list_capacity)),
                 max_buffers,
                 total_buffers: AtomicUsize::new(0),
                 acquire_hits: AtomicUsize::new(0),
@@ -513,6 +516,16 @@ mod tests {
         drop(b1);
         drop(b2);
         assert_eq!(pool.available(), 2, "pool should retain returned buffers");
+    }
+
+    #[test]
+    fn test_page_buf_pool_free_list_capacity_is_lazy() {
+        let pool = PageBufPool::new(PageSize::DEFAULT, 262_144);
+        let capacity = pool.inner.free.lock().capacity();
+        assert_eq!(
+            capacity, PAGE_BUF_POOL_FREE_LIST_INITIAL_CAPACITY,
+            "pool construction must not preallocate one idle-list slot per possible buffer"
+        );
     }
 
     #[test]

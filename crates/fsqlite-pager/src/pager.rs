@@ -6145,6 +6145,23 @@ impl<V: Vfs> SimpleTransaction<V> {
     }
 
     #[must_use]
+    fn freelist_metadata_dirty_after_lease_return_with_inner(
+        &self,
+        inner: &PagerInner<V::File>,
+        committed_db_size: u32,
+        returned_lease_pages: bool,
+    ) -> bool {
+        if !returned_lease_pages
+            && self.freed_pages.is_empty()
+            && self.allocated_from_freelist.is_empty()
+        {
+            return false;
+        }
+
+        self.freelist_metadata_dirty_with_inner(inner, committed_db_size)
+    }
+
+    #[must_use]
     fn freelist_metadata_dirty(&self) -> bool {
         self.inner.lock().map_or(true, |inner| {
             let committed_db_size = self.committed_db_size_with_inner(&inner);
@@ -8263,6 +8280,7 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         // Return any unused lease pages before computing committed db_size.
+        let returned_lease_pages = !self.page_lease.is_empty();
         return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
 
         let committed_db_size = self.committed_db_size_with_inner(&inner);
@@ -8275,7 +8293,11 @@ where
             //
             // Compute freelist_dirty BEFORE draining freed_pages, because
             // predicted_durable_freelist_pages_with_inner reads self.freed_pages.
-            let freelist_dirty = self.freelist_metadata_dirty_with_inner(&inner, committed_db_size);
+            let freelist_dirty = self.freelist_metadata_dirty_after_lease_return_with_inner(
+                &inner,
+                committed_db_size,
+                returned_lease_pages,
+            );
             // CRITICAL FIX (beads_rust#138): Do NOT push freed_pages into
             // inner.freelist during Phase A. In the split-lock WAL commit
             // path, inner.lock() is released between Phase A and Phase B.
@@ -8606,12 +8628,17 @@ where
             .inner
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+        let returned_lease_pages = !self.page_lease.is_empty();
         return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
         let mut committed_db_size = self.committed_db_size_with_inner(&inner);
         // Compute freelist_dirty BEFORE draining freed_pages, because
         // predicted_durable_freelist_pages_with_inner reads self.freed_pages.
-        let mut freelist_dirty_for_retain =
-            self.freelist_metadata_dirty_with_inner(&inner, committed_db_size);
+        let mut freelist_dirty_for_retain = self
+            .freelist_metadata_dirty_after_lease_return_with_inner(
+                &inner,
+                committed_db_size,
+                returned_lease_pages,
+            );
         let mut single_connection_fast_path = self.single_connection_fast_path_enabled();
         let mut metadata_only_single_connection_fast_path = single_connection_fast_path
             && !freelist_dirty_for_retain
@@ -19544,6 +19571,60 @@ mod tests {
         assert!(
             pending_conflict.contains(&page),
             "bead_id={BEAD_ID} case=concurrent_wal_growth_conflict_surface_keeps_real_data_page"
+        );
+    }
+
+    #[test]
+    fn test_freelist_dirty_after_lease_return_short_circuits_clean_append_growth() {
+        let (pager, _) = wal_pager();
+        let cx = Cx::new();
+        let mut txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let page = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, page, &[0x7D; 32]).unwrap();
+
+        let inner = txn.inner.lock().unwrap();
+        let committed_db_size = txn.committed_db_size_with_inner(&inner);
+
+        assert!(
+            !txn.freelist_metadata_dirty_after_lease_return_with_inner(
+                &inner,
+                committed_db_size,
+                false,
+            ),
+            "bead_id={BEAD_ID} case=clean_append_growth_has_no_freelist_metadata_delta"
+        );
+    }
+
+    #[test]
+    fn test_freelist_dirty_after_lease_return_keeps_durable_lease_holes() {
+        let (pager, _) = wal_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+        let mut txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let first_page = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, first_page, &vec![0x81; ps]).unwrap();
+        let second_page = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, second_page, &vec![0x82; ps]).unwrap();
+        let high_page = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, high_page, &vec![0x83; ps]).unwrap();
+
+        let returned_lease_pages = !txn.page_lease.is_empty();
+        assert!(
+            returned_lease_pages,
+            "bead_id={BEAD_ID} case=lease_hole_test_must_exercise_batched_allocator"
+        );
+        let inner_arc = Arc::clone(&txn.inner);
+        let mut inner = inner_arc.lock().unwrap();
+        return_pages_to_freelist(&mut inner.freelist, txn.page_lease.drain(..));
+        let committed_db_size = txn.committed_db_size_with_inner(&inner);
+
+        assert!(
+            txn.freelist_metadata_dirty_after_lease_return_with_inner(
+                &inner,
+                committed_db_size,
+                returned_lease_pages,
+            ),
+            "bead_id={BEAD_ID} case=returned_lease_holes_remain_durable_freelist_delta"
         );
     }
 

@@ -141,6 +141,26 @@ impl IdentifierInterner {
         self.values.insert(interned);
         inserted
     }
+
+    pub(crate) fn clear(&mut self) {
+        self.values.clear();
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let interned_value_bytes = self
+            .values
+            .iter()
+            .fold(0usize, |sum, value| sum.saturating_add(value.len()));
+        self.values
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Arc<str>>())
+            .saturating_add(interned_value_bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
 }
 
 /// SQL lexer that produces a stream of tokens from source text.

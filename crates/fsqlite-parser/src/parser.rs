@@ -140,6 +140,7 @@ impl StatementParseScratch {
     pub fn reset(&mut self) {
         self.tokens.clear();
         self.errors.clear();
+        self.identifier_interner.clear();
     }
 
     #[must_use]
@@ -162,6 +163,12 @@ impl StatementParseScratch {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<ParseError>()),
             )
+            .saturating_add(self.identifier_interner.retained_bytes())
+    }
+
+    #[cfg(test)]
+    fn identifier_interner_is_empty(&self) -> bool {
+        self.identifier_interner.is_empty()
     }
 }
 
@@ -2197,6 +2204,7 @@ fn parse_statements_with_scratch_inner(
     let (statements, errors) = parser.parse_all();
     scratch.tokens = parser.tokens;
     scratch.tokens.clear();
+    scratch.identifier_interner.clear();
     scratch.errors = errors;
     let first_error = scratch.errors.first().cloned();
     scratch.errors.clear();
@@ -8175,6 +8183,33 @@ mod tests {
             scratch.error_capacity(),
             warmed_error_capacity,
             "successful parse should preserve error scratch capacity for the next recovery path",
+        );
+    }
+
+    #[test]
+    fn test_parse_statements_with_scratch_releases_identifier_interns() {
+        let mut scratch = StatementParseScratch::default();
+        let mut sql = String::from("SELECT ");
+        for i in 0..32 {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("unique_identifier_{i} AS unique_alias_{i}"));
+        }
+        sql.push(';');
+
+        let statements = parse_statements_with_scratch(&sql, &mut scratch)
+            .expect("identifier-heavy statement should parse");
+        assert_eq!(statements.len(), 1);
+        assert!(
+            scratch.identifier_interner_is_empty(),
+            "identifier interns are statement-scoped and must not leak across parses",
+        );
+
+        scratch.reset();
+        assert!(
+            scratch.identifier_interner_is_empty(),
+            "explicit scratch reset should also keep the interner logically empty",
         );
     }
 

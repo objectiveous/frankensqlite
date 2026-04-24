@@ -5,7 +5,7 @@
 //! NEAR, column filter, caret), BM25 ranking, FTS5 virtual table with content
 //! modes, and secure-delete / contentless-delete configuration.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::ScalarFunction;
@@ -49,6 +49,7 @@ pub struct Fts5Config {
     secure_delete: bool,
     content_mode: ContentMode,
     contentless_delete: bool,
+    columnsize: bool,
 }
 
 impl Fts5Config {
@@ -58,6 +59,7 @@ impl Fts5Config {
             secure_delete: false,
             content_mode,
             contentless_delete: false,
+            columnsize: true,
         }
     }
 
@@ -69,6 +71,11 @@ impl Fts5Config {
     #[must_use]
     pub const fn contentless_delete_enabled(self) -> bool {
         self.contentless_delete
+    }
+
+    #[must_use]
+    pub const fn columnsize_enabled(self) -> bool {
+        self.columnsize
     }
 
     #[must_use]
@@ -133,6 +140,14 @@ fn parse_bool_like(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "on" | "true" => Some(true),
         "0" | "off" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_columnsize_option(value: &str) -> Option<bool> {
+    match value.trim() {
+        "0" => Some(false),
+        "1" => Some(true),
         _ => None,
     }
 }
@@ -1035,24 +1050,45 @@ pub struct Posting {
 }
 
 /// In-memory inverted index for FTS5.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct InvertedIndex {
     /// term -> list of postings
     index: HashMap<SmallText, PostingList>,
-    /// Total number of documents
-    doc_count: u64,
+    /// Set of rowids currently present in the index.
+    doc_ids: HashSet<i64>,
     /// Total token count per document (for BM25 avgdl)
-    doc_lengths: HashMap<i64, u32>,
+    doc_lengths: Option<HashMap<i64, u32>>,
+}
+
+impl Default for InvertedIndex {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InvertedIndex {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::with_column_sizes(true)
+    }
+
+    #[must_use]
+    pub fn with_column_sizes(track_column_sizes: bool) -> Self {
+        Self {
+            index: HashMap::new(),
+            doc_ids: HashSet::new(),
+            doc_lengths: track_column_sizes.then(HashMap::new),
+        }
+    }
+
+    #[must_use]
+    pub const fn tracks_column_sizes(&self) -> bool {
+        self.doc_lengths.is_some()
     }
 
     /// Index a document's tokens for a given column.
     pub fn add_document(&mut self, docid: i64, column: u32, tokens: &[Fts5Token]) {
+        self.doc_ids.insert(docid);
         // Build term -> positions map for this document+column.
         let mut term_positions: HashMap<&str, Positions> = HashMap::new();
         #[allow(clippy::cast_possible_truncation)]
@@ -1076,13 +1112,15 @@ impl InvertedIndex {
 
         #[allow(clippy::cast_possible_truncation)]
         let new_len = tokens.len() as u32;
-        *self.doc_lengths.entry(docid).or_insert(0) += new_len;
-        self.doc_count = u64::try_from(self.doc_lengths.len()).unwrap_or(u64::MAX);
+        if let Some(doc_lengths) = self.doc_lengths.as_mut() {
+            *doc_lengths.entry(docid).or_insert(0) += new_len;
+        }
     }
 
     /// Index a raw text value directly from a tokenizer, avoiding a temporary
     /// `Vec<Fts5Token>` on hot ingest paths.
     pub fn add_text(&mut self, docid: i64, column: u32, tokenizer: &dyn Fts5Tokenizer, text: &str) {
+        self.doc_ids.insert(docid);
         let mut token_count = 0_u32;
         tokenizer.visit_tokens(text, &mut |term, _start, _end, _| {
             let position = token_count;
@@ -1116,8 +1154,9 @@ impl InvertedIndex {
             }
         });
 
-        *self.doc_lengths.entry(docid).or_insert(0) += token_count;
-        self.doc_count = u64::try_from(self.doc_lengths.len()).unwrap_or(u64::MAX);
+        if let Some(doc_lengths) = self.doc_lengths.as_mut() {
+            *doc_lengths.entry(docid).or_insert(0) += token_count;
+        }
     }
 
     /// Remove a document from the index.
@@ -1125,8 +1164,10 @@ impl InvertedIndex {
         for postings in self.index.values_mut() {
             postings.retain(|p| p.docid != docid);
         }
-        self.doc_lengths.remove(&docid);
-        self.doc_count = u64::try_from(self.doc_lengths.len()).unwrap_or(u64::MAX);
+        self.doc_ids.remove(&docid);
+        if let Some(doc_lengths) = self.doc_lengths.as_mut() {
+            doc_lengths.remove(&docid);
+        }
     }
 
     /// Look up postings for a term.
@@ -1170,23 +1211,44 @@ impl InvertedIndex {
     /// Get total document count.
     #[must_use]
     pub fn total_docs(&self) -> u64 {
-        self.doc_count
+        u64::try_from(self.doc_ids.len()).unwrap_or(u64::MAX)
     }
 
     /// Get average document length.
     #[must_use]
     pub fn avg_doc_length(&self) -> f64 {
-        if self.doc_lengths.is_empty() {
+        if let Some(doc_lengths) = self.doc_lengths.as_ref() {
+            if doc_lengths.is_empty() {
+                return 0.0;
+            }
+            let total: u64 = doc_lengths.values().map(|v| u64::from(*v)).sum();
+            return total as f64 / doc_lengths.len() as f64;
+        }
+
+        if self.doc_ids.is_empty() {
             return 0.0;
         }
-        let total: u64 = self.doc_lengths.values().map(|v| u64::from(*v)).sum();
-        total as f64 / self.doc_lengths.len() as f64
+        let total: u64 = self
+            .doc_ids
+            .iter()
+            .map(|docid| u64::from(self.doc_length(*docid)))
+            .sum();
+        total as f64 / self.doc_ids.len() as f64
     }
 
     /// Get a specific document's length.
     #[must_use]
     pub fn doc_length(&self, docid: i64) -> u32 {
-        self.doc_lengths.get(&docid).copied().unwrap_or(0)
+        if let Some(doc_lengths) = self.doc_lengths.as_ref() {
+            return doc_lengths.get(&docid).copied().unwrap_or(0);
+        }
+
+        self.index
+            .values()
+            .flat_map(|postings| postings.iter())
+            .filter(|posting| posting.docid == docid)
+            .map(|posting| u32::try_from(posting.positions.len()).unwrap_or(u32::MAX))
+            .sum()
     }
 }
 
@@ -1731,7 +1793,7 @@ impl Fts5Table {
             columns,
             config: Fts5Config::default(),
             tokenizer_name: "unicode61".to_owned(),
-            index: InvertedIndex::new(),
+            index: InvertedIndex::with_column_sizes(true),
             documents: HashMap::new(),
             next_rowid: 1,
             txn_state: TransactionalVtabState::default(),
@@ -1824,11 +1886,7 @@ impl Fts5Table {
 
     /// Rebuild the in-memory index and rowid allocator from persisted rows.
     pub fn rebuild_documents(&mut self, rows: Vec<(i64, Vec<String>)>) {
-        self.index = InvertedIndex {
-            index: HashMap::new(),
-            doc_count: 0,
-            doc_lengths: HashMap::with_capacity(rows.len()),
-        };
+        self.index = InvertedIndex::with_column_sizes(self.config.columnsize_enabled());
         self.documents = HashMap::with_capacity(rows.len());
         self.next_rowid = 1;
         let tokenizer = create_tokenizer(&self.tokenizer_name)
@@ -1990,8 +2048,14 @@ impl VirtualTable for Fts5Table {
                         "contentless_delete" | "secure_delete" | "secure-delete" => {
                             let _ = config.apply_control_command(&format!("{key}={value}"));
                         }
+                        "columnsize" => {
+                            config.columnsize = parse_columnsize_option(value_unquoted.as_str())
+                                .ok_or_else(|| {
+                                    FrankenError::function_error("fts5: columnsize must be 0 or 1")
+                                })?;
+                        }
                         // Parsed for compatibility but not used in this in-memory path yet.
-                        "prefix" | "detail" | "columnsize" | "insttoken" => {}
+                        "prefix" | "detail" | "insttoken" => {}
                         _ => {
                             return Err(FrankenError::function_error(format!(
                                 "fts5: unsupported option '{key}'"
@@ -2030,6 +2094,7 @@ impl VirtualTable for Fts5Table {
         let mut table = Self::with_columns(columns);
         table.config = config;
         table.tokenizer_name = tokenizer_name;
+        table.index = InvertedIndex::with_column_sizes(table.config.columnsize_enabled());
         Ok(table)
     }
 
@@ -2105,6 +2170,13 @@ impl VirtualTable for Fts5Table {
             let rowid = if args.len() > 1 && !args[1].is_null() {
                 args[1].to_integer()
             } else {
+                if self.config.content_mode == ContentMode::Contentless
+                    && !self.config.columnsize_enabled()
+                {
+                    return Err(FrankenError::function_error(
+                        "fts5: contentless tables with columnsize=0 require an explicit rowid",
+                    ));
+                }
                 let r = self.next_rowid;
                 self.next_rowid += 1;
                 r
@@ -3149,6 +3221,7 @@ mod tests {
                 "tokenize='porter'",
                 "content=''",
                 "contentless_delete=1",
+                "columnsize=0",
             ],
         )
         .unwrap();
@@ -3156,6 +3229,8 @@ mod tests {
         assert_eq!(vtab.tokenizer_name, "porter");
         assert_eq!(vtab.config.content_mode(), ContentMode::Contentless);
         assert!(vtab.config.contentless_delete_enabled());
+        assert!(!vtab.config.columnsize_enabled());
+        assert!(!vtab.index().tracks_column_sizes());
     }
 
     #[test]
@@ -3164,6 +3239,14 @@ mod tests {
         let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "mystery=1"])
             .expect_err("unsupported option should fail");
         assert!(err.to_string().contains("unsupported option"));
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_invalid_columnsize() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "columnsize=2"])
+            .expect_err("invalid columnsize should fail");
+        assert!(err.to_string().contains("columnsize must be 0 or 1"));
     }
 
     #[test]
@@ -3405,11 +3488,32 @@ mod tests {
     }
 
     #[test]
+    fn test_doc_length_tracking_falls_back_when_columnsize_disabled() {
+        let mut index = InvertedIndex::with_column_sizes(false);
+        let tok = Unicode61Tokenizer::new();
+
+        index.add_document(1, 0, &tok.tokenize("one two"));
+        index.add_document(1, 1, &tok.tokenize("three"));
+        index.add_document(2, 0, &tok.tokenize("solo"));
+
+        assert!(!index.tracks_column_sizes());
+        assert_eq!(index.doc_length(1), 3);
+        assert_eq!(index.doc_length(2), 1);
+        assert!((index.avg_doc_length() - 2.0).abs() < f64::EPSILON);
+
+        index.remove_document(1);
+        assert_eq!(index.total_docs(), 1);
+        assert_eq!(index.doc_length(1), 0);
+        assert_eq!(index.doc_length(2), 1);
+    }
+
+    #[test]
     fn test_fts5_config_default() {
         let config = Fts5Config::default();
         assert_eq!(config.content_mode(), ContentMode::Stored);
         assert!(!config.secure_delete_enabled());
         assert!(!config.contentless_delete_enabled());
+        assert!(config.columnsize_enabled());
     }
 
     #[test]
@@ -4046,6 +4150,32 @@ mod tests {
 
         let result = vtab.update(&cx, &[SqliteValue::Integer(1)]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fts5_vtab_contentless_columnsize_zero_requires_explicit_rowid() {
+        let cx = Cx::new();
+        let mut vtab = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "t", "content", "content=''", "columnsize=0"],
+        )
+        .unwrap();
+
+        let result = vtab.update(
+            &cx,
+            &[
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Text(SmallText::from_string("contentless row")),
+            ],
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("require an explicit rowid")
+        );
     }
 
     #[test]

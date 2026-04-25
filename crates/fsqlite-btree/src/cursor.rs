@@ -7642,7 +7642,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use crate::instrumentation::btree_metrics_snapshot;
+    use crate::instrumentation::{btree_metrics_snapshot, set_btree_metrics_enabled};
     use fsqlite_pager::{MemoryMockMvccPager, MockMvccPager, MvccPager as _, TransactionMode};
     use fsqlite_types::SqliteValue;
     use fsqlite_types::record::serialize_record;
@@ -8462,6 +8462,10 @@ mod tests {
 
     #[test]
     fn test_btree_observability_operation_totals() {
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_btree_metrics_enabled(true);
         let before = btree_metrics_snapshot();
 
         let cx = Cx::new();
@@ -8474,6 +8478,7 @@ mod tests {
         cursor.delete(&cx).unwrap();
 
         let after = btree_metrics_snapshot();
+        set_btree_metrics_enabled(false);
         assert!(
             after.fsqlite_btree_operations_total.seek
                 >= before.fsqlite_btree_operations_total.seek.saturating_add(1)
@@ -8526,6 +8531,10 @@ mod tests {
 
     #[test]
     fn test_btree_observability_split_counter_and_depth_gauge() {
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_btree_metrics_enabled(true);
         let before = btree_metrics_snapshot();
 
         let cx = Cx::new();
@@ -8555,6 +8564,7 @@ mod tests {
         }
 
         let snapshot = btree_metrics_snapshot();
+        set_btree_metrics_enabled(false);
         assert!(
             snapshot.fsqlite_btree_page_splits_total > before.fsqlite_btree_page_splits_total,
             "expected at least one split when loading large rows"
@@ -12477,6 +12487,10 @@ mod tests {
         let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_btree_metrics_enabled(true);
         let cx = Cx::new();
         let root = pn(2);
         let store = MemPageStore::with_empty_table(root, USABLE);
@@ -12506,6 +12520,7 @@ mod tests {
             .expect("no-split insert should succeed");
 
         let snapshot = crate::instrumentation::btree_leaf_reuse_snapshot();
+        set_btree_metrics_enabled(false);
         assert!(
             cursor.pager.read_pages().is_empty(),
             "no-split insert should not re-read the current leaf"
@@ -12534,6 +12549,10 @@ mod tests {
         let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_btree_metrics_enabled(true);
         let cx = Cx::new();
         let root = pn(2);
         let store = MemPageStore::with_empty_index(root, USABLE);
@@ -12563,6 +12582,7 @@ mod tests {
             .expect("no-split index insert should succeed");
 
         let snapshot = crate::instrumentation::btree_leaf_reuse_snapshot();
+        set_btree_metrics_enabled(false);
         assert!(
             cursor.pager.read_pages().is_empty(),
             "no-split index insert should not re-read the current leaf"
@@ -12591,6 +12611,10 @@ mod tests {
         let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_btree_metrics_enabled(true);
         let cx = Cx::new();
         let root = pn(2);
         let store = MemPageStore::with_empty_table(root, USABLE);
@@ -12629,6 +12653,7 @@ mod tests {
             .expect("insert after delete should reuse the retained leaf state");
 
         let snapshot = crate::instrumentation::btree_leaf_reuse_snapshot();
+        set_btree_metrics_enabled(false);
         assert!(
             cursor.pager.read_pages().is_empty(),
             "insert-after-delete should not force a leaf reload on the retained leaf"
@@ -12657,6 +12682,10 @@ mod tests {
         let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_btree_metrics_enabled(true);
         const SMALL_USABLE: u32 = 256;
 
         let cx = Cx::new();
@@ -12709,6 +12738,7 @@ mod tests {
             .expect("fallback insert should still succeed via balance");
 
         let snapshot = crate::instrumentation::btree_leaf_reuse_snapshot();
+        set_btree_metrics_enabled(false);
         assert!(
             snapshot.conservative_reload_fallbacks
                 >= before.conservative_reload_fallbacks.saturating_add(1),

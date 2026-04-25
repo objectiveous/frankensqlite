@@ -148,6 +148,23 @@ impl BtreeOpRuntimeStats {
     }
 }
 
+// ── B-tree hot-path metrics gate (bd-perf cc_3 2026-04-25) ────────────────
+//
+// The per-cursor-op counters below (`record_operation`, `set_depth_gauge`,
+// `record_split_event`, `record_no_split_reuse_hit`,
+// `record_conservative_reload_fallback`, `record_page_header_rebuild`) are
+// consumed only by `fsqlite-e2e` profiling captures and a handful of
+// observability tests — production reads nothing here. Each unconditional
+// `fetch_add` / `store` on a shared static atomic is a cross-core cache-line
+// invalidation under MT load. Mirror the MVCC pattern (bc4fa6b5 / d2156302 /
+// 03c49886): default the gate off so the hot path pays one shared-cache
+// `AtomicBool::load(Relaxed)` instead of a `lock xadd` to a contended line.
+//
+// Callers flip the gate explicitly: `fsqlite-e2e/src/fsqlite_executor.rs`
+// when `HotPathMetricsCapture` is enabled, and tests that assert on these
+// counters before reading the snapshot.
+static FSQLITE_BTREE_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
+
 static BTREE_OP_SEEK_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BTREE_OP_INSERT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BTREE_OP_DELETE_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -235,7 +252,17 @@ fn saturating_add_bytes(counter: &AtomicU64, bytes: usize) {
     counter.fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
 }
 
+#[inline]
 pub(crate) fn record_operation(op_type: BtreeOpType) {
+    if !btree_metrics_enabled() {
+        return;
+    }
+    record_operation_cold(op_type);
+}
+
+#[cold]
+#[inline(never)]
+fn record_operation_cold(op_type: BtreeOpType) {
     let counter = match op_type {
         BtreeOpType::Seek => &BTREE_OP_SEEK_TOTAL,
         BtreeOpType::Insert => &BTREE_OP_INSERT_TOTAL,
@@ -246,6 +273,25 @@ pub(crate) fn record_operation(op_type: BtreeOpType) {
 
 pub fn set_btree_copy_profile_enabled(enabled: bool) {
     BTREE_COPY_PROFILE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Toggle the B-tree hot-path metrics gate.
+///
+/// When `false` (the default), `record_operation`, `set_depth_gauge`,
+/// `record_split_event`, `record_no_split_reuse_hit`,
+/// `record_conservative_reload_fallback`, and `record_page_header_rebuild`
+/// each early-exit on an `AtomicBool` load instead of paying a `fetch_add` /
+/// `store` on a contended global atomic. Diagnostic snapshots (`E2E
+/// `HotPathMetricsCapture`, observability tests) flip this on.
+pub fn set_btree_metrics_enabled(enabled: bool) {
+    FSQLITE_BTREE_METRICS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Read the B-tree hot-path metrics gate.
+#[inline]
+#[must_use]
+pub fn btree_metrics_enabled() -> bool {
+    FSQLITE_BTREE_METRICS_ENABLED.load(Ordering::Relaxed)
 }
 
 pub(crate) fn record_local_payload_copy(bytes: usize) {
@@ -302,15 +348,27 @@ pub(crate) fn record_interior_cell_rebuild(bytes: usize) {
     saturating_add_bytes(&BTREE_INTERIOR_CELL_REBUILD_BYTES, bytes);
 }
 
+#[inline]
 pub(crate) fn record_no_split_reuse_hit() {
+    if !btree_metrics_enabled() {
+        return;
+    }
     BTREE_NO_SPLIT_REUSE_HITS.fetch_add(1, Ordering::Relaxed);
 }
 
+#[inline]
 pub(crate) fn record_conservative_reload_fallback() {
+    if !btree_metrics_enabled() {
+        return;
+    }
     BTREE_CONSERVATIVE_RELOAD_FALLBACKS.fetch_add(1, Ordering::Relaxed);
 }
 
+#[inline]
 pub(crate) fn record_page_header_rebuild() {
+    if !btree_metrics_enabled() {
+        return;
+    }
     BTREE_PAGE_HEADER_REBUILD_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -374,11 +432,19 @@ pub(crate) fn record_nonroot_balance(start: Option<std::time::Instant>) {
     BTREE_NONROOT_BALANCE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
+#[inline]
 pub(crate) fn record_split_event() {
+    if !btree_metrics_enabled() {
+        return;
+    }
     BTREE_PAGE_SPLITS_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+#[inline]
 pub(crate) fn set_depth_gauge(depth: usize) {
+    if !btree_metrics_enabled() {
+        return;
+    }
     let depth_u64 = u64::try_from(depth).unwrap_or(u64::MAX);
     BTREE_DEPTH_GAUGE.store(depth_u64, Ordering::Relaxed);
 }
@@ -558,13 +624,24 @@ pub fn reset_btree_leaf_reuse_profile() {
 pub(crate) static LEAF_REUSE_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
+/// Serializes any test that flips `FSQLITE_BTREE_METRICS_ENABLED`.
+///
+/// The gate is process-global, so two parallel tests that flip it would race
+/// — one disabling the gate mid-run of another, causing the latter's expected
+/// counter advances to be lost. All tests that depend on a specific
+/// gate-on/gate-off state must hold this mutex for the full enable→work→read
+/// span.
+#[cfg(test)]
+pub(crate) static BTREE_METRICS_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
 #[cfg(test)]
 mod tests {
     use super::{
         BtreeOpType, btree_copy_profile_snapshot, btree_leaf_reuse_snapshot,
         btree_metrics_snapshot, record_conservative_reload_fallback, record_no_split_reuse_hit,
         record_operation, record_page_header_rebuild, reset_btree_copy_profile,
-        reset_btree_metrics, set_btree_copy_profile_enabled,
+        reset_btree_metrics, set_btree_copy_profile_enabled, set_btree_metrics_enabled,
     };
     use crate::{BtCursor, BtreeCursorOps, MemPageStore};
     use fsqlite_types::PageNumber;
@@ -576,12 +653,17 @@ mod tests {
 
     #[test]
     fn metrics_snapshot_tracks_operation_buckets() {
+        let _gate_guard = super::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_btree_metrics_enabled(true);
         let before = btree_metrics_snapshot();
         record_operation(BtreeOpType::Seek);
         record_operation(BtreeOpType::Seek);
         record_operation(BtreeOpType::Insert);
 
         let after = btree_metrics_snapshot();
+        set_btree_metrics_enabled(false);
         assert!(
             after.fsqlite_btree_operations_total.seek
                 >= before.fsqlite_btree_operations_total.seek.saturating_add(2)
@@ -696,6 +778,10 @@ mod tests {
         let _guard = super::LEAF_REUSE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _gate_guard = super::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_btree_metrics_enabled(true);
         let before = btree_leaf_reuse_snapshot();
 
         record_no_split_reuse_hit();
@@ -703,6 +789,7 @@ mod tests {
         record_page_header_rebuild();
 
         let after = btree_leaf_reuse_snapshot();
+        set_btree_metrics_enabled(false);
         assert!(
             after.no_split_reuse_hits >= before.no_split_reuse_hits.saturating_add(1),
             "no-split reuse counter should advance"
@@ -715,6 +802,78 @@ mod tests {
         assert!(
             after.page_header_rebuild_count >= before.page_header_rebuild_count.saturating_add(1),
             "page-header rebuild counter should advance"
+        );
+    }
+
+    /// Microbench: gate-off vs gate-on cost of `record_operation` and
+    /// `set_depth_gauge` — the two recorders that fire on every cursor op.
+    ///
+    /// Cross-core contention isn't exercised here (single thread), but the
+    /// per-call atomic fetch_add / store still costs ~5–10 ns even when the
+    /// counter isn't contended. With the gate off we expect a single
+    /// `AtomicBool::load(Relaxed)` per call (~1 ns).
+    ///
+    /// Run via:
+    /// ```text
+    /// cargo test -p fsqlite-btree --lib --release -- --ignored --nocapture \
+    ///   bench_btree_metrics_gate_per_op_cost
+    /// ```
+    /// Wrapper that prevents LLVM from hoisting the gate-load out of the
+    /// bench loop or folding away the body. `record_operation` is `#[inline]`
+    /// — without an inline boundary here the compiler sees a constant-folded
+    /// loop body and elides the work entirely.
+    #[inline(never)]
+    fn bench_record_op_pair(op: BtreeOpType, depth: usize) {
+        record_operation(op);
+        super::set_depth_gauge(depth);
+    }
+
+    #[test]
+    #[ignore = "microbench — run with --ignored --nocapture"]
+    fn bench_btree_metrics_gate_per_op_cost() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let _gate_guard = super::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        const ITERATIONS: u64 = 50_000_000;
+
+        // Gate-off path (default).
+        set_btree_metrics_enabled(false);
+        for _ in 0..100_000 {
+            bench_record_op_pair(black_box(BtreeOpType::Seek), black_box(3));
+        }
+        let off_start = Instant::now();
+        for _ in 0..ITERATIONS {
+            bench_record_op_pair(black_box(BtreeOpType::Seek), black_box(3));
+        }
+        let off_elapsed = off_start.elapsed();
+
+        // Gate-on path.
+        set_btree_metrics_enabled(true);
+        for _ in 0..100_000 {
+            bench_record_op_pair(black_box(BtreeOpType::Seek), black_box(3));
+        }
+        let on_start = Instant::now();
+        for _ in 0..ITERATIONS {
+            bench_record_op_pair(black_box(BtreeOpType::Seek), black_box(3));
+        }
+        let on_elapsed = on_start.elapsed();
+        set_btree_metrics_enabled(false);
+
+        let off_ns = off_elapsed.as_nanos() as f64 / ITERATIONS as f64;
+        let on_ns = on_elapsed.as_nanos() as f64 / ITERATIONS as f64;
+        println!(
+            "btree-metrics gate per-op (record_operation + set_depth_gauge): \
+             gate-off={off_ns:.2} ns/pair  gate-on={on_ns:.2} ns/pair  iterations={ITERATIONS}"
+        );
+        // Gate-off must be no slower than gate-on. An `AtomicBool::load(Relaxed)`
+        // is ~1 ns while the gated `fetch_add` + `store` cost ~5–10 ns even
+        // uncontended (and far more under multi-thread cache-line ping-pong).
+        assert!(
+            off_ns <= on_ns,
+            "gate-off ({off_ns:.2} ns) should not exceed gate-on ({on_ns:.2} ns)"
         );
     }
 }

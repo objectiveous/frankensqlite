@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 
 use fsqlite::{Connection, FrankenError};
 use fsqlite_btree::instrumentation::{
-    BtreeMetricsSnapshot, btree_metrics_snapshot, reset_btree_metrics,
+    BtreeMetricsSnapshot, btree_metrics_enabled, btree_metrics_snapshot, reset_btree_metrics,
+    set_btree_metrics_enabled,
 };
 use fsqlite_core::connection::{hot_path_profile_enabled, reset_hot_path_profile};
 use fsqlite_parser::parser::{parse_metrics_enabled, set_parse_metrics_enabled};
@@ -239,11 +240,13 @@ struct BatchOutcome {
     timing: BatchTiming,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 struct HotPathMetricsCapture {
     enabled: bool,
     prev_parse_metrics_enabled: bool,
     prev_vdbe_metrics_enabled: bool,
+    prev_btree_metrics_enabled: bool,
     vfs_before: VfsMetricsSnapshot,
     wal_before: WalTelemetrySnapshot,
 }
@@ -252,16 +255,19 @@ impl HotPathMetricsCapture {
     fn new(enabled: bool) -> Self {
         let prev_parse_metrics_enabled = parse_metrics_enabled();
         let prev_vdbe_metrics_enabled = vdbe_metrics_enabled();
+        let prev_btree_metrics_enabled = btree_metrics_enabled();
         let mut capture = Self {
             enabled,
             prev_parse_metrics_enabled,
             prev_vdbe_metrics_enabled,
+            prev_btree_metrics_enabled,
             vfs_before: GLOBAL_VFS_METRICS.snapshot(),
             wal_before: wal_telemetry_snapshot(),
         };
         if enabled {
             set_parse_metrics_enabled(true);
             set_vdbe_metrics_enabled(true);
+            set_btree_metrics_enabled(true);
             capture.reset();
         }
         capture
@@ -310,6 +316,7 @@ impl Drop for HotPathMetricsCapture {
     fn drop(&mut self) {
         set_parse_metrics_enabled(self.prev_parse_metrics_enabled);
         set_vdbe_metrics_enabled(self.prev_vdbe_metrics_enabled);
+        set_btree_metrics_enabled(self.prev_btree_metrics_enabled);
     }
 }
 

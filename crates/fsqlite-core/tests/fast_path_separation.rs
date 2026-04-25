@@ -1722,6 +1722,54 @@ fn test_fast_path_count_star_sum_sees_writes_after_repeated_overlay_reads()
         3,
         Some(fsqlite_types::SqliteValue::Integer(270)),
     );
+
+    let update = conn.prepare("UPDATE t SET score = ?2 WHERE id = ?1")?;
+    update.execute_with_params(&[
+        fsqlite_types::SqliteValue::Integer(4),
+        fsqlite_types::SqliteValue::Integer(400),
+    ])?;
+    let after_prepared_update = stmt.query_row()?;
+    let after_prepared_update_again = stmt.query_row()?;
+    assert_count_star_sum_row(
+        &after_prepared_update,
+        3,
+        Some(fsqlite_types::SqliteValue::Integer(630)),
+    );
+    assert_count_star_sum_row(
+        &after_prepared_update_again,
+        3,
+        Some(fsqlite_types::SqliteValue::Integer(630)),
+    );
+
+    let delete = conn.prepare("DELETE FROM t WHERE id = ?1")?;
+    delete.execute_with_params(&[fsqlite_types::SqliteValue::Integer(4)])?;
+    let after_prepared_delete = stmt.query_row()?;
+    let after_prepared_delete_again = stmt.query_row()?;
+    assert_count_star_sum_row(
+        &after_prepared_delete,
+        2,
+        Some(fsqlite_types::SqliteValue::Integer(230)),
+    );
+    assert_count_star_sum_row(
+        &after_prepared_delete_again,
+        2,
+        Some(fsqlite_types::SqliteValue::Integer(230)),
+    );
+
+    update.execute_with_params(&[
+        fsqlite_types::SqliteValue::Integer(2),
+        fsqlite_types::SqliteValue::Null,
+    ])?;
+    let after_null_update = stmt.query_row()?;
+    assert_count_star_sum_row(
+        &after_null_update,
+        2,
+        Some(fsqlite_types::SqliteValue::Integer(30)),
+    );
+
+    delete.execute_with_params(&[fsqlite_types::SqliteValue::Integer(3)])?;
+    let after_last_non_null_delete = stmt.query_row()?;
+    assert_count_star_sum_row(&after_last_non_null_delete, 1, None);
     Ok(())
 }
 

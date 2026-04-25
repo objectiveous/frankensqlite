@@ -422,6 +422,10 @@ impl CellRef {
         page_type: BtreePageType,
         usable_size: u32,
     ) -> Result<Self> {
+        if page_type == BtreePageType::LeafTable {
+            return Self::parse_leaf_table(page, cell_offset, usable_size);
+        }
+
         let mut pos = cell_offset;
 
         // Interior pages start with a 4-byte left child pointer.
@@ -526,6 +530,86 @@ impl CellRef {
         Ok(Self {
             left_child,
             rowid,
+            payload_size,
+            local_size,
+            payload_offset,
+            overflow_page,
+        })
+    }
+
+    #[inline]
+    fn parse_leaf_table(page: &[u8], cell_offset: usize, usable_size: u32) -> Result<Self> {
+        let (payload_size_raw, ps_len) =
+            read_varint(&page[cell_offset..]).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "truncated varint in cell (payload size)".to_owned(),
+            })?;
+        let payload_size =
+            u32::try_from(payload_size_raw).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: "cell payload size exceeds 32-bit range".to_owned(),
+            })?;
+        let rowid_start =
+            cell_offset
+                .checked_add(ps_len)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "cell offset overflow after payload size".to_owned(),
+                })?;
+        let (rowid_raw, rowid_len) =
+            read_varint(&page[rowid_start..]).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "truncated varint in table cell (rowid)".to_owned(),
+            })?;
+        let payload_offset =
+            rowid_start
+                .checked_add(rowid_len)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "cell payload offset overflow".to_owned(),
+                })?;
+
+        let max_local = usable_size.saturating_sub(35);
+        let local_size = if payload_size <= max_local {
+            payload_size
+        } else {
+            local_payload_size(payload_size, usable_size, BtreePageType::LeafTable)
+        };
+        let local_end = payload_offset
+            .checked_add(local_size as usize)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "cell payload offset overflow".to_owned(),
+            })?;
+        if local_end > page.len() || local_end > usable_size as usize {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "cell extends past usable page size (payload bytes)".to_owned(),
+            });
+        }
+
+        let overflow_page = if local_size < payload_size {
+            let overflow_ptr_offset = local_end;
+            if overflow_ptr_offset + 4 > page.len()
+                || overflow_ptr_offset + 4 > usable_size as usize
+            {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "cell extends past usable page size (overflow pointer)".to_owned(),
+                });
+            }
+            let pgno = u32::from_be_bytes([
+                page[overflow_ptr_offset],
+                page[overflow_ptr_offset + 1],
+                page[overflow_ptr_offset + 2],
+                page[overflow_ptr_offset + 3],
+            ]);
+            Some(
+                PageNumber::new(pgno).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "cell has zero overflow page pointer".to_owned(),
+                })?,
+            )
+        } else {
+            None
+        };
+
+        #[allow(clippy::cast_possible_wrap)]
+        let rowid = rowid_raw as i64;
+        Ok(Self {
+            left_child: None,
+            rowid: Some(rowid),
             payload_size,
             local_size,
             payload_offset,

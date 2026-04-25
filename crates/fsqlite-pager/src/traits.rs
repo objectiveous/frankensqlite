@@ -1304,8 +1304,30 @@ impl From<MemoryMockTransaction> for TransactionKind {
 impl sealed::Sealed for TransactionKind {}
 
 impl TransactionHandle for TransactionKind {
+    // `get_page` and `write_page_data` are the two TransactionKind dispatch
+    // sites that show up in MT8 self-time profiles (mt-mvcc-bench, 2026-04-24:
+    // 0.36% and 0.29% respectively). Routing them through `with_handle` /
+    // `with_handle_mut` coerces the concrete `&SimpleTransaction<V>` into
+    // `&dyn TransactionHandle` inside the closure — every call paid a vtable
+    // lookup. Inlining the match here lets LLVM see the concrete type and
+    // dispatch statically, which the rest of `with_handle`'s callers (cold or
+    // shape-uniform sites) don't need.
     fn get_page(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
-        self.with_handle(|txn| txn.get_page(cx, page_no))
+        match self {
+            Self::Memory(txn) => txn.get_page(cx, page_no),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(txn) => txn.get_page(cx, page_no),
+            #[cfg(unix)]
+            Self::Unix(txn) => txn.get_page(cx, page_no),
+            #[cfg(target_os = "windows")]
+            Self::Windows(txn) => txn.get_page(cx, page_no),
+            Self::Mock(txn) => txn.get_page(cx, page_no),
+            Self::MemoryMock(txn) => txn.get_page(cx, page_no),
+            Self::Drained => panic!(
+                "BUG: TransactionKind::Drained accessed in get_page — a retained \
+                 cursor tried to read pages while the transaction was extracted."
+            ),
+        }
     }
 
     fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
@@ -1317,7 +1339,22 @@ impl TransactionHandle for TransactionKind {
     }
 
     fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
-        self.with_handle_mut(|txn| txn.write_page_data(cx, page_no, data))
+        match self {
+            Self::Memory(txn) => txn.write_page_data(cx, page_no, data),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(txn) => txn.write_page_data(cx, page_no, data),
+            #[cfg(unix)]
+            Self::Unix(txn) => txn.write_page_data(cx, page_no, data),
+            #[cfg(target_os = "windows")]
+            Self::Windows(txn) => txn.write_page_data(cx, page_no, data),
+            Self::Mock(txn) => txn.write_page_data(cx, page_no, data),
+            Self::MemoryMock(txn) => txn.write_page_data(cx, page_no, data),
+            Self::Drained => panic!(
+                "BUG: TransactionKind::Drained accessed in write_page_data — a \
+                 retained cursor tried to write pages while the transaction was \
+                 extracted."
+            ),
+        }
     }
 
     fn try_mutate_staged_page_data(

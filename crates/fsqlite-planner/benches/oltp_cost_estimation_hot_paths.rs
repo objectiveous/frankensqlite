@@ -1,10 +1,9 @@
 //! Planner-only cost-estimation microbench for the mixed-OLTP statement shapes
 //! used by `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`.
 //!
-//! This intentionally measures the planner seam before `fsqlite-core`
-//! post-processes `INTEGER PRIMARY KEY` equality and range predicates into
-//! rowid fast paths. The goal is to show what the planner crate itself spends
-//! time doing for the OLTP statement mix, not the later VDBE/runtime upgrades.
+//! This measures the schema-aware planner seam for `INTEGER PRIMARY KEY`
+//! equality predicates. Range predicates use no-index range probes until the
+//! planner grows an explicit rowid-range access-path representation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -13,8 +12,9 @@ use std::time::Instant;
 
 use fsqlite_ast::{BinaryOp as AstBinaryOp, ColumnRef, Expr, Literal, Span};
 use fsqlite_planner::{
-    AccessPath, StatsSource, TableStats, WhereTerm, best_access_path, classify_where_term,
-    cost_metrics_snapshot, reset_cost_metrics, snapshot_index_selection_totals,
+    AccessPath, RowidAliasHint, StatsSource, TableStats, WhereTerm,
+    best_access_path_with_rowid_alias_hints, classify_where_term, cost_metrics_snapshot,
+    reset_cost_metrics, snapshot_index_selection_totals,
 };
 
 const DEFAULT_ITERATIONS: u64 = 2_000_000;
@@ -131,10 +131,17 @@ fn capture_result(
 fn run_shape(iterations: u64, terms: &[WhereTerm<'_>]) -> BenchResult {
     reset_cost_metrics();
     let table = planner_table_stats();
+    let rowid_alias_hints = [RowidAliasHint::new("id")];
     let selection_before = snapshot_index_selection_totals();
     let start = Instant::now();
     for _ in 0..iterations {
-        let access_path: AccessPath = best_access_path(black_box(&table), &[], terms, None);
+        let access_path: AccessPath = best_access_path_with_rowid_alias_hints(
+            black_box(&table),
+            &[],
+            terms,
+            None,
+            &rowid_alias_hints,
+        );
         black_box(access_path);
     }
     capture_result(start, iterations, 0, &selection_before)
@@ -143,6 +150,7 @@ fn run_shape(iterations: u64, terms: &[WhereTerm<'_>]) -> BenchResult {
 fn run_mixed_compile_mix(iterations: u64) -> BenchResult {
     reset_cost_metrics();
     let table = planner_table_stats();
+    let rowid_alias_hints = [RowidAliasHint::new("id")];
     let point_terms = [eq_term("id", 1)];
     let range_terms = [ge_term("id", 100), lt_term("id", 150)];
     let empty_terms: [WhereTerm<'static>; 0] = [];
@@ -174,7 +182,13 @@ fn run_mixed_compile_mix(iterations: u64) -> BenchResult {
         };
 
         planner_ops += 1;
-        let access_path: AccessPath = best_access_path(black_box(&table), &[], terms, None);
+        let access_path: AccessPath = best_access_path_with_rowid_alias_hints(
+            black_box(&table),
+            &[],
+            terms,
+            None,
+            &rowid_alias_hints,
+        );
         black_box(access_path);
     }
 

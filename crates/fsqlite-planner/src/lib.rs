@@ -459,6 +459,50 @@ pub struct IndexInfo {
     pub expression_columns: Vec<Expr>,
 }
 
+/// Schema hint that a visible table column is an alias for SQLite's hidden
+/// rowid, as with `INTEGER PRIMARY KEY`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowidAliasHint {
+    /// Optional table name or query alias qualifier accepted for the column.
+    pub qualifier: Option<String>,
+    /// Visible column name that aliases the rowid.
+    pub column: String,
+}
+
+impl RowidAliasHint {
+    /// Build an unqualified rowid-alias hint for a table-local column.
+    #[must_use]
+    pub fn new(column: impl Into<String>) -> Self {
+        Self {
+            qualifier: None,
+            column: column.into(),
+        }
+    }
+
+    /// Build a rowid-alias hint for a specific table name or query alias.
+    #[must_use]
+    pub fn qualified(qualifier: impl Into<String>, column: impl Into<String>) -> Self {
+        Self {
+            qualifier: Some(qualifier.into()),
+            column: column.into(),
+        }
+    }
+
+    fn matches_column(&self, table_name: &str, column: &WhereColumn) -> bool {
+        if !column.column.eq_ignore_ascii_case(&self.column) {
+            return false;
+        }
+
+        match (column.table.as_deref(), self.qualifier.as_deref()) {
+            (None, _) => true,
+            (Some(column_qualifier), Some(hint_qualifier)) => {
+                column_qualifier.eq_ignore_ascii_case(hint_qualifier)
+            }
+            (Some(column_qualifier), None) => column_qualifier.eq_ignore_ascii_case(table_name),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Access path types
 // ---------------------------------------------------------------------------
@@ -511,7 +555,7 @@ pub struct AccessPath {
     pub table: String,
     /// Kind of scan.
     pub kind: AccessPathKind,
-    /// Index used (None for full table scan / rowid lookup).
+    /// Index used (None for full table scan / rowid lookup / rowid range).
     pub index: Option<String>,
     /// Estimated cost in page reads.
     pub estimated_cost: f64,
@@ -1563,6 +1607,32 @@ pub fn best_access_path(
     best_access_path_with_hints(table, indexes, where_terms, needed_columns, None, None)
 }
 
+/// Build the cheapest [`AccessPath`] while recognizing schema-provided rowid
+/// alias columns such as `id INTEGER PRIMARY KEY`.
+///
+/// Existing callers that do not have schema metadata should use
+/// [`best_access_path`]. Schema-aware callers can pass table-local
+/// [`RowidAliasHint`] values so predicates like `id = ?1` are costed as
+/// [`AccessPathKind::RowidLookup`] without mutating the classified WHERE terms.
+#[must_use]
+pub fn best_access_path_with_rowid_alias_hints(
+    table: &TableStats,
+    indexes: &[IndexInfo],
+    where_terms: &[WhereTerm<'_>],
+    needed_columns: Option<&[String]>,
+    rowid_alias_hints: &[RowidAliasHint],
+) -> AccessPath {
+    best_access_path_internal(
+        table,
+        indexes,
+        where_terms,
+        needed_columns,
+        None,
+        None,
+        rowid_alias_hints,
+    )
+}
+
 /// Build the cheapest [`AccessPath`] while applying explicit index hints and
 /// optional adaptive cracking hint reuse.
 #[must_use]
@@ -1586,6 +1656,7 @@ pub fn best_access_path_with_hints(
         needed_columns,
         index_hint,
         adaptive_preferred_index.as_deref(),
+        &[],
     );
 
     if let Some(store) = cracking_hints {
@@ -1597,7 +1668,7 @@ pub fn best_access_path_with_hints(
 
 /// Build the cheapest [`AccessPath`] with optional explicit and adaptive hints.
 #[must_use]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn best_access_path_internal(
     table: &TableStats,
     indexes: &[IndexInfo],
@@ -1605,6 +1676,7 @@ fn best_access_path_internal(
     needed_columns: Option<&[String]>,
     index_hint: Option<&IndexHint>,
     adaptive_preferred_index: Option<&str>,
+    rowid_alias_hints: &[RowidAliasHint],
 ) -> AccessPath {
     let started = std::time::Instant::now();
     let explicit_indexed_by = match index_hint {
@@ -1612,24 +1684,59 @@ fn best_access_path_internal(
         _ => None,
     };
     let not_indexed = matches!(index_hint, Some(IndexHint::NotIndexed));
+    let rowid_equality_candidate =
+        find_rowid_equality_term(&table.name, where_terms, rowid_alias_hints).is_some();
+    let rowid_range_candidate =
+        find_rowid_range_column(&table.name, where_terms, rowid_alias_hints).is_some();
 
-    let mut best = AccessPath {
-        table: table.name.clone(),
-        kind: AccessPathKind::FullTableScan,
-        index: None,
-        estimated_cost: if explicit_indexed_by.is_some() {
-            f64::INFINITY
-        } else {
-            estimate_cost_ext(
+    let mut best = if explicit_indexed_by.is_some() {
+        AccessPath {
+            table: table.name.clone(),
+            kind: AccessPathKind::FullTableScan,
+            index: None,
+            estimated_cost: f64::INFINITY,
+            estimated_rows: table.n_rows as f64,
+            time_travel: None,
+            probe: None,
+        }
+    } else if !not_indexed && rowid_equality_candidate {
+        let kind = AccessPathKind::RowidLookup;
+        AccessPath {
+            table: table.name.clone(),
+            estimated_cost: estimate_cost_ext(&kind, table.n_pages, 0, table.n_rows),
+            kind,
+            index: None,
+            estimated_rows: 1.0,
+            time_travel: None,
+            probe: None,
+        }
+    } else if !not_indexed && rowid_range_candidate {
+        let selectivity = DEFAULT_RANGE_SELECTIVITY;
+        let kind = AccessPathKind::IndexScanRange { selectivity };
+        AccessPath {
+            table: table.name.clone(),
+            estimated_cost: estimate_cost_ext(&kind, table.n_pages, 0, table.n_rows),
+            kind,
+            index: None,
+            estimated_rows: (table.n_rows as f64 * selectivity).max(1.0),
+            time_travel: None,
+            probe: None,
+        }
+    } else {
+        AccessPath {
+            table: table.name.clone(),
+            kind: AccessPathKind::FullTableScan,
+            index: None,
+            estimated_cost: estimate_cost_ext(
                 &AccessPathKind::FullTableScan,
                 table.n_pages,
                 0,
                 table.n_rows,
-            )
-        },
-        estimated_rows: table.n_rows as f64,
-        time_travel: None,
-        probe: None,
+            ),
+            estimated_rows: table.n_rows as f64,
+            time_travel: None,
+            probe: None,
+        }
     };
 
     let mut candidates_considered: usize = 0;
@@ -1851,23 +1958,6 @@ fn best_access_path_internal(
         }
     }
 
-    // Check rowid lookup.
-    if !not_indexed && explicit_indexed_by.is_none() && has_rowid_equality(where_terms) {
-        let kind = AccessPathKind::RowidLookup;
-        let cost = estimate_cost_ext(&kind, table.n_pages, 0, table.n_rows);
-        if cost < best.estimated_cost {
-            best = AccessPath {
-                table: table.name.clone(),
-                kind,
-                index: None,
-                estimated_cost: cost,
-                estimated_rows: 1.0,
-                time_travel: None,
-                probe: None,
-            };
-        }
-    }
-
     if !best.estimated_cost.is_finite() {
         best = AccessPath {
             table: table.name.clone(),
@@ -1885,7 +1975,12 @@ fn best_access_path_internal(
         };
     }
 
-    best.probe = extract_access_path_probe(&best, indexes, where_terms);
+    best.probe = extract_access_path_probe_with_rowid_aliases(
+        &best,
+        indexes,
+        where_terms,
+        rowid_alias_hints,
+    );
 
     let chosen_index = best.index.as_deref().unwrap_or("(none)");
     let selectivity = match &best.kind {
@@ -2566,11 +2661,57 @@ fn is_rowid_column(wc: &WhereColumn) -> bool {
     is_rowid_alias_name(&wc.column)
 }
 
-/// Check if any WHERE term has a rowid equality constraint.
-fn has_rowid_equality(terms: &[WhereTerm<'_>]) -> bool {
+fn where_term_matches_rowid_equality(
+    table_name: &str,
+    term: &WhereTerm<'_>,
+    rowid_alias_hints: &[RowidAliasHint],
+) -> bool {
+    if matches!(term.kind, WhereTermKind::RowidEquality) {
+        return true;
+    }
+
+    matches!(term.kind, WhereTermKind::Equality)
+        && term.column.as_ref().is_some_and(|column| {
+            rowid_alias_hints
+                .iter()
+                .any(|hint| hint.matches_column(table_name, column))
+        })
+}
+
+fn where_term_matches_rowid_range(
+    table_name: &str,
+    term: &WhereTerm<'_>,
+    rowid_alias_hints: &[RowidAliasHint],
+) -> bool {
+    matches!(term.kind, WhereTermKind::Range | WhereTermKind::Between)
+        && term.column.as_ref().is_some_and(|column| {
+            is_rowid_column(column)
+                || rowid_alias_hints
+                    .iter()
+                    .any(|hint| hint.matches_column(table_name, column))
+        })
+}
+
+fn find_rowid_equality_term<'terms, 'expr>(
+    table_name: &str,
+    terms: &'terms [WhereTerm<'expr>],
+    rowid_alias_hints: &[RowidAliasHint],
+) -> Option<&'terms WhereTerm<'expr>> {
     terms
         .iter()
-        .any(|t| matches!(t.kind, WhereTermKind::RowidEquality))
+        .find(|term| where_term_matches_rowid_equality(table_name, term, rowid_alias_hints))
+}
+
+fn find_rowid_range_column(
+    table_name: &str,
+    terms: &[WhereTerm<'_>],
+    rowid_alias_hints: &[RowidAliasHint],
+) -> Option<String> {
+    terms.iter().find_map(|term| {
+        where_term_matches_rowid_range(table_name, term, rowid_alias_hints)
+            .then(|| term.column.as_ref().map(|column| column.column.clone()))
+            .flatten()
+    })
 }
 
 /// Extract the non-column side of a binary comparison expression.
@@ -2590,17 +2731,16 @@ fn extract_comparison_operand(expr: &Expr) -> Option<Expr> {
 /// Given a finalized [`AccessPath`] and the WHERE terms that produced it,
 /// extract probe expressions so downstream consumers do not re-parse the
 /// WHERE clause.
-fn extract_access_path_probe(
+fn extract_access_path_probe_with_rowid_aliases(
     best: &AccessPath,
     indexes: &[IndexInfo],
     where_terms: &[WhereTerm<'_>],
+    rowid_alias_hints: &[RowidAliasHint],
 ) -> Option<AccessPathProbe> {
     match &best.kind {
         AccessPathKind::FullTableScan => None,
         AccessPathKind::RowidLookup => {
-            let term = where_terms
-                .iter()
-                .find(|t| matches!(t.kind, WhereTermKind::RowidEquality))?;
+            let term = find_rowid_equality_term(&best.table, where_terms, rowid_alias_hints)?;
             let target = extract_comparison_operand(term.expr)?;
             Some(AccessPathProbe::RowidEquality {
                 target: Box::new(target),
@@ -2635,110 +2775,122 @@ fn extract_access_path_probe(
             None
         }
         AccessPathKind::IndexScanRange { .. } | AccessPathKind::CoveringIndexScan { .. } => {
+            if best.index.is_none() {
+                let leading_col =
+                    find_rowid_range_column(&best.table, where_terms, rowid_alias_hints)?;
+                return extract_range_probe_for_column(where_terms, &leading_col);
+            }
             let index_name = best.index.as_deref()?;
             let idx = indexes
                 .iter()
                 .find(|i| i.name.eq_ignore_ascii_case(index_name))?;
             let leading_col = idx.columns.first()?;
-            let mut lower: Option<(Box<Expr>, bool)> = None;
-            let mut upper: Option<(Box<Expr>, bool)> = None;
-            for term in where_terms {
-                let col = match &term.column {
-                    Some(c) if c.column.eq_ignore_ascii_case(leading_col) => c,
-                    _ => continue,
-                };
-                if matches!(term.kind, WhereTermKind::Equality) {
-                    let target = extract_comparison_operand(term.expr)?;
-                    return Some(AccessPathProbe::Equality {
-                        column: col.column.clone(),
-                        target: Box::new(target),
-                    });
-                }
-                if let WhereTermKind::LikePrefix {
-                    prefix,
-                    upper_bound,
-                } = &term.kind
-                {
-                    let lo = Expr::Literal(Literal::String(prefix.clone()), Span::ZERO);
-                    let lo_bound = Some((Box::new(lo), true));
-                    let hi_bound = upper_bound.as_ref().map(|ub| {
-                        (
-                            Box::new(Expr::Literal(Literal::String(ub.clone()), Span::ZERO)),
-                            false,
-                        )
-                    });
+            extract_range_probe_for_column(where_terms, leading_col)
+        }
+    }
+}
+
+fn extract_range_probe_for_column(
+    where_terms: &[WhereTerm<'_>],
+    leading_col: &str,
+) -> Option<AccessPathProbe> {
+    let mut lower: Option<(Box<Expr>, bool)> = None;
+    let mut upper: Option<(Box<Expr>, bool)> = None;
+    for term in where_terms {
+        let col = match &term.column {
+            Some(c) if c.column.eq_ignore_ascii_case(leading_col) => c,
+            _ => continue,
+        };
+        if matches!(term.kind, WhereTermKind::Equality) {
+            let target = extract_comparison_operand(term.expr)?;
+            return Some(AccessPathProbe::Equality {
+                column: col.column.clone(),
+                target: Box::new(target),
+            });
+        }
+        if let WhereTermKind::LikePrefix {
+            prefix,
+            upper_bound,
+        } = &term.kind
+        {
+            let lo = Expr::Literal(Literal::String(prefix.clone()), Span::ZERO);
+            let lo_bound = Some((Box::new(lo), true));
+            let hi_bound = upper_bound.as_ref().map(|ub| {
+                (
+                    Box::new(Expr::Literal(Literal::String(ub.clone()), Span::ZERO)),
+                    false,
+                )
+            });
+            return Some(AccessPathProbe::Range {
+                column: col.column.clone(),
+                lower: lo_bound,
+                upper: hi_bound,
+            });
+        }
+        if matches!(term.kind, WhereTermKind::Between) {
+            if let Expr::Between { low, high, not, .. } = term.expr {
+                if !not {
                     return Some(AccessPathProbe::Range {
                         column: col.column.clone(),
-                        lower: lo_bound,
-                        upper: hi_bound,
+                        lower: Some((Box::new(low.as_ref().clone()), true)),
+                        upper: Some((Box::new(high.as_ref().clone()), true)),
                     });
                 }
-                if matches!(term.kind, WhereTermKind::Between) {
-                    if let Expr::Between { low, high, not, .. } = term.expr {
-                        if !not {
-                            return Some(AccessPathProbe::Range {
-                                column: col.column.clone(),
-                                lower: Some((Box::new(low.as_ref().clone()), true)),
-                                upper: Some((Box::new(high.as_ref().clone()), true)),
-                            });
-                        }
-                    }
-                }
-                if !matches!(term.kind, WhereTermKind::Range) {
-                    continue;
-                }
-                if let Expr::BinaryOp {
-                    left, op, right, ..
-                } = term.expr
-                {
-                    let col_on_left = extract_where_column(left).is_some();
-                    match op {
-                        AstBinaryOp::Gt => {
-                            let val = if col_on_left { right } else { left };
-                            if col_on_left {
-                                lower = Some((Box::new(val.as_ref().clone()), false));
-                            } else {
-                                upper = Some((Box::new(val.as_ref().clone()), false));
-                            }
-                        }
-                        AstBinaryOp::Ge => {
-                            let val = if col_on_left { right } else { left };
-                            if col_on_left {
-                                lower = Some((Box::new(val.as_ref().clone()), true));
-                            } else {
-                                upper = Some((Box::new(val.as_ref().clone()), true));
-                            }
-                        }
-                        AstBinaryOp::Lt => {
-                            let val = if col_on_left { right } else { left };
-                            if col_on_left {
-                                upper = Some((Box::new(val.as_ref().clone()), false));
-                            } else {
-                                lower = Some((Box::new(val.as_ref().clone()), false));
-                            }
-                        }
-                        AstBinaryOp::Le => {
-                            let val = if col_on_left { right } else { left };
-                            if col_on_left {
-                                upper = Some((Box::new(val.as_ref().clone()), true));
-                            } else {
-                                lower = Some((Box::new(val.as_ref().clone()), true));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if lower.is_some() || upper.is_some() {
-                Some(AccessPathProbe::Range {
-                    column: leading_col.clone(),
-                    lower,
-                    upper,
-                })
-            } else {
-                None
             }
         }
+        if !matches!(term.kind, WhereTermKind::Range) {
+            continue;
+        }
+        if let Expr::BinaryOp {
+            left, op, right, ..
+        } = term.expr
+        {
+            let col_on_left = extract_where_column(left).is_some();
+            match op {
+                AstBinaryOp::Gt => {
+                    let val = if col_on_left { right } else { left };
+                    if col_on_left {
+                        lower = Some((Box::new(val.as_ref().clone()), false));
+                    } else {
+                        upper = Some((Box::new(val.as_ref().clone()), false));
+                    }
+                }
+                AstBinaryOp::Ge => {
+                    let val = if col_on_left { right } else { left };
+                    if col_on_left {
+                        lower = Some((Box::new(val.as_ref().clone()), true));
+                    } else {
+                        upper = Some((Box::new(val.as_ref().clone()), true));
+                    }
+                }
+                AstBinaryOp::Lt => {
+                    let val = if col_on_left { right } else { left };
+                    if col_on_left {
+                        upper = Some((Box::new(val.as_ref().clone()), false));
+                    } else {
+                        lower = Some((Box::new(val.as_ref().clone()), false));
+                    }
+                }
+                AstBinaryOp::Le => {
+                    let val = if col_on_left { right } else { left };
+                    if col_on_left {
+                        upper = Some((Box::new(val.as_ref().clone()), true));
+                    } else {
+                        lower = Some((Box::new(val.as_ref().clone()), true));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if lower.is_some() || upper.is_some() {
+        Some(AccessPathProbe::Range {
+            column: leading_col.to_owned(),
+            lower,
+            upper,
+        })
+    } else {
+        None
     }
 }
 
@@ -3946,6 +4098,7 @@ fn join_access_path(
         needed_columns,
         explicit_hint,
         adaptive_hint,
+        &[],
     )
 }
 
@@ -7252,6 +7405,56 @@ mod tests {
     }
 
     #[test]
+    fn test_best_access_path_ipk_alias_hint_uses_rowid_lookup() {
+        let table = table_stats("bench", 128, 5000);
+        let hints = [RowidAliasHint::new("id")];
+
+        let point =
+            best_access_path_with_rowid_alias_hints(&table, &[], &[eq_term("id")], None, &hints);
+
+        assert!(matches!(point.kind, AccessPathKind::RowidLookup));
+        assert_eq!(point.estimated_rows, 1.0);
+        assert!(matches!(
+            &point.probe,
+            Some(AccessPathProbe::RowidEquality { target })
+                if **target == Expr::Literal(Literal::Integer(1), Span::ZERO)
+        ));
+
+        let range =
+            best_access_path_with_rowid_alias_hints(&table, &[], &[range_term("id")], None, &hints);
+        assert!(matches!(range.kind, AccessPathKind::IndexScanRange { .. }));
+        assert!(range.index.is_none());
+        assert!(matches!(
+            &range.probe,
+            Some(AccessPathProbe::Range {
+                column,
+                lower: Some(_),
+                ..
+            }) if column == "id"
+        ));
+    }
+
+    #[test]
+    fn test_best_access_path_ipk_alias_hint_respects_qualifier() {
+        let table = table_stats("bench", 128, 5000);
+        let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::qualified("b", "id"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(7), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let terms = [classify_where_term(expr)];
+
+        let table_only = [RowidAliasHint::new("id")];
+        let miss = best_access_path_with_rowid_alias_hints(&table, &[], &terms, None, &table_only);
+        assert!(matches!(miss.kind, AccessPathKind::FullTableScan));
+
+        let qualified = [RowidAliasHint::qualified("b", "id")];
+        let hit = best_access_path_with_rowid_alias_hints(&table, &[], &terms, None, &qualified);
+        assert!(matches!(hit.kind, AccessPathKind::RowidLookup));
+    }
+
+    #[test]
     fn test_analyze_stats_override() {
         // With ANALYZE stats, the source is recorded.
         let table = TableStats {
@@ -10062,7 +10265,7 @@ mod probe_tests {
             time_travel: None,
             probe: None,
         };
-        let probe = extract_access_path_probe(&ap, &[], &terms);
+        let probe = extract_access_path_probe_with_rowid_aliases(&ap, &[], &terms, &[]);
         assert!(
             matches!(&probe, Some(AccessPathProbe::RowidEquality { target }) if **target == Expr::Literal(Literal::Integer(42), Span::ZERO))
         );
@@ -10098,7 +10301,7 @@ mod probe_tests {
             time_travel: None,
             probe: None,
         };
-        let probe = extract_access_path_probe(&ap, &indexes, &terms);
+        let probe = extract_access_path_probe_with_rowid_aliases(&ap, &indexes, &terms, &[]);
         match &probe {
             Some(AccessPathProbe::Equality { column, target }) => {
                 assert_eq!(column, "name");
@@ -10159,7 +10362,7 @@ mod probe_tests {
             time_travel: None,
             probe: None,
         };
-        let probe = extract_access_path_probe(&ap, &indexes, &terms);
+        let probe = extract_access_path_probe_with_rowid_aliases(&ap, &indexes, &terms, &[]);
         match &probe {
             Some(AccessPathProbe::Range {
                 column,
@@ -10217,7 +10420,7 @@ mod probe_tests {
             time_travel: None,
             probe: None,
         };
-        let probe = extract_access_path_probe(&ap, &indexes, &terms);
+        let probe = extract_access_path_probe_with_rowid_aliases(&ap, &indexes, &terms, &[]);
         match &probe {
             Some(AccessPathProbe::InList { column, values }) => {
                 assert_eq!(column, "status");
@@ -10278,7 +10481,7 @@ mod probe_tests {
             time_travel: None,
             probe: None,
         };
-        let probe = extract_access_path_probe(&ap, &indexes, &terms);
+        let probe = extract_access_path_probe_with_rowid_aliases(&ap, &indexes, &terms, &[]);
         assert!(
             matches!(&probe, Some(AccessPathProbe::Equality { .. })),
             "equality should be preferred when both equality and IN terms exist"
@@ -10328,7 +10531,7 @@ mod probe_tests {
             time_travel: None,
             probe: None,
         };
-        let probe = extract_access_path_probe(&ap, &indexes, &terms);
+        let probe = extract_access_path_probe_with_rowid_aliases(&ap, &indexes, &terms, &[]);
         match &probe {
             Some(AccessPathProbe::Range {
                 column,
@@ -10364,7 +10567,7 @@ mod probe_tests {
             time_travel: None,
             probe: None,
         };
-        assert!(extract_access_path_probe(&ap, &[], &[]).is_none());
+        assert!(extract_access_path_probe_with_rowid_aliases(&ap, &[], &[], &[]).is_none());
     }
 
     #[test]
@@ -10403,7 +10606,7 @@ mod probe_tests {
             time_travel: None,
             probe: None,
         };
-        let probe = extract_access_path_probe(&ap, &indexes, &terms);
+        let probe = extract_access_path_probe_with_rowid_aliases(&ap, &indexes, &terms, &[]);
         match &probe {
             Some(AccessPathProbe::Range {
                 column,

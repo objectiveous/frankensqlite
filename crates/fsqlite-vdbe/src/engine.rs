@@ -11888,6 +11888,32 @@ impl VdbeEngine {
                 }
                 Ok(true)
             }
+            // IfNot is the canonical falsy-branch jump: emitted ~48
+            // production sites driving CASE/COALESCE WHEN-fallthrough,
+            // AND-short-circuit, LIMIT-zero detection, HAVING-skip,
+            // and the second arm of every truthiness probe.  Same
+            // family as the already-promoted IsNull/IfPos/DecrJumpZero
+            // — small body, high call frequency, dispatch routing
+            // cost dominates work cost.  Body mirrors the existing
+            // main-match arm verbatim, including the C-SQLite
+            // null-as-jump-iff-p3 semantics.
+            Opcode::IfNot => {
+                let val = self.get_reg(op.p1);
+                let should_jump = if val.is_null() {
+                    op.p3 != 0
+                } else {
+                    !vdbe_real_is_truthy(val)
+                };
+                if should_jump {
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        *pc = op.p2 as usize;
+                    }
+                } else {
+                    *pc += 1;
+                }
+                Ok(true)
+            }
             // bd-perf (V2.1): Fused NewRowid + MakeRecord + Insert for
             // sequential append. Combines 3 opcodes into 1 dispatch.
             // P1=cursor, P2=first_reg, P3=num_cols, P5=insert_flags.
@@ -28245,6 +28271,91 @@ mod tests {
                 vec![SqliteValue::Integer(0)],
                 vec![SqliteValue::Integer(1)],
                 vec![SqliteValue::Integer(7)],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_if_not_via_hot_path() {
+        // Pins the hot-path arm's behaviour to the main-match arm
+        // across all three IfNot input classes:
+        //   - truthy non-zero integer:    fall through (no jump)
+        //   - falsy zero integer:         jump (taken)
+        //   - NULL with p3=0:             fall through (don't jump)
+        //   - NULL with p3=1:             jump (taken)
+        //
+        // The hot-path arm only covers control flow — neither branch
+        // mutates the source register, so the seeded values stay put
+        // across each IfNot dispatch.  Each block uses an AddImm
+        // sentinel after the IfNot to prove which side ran.
+        //
+        // Trace (r_truthy=1, r_falsy=0, r_null=NULL, r_hit=0):
+        //   IfNot r_truthy → 1 truthy: fall through; AddImm r_hit,1 → r_hit=1
+        //   skip1: ResultRow r_hit                              emits [1], r_hit=NULL
+        //   r_hit=0
+        //   IfNot r_falsy  → 0 falsy: jump skip2 (skip AddImm); r_hit=0
+        //   skip2: ResultRow r_hit                              emits [0], r_hit=NULL
+        //   r_hit=0
+        //   IfNot r_null,p3=0 → NULL && p3==0: fall through; AddImm r_hit,1 → r_hit=1
+        //   skip3: ResultRow r_hit                              emits [1], r_hit=NULL
+        //   r_hit=0
+        //   IfNot r_null,p3=1 → NULL && p3!=0: jump skip4 (skip AddImm); r_hit=0
+        //   skip4: ResultRow r_hit                              emits [0]
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let skip1 = b.emit_label();
+            let skip2 = b.emit_label();
+            let skip3 = b.emit_label();
+            let skip4 = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_truthy = b.alloc_reg();
+            let r_falsy = b.alloc_reg();
+            let r_null = b.alloc_reg();
+            let r_hit = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 1, r_truthy, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_falsy, 0, P4::None, 0);
+            b.emit_op(Opcode::Null, 0, r_null, 0, P4::None, 0);
+
+            // Block 1: truthy → fall through
+            b.emit_op(Opcode::Integer, 0, r_hit, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::IfNot, r_truthy, 0, skip1, P4::None, 0);
+            b.emit_op(Opcode::AddImm, r_hit, 1, 0, P4::None, 0);
+            b.resolve_label(skip1);
+            b.emit_op(Opcode::ResultRow, r_hit, 1, 0, P4::None, 0);
+
+            // Block 2: falsy → jump
+            b.emit_op(Opcode::Integer, 0, r_hit, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::IfNot, r_falsy, 0, skip2, P4::None, 0);
+            b.emit_op(Opcode::AddImm, r_hit, 1, 0, P4::None, 0);
+            b.resolve_label(skip2);
+            b.emit_op(Opcode::ResultRow, r_hit, 1, 0, P4::None, 0);
+
+            // Block 3: NULL with p3=0 → fall through
+            b.emit_op(Opcode::Integer, 0, r_hit, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::IfNot, r_null, 0, skip3, P4::None, 0);
+            b.emit_op(Opcode::AddImm, r_hit, 1, 0, P4::None, 0);
+            b.resolve_label(skip3);
+            b.emit_op(Opcode::ResultRow, r_hit, 1, 0, P4::None, 0);
+
+            // Block 4: NULL with p3=1 → jump
+            b.emit_op(Opcode::Integer, 0, r_hit, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::IfNot, r_null, 1, skip4, P4::None, 0);
+            b.emit_op(Opcode::AddImm, r_hit, 1, 0, P4::None, 0);
+            b.resolve_label(skip4);
+            b.emit_op(Opcode::ResultRow, r_hit, 1, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Integer(1)],
+                vec![SqliteValue::Integer(0)],
+                vec![SqliteValue::Integer(1)],
+                vec![SqliteValue::Integer(0)],
             ]
         );
     }

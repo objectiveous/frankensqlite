@@ -8,7 +8,7 @@ use fsqlite_types::opcode::{Opcode, P4};
 use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{Cx, PageNumber, PageSize};
-use fsqlite_vdbe::engine::{VdbeEngine, set_vdbe_jit_enabled};
+use fsqlite_vdbe::engine::{MemDatabase, VdbeEngine, set_vdbe_jit_enabled};
 use fsqlite_vdbe::{
     ProgramBuilder, VdbeProgram, profile_vdbe_commit_stage, profile_vdbe_decode_stage,
 };
@@ -171,6 +171,39 @@ fn build_execute_stage_isnull_program(op_repeats: usize) -> VdbeProgram {
     builder
         .finish()
         .expect("pipeline execute isnull benchmark program should build")
+}
+
+/// Build a dispatch-dominated program whose inner loop is a stream of
+/// `Rowid` ops against a single positioned storage cursor.  The cursor
+/// is opened on a one-row table and Rewound to the only row, so each
+/// dispatched `Rowid` op runs the realistic body shape (one
+/// `storage_cursors` HashMap probe + one `cursor.rowid` call + one
+/// `set_reg_fast`) without any cursor motion in between.  This isolates
+/// the hot-path pre-filter vs main-match routing cost for the `Rowid`
+/// arm specifically — same shape pattern as the `IsNull`/`IfPos`
+/// /`IfNot` benches, where the body is uniform across ops and dispatch
+/// routing is the variable being measured.
+fn build_execute_stage_rowid_program(root_page: i32, op_repeats: usize) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    // The bytecode verifier requires Rewind p2 to be strictly `<
+    // op_count`, so the Rewind EOF target points at a real instruction
+    // — the program-end Halt — via a label resolved *at* that Halt.
+    // The single-row table guarantees Rewind never takes the EOF branch
+    // in the bench loop, but the verifier still demands a valid
+    // in-bounds target.  Init is omitted: the engine starts at pc=0
+    // unconditionally.
+    let halt = builder.emit_label();
+    builder.emit_op(Opcode::OpenWrite, 0, root_page, 0, P4::Int(1), 0);
+    builder.emit_jump_to_label(Opcode::Rewind, 0, 0, halt, P4::None, 0);
+    let r_out = builder.alloc_reg();
+    for _ in 0..op_repeats {
+        builder.emit_op(Opcode::Rowid, 0, r_out, 0, P4::None, 0);
+    }
+    builder.resolve_label(halt);
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder
+        .finish()
+        .expect("pipeline execute rowid benchmark program should build")
 }
 
 fn build_execute_stage_ifnot_program(op_repeats: usize) -> VdbeProgram {
@@ -448,6 +481,52 @@ fn bench_vdbe_execute_isnull_stage(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_vdbe_execute_rowid_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_rowid");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        // Build a fresh single-row MemDatabase per param so each bench
+        // run gets an independent root-page id (engine takes ownership
+        // of the database).  Rowid bodies hit `storage_cursors` after
+        // OpenWrite/Rewind position the cursor on the only row.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        db.get_table_mut(root)
+            .expect("table should exist")
+            .insert_row(1, vec![SqliteValue::Integer(42)]);
+        let program = build_execute_stage_rowid_program(root, op_repeats);
+
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &(program, db),
+            |b, (program, db)| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                engine.enable_storage_cursors(true);
+                engine.set_database(db.clone());
+                engine.set_reject_mem_fallback(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute rowid benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_vdbe_execute_ifnot_stage(c: &mut Criterion) {
     set_vdbe_jit_enabled(false);
     let mut group = c.benchmark_group("vdbe_pipeline_execute_ifnot");
@@ -519,6 +598,7 @@ criterion_group!(
     bench_vdbe_execute_ifpos_stage,
     bench_vdbe_execute_isnull_stage,
     bench_vdbe_execute_ifnot_stage,
+    bench_vdbe_execute_rowid_stage,
     bench_vdbe_commit_stage
 );
 criterion_main!(benches);

@@ -11914,6 +11914,26 @@ impl VdbeEngine {
                 }
                 Ok(true)
             }
+            // Rowid extracts the rowid of the currently-positioned row on
+            // cursor p1 into register p2.  Emitted at ~51 codegen sites
+            // across fsqlite-vdbe/-planner/-core, driving every JOIN
+            // match-probe rowid lookup, every UPDATE/DELETE row-key read,
+            // every INSERT-returning-rowid path, every rowid-as-column
+            // projection, and the by-rowid aggregate fast paths.  Body
+            // mirrors the existing main-match arm verbatim — single
+            // `cursor_rowid` call (one HashMap probe in the common
+            // storage-cursor path, one cursor.rowid call) plus a register
+            // write.  Same family as the already-promoted IsNull/IfPos
+            // /IfNot/SCopy: small body, high call frequency, dispatch
+            // routing cost dominates work cost.
+            Opcode::Rowid => {
+                let cursor_id = op.p1;
+                let target = op.p2;
+                let val = self.cursor_rowid(cursor_id)?;
+                self.set_reg_fast(target, val);
+                *pc += 1;
+                Ok(true)
+            }
             // bd-perf (V2.1): Fused NewRowid + MakeRecord + Insert for
             // sequential append. Combines 3 opcodes into 1 dispatch.
             // P1=cursor, P2=first_reg, P3=num_cols, P5=insert_flags.
@@ -28356,6 +28376,72 @@ mod tests {
                 vec![SqliteValue::Integer(0)],
                 vec![SqliteValue::Integer(1)],
                 vec![SqliteValue::Integer(0)],
+            ]
+        );
+    }
+
+    // ── Rowid opcode test ────────────────────────────────────────
+
+    #[test]
+    fn test_rowid_via_hot_path() {
+        // Pins the hot-path arm's behaviour to the main-match arm
+        // across the two Rowid input classes that share a single
+        // `cursor_rowid` call:
+        //   - storage cursor positioned on a row → emit Integer(rowid)
+        //   - cursor id never opened            → emit Null
+        //
+        // The hot-path arm is a verbatim copy of the main-match arm
+        // (`val = self.cursor_rowid(cursor_id)?; set_reg_fast(p2, val)`),
+        // so any divergence between the two would surface here.
+        //
+        // Layout note: the bytecode verifier requires Rewind p2 to be
+        // strictly `< op_count`, so the Rewind EOF target must point at
+        // a real instruction (we use the Halt at the program end via a
+        // label resolved *at* that Halt).  Init is omitted entirely:
+        // the engine starts execution at pc=0 unconditionally and no
+        // verifier path requires Init's presence.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(7, vec![SqliteValue::Integer(70)]);
+        table.insert(11, vec![SqliteValue::Integer(110)]);
+
+        let (rows, _) = run_write_with_storage_cursors(db, |b| {
+            let halt = b.emit_label();
+
+            // Probe a never-opened cursor id first → expects Null.  This
+            // exercises the `cursor_rowid` fallthrough where neither
+            // `storage_cursors` nor `vtab_cursors` nor `cursors` has a
+            // matching id.
+            let r_unopened = b.alloc_reg();
+            b.emit_op(Opcode::Rowid, 99, r_unopened, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_unopened, 1, 0, P4::None, 0);
+
+            // Open writable cursor 0 and Rewind onto rowid=7.  EOF
+            // jumps to Halt directly.
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, halt, P4::None, 0);
+
+            // Body: Rowid → ResultRow → Next loops until EOF, then
+            // falls through to Halt.
+            let body = b.current_addr();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Rowid, 0, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            let next_target =
+                i32::try_from(body).expect("program counter should fit into i32 for tests");
+            b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+
+            b.resolve_label(halt);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        });
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Null],
+                vec![SqliteValue::Integer(7)],
+                vec![SqliteValue::Integer(11)],
             ]
         );
     }

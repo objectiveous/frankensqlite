@@ -7,6 +7,8 @@ use fsqlite_types::SqliteValue;
 use tempfile::NamedTempFile;
 
 const INSERT_SQL: &str = "INSERT INTO bench (id, payload) VALUES (?1, ?2)";
+const SELECT_COUNT_SUM_SQL: &str = "SELECT COUNT(*), SUM(score) FROM select_bench";
+const SELECT_COVERING_INDEX_SQL: &str = "SELECT name FROM select_bench WHERE name = ?1";
 
 fn open_mt_mvcc_prepare_conn() -> (Connection, NamedTempFile) {
     let tmp = NamedTempFile::new().expect("tempfile");
@@ -60,6 +62,61 @@ fn bench_mt_mvcc_prepare_then_execute_cycle(iterations: u64) -> f64 {
     start.elapsed().as_secs_f64() * 1_000_000_000.0 / iterations as f64
 }
 
+fn open_prepared_select_fast_path_conn() -> Connection {
+    let conn = Connection::open(":memory:").expect("open memory connection");
+    conn.execute(
+        "CREATE TABLE select_bench (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            score INTEGER NOT NULL
+        );",
+    )
+    .expect("create select bench table");
+    conn.execute("CREATE INDEX select_bench_name ON select_bench(name);")
+        .expect("create select bench index");
+    let insert = conn
+        .prepare("INSERT INTO select_bench VALUES (?1, ?2, ?3)")
+        .expect("prepare select bench insert");
+    for id in 1..=64_i64 {
+        insert
+            .execute_with_params(&[
+                SqliteValue::Integer(id),
+                SqliteValue::Text(format!("name_{id}").into()),
+                SqliteValue::Integer(id * 7),
+            ])
+            .expect("seed select bench row");
+    }
+    conn
+}
+
+fn bench_prepared_select_fast_path_pair(iterations: u64) -> f64 {
+    let conn = open_prepared_select_fast_path_conn();
+    let count_sum = conn
+        .prepare(SELECT_COUNT_SUM_SQL)
+        .expect("prepare count/sum");
+    let covering_index = conn
+        .prepare(SELECT_COVERING_INDEX_SQL)
+        .expect("prepare covering indexed equality");
+    let probe = [SqliteValue::Text("name_32".into())];
+    black_box(count_sum.query_row().expect("warm count/sum"));
+    black_box(
+        covering_index
+            .query_with_params(&probe)
+            .expect("warm covering indexed equality"),
+    );
+
+    let start = Instant::now();
+    for _ in 0..iterations {
+        black_box(count_sum.query_row().expect("count/sum fast path"));
+        black_box(
+            covering_index
+                .query_with_params(&probe)
+                .expect("covering indexed equality fast path"),
+        );
+    }
+    start.elapsed().as_secs_f64() * 1_000_000_000.0 / iterations as f64
+}
+
 fn parse_iterations() -> u64 {
     let mut args = env::args().skip(1);
     let mut iterations = 2_000_000_u64;
@@ -97,6 +154,15 @@ fn parse_iterations() -> u64 {
                 );
                 std::process::exit(0);
             }
+            "select_fast_paths" => {
+                let select_fast_paths_ns =
+                    bench_prepared_select_fast_path_pair(iterations.min(200_000));
+                println!(
+                    "prepared_cache_hot_paths select_count_sum_plus_covering_index_ns_per_pair={select_fast_paths_ns:.2} iterations={}",
+                    iterations.min(200_000)
+                );
+                std::process::exit(0);
+            }
             _ => {
                 eprintln!("invalid --filter value: {filter}");
                 std::process::exit(2);
@@ -110,12 +176,17 @@ fn main() {
     let iterations = parse_iterations();
     let prepare_hit_ns = bench_mt_mvcc_prepare_hit(iterations);
     let prepare_execute_ns = bench_mt_mvcc_prepare_then_execute_cycle(iterations.min(200_000));
+    let select_fast_paths_ns = bench_prepared_select_fast_path_pair(iterations.min(200_000));
 
     println!(
         "prepared_cache_hot_paths mt_mvcc_prepare_hit_ns_per_op={prepare_hit_ns:.2} iterations={iterations}"
     );
     println!(
         "prepared_cache_hot_paths mt_mvcc_prepare_then_execute_cycle_ns_per_op={prepare_execute_ns:.2} iterations={}",
+        iterations.min(200_000)
+    );
+    println!(
+        "prepared_cache_hot_paths select_count_sum_plus_covering_index_ns_per_pair={select_fast_paths_ns:.2} iterations={}",
         iterations.min(200_000)
     );
 }

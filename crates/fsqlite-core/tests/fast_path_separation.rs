@@ -1414,6 +1414,62 @@ fn test_fast_path_count_star_sum_basic_correctness() {
 }
 
 #[test]
+fn test_fast_path_count_sum_and_covering_indexed_equality_shapes_stay_direct() {
+    let _profile_guard = FastPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT NOT NULL, score INTEGER NOT NULL)",
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX t_name ON t(name)").unwrap();
+    conn.execute(
+        "INSERT INTO t VALUES
+            (1, 'alpha', 10),
+            (2, 'beta', 20),
+            (3, 'gamma', 30)",
+    )
+    .unwrap();
+
+    let count_sum = conn.prepare("SELECT COUNT(*), SUM(score) FROM t").unwrap();
+    let covering_lookup = conn.prepare("SELECT name FROM t WHERE name = ?1").unwrap();
+
+    let before = hot_path_profile_snapshot();
+    let aggregate_row = count_sum.query_row().unwrap();
+    let lookup_rows = covering_lookup
+        .query_with_params(&[fsqlite_types::SqliteValue::Text("beta".into())])
+        .unwrap();
+    let after = hot_path_profile_snapshot();
+
+    assert_count_star_sum_row(
+        &aggregate_row,
+        3,
+        Some(fsqlite_types::SqliteValue::Integer(60)),
+    );
+    assert_eq!(lookup_rows.len(), 1);
+    assert_eq!(
+        lookup_rows[0].values(),
+        &[fsqlite_types::SqliteValue::Text("beta".into())]
+    );
+
+    let (fast_delta, slow_delta) = fast_slow_delta(&before.parser, &after.parser);
+    assert_eq!(
+        fast_delta, 2,
+        "COUNT(*)+SUM() and covering indexed equality should both use prepared fast execution"
+    );
+    assert_eq!(
+        slow_delta, 0,
+        "new prepared SELECT fast-path shapes should not fall back to slow execution"
+    );
+    assert_eq!(
+        after
+            .direct_indexed_equality_query_hits
+            .saturating_sub(before.direct_indexed_equality_query_hits),
+        1,
+        "covering indexed equality should use the direct indexed-equality path"
+    );
+}
+
+#[test]
 fn test_fast_path_count_star_sum_empty_table_returns_zero_and_null() {
     let _profile_guard = FastPathProfileTestGuard::new();
     let conn = Connection::open(":memory:").unwrap();

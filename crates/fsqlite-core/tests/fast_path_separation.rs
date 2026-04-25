@@ -1675,6 +1675,47 @@ fn test_fast_path_count_star_sum_sees_post_delete_visibility() {
 }
 
 #[test]
+fn test_fast_path_count_star_sum_sees_writes_after_repeated_overlay_reads()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _profile_guard = FastPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, score INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")?;
+
+    let stmt = conn.prepare("SELECT COUNT(*), SUM(score) FROM t")?;
+
+    let first = stmt.query_row()?;
+    let second = stmt.query_row()?;
+    assert_count_star_sum_row(&first, 3, Some(fsqlite_types::SqliteValue::Integer(60)));
+    assert_count_star_sum_row(&second, 3, Some(fsqlite_types::SqliteValue::Integer(60)));
+
+    conn.execute("UPDATE t SET score = 200 WHERE id = 2")?;
+    let after_update = stmt.query_row()?;
+    assert_count_star_sum_row(
+        &after_update,
+        3,
+        Some(fsqlite_types::SqliteValue::Integer(240)),
+    );
+
+    conn.execute("DELETE FROM t WHERE id = 1")?;
+    let after_delete = stmt.query_row()?;
+    assert_count_star_sum_row(
+        &after_delete,
+        2,
+        Some(fsqlite_types::SqliteValue::Integer(230)),
+    );
+
+    conn.execute("INSERT INTO t VALUES (4, 40)")?;
+    let after_insert = stmt.query_row()?;
+    assert_count_star_sum_row(
+        &after_insert,
+        3,
+        Some(fsqlite_types::SqliteValue::Integer(270)),
+    );
+    Ok(())
+}
+
+#[test]
 fn test_fast_path_group_by_rowid_bucket_sum_matches_sqlite_reference_rows() {
     const CREATE_TABLE: &str =
         "CREATE TABLE bench(id INTEGER PRIMARY KEY, name TEXT NOT NULL, value REAL NOT NULL)";

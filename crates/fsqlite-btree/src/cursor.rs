@@ -2153,6 +2153,25 @@ impl<P: PageReader> BtCursor<P> {
         Ok(slot.into_cell_ref())
     }
 
+    /// Parse a cell without updating the cursor-local cell-slot cache.
+    ///
+    /// This is for single-consumer sequential scans where the caller needs
+    /// rowid and payload exactly once before advancing. Binary-search and
+    /// repeated-probe paths should keep using [`Self::parse_cell_at`].
+    fn parse_cell_at_uncached(&self, entry: &StackEntry, idx: u16) -> Result<CellRef> {
+        if idx >= entry.header.cell_count {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "cell index {} out of bounds ({})",
+                    idx, entry.header.cell_count
+                ),
+            });
+        }
+
+        let slot = self.parse_cell_slot_at(entry, idx)?;
+        Ok(slot.into_cell_ref())
+    }
+
     /// Move the cursor to the first entry in the subtree rooted at `page_no`.
     fn move_to_leftmost_leaf(
         &mut self,
@@ -7412,7 +7431,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             .stack
             .last()
             .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
-        let cell = self.parse_cell_at(top, top.cell_idx)?;
+        let cell = self.parse_cell_at_uncached(top, top.cell_idx)?;
         self.read_cell_payload_into(cx, top, &cell, buf)?;
         if let Some(rowid) = cell.rowid {
             return Ok(rowid);

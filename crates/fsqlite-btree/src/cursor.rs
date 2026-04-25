@@ -20,7 +20,7 @@
 //! ```
 
 use crate::balance;
-use crate::cell::{self, BtreePageHeader, CellRef};
+use crate::cell::{self, BtreePageHeader, BtreePageType, CellRef};
 use crate::instrumentation::{self, BtreeOpRuntimeStats, BtreeOpType};
 use crate::overflow;
 use crate::traits::{BtreeCursorOps, SeekResult, sealed};
@@ -7084,6 +7084,92 @@ impl<P: PageWriter> BtCursor<P> {
     pub fn swap_cell_scratch(&mut self, scratch: &mut Vec<u8>) {
         std::mem::swap(&mut self.cell_buf, scratch);
     }
+
+    fn local_leaf_table_rowid_and_payload<'a>(
+        &'a self,
+        entry: &'a StackEntry,
+        idx: u16,
+    ) -> Result<Option<(i64, Cow<'a, [u8]>)>> {
+        if entry.header.page_type != BtreePageType::LeafTable {
+            return Ok(None);
+        }
+        if idx >= entry.header.cell_count {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "cell index {} out of bounds ({})",
+                    idx, entry.header.cell_count
+                ),
+            });
+        }
+
+        let page = entry.page_data.as_bytes();
+        let idx_usize = usize::from(idx);
+        let cell_offset = if idx_usize < entry.cell_pointers.len() {
+            usize::from(entry.cell_pointers[idx_usize])
+        } else {
+            usize::from(Self::read_stack_entry_cell_pointer_inline(entry, idx)?)
+        };
+        let payload_size_slice =
+            page.get(cell_offset..)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!("cell offset {cell_offset} extends past page"),
+                })?;
+        let (payload_size_raw, ps_len) =
+            read_varint(payload_size_slice).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "truncated varint in cell (payload size)".to_owned(),
+            })?;
+        let payload_size =
+            u32::try_from(payload_size_raw).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: "cell payload size exceeds 32-bit range".to_owned(),
+            })?;
+        if payload_size > self.usable_size.saturating_sub(35) {
+            return Ok(None);
+        }
+
+        let rowid_start =
+            cell_offset
+                .checked_add(ps_len)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "cell offset overflow after payload size".to_owned(),
+                })?;
+        let rowid_slice = page
+            .get(rowid_start..)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "cell offset overflow after payload size".to_owned(),
+            })?;
+        let (rowid_raw, rowid_len) =
+            read_varint(rowid_slice).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "truncated varint in table cell (rowid)".to_owned(),
+            })?;
+        let payload_offset =
+            rowid_start
+                .checked_add(rowid_len)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "cell payload offset overflow".to_owned(),
+                })?;
+        let payload_len =
+            usize::try_from(payload_size).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: "cell payload size exceeds usize range".to_owned(),
+            })?;
+        let local_end = payload_offset.checked_add(payload_len).ok_or_else(|| {
+            FrankenError::DatabaseCorrupt {
+                detail: "cell payload offset overflow".to_owned(),
+            }
+        })?;
+        let usable_size = usize::try_from(self.usable_size).unwrap_or(usize::MAX);
+        if local_end > page.len() || local_end > usable_size {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "cell extends past usable page size (payload bytes)".to_owned(),
+            });
+        }
+
+        #[allow(clippy::cast_possible_wrap)]
+        let rowid = rowid_raw as i64;
+        Ok(Some((
+            rowid,
+            Cow::Borrowed(&page[payload_offset..local_end]),
+        )))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7591,6 +7677,9 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             .stack
             .last()
             .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
+        if let Some(row) = self.local_leaf_table_rowid_and_payload(top, top.cell_idx)? {
+            return Ok(row);
+        }
         let cell = self.parse_cell_at_uncached(top, top.cell_idx)?;
         let payload = self.read_cell_payload(cx, top, &cell)?;
         if let Some(rowid) = cell.rowid {
@@ -12802,6 +12891,25 @@ mod tests {
             assert_eq!(cursor.rowid(&cx).unwrap(), rowid);
             assert_eq!(cursor.payload(&cx).unwrap(), payload_for_rowid(rowid));
         }
+    }
+
+    #[test]
+    fn test_rowid_and_payload_cow_reads_local_leaf_table_payload() {
+        let payload = b"small local payload";
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&[(7, payload)]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+        assert!(cursor.table_move_to(&cx, 7).unwrap().is_found());
+
+        let (rowid, got) = cursor.rowid_and_payload_cow(&cx).unwrap();
+        assert_eq!(rowid, 7);
+        assert_eq!(got.as_ref(), payload);
+        assert!(
+            matches!(got, Cow::Borrowed(_)),
+            "local leaf-table payloads should stay borrowed"
+        );
     }
 
     #[test]

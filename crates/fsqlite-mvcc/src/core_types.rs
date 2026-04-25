@@ -11,7 +11,7 @@ use fsqlite_types::sync_primitives::{Condvar, Mutex, RwLock};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, Thread, ThreadId};
 use std::time::{Duration, Instant};
 
@@ -425,6 +425,14 @@ pub struct InProcessPageLockTable {
     /// Eliminates thundering herd: releasing page P only wakes threads waiting
     /// for page P, not all waiters. Sharded the same way as `shards`.
     waiter_shards: Box<[WaiterShard; LOCK_TABLE_SHARDS]>,
+    /// Total live waiter entries across all `waiter_shards`. Read by the
+    /// fast-path skip in `notify_all_waiters` / `notify_waiters_for_page`
+    /// to avoid 256 (or 1) per-shard mutex acquires when no thread is
+    /// parked. Synchronization with `register_waiter` is established via
+    /// paired SeqCst fences (Dekker), so the load and modify can both
+    /// remain `Relaxed`. Over-counting (e.g., from a panicking waiter that
+    /// skipped `unregister_waiter`) is safe — it only forces the slow path.
+    waiter_count: AtomicUsize,
     /// Optional conflict observer for MVCC analytics (bd-t6sv2.1).
     /// When `None`, conflict emission is a no-op branch (zero cost).
     observer: Option<std::sync::Arc<dyn fsqlite_observability::ConflictObserver>>,
@@ -543,6 +551,7 @@ impl InProcessPageLockTable {
             change_gate: Mutex::new(()),
             change_cv: Condvar::new(),
             waiter_shards: Self::alloc_waiter_shards(),
+            waiter_count: AtomicUsize::new(0),
             observer: None,
         }
     }
@@ -567,6 +576,7 @@ impl InProcessPageLockTable {
             change_gate: Mutex::new(()),
             change_cv: Condvar::new(),
             waiter_shards: Self::alloc_waiter_shards(),
+            waiter_count: AtomicUsize::new(0),
             observer: Some(observer),
         }
     }
@@ -1407,6 +1417,14 @@ impl InProcessPageLockTable {
             id: current_id,
             thread: current_thread.clone(),
         });
+        self.waiter_count.fetch_add(1, Ordering::Relaxed);
+        drop(map);
+        // Pairs with the SeqCst fence in `notify_*_waiters` fast paths.
+        // Either the notifier sees `waiter_count >= 1` and takes the slow
+        // path (waking us via the shard mutex), or the waiter's holder
+        // recheck (sequenced after this fence in `wait_for_holder_change`)
+        // observes the notifier's pre-fence release CAS. Dekker.
+        std::sync::atomic::fence(Ordering::SeqCst);
     }
 
     /// Unregister the current thread from the waiter queue for `page`.
@@ -1414,9 +1432,14 @@ impl InProcessPageLockTable {
         let shard_idx = Self::shard_index_static(page);
         let mut map = self.waiter_shards[shard_idx].lock();
         if let Some(queue) = map.get_mut(&page) {
+            let before = queue.len();
             queue.retain(|waiter| waiter.id != current_id);
+            let removed = before - queue.len();
             if queue.is_empty() {
                 map.remove(&page);
+            }
+            if removed > 0 {
+                self.waiter_count.fetch_sub(removed, Ordering::Relaxed);
             }
         }
     }
@@ -1426,15 +1449,31 @@ impl InProcessPageLockTable {
     /// This is the primary notification method for single-page releases.
     /// Eliminates thundering herd by waking only relevant waiters.
     fn notify_waiters_for_page(&self, page: PageNumber) {
-        let shard_idx = Self::shard_index_static(page);
-        let mut map = self.waiter_shards[shard_idx].lock();
-        if let Some(queue) = map.remove(&page) {
-            // Unpark all threads waiting for this specific page.
-            for waiter in queue {
-                waiter.thread.unpark();
+        // Pairs with the SeqCst fence in `register_waiter`. The caller's
+        // release CAS on the page's `fast_locks`/shard slot is sequenced
+        // before this fence; the waiter's `register_waiter`+fence is
+        // sequenced before its post-register holder recheck. By Dekker on
+        // SeqCst fences, either we observe `waiter_count >= 1` here (and
+        // take the per-page mutex slow path) or the waiter observes our
+        // released holder and never parks. The change_epoch + condvar
+        // bump still runs so threads on `wait_for_release_progress` make
+        // progress.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if self.waiter_count.load(Ordering::Relaxed) > 0 {
+            let shard_idx = Self::shard_index_static(page);
+            let mut map = self.waiter_shards[shard_idx].lock();
+            if let Some(queue) = map.remove(&page) {
+                let drained = queue.len();
+                // Unpark all threads waiting for this specific page.
+                for waiter in queue {
+                    waiter.thread.unpark();
+                }
+                if drained > 0 {
+                    self.waiter_count.fetch_sub(drained, Ordering::Relaxed);
+                }
             }
+            drop(map);
         }
-        drop(map);
         // Bump epoch and notify condvar as fallback for WASM (no thread::park)
         // and edge cases (threads that registered between remove and park).
         // Must use notify_all on WASM: multiple pages may have waiters, and
@@ -1454,13 +1493,26 @@ impl InProcessPageLockTable {
     /// Used for bulk operations like `release_all` and `release_set` where
     /// iterating over every released page would be expensive or impractical.
     fn notify_all_waiters(&self) {
-        // Wake all per-page waiters.
-        for shard in self.waiter_shards.iter() {
-            let mut map = shard.lock();
-            for (_, queue) in map.drain() {
-                for waiter in queue {
-                    waiter.thread.unpark();
+        // Pairs with the SeqCst fence in `register_waiter`; see Dekker note
+        // on `notify_waiters_for_page`. When `waiter_count == 0` we skip
+        // the 256-shard mutex iteration entirely — this is the common case
+        // on commit/release_all when no thread is parked on a page lock.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if self.waiter_count.load(Ordering::Relaxed) > 0 {
+            // Wake all per-page waiters.
+            let mut total_drained: usize = 0;
+            for shard in self.waiter_shards.iter() {
+                let mut map = shard.lock();
+                for (_, queue) in map.drain() {
+                    total_drained += queue.len();
+                    for waiter in queue {
+                        waiter.thread.unpark();
+                    }
                 }
+            }
+            if total_drained > 0 {
+                self.waiter_count
+                    .fetch_sub(total_drained, Ordering::Relaxed);
             }
         }
         // Also signal the condvar for fallback compatibility.
@@ -3405,6 +3457,121 @@ mod tests {
         eprintln!(
             "wait_for_holder_change microbench: median={median:.0} wakes/sec, mean={mean:.0} \
              wakes/sec (n={TRIALS}, {duration:?}/trial)"
+        );
+    }
+
+    /// Microbench for the no-waiters fast path in `notify_all_waiters` and
+    /// `notify_waiters_for_page`. Times direct calls into both helpers
+    /// when `waiter_count == 0` (the dominant production case on
+    /// commit / release_all when no thread is parked on a page lock).
+    /// Without the gate each `notify_all_waiters` call acquires 256
+    /// per-shard mutexes; with the gate it short-circuits on a single
+    /// SeqCst-fenced atomic load.
+    ///
+    /// Each helper is timed twice: once with `waiter_count == 0` (gated
+    /// fast path — production case) and once with `waiter_count` forced
+    /// non-zero before each call (forces the pre-gate slow path with
+    /// empty maps, mimicking the previous unconditional behavior). The
+    /// difference between the two columns is the gate's saving.
+    ///
+    /// Run with:
+    /// `cargo test -p fsqlite-mvcc --lib --release -- \
+    ///    bench_notify_waiters_no_waiters --ignored --nocapture`
+    #[test]
+    #[ignore = "microbench — run manually"]
+    #[allow(clippy::unit_arg)]
+    fn bench_notify_waiters_no_waiters() {
+        let table = InProcessPageLockTable::new();
+        let page = PageNumber::new(17).unwrap();
+
+        const ITERS_ALL_FAST: u32 = 1_000_000;
+        const ITERS_ALL_SLOW: u32 = 100_000;
+        const ITERS_PAGE_FAST: u32 = 5_000_000;
+        const ITERS_PAGE_SLOW: u32 = 5_000_000;
+        const TRIALS: usize = 7;
+
+        // Warm-up.
+        for _ in 0..ITERS_ALL_FAST {
+            std::hint::black_box(table.notify_all_waiters());
+        }
+        for _ in 0..ITERS_PAGE_FAST {
+            std::hint::black_box(table.notify_waiters_for_page(page));
+        }
+        debug_assert_eq!(table.waiter_count.load(Ordering::Relaxed), 0);
+
+        // Fast path (gate fires): waiter_count stays 0.
+        let mut all_fast = Vec::with_capacity(TRIALS);
+        for _ in 0..TRIALS {
+            let start = Instant::now();
+            for _ in 0..ITERS_ALL_FAST {
+                std::hint::black_box(table.notify_all_waiters());
+            }
+            let elapsed = start.elapsed();
+            let ns = elapsed.as_nanos() as f64 / f64::from(ITERS_ALL_FAST);
+            eprintln!("  notify_all  fast trial: {ns:.1} ns/call ({elapsed:?} total)");
+            all_fast.push(ns);
+        }
+
+        let mut all_slow = Vec::with_capacity(TRIALS);
+        for _ in 0..TRIALS {
+            let start = Instant::now();
+            for _ in 0..ITERS_ALL_SLOW {
+                // Force waiter_count > 0 *for the gate's load* so the
+                // slow body runs — but no real entries exist, so the
+                // shard iteration drains 0 and the fetch_sub is skipped.
+                // This isolates the cost of the 256 shard mutex acquires
+                // and the empty `map.drain()` calls (i.e., the old
+                // unconditional behavior).
+                table.waiter_count.store(1, Ordering::Relaxed);
+                std::hint::black_box(table.notify_all_waiters());
+            }
+            let elapsed = start.elapsed();
+            table.waiter_count.store(0, Ordering::Relaxed);
+            let ns = elapsed.as_nanos() as f64 / f64::from(ITERS_ALL_SLOW);
+            eprintln!("  notify_all  slow trial: {ns:.1} ns/call ({elapsed:?} total)");
+            all_slow.push(ns);
+        }
+
+        let mut page_fast = Vec::with_capacity(TRIALS);
+        for _ in 0..TRIALS {
+            let start = Instant::now();
+            for _ in 0..ITERS_PAGE_FAST {
+                std::hint::black_box(table.notify_waiters_for_page(page));
+            }
+            let elapsed = start.elapsed();
+            let ns = elapsed.as_nanos() as f64 / f64::from(ITERS_PAGE_FAST);
+            eprintln!("  notify_page fast trial: {ns:.1} ns/call ({elapsed:?} total)");
+            page_fast.push(ns);
+        }
+
+        let mut page_slow = Vec::with_capacity(TRIALS);
+        for _ in 0..TRIALS {
+            let start = Instant::now();
+            for _ in 0..ITERS_PAGE_SLOW {
+                table.waiter_count.store(1, Ordering::Relaxed);
+                std::hint::black_box(table.notify_waiters_for_page(page));
+            }
+            let elapsed = start.elapsed();
+            table.waiter_count.store(0, Ordering::Relaxed);
+            let ns = elapsed.as_nanos() as f64 / f64::from(ITERS_PAGE_SLOW);
+            eprintln!("  notify_page slow trial: {ns:.1} ns/call ({elapsed:?} total)");
+            page_slow.push(ns);
+        }
+
+        all_fast.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        all_slow.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        page_fast.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        page_slow.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        eprintln!(
+            "bench_notify_waiters_no_waiters: \
+             notify_all  fast median={:.1} ns/call, slow median={:.1} ns/call; \
+             notify_page fast median={:.1} ns/call, slow median={:.1} ns/call (n={})",
+            all_fast[TRIALS / 2],
+            all_slow[TRIALS / 2],
+            page_fast[TRIALS / 2],
+            page_slow[TRIALS / 2],
+            TRIALS,
         );
     }
 

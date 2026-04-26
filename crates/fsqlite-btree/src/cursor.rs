@@ -4350,6 +4350,7 @@ impl<P: PageWriter> BtCursor<P> {
                     &entry.cell_pointers,
                 );
             }
+            entry.mutation_counter = Self::page_mutation_counter(&entry.page_data);
             #[allow(clippy::cast_possible_truncation)]
             {
                 entry.cell_idx = insert_at as u16;
@@ -9805,6 +9806,26 @@ mod tests {
 
         assert!(cursor.index_move_to(&cx, b"banana").unwrap().is_found());
         assert_eq!(cursor.payload(&cx).unwrap(), b"banana");
+    }
+
+    #[test]
+    fn test_cursor_index_insert_before_cached_leaf_slot_preserves_order() {
+        let root = pn(2);
+        let store = MemPageStore::with_empty_index(root, 512);
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, root, 512, false);
+
+        let high_key = synthetic_index_key(791);
+        let low_key = synthetic_index_key(357);
+
+        cursor.index_insert(&cx, &high_key).unwrap();
+        cursor.index_insert(&cx, &low_key).unwrap();
+
+        validate_index_tree_invariants(&mut cursor, root).unwrap();
+        assert_eq!(
+            scan_all_index_keys(&mut cursor, &cx).unwrap(),
+            vec![low_key, high_key]
+        );
     }
 
     #[test]

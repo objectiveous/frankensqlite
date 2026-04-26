@@ -449,6 +449,14 @@ impl CellRef {
         page_type: BtreePageType,
         usable_size: u32,
     ) -> Result<Self> {
+        if cell_offset > page.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "cell offset {cell_offset} extends past page length {}",
+                    page.len()
+                ),
+            });
+        }
         if page_type == BtreePageType::LeafTable {
             return Self::parse_leaf_table(page, cell_offset, usable_size);
         }
@@ -682,13 +690,30 @@ impl CellRef {
     /// math, no overflow-pointer materialisation.
     #[inline]
     pub fn parse_leaf_table_rowid(page: &[u8], cell_offset: usize) -> Result<i64> {
-        let (_, ps_len) =
-            read_varint(&page[cell_offset..]).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                detail: "truncated varint in table cell (payload size)".to_owned(),
+        let cell = page
+            .get(cell_offset..)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "cell offset {cell_offset} extends past page length {}",
+                    page.len()
+                ),
             })?;
-        let rowid_start = cell_offset + ps_len;
+        let (_, ps_len) = read_varint(cell).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "truncated varint in table cell (payload size)".to_owned(),
+        })?;
+        let rowid_start =
+            cell_offset
+                .checked_add(ps_len)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "cell offset overflow after payload size".to_owned(),
+                })?;
+        let rowid_slice = page
+            .get(rowid_start..)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "cell offset overflow after payload size".to_owned(),
+            })?;
         let (rowid_raw, _) =
-            read_varint(&page[rowid_start..]).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            read_varint(rowid_slice).ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: "truncated varint in table cell (rowid)".to_owned(),
             })?;
         #[allow(clippy::cast_possible_wrap)]
@@ -1310,6 +1335,20 @@ mod tests {
     fn test_read_table_leaf_rowid_at_offset_out_of_range() {
         let page = vec![0u8; 16];
         assert!(read_table_leaf_rowid_at_offset(&page, 17).is_none());
+    }
+
+    #[test]
+    fn test_parse_leaf_table_rowid_reports_out_of_range_offset() {
+        let page = vec![0u8; 16];
+        let err = CellRef::parse_leaf_table_rowid(&page, 17).unwrap_err();
+        assert!(matches!(err, FrankenError::DatabaseCorrupt { .. }));
+    }
+
+    #[test]
+    fn test_cellref_parse_reports_out_of_range_offset() {
+        let page = vec![0u8; 16];
+        let err = CellRef::parse(&page, 17, BtreePageType::LeafTable, 4096).unwrap_err();
+        assert!(matches!(err, FrankenError::DatabaseCorrupt { .. }));
     }
 
     #[test]

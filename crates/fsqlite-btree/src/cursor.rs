@@ -7085,11 +7085,11 @@ impl<P: PageWriter> BtCursor<P> {
         std::mem::swap(&mut self.cell_buf, scratch);
     }
 
-    fn local_leaf_table_rowid_and_payload<'a>(
+    fn local_leaf_table_cell<'a>(
         &'a self,
         entry: &'a StackEntry,
         idx: u16,
-    ) -> Result<Option<(i64, Cow<'a, [u8]>)>> {
+    ) -> Result<Option<(i64, &'a [u8])>> {
         if entry.header.page_type != BtreePageType::LeafTable {
             return Ok(None);
         }
@@ -7165,10 +7165,32 @@ impl<P: PageWriter> BtCursor<P> {
 
         #[allow(clippy::cast_possible_wrap)]
         let rowid = rowid_raw as i64;
-        Ok(Some((
-            rowid,
-            Cow::Borrowed(&page[payload_offset..local_end]),
-        )))
+        Ok(Some((rowid, &page[payload_offset..local_end])))
+    }
+
+    fn local_leaf_table_rowid_and_payload<'a>(
+        &'a self,
+        entry: &'a StackEntry,
+        idx: u16,
+    ) -> Result<Option<(i64, Cow<'a, [u8]>)>> {
+        Ok(self
+            .local_leaf_table_cell(entry, idx)?
+            .map(|(rowid, payload)| (rowid, Cow::Borrowed(payload))))
+    }
+
+    fn local_leaf_table_payload_into(
+        &self,
+        entry: &StackEntry,
+        idx: u16,
+        out: &mut Vec<u8>,
+    ) -> Result<bool> {
+        let Some((_, payload)) = self.local_leaf_table_cell(entry, idx)? else {
+            return Ok(false);
+        };
+        out.clear();
+        instrumentation::record_local_payload_copy(payload.len());
+        out.extend_from_slice(payload);
+        Ok(true)
     }
 
     fn local_leaf_table_payload_prefix_into(
@@ -7667,6 +7689,9 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             .stack
             .last()
             .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
+        if self.local_leaf_table_payload_into(top, top.cell_idx, buf)? {
+            return Ok(());
+        }
         let cell = self.parse_cell_at(top, top.cell_idx)?;
 
         self.read_cell_payload_into(cx, top, &cell, buf)

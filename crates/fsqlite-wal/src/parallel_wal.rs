@@ -30,7 +30,7 @@ use std::time::Duration;
 
 #[cfg(not(target_arch = "wasm32"))]
 use asupersync::runtime::{BlockingTaskHandle, RuntimeHandle};
-use fsqlite_types::{CommitSeq, PageNumber, TxnToken, cx::Cx};
+use fsqlite_types::{CommitSeq, PageNumber, TxnToken, cx::Cx, limits};
 
 use crate::group_commit::TransactionFrameBatchContext;
 use crate::per_core_buffer::{
@@ -552,6 +552,16 @@ const SEGMENT_VERSION: u16 = 1;
 /// Segment file header size in bytes.
 const SEGMENT_HEADER_SIZE: usize = 24;
 
+/// Fixed record bytes for a record without `end_seq` and without page images.
+const SEGMENT_RECORD_MIN_SIZE: usize = 8 + 4 + 8 + 4 + 8 + 1 + 4 + 4;
+
+/// Largest supported page image in a segment record.
+const MAX_SEGMENT_RECORD_IMAGE_BYTES: usize = limits::MAX_PAGE_SIZE as usize;
+
+/// Largest record payload the segment reader will allocate from an on-disk length.
+const MAX_SEGMENT_RECORD_SIZE: usize =
+    SEGMENT_RECORD_MIN_SIZE + 8 + 2 * MAX_SEGMENT_RECORD_IMAGE_BYTES;
+
 /// fsync policy for segment files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FsyncPolicy {
@@ -683,6 +693,22 @@ pub fn write_segment(
     fsync_policy: FsyncPolicy,
 ) -> io::Result<usize> {
     let path = segment_path(db_path, batch.epoch);
+
+    let ordered_records = ordered_segment_records(batch.epoch, &batch.records)?;
+    for record in &ordered_records {
+        validate_segment_record_images(record)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    }
+    let record_count = u32::try_from(ordered_records.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "segment record count {} exceeds u32 header field",
+                ordered_records.len()
+            ),
+        )
+    })?;
+
     let file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -690,18 +716,25 @@ pub fn write_segment(
         .open(&path)?;
     let mut writer = BufWriter::new(file);
 
-    let ordered_records = ordered_segment_records(batch.epoch, &batch.records)?;
-
     // Write header
-    let header = SegmentHeader::new(batch.epoch, ordered_records.len() as u32);
+    let header = SegmentHeader::new(batch.epoch, record_count);
     let header_bytes = header.to_bytes();
     writer.write_all(&header_bytes)?;
     let mut total_bytes = SEGMENT_HEADER_SIZE;
 
     // Write records in canonical replay order so crash recovery is deterministic.
     for record in &ordered_records {
-        let record_bytes = serialize_record(record);
-        let len = record_bytes.len() as u32;
+        let record_bytes =
+            serialize_record(record).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let len = u32::try_from(record_bytes.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "segment record length {} exceeds u32 length prefix",
+                    record_bytes.len()
+                ),
+            )
+        })?;
         writer.write_all(&len.to_le_bytes())?;
         writer.write_all(&record_bytes)?;
         total_bytes += 4 + record_bytes.len();
@@ -734,6 +767,12 @@ pub fn read_segment(path: &Path) -> io::Result<(SegmentHeader, Vec<WalRecord>)> 
         let mut len_buf = [0u8; 4];
         reader.read_exact(&mut len_buf)?;
         let len = u32::from_le_bytes(len_buf) as usize;
+        if len > MAX_SEGMENT_RECORD_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("segment record length {len} exceeds maximum {MAX_SEGMENT_RECORD_SIZE}"),
+            ));
+        }
 
         let mut record_buf = vec![0u8; len];
         reader.read_exact(&mut record_buf)?;
@@ -941,10 +980,10 @@ pub fn cleanup_segments(db_path: &Path) -> io::Result<usize> {
 }
 
 /// Serialize a WalRecord to bytes.
-fn serialize_record(record: &WalRecord) -> Vec<u8> {
+fn serialize_record(record: &WalRecord) -> Result<Vec<u8>, String> {
     // Simple binary format:
     // [8] txn_id
-    // [8] txn_epoch
+    // [4] txn_epoch
     // [8] record_epoch
     // [4] page_id
     // [8] begin_seq
@@ -954,6 +993,12 @@ fn serialize_record(record: &WalRecord) -> Vec<u8> {
     // [N] before_image
     // [4] after_image_len
     // [N] after_image
+    validate_segment_record_images(record)?;
+    let before_len = u32::try_from(record.before_image.len())
+        .map_err(|_| "before_image length exceeds u32 length prefix".to_string())?;
+    let after_len = u32::try_from(record.after_image.len())
+        .map_err(|_| "after_image length exceeds u32 length prefix".to_string())?;
+
     let mut buf = Vec::with_capacity(64 + record.before_image.len() + record.after_image.len());
 
     buf.extend_from_slice(&record.txn_token.id.get().to_le_bytes());
@@ -967,64 +1012,86 @@ fn serialize_record(record: &WalRecord) -> Vec<u8> {
     } else {
         buf.push(0);
     }
-    buf.extend_from_slice(&(record.before_image.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&before_len.to_le_bytes());
     buf.extend_from_slice(&record.before_image);
-    buf.extend_from_slice(&(record.after_image.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&after_len.to_le_bytes());
     buf.extend_from_slice(&record.after_image);
 
-    buf
+    Ok(buf)
+}
+
+fn validate_segment_record_images(record: &WalRecord) -> Result<(), String> {
+    validate_segment_image_len("before_image", record.before_image.len())?;
+    validate_segment_image_len("after_image", record.after_image.len())
+}
+
+fn validate_segment_image_len(field: &'static str, len: usize) -> Result<(), String> {
+    if len > MAX_SEGMENT_RECORD_IMAGE_BYTES {
+        return Err(format!(
+            "{field} length {len} exceeds maximum {MAX_SEGMENT_RECORD_IMAGE_BYTES}"
+        ));
+    }
+    Ok(())
+}
+
+fn read_record_bytes<'a>(
+    buf: &'a [u8],
+    offset: &mut usize,
+    len: usize,
+    field: &'static str,
+) -> Result<&'a [u8], String> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| format!("{field} offset overflow"))?;
+    let bytes = buf
+        .get(*offset..end)
+        .ok_or_else(|| format!("{field} truncated"))?;
+    *offset = end;
+    Ok(bytes)
+}
+
+fn read_record_u32(buf: &[u8], offset: &mut usize, field: &'static str) -> Result<u32, String> {
+    let bytes = read_record_bytes(buf, offset, 4, field)?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_record_u64(buf: &[u8], offset: &mut usize, field: &'static str) -> Result<u64, String> {
+    let bytes = read_record_bytes(buf, offset, 8, field)?;
+    Ok(u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]))
 }
 
 /// Deserialize a WalRecord from bytes.
 fn deserialize_record(buf: &[u8]) -> Result<WalRecord, String> {
-    // Minimum size: 8 + 4 + 8 + 4 + 8 + 1 + 4 + 4 = 41 bytes (no end_seq, empty images)
-    if buf.len() < 41 {
+    if buf.len() < SEGMENT_RECORD_MIN_SIZE {
         return Err("record too short".to_string());
     }
 
     let mut offset = 0;
 
-    let txn_id = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
-    offset += 8;
-    let txn_epoch = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap());
-    offset += 4;
-    let record_epoch = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
-    offset += 8;
-    let page_id = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap());
-    offset += 4;
-    let begin_seq = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
-    offset += 8;
-    let has_end_seq = buf[offset];
-    offset += 1;
+    let txn_id = read_record_u64(buf, &mut offset, "txn_id")?;
+    let txn_epoch = read_record_u32(buf, &mut offset, "txn_epoch")?;
+    let record_epoch = read_record_u64(buf, &mut offset, "record_epoch")?;
+    let page_id = read_record_u32(buf, &mut offset, "page_id")?;
+    let begin_seq = read_record_u64(buf, &mut offset, "begin_seq")?;
+    let has_end_seq = *read_record_bytes(buf, &mut offset, 1, "end_seq flag")?
+        .first()
+        .ok_or_else(|| "end_seq flag truncated".to_string())?;
     let end_seq = if has_end_seq == 1 {
-        if offset + 8 > buf.len() {
-            return Err("end_seq truncated".to_string());
-        }
-        let seq = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
-        offset += 8;
+        let seq = read_record_u64(buf, &mut offset, "end_seq")?;
         Some(CommitSeq::new(seq))
-    } else {
+    } else if has_end_seq == 0 {
         None
+    } else {
+        return Err(format!("invalid end_seq flag: {has_end_seq}"));
     };
-    if offset + 4 > buf.len() {
-        return Err("before_image length truncated".to_string());
-    }
-    let before_len = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
-    offset += 4;
-    if offset + before_len > buf.len() {
-        return Err("before_image truncated".to_string());
-    }
-    let before_image = buf[offset..offset + before_len].to_vec();
-    offset += before_len;
-    if offset + 4 > buf.len() {
-        return Err("after_image length truncated".to_string());
-    }
-    let after_len = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
-    offset += 4;
-    if offset + after_len > buf.len() {
-        return Err("after_image truncated".to_string());
-    }
-    let after_image = buf[offset..offset + after_len].to_vec();
+    let before_len = read_record_u32(buf, &mut offset, "before_image length")? as usize;
+    validate_segment_image_len("before_image", before_len)?;
+    let before_image = read_record_bytes(buf, &mut offset, before_len, "before_image")?.to_vec();
+    let after_len = read_record_u32(buf, &mut offset, "after_image length")? as usize;
+    validate_segment_image_len("after_image", after_len)?;
+    let after_image = read_record_bytes(buf, &mut offset, after_len, "after_image")?.to_vec();
 
     let txn_id = fsqlite_types::TxnId::new(txn_id).ok_or("invalid txn_id (zero)")?;
     let page_id = PageNumber::new(page_id).ok_or("invalid page_id (zero)")?;
@@ -1529,11 +1596,17 @@ mod tests {
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
     use std::path::PathBuf;
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::{LazyLock, Mutex, MutexGuard};
 
     use crate::per_core_buffer::reset_slot_counter;
 
     static PARALLEL_WAL_LANE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn lane_test_guard() -> MutexGuard<'static, ()> {
+        PARALLEL_WAL_LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     fn test_runtime() -> asupersync::runtime::Runtime {
         RuntimeBuilder::current_thread()
@@ -1604,6 +1677,7 @@ mod tests {
 
     #[test]
     fn test_thread_slot_assignment() {
+        let _guard = lane_test_guard();
         let path = PathBuf::from("/tmp/test.db");
         let config = ParallelWalConfig {
             slot_count: 4,
@@ -1620,6 +1694,7 @@ mod tests {
 
     #[test]
     fn test_lane_stager_identity_is_stable_within_thread() {
+        let _guard = lane_test_guard();
         let stager = ParallelWalLaneStager::<u32>::new(ParallelWalControlSurface {
             mode: ParallelWalOperatingMode::Auto,
             lane_count_override: Some(4),
@@ -1634,10 +1709,7 @@ mod tests {
 
     #[test]
     fn test_lane_stager_reuses_lanes_after_worker_churn() {
-        let _guard = match PARALLEL_WAL_LANE_TEST_LOCK.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let _guard = lane_test_guard();
         reset_slot_counter();
 
         let stager = Arc::new(ParallelWalLaneStager::<u32>::new(
@@ -1668,6 +1740,7 @@ mod tests {
 
     #[test]
     fn test_lane_stager_conservative_mode_collapses_to_single_lane() {
+        let _guard = lane_test_guard();
         let stager = Arc::new(ParallelWalLaneStager::<u32>::new(
             ParallelWalControlSurface {
                 mode: ParallelWalOperatingMode::Conservative,
@@ -1947,6 +2020,7 @@ mod tests {
     fn test_submit_batch_persists_actual_frame_payloads() {
         use tempfile::tempdir;
 
+        let _guard = lane_test_guard();
         let dir = tempdir().expect("create temp dir");
         let db_path = dir.path().join("submit_batch.db");
         let config = ParallelWalConfig {
@@ -1980,6 +2054,7 @@ mod tests {
     fn test_advance_and_flush_does_not_mark_epoch_durable_on_segment_write_failure() {
         use tempfile::tempdir;
 
+        let _guard = lane_test_guard();
         let dir = tempdir().expect("create temp dir");
         let db_path = dir.path().join("missing").join("write_failure.db");
         let config = ParallelWalConfig {
@@ -2128,6 +2203,53 @@ mod tests {
     }
 
     #[test]
+    fn test_deserialize_record_rejects_invalid_end_seq_flag() {
+        let record = WalRecord {
+            txn_token: TxnToken::new(
+                fsqlite_types::TxnId::new(1).expect("txn id should be non-zero"),
+                fsqlite_types::TxnEpoch::new(0),
+            ),
+            epoch: 5,
+            page_id: PageNumber::new(1).expect("page should be non-zero"),
+            begin_seq: CommitSeq::new(100),
+            end_seq: None,
+            before_image: Vec::new(),
+            after_image: vec![0xAA; 8],
+        };
+        let mut bytes = serialize_record(&record).expect("sample record should serialize");
+        let end_seq_flag_offset = 8 + 4 + 8 + 4 + 8;
+        bytes[end_seq_flag_offset] = 2;
+
+        let error = deserialize_record(&bytes)
+            .expect_err("invalid end_seq flag must reject corrupt record bytes");
+        assert!(
+            error.contains("invalid end_seq flag"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_read_segment_rejects_oversized_record_length_before_allocation() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("oversized.db");
+        let seg_path = segment_path(&db_path, 1);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&SegmentHeader::new(1, 1).to_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&seg_path, bytes).expect("write corrupt segment");
+
+        let error =
+            read_segment(&seg_path).expect_err("oversized record length must fail before alloc");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("exceeds maximum"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn test_segment_write_and_recovery_canonicalize_intra_epoch_order() {
         use tempfile::tempdir;
 
@@ -2218,6 +2340,46 @@ mod tests {
                 .to_string()
                 .contains("segment epoch 5 contains record from epoch 4"),
             "unexpected error: {error}"
+        );
+        assert!(
+            !segment_path(&db_path, 5).exists(),
+            "failed validation must not create or truncate a segment file"
+        );
+    }
+
+    #[test]
+    fn test_write_segment_rejects_oversized_page_image_before_create() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("oversized-write.db");
+        let batch = EpochFlushBatch {
+            epoch: 5,
+            records: vec![WalRecord {
+                txn_token: TxnToken::new(
+                    fsqlite_types::TxnId::new(1).expect("txn id should be non-zero"),
+                    fsqlite_types::TxnEpoch::new(0),
+                ),
+                epoch: 5,
+                page_id: PageNumber::new(1).expect("page should be non-zero"),
+                begin_seq: CommitSeq::new(100),
+                end_seq: Some(CommitSeq::new(100)),
+                before_image: Vec::new(),
+                after_image: vec![0xAB; MAX_SEGMENT_RECORD_IMAGE_BYTES + 1],
+            }],
+            records_per_core: vec![1],
+        };
+
+        let error = write_segment(&db_path, &batch, FsyncPolicy::Off)
+            .expect_err("segment write must reject oversized page images");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("after_image length"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !segment_path(&db_path, 5).exists(),
+            "failed validation must not create or truncate a segment file"
         );
     }
 

@@ -204,7 +204,7 @@ fn sort_cells_desc_by_ptr(v: &mut [(usize, usize, usize)]) {
 
 #[inline]
 fn cell_ptrs_are_descending(ptrs: &[u16]) -> bool {
-    ptrs.windows(2).all(|pair| pair[0] >= pair[1])
+    ptrs.windows(2).all(|pair| pair[0] > pair[1])
 }
 
 // ---------------------------------------------------------------------------
@@ -11138,6 +11138,29 @@ mod tests {
         assert!(cursor.next(&cx).unwrap());
         assert_eq!(cursor.rowid(&cx).unwrap(), 3);
         assert!(!cursor.next(&cx).unwrap());
+    }
+
+    #[test]
+    fn test_table_delete_rejects_duplicate_compact_leaf_pointer() {
+        let mut page = build_leaf_table(&[(1, b"one"), (2, b"two"), (3, b"three")]);
+        let duplicate_ptr = u16::from_be_bytes([page[10], page[11]]);
+        page[12..14].copy_from_slice(&duplicate_ptr.to_be_bytes());
+        page[5..7].copy_from_slice(&duplicate_ptr.to_be_bytes());
+
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, page);
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+        assert!(cursor.first(&cx).unwrap());
+
+        let err = cursor
+            .delete(&cx)
+            .expect_err("duplicate compact cell pointers must be rejected as corruption");
+        assert!(
+            matches!(err, FrankenError::DatabaseCorrupt { ref detail } if detail.contains("not monotone")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

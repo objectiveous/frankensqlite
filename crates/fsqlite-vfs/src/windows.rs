@@ -767,7 +767,7 @@ impl VfsFile for WindowsFile {
                             });
                         }
                         let mut updated_region = occupied.get().clone();
-                        updated_region.resize(size_usize);
+                        updated_region.try_resize_heap(size_usize)?;
                         occupied.insert(updated_region);
                     }
                     occupied.into_mut()

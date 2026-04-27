@@ -378,9 +378,7 @@ impl ShmRegion {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let range = self.checked_aligned_u64_offset(offset, guard.len())?;
-                let bytes: [u8; 8] = guard[range]
-                    .try_into()
-                    .expect("slice is exactly 8 bytes");
+                let bytes: [u8; 8] = guard[range].try_into().expect("slice is exactly 8 bytes");
                 Ok(u64::from_le_bytes(bytes))
             }
             #[cfg(unix)]
@@ -537,40 +535,17 @@ impl ShmRegion {
         }
     }
 
-    /// Resize the shared memory region.
-    ///
-    /// This is only supported for heap-backed regions. Mmap-backed regions
-    /// must be remapped by calling `shm_map` again with the new size.
+    /// Resize a heap-backed shared-memory region without panicking on OOM.
     ///
     /// Existing clones of this `ShmRegion` will still share the same underlying
     /// data, but their locally cached `len()` will not be updated. This matches
     /// the semantics of `mremap` where other handles must explicitly remap
     /// to see the new size, while still sharing the physical bytes.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if called on an mmap-backed region.
-    pub fn resize(&mut self, new_size: usize) {
-        match &self.backing {
-            ShmRegionBacking::Heap(data) => {
-                let mut guard = data
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if new_size > guard.len() {
-                    guard.resize(new_size, 0);
-                } else if new_size < guard.len() {
-                    guard.truncate(new_size);
-                }
-                self.len = new_size;
-            }
-            #[cfg(unix)]
-            ShmRegionBacking::Mmap(_) => {
-                panic!("cannot resize mmap-backed ShmRegion; remap instead");
-            }
-        }
-    }
-
-    /// Resize a heap-backed shared-memory region without panicking on OOM.
+    /// Returns [`FrankenError::Unsupported`] for mmap-backed regions, which
+    /// must be remapped by calling `shm_map` again with the new size.
     pub fn try_resize_heap(&mut self, new_size: usize) -> Result<()> {
         match &self.backing {
             ShmRegionBacking::Heap(data) => {
@@ -630,7 +605,7 @@ impl ShmRegion {
     }
 
     fn checked_aligned_u64_offset(&self, offset: usize, actual_len: usize) -> Result<Range<usize>> {
-        if !offset.is_multiple_of(std::mem::align_of::<u64>()) {
+        if offset % std::mem::align_of::<u64>() != 0 {
             return Err(FrankenError::OutOfRange {
                 what: "SHM atomic u64 access".to_owned(),
                 value: format!("unaligned offset={offset}"),
@@ -645,10 +620,12 @@ impl ShmRegion {
         len: usize,
         what: &'static str,
     ) -> Result<Range<usize>> {
-        let end = offset.checked_add(width).ok_or_else(|| FrankenError::OutOfRange {
-            what: what.to_owned(),
-            value: format!("offset={offset} width={width} len={len}"),
-        })?;
+        let end = offset
+            .checked_add(width)
+            .ok_or_else(|| FrankenError::OutOfRange {
+                what: what.to_owned(),
+                value: format!("offset={offset} width={width} len={len}"),
+            })?;
         if end > len {
             return Err(FrankenError::OutOfRange {
                 what: what.to_owned(),
@@ -942,6 +919,56 @@ mod tests {
     fn test_shm_region_read_u64_out_of_bounds() {
         let region = ShmRegion::new(8);
         let err = region.read_u64_le(4).unwrap_err(); // offset 4 + 8 = 12 > 8
+        assert!(matches!(err, FrankenError::OutOfRange { .. }));
+    }
+
+    #[test]
+    fn test_shm_region_write_out_of_bounds_returns_error() {
+        let region = ShmRegion::new(4);
+        let err = region.write_u32_le(2, 99).unwrap_err();
+        assert!(matches!(err, FrankenError::OutOfRange { .. }));
+
+        let region = ShmRegion::new(8);
+        let err = region.write_u64_le(4, 99).unwrap_err();
+        assert!(matches!(err, FrankenError::OutOfRange { .. }));
+    }
+
+    #[test]
+    fn test_shm_region_offset_overflow_returns_error() {
+        let region = ShmRegion::new(64);
+
+        let err = region.read_u32_le(usize::MAX - 1).unwrap_err();
+        assert!(matches!(err, FrankenError::OutOfRange { .. }));
+
+        let err = region.write_u64_le(usize::MAX - 7, 99).unwrap_err();
+        assert!(matches!(err, FrankenError::OutOfRange { .. }));
+    }
+
+    #[test]
+    fn test_shm_region_atomic_bad_offsets_return_error() {
+        let region = ShmRegion::new(16);
+
+        let err = region.atomic_load_u64_le(4, Ordering::SeqCst).unwrap_err();
+        assert!(matches!(err, FrankenError::OutOfRange { .. }));
+
+        let err = region
+            .atomic_store_u64_le(12, 99, Ordering::SeqCst)
+            .unwrap_err();
+        assert!(matches!(err, FrankenError::OutOfRange { .. }));
+
+        let err = region
+            .atomic_compare_exchange_u64_le(usize::MAX, 0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .unwrap_err();
+        assert!(matches!(err, FrankenError::OutOfRange { .. }));
+    }
+
+    #[test]
+    fn test_shm_region_stale_clone_after_shrink_returns_error() {
+        let mut region = ShmRegion::new(16);
+        let clone = region.clone();
+        region.try_resize_heap(4).unwrap();
+
+        let err = clone.read_u64_le(8).unwrap_err();
         assert!(matches!(err, FrankenError::OutOfRange { .. }));
     }
 

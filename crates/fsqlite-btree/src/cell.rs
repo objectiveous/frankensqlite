@@ -302,11 +302,27 @@ pub fn read_cell_pointers_into(
         });
     }
 
-    if ptr_array_end > header.cell_content_offset as usize {
+    let cell_content_offset =
+        usize::try_from(header.cell_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "cell content offset {} exceeds platform address range",
+                header.cell_content_offset
+            ),
+        })?;
+    if count > 0 && cell_content_offset >= page.len() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "non-empty page cell content offset {cell_content_offset} starts outside page of {} bytes",
+                page.len()
+            ),
+        });
+    }
+
+    if ptr_array_end > cell_content_offset {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
                 "cell pointer array overlaps with cell content area: ptr_end={} > content={}",
-                ptr_array_end, header.cell_content_offset
+                ptr_array_end, cell_content_offset
             ),
         });
     }
@@ -1067,6 +1083,42 @@ mod tests {
 
         let read_ptrs = read_cell_pointers(&page, &header, 0).unwrap();
         assert_eq!(read_ptrs, vec![3900, 3950, 4000]);
+    }
+
+    #[test]
+    fn test_read_cell_pointers_rejects_non_empty_page_with_65536_content_offset() {
+        let header = BtreePageHeader {
+            page_type: BtreePageType::LeafTable,
+            first_freeblock: 0,
+            cell_count: 1,
+            cell_content_offset: 65536,
+            fragmented_free_bytes: 0,
+            right_child: None,
+        };
+
+        let mut page = vec![0u8; 4096];
+        header.write(&mut page, 0);
+
+        let err = read_cell_pointers(&page, &header, 0).unwrap_err();
+        assert!(err.to_string().contains("starts outside page"));
+    }
+
+    #[test]
+    fn test_read_cell_pointers_rejects_non_empty_page_with_end_content_offset() {
+        let header = BtreePageHeader {
+            page_type: BtreePageType::LeafTable,
+            first_freeblock: 0,
+            cell_count: 1,
+            cell_content_offset: 4096,
+            fragmented_free_bytes: 0,
+            right_child: None,
+        };
+
+        let mut page = vec![0u8; 4096];
+        header.write(&mut page, 0);
+
+        let err = read_cell_pointers(&page, &header, 0).unwrap_err();
+        assert!(err.to_string().contains("starts outside page"));
     }
 
     // -- Local payload calculation tests --

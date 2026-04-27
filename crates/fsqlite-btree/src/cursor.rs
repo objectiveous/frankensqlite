@@ -5544,50 +5544,50 @@ impl<P: PageWriter> BtCursor<P> {
 
         if compact_cell_area && cell_ptrs_are_descending(&ptrs) {
             let page_bytes = page_data.as_bytes_mut();
-            let mut next_boundary = self.usable_size as usize;
-            let mut new_content_offset = self.usable_size as usize;
-            for (original_idx, ptr_slot) in ptrs.iter_mut().enumerate().take(original_len) {
-                let ptr = usize::from(*ptr_slot);
-                if ptr >= next_boundary {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: "compact table leaf cell offsets are not monotone".to_owned(),
-                    });
-                }
-                let size = next_boundary - ptr;
-                next_boundary = ptr;
-                if original_idx == delete_idx {
-                    continue;
-                }
-                new_content_offset = new_content_offset.checked_sub(size).ok_or_else(|| {
-                    FrankenError::DatabaseCorrupt {
+            let deleted_ptr = usize::from(ptrs[delete_idx]);
+            let deleted_upper = if delete_idx == 0 {
+                self.usable_size as usize
+            } else {
+                usize::from(ptrs[delete_idx - 1])
+            };
+            if deleted_ptr >= deleted_upper {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "compact table leaf cell offsets are not monotone".to_owned(),
+                });
+            }
+            let deleted_size = deleted_upper - deleted_ptr;
+            let old_content_offset = header.content_offset(self.usable_size);
+            if old_content_offset > deleted_ptr {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "compact table leaf content offset exceeds deleted cell".to_owned(),
+                });
+            }
+            let new_content_offset =
+                old_content_offset
+                    .checked_add(deleted_size)
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: "table leaf cell size overflow during delete defragmentation"
                             .to_owned(),
-                    }
-                })?;
-                if new_content_offset < ptr_array_end {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: "table leaf cell content overlaps pointer array during delete defragmentation"
-                            .to_owned(),
-                    });
-                }
-                if new_content_offset != ptr {
-                    page_bytes.copy_within(ptr..ptr + size, new_content_offset);
-                }
-                *ptr_slot = u16::try_from(new_content_offset).map_err(|_| {
-                    FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "table leaf cell offset {} exceeds u16 range on page {}",
-                            new_content_offset,
-                            leaf_page_no.get()
-                        ),
-                    }
-                })?;
-            }
-            if next_boundary != header.content_offset(self.usable_size) {
+                    })?;
+            if new_content_offset > self.usable_size as usize || new_content_offset < ptr_array_end
+            {
                 return Err(FrankenError::DatabaseCorrupt {
-                    detail: "compact table leaf content offset does not match cell extent"
+                    detail: "table leaf cell content overlaps pointer array during delete defragmentation"
                         .to_owned(),
                 });
+            }
+            if old_content_offset < deleted_ptr {
+                page_bytes.copy_within(old_content_offset..deleted_ptr, new_content_offset);
+            }
+            for ptr_slot in ptrs.iter_mut().skip(delete_idx + 1) {
+                let adjusted = usize::from(*ptr_slot) + deleted_size;
+                *ptr_slot = u16::try_from(adjusted).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table leaf cell offset {} exceeds u16 range on page {}",
+                        adjusted,
+                        leaf_page_no.get()
+                    ),
+                })?;
             }
             ptrs.remove(delete_idx);
             if new_content_offset > ptr_array_end {

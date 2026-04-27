@@ -23,6 +23,16 @@ const DEFAULT_ITERS: usize = 10;
 const BENCH_CREATE_SQL: &str =
     "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT NOT NULL, value REAL NOT NULL)";
 const BENCH_INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, ('user_' || ?1), (?1 * 0.137))";
+const BENCHMARK_PRAGMAS: &[&str] = &[
+    "PRAGMA page_size = 4096;",
+    "PRAGMA journal_mode = WAL;",
+    "PRAGMA synchronous = NORMAL;",
+    "PRAGMA cache_size = -64000;",
+    // This profiler never issues FOR SYSTEM_TIME queries. Match
+    // comprehensive_bench's write scenarios and suppress the optional
+    // MemDatabase history clone that otherwise runs on each explicit COMMIT.
+    "PRAGMA fsqlite_capture_time_travel_snapshots=false;",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkloadKind {
@@ -151,23 +161,27 @@ fn per_row_ns(total_ns: u128, op_count: usize, iters: usize) -> f64 {
     }
 }
 
-fn apply_benchmark_pragmas(conn: &fsqlite::Connection) {
-    for pragma in [
-        "PRAGMA page_size = 4096;",
-        "PRAGMA journal_mode = WAL;",
-        "PRAGMA synchronous = NORMAL;",
-        "PRAGMA cache_size = -64000;",
-    ] {
-        let _ = conn.execute(pragma);
+fn apply_benchmark_pragmas(conn: &fsqlite::Connection) -> Result<(), RunError> {
+    for pragma in BENCHMARK_PRAGMAS {
+        conn.execute(pragma)
+            .map_err(|err| RunError::Runtime(format!("apply benchmark pragma {pragma}: {err}")))?;
     }
 
     if std::env::var("FSQLITE_BENCH_LAB_UNSAFE")
         .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
     {
-        let _ = conn.execute("PRAGMA fsqlite.write_merge = LAB_UNSAFE;");
-        let _ = conn.execute("PRAGMA fsqlite.ssi_e_process_alpha = 0.001;");
+        for pragma in [
+            "PRAGMA fsqlite.write_merge = LAB_UNSAFE;",
+            "PRAGMA fsqlite.ssi_e_process_alpha = 0.001;",
+        ] {
+            conn.execute(pragma).map_err(|err| {
+                RunError::Runtime(format!("apply benchmark pragma {pragma}: {err}"))
+            })?;
+        }
     }
+
+    Ok(())
 }
 
 fn run_benchmark(args: &BenchArgs) -> Result<(), RunError> {
@@ -195,7 +209,7 @@ fn run_benchmark(args: &BenchArgs) -> Result<(), RunError> {
     for iter in 0..args.iters {
         let conn = fsqlite::Connection::open(":memory:")
             .map_err(|err| RunError::Runtime(format!("open in-memory database: {err}")))?;
-        apply_benchmark_pragmas(&conn);
+        apply_benchmark_pragmas(&conn)?;
         conn.execute(BENCH_CREATE_SQL)
             .map_err(|err| RunError::Runtime(format!("create benchmark table: {err}")))?;
         conn.execute("BEGIN")
@@ -286,8 +300,8 @@ fn run_benchmark(args: &BenchArgs) -> Result<(), RunError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BENCH_CREATE_SQL, BENCH_INSERT_SQL, BenchArgs, DEFAULT_ITERS, DEFAULT_ROWS, RunError,
-        WorkloadKind, parse_args, per_row_ns, run_benchmark,
+        BENCH_CREATE_SQL, BENCH_INSERT_SQL, BENCHMARK_PRAGMAS, BenchArgs, DEFAULT_ITERS,
+        DEFAULT_ROWS, RunError, WorkloadKind, parse_args, per_row_ns, run_benchmark,
     };
 
     #[test]
@@ -351,6 +365,15 @@ mod tests {
         assert_eq!(
             BENCH_INSERT_SQL,
             "INSERT INTO bench VALUES (?1, ('user_' || ?1), (?1 * 0.137))"
+        );
+    }
+
+    #[test]
+    fn benchmark_pragmas_disable_time_travel_capture() {
+        assert!(
+            BENCHMARK_PRAGMAS.iter().any(|pragma| pragma
+                .eq_ignore_ascii_case("PRAGMA fsqlite_capture_time_travel_snapshots=false;")),
+            "perf-update-delete should profile UPDATE/DELETE, not optional time-travel snapshot cloning"
         );
     }
 

@@ -2419,7 +2419,7 @@ fn decode_big_endian_signed(bytes: &[u8]) -> i64 {
 }
 
 /// Encode a `SqliteValue` into its serial type byte representation.
-#[inline(always)]
+#[inline]
 fn encode_serialized_value(value: &SqliteValue, payload_len: usize, buf: &mut [u8]) {
     debug_assert_eq!(buf.len(), payload_len);
     match value {

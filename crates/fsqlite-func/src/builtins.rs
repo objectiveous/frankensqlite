@@ -433,8 +433,10 @@ impl ScalarFunction for InstrFunc {
             _ => {
                 // Text: character-level search.
                 // SQLite: empty needle returns 1, empty haystack with non-empty needle returns 0.
-                let haystack = args[0].to_text();
-                let needle = args[1].to_text();
+                let haystack = text_arg(&args[0]);
+                let needle = text_arg(&args[1]);
+                let haystack = haystack.as_ref();
+                let needle = needle.as_ref();
                 if needle.is_empty() {
                     return Ok(SqliteValue::Integer(1));
                 }
@@ -442,7 +444,7 @@ impl ScalarFunction for InstrFunc {
                     return Ok(SqliteValue::Integer(0));
                 }
                 let pos = haystack
-                    .find(&needle)
+                    .find(needle)
                     .map_or(0, |byte_pos| haystack[..byte_pos].chars().count() + 1);
                 Ok(SqliteValue::Integer(i64::try_from(pos).unwrap_or(0)))
             }
@@ -2856,6 +2858,46 @@ mod tests {
             )
             .unwrap(),
             SqliteValue::Integer(1)
+        );
+    }
+
+    #[test]
+    #[ignore = "perf-only benchmark"]
+    fn perf_instr_text_args() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const INVOCATIONS: usize = 100_000;
+        const REPEATS: usize = 5;
+
+        let f = InstrFunc;
+        let args = [
+            SqliteValue::Text(SmallText::from_string("payload payload sentinel")),
+            SqliteValue::Text(SmallText::from_string("sentinel")),
+        ];
+
+        let mut best_ns = u128::MAX;
+        let mut result_value = 0i64;
+        for _ in 0..REPEATS {
+            let started = Instant::now();
+            for _ in 0..INVOCATIONS {
+                let result = black_box(
+                    f.invoke(black_box(args.as_slice()))
+                        .expect("instr benchmark invocation must succeed"),
+                );
+                result_value = match result {
+                    SqliteValue::Integer(value) => value,
+                    SqliteValue::Null
+                    | SqliteValue::Float(_)
+                    | SqliteValue::Text(_)
+                    | SqliteValue::Blob(_) => 0,
+                };
+            }
+            best_ns = best_ns.min(started.elapsed().as_nanos());
+        }
+
+        println!(
+            "instr_text_args invocations={INVOCATIONS} repeats={REPEATS} best_ns={best_ns} result_value={result_value}"
         );
     }
 

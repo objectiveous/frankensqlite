@@ -295,15 +295,20 @@ impl ScalarFunction for ConcatWsFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
-        let sep = args[0].to_text();
-        let mut parts = Vec::new();
+        let sep = text_arg(&args[0]);
+        let mut result = String::new();
+        let mut has_part = false;
         for arg in &args[1..] {
             // NULL args are skipped entirely
             if !arg.is_null() {
-                parts.push(arg.to_text());
+                if has_part {
+                    result.push_str(sep.as_ref());
+                }
+                result.push_str(text_arg(arg).as_ref());
+                has_part = true;
             }
         }
-        Ok(SqliteValue::Text(SmallText::from_string(parts.join(&sep))))
+        Ok(SqliteValue::Text(SmallText::from_string(result)))
     }
 
     fn num_args(&self) -> i32 {

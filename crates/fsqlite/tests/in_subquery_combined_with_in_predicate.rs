@@ -5,7 +5,7 @@
 //!
 //! The fix landed before this test was written; this test guards the property.
 
-use fsqlite::Connection;
+use fsqlite::{Connection, Row};
 use fsqlite_types::SqliteValue;
 
 fn setup() -> Connection {
@@ -31,12 +31,14 @@ fn setup() -> Connection {
         .unwrap();
     conn.execute("INSERT INTO issues VALUES ('b', 'feature', 'open');")
         .unwrap();
-    conn.execute("INSERT INTO labels VALUES ('a', 'core');").unwrap();
-    conn.execute("INSERT INTO labels VALUES ('b', 'core');").unwrap();
+    conn.execute("INSERT INTO labels VALUES ('a', 'core');")
+        .unwrap();
+    conn.execute("INSERT INTO labels VALUES ('b', 'core');")
+        .unwrap();
     conn
 }
 
-fn ids(rows: &[fsqlite_types::Row]) -> Vec<String> {
+fn ids(rows: &[Row]) -> Vec<String> {
     rows.iter()
         .map(|r| match &r.values()[0] {
             SqliteValue::Text(s) => s.to_string(),

@@ -75,6 +75,22 @@ impl WalGenerationIdentity {
     }
 }
 
+#[inline]
+fn push_wal_frame_bytes(
+    frame_scratch: &mut Vec<u8>,
+    page_number: u32,
+    db_size_if_commit: u32,
+    salts: WalSalts,
+    page_data: &[u8],
+) {
+    frame_scratch.extend_from_slice(&page_number.to_be_bytes());
+    frame_scratch.extend_from_slice(&db_size_if_commit.to_be_bytes());
+    frame_scratch.extend_from_slice(&salts.salt1.to_be_bytes());
+    frame_scratch.extend_from_slice(&salts.salt2.to_be_bytes());
+    frame_scratch.extend_from_slice(&[0_u8; 8]);
+    frame_scratch.extend_from_slice(page_data);
+}
+
 /// A WAL file backed by a VFS file handle.
 ///
 /// Manages the write-ahead log: creation, sequential frame append with
@@ -699,19 +715,19 @@ impl<F: VfsFile> WalFile<F> {
         let offset = self.frame_offset(self.frame_count);
 
         let mut frame_scratch = std::mem::take(&mut self.frame_scratch);
-        frame_scratch.resize(frame_size, 0);
+        frame_scratch.clear();
+        if frame_scratch.capacity() < frame_size {
+            frame_scratch.reserve(frame_size - frame_scratch.capacity());
+        }
         let append_result = (|| -> Result<SqliteWalChecksum> {
+            push_wal_frame_bytes(
+                &mut frame_scratch,
+                page_number,
+                db_size_if_commit,
+                salts,
+                page_data,
+            );
             let frame = &mut frame_scratch[..frame_size];
-
-            // Write page number and db_size into the first 8 bytes.
-            frame[..4].copy_from_slice(&page_number.to_be_bytes());
-            frame[4..8].copy_from_slice(&db_size_if_commit.to_be_bytes());
-
-            // Write salts.
-            write_wal_frame_salts(&mut frame[..WAL_FRAME_HEADER_SIZE], salts)?;
-
-            // Copy page data.
-            frame[WAL_FRAME_HEADER_SIZE..].copy_from_slice(page_data);
 
             // Compute and write checksum (updates bytes 16..24 of the frame header).
             let new_checksum =
@@ -1088,7 +1104,10 @@ impl<F: VfsFile> WalFile<F> {
         let frame_count_before = self.frame_count;
 
         let mut frame_scratch = std::mem::take(&mut self.frame_scratch);
-        frame_scratch.resize(total_bytes, 0);
+        frame_scratch.clear();
+        if frame_scratch.capacity() < total_bytes {
+            frame_scratch.reserve(total_bytes - frame_scratch.capacity());
+        }
         // bd-db300.3.8.6: Fuse frame assembly + checksum computation into a
         // single pass, eliminating the intermediate Vec<WalChecksumTransform>
         // allocation and the redundant second write_wal_frame_salts call that
@@ -1118,13 +1137,16 @@ impl<F: VfsFile> WalFile<F> {
                 let buf_offset = idx
                     .checked_mul(frame_size)
                     .ok_or(FrankenError::DatabaseFull)?;
-                let frame_slice = &mut frame_scratch[buf_offset..buf_offset + frame_size];
 
                 // Build the frame: page_number, db_size, salts, page data.
-                frame_slice[..4].copy_from_slice(&frame.page_number.to_be_bytes());
-                frame_slice[4..8].copy_from_slice(&frame.db_size_if_commit.to_be_bytes());
-                write_wal_frame_salts(&mut frame_slice[..WAL_FRAME_HEADER_SIZE], salts)?;
-                frame_slice[WAL_FRAME_HEADER_SIZE..].copy_from_slice(frame.page_data);
+                push_wal_frame_bytes(
+                    &mut frame_scratch,
+                    frame.page_number,
+                    frame.db_size_if_commit,
+                    salts,
+                    frame.page_data,
+                );
+                let frame_slice = &mut frame_scratch[buf_offset..buf_offset + frame_size];
 
                 // Compute and write the checksum inline — no transform Vec needed.
                 running_checksum = write_wal_frame_checksum(

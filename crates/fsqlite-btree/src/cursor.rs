@@ -5514,7 +5514,8 @@ impl<P: PageWriter> BtCursor<P> {
         let mut page_data = self.pager.read_page_data(cx, leaf_page_no)?;
         let header_offset = cell::header_offset_for_page(leaf_page_no);
         let mut header = cell::parse_page_header(page_data.as_bytes(), leaf_page_no)?;
-        let mut ptrs = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
+        let mut ptrs = take_pooled_cell_pointers();
+        cell::read_cell_pointers_into(page_data.as_bytes(), &header, header_offset, &mut ptrs)?;
         let original_len = ptrs.len();
         if delete_idx >= original_len {
             return Err(FrankenError::DatabaseCorrupt {
@@ -5725,7 +5726,9 @@ impl<P: PageWriter> BtCursor<P> {
             header.write(page_bytes, header_offset);
             cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
         } else {
-            let mut cells_to_move = Vec::with_capacity(ptrs.len());
+            let mut cells_to_move = std::mem::take(&mut self.defrag_cells_scratch);
+            cells_to_move.clear();
+            cells_to_move.reserve(ptrs.len());
             if compact_cell_area {
                 for (original_idx, &off) in ptrs.iter().enumerate() {
                     let post_delete_idx = match original_idx.cmp(&delete_idx) {
@@ -5774,7 +5777,7 @@ impl<P: PageWriter> BtCursor<P> {
             {
                 let page_bytes = page_data.as_bytes_mut();
                 let mut new_content_offset = self.usable_size as usize;
-                for (ptr, size, i) in cells_to_move {
+                for &(ptr, size, i) in &cells_to_move {
                     if i == usize::MAX {
                         continue;
                     }
@@ -5830,9 +5833,11 @@ impl<P: PageWriter> BtCursor<P> {
                 header.write(page_bytes, header_offset);
                 cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
             }
+            self.defrag_cells_scratch = cells_to_move;
         }
 
         self.pager.write_page_data(cx, leaf_page_no, page_data)?;
+        recycle_cell_pointers(ptrs);
 
         let mut refreshed = self.reload_page_fresh(cx, leaf_page_no)?;
         let new_count = refreshed.header.cell_count;

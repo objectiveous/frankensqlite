@@ -8131,6 +8131,9 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             .stack
             .last()
             .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
+        if top.header.page_type.is_leaf() && top.header.page_type.is_table() {
+            return Self::table_leaf_rowid_at(top, top.cell_idx);
+        }
         let cell = self.parse_cell_at(top, top.cell_idx)?;
         if let Some(rowid) = cell.rowid {
             return Ok(rowid);
@@ -13437,6 +13440,22 @@ mod tests {
             .payload_prefix_into(&cx, 5, &mut prefix)
             .expect("local leaf prefix read should succeed");
         assert_eq!(prefix, b"small");
+    }
+
+    #[test]
+    fn test_rowid_reads_table_leaf_without_cell_slot_parse() {
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_leaf_table(&[(7, b"seven"), (9, b"nine")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+        assert!(cursor.table_move_to(&cx, 9).unwrap().is_found());
+        assert!(cursor.cell_slot_cache.borrow().entries.is_empty());
+
+        assert_eq!(cursor.rowid(&cx).unwrap(), 9);
+        assert!(cursor.cell_slot_cache.borrow().entries.is_empty());
     }
 
     #[test]

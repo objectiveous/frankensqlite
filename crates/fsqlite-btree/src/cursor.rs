@@ -7350,6 +7350,31 @@ impl<P: PageWriter> BtCursor<P> {
             .map(TableAppendHint::from)
     }
 
+    /// Overwrite the payload bytes for the currently positioned leaf-table row
+    /// when the new record has the same local, non-overflow size.
+    ///
+    /// This is a deliberately narrow primitive for direct UPDATE fast paths that
+    /// have already proven the rowid is unchanged and no secondary index or
+    /// trigger maintenance is required.  It preserves the cell header, rowid
+    /// varint, pointer array, freeblock chain, and cursor position; callers fall
+    /// back to delete+insert whenever the record size changes or overflow is
+    /// involved.
+    #[doc(hidden)]
+    pub fn table_overwrite_current_payload_same_size_no_overflow(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        payload: &[u8],
+    ) -> Result<bool> {
+        let result = self.with_btree_op(cx, BtreeOpType::Delete, |cursor| {
+            cursor.overwrite_current_table_payload_same_size_no_overflow(cx, rowid, payload)
+        });
+        if matches!(result, Ok(true)) {
+            self.bump_row_image_epoch();
+        }
+        result
+    }
+
     /// Swap in or out an external reusable cell-assembly buffer.
     ///
     /// Fresh cursor instances otherwise start with an empty `cell_buf`, which
@@ -7359,6 +7384,60 @@ impl<P: PageWriter> BtCursor<P> {
     #[doc(hidden)]
     pub fn swap_cell_scratch(&mut self, scratch: &mut Vec<u8>) {
         std::mem::swap(&mut self.cell_buf, scratch);
+    }
+
+    fn overwrite_current_table_payload_same_size_no_overflow(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        payload: &[u8],
+    ) -> Result<bool> {
+        observe_cursor_cancellation(cx)?;
+        self.clear_rightmost_leaf_cache();
+
+        let Some(top) = self.stack.last() else {
+            return Ok(false);
+        };
+        if self.at_eof || top.header.page_type != BtreePageType::LeafTable {
+            return Ok(false);
+        }
+
+        let leaf_page_no = top.page_no;
+        let cell_idx = top.cell_idx;
+        let cell = self.parse_cell_at(top, cell_idx)?;
+        if cell.rowid != Some(rowid)
+            || cell.overflow_page.is_some()
+            || usize::try_from(cell.payload_size).ok() != Some(payload.len())
+            || usize::try_from(cell.local_size).ok() != Some(payload.len())
+        {
+            return Ok(false);
+        }
+
+        let usable_size = usize::try_from(self.usable_size).unwrap_or(usize::MAX);
+        let end = cell
+            .payload_offset
+            .checked_add(payload.len())
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "same-size payload overwrite offset overflow".to_owned(),
+            })?;
+
+        let staged_page = {
+            let entry = self
+                .stack
+                .last_mut()
+                .ok_or_else(|| FrankenError::internal("cursor stack empty during overwrite"))?;
+            if end > entry.page_data.as_bytes().len() || end > usable_size {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "same-size payload overwrite extends past usable page".to_owned(),
+                });
+            }
+            entry.page_data.as_bytes_mut()[cell.payload_offset..end].copy_from_slice(payload);
+            entry.mutation_counter = Self::page_mutation_counter(&entry.page_data);
+            entry.page_data.clone()
+        };
+        self.pager.write_page_data(cx, leaf_page_no, staged_page)?;
+        self.at_eof = false;
+        Ok(true)
     }
 
     fn local_leaf_table_cell<'a>(
@@ -12449,6 +12528,42 @@ mod tests {
             }
         }
         assert!(!cursor.next(&cx).unwrap());
+    }
+
+    #[test]
+    fn test_table_overwrite_current_payload_same_size_no_overflow_preserves_cell_shape() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(
+            2,
+            build_leaf_table(&[(1, b"aaaaaaaa"), (2, b"bbbbbbbb"), (3, b"cccccccc")]),
+        );
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
+
+        assert!(
+            cursor
+                .table_overwrite_current_payload_same_size_no_overflow(&cx, 2, b"BBBBBBBB")
+                .unwrap()
+        );
+        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
+        assert_eq!(cursor.payload(&cx).unwrap(), b"BBBBBBBB");
+
+        assert!(
+            !cursor
+                .table_overwrite_current_payload_same_size_no_overflow(&cx, 2, b"too-long!")
+                .unwrap(),
+            "size-changing updates must fall back to delete+insert"
+        );
+        assert_eq!(cursor.payload(&cx).unwrap(), b"BBBBBBBB");
+
+        assert!(cursor.table_move_to(&cx, 1).unwrap().is_found());
+        assert_eq!(cursor.payload(&cx).unwrap(), b"aaaaaaaa");
+        assert!(cursor.next(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
+        assert!(cursor.next(&cx).unwrap());
+        assert_eq!(cursor.payload(&cx).unwrap(), b"cccccccc");
     }
 
     #[test]

@@ -1614,8 +1614,9 @@ impl ScalarFunction for SqliteCompileoptionUsedFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
+        let query = text_arg(&args[0]);
         Ok(SqliteValue::Integer(i64::from(sqlite_compileoption_used(
-            &args[0].to_text(),
+            query.as_ref(),
         ))))
     }
 
@@ -4122,6 +4123,57 @@ mod tests {
         assert_eq!(
             invoke1(&func, SqliteValue::Null).unwrap(),
             SqliteValue::Null
+        );
+    }
+
+    #[test]
+    #[ignore = "perf-only benchmark"]
+    fn perf_compileoption_used_text_args() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const INVOCATIONS: usize = 1_000_000;
+        const REPEATS: usize = 7;
+
+        let f = SqliteCompileoptionUsedFunc;
+        let present_args = [SqliteValue::Text(SmallText::from_string(
+            "SQLITE_ENABLE_ICU",
+        ))];
+        let absent_args = [SqliteValue::Text(SmallText::from_string(
+            "ENABLE_NOT_PRESENT",
+        ))];
+
+        let mut present_best_ns = u128::MAX;
+        let mut absent_best_ns = u128::MAX;
+        let mut checksum = 0i64;
+        for _ in 0..REPEATS {
+            let started = Instant::now();
+            for _ in 0..INVOCATIONS {
+                let result = black_box(
+                    f.invoke(black_box(present_args.as_slice()))
+                        .expect("compileoption present benchmark invocation must succeed"),
+                );
+                if let SqliteValue::Integer(value) = result {
+                    checksum = checksum.wrapping_add(value);
+                }
+            }
+            present_best_ns = present_best_ns.min(started.elapsed().as_nanos());
+
+            let started = Instant::now();
+            for _ in 0..INVOCATIONS {
+                let result = black_box(
+                    f.invoke(black_box(absent_args.as_slice()))
+                        .expect("compileoption absent benchmark invocation must succeed"),
+                );
+                if let SqliteValue::Integer(value) = result {
+                    checksum = checksum.wrapping_add(value);
+                }
+            }
+            absent_best_ns = absent_best_ns.min(started.elapsed().as_nanos());
+        }
+
+        println!(
+            "compileoption_used_text_args invocations={INVOCATIONS} repeats={REPEATS} present_best_ns={present_best_ns} absent_best_ns={absent_best_ns} checksum={checksum}"
         );
     }
 

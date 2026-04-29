@@ -1163,15 +1163,16 @@ impl ScalarFunction for UnhexFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
-        let input = args[0].to_text();
+        let input = text_arg(&args[0]);
         let ignore_chars: Vec<char> = if args.len() > 1 && !args[1].is_null() {
-            args[1].to_text().chars().collect()
+            text_arg(&args[1]).chars().collect()
         } else {
             Vec::new()
         };
 
         // Filter out ignored characters
         let filtered: String = input
+            .as_ref()
             .chars()
             .filter(|c| !ignore_chars.contains(c))
             .collect();
@@ -3692,6 +3693,58 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(result, SqliteValue::Blob(Arc::from(b"Hel".as_slice())));
+    }
+
+    #[test]
+    #[ignore = "perf-only benchmark"]
+    fn perf_unhex_text_args() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const INVOCATIONS: usize = 300_000;
+        const REPEATS: usize = 7;
+
+        let f = UnhexFunc;
+        let plain_args = [SqliteValue::Text(SmallText::from_string(
+            "48656C6C6F776F726C64",
+        ))];
+        let ignore_args = [
+            SqliteValue::Text(SmallText::from_string("48-65-6C-6C-6F")),
+            SqliteValue::Text(SmallText::from_string("-")),
+        ];
+        let mut plain_best_ns = u128::MAX;
+        let mut ignore_best_ns = u128::MAX;
+        let mut checksum = 0usize;
+
+        for _ in 0..REPEATS {
+            let started = Instant::now();
+            for _ in 0..INVOCATIONS {
+                let result = black_box(
+                    f.invoke(black_box(plain_args.as_slice()))
+                        .expect("unhex benchmark invocation must succeed"),
+                );
+                if let SqliteValue::Blob(blob) = result {
+                    checksum = checksum.wrapping_add(blob.len());
+                }
+            }
+            plain_best_ns = plain_best_ns.min(started.elapsed().as_nanos());
+
+            let started = Instant::now();
+            for _ in 0..INVOCATIONS {
+                let result = black_box(
+                    f.invoke(black_box(ignore_args.as_slice()))
+                        .expect("unhex ignore benchmark invocation must succeed"),
+                );
+                if let SqliteValue::Blob(blob) = result {
+                    checksum = checksum.wrapping_add(blob.len());
+                }
+            }
+            ignore_best_ns = ignore_best_ns.min(started.elapsed().as_nanos());
+        }
+
+        println!(
+            "unhex_text_args invocations={INVOCATIONS} repeats={REPEATS} plain_best_ns={plain_best_ns} ignore_best_ns={ignore_best_ns} checksum={checksum}"
+        );
     }
 
     // ── unicode ──────────────────────────────────────────────────────────

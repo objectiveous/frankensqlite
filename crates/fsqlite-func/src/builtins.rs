@@ -1226,8 +1226,8 @@ impl ScalarFunction for UnicodeFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
-        let s = args[0].to_text();
-        match s.chars().next() {
+        let s = text_arg(&args[0]);
+        match s.as_ref().chars().next() {
             Some(c) => Ok(SqliteValue::Integer(i64::from(c as u32))),
             None => Ok(SqliteValue::Null),
         }
@@ -3699,6 +3699,39 @@ mod tests {
         assert_eq!(
             invoke1(&UnicodeFunc, SqliteValue::Text(SmallText::from_string("A"))).unwrap(),
             SqliteValue::Integer(65)
+        );
+    }
+
+    #[test]
+    #[ignore = "perf-only benchmark"]
+    fn perf_unicode_text_arg() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const INVOCATIONS: usize = 1_000_000;
+        const REPEATS: usize = 7;
+
+        let f = UnicodeFunc;
+        let args = [SqliteValue::Text(SmallText::from_string("Alphabet soup"))];
+        let mut text_best_ns = u128::MAX;
+        let mut checksum = 0i64;
+
+        for _ in 0..REPEATS {
+            let started = Instant::now();
+            for _ in 0..INVOCATIONS {
+                let result = black_box(
+                    f.invoke(black_box(args.as_slice()))
+                        .expect("unicode benchmark invocation must succeed"),
+                );
+                if let SqliteValue::Integer(codepoint) = result {
+                    checksum = checksum.wrapping_add(codepoint);
+                }
+            }
+            text_best_ns = text_best_ns.min(started.elapsed().as_nanos());
+        }
+
+        println!(
+            "unicode_text_arg invocations={INVOCATIONS} repeats={REPEATS} text_best_ns={text_best_ns} checksum={checksum}"
         );
     }
 

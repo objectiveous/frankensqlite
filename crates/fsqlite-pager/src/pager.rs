@@ -2000,7 +2000,7 @@ fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     write_set: &mut HashMap<PageNumber, StagedPage, S>,
     write_pages_sorted: &mut Vec<PageNumber>,
     committed_db_size: u32,
-    pending_freed_pages: &[PageNumber],
+    pending_free_pages: &[PageNumber],
 ) -> Result<()> {
     if committed_db_size == 0 {
         inner.freelist.clear();
@@ -2012,14 +2012,15 @@ fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     // never part of the durable file image, so they must not be serialized
     // into page-1 freelist metadata until db_size grows to include them.
     let upper_bound = inner.next_page.saturating_sub(1).max(committed_db_size);
-    // Build the predicted freelist from the committed freelist plus pending
-    // freed pages WITHOUT mutating inner.freelist. This prevents concurrent
-    // transactions from observing uncommitted freelist changes during the
-    // window between Phase A (prepare) and Phase B (WAL I/O) of the split-
-    // lock commit path. Freed pages are only promoted into inner.freelist
-    // after Phase B succeeds (in Phase C). See beads_rust#138.
+    // Build the predicted freelist from the committed freelist plus pages
+    // that will become free if this commit succeeds WITHOUT mutating
+    // inner.freelist. This prevents concurrent transactions from observing
+    // uncommitted freelist changes during the window between Phase A (prepare)
+    // and Phase B (WAL I/O) of the split-lock commit path. Newly free pages
+    // are only promoted into inner.freelist after Phase B succeeds (in Phase C).
+    // See beads_rust#138.
     let mut predicted_freelist = inner.freelist.clone();
-    return_pages_to_freelist(&mut predicted_freelist, pending_freed_pages.iter().copied());
+    return_pages_to_freelist(&mut predicted_freelist, pending_free_pages.iter().copied());
     let predicted_normalized = normalize_freelist(&predicted_freelist, upper_bound);
     // NOTE: Do NOT normalize inner.freelist here — this runs during Phase A
     // where inner.lock() may be released before Phase B. Mutating the shared
@@ -6233,27 +6234,22 @@ impl<V: Vfs> SimpleTransaction<V> {
     }
 
     #[must_use]
-    fn freelist_metadata_dirty_after_lease_return_with_inner(
+    fn freelist_metadata_dirty_with_pending_free_pages(
         &self,
         inner: &PagerInner<V::File>,
         committed_db_size: u32,
-        lease_return_affects_durable_freelist: bool,
+        pending_free_pages: &[PageNumber],
     ) -> bool {
-        if !lease_return_affects_durable_freelist
-            && self.freed_pages.is_empty()
+        if !pending_free_pages
+            .iter()
+            .any(|page| page.get() <= committed_db_size)
             && self.allocated_from_freelist.is_empty()
         {
             return false;
         }
 
-        self.freelist_metadata_dirty_with_inner(inner, committed_db_size)
-    }
-
-    #[must_use]
-    fn page_lease_return_affects_durable_freelist(&self, committed_db_size: u32) -> bool {
-        self.page_lease
-            .iter()
-            .any(|page| page.get() <= committed_db_size)
+        self.committed_durable_freelist_pages_with_inner(inner)
+            != Self::durable_freelist_pages_with_inner(inner, committed_db_size, pending_free_pages)
     }
 
     #[must_use]
@@ -6631,6 +6627,66 @@ impl<V: Vfs> SimpleTransaction<V> {
     fn discard_committed_pages(&mut self) {
         self.write_set.clear();
         self.write_pages_sorted.clear();
+    }
+
+    fn collect_unstaged_allocated_pages(&self) -> Vec<PageNumber> {
+        self.allocated_from_eof
+            .iter()
+            .chain(self.allocated_from_freelist.iter())
+            .copied()
+            .filter(|page| !self.write_set.contains_key(page) && !self.freed_pages.contains(page))
+            .collect()
+    }
+
+    fn pending_free_pages_for_commit(&self) -> Vec<PageNumber> {
+        let mut pending = self.collect_unstaged_allocated_pages();
+        pending.extend(self.page_lease.iter().copied());
+        pending.extend(self.freed_pages.iter().copied());
+        pending
+    }
+
+    fn drain_unstaged_allocated_pages(&mut self) -> Vec<PageNumber> {
+        let mut unstaged = Vec::new();
+        let write_set = &self.write_set;
+        let freed_pages = &self.freed_pages;
+
+        self.allocated_from_eof.retain(|page| {
+            let keep = write_set.contains_key(page) || freed_pages.contains(page);
+            if !keep {
+                unstaged.push(*page);
+            }
+            keep
+        });
+        self.allocated_from_freelist.retain(|page| {
+            let keep = write_set.contains_key(page) || freed_pages.contains(page);
+            if !keep {
+                unstaged.push(*page);
+            }
+            keep
+        });
+
+        unstaged
+    }
+
+    fn restore_uncommitted_allocations_for_clean_commit(
+        &mut self,
+        inner: &mut PagerInner<V::File>,
+    ) {
+        return_pages_to_freelist(&mut inner.freelist, self.allocated_from_freelist.drain(..));
+
+        if self.mode == TransactionMode::Concurrent {
+            return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
+            return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
+        } else {
+            self.page_lease.clear();
+            self.allocated_from_eof.clear();
+            inner.db_size = self.original_db_size;
+            inner.next_page = if inner.db_size >= 2 {
+                inner.db_size.saturating_add(1)
+            } else {
+                2
+            };
+        }
     }
 }
 
@@ -8371,12 +8427,11 @@ where
                      state was dropped between staging and commit",
                 ));
             }
-            let mut inner = self
-                .inner
+            let inner_arc = Arc::clone(&self.inner);
+            let mut inner = inner_arc
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-            // Return any unused lease pages.
-            return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
+            self.restore_uncommitted_allocations_for_clean_commit(&mut inner);
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
             if self.mode != TransactionMode::Concurrent {
                 inner.writer_active = false;
@@ -8423,18 +8478,15 @@ where
 
         // Phase A: Prepare write_set under inner lock (~20us)
         // Snapshot state needed for WAL I/O, then DROP inner.lock() immediately.
-        let mut inner = self
-            .inner
+        let inner_arc = Arc::clone(&self.inner);
+        let mut inner = inner_arc
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-        // Return unused lease pages after checking whether they can change
-        // the durable freelist. Volatile EOF lease pages above the commit
-        // size stay reusable in memory, but do not justify cloning and
-        // normalizing the durable freelist under the Phase A mutex.
         let committed_db_size = self.committed_db_size_with_inner(&inner);
-        let lease_return_affects_durable_freelist =
-            self.page_lease_return_affects_durable_freelist(committed_db_size);
-        return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
+        let mut pending_returned_pages = self.drain_unstaged_allocated_pages();
+        pending_returned_pages.append(&mut self.page_lease);
+        let mut pending_free_pages = pending_returned_pages.clone();
+        pending_free_pages.extend(self.freed_pages.iter().copied());
 
         // Declared outside the block so it survives to Phase C where freed
         // pages are promoted into inner.freelist after successful WAL commit.
@@ -8443,28 +8495,23 @@ where
         {
             // ShardedPageCache uses per-shard internal locking
             //
-            // Compute freelist_dirty BEFORE draining freed_pages, because
-            // predicted_durable_freelist_pages_with_inner reads self.freed_pages.
-            let freelist_dirty = self.freelist_metadata_dirty_after_lease_return_with_inner(
+            let freelist_dirty = self.freelist_metadata_dirty_with_pending_free_pages(
                 &inner,
                 committed_db_size,
-                lease_return_affects_durable_freelist,
+                &pending_free_pages,
             );
-            // CRITICAL FIX (beads_rust#138): Do NOT push freed_pages into
-            // inner.freelist during Phase A. In the split-lock WAL commit
-            // path, inner.lock() is released between Phase A and Phase B.
-            // If freed pages are pushed here, a concurrent transaction's
-            // Phase A can observe them and serialize a conflicting freelist
-            // into its write_set. When both batches reach the WAL, the
-            // last writer's page 1 (with stale/inconsistent freelist
-            // trunk pointer and count) overwrites the first writer's,
-            // creating orphaned pages ("page N is never used").
+            // CRITICAL FIX (beads_rust#138): Do NOT push pages that become
+            // free into inner.freelist during Phase A. In the split-lock WAL
+            // commit path, inner.lock() is released between Phase A and Phase B.
+            // If free pages are pushed here, a concurrent transaction's Phase A
+            // can observe and reuse them before this commit is durable, creating
+            // orphaned pages ("page N is never used") if WAL ordering flips.
             //
-            // Instead, we drain freed_pages into a local vec and pass it
-            // to the serializer which builds a predicted freelist from
-            // inner.freelist + pending_freed without mutating inner.freelist.
-            // The actual promotion into inner.freelist is deferred to
-            // Phase C (after WAL success).
+            // Instead, drain them into local vectors and pass the combined
+            // pending_free_pages to the serializer, which builds a predicted
+            // freelist without mutating inner.freelist. The actual promotion is
+            // deferred to Phase C (after WAL success), or to the failure cleanup
+            // for pages that were merely unused allocations.
             //
             // Capture the semantic Page 1 plan before freelist serialization
             // injects synthetic Page 1 metadata into the write_set. Otherwise
@@ -8482,9 +8529,10 @@ where
                     &mut self.write_set,
                     &mut self.write_pages_sorted,
                     committed_db_size,
-                    &pending_freed,
+                    &pending_free_pages,
                 ) {
                     self.freed_pages.extend(pending_freed);
+                    return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
                     return Err(e);
                 }
             }
@@ -8512,6 +8560,7 @@ where
                     Ok(p) => p,
                     Err(e) => {
                         self.freed_pages.extend(pending_freed);
+                        return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
                         return Err(e);
                     }
                 };
@@ -8544,7 +8593,7 @@ where
                 self.predicted_conflict_pages_for_wal_commit_with_inner(
                     &inner,
                     wal_page1_plan,
-                    &pending_freed,
+                    &pending_free_pages,
                 )
             } else {
                 Vec::new()
@@ -8588,6 +8637,12 @@ where
                 Ok(guard) => guard,
                 Err(e) => {
                     self.freed_pages.extend(pending_freed);
+                    if let Ok(mut recovery_inner) = self.inner.lock() {
+                        return_pages_to_freelist(
+                            &mut recovery_inner.freelist,
+                            pending_returned_pages,
+                        );
+                    }
                     return Err(e);
                 }
             };
@@ -8620,10 +8675,11 @@ where
 
         if commit_result.is_ok() {
             // Phase C1 (FAST, under inner.lock): Update metadata only.
-            // CRITICAL FIX (beads_rust#138): Now that WAL I/O has succeeded,
-            // promote the pending freed pages into inner.freelist. This is
-            // the deferred half of the Phase A fix — freed pages are only
-            // visible to other transactions after the WAL commit is durable.
+            // Now that WAL I/O has succeeded, promote pages that became free
+            // into inner.freelist. This is the deferred half of the Phase A
+            // fix: reusable pages become visible only after the WAL commit is
+            // durable.
+            return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
             return_pages_to_freelist(&mut inner.freelist, pending_freed);
             // Cross-process #70: the group-commit flusher already set
             // inner.db_size to final_db_size in WAL mode, but with concurrent
@@ -8756,6 +8812,7 @@ where
             // they leaked into inner.freelist regardless of commit outcome;
             // now we only promote on success and restore on failure.
             self.freed_pages.extend(pending_freed);
+            return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
             drop(inner);
         }
         commit_result
@@ -8780,22 +8837,17 @@ where
         //  - Don't set writer_active = false
         //  - Don't set committed/finished = true
         //  - Clear write_set for reuse instead
-        let mut inner = self
-            .inner
+        let inner_arc = Arc::clone(&self.inner);
+        let mut inner = inner_arc
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         let mut committed_db_size = self.committed_db_size_with_inner(&inner);
-        let lease_return_affects_durable_freelist =
-            self.page_lease_return_affects_durable_freelist(committed_db_size);
-        return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
-        // Compute freelist_dirty BEFORE draining freed_pages, because
-        // predicted_durable_freelist_pages_with_inner reads self.freed_pages.
-        let mut freelist_dirty_for_retain = self
-            .freelist_metadata_dirty_after_lease_return_with_inner(
-                &inner,
-                committed_db_size,
-                lease_return_affects_durable_freelist,
-            );
+        let mut pending_free_pages_for_retain = self.pending_free_pages_for_commit();
+        let mut freelist_dirty_for_retain = self.freelist_metadata_dirty_with_pending_free_pages(
+            &inner,
+            committed_db_size,
+            &pending_free_pages_for_retain,
+        );
         let mut single_connection_fast_path = self.single_connection_fast_path_enabled();
         let mut metadata_only_single_connection_fast_path = single_connection_fast_path
             && !freelist_dirty_for_retain
@@ -8809,13 +8861,16 @@ where
         {
             drop(inner);
             self.materialize_retained_memory_overlay_into_write_set()?;
-            inner = self
-                .inner
+            inner = inner_arc
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             committed_db_size = self.committed_db_size_with_inner(&inner);
-            freelist_dirty_for_retain =
-                self.freelist_metadata_dirty_with_inner(&inner, committed_db_size);
+            pending_free_pages_for_retain = self.pending_free_pages_for_commit();
+            freelist_dirty_for_retain = self.freelist_metadata_dirty_with_pending_free_pages(
+                &inner,
+                committed_db_size,
+                &pending_free_pages_for_retain,
+            );
             single_connection_fast_path = self.single_connection_fast_path_enabled();
             metadata_only_single_connection_fast_path = single_connection_fast_path
                 && !freelist_dirty_for_retain
@@ -8823,10 +8878,14 @@ where
             defer_private_memory_flush =
                 self.memory_db_bump_alloc && metadata_only_single_connection_fast_path;
         }
-        // CRITICAL FIX (beads_rust#138): Drain freed_pages AFTER dirty check
-        // but do NOT push into inner.freelist. Pass to serializer as
-        // pending_freed so inner.freelist remains untouched until Phase C
-        // (after successful commit).
+        // Drain freed_pages AFTER dirty check but do NOT push into
+        // inner.freelist. The serializer receives pending_free_pages so
+        // inner.freelist remains untouched until Phase C (after successful
+        // commit).
+        let mut pending_returned_pages = self.drain_unstaged_allocated_pages();
+        pending_returned_pages.append(&mut self.page_lease);
+        let mut pending_free_pages = pending_returned_pages.clone();
+        pending_free_pages.extend(self.freed_pages.iter().copied());
         let pending_freed: Vec<PageNumber> = self.freed_pages.drain(..).collect();
         let commit_result = {
             let freelist_dirty = freelist_dirty_for_retain;
@@ -8843,9 +8902,10 @@ where
                     &mut self.write_set,
                     &mut self.write_pages_sorted,
                     committed_db_size,
-                    &pending_freed,
+                    &pending_free_pages,
                 ) {
                     self.freed_pages.extend(pending_freed);
+                    return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
                     return Err(e);
                 }
             }
@@ -8878,6 +8938,7 @@ where
                     Ok(p) => p,
                     Err(e) => {
                         self.freed_pages.extend(pending_freed);
+                        return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
                         return Err(e);
                     }
                 };
@@ -8906,7 +8967,7 @@ where
                 self.predicted_conflict_pages_for_wal_commit_with_inner(
                     &inner,
                     wal_page1_plan,
-                    &pending_freed,
+                    &pending_free_pages,
                 )
             } else {
                 Vec::new()
@@ -8935,6 +8996,12 @@ where
                     Ok(guard) => guard,
                     Err(e) => {
                         self.freed_pages.extend(pending_freed);
+                        if let Ok(mut recovery_inner) = self.inner.lock() {
+                            return_pages_to_freelist(
+                                &mut recovery_inner.freelist,
+                                pending_returned_pages,
+                            );
+                        }
                         return Err(e);
                     }
                 };
@@ -8961,6 +9028,7 @@ where
                         &self.write_pages_sorted,
                     ) {
                         self.freed_pages.extend(pending_freed);
+                        return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
                         return Err(e);
                     }
                 }
@@ -8981,6 +9049,7 @@ where
             // For journal mode, update db_size from our computed value.
             // For WAL mode with group commit, the flusher already set inner.db_size
             // to the consolidated max across all batched transactions - don't revert it.
+            return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
             return_pages_to_freelist(&mut inner.freelist, pending_freed);
             // See commit() Phase C1: keep inner.db_size monotonic across
             // concurrent cross-process commits so we never publish a db_size
@@ -9032,6 +9101,7 @@ where
             self.allocated_from_eof.clear();
             self.savepoint_stack.clear();
             self.rolled_back_pages.clear();
+            self.writes_observed = false;
             if !metadata_only_single_connection_fast_path {
                 self.txn_read_cache.borrow_mut().clear();
             }
@@ -9050,6 +9120,7 @@ where
             // CRITICAL FIX (beads_rust#138): Restore pending freed pages on
             // commit failure so rollback can still see them.
             self.freed_pages.extend(pending_freed);
+            return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
             drop(inner);
             commit_result?;
             unreachable!()
@@ -19972,11 +20043,7 @@ mod tests {
         let committed_db_size = txn.committed_db_size_with_inner(&inner);
 
         assert!(
-            !txn.freelist_metadata_dirty_after_lease_return_with_inner(
-                &inner,
-                committed_db_size,
-                false,
-            ),
+            !txn.freelist_metadata_dirty_with_pending_free_pages(&inner, committed_db_size, &[]),
             "bead_id={BEAD_ID} case=clean_append_growth_has_no_freelist_metadata_delta"
         );
     }
@@ -19993,7 +20060,7 @@ mod tests {
         txn.write_page(&cx, second_page, &vec![0x72; ps]).unwrap();
 
         let inner_arc = Arc::clone(&txn.inner);
-        let mut inner = inner_arc.lock().unwrap();
+        let inner = inner_arc.lock().unwrap();
         let committed_db_size = txn.committed_db_size_with_inner(&inner);
         assert!(
             txn.page_lease
@@ -20001,19 +20068,20 @@ mod tests {
                 .all(|page| page.get() > committed_db_size),
             "bead_id=bd-wee9a case=volatile_eof_lease_pages_must_be_above_commit_size"
         );
-        let lease_return_affects_durable_freelist =
-            txn.page_lease_return_affects_durable_freelist(committed_db_size);
+        let pending_returned_pages = txn.page_lease.clone();
+        let lease_return_affects_durable_freelist = pending_returned_pages
+            .iter()
+            .any(|page| page.get() <= committed_db_size);
         assert!(
             !lease_return_affects_durable_freelist,
             "bead_id=bd-wee9a case=volatile_eof_lease_return_has_no_durable_freelist_effect"
         );
-        return_pages_to_freelist(&mut inner.freelist, txn.page_lease.drain(..));
 
         assert!(
-            !txn.freelist_metadata_dirty_after_lease_return_with_inner(
+            !txn.freelist_metadata_dirty_with_pending_free_pages(
                 &inner,
                 committed_db_size,
-                lease_return_affects_durable_freelist,
+                &pending_returned_pages,
             ),
             "bead_id=bd-wee9a case=volatile_eof_lease_return_skips_freelist_dirty_work"
         );
@@ -20037,23 +20105,84 @@ mod tests {
             "bead_id={BEAD_ID} case=lease_hole_test_must_exercise_batched_allocator"
         );
         let inner_arc = Arc::clone(&txn.inner);
-        let mut inner = inner_arc.lock().unwrap();
+        let inner = inner_arc.lock().unwrap();
         let committed_db_size = txn.committed_db_size_with_inner(&inner);
-        let lease_return_affects_durable_freelist =
-            txn.page_lease_return_affects_durable_freelist(committed_db_size);
+        let pending_returned_pages = txn.page_lease.clone();
+        let lease_return_affects_durable_freelist = pending_returned_pages
+            .iter()
+            .any(|page| page.get() <= committed_db_size);
         assert!(
             lease_return_affects_durable_freelist,
             "bead_id={BEAD_ID} case=lease_hole_return_affects_durable_freelist"
         );
-        return_pages_to_freelist(&mut inner.freelist, txn.page_lease.drain(..));
 
         assert!(
-            txn.freelist_metadata_dirty_after_lease_return_with_inner(
+            txn.freelist_metadata_dirty_with_pending_free_pages(
                 &inner,
                 committed_db_size,
-                lease_return_affects_durable_freelist,
+                &pending_returned_pages,
             ),
             "bead_id={BEAD_ID} case=returned_lease_holes_remain_durable_freelist_delta"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_commit_freelists_unstaged_allocated_eof_holes() {
+        let (pager, _) = wal_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let (unwritten_page, high_page) = {
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+            let first_page = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, first_page, &vec![0x91; ps]).unwrap();
+
+            let unwritten_page = txn.allocate_page(&cx).unwrap();
+            let high_page = txn.allocate_page(&cx).unwrap();
+            assert!(
+                unwritten_page.get() < high_page.get(),
+                "bead_id={BEAD_ID} case=unstaged_allocation_test_needs_page_count_hole"
+            );
+            assert!(
+                !txn.write_set.contains_key(&unwritten_page),
+                "bead_id={BEAD_ID} case=unwritten_allocated_page_must_not_be_staged"
+            );
+            txn.write_page(&cx, high_page, &vec![0x92; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+            (unwritten_page, high_page)
+        };
+
+        let inner = pager.inner.lock().unwrap();
+        assert_eq!(
+            inner.db_size,
+            high_page.get(),
+            "bead_id={BEAD_ID} case=high_page_advances_committed_db_size"
+        );
+        assert!(
+            inner.freelist.contains(&unwritten_page),
+            "bead_id={BEAD_ID} case=unstaged_allocated_page_reusable_in_memory page={}",
+            unwritten_page.get()
+        );
+
+        let page1 = inner
+            .read_committed_page_copy(&cx, &pager.wal_backend, PageNumber::ONE)
+            .unwrap();
+        let header_bytes: [u8; DATABASE_HEADER_SIZE] =
+            page1[..DATABASE_HEADER_SIZE].try_into().unwrap();
+        let header = DatabaseHeader::from_bytes(&header_bytes).unwrap();
+        let durable_freelist = load_freelist_from_committed_state(
+            &cx,
+            &inner,
+            &pager.wal_backend,
+            header.page_count,
+            header.freelist_trunk,
+            header.freelist_count,
+        )
+        .unwrap();
+        assert!(
+            durable_freelist.contains(&unwritten_page),
+            "bead_id={BEAD_ID} case=unstaged_allocated_page_serialized_to_durable_freelist page={} freelist={durable_freelist:?}",
+            unwritten_page.get()
         );
     }
 

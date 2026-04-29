@@ -57,6 +57,172 @@ document is out of date. Fix this doc, not the harness.
 
 ---
 
+## The seven questions, answered
+
+This section answers, in plain English, the seven questions enumerated in
+[#80](https://github.com/Dicklesworthstone/frankensqlite/issues/80). For
+mechanism (MVCC, DPOR, page-conflict math), see the README's
+"Concurrency Model" / "Multi-Process MVCC" sections; this section is the
+*caller-facing contract*.
+
+### 1. Process count — how many caller processes can safely share one DB file?
+
+- **Single-process**: any number of `Connection` instances, supported
+  unconditionally.
+- **Multi-process**: target is N ≤ 32 short-lived writers per file
+  (matching the swarm harness scale). Today the multi-process surface is
+  *partial* — see [#70](https://github.com/Dicklesworthstone/frankensqlite/issues/70)
+  for the open root-cause sweep. Treat the largest N at which
+  `cargo run -p fsqlite-e2e --bin swarm-multiprocess --workers N --seconds 3600`
+  is green on your platform as the conservative upper bound. Mixing
+  fsqlite and stock-SQLite *concurrent* opens against the same file is
+  not supported (each side enforces invariants over its own pager only;
+  the on-disk format is interoperable when checkpointed and idle).
+
+### 2. Connection lifetime — short-lived OK, or long-lived only?
+
+Both are supported. The contract is written for short-lived
+(`open / work / commit / close` churn), which is the realistic AI-agent
+workload. Long-lived connections are also supported and are the cheaper
+path: open-time cost amortizes across more transactions. There is no
+PRAGMA or runtime mode you have to flip to opt into either; the same
+`Connection::open` handles both.
+
+The fsqlite-pager freelist allocator persists committed allocations
+through close (the [#56](https://github.com/Dicklesworthstone/frankensqlite/issues/56)
+"freelist trunk page exceeds db_size on third+ open" class is regression-netted
+by the swarm harness's `sequential_open` criterion); short-lived churn
+must not produce process-global state leakage.
+
+### 3. Visibility guarantee — when does B see A's COMMIT?
+
+- **Read-your-own-writes**: immediately, on the same `Connection`.
+  `COMMIT` returning `Ok` means the next `query`/`query_with_params` on
+  the same `Connection` sees the new row. This is unconditional.
+- **Cross-Connection (same process)**: visible at B's *next transaction
+  boundary*. fsqlite uses `schema_cookie` + per-connection prepared-plan
+  invalidation (see `crates/fsqlite-core/src/connection.rs` —
+  `schema_cookie` / `schema_generation` checks at prepared-statement
+  reuse). Within an active read transaction on B, B sees its own
+  consistent snapshot; A's commits become visible when B begins a
+  new transaction.
+- **Cross-process**: same as cross-Connection, mediated by the
+  shared-memory file (`*.fsqlite-shm`, see `crates/fsqlite-mvcc/src/shm.rs`)
+  for MVCC commit_seq propagation, plus standard SQLite WAL-index for
+  page-level visibility. The window between "process A's `COMMIT`
+  returns" and "process B's next `BEGIN` sees the new state" is bounded
+  by shared-memory atomic visibility (typically nanoseconds on the same
+  host) plus B's own read-snapshot acquisition. There is no indeterminate
+  staleness window once B has started a fresh transaction.
+
+### 4. Plan-cache visibility — does the prepared-statement cache participate?
+
+**Yes**, and this is exactly the bug surface that produced the
+[beads_rust#252 / #254 / #255](https://github.com/Dicklesworthstone/beads_rust/issues/252)
+family. The contract:
+
+- The prepared-plan cache *is* invalidated on schema change
+  (`schema_cookie` bump). That part has worked since this code shipped.
+- Historically, plan-cache entries did **not** always invalidate on
+  *data* changes that shifted index layout (e.g. a B-tree split from a
+  concurrent INSERT could leave a cached cursor pointing at a stale
+  page). That class is what beads_rust#252/#254/#255 saw as
+  `SELECT … WHERE pk = ?` returning zero rows for a freshly-committed
+  row, or the wrong row.
+- After the fixes referenced in the
+  `flat-combining-page-locks` /
+  `feat/conformal-retry-budget` series, the prepared-plan cache is
+  required to invalidate on cross-Connection commit boundaries that
+  touch the cache's covered pages. The
+  `cross_process_visibility` and `wrong_row_returns` criteria in the
+  swarm harness exist to nail this down.
+- Caller obligation: do **not** assume that re-using a prepared
+  statement across transaction boundaries on the same connection
+  preserves a snapshot. Re-prepare or rely on the connection-level
+  invalidation; do not cache plan handles in an outer pool that
+  outlives a transaction without consulting `schema_cookie`.
+
+### 5. Lock-timeout semantics — does `PRAGMA busy_timeout` apply across processes?
+
+- Same-process, multi-Connection: yes, unambiguously. `busy_timeout`
+  applies to MVCC abort/retry and to WAL-index locks alike.
+- Cross-process: yes for advisory `fcntl(F_SETLK)` byte-range locks on
+  the DB file (see `crates/fsqlite-vfs/src/unix.rs` lines 275–410). The
+  VFS retries `F_SETLK` with exponential backoff up to `busy_timeout`,
+  matching stock SQLite. Historical gap
+  ([#45](https://github.com/Dicklesworthstone/frankensqlite/issues/45))
+  was a non-blocking `F_SETLK` that returned immediately — that has been
+  patched; the swarm harness's `busy_timeout` criterion is the
+  regression net.
+- On exhaustion, the failure mode is `FrankenError::Busy` (or
+  `BusyRecovery` / `BusySnapshot { .. }` for the snapshot-isolation
+  variants). It is **never** an indefinite hang and **never** a
+  silent zero-rows-committed exit. Callers retry on `Busy*`.
+- Granularity: timeout applies per *acquisition attempt*. A long
+  transaction holding many page locks does not consume the timeout once
+  acquired — only the wait phase does.
+
+### 6. Where fsqlite is **weaker** than stock SQLite
+
+These are intentional or known gaps documented so callers can plan:
+
+- **Multi-process WAL checkpoint coordination** is currently weaker.
+  Stock SQLite's checkpoint protocol has been hardened over decades
+  against multi-process opener contention; fsqlite's Silo-style epoch
+  group commit is newer. Until #70's hardening series is fully landed,
+  multi-process *checkpoint* (not normal commit) is the gap. The
+  symptoms ("WAL file too small for header during rebuild" on warm
+  start; transient `freelist trunk page exceeds db_size`) are cataloged
+  in the [#70 history](https://github.com/Dicklesworthstone/frankensqlite/issues/70).
+  Mitigation: callers should not race `wal_checkpoint(TRUNCATE)` from
+  multiple processes; let the auto-checkpointer coordinate, or
+  serialize through a single owner.
+- **Stale prepared-plan cache vs. concurrent index growth**: stock
+  SQLite re-validates prepared statements aggressively on schema or
+  catalog change; fsqlite's plan cache participates in cross-process
+  visibility but historically has had narrower invalidation windows
+  than stock. This is the beads_rust#252/#254/#255 class. Best caller
+  defense today: do not pool prepared statements across transaction
+  boundaries in code that runs against fsqlite without explicit
+  `schema_cookie` checks.
+- **Cross-process advisory lock interop with non-fsqlite openers**:
+  stock SQLite is the de-facto standard. If you open the same file
+  with both fsqlite and stock SQLite *at the same time*, only stock's
+  invariants are guaranteed at the wire format. Sequential
+  hand-off (close one, open the other) is fine and is what
+  conformance tests exercise.
+- **No shm-less WAL fallback parity** when shared memory is
+  unavailable: stock SQLite degrades gracefully via heap-shm; fsqlite
+  falls back to file-lock-based coordination that degrades to
+  single-writer (per the README "File-Lock Fallback" section). This is
+  a parity gap, not a correctness gap — it is loud, not silent.
+
+### 7. Where fsqlite intends stock-SQLite parity
+
+- Wire format on a checkpointed file: byte-for-byte stock-compatible.
+  After successful checkpoint, stock SQLite must open the file and
+  pass `PRAGMA integrity_check`. This is enforced by
+  `crates/fsqlite-e2e/tests/compat_file_format.rs`,
+  `crates/fsqlite-e2e/tests/golden_integrity.rs`,
+  and the `swarm-multiprocess` harness's `sqlite_integrity_check`
+  criterion.
+- SQL surface for the conformance corpus: see
+  [`docs/canonical_parity_contract.md`](./canonical_parity_contract.md).
+- Single-writer + multi-reader WAL semantics: full parity, including
+  `busy_timeout` honor, `SQLITE_BUSY` error codes, and `PRAGMA
+  wal_autocheckpoint` thresholds.
+- `PRAGMA integrity_check` semantics: parity is the contract. fsqlite
+  must pass on a file stock will pass on, and vice versa.
+- Connection lifecycle: `open` / `close` semantics match stock —
+  including the hand-off via WAL checkpoint on the last connection
+  closing.
+
+Where parity is a *goal* but not yet *enforced*: anywhere this
+document marks "partial" above. The swarm harness is the binary
+boundary between parity-claimed and parity-aspired.
+
+---
+
 ## The concurrency contract
 
 ### Supported: single-process, multi-Connection via MVCC WAL
@@ -257,3 +423,14 @@ grow a scenario that proves the refusal actually refuses.
   contract as it stands at commit `bd770f2f` (Silo-style epoch group
   commit primitive just landed; multi-process swarm path still under
   hardening via the branches enumerated above).
+- **2026-04-29**: Added the "seven questions, answered" section in
+  response to [#80](https://github.com/Dicklesworthstone/frankensqlite/issues/80).
+  Plain-English caller-facing answers to: process count, connection
+  lifetime, visibility guarantee, plan-cache visibility, lock-timeout
+  semantics, where fsqlite is weaker than stock, where parity is
+  intended. Companion regression net is the
+  [#79](https://github.com/Dicklesworthstone/frankensqlite/issues/79)
+  swarm-writer harness at
+  `crates/fsqlite-e2e/tests/swarm_writer_harness.rs`
+  (`#[ignore]`-gated; runs via
+  `cargo test --release -p fsqlite-e2e --test swarm_writer_harness -- --ignored --nocapture --test-threads=1`).

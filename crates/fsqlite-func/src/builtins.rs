@@ -1804,46 +1804,55 @@ fn glob_match_inner(pat: &[char], txt: &[char], mut pi: usize, mut ti: usize) ->
 
 pub struct UnistrFunc;
 
+fn peek_unistr_escape(chars: &std::str::Chars<'_>, digits: usize) -> Option<char> {
+    let mut lookahead = chars.clone();
+    let _marker = lookahead.next()?;
+    let mut codepoint = 0u32;
+    for _ in 0..digits {
+        codepoint = (codepoint << 4) | u32::from(hex_digit(lookahead.next()?)?);
+    }
+    char::from_u32(codepoint)
+}
+
+fn consume_unistr_escape(chars: &mut std::str::Chars<'_>, digits: usize) {
+    let _marker = chars.next();
+    for _ in 0..digits {
+        let _digit = chars.next();
+    }
+}
+
 impl ScalarFunction for UnistrFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
-        let input = args[0].to_text();
-        let mut result = String::new();
-        let chars: Vec<char> = input.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            if chars[i] == '\\' && i + 1 < chars.len() {
+        let input = text_arg(&args[0]);
+        let mut result = String::with_capacity(input.len());
+        let mut chars = input.as_ref().chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
                 // C SQLite: \\ is an escaped backslash literal.
-                if chars[i + 1] == '\\' {
+                if chars.as_str().starts_with('\\') {
+                    let _ = chars.next();
                     result.push('\\');
-                    i += 2;
                     continue;
-                } else if chars[i + 1] == 'u' && i + 5 < chars.len() {
+                } else if chars.as_str().starts_with('u') {
                     // \uXXXX
-                    let hex: String = chars[i + 2..i + 6].iter().collect();
-                    if let Ok(cp) = u32::from_str_radix(&hex, 16) {
-                        if let Some(c) = char::from_u32(cp) {
-                            result.push(c);
-                            i += 6;
-                            continue;
-                        }
+                    if let Some(c) = peek_unistr_escape(&chars, 4) {
+                        consume_unistr_escape(&mut chars, 4);
+                        result.push(c);
+                        continue;
                     }
-                } else if chars[i + 1] == 'U' && i + 9 < chars.len() {
+                } else if chars.as_str().starts_with('U') {
                     // \UXXXXXXXX
-                    let hex: String = chars[i + 2..i + 10].iter().collect();
-                    if let Ok(cp) = u32::from_str_radix(&hex, 16) {
-                        if let Some(c) = char::from_u32(cp) {
-                            result.push(c);
-                            i += 10;
-                            continue;
-                        }
+                    if let Some(c) = peek_unistr_escape(&chars, 8) {
+                        consume_unistr_escape(&mut chars, 8);
+                        result.push(c);
+                        continue;
                     }
                 }
             }
-            result.push(chars[i]);
-            i += 1;
+            result.push(ch);
         }
         Ok(SqliteValue::Text(SmallText::from_string(result)))
     }
@@ -3602,6 +3611,81 @@ mod tests {
             )
             .unwrap(),
             SqliteValue::Text(SmallText::from_string("'A'"))
+        );
+    }
+
+    #[test]
+    fn test_unistr_decodes_backslash_and_unicode_escapes() {
+        assert_eq!(
+            invoke1(
+                &UnistrFunc,
+                SqliteValue::Text(SmallText::from_string("a\\\\b\\u0020\\U0001f600"))
+            )
+            .unwrap(),
+            SqliteValue::Text(SmallText::from_string("a\\b \u{1f600}"))
+        );
+    }
+
+    #[test]
+    fn test_unistr_invalid_escape_falls_back_to_literal_backslash() {
+        assert_eq!(
+            invoke1(
+                &UnistrFunc,
+                SqliteValue::Text(SmallText::from_string("\\u12xz"))
+            )
+            .unwrap(),
+            SqliteValue::Text(SmallText::from_string("\\u12xz"))
+        );
+    }
+
+    #[test]
+    #[ignore = "perf-only benchmark"]
+    fn perf_unistr_text_args() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const INVOCATIONS: usize = 500_000;
+        const REPEATS: usize = 7;
+
+        let f = UnistrFunc;
+        let plain_args = [SqliteValue::Text(SmallText::from_string(
+            "plain unicode payload",
+        ))];
+        let escaped_args = [SqliteValue::Text(SmallText::from_string(
+            "a\\\\b\\u0020\\u0048\\u0069\\U0001f600",
+        ))];
+
+        let mut plain_best_ns = u128::MAX;
+        let mut escaped_best_ns = u128::MAX;
+        let mut checksum = 0usize;
+        for _ in 0..REPEATS {
+            let started = Instant::now();
+            for _ in 0..INVOCATIONS {
+                let result = black_box(
+                    f.invoke(black_box(plain_args.as_slice()))
+                        .expect("unistr plain benchmark invocation must succeed"),
+                );
+                if let SqliteValue::Text(text) = result {
+                    checksum = checksum.wrapping_add(text.len());
+                }
+            }
+            plain_best_ns = plain_best_ns.min(started.elapsed().as_nanos());
+
+            let started = Instant::now();
+            for _ in 0..INVOCATIONS {
+                let result = black_box(
+                    f.invoke(black_box(escaped_args.as_slice()))
+                        .expect("unistr escaped benchmark invocation must succeed"),
+                );
+                if let SqliteValue::Text(text) = result {
+                    checksum = checksum.wrapping_add(text.len());
+                }
+            }
+            escaped_best_ns = escaped_best_ns.min(started.elapsed().as_nanos());
+        }
+
+        println!(
+            "unistr_text_args invocations={INVOCATIONS} repeats={REPEATS} plain_best_ns={plain_best_ns} escaped_best_ns={escaped_best_ns} checksum={checksum}"
         );
     }
 

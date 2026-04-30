@@ -740,9 +740,6 @@ pub fn attempt_page_repair(
     let k_usize = k as usize;
     let seed = derive_db_fec_repair_seed(group_meta);
     let decoder = asupersync::raptorq::decoder::InactivationDecoder::new(k_usize, page_size, seed);
-    let params = decoder.params();
-    let base_rows = params.s + params.h;
-    let constraints = asupersync::raptorq::systematic::ConstraintMatrix::build(params, seed);
 
     let mut received = decoder.constraint_symbols();
 
@@ -767,27 +764,13 @@ pub fn attempt_page_repair(
         }
     }
 
-    // RFC 6330 decode requires K' source-domain rows; PI rows (K'−K) are
-    // zero-padded source symbols that must be represented explicitly.
-    for source_index in k_usize..params.k_prime {
-        let row = base_rows + source_index;
-        let mut columns = Vec::new();
-        let mut coefficients = Vec::new();
-        for col in 0..constraints.cols {
-            let coeff = constraints.get(row, col);
-            if !coeff.is_zero() {
-                columns.push(col);
-                coefficients.push(coeff);
-            }
-        }
-        received.push(asupersync::raptorq::decoder::ReceivedSymbol {
-            esi: u32::try_from(source_index).expect("source index fits u32"),
-            is_source: true,
-            columns,
-            coefficients,
-            data: vec![0_u8; page_size],
-        });
-    }
+    // asupersync 0.3.x synthesizes the K..K' RFC 6330 zero-padding rows
+    // internally inside `decode` (see `implicit_padding_rows` in
+    // asupersync-0.3.1/src/raptorq/decoder.rs:1212 and the decode
+    // accumulation at line 1688). Supplying them here as caller-provided
+    // source symbols is now rejected because source ESIs are validated
+    // against the real K domain, so the previous manual K..K' injection
+    // block is removed. Closes #83.
 
     let result = decoder
         .decode(&received)

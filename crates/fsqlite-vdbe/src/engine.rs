@@ -10788,62 +10788,43 @@ impl VdbeEngine {
 
                     let accum_reg = op.p3;
                     let is_distinct = op.p1 != 0;
-                    let args = self.collect_reg_range(op.p2, usize::from(op.p5));
+                    let arg_count = usize::from(op.p5);
                     let execution_cx = self.execution_cx.clone();
-                    let ctx = self
-                        .ensure_cold_state_for(StatementColdState::AGGREGATES)
-                        .aggregates
-                        .entry_or_insert_with(accum_reg, || {
-                            let state = func.initial_state();
-                            AggregateContext {
-                                func: func.clone(),
-                                state,
-                                distinct_seen: if is_distinct {
-                                    Some(std::collections::HashSet::new())
-                                } else {
-                                    None
-                                },
+                    if op.p2 >= 0
+                        && (op.p2 as usize).saturating_add(arg_count) <= self.registers.len()
+                    {
+                        for offset in 0..arg_count {
+                            if let Some(reg) = Self::reg_with_offset(op.p2, offset) {
+                                self.materialize_make_record_sideband(reg);
                             }
-                        });
-
-                    if !Arc::ptr_eq(&ctx.func, &func) {
-                        return Err(FrankenError::Internal(
-                            "AggStep accumulator reused for a different aggregate".to_owned(),
-                        ));
-                    }
-
-                    // For DISTINCT aggregates, skip if we've already seen these args.
-                    // NULL values are always skipped for DISTINCT (SQL semantics).
-                    let should_step = if let Some(ref mut seen) = ctx.distinct_seen {
-                        // Skip NULL arguments for DISTINCT aggregates.
-                        if args.iter().any(|a| matches!(a, SqliteValue::Null)) {
-                            false
-                        } else {
-                            seen.insert(distinct_key_collated(&args, agg_collation))
                         }
+                        let start_idx = op.p2 as usize;
+                        let args = &self.registers[start_idx..start_idx + arg_count];
+                        Self::agg_step_with_args(
+                            &mut self.cold_state,
+                            &mut self.statement_cold_state,
+                            accum_reg,
+                            is_distinct,
+                            &func,
+                            func_name,
+                            agg_collation,
+                            &execution_cx,
+                            args,
+                        )?;
                     } else {
-                        true
-                    };
-
-                    observe_execution_cancellation(&execution_cx)?;
-                    if should_step {
-                        if let Some(collation) = agg_collation
-                            && (func_name.eq_ignore_ascii_case("min")
-                                || func_name.eq_ignore_ascii_case("max"))
-                            && !args.is_empty()
-                            && !args[0].is_null()
-                        {
-                            agg_step_min_max_collated(
-                                &mut ctx.state,
-                                &args[0],
-                                func_name.eq_ignore_ascii_case("max"),
-                                collation,
-                            );
-                        } else {
-                            ctx.func.step(&mut ctx.state, &args)?;
-                        }
+                        let args = self.collect_reg_range(op.p2, arg_count);
+                        Self::agg_step_with_args(
+                            &mut self.cold_state,
+                            &mut self.statement_cold_state,
+                            accum_reg,
+                            is_distinct,
+                            &func,
+                            func_name,
+                            agg_collation,
+                            &execution_cx,
+                            &args,
+                        )?;
                     }
-                    observe_execution_cancellation(&execution_cx)?;
                     pc += 1;
                 }
 
@@ -13046,6 +13027,72 @@ impl VdbeEngine {
                 let _ = self.take_reg(reg);
             }
         }
+    }
+
+    fn agg_step_with_args(
+        cold_state: &mut Option<Box<ColdVdbeState>>,
+        statement_cold_state: &mut StatementColdState,
+        accum_reg: i32,
+        is_distinct: bool,
+        func: &Arc<ErasedAggregateFunction>,
+        func_name: &str,
+        agg_collation: Option<&str>,
+        execution_cx: &Cx,
+        args: &[SqliteValue],
+    ) -> Result<()> {
+        statement_cold_state.insert(StatementColdState::AGGREGATES);
+        let ctx = cold_state
+            .get_or_insert_with(|| Box::new(ColdVdbeState::new()))
+            .aggregates
+            .entry_or_insert_with(accum_reg, || {
+                let state = func.initial_state();
+                AggregateContext {
+                    func: func.clone(),
+                    state,
+                    distinct_seen: if is_distinct {
+                        Some(std::collections::HashSet::new())
+                    } else {
+                        None
+                    },
+                }
+            });
+
+        if !Arc::ptr_eq(&ctx.func, func) {
+            return Err(FrankenError::Internal(
+                "AggStep accumulator reused for a different aggregate".to_owned(),
+            ));
+        }
+
+        // For DISTINCT aggregates, skip if we've already seen these args.
+        // NULL values are always skipped for DISTINCT (SQL semantics).
+        let should_step = if let Some(ref mut seen) = ctx.distinct_seen {
+            if args.iter().any(|a| matches!(a, SqliteValue::Null)) {
+                false
+            } else {
+                seen.insert(distinct_key_collated(args, agg_collation))
+            }
+        } else {
+            true
+        };
+
+        observe_execution_cancellation(execution_cx)?;
+        if should_step {
+            if let Some(collation) = agg_collation
+                && (func_name.eq_ignore_ascii_case("min") || func_name.eq_ignore_ascii_case("max"))
+                && !args.is_empty()
+                && !args[0].is_null()
+            {
+                agg_step_min_max_collated(
+                    &mut ctx.state,
+                    &args[0],
+                    func_name.eq_ignore_ascii_case("max"),
+                    collation,
+                );
+            } else {
+                ctx.func.step(&mut ctx.state, args)?;
+            }
+        }
+        observe_execution_cancellation(execution_cx)
     }
 
     #[allow(dead_code)]

@@ -48,8 +48,9 @@ use fsqlite_wal::{
     ParallelWalFallbackReason, ParallelWalLaneBatch, ParallelWalLaneStager,
     ParallelWalOperatingMode, ParallelWalShadowVerdict, RecoveryFence, SubmitOutcome,
     TransactionConflictSnapshot, TransactionFrameBatch, TransactionFrameBatchContext, WalFile,
-    parallel_wal_fallback_reason_name, parallel_wal_mode_name, parallel_wal_shadow_verdict_name,
-    parallel_wal_should_shadow_compare, resolve_parallel_wal_control_surface_from_env,
+    WalGenerationIdentity, parallel_wal_fallback_reason_name, parallel_wal_mode_name,
+    parallel_wal_shadow_verdict_name, parallel_wal_should_shadow_compare,
+    resolve_parallel_wal_control_surface_from_env,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -1532,6 +1533,14 @@ pub(crate) struct PagerInner<F: VfsFile> {
     /// skip the expensive committed-page metadata reload when no durable state
     /// changed underneath this pager.
     committed_db_file_size_bytes: u64,
+    /// Durable database-header change counter from the last committed-state
+    /// metadata probe. In WAL mode this is the stable base added to the
+    /// currently visible WAL commit count.
+    committed_db_change_counter: u64,
+    /// WAL generation paired with `committed_db_change_counter`. If the WAL
+    /// generation changes, the main DB header must be read again before the
+    /// cached base counter can be trusted.
+    committed_wal_generation: Option<WalGenerationIdentity>,
 }
 
 impl<F: VfsFile> PagerInner<F> {
@@ -1656,41 +1665,58 @@ impl<F: VfsFile> PagerInner<F> {
     /// avoids page-1 materialization and freelist reconstruction unless the
     /// visible state actually changed.
     fn probe_visible_commit_seq(
-        &self,
+        &mut self,
         cx: &Cx,
         wal_backend: &SharedWalBackend,
     ) -> Result<(CommitSeq, u64, bool)> {
         let file_size = self.db_file.file_size(cx)?;
-        let wal_visible_commit_count = if self.journal_mode == JournalMode::Wal {
+        let (wal_visible_commit_count, wal_generation) = if self.journal_mode == JournalMode::Wal {
             with_wal_backend(wal_backend, |wal| {
                 wal.begin_transaction(cx)?;
-                wal.committed_txn_count(cx)
+                let snapshot = wal.pinned_read_snapshot();
+                let commit_count =
+                    snapshot.map_or_else(|| wal.committed_txn_count(cx), |s| Ok(s.commit_count))?;
+                Ok((commit_count, snapshot.map(|s| s.generation)))
             })?
         } else {
-            0
+            (0, None)
         };
         let wal_snapshot_initialized = self.journal_mode == JournalMode::Wal;
-        let base_header_bytes = self.read_database_file_header_bytes(cx, file_size)?;
-        let base_change_counter = if self.journal_mode == JournalMode::Wal {
-            match DatabaseHeader::from_bytes(&base_header_bytes) {
-                Ok(base_header) => u64::from(base_header.change_counter),
-                Err(error) => {
-                    stale_main_header_change_counter_under_wal(&base_header_bytes, &error)
-                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+
+        let cached_wal_base_is_current = self.journal_mode == JournalMode::Wal
+            && file_size == self.committed_db_file_size_bytes
+            && wal_generation.is_some()
+            && self.committed_wal_generation == wal_generation;
+        let base_change_counter = if cached_wal_base_is_current {
+            self.committed_db_change_counter
+        } else {
+            let base_header_bytes = self.read_database_file_header_bytes(cx, file_size)?;
+            let base_change_counter = if self.journal_mode == JournalMode::Wal {
+                match DatabaseHeader::from_bytes(&base_header_bytes) {
+                    Ok(base_header) => u64::from(base_header.change_counter),
+                    Err(error) => {
+                        stale_main_header_change_counter_under_wal(&base_header_bytes, &error)
+                            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "invalid database-file header during WAL refresh: {error}"
+                                ),
+                            })?
+                    }
+                }
+            } else {
+                u64::from(
+                    DatabaseHeader::from_bytes(&base_header_bytes)
+                        .map_err(|error| FrankenError::DatabaseCorrupt {
                             detail: format!(
-                                "invalid database-file header during WAL refresh: {error}"
+                                "invalid database header during pager refresh: {error}"
                             ),
                         })?
-                }
-            }
-        } else {
-            u64::from(
-                DatabaseHeader::from_bytes(&base_header_bytes)
-                    .map_err(|error| FrankenError::DatabaseCorrupt {
-                        detail: format!("invalid database header during pager refresh: {error}"),
-                    })?
-                    .change_counter,
-            )
+                        .change_counter,
+                )
+            };
+            self.committed_db_change_counter = base_change_counter;
+            self.committed_wal_generation = wal_generation;
+            base_change_counter
         };
         let visible_commit_seq =
             CommitSeq::new(base_change_counter.saturating_add(wal_visible_commit_count));
@@ -5497,6 +5523,8 @@ where
                 rollback_journal_recovery_state: RollbackJournalRecoveryState::Clean,
                 commit_seq: initial_commit_seq,
                 committed_db_file_size_bytes: file_size,
+                committed_db_change_counter: u64::from(header.change_counter),
+                committed_wal_generation: None,
             })),
             cache: Arc::new(cache),
             pool,
@@ -5679,6 +5707,10 @@ where
                 rollback_journal_recovery_state: RollbackJournalRecoveryState::Clean,
                 commit_seq: initial_commit_seq,
                 committed_db_file_size_bytes: file_size,
+                committed_db_change_counter: header
+                    .as_ref()
+                    .map_or(0, |header| u64::from(header.change_counter)),
+                committed_wal_generation: None,
             })),
             cache: Arc::new(cache),
             pool,

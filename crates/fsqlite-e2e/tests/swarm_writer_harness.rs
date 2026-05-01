@@ -93,6 +93,7 @@ enum Op {
 }
 
 /// Audit-log record format. One line per record, JSON.
+#[allow(clippy::too_many_arguments)]
 fn audit_line(
     backend: &str,
     pid: u32,
@@ -190,13 +191,22 @@ impl Backend {
 
 fn cfg_from_env(backend: Backend) -> RunConfig {
     fn env_u64(k: &str, dflt: u64) -> u64 {
-        env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(dflt)
+        env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(dflt)
     }
     fn env_usize(k: &str, dflt: usize) -> usize {
-        env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(dflt)
+        env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(dflt)
     }
     fn env_i64(k: &str, dflt: i64) -> i64 {
-        env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(dflt)
+        env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(dflt)
     }
     RunConfig {
         workers: env_usize("FSQLITE_SWARM_WORKERS", DEFAULT_WORKERS),
@@ -209,13 +219,15 @@ fn cfg_from_env(backend: Backend) -> RunConfig {
 }
 
 fn parent_test_root() -> PathBuf {
-    let base =
-        env::var("FSQLITE_SWARM_RUN_DIR").map_or_else(|_| env::temp_dir(), PathBuf::from);
+    let base = env::var("FSQLITE_SWARM_RUN_DIR").map_or_else(|_| env::temp_dir(), PathBuf::from);
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or_default();
-    base.join(format!("fsqlite-swarm-harness-{stamp}-pid{}", std::process::id()))
+    base.join(format!(
+        "fsqlite-swarm-harness-{stamp}-pid{}",
+        std::process::id()
+    ))
 }
 
 /// Top-level test entry point: orchestrates fsqlite + stock-sqlite
@@ -333,10 +345,7 @@ fn initialize_database(cfg: &RunConfig, db_path: &Path) {
         Backend::Fsqlite => {
             let conn = Connection::open(db_path.to_string_lossy().to_string())
                 .expect("fsqlite open for init");
-            let _ = conn.execute(&format!(
-                "PRAGMA busy_timeout={};",
-                cfg.busy_timeout_ms
-            ));
+            let _ = conn.execute(&format!("PRAGMA busy_timeout={};", cfg.busy_timeout_ms));
             let _ = conn.execute("PRAGMA journal_mode=WAL;");
             let _ = conn.execute("PRAGMA synchronous=NORMAL;");
             // Best-effort: enable concurrent mode on fsqlite — it's a
@@ -390,10 +399,7 @@ fn run_sequential_open_check(cfg: &RunConfig, run_dir: &Path) -> CriterionReport
             Backend::Fsqlite => {
                 let conn = Connection::open(path.to_string_lossy().to_string())
                     .map_err(|e| format!("open#{i}: {e}"))?;
-                let _ = conn.execute(&format!(
-                    "PRAGMA busy_timeout={};",
-                    cfg.busy_timeout_ms
-                ));
+                let _ = conn.execute(&format!("PRAGMA busy_timeout={};", cfg.busy_timeout_ms));
                 let _ = conn.execute("PRAGMA journal_mode=WAL;");
                 if i == 0 {
                     conn.execute(
@@ -451,11 +457,7 @@ fn run_sequential_open_check(cfg: &RunConfig, run_dir: &Path) -> CriterionReport
     }
 }
 
-fn spawn_and_collect_workers(
-    cfg: &RunConfig,
-    db_path: &Path,
-    audit_dir: &Path,
-) -> CriterionReport {
+fn spawn_and_collect_workers(cfg: &RunConfig, db_path: &Path, audit_dir: &Path) -> CriterionReport {
     let exe = match env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -532,9 +534,7 @@ fn spawn_and_collect_workers(
                     }
                 }
                 Ok(None) => {
-                    if started.elapsed()
-                        > Duration::from_millis(PROC_LIFETIME_MAX_MS + 5_000)
-                    {
+                    if started.elapsed() > Duration::from_millis(PROC_LIFETIME_MAX_MS + 5_000) {
                         let _ = child.kill();
                         bad.push(format!(
                             "worker {id} hung past {}ms; killed (assertion #7 failure: \
@@ -965,9 +965,7 @@ fn assert_no_silent_zero_row(
             .prepare("SELECT k FROM swarm_kv WHERE k = ?1")
             .map_err(|e| e.to_string())?;
         for k in &seen_keys {
-            let n: Option<i64> = stmt
-                .query_row(rusqlite::params![*k], |r| r.get(0))
-                .ok();
+            let n: Option<i64> = stmt.query_row(rusqlite::params![*k], |r| r.get(0)).ok();
             if n.is_none() {
                 missing.push(*k);
                 if missing.len() > 64 {
@@ -1086,7 +1084,12 @@ fn run_as_child(backend: Backend) {
     match res {
         Ok(Ok(())) => std::process::exit(0),
         Ok(Err(e)) => {
-            eprintln!("[swarm-child] {} {} error: {}", backend.as_str(), std::process::id(), e);
+            eprintln!(
+                "[swarm-child] {} {} error: {}",
+                backend.as_str(),
+                std::process::id(),
+                e
+            );
             std::process::exit(1);
         }
         Err(_) => {
@@ -1177,6 +1180,7 @@ fn pick_op(rng: &mut StdRng) -> Op {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn child_run_fsqlite(
     db_path: &str,
     audit: &mut File,
@@ -1191,10 +1195,22 @@ fn child_run_fsqlite(
     let conn = match Connection::open(db_path.to_string()) {
         Ok(c) => c,
         Err(e) => {
-            audit.write_all(audit_line(
-                "fsqlite", pid, "open_err", -1, None, None, None, 0,
-                Some(&format!("{e}")),
-            ).as_bytes()).ok();
+            audit
+                .write_all(
+                    audit_line(
+                        "fsqlite",
+                        pid,
+                        "open_err",
+                        -1,
+                        None,
+                        None,
+                        None,
+                        0,
+                        Some(&format!("{e}")),
+                    )
+                    .as_bytes(),
+                )
+                .ok();
             return Err(format!("open: {e}"));
         }
     };
@@ -1407,6 +1423,7 @@ fn retry_busy_fsqlite<T>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn child_run_stock(
     db_path: &str,
     audit: &mut File,
@@ -1478,9 +1495,8 @@ fn child_run_stock(
             Op::SelectRange => (|| -> Result<String, rusqlite::Error> {
                 let lo = rng.gen_range(0..keyspace);
                 let hi = (lo + rng.gen_range(1..32)).min(keyspace);
-                let mut stmt = conn.prepare(
-                    "SELECT k, v FROM swarm_kv WHERE k BETWEEN ?1 AND ?2",
-                )?;
+                let mut stmt =
+                    conn.prepare("SELECT k, v FROM swarm_kv WHERE k BETWEEN ?1 AND ?2")?;
                 let mut rows = stmt.query(rusqlite::params![lo, hi])?;
                 while let Some(_r) = rows.next()? {}
                 Ok("select_range".to_owned())

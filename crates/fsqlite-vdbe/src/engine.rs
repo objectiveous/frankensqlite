@@ -10549,15 +10549,7 @@ impl VdbeEngine {
                             })?;
                         }
 
-                        sc.payload_buf.clear();
-                        sc.cursor.payload_into(&sc.cx, &mut sc.payload_buf)?;
-                        sc.cur_vals_buf.clear();
-                        if fsqlite_types::record::parse_record_into(
-                            &sc.payload_buf,
-                            &mut sc.cur_vals_buf,
-                        )
-                        .is_none()
-                        {
+                        if !try_decode_storage_cursor_current_index_record(cursor_id, sc)? {
                             return Err(FrankenError::internal(
                                 "IdxCmp: malformed index record at cursor position",
                             ));
@@ -13728,12 +13720,12 @@ impl VdbeEngine {
     }
 
     /// Get the rowid from the cursor's current row.
-    fn cursor_rowid(&self, cursor_id: i32) -> Result<SqliteValue> {
-        if let Some(cursor) = self.storage_cursors.get(&cursor_id) {
+    fn cursor_rowid(&mut self, cursor_id: i32) -> Result<SqliteValue> {
+        if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
             if cursor.cursor.eof() {
                 return Ok(SqliteValue::Null);
             }
-            return Ok(SqliteValue::Integer(cursor.cursor.rowid(&cursor.cx)?));
+            return Ok(SqliteValue::Integer(storage_cursor_cached_rowid(cursor)?));
         }
 
         if let Some(state) = self
@@ -14524,6 +14516,7 @@ fn try_decode_storage_cursor_current_index_record(
     cursor_id: i32,
     cursor: &mut StorageCursor,
 ) -> Result<bool> {
+    refresh_storage_cursor_first_key_state(cursor, false);
     cursor.payload_buf.clear();
     cursor
         .cursor
@@ -14532,6 +14525,11 @@ fn try_decode_storage_cursor_current_index_record(
     let decoded =
         fsqlite_types::record::parse_record_into(&cursor.payload_buf, &mut cursor.cur_vals_buf)
             .is_some();
+    cursor.cached_rowid = if decoded {
+        cursor.cur_vals_buf.last().and_then(SqliteValue::as_integer)
+    } else {
+        None
+    };
     tracing::trace!(
         cursor_id,
         decoded,
@@ -14844,6 +14842,7 @@ fn refresh_storage_cursor_first_key_state(cursor: &mut StorageCursor, collect_vd
 }
 
 fn storage_cursor_cached_rowid(cursor: &mut StorageCursor) -> Result<i64> {
+    refresh_storage_cursor_first_key_state(cursor, false);
     if let Some(rowid) = cursor.cached_rowid {
         return Ok(rowid);
     }

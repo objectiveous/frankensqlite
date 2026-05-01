@@ -9902,24 +9902,24 @@ impl VdbeEngine {
                 }
 
                 Opcode::SorterInsert => {
-                    // Move the record value out of the register instead of
-                    // cloning it — the register will be overwritten by the
-                    // next MakeRecord before it's read again.
-                    //
                     // Lazy key decode: only decode the first `key_columns`
                     // values (the sort key) instead of all columns.  The
                     // raw blob is retained for output via `SorterData`.
                     let cursor_id = op.p1;
-                    let record = self.take_reg(op.p2);
+                    let record_reg = op.p2;
+                    let sideband_active =
+                        self.make_record_lookaside.sideband_is_armed_for(record_reg);
+                    let blob = if sideband_active {
+                        self.make_record_lookaside.disarm();
+                        self.make_record_lookaside.take_buf()
+                    } else {
+                        // Move the record value out of the register instead of
+                        // cloning it; MakeRecord sideband consumers above avoid
+                        // this path because take_reg would materialize the blob.
+                        let record = self.take_reg(record_reg);
+                        record_blob_bytes(&record).to_vec()
+                    };
                     if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
-                        let sideband_active =
-                            self.make_record_lookaside.sideband_is_armed_for(op.p2);
-                        let blob = if sideband_active {
-                            self.make_record_lookaside.disarm();
-                            self.make_record_lookaside.take_buf()
-                        } else {
-                            record_blob_bytes(&record).to_vec()
-                        };
                         let key_values =
                             fsqlite_types::record::parse_record_prefix(&blob, sorter.key_columns)
                                 .ok_or_else(|| FrankenError::DatabaseCorrupt {
@@ -19643,6 +19643,55 @@ mod tests {
     }
 
     #[test]
+    fn test_sorter_insert_consumes_make_record_sideband_without_materializing() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_vdbe_test_sideband_materialization_count();
+
+        let before = vdbe_test_sideband_materialization_count_snapshot();
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let loop_start = b.emit_label();
+            let empty = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_value = b.alloc_reg();
+            let r_record = b.alloc_reg();
+            let r_sorted = b.alloc_reg();
+
+            b.emit_op(Opcode::SorterOpen, 0, 1, 0, P4::None, 0);
+
+            for value in [3, 1, 2] {
+                b.emit_op(Opcode::Integer, value, r_value, 0, P4::None, 0);
+                b.emit_op(Opcode::MakeRecord, r_value, 1, r_record, P4::None, 0);
+                b.emit_op(Opcode::SorterInsert, 0, r_record, 0, P4::None, 0);
+            }
+
+            b.emit_jump_to_label(Opcode::SorterSort, 0, 0, empty, P4::None, 0);
+            b.resolve_label(loop_start);
+            b.emit_op(Opcode::SorterData, 0, r_sorted, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_sorted, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SorterNext, 0, 0, loop_start, P4::None, 0);
+            b.resolve_label(empty);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        let after = vdbe_test_sideband_materialization_count_snapshot();
+
+        assert_eq!(
+            after - before,
+            0,
+            "SorterInsert should move MakeRecord sideband bytes directly into the sorter"
+        );
+        let decoded: Vec<i64> = rows
+            .into_iter()
+            .map(|row| decode_record(&row[0]).unwrap()[0].to_integer())
+            .collect();
+        assert_eq!(decoded, vec![1, 2, 3]);
+    }
+
+    #[test]
     fn test_sorter_compare_jumps_on_key_difference() {
         let rows = run_program(|b| {
             let end = b.emit_label();
@@ -22578,15 +22627,25 @@ mod tests {
             1,
             "this string is definitely longer than twenty three bytes",
         );
-        let SqliteValue::Text(first) = engine.get_reg(1) else {
-            panic!("register should contain text");
+        let first_reg = engine.get_reg(1);
+        assert!(
+            matches!(first_reg, SqliteValue::Text(_)),
+            "register should contain text"
+        );
+        let SqliteValue::Text(first) = first_reg else {
+            return;
         };
         let original_ptr = first.as_str().as_ptr();
 
         engine.write_text_to_reg(1, "another long string that still fits the same allocation");
 
-        let SqliteValue::Text(updated) = engine.get_reg(1) else {
-            panic!("register should still contain text");
+        let updated_reg = engine.get_reg(1);
+        assert!(
+            matches!(updated_reg, SqliteValue::Text(_)),
+            "register should still contain text"
+        );
+        let SqliteValue::Text(updated) = updated_reg else {
+            return;
         };
         assert_eq!(updated.as_str().as_ptr(), original_ptr);
         assert_eq!(
@@ -22600,15 +22659,25 @@ mod tests {
         let mut engine = VdbeEngine::new(2);
 
         engine.write_blob_to_reg(1, &[1_u8, 2, 3, 4]);
-        let SqliteValue::Blob(first) = engine.get_reg(1) else {
-            panic!("register should contain blob");
+        let first_reg = engine.get_reg(1);
+        assert!(
+            matches!(first_reg, SqliteValue::Blob(_)),
+            "register should contain blob"
+        );
+        let SqliteValue::Blob(first) = first_reg else {
+            return;
         };
         let original_ptr = Arc::as_ptr(first);
 
         engine.write_blob_to_reg(1, &[9_u8, 8, 7, 6]);
 
-        let SqliteValue::Blob(updated) = engine.get_reg(1) else {
-            panic!("register should still contain blob");
+        let updated_reg = engine.get_reg(1);
+        assert!(
+            matches!(updated_reg, SqliteValue::Blob(_)),
+            "register should still contain blob"
+        );
+        let SqliteValue::Blob(updated) = updated_reg else {
+            return;
         };
         assert_eq!(Arc::as_ptr(updated), original_ptr);
         assert_eq!(updated.as_ref(), &[9_u8, 8, 7, 6]);
@@ -29854,10 +29923,10 @@ mod tests {
             marker.is_some(),
             "time-travel marker should be set on cursor 0"
         );
-        match marker.unwrap() {
-            TimeTravelMarker::CommitSeq(seq) => assert_eq!(*seq, 5),
-            _ => panic!("expected CommitSeq marker"),
-        }
+        assert!(
+            matches!(marker, Some(TimeTravelMarker::CommitSeq(seq)) if *seq == 5),
+            "expected CommitSeq marker"
+        );
     }
 
     #[test]

@@ -8067,6 +8067,10 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             .stack
             .last()
             .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
+        if let Some((_, payload)) = self.local_leaf_table_cell(top, top.cell_idx)? {
+            instrumentation::record_owned_payload_materialization(payload.len());
+            return Ok(payload.to_vec());
+        }
         let cell = self.parse_cell_at(top, top.cell_idx)?;
         match self.read_cell_payload(cx, top, &cell)? {
             Cow::Borrowed(bytes) => {
@@ -13532,6 +13536,12 @@ mod tests {
         assert!(
             matches!(got, Cow::Borrowed(_)),
             "local leaf-table payloads should stay borrowed"
+        );
+        assert!(cursor.cell_slot_cache.borrow().entries.is_empty());
+        assert_eq!(cursor.payload(&cx).unwrap(), payload);
+        assert!(
+            cursor.cell_slot_cache.borrow().entries.is_empty(),
+            "payload() should read local leaf-table cells without populating the cell-slot cache"
         );
 
         let mut prefix = Vec::new();

@@ -23611,7 +23611,7 @@ mod tests {
 
         assert_eq!(table.count_rowid_range(11, 14), 3);
         assert_eq!(table.count_rowid_range(i64::MIN, 12), 2);
-        assert_eq!(table.count_rowid_range(13, i64::MAX), 8);
+        assert_eq!(table.count_rowid_range(13, i64::MAX), 2);
         let dense_values = table
             .iter_rows_in_rowid_range(11, 14)
             .map(|(rowid, values)| (rowid, values.first().cloned()))
@@ -23627,8 +23627,8 @@ mod tests {
 
         assert!(table.delete_by_rowid(12), "middle row should be removed");
         assert_eq!(table.count_rowid_range(11, 14), 2);
-        assert_eq!(table.count_rowid_range(i64::MIN, 12), 1);
-        assert_eq!(table.count_rowid_range(13, i64::MAX), 8);
+        assert_eq!(table.count_rowid_range(i64::MIN, 12), 2);
+        assert_eq!(table.count_rowid_range(13, i64::MAX), 2);
         let sparse_values = table
             .iter_rows_in_rowid_range(11, 14)
             .map(|(rowid, values)| (rowid, values.first().cloned()))

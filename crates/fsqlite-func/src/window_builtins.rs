@@ -425,10 +425,10 @@ impl WindowFunction for NtileFunc {
 
 /// State for `lag()`: maintains a buffer of previous values.
 pub struct LagState {
-    buffer: VecDeque<SqliteValue>,
+    buffer: Vec<SqliteValue>,
     offsets: Vec<Option<i64>>,
     defaults: Vec<SqliteValue>,
-    row_number: i64,
+    current_row: i64,
 }
 
 pub struct LagFunc;
@@ -438,10 +438,10 @@ impl WindowFunction for LagFunc {
 
     fn initial_state(&self) -> Self::State {
         LagState {
-            buffer: VecDeque::new(),
+            buffer: Vec::new(),
             offsets: Vec::new(),
             defaults: Vec::new(),
-            row_number: 0,
+            current_row: 0,
         }
     }
 
@@ -449,22 +449,22 @@ impl WindowFunction for LagFunc {
         let val = args.first().cloned().unwrap_or(SqliteValue::Null);
         let offset = args
             .get(1)
-            .map(|off| (!off.is_null()).then(|| off.to_integer().max(0)))
+            .map(|off| (!off.is_null()).then(|| off.to_integer()))
             .unwrap_or(Some(1));
         let default_val = args.get(2).cloned().unwrap_or(SqliteValue::Null);
-        state.row_number += 1;
-        state.buffer.push_back(val);
+        state.buffer.push(val);
         state.offsets.push(offset);
         state.defaults.push(default_val);
         Ok(())
     }
 
-    fn inverse(&self, _state: &mut Self::State, _args: &[SqliteValue]) -> Result<()> {
+    fn inverse(&self, state: &mut Self::State, _args: &[SqliteValue]) -> Result<()> {
+        state.current_row += 1;
         Ok(())
     }
 
     fn value(&self, state: &Self::State) -> Result<SqliteValue> {
-        let current_index = usize::try_from(state.row_number.saturating_sub(1)).unwrap_or(0);
+        let current_index = usize::try_from(state.current_row).unwrap_or(usize::MAX);
         let default_val = state
             .defaults
             .get(current_index)
@@ -473,11 +473,15 @@ impl WindowFunction for LagFunc {
         let Some(offset) = state.offsets.get(current_index).copied().flatten() else {
             return Ok(default_val);
         };
-        let idx = state.row_number - offset;
-        if idx < 1 || idx > state.buffer.len() as i64 {
+        let target = state.current_row - offset;
+        let Ok(target_index) = usize::try_from(target) else {
             return Ok(default_val);
-        }
-        Ok(state.buffer[(idx - 1) as usize].clone())
+        };
+        Ok(state
+            .buffer
+            .get(target_index)
+            .cloned()
+            .unwrap_or(default_val))
     }
 
     fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
@@ -1510,15 +1514,14 @@ mod tests {
     #[test]
     fn test_lag_default() {
         // lag(X) with default offset=1: previous row's value, NULL for first.
-        let results =
-            run_window_partition(&LagFunc, &[vec![int(10)], vec![int(20)], vec![int(30)]]);
+        let results = run_window_two_pass(&LagFunc, &[vec![int(10)], vec![int(20)], vec![int(30)]]);
         assert_eq!(results, vec![null(), int(10), int(20)]);
     }
 
     #[test]
     fn test_lag_offset_3() {
         // lag(X, 3): 3 rows back.
-        let results = run_window_partition(
+        let results = run_window_two_pass(
             &LagFunc,
             &[
                 vec![int(10), int(3)],
@@ -1534,7 +1537,7 @@ mod tests {
     #[test]
     fn test_lag_default_value() {
         // lag(X, 1, -1): returns -1 when no previous row.
-        let results = run_window_partition(
+        let results = run_window_two_pass(
             &LagFunc,
             &[
                 vec![int(10), int(1), int(-1)],
@@ -1546,7 +1549,7 @@ mod tests {
 
     #[test]
     fn test_lag_null_offset_returns_default_for_each_row() {
-        let results = run_window_partition(
+        let results = run_window_two_pass(
             &LagFunc,
             &[
                 vec![int(10), null(), text("N/A")],
@@ -1558,7 +1561,7 @@ mod tests {
 
     #[test]
     fn test_lag_uses_current_row_offset_and_default() {
-        let results = run_window_partition(
+        let results = run_window_two_pass(
             &LagFunc,
             &[
                 vec![int(10), int(1), text("first")],
@@ -1571,6 +1574,19 @@ mod tests {
             results,
             vec![text("first"), text("null-offset"), int(20), int(20)]
         );
+    }
+
+    #[test]
+    fn test_lag_negative_offset_reads_following_row() {
+        let results = run_window_two_pass(
+            &LagFunc,
+            &[
+                vec![int(10), int(-1), text("N/A")],
+                vec![int(20), int(-1), text("N/A")],
+                vec![int(30), int(-1), text("N/A")],
+            ],
+        );
+        assert_eq!(results, vec![int(20), int(30), text("N/A")]);
     }
 
     // ── lead ─────────────────────────────────────────────────────────

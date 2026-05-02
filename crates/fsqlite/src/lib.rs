@@ -5975,6 +5975,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn window_lag_negative_offset_reads_following_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES(1,10),(2,20),(3,30);")
+            .unwrap();
+        let rows = conn
+            .query("SELECT id, lag(val,-1,'D') OVER (ORDER BY id) FROM t1 ORDER BY id;")
+            .unwrap();
+        let results: Vec<Vec<SqliteValue>> = rows.iter().map(row_values).collect();
+        assert_eq!(
+            results,
+            vec![
+                vec![SqliteValue::Integer(1), SqliteValue::Integer(20)],
+                vec![SqliteValue::Integer(2), SqliteValue::Integer(30)],
+                vec![SqliteValue::Integer(3), SqliteValue::Text("D".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn window_grouped_ntile_advances_two_pass_position() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES(1,10),(2,20),(3,30);")
+            .unwrap();
+        let rows = conn
+            .query("SELECT id, ntile(2) OVER (ORDER BY id) FROM t GROUP BY id ORDER BY id;")
+            .unwrap();
+        let results: Vec<Vec<SqliteValue>> = rows.iter().map(row_values).collect();
+        assert_eq!(
+            results,
+            vec![
+                vec![SqliteValue::Integer(1), SqliteValue::Integer(1)],
+                vec![SqliteValue::Integer(2), SqliteValue::Integer(1)],
+                vec![SqliteValue::Integer(3), SqliteValue::Integer(2)],
+            ]
+        );
+    }
+
     // ── CTE (WITH) probe ─────────────────────────────────────────────────
 
     #[test]

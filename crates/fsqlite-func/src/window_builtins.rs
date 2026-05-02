@@ -1195,18 +1195,7 @@ impl WindowFunction for WindowStringAggFunc {
 
 /// Compare two SQLite values using type-aware ordering.
 pub fn cmp_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
-    match (a, b) {
-        (SqliteValue::Null, SqliteValue::Null) => std::cmp::Ordering::Equal,
-        (SqliteValue::Null, _) => std::cmp::Ordering::Less,
-        (_, SqliteValue::Null) => std::cmp::Ordering::Greater,
-        (SqliteValue::Integer(ai), SqliteValue::Integer(bi)) => ai.cmp(bi),
-        (SqliteValue::Float(af), SqliteValue::Float(bf)) => af.total_cmp(bf),
-        (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => (*ai as f64).total_cmp(bf),
-        (SqliteValue::Float(af), SqliteValue::Integer(bi)) => af.total_cmp(&(*bi as f64)),
-        (SqliteValue::Text(at), SqliteValue::Text(bt)) => at.cmp(bt),
-        (SqliteValue::Blob(ab), SqliteValue::Blob(bb)) => ab.cmp(bb),
-        _ => a.to_text().cmp(&b.to_text()),
-    }
+    a.cmp(b)
 }
 
 // ── Registration ──────────────────────────────────────────────────────────
@@ -1252,6 +1241,10 @@ mod tests {
 
     fn text(s: &str) -> SqliteValue {
         SqliteValue::Text(s.into())
+    }
+
+    fn blob(bytes: &[u8]) -> SqliteValue {
+        SqliteValue::Blob(std::sync::Arc::from(bytes))
     }
 
     fn null() -> SqliteValue {
@@ -1678,6 +1671,32 @@ mod tests {
 
         func.step(&mut state, &[float(0.5)]).unwrap();
         assert!(matches!(func.value(&state).unwrap(), SqliteValue::Float(_)));
+    }
+
+    // ── min / max ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_window_min_max_use_sqlite_storage_class_order() {
+        let text_value = text("z");
+        let blob_value = blob(b"\0");
+
+        let mut min_state = WindowMinFunc.initial_state();
+        WindowMinFunc
+            .step(&mut min_state, std::slice::from_ref(&blob_value))
+            .unwrap();
+        WindowMinFunc
+            .step(&mut min_state, std::slice::from_ref(&text_value))
+            .unwrap();
+        assert_eq!(WindowMinFunc.value(&min_state).unwrap(), text_value);
+
+        let mut max_state = WindowMaxFunc.initial_state();
+        WindowMaxFunc
+            .step(&mut max_state, std::slice::from_ref(&text_value))
+            .unwrap();
+        WindowMaxFunc
+            .step(&mut max_state, std::slice::from_ref(&blob_value))
+            .unwrap();
+        assert_eq!(WindowMaxFunc.value(&max_state).unwrap(), blob_value);
     }
 
     // ── group_concat / string_agg ────────────────────────────────────

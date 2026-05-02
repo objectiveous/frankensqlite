@@ -209,11 +209,11 @@ impl ScalarFunction for CharFunc {
         let mut result = String::new();
         for arg in args {
             // C SQLite: sqlite3_value_int(NULL) returns 0, so NULL → U+0000.
-            #[allow(clippy::cast_sign_loss)]
-            let cp = arg.to_integer() as u32;
-            if let Some(c) = char::from_u32(cp) {
-                result.push(c);
-            }
+            let ch = u32::try_from(arg.to_integer())
+                .ok()
+                .and_then(char::from_u32)
+                .unwrap_or(char::REPLACEMENT_CHARACTER);
+            result.push(ch);
         }
         Ok(SqliteValue::Text(SmallText::from_string(result)))
     }
@@ -2585,6 +2585,22 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(result, SqliteValue::Text(SmallText::from_string("A\0B")));
+    }
+
+    #[test]
+    fn test_char_invalid_scalar_values_use_replacement_character() {
+        let f = CharFunc;
+        let result = f
+            .invoke(&[
+                SqliteValue::Integer(-1),
+                SqliteValue::Integer(65),
+                SqliteValue::Integer(1_114_112),
+            ])
+            .unwrap();
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::from_string("\u{fffd}A\u{fffd}"))
+        );
     }
 
     // ── coalesce ─────────────────────────────────────────────────────────

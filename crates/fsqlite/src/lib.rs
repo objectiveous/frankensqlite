@@ -7708,6 +7708,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn regression_table_alias_hides_base_table_qualifier() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
+
+        let err = conn
+            .query("SELECT t.x FROM t AS a;")
+            .expect_err("base table qualifier should not resolve after aliasing");
+        let message = err.to_string();
+        assert!(
+            message.contains("no such table: t") || message.contains("no such column"),
+            "unexpected error: {err:?}"
+        );
+    }
+
     fn assert_wrong_function_arity(conn: &Connection, sql: &str, name: &str) {
         let err = conn
             .query(sql)

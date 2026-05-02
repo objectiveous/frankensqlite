@@ -7438,12 +7438,7 @@ fn resolve_join_output_count(
             ResultColumn::Star => tables.iter().map(|(t, _)| t.columns.len()).sum(),
             ResultColumn::TableStar(name) => tables
                 .iter()
-                .find(|(t, alias)| {
-                    alias.map_or_else(
-                        || t.name.eq_ignore_ascii_case(&name.name),
-                        |a| a.eq_ignore_ascii_case(&name.name),
-                    )
-                })
+                .find(|(t, alias)| join_qualifier_matches(Some(&name.name), t, *alias))
                 .map_or(0, |(t, _)| t.columns.len()),
             ResultColumn::Expr { .. } => 1,
         })
@@ -7654,7 +7649,10 @@ fn join_qualifier_matches(
     alias: Option<&str>,
 ) -> bool {
     qualifier.is_none_or(|q| {
-        alias.is_some_and(|a| a.eq_ignore_ascii_case(q)) || table.name.eq_ignore_ascii_case(q)
+        alias.map_or_else(
+            || table.name.eq_ignore_ascii_case(q),
+            |a| a.eq_ignore_ascii_case(q),
+        )
     })
 }
 
@@ -7753,11 +7751,10 @@ fn emit_join_result_columns(
                 }
             }
             ResultColumn::TableStar(table_name) => {
-                let name_lower = table_name.name.to_ascii_lowercase();
+                let mut matched = false;
                 for (cursor_idx, (table, alias)) in tables.iter().enumerate() {
-                    let matches = alias.is_some_and(|a| a.eq_ignore_ascii_case(&name_lower))
-                        || table.name.eq_ignore_ascii_case(&name_lower);
-                    if matches {
+                    if join_qualifier_matches(Some(&table_name.name), table, *alias) {
+                        matched = true;
                         for col_idx in 0..table.columns.len() {
                             let dst = out_regs + reg_offset;
                             b.emit_op(
@@ -7772,6 +7769,9 @@ fn emit_join_result_columns(
                         }
                         break;
                     }
+                }
+                if !matched {
+                    return Err(CodegenError::TableNotFound(table_name.to_string()));
                 }
             }
             ResultColumn::Expr { expr, .. } => {
@@ -13619,8 +13619,10 @@ fn is_hidden_rowid_alias_name(name: &str) -> bool {
 }
 
 fn matches_table_or_alias(qualifier: &str, table: &TableSchema, table_alias: Option<&str>) -> bool {
-    qualifier.eq_ignore_ascii_case(&table.name)
-        || table_alias.is_some_and(|alias| qualifier.eq_ignore_ascii_case(alias))
+    table_alias.map_or_else(
+        || qualifier.eq_ignore_ascii_case(&table.name),
+        |alias| qualifier.eq_ignore_ascii_case(alias),
+    )
 }
 
 /// Source for a sort key: either a table column or the implicit rowid.
@@ -19019,6 +19021,18 @@ mod tests {
             source: TableOrSubquery::Table {
                 name: QualifiedName::bare(name),
                 alias: None,
+                index_hint: None,
+                time_travel: None,
+            },
+            joins: vec![],
+        }
+    }
+
+    fn from_table_as(name: &str, alias: &str) -> FromClause {
+        FromClause {
+            source: TableOrSubquery::Table {
+                name: QualifiedName::bare(name),
+                alias: Some(alias.to_owned()),
                 index_hint: None,
                 time_travel: None,
             },
@@ -28951,6 +28965,126 @@ mod tests {
             .expect_err("unqualified JOIN rowid should be ambiguous");
         assert!(
             matches!(err, CodegenError::AmbiguousColumn(ref name) if name == "rowid"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_codegen_table_alias_hides_base_table_qualifier() {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::qualified("t", "a"), Span::ZERO),
+                        alias: None,
+                    }],
+                    from: Some(from_table_as("t", "u")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_select(&mut b, &stmt, &schema, &ctx)
+            .expect_err("base table qualifier must not resolve after aliasing");
+        assert!(
+            matches!(err, CodegenError::TableNotFound(ref name) if name == "t"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_codegen_join_alias_hides_base_table_qualifier() {
+        let schema = vec![
+            TableSchema {
+                name: "t".to_owned(),
+                root_page: 2,
+                columns: vec![ColumnInfo::basic("a", 'D', false)],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: vec![],
+                foreign_keys: vec![],
+                check_constraints: vec![],
+            },
+            TableSchema {
+                name: "s".to_owned(),
+                root_page: 3,
+                columns: vec![ColumnInfo::basic("a", 'D', false)],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: vec![],
+                foreign_keys: vec![],
+                check_constraints: vec![],
+            },
+        ];
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::qualified("u", "a"), Span::ZERO),
+                        alias: None,
+                    }],
+                    from: Some(FromClause {
+                        source: TableOrSubquery::Table {
+                            name: QualifiedName::bare("t"),
+                            alias: Some("u".to_owned()),
+                            index_hint: None,
+                            time_travel: None,
+                        },
+                        joins: vec![JoinClause {
+                            join_type: JoinType {
+                                natural: false,
+                                kind: JoinKind::Inner,
+                            },
+                            table: TableOrSubquery::Table {
+                                name: QualifiedName::bare("s"),
+                                alias: Some("v".to_owned()),
+                                index_hint: None,
+                                time_travel: None,
+                            },
+                            constraint: Some(JoinConstraint::On(Expr::BinaryOp {
+                                left: Box::new(Expr::Column(
+                                    ColumnRef::qualified("t", "a"),
+                                    Span::ZERO,
+                                )),
+                                op: AstBinaryOp::Eq,
+                                right: Box::new(Expr::Column(
+                                    ColumnRef::qualified("v", "a"),
+                                    Span::ZERO,
+                                )),
+                                span: Span::ZERO,
+                            })),
+                        }],
+                    }),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_select(&mut b, &stmt, &schema, &ctx)
+            .expect_err("JOIN qualifier must use the table alias once present");
+        assert!(
+            matches!(err, CodegenError::ColumnNotFound { ref table, ref column } if table == "t" && column == "a"),
             "unexpected error: {err:?}"
         );
     }

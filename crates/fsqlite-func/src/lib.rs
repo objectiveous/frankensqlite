@@ -256,7 +256,7 @@ impl FunctionKey {
 ///
 /// Lookup strategy (§9.5):
 /// 1. Exact match on `(UPPERCASE_NAME, num_args)`.
-/// 2. Fallback to variadic version `(UPPERCASE_NAME, -1)`.
+/// 2. Fallback to an arity-compatible variadic version `(UPPERCASE_NAME, -1)`.
 /// 3. `None` if neither found (caller should raise "no such function").
 #[derive(Default)]
 pub struct FunctionRegistry {
@@ -325,8 +325,8 @@ impl FunctionRegistry {
 
     /// Look up a scalar function by `(name, num_args)`.
     ///
-    /// Tries exact match first, then falls back to the variadic version
-    /// `(name, -1)` if no exact match exists.
+    /// Tries exact match first, then falls back to an arity-compatible
+    /// variadic version `(name, -1)` if no exact match exists.
     #[must_use]
     pub fn find_scalar(&self, name: &str, num_args: i32) -> Option<Arc<dyn ScalarFunction>> {
         let canon = canonical_name(name);
@@ -356,7 +356,11 @@ impl FunctionRegistry {
             name: canonical.to_owned(),
             num_args: -1,
         };
-        let result = self.scalars.get(&variadic).map(Arc::clone);
+        let result = self
+            .scalars
+            .get(&variadic)
+            .filter(|function| function.accepts_arg_count(num_args))
+            .map(Arc::clone);
         debug!(
             name = %canonical,
             arity = num_args,
@@ -642,7 +646,7 @@ mod tests {
                 entry.family == family && entry.name == name && entry.num_args == num_args
             })
             .unwrap_or_else(|| {
-                panic!(
+                unreachable!(
                     "missing builtin surface entry: family={} name={} arity={}",
                     family.label(),
                     name,
@@ -750,6 +754,14 @@ mod tests {
 
         fn num_args(&self) -> i32 {
             -1
+        }
+
+        fn min_args(&self) -> i32 {
+            1
+        }
+
+        fn max_args(&self) -> Option<i32> {
+            Some(3)
         }
 
         fn name(&self) -> &str {
@@ -899,6 +911,11 @@ mod tests {
         // Register only the variadic version (num_args = -1)
         registry.register_scalar(VariadicConcat);
 
+        assert!(
+            registry.find_scalar("my_func", 0).is_none(),
+            "below variadic minimum should not resolve"
+        );
+
         // Look up with specific arg count — no exact match, falls back to variadic
         let f = registry
             .find_scalar("my_func", 3)
@@ -911,6 +928,10 @@ mod tests {
             ])
             .unwrap(),
             SqliteValue::Text("abc".into())
+        );
+        assert!(
+            registry.find_scalar("my_func", 4).is_none(),
+            "above variadic maximum should not resolve"
         );
     }
 
@@ -932,9 +953,9 @@ mod tests {
             SqliteValue::Integer(42)
         );
 
-        // Look up with num_args=5 — no exact match, falls back to variadic
+        // Look up with num_args=3 — no exact match, falls back to variadic
         let f = registry
-            .find_scalar("my_func", 5)
+            .find_scalar("my_func", 3)
             .expect("variadic fallback");
         assert_eq!(f.num_args(), -1);
     }

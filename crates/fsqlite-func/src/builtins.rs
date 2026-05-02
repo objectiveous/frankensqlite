@@ -252,6 +252,10 @@ impl ScalarFunction for CoalesceFunc {
         -1
     }
 
+    fn min_args(&self) -> i32 {
+        2
+    }
+
     fn name(&self) -> &str {
         "coalesce"
     }
@@ -275,6 +279,10 @@ impl ScalarFunction for ConcatFunc {
 
     fn num_args(&self) -> i32 {
         -1
+    }
+
+    fn min_args(&self) -> i32 {
+        1
     }
 
     fn name(&self) -> &str {
@@ -313,6 +321,10 @@ impl ScalarFunction for ConcatWsFunc {
 
     fn num_args(&self) -> i32 {
         -1
+    }
+
+    fn min_args(&self) -> i32 {
+        2
     }
 
     fn name(&self) -> &str {
@@ -615,6 +627,14 @@ impl ScalarFunction for TrimFunc {
         -1 // 1 or 2 args
     }
 
+    fn min_args(&self) -> i32 {
+        1
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        Some(2)
+    }
+
     fn name(&self) -> &str {
         "trim"
     }
@@ -640,6 +660,14 @@ impl ScalarFunction for LtrimFunc {
         -1
     }
 
+    fn min_args(&self) -> i32 {
+        1
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        Some(2)
+    }
+
     fn name(&self) -> &str {
         "ltrim"
     }
@@ -663,6 +691,14 @@ impl ScalarFunction for RtrimFunc {
 
     fn num_args(&self) -> i32 {
         -1
+    }
+
+    fn min_args(&self) -> i32 {
+        1
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        Some(2)
     }
 
     fn name(&self) -> &str {
@@ -857,6 +893,14 @@ impl ScalarFunction for RoundFunc {
 
     fn num_args(&self) -> i32 {
         -1 // 1 or 2 args
+    }
+
+    fn min_args(&self) -> i32 {
+        1
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        Some(2)
     }
 
     fn name(&self) -> &str {
@@ -1203,6 +1247,14 @@ impl ScalarFunction for UnhexFunc {
         -1 // 1 or 2 args
     }
 
+    fn min_args(&self) -> i32 {
+        1
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        Some(2)
+    }
+
     fn name(&self) -> &str {
         "unhex"
     }
@@ -1366,6 +1418,14 @@ impl ScalarFunction for SubstrFunc {
         -1 // 2 or 3 args
     }
 
+    fn min_args(&self) -> i32 {
+        2
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        Some(3)
+    }
+
     fn name(&self) -> &str {
         "substr"
     }
@@ -1520,6 +1580,10 @@ impl ScalarFunction for ScalarMaxFunc {
         -1
     }
 
+    fn min_args(&self) -> i32 {
+        1
+    }
+
     fn name(&self) -> &str {
         "max"
     }
@@ -1546,6 +1610,10 @@ impl ScalarFunction for ScalarMinFunc {
 
     fn num_args(&self) -> i32 {
         -1
+    }
+
+    fn min_args(&self) -> i32 {
+        1
     }
 
     fn name(&self) -> &str {
@@ -2080,6 +2148,14 @@ pub fn register_builtins(registry: &mut FunctionRegistry) {
 
         fn num_args(&self) -> i32 {
             -1
+        }
+
+        fn min_args(&self) -> i32 {
+            2
+        }
+
+        fn max_args(&self) -> Option<i32> {
+            Some(3)
         }
 
         fn name(&self) -> &str {
@@ -4523,6 +4599,46 @@ mod tests {
         // Loadable extensions are not exposed as SQL function by default.
         assert!(registry.find_scalar("load_extension", 1).is_none());
         assert!(registry.find_scalar("load_extension", 2).is_none());
+    }
+
+    #[test]
+    fn test_register_builtins_rejects_invalid_variadic_arities() {
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+
+        for (name, too_few, valid, too_many) in [
+            ("coalesce", 1, 2, None),
+            ("concat", 0, 1, None),
+            ("concat_ws", 1, 2, None),
+            ("trim", 0, 1, Some(3)),
+            ("ltrim", 0, 1, Some(3)),
+            ("rtrim", 0, 1, Some(3)),
+            ("round", 0, 1, Some(3)),
+            ("unhex", 0, 1, Some(3)),
+            ("substr", 1, 2, Some(4)),
+            ("substring", 1, 2, Some(4)),
+            ("max", 0, 1, None),
+            ("min", 0, 1, None),
+        ] {
+            assert!(
+                registry.find_scalar(name, too_few).is_none(),
+                "{name}/{too_few} should not resolve"
+            );
+            assert!(
+                registry.find_scalar(name, valid).is_some(),
+                "{name}/{valid} should resolve"
+            );
+            if let Some(arity) = too_many {
+                assert!(
+                    registry.find_scalar(name, arity).is_none(),
+                    "{name}/{arity} should not resolve"
+                );
+            }
+        }
+
+        assert!(registry.find_scalar("char", 0).is_some());
+        assert!(registry.find_scalar("format", 0).is_some());
+        assert!(registry.find_scalar("printf", 0).is_some());
     }
 
     #[test]

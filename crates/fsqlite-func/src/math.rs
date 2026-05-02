@@ -437,6 +437,14 @@ impl ScalarFunction for LogFunc {
         -1 // variadic: 1 or 2 args
     }
 
+    fn min_args(&self) -> i32 {
+        1
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        Some(2)
+    }
+
     fn name(&self) -> &str {
         "log"
     }
@@ -679,7 +687,7 @@ mod tests {
             SqliteValue::Float(v) => {
                 assert!((v - expected).abs() < EPS, "expected {expected}, got {v}");
             }
-            other => panic!("expected Float({expected}), got {other:?}"),
+            other => unreachable!("expected Float({expected}), got {other:?}"),
         }
     }
 
@@ -928,7 +936,7 @@ mod tests {
         let r = ExpFunc.invoke(&[float(1000.0)]).unwrap();
         match r {
             SqliteValue::Float(v) => assert!(v.is_infinite() && v > 0.0, "+Inf expected"),
-            other => panic!("expected +Inf Float, got {other:?}"),
+            other => unreachable!("expected +Inf Float, got {other:?}"),
         }
     }
 
@@ -1013,7 +1021,7 @@ mod tests {
         let r = ExpFunc.invoke(&[float(1000.0)]).unwrap();
         match r {
             SqliteValue::Float(v) => assert!(v.is_infinite()),
-            other => panic!("expected Inf, got {other:?}"),
+            other => unreachable!("expected Inf, got {other:?}"),
         }
     }
 
@@ -1024,12 +1032,12 @@ mod tests {
         let r = SinhFunc.invoke(&[float(1000.0)]).unwrap();
         match r {
             SqliteValue::Float(v) => assert!(v.is_infinite() && v > 0.0),
-            other => panic!("expected +Inf, got {other:?}"),
+            other => unreachable!("expected +Inf, got {other:?}"),
         }
         let r = SinhFunc.invoke(&[float(-1000.0)]).unwrap();
         match r {
             SqliteValue::Float(v) => assert!(v.is_infinite() && v < 0.0),
-            other => panic!("expected -Inf, got {other:?}"),
+            other => unreachable!("expected -Inf, got {other:?}"),
         }
     }
 
@@ -1139,8 +1147,10 @@ mod tests {
         }
 
         // log is variadic (-1), test lookup with 1 and 2 args
+        assert!(reg.find_scalar("log", 0).is_none(), "log/0 rejected");
         assert!(reg.find_scalar("log", 1).is_some(), "log/1 via variadic");
         assert!(reg.find_scalar("log", 2).is_some(), "log/2 via variadic");
+        assert!(reg.find_scalar("log", 3).is_none(), "log/3 rejected");
     }
 
     #[test]

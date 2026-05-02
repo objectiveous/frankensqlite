@@ -52,6 +52,26 @@ pub trait ScalarFunction: Send + Sync {
     /// `-1` means variadic (any number of arguments).
     fn num_args(&self) -> i32;
 
+    /// Minimum accepted argument count for variadic functions.
+    ///
+    /// Fixed-arity functions default to their exact arity. Variadic functions
+    /// default to accepting zero arguments unless an implementation tightens
+    /// the bound to match SQLite's function surface.
+    fn min_args(&self) -> i32 {
+        self.num_args().max(0)
+    }
+
+    /// Maximum accepted argument count, or `None` for unbounded variadic
+    /// functions.
+    fn max_args(&self) -> Option<i32> {
+        (self.num_args() >= 0).then(|| self.num_args())
+    }
+
+    /// Return whether this function accepts `num_args` arguments.
+    fn accepts_arg_count(&self, num_args: i32) -> bool {
+        num_args >= self.min_args() && self.max_args().is_none_or(|max| num_args <= max)
+    }
+
     /// The function name, used in error messages and EXPLAIN output.
     fn name(&self) -> &str;
 }
@@ -216,6 +236,10 @@ mod tests {
     fn test_scalar_function_variadic() {
         let f = Concat;
         assert_eq!(f.num_args(), -1);
+        assert_eq!(f.min_args(), 0);
+        assert_eq!(f.max_args(), None);
+        assert!(f.accepts_arg_count(0));
+        assert!(f.accepts_arg_count(3));
 
         // 0 args
         assert_eq!(f.invoke(&[]).unwrap(), SqliteValue::Text("".into()));

@@ -345,6 +345,8 @@ pub struct NtileState {
 
 pub struct NtileFunc;
 
+const INVALID_NTILE_ARGUMENT: &str = "argument of ntile must be a positive integer";
+
 impl WindowFunction for NtileFunc {
     type State = NtileState;
 
@@ -357,11 +359,14 @@ impl WindowFunction for NtileFunc {
     }
 
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
-        state.partition_size += 1;
-        if state.partition_size == 1 {
-            let n = args.first().map_or(1, |v| v.to_integer().max(1));
+        if state.partition_size == 0 {
+            let n = args.first().map_or(0, SqliteValue::to_integer);
+            if n <= 0 {
+                return Err(FrankenError::function_error(INVALID_NTILE_ARGUMENT));
+            }
             state.n = n;
         }
+        state.partition_size += 1;
         Ok(())
     }
 
@@ -371,7 +376,7 @@ impl WindowFunction for NtileFunc {
     }
 
     fn value(&self, state: &Self::State) -> Result<SqliteValue> {
-        if state.n <= 0 || state.partition_size == 0 {
+        if state.partition_size == 0 {
             return Ok(SqliteValue::Integer(1));
         }
         let n = state.n;
@@ -656,6 +661,8 @@ pub struct NthValueState {
 
 pub struct NthValueFunc;
 
+const INVALID_NTH_VALUE_ARGUMENT: &str = "second argument to nth_value must be a positive integer";
+
 impl WindowFunction for NthValueFunc {
     type State = NthValueState;
 
@@ -668,11 +675,13 @@ impl WindowFunction for NthValueFunc {
 
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
         let val = args.first().cloned().unwrap_or(SqliteValue::Null);
+        let n = args.get(1).map_or(0, SqliteValue::to_integer);
+        if n <= 0 {
+            return Err(FrankenError::function_error(INVALID_NTH_VALUE_ARGUMENT));
+        }
         // Capture N from second arg on first call.
         if state.frame.is_empty() {
-            if let Some(n_arg) = args.get(1) {
-                state.n = n_arg.to_integer();
-            }
+            state.n = n;
         }
         state.frame.push_back(val);
         Ok(())
@@ -684,11 +693,6 @@ impl WindowFunction for NthValueFunc {
     }
 
     fn value(&self, state: &Self::State) -> Result<SqliteValue> {
-        // nth_value is 1-based.  N <= 0 is an error per SQLite docs,
-        // but we return NULL to be safe (the VDBE should validate N).
-        if state.n <= 0 {
-            return Ok(SqliteValue::Null);
-        }
         let idx = (state.n - 1) as usize;
         Ok(state.frame.get(idx).cloned().unwrap_or(SqliteValue::Null))
     }
@@ -1251,6 +1255,13 @@ mod tests {
         SqliteValue::Null
     }
 
+    fn assert_function_error(err: FrankenError, expected: &str) {
+        match err {
+            FrankenError::FunctionError(message) => assert_eq!(message, expected),
+            other => panic!("expected function error {expected:?}, got {other:?}"),
+        }
+    }
+
     /// Simulate a partition by calling step() for each row, collecting
     /// value() after each step.  Returns the vector of per-row results.
     /// Suitable for progressive functions (row_number, rank, dense_rank).
@@ -1470,6 +1481,15 @@ mod tests {
         assert_eq!(results, vec![int(1), int(2), int(3)]);
     }
 
+    #[test]
+    fn test_ntile_rejects_non_positive_argument() {
+        for n in [0, -1] {
+            let mut state = NtileFunc.initial_state();
+            let err = NtileFunc.step(&mut state, &[int(n)]).unwrap_err();
+            assert_function_error(err, INVALID_NTILE_ARGUMENT);
+        }
+    }
+
     // ── lag ──────────────────────────────────────────────────────────
 
     #[test]
@@ -1636,11 +1656,27 @@ mod tests {
 
     #[test]
     fn test_nth_value_n_zero() {
-        // nth_value(X, 0) returns NULL (0 is invalid, 1-based).
         let func = NthValueFunc;
         let mut state = func.initial_state();
-        func.step(&mut state, &[int(10), int(0)]).unwrap();
-        assert_eq!(func.value(&state).unwrap(), null());
+        let err = func.step(&mut state, &[int(10), int(0)]).unwrap_err();
+        assert_function_error(err, INVALID_NTH_VALUE_ARGUMENT);
+    }
+
+    #[test]
+    fn test_nth_value_rejects_negative_n() {
+        let func = NthValueFunc;
+        let mut state = func.initial_state();
+        let err = func.step(&mut state, &[int(10), int(-1)]).unwrap_err();
+        assert_function_error(err, INVALID_NTH_VALUE_ARGUMENT);
+    }
+
+    #[test]
+    fn test_nth_value_rejects_non_positive_n_after_first_row() {
+        let func = NthValueFunc;
+        let mut state = func.initial_state();
+        func.step(&mut state, &[int(10), int(1)]).unwrap();
+        let err = func.step(&mut state, &[int(20), int(0)]).unwrap_err();
+        assert_function_error(err, INVALID_NTH_VALUE_ARGUMENT);
     }
 
     // ── sum / total / avg ────────────────────────────────────────────

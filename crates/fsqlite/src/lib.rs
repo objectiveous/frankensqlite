@@ -7552,6 +7552,16 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 0);
 
+        let rows = conn
+            .query("SELECT a.x FROM a JOIN b ON a.rowid = '1';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+
+        let rows = conn
+            .query("SELECT a.x FROM a JOIN b ON a.rowid > '0';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+
         conn.execute("CREATE TABLE txt(v TEXT)").unwrap();
         conn.execute("CREATE TABLE num(v NUMERIC)").unwrap();
         conn.execute("INSERT INTO txt VALUES ('9')").unwrap();

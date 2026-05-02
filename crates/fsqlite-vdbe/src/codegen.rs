@@ -7530,6 +7530,7 @@ fn emit_join_expr(
             let comparison_collation = join_effective_collation(left, tables)
                 .or_else(|| join_effective_collation(right, tables))
                 .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
+            let comparison_p5 = 0x20 | join_comparison_affinity_p5(left, right, tables);
             match op {
                 BinaryOp::Eq => {
                     // Use Eq with STOREP2 to store result in target.
@@ -7539,7 +7540,7 @@ fn emit_join_expr(
                         target,
                         left_reg,
                         comparison_collation,
-                        0x20,
+                        comparison_p5,
                     );
                 }
                 BinaryOp::Ne => {
@@ -7549,7 +7550,7 @@ fn emit_join_expr(
                         target,
                         left_reg,
                         comparison_collation,
-                        0x20,
+                        comparison_p5,
                     );
                 }
                 BinaryOp::Lt => {
@@ -7559,7 +7560,7 @@ fn emit_join_expr(
                         target,
                         left_reg,
                         comparison_collation,
-                        0x20,
+                        comparison_p5,
                     );
                 }
                 BinaryOp::Le => {
@@ -7569,7 +7570,7 @@ fn emit_join_expr(
                         target,
                         left_reg,
                         comparison_collation,
-                        0x20,
+                        comparison_p5,
                     );
                 }
                 BinaryOp::Gt => {
@@ -7579,7 +7580,7 @@ fn emit_join_expr(
                         target,
                         left_reg,
                         comparison_collation,
-                        0x20,
+                        comparison_p5,
                     );
                 }
                 BinaryOp::Ge => {
@@ -7589,7 +7590,7 @@ fn emit_join_expr(
                         target,
                         left_reg,
                         comparison_collation,
-                        0x20,
+                        comparison_p5,
                     );
                 }
                 BinaryOp::Add => {
@@ -17923,6 +17924,62 @@ fn join_effective_collation<'a>(
             .column_index(&col_ref.column)
             .and_then(|index| table.columns[index].collation.as_deref())
     })
+}
+
+fn join_expr_affinity(expr: &Expr, tables: &[(&TableSchema, Option<&str>)]) -> u8 {
+    let inner = if let Expr::Collate { expr: inner, .. } = expr {
+        inner.as_ref()
+    } else {
+        expr
+    };
+    match inner {
+        Expr::Column(col_ref, _) => tables
+            .iter()
+            .find_map(|(table, alias)| {
+                if let Some(qualifier) = col_ref.table.as_deref()
+                    && !matches_table_or_alias(qualifier, table, *alias)
+                {
+                    return None;
+                }
+                if let Some(index) = table.column_index(&col_ref.column) {
+                    return Some(
+                        table.columns[index]
+                            .type_name
+                            .as_deref()
+                            .map_or(b'A', column_type_to_affinity),
+                    );
+                }
+                table
+                    .resolves_to_hidden_rowid(&col_ref.column)
+                    .then_some(b'D')
+            })
+            .unwrap_or(b'A'),
+        Expr::Cast { type_name, .. } => type_name_to_affinity(type_name),
+        _ => b'A',
+    }
+}
+
+fn join_comparison_affinity_p5(
+    left: &Expr,
+    right: &Expr,
+    tables: &[(&TableSchema, Option<&str>)],
+) -> u16 {
+    let left_affinity = join_expr_affinity(left, tables);
+    let right_affinity = join_expr_affinity(right, tables);
+    let is_numeric = |affinity: u8| matches!(affinity, b'C' | b'D' | b'E');
+
+    if is_numeric(left_affinity) && matches!(right_affinity, b'A' | b'B') {
+        return u16::from(b'C');
+    }
+    if is_numeric(right_affinity) && matches!(left_affinity, b'A' | b'B') {
+        return u16::from(b'C');
+    }
+    if (left_affinity == b'B' && right_affinity == b'A')
+        || (left_affinity == b'A' && right_affinity == b'B')
+    {
+        return u16::from(b'B');
+    }
+    0
 }
 
 /// Extract explicit COLLATE from an ORDER BY term's expression.

@@ -52,7 +52,7 @@ mod parser_tests {
                     "select has from clause or core"
                 );
             }
-            other => panic!("bead_id={BEAD_ID} case=select_star expected Select, got {other:?}"),
+            other => diag_assert!(ctx, false, "expected Select, got {other:?}"),
         }
     }
 
@@ -107,7 +107,7 @@ mod parser_tests {
             Statement::Insert(ins) => {
                 diag_assert_eq!(ctx, ins.table.name.as_str(), "users");
             }
-            other => panic!("bead_id={BEAD_ID} case=insert_values expected Insert, got {other:?}"),
+            other => diag_assert!(ctx, false, "expected Insert, got {other:?}"),
         }
     }
 
@@ -149,7 +149,7 @@ mod parser_tests {
         diag_assert_eq!(ctx.clone(), stmts.len(), 1);
         match &stmts[0] {
             Statement::Update(_) => {}
-            other => panic!("bead_id={BEAD_ID} case=update_where expected Update, got {other:?}"),
+            other => diag_assert!(ctx, false, "expected Update, got {other:?}"),
         }
     }
 
@@ -183,9 +183,7 @@ mod parser_tests {
             Statement::CreateTable(ct) => {
                 diag_assert_eq!(ctx, ct.name.name.as_str(), "t1");
             }
-            other => {
-                panic!("bead_id={BEAD_ID} case=create_table expected CreateTable, got {other:?}")
-            }
+            other => diag_assert!(ctx, false, "expected CreateTable, got {other:?}"),
         }
     }
 
@@ -680,7 +678,7 @@ mod vdbe_tests {
         match op.p4 {
             #[allow(clippy::neg_cmp_op_on_partial_ord)]
             P4::Real(v) => diag_assert!(ctx, (v - 3.14).abs() < f64::EPSILON, "value matches"),
-            _ => panic!("bead_id={BEAD_ID} case=real_p4 expected P4::Real"),
+            other => diag_assert!(ctx, false, "expected P4::Real, got {other:?}"),
         }
     }
 
@@ -862,6 +860,7 @@ mod vdbe_tests {
 #[cfg(test)]
 mod function_tests {
     use super::*;
+    use fsqlite_error::FrankenError;
     use fsqlite_func::{
         FunctionRegistry, register_builtins, register_datetime_builtins, register_math_builtins,
     };
@@ -1035,7 +1034,7 @@ mod function_tests {
         match result {
             #[allow(clippy::neg_cmp_op_on_partial_ord)]
             SqliteValue::Float(v) => diag_assert!(ctx, (v - 3.14).abs() < f64::EPSILON, "matches"),
-            other => panic!("bead_id={BEAD_ID} case=abs_float expected Float, got {other:?}"),
+            other => diag_assert!(ctx, false, "expected Float, got {other:?}"),
         }
     }
 
@@ -1134,10 +1133,28 @@ mod function_tests {
         let reg = full_registry();
         let ctx = DiagContext::new(BEAD_ID)
             .case("wrong_arity")
-            .invariant("Wrong arg count returns None (unless variadic)");
+            .invariant("Wrong arg count returns a function error for known scalar names");
         // abs takes exactly 1 arg
         let result = reg.find_scalar("abs", 5);
-        diag_assert_eq!(ctx, result.is_none(), true);
+        let Some(function) = result else {
+            diag_assert!(ctx, false, "wrong arity should return an erroring scalar");
+            return;
+        };
+        let err = function
+            .invoke(&[
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Null,
+            ])
+            .expect_err("wrong arity should return function error");
+        diag_assert!(
+            ctx,
+            matches!(&err, FrankenError::FunctionError(message)
+                if message == "wrong number of arguments to function abs()"),
+            "wrong arity raises SQLite-compatible function error"
+        );
     }
 
     #[test]

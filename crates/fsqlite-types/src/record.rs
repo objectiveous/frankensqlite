@@ -1436,6 +1436,10 @@ where
 {
     const STACK_PRECOMPUTED_RECORD_SLOTS: usize = 16;
 
+    if header.slots.len() == 1 {
+        return serialize_single_slot_precomputed_record_into(values, header, buf);
+    }
+
     if header.slots.len() > STACK_PRECOMPUTED_RECORD_SLOTS {
         return serialize_record_iter_with_precomputed_header_append_into(values, header, buf);
     }
@@ -1491,6 +1495,42 @@ where
     }
 
     debug_assert_eq!(body_offset, total_size);
+    true
+}
+
+fn serialize_single_slot_precomputed_record_into<'a, I>(
+    values: I,
+    header: &PrecomputedRecordHeader,
+    buf: &mut Vec<u8>,
+) -> bool
+where
+    I: Iterator<Item = &'a SqliteValue>,
+{
+    let mut values = values;
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+
+    let slot = &header.slots[0];
+    let Some((serial_byte, payload_len)) = slot.kind.serial_byte_and_payload_len(value) else {
+        return false;
+    };
+    let header_size = header.template.len();
+    let Some(total_size) = header_size.checked_add(payload_len) else {
+        return false;
+    };
+
+    buf.clear();
+    buf.resize(total_size, 0);
+    buf[..header_size].copy_from_slice(&header.template);
+    if slot.kind.needs_runtime_patch() {
+        debug_assert!(slot.header_offset < header_size);
+        buf[slot.header_offset] = serial_byte;
+    }
+    encode_serialized_value(value, payload_len, &mut buf[header_size..]);
     true
 }
 
@@ -2602,6 +2642,36 @@ mod tests {
         assert_eq!(buf.len(), exact);
         assert_eq!(buf.capacity(), capacity);
         assert_eq!(parse_record(&buf).unwrap(), values);
+    }
+
+    #[test]
+    fn opt_a2_precomputed_header_single_slot_vec_serializer_matches_generic() {
+        let header =
+            PrecomputedRecordHeader::new(&[PrecomputedSerialTypeKind::AnyOneByteVarintOrNull]);
+        let cases = [
+            SqliteValue::Null,
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(127),
+            SqliteValue::Float(1.25),
+            SqliteValue::Text(SmallText::new("abc")),
+            SqliteValue::Blob(Arc::from([0xCA_u8, 0xFE].as_slice())),
+        ];
+
+        for value in cases {
+            let values = [value];
+            let expected = serialize_record(&values);
+            let mut buf = vec![0xA5; 32];
+            let capacity = buf.capacity();
+            assert!(serialize_record_iter_with_precomputed_header_into(
+                values.iter(),
+                &header,
+                &mut buf,
+            ));
+            assert_eq!(buf, expected);
+            assert_eq!(buf.len(), expected.len());
+            assert_eq!(buf.capacity(), capacity);
+            assert_eq!(parse_record(&buf).unwrap(), values.as_slice());
+        }
     }
 
     #[test]

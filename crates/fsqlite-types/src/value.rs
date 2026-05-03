@@ -1356,9 +1356,6 @@ fn ascii_ci_eq_bytes(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
     }
-    if left == right {
-        return true;
-    }
     let mut idx = 0;
     while idx < left.len() {
         if !ascii_ci_eq_byte(left[idx], right[idx]) {

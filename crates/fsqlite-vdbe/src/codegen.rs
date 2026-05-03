@@ -3772,10 +3772,6 @@ fn codegen_select_count_star_indexed_in_scan(
             0,
         );
 
-        let r_probe_value = b.alloc_reg();
-        let r_min_rowid = b.alloc_reg();
-        let r_probe_record = b.alloc_reg();
-        let r_current_key = b.alloc_reg();
         let probe_done = b.emit_label();
         if use_exists_semijoin_merge {
             b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, probe_done, P4::None, 0);
@@ -3802,6 +3798,8 @@ fn codegen_select_count_star_indexed_in_scan(
         let source_rowid_reg = (source_rowid_range.is_some()
             && matches!(probe_source.value, InProbeValue::Rowid))
         .then(|| b.alloc_reg());
+        let r_probe_value = source_rowid_reg.unwrap_or_else(|| b.alloc_reg());
+        let r_current_key = b.alloc_reg();
 
         let probe_start = b.current_addr();
         if let Some(range) = source_rowid_range {
@@ -3882,14 +3880,14 @@ fn codegen_select_count_star_indexed_in_scan(
             register_base: None,
             secondary: None,
         };
-        if let Some(rowid_reg) = source_rowid_reg {
-            b.emit_op(Opcode::Copy, rowid_reg, r_probe_value, 0, P4::None, 0);
-        } else {
+        if source_rowid_reg.is_none() {
             emit_in_probe_value(b, source_cursor, probe_source, r_probe_value, &probe_scan);
         }
 
         let next_probe = b.emit_label();
-        b.emit_jump_to_label(Opcode::IsNull, r_probe_value, 0, next_probe, P4::None, 0);
+        if source_rowid_reg.is_none() {
+            b.emit_jump_to_label(Opcode::IsNull, r_probe_value, 0, next_probe, P4::None, 0);
+        }
         if use_exists_semijoin_merge {
             let advance_outer = b.emit_label();
             let align_outer = b.emit_label();
@@ -3928,6 +3926,8 @@ fn codegen_select_count_star_indexed_in_scan(
             b.emit_jump_to_label(Opcode::Next, idx_cursor, 0, align_outer, P4::None, 0);
             b.emit_jump_to_label(Opcode::Goto, 0, 0, probe_done, P4::None, 0);
         } else {
+            let r_min_rowid = b.alloc_reg();
+            let r_probe_record = b.alloc_reg();
             b.emit_op(Opcode::Int64, 0, r_min_rowid, 0, P4::Int64(i64::MIN), 0);
             b.emit_op(
                 Opcode::MakeRecord,
@@ -25123,6 +25123,25 @@ mod tests {
         assert!(
             prog.ops().iter().any(|op| op.opcode == Opcode::Rowid),
             "rowid-driven IN-subquery should read source rowids for bounded stop checks"
+        );
+        let rowid_reg = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Rowid)
+            .expect("rowid-backed probe should read the source rowid")
+            .p2;
+        let count_eq_run = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::CountIndexEqRun)
+            .expect("rowid-backed probe should count duplicate index-key runs");
+        assert_eq!(
+            count_eq_run.p3, rowid_reg,
+            "CountIndexEqRun should consume the source rowid register directly"
+        );
+        assert!(
+            prog.ops().iter().all(|op| op.opcode != Opcode::Copy),
+            "rowid-backed indexed IN count should not copy the rowid into a separate probe register"
         );
     }
 

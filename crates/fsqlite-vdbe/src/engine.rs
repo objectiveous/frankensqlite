@@ -1223,26 +1223,26 @@ impl SorterCursor {
         }
     }
 
-    fn find_worst_row_index(&self, collation_registry: &CollationRegistry) -> Option<usize> {
-        if self.rows.is_empty() {
-            return None;
-        }
-
-        let mut worst_idx = 0usize;
-        for idx in 1..self.rows.len() {
+    fn insert_sorted_top_n_row(&mut self, row: SorterRow, collation_registry: &CollationRegistry) {
+        let mut low = 0usize;
+        let mut high = self.rows.len();
+        while low < high {
+            let mid = low + (high - low) / 2;
             let ordering = compare_sorter_rows(
-                &self.rows[idx].values,
-                &self.rows[worst_idx].values,
+                &row.values,
+                &self.rows[mid].values,
                 self.key_columns,
                 &self.sort_key_orders,
                 &self.collations,
                 collation_registry,
             );
-            if ordering != Ordering::Less {
-                worst_idx = idx;
+            if ordering == Ordering::Less {
+                high = mid;
+            } else {
+                low = mid + 1;
             }
         }
-        Some(worst_idx)
+        self.rows.insert(low, row);
     }
 
     /// Estimate the memory footprint of a sorter row.
@@ -1268,42 +1268,35 @@ impl SorterCursor {
 
             let new_row_size = Self::estimate_row_size(&values, &blob);
             let new_row = SorterRow { values, blob };
+            let collation_registry = Arc::clone(&self.collation_registry);
+            let coll_guard = collation_registry.lock().unwrap_or_else(|e| e.into_inner());
             if self.rows.len() < limit {
+                self.insert_sorted_top_n_row(new_row, &coll_guard);
                 self.memory_used += new_row_size;
-                self.rows.push(new_row);
                 self.invalidate_output_row_cache();
                 return Ok(());
             }
 
-            let replacement = {
-                let coll_guard = self
-                    .collation_registry
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                self.find_worst_row_index(&coll_guard)
-                    .and_then(|worst_idx| {
-                        let ordering = compare_sorter_rows(
-                            &new_row.values,
-                            &self.rows[worst_idx].values,
-                            self.key_columns,
-                            &self.sort_key_orders,
-                            &self.collations,
-                            &coll_guard,
-                        );
-                        (ordering == Ordering::Less).then(|| {
-                            let replaced_size = Self::estimate_row_size(
-                                &self.rows[worst_idx].values,
-                                &self.rows[worst_idx].blob,
-                            );
-                            (worst_idx, replaced_size)
-                        })
-                    })
-            };
-
-            if let Some((worst_idx, replaced_size)) = replacement {
-                self.memory_used = self.memory_used.saturating_sub(replaced_size);
+            if let Some(worst_row) = self.rows.last() {
+                let ordering = compare_sorter_rows(
+                    &new_row.values,
+                    &worst_row.values,
+                    self.key_columns,
+                    &self.sort_key_orders,
+                    &self.collations,
+                    &coll_guard,
+                );
+                if ordering != Ordering::Less {
+                    return Ok(());
+                }
+                self.insert_sorted_top_n_row(new_row, &coll_guard);
+                let removed_row = self
+                    .rows
+                    .pop()
+                    .expect("top-N sorter should remove one retained row");
+                let removed_size = Self::estimate_row_size(&removed_row.values, &removed_row.blob);
+                self.memory_used = self.memory_used.saturating_sub(removed_size);
                 self.memory_used = self.memory_used.saturating_add(new_row_size);
-                self.rows[worst_idx] = new_row;
                 self.invalidate_output_row_cache();
             }
             return Ok(());
@@ -1430,6 +1423,11 @@ impl SorterCursor {
             .unwrap_or_else(|e| e.into_inner());
 
         if self.spill_runs.is_empty() {
+            if self.top_n_limit.is_some() {
+                self.rows_sorted_total += self.rows.len() as u64;
+                return Ok(());
+            }
+
             // Pure in-memory sort — fast path.
             let key_columns = self.key_columns;
             let orders = self.sort_key_orders.clone();
@@ -28544,6 +28542,38 @@ mod tests {
             .map(|r| r.values[0].to_integer())
             .collect();
         assert_eq!(values, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_sorter_top_n_limit_desc_keeps_rows_sorted_during_insert() {
+        let mut sorter = SorterCursor::with_collation_registry(
+            1,
+            vec![SortKeyOrder::Desc],
+            Vec::new(),
+            Arc::new(Mutex::new(CollationRegistry::new())),
+            Some(3),
+        );
+
+        for value in [1i64, 2, 3, 4, 5] {
+            sorter
+                .insert_row(vec![SqliteValue::Integer(value)], vec![])
+                .expect("insert should succeed");
+        }
+
+        let retained: Vec<i64> = sorter
+            .rows
+            .iter()
+            .map(|r| r.values[0].to_integer())
+            .collect();
+        assert_eq!(retained, vec![5, 4, 3]);
+
+        sorter.sort().expect("sort should succeed");
+        let sorted: Vec<i64> = sorter
+            .rows
+            .iter()
+            .map(|r| r.values[0].to_integer())
+            .collect();
+        assert_eq!(sorted, vec![5, 4, 3]);
     }
 
     // ── bd-2ttd8.1: Pager routing and parity-cert tests ──────────────

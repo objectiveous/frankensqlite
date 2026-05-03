@@ -1348,7 +1348,8 @@ fn ascii_fold_byte(byte: u8) -> u8 {
 
 #[inline]
 fn ascii_ci_eq_byte(left: u8, right: u8) -> bool {
-    left == right || ascii_fold_byte(left) == ascii_fold_byte(right)
+    left == right
+        || ((left ^ right) == 0x20 && left.is_ascii_alphabetic() && right.is_ascii_alphabetic())
 }
 
 fn ascii_ci_eq_bytes(left: &[u8], right: &[u8]) -> bool {
@@ -3122,6 +3123,12 @@ mod tests {
         assert!(!sql_like("Ä", "ä", None));
         // But exact match works.
         assert!(sql_like("ä", "ä", None));
+    }
+
+    #[test]
+    fn test_like_fast_path_does_not_fold_ascii_punctuation() {
+        assert!(!sql_like("[", "{", None));
+        assert!(!sql_like("@", "`", None));
     }
 
     #[test]

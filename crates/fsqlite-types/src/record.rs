@@ -12,6 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 
+use smallvec::SmallVec;
+
 #[cfg(all(target_arch = "x86_64", not(target_arch = "wasm32")))]
 use std::simd::{
     Simd,
@@ -1399,8 +1401,8 @@ pub fn serialize_record_refs(values: &[&SqliteValue]) -> Vec<u8> {
 /// Core serialization logic.
 ///
 /// Matches SQLite's `OP_MakeRecord` shape: one pass to measure header/body
-/// sizes, one pass to write serial types + payload bytes directly into the
-/// destination buffer.
+/// sizes while caching each column layout, one pass to write serial types +
+/// payload bytes directly into the destination buffer.
 pub fn serialize_record_iter<'a, I>(values: I) -> Vec<u8>
 where
     I: Iterator<Item = &'a SqliteValue> + Clone,
@@ -1847,6 +1849,17 @@ fn serialize_record_iter_into_impl<'a, I>(values: I, buf: &mut Vec<u8>)
 where
     I: Iterator<Item = &'a SqliteValue> + Clone,
 {
+    if values.size_hint().1.is_some_and(|len| len <= 3) {
+        serialize_record_iter_into_impl_two_pass(values, buf);
+    } else {
+        serialize_record_iter_into_impl_cached_layout(values, buf);
+    }
+}
+
+fn serialize_record_iter_into_impl_two_pass<'a, I>(values: I, buf: &mut Vec<u8>)
+where
+    I: Iterator<Item = &'a SqliteValue> + Clone,
+{
     let mut header_content_size = 0usize;
     let mut body_size = 0usize;
 
@@ -1871,6 +1884,54 @@ where
 
     for value in values {
         let (serial_type, payload_len) = serialized_value_layout(value);
+        header_offset += write_varint(&mut buf[header_offset..], serial_type);
+        append_serialized_value(value, payload_len, buf);
+    }
+
+    debug_assert_eq!(header_offset, header_size);
+    debug_assert_eq!(buf.len(), total_size);
+}
+
+fn serialize_record_iter_into_impl_cached_layout<'a, I>(values: I, buf: &mut Vec<u8>)
+where
+    I: Iterator<Item = &'a SqliteValue>,
+{
+    let mut header_content_size = 0usize;
+    let mut body_size = 0usize;
+    let mut layouts: SmallVec<[(&'a SqliteValue, u64, usize); 16]> = SmallVec::new();
+
+    for value in values {
+        let (serial_type, payload_len) = serialized_value_layout(value);
+        header_content_size += varint_len(serial_type);
+        body_size += payload_len;
+        layouts.push((value, serial_type, payload_len));
+    }
+
+    write_serialized_record_from_layouts(layouts.into_iter(), header_content_size, body_size, buf);
+}
+
+fn write_serialized_record_from_layouts<'a, I>(
+    layouts: I,
+    header_content_size: usize,
+    body_size: usize,
+    buf: &mut Vec<u8>,
+) where
+    I: Iterator<Item = (&'a SqliteValue, u64, usize)>,
+{
+    let header_size = compute_header_size(header_content_size);
+    let total_size = header_size + body_size;
+    buf.clear();
+    if buf.capacity() < total_size {
+        buf.reserve(total_size - buf.capacity());
+    }
+    buf.resize(header_size, 0);
+
+    let mut header_offset = write_varint(
+        buf.as_mut_slice(),
+        u64::try_from(header_size).unwrap_or(u64::MAX),
+    );
+
+    for (value, serial_type, payload_len) in layouts {
         header_offset += write_varint(&mut buf[header_offset..], serial_type);
         append_serialized_value(value, payload_len, buf);
     }

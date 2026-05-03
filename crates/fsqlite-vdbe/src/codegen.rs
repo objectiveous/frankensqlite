@@ -25105,8 +25105,8 @@ mod tests {
         assert!(
             prog.ops()
                 .iter()
-                .any(|op| op.opcode == Opcode::OpenAutoindex),
-            "rowid-driven IN-subquery should still materialize the RHS probe set once"
+                .all(|op| op.opcode != Opcode::OpenAutoindex),
+            "rowid-driven IN-subquery should scan the unique rowid probe source directly"
         );
         assert!(
             prog.ops()

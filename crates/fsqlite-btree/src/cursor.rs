@@ -4670,12 +4670,12 @@ impl<P: PageWriter> BtCursor<P> {
     /// offset)))` on a successful append. Propagates any error from `writer`
     /// or from size conversions.
     ///
-    /// # Safety contract
+    /// # Error contract
     ///
     /// The writer MUST fully initialize exactly `payload_len` bytes of the
-    /// slice it receives (or return `Err`). On `Err` the page buffer state is
-    /// unspecified and the cell header/pointer updates in this function are
-    /// still in effect — callers should abort the statement rather than retry.
+    /// slice it receives (or return `Err`). On `Err`, no cell pointer or header
+    /// update is published; bytes in the unreferenced free-space slot may have
+    /// been touched, but the page still describes the pre-call cell set.
     fn try_append_table_leaf_payload_in_place_no_overflow_mutate_only_with_writer<W>(
         usable_size: u32,
         leaf_page_no: PageNumber,
@@ -4740,8 +4740,7 @@ impl<P: PageWriter> BtCursor<P> {
             + usize::from(header.page_type.header_size())
             + usize::from(insert_idx) * 2;
 
-        header.cell_count = new_cell_count;
-        header.cell_content_offset =
+        let new_cell_content_offset =
             u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
                 detail: format!(
                     "new leaf content offset {} exceeds u32 range on page {}",
@@ -4761,6 +4760,8 @@ impl<P: PageWriter> BtCursor<P> {
             write_offset += rowid_len;
             let payload_slice = &mut page_bytes[write_offset..write_offset + local_size];
             writer(payload_slice)?;
+            header.cell_count = new_cell_count;
+            header.cell_content_offset = new_cell_content_offset;
             page_bytes[ptr_offset..ptr_offset + 2].copy_from_slice(&new_cell_offset.to_be_bytes());
             header.write(page_bytes, header_offset);
         }
@@ -13469,6 +13470,31 @@ mod tests {
         );
         assert_eq!(cursor.rowid(&cx).unwrap(), 2);
         assert_eq!(cursor.payload(&cx).unwrap(), payload);
+    }
+
+    #[test]
+    fn test_table_append_after_last_position_with_writer_error_does_not_publish_cell() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+
+        cursor.table_insert(&cx, 1, b"seed").unwrap();
+        assert!(cursor.last(&cx).unwrap());
+        let error = cursor
+            .table_append_after_last_position_with_writer(&cx, 2, 8, |dst| {
+                dst.copy_from_slice(b"partial!");
+                Err(FrankenError::internal("forced direct writer failure"))
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("forced direct writer failure"));
+        assert!(
+            !cursor.table_move_to(&cx, 2).unwrap().is_found(),
+            "failed writer append must not publish a new row"
+        );
+        assert!(cursor.table_move_to(&cx, 1).unwrap().is_found());
+        assert_eq!(cursor.payload(&cx).unwrap(), b"seed");
     }
 
     #[test]

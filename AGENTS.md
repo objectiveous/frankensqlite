@@ -119,6 +119,15 @@ inherits = "release"
 opt-level = 3
 ```
 
+### Performance Negative Results Ledger
+
+Before starting performance work, read
+`docs/progress/perf-negative-results.md`. If a candidate optimization is
+abandoned, reverted, or rejected by the benchmark matrix, add a short entry with
+the target workload, files touched, evidence artifacts, measured result, and the
+condition under which it is worth retrying. This is mandatory: failed
+optimization ideas must be durable so future agents do not repeat them.
+
 ---
 
 ## Code Editing Discipline

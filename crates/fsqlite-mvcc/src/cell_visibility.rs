@@ -1161,7 +1161,7 @@ impl CellVisibilityLog {
             for shard in self.shards.iter() {
                 let heads = shard.heads.read();
 
-                for entry in heads.values() {
+                for (_, entry) in heads.iter() {
                     let mut current_idx = Some(entry.head_idx);
                     let mut found_visible_below_horizon = false;
 
@@ -1333,7 +1333,7 @@ impl CellVisibilityLog {
 
         for shard in self.shards.iter() {
             let heads = shard.heads.read();
-            for (pgno, _) in heads.keys() {
+            for ((pgno, _), _) in heads.iter() {
                 pages.insert(*pgno);
             }
         }

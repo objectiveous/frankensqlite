@@ -15156,6 +15156,62 @@ struct SecondaryScan<'a> {
     table_alias: Option<&'a str>,
 }
 
+fn literal_integer_value(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Literal(Literal::Integer(value), _) => Some(*value),
+        _ => None,
+    }
+}
+
+fn try_emit_column_substr_prefix(
+    b: &mut ProgramBuilder,
+    name: &str,
+    arg_list: &[Expr],
+    reg: i32,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    if !(name.eq_ignore_ascii_case("substr") || name.eq_ignore_ascii_case("substring"))
+        || arg_list.len() != 3
+        || ctx.register_base.is_some()
+    {
+        return false;
+    }
+
+    let Expr::Column(col_ref, _) = &arg_list[0] else {
+        return false;
+    };
+    let Some(col_idx) = resolve_column_in_ctx(col_ref, ctx) else {
+        return false;
+    };
+    if ctx.table.columns.get(col_idx).is_some_and(|col| col.is_ipk)
+        || literal_integer_value(&arg_list[1]) != Some(1)
+    {
+        return false;
+    }
+    let Some(prefix_len) = literal_integer_value(&arg_list[2]) else {
+        return false;
+    };
+    let Ok(prefix_len) = i32::try_from(prefix_len) else {
+        return false;
+    };
+    if prefix_len < 0 {
+        return false;
+    }
+    let Ok(col_idx) = i32::try_from(col_idx) else {
+        return false;
+    };
+
+    b.emit_op(
+        Opcode::ColumnSubstrPrefix,
+        ctx.cursor,
+        col_idx,
+        reg,
+        P4::Int(prefix_len),
+        0,
+    );
+    true
+}
+
 enum InProbeValue<'a> {
     Expr(&'a Expr),
     FirstColumn,
@@ -16163,6 +16219,11 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                     b.emit_op(Opcode::PureFunc, 0, 0, reg, P4::FuncName(canon), 0);
                 }
                 fsqlite_ast::FunctionArgs::List(arg_list) => {
+                    if let Some(scan_ctx) = ctx
+                        && try_emit_column_substr_prefix(b, name, arg_list, reg, scan_ctx)
+                    {
+                        return;
+                    }
                     let Ok(nargs) = u16::try_from(arg_list.len()) else {
                         b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
                         return;
@@ -17689,6 +17750,13 @@ fn emit_expr_with_fallback(
                     b.emit_op(Opcode::PureFunc, 0, 0, reg, P4::FuncName(canon), 0);
                 }
                 fsqlite_ast::FunctionArgs::List(arg_list) => {
+                    if try_emit_column_substr_prefix(b, name, arg_list, reg, inner_ctx)
+                        || outer_ctx.is_some_and(|outer| {
+                            try_emit_column_substr_prefix(b, name, arg_list, reg, outer)
+                        })
+                    {
+                        return;
+                    }
                     let Ok(nargs) = u16::try_from(arg_list.len()) else {
                         b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
                         return;
@@ -19099,6 +19167,23 @@ mod tests {
 
     fn expr_sql(sql: &str) -> Expr {
         parse_sql_expr(sql).expect("test expression SQL should parse")
+    }
+
+    fn select_sql(sql: &str) -> SelectStatement {
+        let Some((statement, tail)) =
+            parse_first_statement_with_tail(sql).expect("test SELECT SQL should parse")
+        else {
+            unreachable!("expected parsed SELECT statement");
+        };
+        assert_eq!(
+            tail,
+            sql.len(),
+            "parser should consume the whole SQL string"
+        );
+        match statement {
+            Statement::Select(stmt) => stmt,
+            other => unreachable!("expected SELECT statement, got {other:?}"),
+        }
     }
 
     fn lower_name_eq_param(n: u32) -> Box<Expr> {
@@ -22051,6 +22136,89 @@ mod tests {
                 &[Opcode::Init, Opcode::OpenRead, Opcode::Rewind, Opcode::Add]
             ),
             "expected Add opcode for expression evaluation"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_substr_prefix_column_uses_direct_opcode() {
+        let stmt = select_sql("SELECT substr(b, 1, 3) FROM t");
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+
+        assert!(
+            ops.contains(&Opcode::ColumnSubstrPrefix),
+            "literal prefix substr(column, 1, N) should avoid full column materialization"
+        );
+        assert!(
+            !ops.contains(&Opcode::PureFunc),
+            "direct prefix substr should not emit scalar function dispatch"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_substr_prefix_column_executes() {
+        let stmt = select_sql("SELECT substr(name, 1, 4), substring(name, 1, 99) FROM bench");
+        let results = execute_codegen_select_with_storage_cursor(
+            &stmt,
+            &test_small_bench_schema(),
+            seed_small_bench_db(3),
+        );
+
+        assert_eq!(
+            results,
+            vec![
+                vec![
+                    SqliteValue::Text("name".into()),
+                    SqliteValue::Text("name0".into()),
+                ],
+                vec![
+                    SqliteValue::Text("name".into()),
+                    SqliteValue::Text("name1".into()),
+                ],
+                vec![
+                    SqliteValue::Text("name".into()),
+                    SqliteValue::Text("name2".into()),
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_substr_prefix_column_preserves_unicode_and_blob_edges() {
+        let mut db = MemDatabase::new();
+        db.create_table_at(2, 3);
+        let table = db.get_table_mut(2).expect("bench table should exist");
+        table.insert_row(
+            1,
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("éclair".into()),
+                SqliteValue::Float(1.0),
+            ],
+        );
+        table.insert_row(
+            2,
+            vec![
+                SqliteValue::Integer(2),
+                SqliteValue::Blob(Arc::from(&b"abcdef"[..])),
+                SqliteValue::Float(2.0),
+            ],
+        );
+
+        let stmt = select_sql("SELECT substr(name, 1, 2) FROM bench");
+        let results =
+            execute_codegen_select_with_storage_cursor(&stmt, &test_small_bench_schema(), db);
+
+        assert_eq!(
+            results,
+            vec![
+                vec![SqliteValue::Text("éc".into())],
+                vec![SqliteValue::Blob(Arc::from(&b"ab"[..]))],
+            ]
         );
     }
 

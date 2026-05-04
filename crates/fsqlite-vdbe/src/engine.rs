@@ -19,6 +19,7 @@
 )]
 use hashbrown::{HashMap, HashSet};
 use std::any::Any;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -166,7 +167,9 @@ use fsqlite_types::record::{
     parse_record, serialize_record, serialize_record_iter_with_precomputed_header_into,
     simd_serialize_integer_record,
 };
-use fsqlite_types::serial_type::{read_varint, serial_type_len};
+use fsqlite_types::serial_type::{
+    SerialTypeClass, classify_serial_type, read_varint, serial_type_len,
+};
 use fsqlite_types::value::{
     SmallText, SqlLikeFastPathKind, SqliteValue, pool_return_reusable, sql_like_fast_path_matches,
 };
@@ -5718,6 +5721,36 @@ fn trim_rtrim_collation_text(text: &[u8]) -> &[u8] {
         end -= 1;
     }
     &text[..end]
+}
+
+fn sqlite_substr_prefix_value(value: &SqliteValue, prefix_len: usize) -> SqliteValue {
+    match value {
+        SqliteValue::Null => SqliteValue::Null,
+        SqliteValue::Blob(bytes) => {
+            let end = prefix_len.min(bytes.len());
+            SqliteValue::Blob(Arc::from(&bytes[..end]))
+        }
+        SqliteValue::Text(text) => {
+            sqlite_substr_prefix_text(Cow::Borrowed(text.as_str()), prefix_len)
+        }
+        SqliteValue::Integer(_) | SqliteValue::Float(_) => {
+            sqlite_substr_prefix_text(Cow::Owned(value.to_text()), prefix_len)
+        }
+    }
+}
+
+fn sqlite_substr_prefix_text(text: Cow<'_, str>, prefix_len: usize) -> SqliteValue {
+    let text = text.as_ref();
+    let end = if text.is_ascii() {
+        prefix_len.min(text.len())
+    } else if prefix_len == 0 {
+        0
+    } else {
+        text.char_indices()
+            .nth(prefix_len)
+            .map_or(text.len(), |(idx, _)| idx)
+    };
+    SqliteValue::Text(SmallText::new(&text[..end]))
 }
 
 impl VdbeEngine {
@@ -11986,6 +12019,11 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            Opcode::ColumnSubstrPrefix => {
+                self.execute_column_substr_prefix_hot(op)?;
+                *pc += 1;
+                Ok(true)
+            }
             Opcode::ResultRow => {
                 self.execute_result_row_hot(op, collect_vdbe_metrics, row_handler)?;
                 *pc += 1;
@@ -12366,6 +12404,31 @@ impl VdbeEngine {
             let val = self.cursor_column(cursor_id, col_idx)?;
             self.set_reg_fast(target, val);
         }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn execute_column_substr_prefix_hot(&mut self, op: &VdbeOp) -> Result<()> {
+        let Ok(col_idx) = usize::try_from(op.p2) else {
+            self.set_reg_fast(op.p3, SqliteValue::Null);
+            return Ok(());
+        };
+        let P4::Int(prefix_len) = &op.p4 else {
+            self.set_reg_fast(op.p3, SqliteValue::Null);
+            return Ok(());
+        };
+        let Ok(prefix_len) = usize::try_from(*prefix_len) else {
+            self.set_reg_fast(op.p3, SqliteValue::Null);
+            return Ok(());
+        };
+
+        if let Some(value) = self.column_substr_prefix_direct(op.p1, col_idx, prefix_len)? {
+            self.set_reg_fast(op.p3, value);
+            return Ok(());
+        }
+
+        let value = self.cursor_column(op.p1, col_idx)?;
+        self.set_reg_fast(op.p3, sqlite_substr_prefix_value(&value, prefix_len));
         Ok(())
     }
 
@@ -13419,6 +13482,131 @@ impl VdbeEngine {
             return;
         }
         self.replace_register_value(idx, SqliteValue::Blob(Arc::from(blob)));
+    }
+
+    /// Return `SUBSTR(column, 1, prefix_len)` directly from raw storage bytes
+    /// when the column's storage class makes that equivalent to scalar `substr`.
+    #[allow(clippy::too_many_lines, clippy::cast_sign_loss)]
+    fn column_substr_prefix_direct(
+        &mut self,
+        cursor_id: i32,
+        col_idx: usize,
+        prefix_len: usize,
+    ) -> Result<Option<SqliteValue>> {
+        let collect_vdbe_metrics = self.collect_vdbe_metrics;
+        let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) else {
+            return Ok(None);
+        };
+        if cursor.cursor.eof() {
+            return Ok(Some(SqliteValue::Null));
+        }
+
+        ensure_storage_cursor_row_layout(cursor, 0, collect_vdbe_metrics)?;
+
+        let root_page = self.cursor_root_pages.get(&cursor_id).copied();
+        let ipk_col_idx = root_page
+            .and_then(|rp| self.rowid_alias_col_by_root_page.get(&rp))
+            .copied();
+        let payload_includes = if let Some(ipk) = ipk_col_idx {
+            if let Some(cached) = cursor.payload_includes_rowid_alias {
+                cached
+            } else if let Some(includes) = root_page.and_then(|rp| {
+                payload_includes_rowid_alias_without_rowid(
+                    &cursor.row_decode,
+                    ipk,
+                    self.table_column_count_by_root_page.get(&rp).copied(),
+                    self.first_not_null_non_ipk_col_by_root_page
+                        .get(&rp)
+                        .copied(),
+                )
+            }) {
+                cursor.payload_includes_rowid_alias = Some(includes);
+                includes
+            } else {
+                let rowid = storage_cursor_cached_rowid(cursor)?;
+                if let Some(ipk_col) = cursor.row_decode.column_offset(ipk).copied()
+                    && let Some(ipk_end) = column_payload_end(&ipk_col)
+                {
+                    ensure_storage_cursor_row_layout(cursor, ipk_end, collect_vdbe_metrics)?;
+                }
+                let includes = root_page.is_some_and(|rp| {
+                    payload_includes_rowid_alias_lazy(
+                        &cursor.row_decode,
+                        &cursor.payload_buf,
+                        rowid,
+                        ipk,
+                        self.table_column_count_by_root_page.get(&rp).copied(),
+                        self.first_not_null_non_ipk_col_by_root_page
+                            .get(&rp)
+                            .copied(),
+                    )
+                });
+                cursor.payload_includes_rowid_alias = Some(includes);
+                includes
+            }
+        } else {
+            false
+        };
+
+        let payload_idx = if let Some(ipk) = ipk_col_idx {
+            if col_idx == ipk {
+                return Ok(None);
+            }
+            if col_idx > ipk && !payload_includes {
+                col_idx - 1
+            } else {
+                col_idx
+            }
+        } else {
+            col_idx
+        };
+
+        let Some(col) = cursor.row_decode.column_offset(payload_idx).copied() else {
+            return Ok(None);
+        };
+        let Some(col_end) = column_payload_end(&col) else {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("malformed column {payload_idx} payload length"),
+            });
+        };
+        ensure_storage_cursor_row_layout(cursor, col_end, collect_vdbe_metrics)?;
+        let start =
+            usize::try_from(col.body_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!("malformed column {payload_idx} payload offset"),
+            })?;
+        let bytes = cursor.payload_buf.get(start..col_end).ok_or_else(|| {
+            FrankenError::DatabaseCorrupt {
+                detail: format!("column {payload_idx} payload exceeds row image"),
+            }
+        })?;
+
+        let value = match classify_serial_type(col.serial_type) {
+            SerialTypeClass::Null => Some(SqliteValue::Null),
+            SerialTypeClass::Text => {
+                if !bytes.is_ascii() {
+                    return Ok(None);
+                }
+                let end = prefix_len.min(bytes.len());
+                let text = std::str::from_utf8(&bytes[..end])
+                    .expect("ASCII storage text prefix must be valid UTF-8");
+                Some(SqliteValue::Text(SmallText::new(text)))
+            }
+            SerialTypeClass::Blob => {
+                let end = prefix_len.min(bytes.len());
+                Some(SqliteValue::Blob(Arc::from(&bytes[..end])))
+            }
+            SerialTypeClass::Integer
+            | SerialTypeClass::Float
+            | SerialTypeClass::Zero
+            | SerialTypeClass::One
+            | SerialTypeClass::Reserved => None,
+        };
+
+        if collect_vdbe_metrics && let Some(value) = value.as_ref() {
+            FSQLITE_VDBE_COLUMN_READS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            record_decoded_value_metrics(value);
+        }
+        Ok(value)
     }
 
     /// Zero-clone column-to-register write for storage cursors.

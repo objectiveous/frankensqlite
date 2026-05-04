@@ -544,11 +544,21 @@ pub enum Opcode {
     /// immediately-following `ResultRow` consumes exactly the register
     /// written by `Integer` and outputs exactly one column.
     FusedLiteralResultRow = 196,
+
+    /// Compute `SUBSTR(column, 1, P4)` directly from a table cursor column.
+    ///
+    /// P1 = cursor number, P2 = logical column index, P3 = output register,
+    /// P4 = `Int(prefix_len)`, P5 = 0.
+    ///
+    /// The engine may fast-path storage TEXT/BLOB payload prefixes without
+    /// materializing the full column. Unsupported storage classes fall back to
+    /// the equivalent scalar `substr(value, 1, prefix_len)` behavior.
+    ColumnSubstrPrefix = 197,
 }
 
 impl Opcode {
     /// Total number of opcodes defined.
-    pub const COUNT: usize = 197;
+    pub const COUNT: usize = 198;
 
     /// Get the opcode name as a static string slice.
     #[allow(clippy::too_many_lines)]
@@ -750,6 +760,7 @@ impl Opcode {
             Self::FusedAppendInsert => "FusedAppendInsert",
             Self::FusedOpenWriteLast => "FusedOpenWriteLast",
             Self::FusedLiteralResultRow => "FusedLiteralResultRow",
+            Self::ColumnSubstrPrefix => "ColumnSubstrPrefix",
         }
     }
 
@@ -961,6 +972,7 @@ impl Opcode {
             194 => Some(Self::FusedAppendInsert),
             195 => Some(Self::FusedOpenWriteLast),
             196 => Some(Self::FusedLiteralResultRow),
+            197 => Some(Self::ColumnSubstrPrefix),
             _ => None,
         }
     }
@@ -1565,7 +1577,7 @@ mod tests {
 
     #[test]
     fn opcode_count() {
-        assert_eq!(Opcode::COUNT, 197);
+        assert_eq!(Opcode::COUNT, 198);
     }
 
     #[test]
@@ -1588,7 +1600,8 @@ mod tests {
         assert_eq!(Opcode::from_byte(191), Some(Opcode::Noop));
         assert_eq!(Opcode::from_byte(192), Some(Opcode::LikeConstFast));
         assert_eq!(Opcode::from_byte(196), Some(Opcode::FusedLiteralResultRow));
-        assert_eq!(Opcode::from_byte(197), None);
+        assert_eq!(Opcode::from_byte(197), Some(Opcode::ColumnSubstrPrefix));
+        assert_eq!(Opcode::from_byte(198), None);
         assert_eq!(Opcode::from_byte(255), None);
     }
 

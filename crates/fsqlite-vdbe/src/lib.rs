@@ -253,6 +253,10 @@ pub(crate) fn opcode_register_spans(op: &VdbeOp) -> OpcodeRegisterSpans {
             // liveness standpoint it both reads and writes that single slot.
             (start, len, start, len)
         }
+        Opcode::ColumnSubstrPrefix => {
+            let (write_start, write_len) = register_range(op.p3, 1);
+            (-1, 0, write_start, write_len)
+        }
         Opcode::Add
         | Opcode::Subtract
         | Opcode::Multiply
@@ -939,6 +943,7 @@ fn compute_requires_attached_memdb(ops: &[VdbeOp]) -> bool {
             | Opcode::Next
             | Opcode::Prev
             | Opcode::Column
+            | Opcode::ColumnSubstrPrefix
             | Opcode::Count
             | Opcode::SeekLT
             | Opcode::SeekLE

@@ -28677,7 +28677,7 @@ mod tests {
         let group_expr = Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("id"), Span::ZERO)),
             op: AstBinaryOp::Divide,
-            right: Box::new(Expr::Literal(Literal::Integer(3), Span::ZERO)),
+            right: Box::new(Expr::Literal(Literal::Integer(10), Span::ZERO)),
             span: Span::ZERO,
         };
         let stmt = SelectStatement {
@@ -28763,7 +28763,7 @@ mod tests {
         let group_expr = Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("id"), Span::ZERO)),
             op: AstBinaryOp::Divide,
-            right: Box::new(Expr::Literal(Literal::Integer(10), Span::ZERO)),
+            right: Box::new(Expr::Literal(Literal::Integer(3), Span::ZERO)),
             span: Span::ZERO,
         };
         let stmt = SelectStatement {

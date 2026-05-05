@@ -726,12 +726,16 @@ kept out of the tree but did not yet have a ledger entry.
     passed.
   - A/B artifact:
     `tests/artifacts/perf/btree-same-size-overwrite-cyangorge-20260505T0755Z/hyperfine-update.json`.
-- Result: rejected and reverted. On the exact update workload,
-  `perf-update-delete 10000 40 update`, the clean baseline mean was
-  `353.2 ms +/- 4.6 ms` while the candidate mean was
-  `357.3 ms +/- 5.4 ms`; hyperfine reported the baseline as
-  `1.01 +/- 0.02` times faster. The extra staged-page mutation hook and second
-  payload copy did not beat the existing full-page overwrite-steal path.
+  - Corrected same-code A/B artifact after a concurrent peer commit landed:
+    `tests/artifacts/perf/btree-same-size-overwrite-current-head-cyangorge-20260505T0804Z/hyperfine-update.json`.
+- Result: rejected and reverted. The preliminary A/B showed the baseline ahead,
+  but it used a clean binary from before a concurrent peer commit. The corrected
+  current-code A/B on the exact update workload,
+  `perf-update-delete 10000 40 update`, was still a no-win: clean baseline mean
+  `357.9 ms +/- 6.1 ms`, candidate mean `359.4 ms +/- 7.4 ms`, with hyperfine
+  reporting the baseline as `1.00 +/- 0.03` times faster. The extra staged-page
+  mutation hook and second payload copy did not clear the keep bar against the
+  existing full-page overwrite-steal path.
 - Do not retry staged-page mutation for same-size UPDATE as a standalone B-tree
   change. Reconsider only if the direct UPDATE caller can supply a payload-slice
   patch that avoids rebuilding the full record first, or if a profile shows

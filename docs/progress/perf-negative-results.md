@@ -49,6 +49,30 @@ Primary CASS evidence:
 - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T22-55-5b9da3d6.json -n 153 -C 18`
 - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-09-1bf54aa9.json -n 267 -C 10`
 
+## 2026-05-05 - SmallText direct-byte Eq/Ord/Hash traits
+
+- Target: `Read-After-Write Query Performance`, especially secondary indexed
+  equality probes whose cache path compares/hashes short TEXT values.
+- Touched: `crates/fsqlite-types/src/value.rs`.
+- Candidate shape: make `SmallText` `PartialEq`, `Ord`, and `Hash` use
+  `as_bytes_direct()` instead of `as_str()` so inline strings avoid repeated
+  UTF-8 validation; preserve `str` hash compatibility by writing bytes plus the
+  `0xff` separator used by `Hasher::write_str`.
+- Evidence:
+  - Baseline: `tests/artifacts/perf/read-indexed-baseline-cyangorge-20260504T2355Z/report.json`.
+  - Noisy candidate: `tests/artifacts/perf/read-smalltext-byte-traits-cyangorge-20260505T0001Z/report.json`.
+  - Candidate repeat after the competing build finished:
+    `tests/artifacts/perf/read-smalltext-byte-traits-cyangorge-20260505T0010Z/report.json`.
+- Result: rejected before commit and reverted. The candidate repeat did not move
+  the read-section average (`3.09x` versus `3.08x` baseline). Secondary indexed
+  lookup remained mixed: the 100-row fsqlite median was essentially unchanged,
+  the 1000-row median worsened, and the 10000-row improvement was within noise
+  while the row still had high variance.
+- Do not retry as a broad `SmallText` trait cleanup. Reconsider only if a CPU or
+  allocation profile shows UTF-8 validation inside `SmallText` traits dominating
+  a specific workload and a clean A/B run improves FrankenSQLite absolute
+  medians, not just C/FrankenSQLite ratios.
+
 ## 2026-05-04 - Single-value insert serialization specialization
 
 - Target: insert throughput, especially tiny/small single-column and small-record rows.

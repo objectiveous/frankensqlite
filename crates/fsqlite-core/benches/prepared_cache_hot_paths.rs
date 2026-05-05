@@ -9,6 +9,7 @@ use tempfile::NamedTempFile;
 const INSERT_SQL: &str = "INSERT INTO bench (id, payload) VALUES (?1, ?2)";
 const SELECT_COUNT_SUM_SQL: &str = "SELECT COUNT(*), SUM(score) FROM select_bench";
 const SELECT_COVERING_INDEX_SQL: &str = "SELECT name FROM select_bench WHERE name = ?1";
+const SELECT_INDEXED_EQUALITY_SQL: &str = "SELECT * FROM select_bench WHERE name = ?1";
 const COUNT_INDEXED_ROWID_PROBE_SQL: &str =
     "SELECT COUNT(*) FROM products WHERE category_id IN (SELECT id FROM categories WHERE id <= 5)";
 
@@ -64,8 +65,17 @@ fn bench_mt_mvcc_prepare_then_execute_cycle(iterations: u64) -> f64 {
     start.elapsed().as_secs_f64() * 1_000_000_000.0 / iterations as f64
 }
 
-fn open_prepared_select_fast_path_conn() -> Connection {
+fn open_prepared_select_fast_path_conn_with_count(count: i64) -> Connection {
     let conn = Connection::open(":memory:").expect("open memory connection");
+    for pragma in [
+        "PRAGMA page_size = 4096;",
+        "PRAGMA journal_mode = WAL;",
+        "PRAGMA synchronous = NORMAL;",
+        "PRAGMA cache_size = -64000;",
+        "PRAGMA fsqlite_capture_time_travel_snapshots=false;",
+    ] {
+        let _ = conn.execute(pragma);
+    }
     conn.execute(
         "CREATE TABLE select_bench (
             id INTEGER PRIMARY KEY,
@@ -74,12 +84,11 @@ fn open_prepared_select_fast_path_conn() -> Connection {
         );",
     )
     .expect("create select bench table");
-    conn.execute("CREATE INDEX select_bench_name ON select_bench(name);")
-        .expect("create select bench index");
+    conn.execute("BEGIN;").expect("begin select bench seed");
     let insert = conn
         .prepare("INSERT INTO select_bench VALUES (?1, ?2, ?3)")
         .expect("prepare select bench insert");
-    for id in 1..=64_i64 {
+    for id in 1..=count {
         insert
             .execute_with_params(&[
                 SqliteValue::Integer(id),
@@ -88,7 +97,14 @@ fn open_prepared_select_fast_path_conn() -> Connection {
             ])
             .expect("seed select bench row");
     }
+    conn.execute("COMMIT;").expect("commit select bench seed");
+    conn.execute("CREATE INDEX select_bench_name ON select_bench(name);")
+        .expect("create select bench index");
     conn
+}
+
+fn open_prepared_select_fast_path_conn() -> Connection {
+    open_prepared_select_fast_path_conn_with_count(64)
 }
 
 fn bench_prepared_select_fast_path_pair(iterations: u64) -> f64 {
@@ -116,6 +132,36 @@ fn bench_prepared_select_fast_path_pair(iterations: u64) -> f64 {
                 .expect("covering indexed equality fast path"),
         );
     }
+    start.elapsed().as_secs_f64() * 1_000_000_000.0 / iterations as f64
+}
+
+fn bench_prepared_indexed_equality_query(iterations: u64, count: i64) -> f64 {
+    let conn = open_prepared_select_fast_path_conn_with_count(count);
+    let indexed_equality = conn
+        .prepare(SELECT_INDEXED_EQUALITY_SQL)
+        .expect("prepare indexed equality");
+    let probe = [SqliteValue::Text(format!("name_{}", count / 2).into())];
+    black_box(
+        indexed_equality
+            .query_with_params(&probe)
+            .expect("warm indexed equality"),
+    );
+    black_box(
+        indexed_equality
+            .query_with_params(&probe)
+            .expect("warm cached indexed equality"),
+    );
+
+    let start = Instant::now();
+    let mut row_count = 0_usize;
+    for _ in 0..iterations {
+        let rows = indexed_equality
+            .query_with_params(&probe)
+            .expect("indexed equality fast path");
+        row_count = row_count.saturating_add(rows.len());
+        black_box(rows);
+    }
+    black_box(row_count);
     start.elapsed().as_secs_f64() * 1_000_000_000.0 / iterations as f64
 }
 
@@ -241,6 +287,15 @@ fn parse_iterations() -> u64 {
                     );
                 println!(
                     "prepared_cache_hot_paths count_indexed_rowid_probe_query_row_ns_per_op={count_indexed_rowid_probe_ns:.2} rows=1000 iterations={}",
+                    iterations.min(200_000)
+                );
+                std::process::exit(0);
+            }
+            "indexed_equality_100k" => {
+                let indexed_equality_ns =
+                    bench_prepared_indexed_equality_query(iterations.min(200_000), 100_000);
+                println!(
+                    "prepared_cache_hot_paths indexed_equality_query_ns_per_op={indexed_equality_ns:.2} rows=100000 iterations={}",
                     iterations.min(200_000)
                 );
                 std::process::exit(0);

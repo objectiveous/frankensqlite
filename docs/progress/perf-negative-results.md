@@ -100,6 +100,38 @@ Primary CASS evidence:
   prepared indexed equality, or after the benchmark target is proven to enter
   the file-backed branch.
 
+## 2026-05-04 - Prepared COUNT(*) LIKE snapshot cache
+
+- Target: `String & Pattern Matching Performance`, especially prepared
+  `SELECT COUNT(*) FROM docs WHERE title/body LIKE <literal pattern>` rows.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  adjacent byte-compare cleanup in `crates/fsqlite-types/src/value.rs` landed
+  separately.
+- Candidate shape: add a one-entry `PreparedCountLikePatternLastResult` cache
+  for clean-memory prepared `COUNT(*) WHERE col LIKE literal` query-row calls,
+  keyed by root page, column, rowid alias, LIKE fast-path kind/literal, visible
+  commit sequence, and MemDB undo version.
+- Candidate commit:
+  `b9cc83a7 perf(core): cache prepared COUNT(*) ... LIKE pattern results across clean-memory snapshots`.
+- Revert commit: `a05d1e02 perf(core): revert regressed count-like cache`.
+- Evidence:
+  - Candidate/revert string artifacts:
+    `tests/artifacts/perf/string-like-cache-candidate-cyangorge-20260504T2055Z/report.json`
+    and
+    `tests/artifacts/perf/string-like-cache-revert-cyangorge-20260504T2130Z/report.json`.
+  - Earlier local candidate artifacts:
+    `tests/artifacts/perf/string-like-count-cache-candidate-local-20260503T031439Z/report.json`
+    and repeat
+    `tests/artifacts/perf/string-like-count-cache-candidate-repeat-local-20260503T031459Z/report.json`.
+- Result: rejected and reverted. The cache proof was plausible, but the real
+  string-section benchmark did not produce a defensible matrix win and the
+  landed cache was explicitly reverted as regressed. Do not retry the same
+  one-entry prepared count-like result cache. Reconsider only if a fresh profile
+  proves repeated `COUNT LIKE` result caching removes more work than
+  schema/snapshot validation adds, and a close A/B string-section run improves
+  FrankenSQLite absolute medians for prefix and wildcard rows without moving
+  regressions into other string rows.
+
 ## 2026-05-05 - GROUP_CONCAT integer itoa append
 
 - Target: string workload `GROUP_CONCAT` rows, especially

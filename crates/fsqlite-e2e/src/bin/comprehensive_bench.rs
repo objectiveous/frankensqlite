@@ -21,7 +21,10 @@ use std::sync::{Arc, Barrier, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 use asupersync::runtime::{BlockingTaskHandle, Runtime, RuntimeBuilder};
-use fsqlite_core::connection::{hot_path_profile_snapshot, reset_hot_path_profile};
+use fsqlite_core::connection::{
+    hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
+    set_hot_path_profile_enabled,
+};
 use serde::Serialize;
 
 // ─── Configuration ─────────────────────────────────────────────────────
@@ -3327,15 +3330,19 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
             .prepare("SELECT * FROM bench WHERE name = ?1")
             .unwrap();
         let target_name_param = [fsqlite::SqliteValue::Text(target_name.into())];
+        let profile_idx_enabled = std::env::var("FSQLITE_BENCH_PROFILE_IDX")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let previous_hot_path_profile_enabled = hot_path_profile_enabled();
+        if profile_idx_enabled {
+            set_hot_path_profile_enabled(true);
+        }
         reset_hot_path_profile();
         let fs = measure(&format!("fs_idx_{count}"), 1, || {
             let _rows = fs_stmt.query_with_params(&target_name_param).unwrap();
         });
         let fs_idx_profile = hot_path_profile_snapshot();
-        if std::env::var("FSQLITE_BENCH_PROFILE_IDX")
-            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-        {
+        if profile_idx_enabled {
             let profile_iters = std::env::var("FSQLITE_BENCH_PROFILE_IDX_ITERS")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
@@ -3353,10 +3360,17 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
             let ns_per_op =
                 start.elapsed().as_secs_f64() * 1_000_000_000.0 / profile_iters.max(1) as f64;
             eprintln!(
-                "    [fs_idx_{count}] profile direct_hits={} measured_direct_hits={} tight_loop_ns_per_op={ns_per_op:.2} iterations={profile_iters} rows_seen={row_count}",
+                "    [fs_idx_{count}] profile direct_hits={} measured_direct_hits={} fast={} slow={} memdb_refresh={} cached_read_parks={} cached_read_reuses={} cached_write_reuses={} tight_loop_ns_per_op={ns_per_op:.2} iterations={profile_iters} rows_seen={row_count}",
                 profile.direct_indexed_equality_query_hits,
                 fs_idx_profile.direct_indexed_equality_query_hits,
+                profile.parser.fast_path_executions,
+                profile.parser.slow_path_executions,
+                profile.memdb_refresh_count,
+                profile.cached_read_snapshot_parks,
+                profile.cached_read_snapshot_reuses,
+                profile.cached_write_txn_reuses,
             );
+            set_hot_path_profile_enabled(previous_hot_path_profile_enabled);
         }
         eprintln!(
             "C={} F={}",

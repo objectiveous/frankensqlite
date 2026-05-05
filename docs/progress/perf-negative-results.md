@@ -968,3 +968,52 @@ Primary CASS evidence:
 - Do not retry this as a standalone branch-elision micro-optimization.
   Reconsider only if retained autocommit cache maintenance is redesigned or a
   profile shows this exact hook dominating a retained-autocommit-only workload.
+
+## 2026-05-05 - CASS last-60-day no-retry expansion
+
+Scope: follow-up `cass` archaeology over the last 60 days, using a session set
+from direct `/data/projects/frankensqlite` hits plus archived
+`/home/ubuntu/.gemini/tmp/frankensqlite` sessions, then searching negative
+signals including `rejected`, `reverted`, `abandoned`, `slower`,
+`didn't help`, `did not help`, `no improvement`, `within noise`,
+`regressed`, `worse`, `rollback`, `failed to improve`, `no measurable`, and
+`revert it for now`. The attempted `cass index --json` refresh timed out in
+the preparing phase, so these are evidence from the existing CASS index.
+
+- Do not revive the `SqliteValue` `Arc<str>` / `Arc<[u8]>` conversion as a
+  prerequisite for `Opcode::SCopy`, sorter, pseudo-cursor, or row-cache work.
+  CASS shows it was attempted during the sorter/column-cache optimization pass,
+  caused widespread cross-crate breakage, and was explicitly reverted back to
+  `String`/`Vec<u8>` to regain a compilable state. This reinforces the older
+  generic `SqliteValue` `Arc` entry: retry only with a designed serde and
+  cross-crate migration plan, not as a local VDBE hot-path patch.
+- Do not implement prepared DML execution by simply calling the compiled VDBE
+  program and bypassing `execute_statement_dispatch`. CASS records the agent
+  rejecting that shape after tracing DML dispatch: triggers, foreign keys,
+  constraint enforcement, autocommit wrapping, and fallback paths live there.
+  The acceptable shape is a precompiled-program hook that still preserves DML
+  dispatch semantics; a direct bytecode-only shortcut is a correctness trap.
+- Do not change the public `Row` representation from `Vec<SqliteValue>` to
+  `SmallVec` as a standalone allocation optimization. CASS shows that the
+  public-row `SmallVec` idea was reverted for API stability while keeping the
+  internal VDBE `SmallVec` paths. Reconsider only with an explicit public API
+  migration plan and downstream compatibility proof.
+- Do not use the old raw-string `bench_insert` benchmark as the keep/reject
+  proof for engine-level insert changes. CASS records an optimization pass that
+  attacked serializer, VFS append, and hash-map hotspots but moved the benchmark
+  only from about `0.271 s` to `0.265 s` because the benchmark itself generated
+  10,000 distinct SQL strings and thrashed parse/codegen caches. Use the current
+  prepared-statement matrix rows, or a same-window prepared insert microbench,
+  before keeping engine patches.
+- Treat `Opcode::MustBeInt`, `BtCursor::last` `at_eof`, active-transaction
+  checkpoint blocking, and `with_pager_write_txn` active-transaction bypass as
+  CASS false leads, not optimization targets. The mined sessions re-read those
+  paths and concluded the current implementations were already handling the
+  suspected issue or that the target was not a performance defect.
+
+CASS evidence:
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-09-1bf54aa9.json -n 204 -C 45`
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-09-1bf54aa9.json -n 230 -C 80`
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-a1108e5a.json -n 120 -C 45`
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-08T22-16-ee1022e3.json -n 30 -C 25`
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-854547a1.json -n 140 -C 45`

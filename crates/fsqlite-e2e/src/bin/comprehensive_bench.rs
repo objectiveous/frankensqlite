@@ -21,6 +21,7 @@ use std::sync::{Arc, Barrier, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 use asupersync::runtime::{BlockingTaskHandle, Runtime, RuntimeBuilder};
+use fsqlite_core::connection::{hot_path_profile_snapshot, reset_hot_path_profile};
 use serde::Serialize;
 
 // ─── Configuration ─────────────────────────────────────────────────────
@@ -3326,9 +3327,37 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
             .prepare("SELECT * FROM bench WHERE name = ?1")
             .unwrap();
         let target_name_param = [fsqlite::SqliteValue::Text(target_name.into())];
+        reset_hot_path_profile();
         let fs = measure(&format!("fs_idx_{count}"), 1, || {
             let _rows = fs_stmt.query_with_params(&target_name_param).unwrap();
         });
+        let fs_idx_profile = hot_path_profile_snapshot();
+        if std::env::var("FSQLITE_BENCH_PROFILE_IDX")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            let profile_iters = std::env::var("FSQLITE_BENCH_PROFILE_IDX_ITERS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(50_000);
+            reset_hot_path_profile();
+            let start = Instant::now();
+            let mut row_count = 0_usize;
+            for _ in 0..profile_iters {
+                let rows = fs_stmt.query_with_params(&target_name_param).unwrap();
+                row_count = row_count.saturating_add(rows.len());
+                std::hint::black_box(rows);
+            }
+            std::hint::black_box(row_count);
+            let profile = hot_path_profile_snapshot();
+            let ns_per_op =
+                start.elapsed().as_secs_f64() * 1_000_000_000.0 / profile_iters.max(1) as f64;
+            eprintln!(
+                "    [fs_idx_{count}] profile direct_hits={} measured_direct_hits={} tight_loop_ns_per_op={ns_per_op:.2} iterations={profile_iters} rows_seen={row_count}",
+                profile.direct_indexed_equality_query_hits,
+                fs_idx_profile.direct_indexed_equality_query_hits,
+            );
+        }
         eprintln!(
             "C={} F={}",
             format_duration(cs.median()),

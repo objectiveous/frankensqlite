@@ -622,3 +622,39 @@ kept out of the tree but did not yet have a ledger entry.
   published snapshot, the new `ConcurrentRegistry` session snapshot, and the
   `concurrent_commit_index` frontier are all advanced together before any page
   write is tracked.
+
+## 2026-05-05 - Precomputed record-header append serializer
+
+- Target: quick INSERT matrix, especially cached-header direct INSERT rows where
+  record serialization and allocation/copy cost still show up in the profile.
+- Touched during rejected candidate: `crates/fsqlite-types/src/record.rs`.
+- Candidate shape: for stack-sized `PrecomputedRecordHeader` serializers, stop
+  pre-sizing the whole output record with zeroes. Instead, append the cached
+  header template and then append serialized payload bytes with
+  `append_serialized_value`. The first draft accidentally used
+  `Vec::reserve(total_size - capacity)` after `clear()`, which can under-reserve
+  because `reserve` is relative to length; the final measured candidate fixed
+  that to reserve against the cleared vector length before benchmarking.
+- Evidence:
+  - Correctness:
+    `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-cyangorge-target cargo test -p fsqlite-types precomputed_header -- --nocapture`
+    passed.
+  - Candidate build:
+    `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-wal-measure-target cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`
+    passed in the detached measurement worktree.
+  - Same-window clean baseline:
+    `tests/artifacts/perf/record-precomputed-append-samewindow-baseline-cyangorge-20260505T0732Z/report.json`.
+  - Final corrected candidate:
+    `tests/artifacts/perf/record-precomputed-append-reserve-fixed-quick-candidate-cyangorge-20260505T0723Z/report.json`.
+- Result: rejected and reverted. The final candidate lost to the same-window
+  clean baseline on the insert quick matrix: primary weighted score worsened
+  from `1.9105` to `1.9905`, average ratio worsened from `2.9409x` to
+  `3.0146x`, and the row-level comparison had 13 FrankenSQLite medians
+  regressing by more than 3% versus only one improving. The largest observed
+  FrankenSQLite median regressions were medium_6col 100 rows (`0.432 ms` to
+  `0.578 ms`), medium_6col 1000 rows (`1.606 ms` to `1.836 ms`), and
+  medium_6col record-size 10K (`9.671 ms` to `10.628 ms`).
+- Do not retry this zero-fill avoidance shape for cached precomputed record
+  headers. Reconsider only if a lower-level profile proves `Vec::resize`
+  zero-fill is a dominant self-time frame and a same-window A/B improves
+  FrankenSQLite absolute medians, not just ratio noise against C SQLite.

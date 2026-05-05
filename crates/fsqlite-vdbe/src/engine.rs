@@ -20,7 +20,7 @@
 use hashbrown::{HashMap, HashSet};
 use std::any::Any;
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -1721,6 +1721,7 @@ impl ConcurrentContext {
 #[derive(Clone)]
 pub struct SharedTxnPageIo {
     txn: Rc<RefCell<TransactionKind>>,
+    page_size: Rc<Cell<usize>>,
     /// MVCC concurrent context (bd-kivg / 5E.2). When present, enables
     /// page-level locking for write operations.
     concurrent: Rc<RefCell<Option<ConcurrentContext>>>,
@@ -1744,8 +1745,10 @@ impl std::fmt::Debug for SharedTxnPageIo {
 
 impl SharedTxnPageIo {
     fn from_parts(txn: TransactionKind, concurrent: Option<ConcurrentContext>) -> Self {
+        let page_size = txn.page_size().as_usize();
         Self {
             txn: Rc::new(RefCell::new(txn)),
+            page_size: Rc::new(Cell::new(page_size)),
             concurrent: Rc::new(RefCell::new(concurrent)),
         }
     }
@@ -1796,6 +1799,7 @@ impl SharedTxnPageIo {
         txn: TransactionKind,
         concurrent: Option<ConcurrentContext>,
     ) -> TransactionKind {
+        self.page_size.set(txn.page_size().as_usize());
         self.concurrent.replace(concurrent);
         self.txn.replace(txn)
     }
@@ -2778,13 +2782,13 @@ impl PageReader for SharedTxnPageIo {
 
 impl PageWriter for SharedTxnPageIo {
     fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-        let page_size = self.txn.borrow().page_size().as_usize();
+        let page_size = self.page_size.get();
         let page_data = normalize_owned_page_data(page_size, data)?;
         self.write_page_internal(cx, page_no, page_data)
     }
 
     fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
-        let page_size = self.txn.borrow().page_size().as_usize();
+        let page_size = self.page_size.get();
         let page_data = normalize_page_data_to_size(page_size, data)?;
         self.write_page_internal(cx, page_no, page_data)
     }

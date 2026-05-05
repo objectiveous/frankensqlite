@@ -100,6 +100,42 @@ and page I/O wrapper construction.
   optimization. The allocation avoided here is too small and too noisy relative
   to row-build, B-tree, pager, WAL, and benchmark fixed costs.
 
+## 2026-05-05 - Large borrowed WAL commit threshold
+
+Scope: `comprehensive-bench --quick --filter insert`, targeting the large-row
+commit path after `insert-commit-profile-cyangorge-20260505T1615Z` showed
+`pager::build_group_commit_batch` cloning staged pages into owned
+`TransactionFrameBatch` frames.
+
+- Touched during reverted candidate: `crates/fsqlite-pager/src/pager.rs`.
+- Candidate shape: promote the borrowed `collect_wal_commit_batch` helper out
+  of test-only code and, for commits with at least `512` frames, bypass the
+  owned group-commit batch by appending borrowed frame refs directly while
+  still checking the pinned WAL conflict snapshot, using prepared-frame
+  validation, taking the DB-file `Reserved` lock, honoring sync policy, and
+  updating `inner.db_size`.
+- Correctness checks: `cargo test -p fsqlite-pager test_collect_wal_commit_batch
+  -- --nocapture` passed (`4` tests), and `cargo test -p fsqlite-pager
+  group_commit -- --nocapture --test-threads=1` passed (`22` tests). The same
+  `group_commit` filter without serialized test execution showed existing
+  fault-hook interference between tests, so the serialized rerun was used for
+  the candidate check.
+- Evidence artifact:
+  `tests/artifacts/perf/group-commit-large-borrowed-cyangorge-20260505T1650Z/summary.md`.
+- Result: abandoned/reverted. The benchmark run was contaminated by an
+  unrelated dirty `crates/fsqlite-btree/src/cursor.rs` diff that appeared while
+  measuring, but the candidate was not promising enough to justify an isolated
+  repeat: weighted insert score worsened `1.699053 -> 1.787694`, geomean ratio
+  worsened `2.362302x -> 2.390798x`, `write_bulk` worsened `2.515348x ->
+  2.526914x`, and `write_single` worsened `1.490767x -> 1.592921x`. Target
+  FSQLite medians did not improve cleanly (`large_10col` 10K
+  `36.165071 ms -> 37.493052 ms`, record-size large 10K
+  `37.055950 ms -> 37.160930 ms`, record-size medium 10K
+  `9.888943 ms -> 11.164965 ms`).
+- Do not retry this exact borrowed large-commit threshold without an isolated
+  A/B and a proof that bypassing the queue still preserves the group-commit
+  fault/publish semantics under concurrent writers.
+
 ## 2026-05-04 - CASS archaeology guardrails
 
 Scope: `cass` searches restricted to FrankenSQLite content since `2026-03-04`,

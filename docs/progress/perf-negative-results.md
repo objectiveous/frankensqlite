@@ -167,6 +167,33 @@ kept out of the tree but did not yet have a ledger entry.
   unless a later design can prove lower per-row overhead and an insert-section
   A/B improves the primary ratios, not just a unit proof.
 
+## 2026-05-05 - WAL prepared-frame no-memset serializer
+
+- Target: insert commit hot path where WAL frame preparation appeared to pay a
+  payload-sized zero-fill before overwriting the full frame bytes.
+- Touched during rejected candidate:
+  `crates/fsqlite-wal/src/wal.rs::prepare_frame_bytes_with_transforms_into`.
+- Candidate shape: replace `Vec::resize(total_bytes, 0)` plus frame overwrite
+  with direct frame-byte appends via `push_wal_frame_bytes`, preserving checksum
+  transform calculation while avoiding memset-style initialization.
+- Evidence:
+  - Baseline:
+    `tests/artifacts/perf/wal-no-memset-clean-baseline-cyangorge-20260505T063541Z/report.json`.
+  - Candidate:
+    `tests/artifacts/perf/wal-no-memset-clean-candidate-cyangorge-20260505T063541Z/report.json`.
+  - Focused proof passed:
+    `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-cyangorge-target cargo test -p fsqlite-wal test_prepared_batch -- --nocapture`.
+- Result: rejected and reverted by CyanGorge before commit. A clean-worktree A/B
+  on `HEAD` (`5b5212f5`) improved insert average ratio from `3.184x` to
+  `2.955x` and geomean from `2.915x` to `2.750x`, but the primary weighted
+  score was effectively unchanged (`2.08110` to `2.07856`) and important rows
+  regressed: write-single average ratio moved from `1.821x` to `1.868x`,
+  `large_10col` 10K single-transaction F median moved from `36.58 ms` to
+  `38.43 ms`, and 1000-row autocommit F median moved from `1.54 ms` to
+  `1.83 ms`. Do not retry this serializer shape unless a fresh profile shows
+  zero-fill dominates a current workload and a full section A/B improves the
+  primary/weighted score without write-single regression.
+
 ## 2026-05-05 - Prepared indexed-equality schema microbatch carry
 
 - Target: `Read-After-Write Query Performance`, especially repeated prepared

@@ -1659,3 +1659,40 @@ commits. Entries already present in this ledger were not duplicated.
   Retry only with an interleaved clean/candidate A/B that preserves the
   large-row improvement, restores the weighted score/write-single rows, and
   explains or fixes the broader append-filter failure.
+
+## 2026-05-05 - Thresholded WAL prepared-frame direct publication
+
+- Target: same large INSERT commit/publish cost as the dirty direct-publication
+  check, but with a frame-count threshold intended to keep small/write-single
+  commits on the existing path.
+- Touched during rejected isolated candidate:
+  `crates/fsqlite-core/src/wal_adapter.rs` in temporary worktree
+  `/data/tmp/frankensqlite-cyangorge-wal-threshold-20260505T1406`; the shared
+  source file was reserved by PurpleCoast and was not edited.
+- Candidate shape: factor WAL commit snapshot publication over generic frame
+  entries, then use direct publication from `prepared.frame_metas` only when
+  `prepared.frame_count() >= 128`. A new 128-frame unit test asserted the large
+  direct path publishes all pages and leaves no pending publication entries.
+- Correctness smoke:
+  `cargo fmt`,
+  `cargo test -p fsqlite-core --lib append -- --nocapture` passed
+  (`18` tests), and
+  `cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`
+  passed in the isolated worktree.
+- Evidence artifacts:
+  `tests/artifacts/perf/insert-external-qb-hint-owned-cyangorge-baseline-20260505T1318Z/report.json`,
+  `tests/artifacts/perf/insert-wal-publish-direct-current-dirty-cyangorge-20260505T135315Z/report.json`,
+  and
+  `tests/artifacts/perf/insert-wal-publish-threshold-cyangorge-20260505T1406Z/report.json`.
+  Summary:
+  `tests/artifacts/perf/insert-wal-publish-threshold-cyangorge-20260505T1406Z/summary.md`.
+- Result: rejected. The thresholded variant was worse than both clean baseline
+  and the full dirty direct-publication variant: geomean F/C ratio `2.3832x`
+  baseline / `2.3890x` full-direct / `2.5341x` threshold, weighted score
+  `1.6578` / `1.7359` / `1.8890`, and write-single geomean `1.4354x` /
+  `1.5293x` / `1.6811x`. It also failed to preserve the full direct large-row
+  win: record-size `large_10col` F median was `39.4682 ms` baseline,
+  `34.7089 ms` full-direct, and `38.2606 ms` threshold.
+- Do not retry a simple frame-count threshold around WAL prepared-frame direct
+  publication. First prove why the full direct path improved large rows, then
+  design a narrower change that does not disturb write-single or B-tree timing.

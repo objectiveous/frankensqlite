@@ -1739,3 +1739,41 @@ CASS evidence:
 - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-a1108e5a.json -n 84 -C 60`
 - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-9581ae40.json -n 120 -C 40`
 - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-628c8b17.json -n 90 -C 35`
+
+## 2026-05-05 - Direct INSERT row-value text pooling
+
+- Target: prepared direct INSERT row-build cost on medium/large concat-heavy
+  rows after the current insert profile showed `row_build_ns` around
+  `5.96 ms` on both large 10K single-transaction rows.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  source was reverted after the benchmark.
+- Candidate shape: return heap-backed `SqliteValue::Text` row-scratch values
+  to the existing `fsqlite_types::value` TLS pool when lazy private-memory
+  direct inserts clear `mem_row_values`, then build concat-chain text results
+  from a pooled `SmallText` slot via `SmallText::overwrite`.
+- Correctness/build smoke passed before the A/B:
+  `cargo fmt --check`,
+  `cargo test -p fsqlite-core test_prepared_direct_simple_insert_returns_concat_text_to_value_pool -- --nocapture`,
+  `cargo test -p fsqlite-core test_prepared_direct_simple_insert_large_profile_breakdown -- --nocapture`,
+  `cargo test -p fsqlite-core test_prepared_direct_simple_insert_autocommit_profile_breakdown -- --nocapture`,
+  and `cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`.
+- Evidence artifacts:
+  `tests/artifacts/perf/insert-profile-current-head-cyangorge-20260505T122449Z/report.json`
+  and
+  `tests/artifacts/perf/insert-row-text-pool-cyangorge-20260505T1434Z/report.json`.
+  Summary:
+  `tests/artifacts/perf/insert-row-text-pool-cyangorge-20260505T1434Z/summary.md`.
+- Result: rejected and reverted. Insert avg/geomean ratios improved
+  (`2.4610x -> 2.3595x`, `2.3623x -> 2.2890x`), but the primary weighted
+  insert score regressed `1.6991 -> 1.7329` and write-single geomean regressed
+  `1.4908x -> 1.5517x`. Important absolute FrankenSQLite medians worsened:
+  `small_3col` 1K single transaction `0.8055 ms -> 0.9613 ms`, `small_3col`
+  10K single transaction `6.8949 ms -> 7.7481 ms`, `medium_6col` 10K
+  `13.6661 ms -> 14.6216 ms`, `large_10col` 10K `36.1651 ms -> 36.7869 ms`,
+  and record-size `large_10col` `37.0559 ms -> 37.6541 ms`.
+- Do not retry direct INSERT row-value pooling / pooled `SmallText::overwrite`
+  as a standalone row-build optimization. The profile counters showed the
+  root hypothesis failed on the target large rows: row-build time got worse
+  (`large_10col` single transaction `5.958 ms -> 7.404 ms`, record-size
+  `large_10col` `5.973 ms -> 6.722 ms`), so TLS pool traffic cost more than
+  it saved.

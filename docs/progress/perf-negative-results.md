@@ -2396,3 +2396,33 @@ set: sessions found by
 - CASS index state at the time of this resweep was stale but usable
   (`database.exists=true`, `index.stale=true`, no active rebuild). Refresh the
   index before relying on this note for sessions created after this date.
+
+## 2026-05-05 - SharedTxnPageIo cached page-size borrow removal
+
+- Target: large INSERT write path after
+  `tests/artifacts/perf/insert-large-current-cyangorge-20260505T221825Z/`
+  showed `SharedTxnPageIo::write_page_data`/`write_page_internal` under the
+  retained rightmost-leaf append profile.
+- Candidate shape: commit `16b1907d` cached `TransactionKind::page_size()` in a
+  shared `Cell<usize>` inside `SharedTxnPageIo`, updated it on `refill`, and
+  used it in `PageWriter::write_page` / `write_page_data` to avoid a hot-path
+  `RefCell` borrow before page-data normalization.
+- Evidence:
+  - Baseline/current profile:
+    `tests/artifacts/perf/insert-large-current-cyangorge-20260505T221825Z/report.json`
+    and `stderr-insert.log`.
+  - Candidate:
+    `tests/artifacts/perf/shared-txn-page-size-cache-cyangorge-20260505T2230Z/report.json`
+    and `stderr.log`.
+- Correctness smoke before measurement: `cargo fmt --check` and
+  `env CARGO_TARGET_DIR=.rch-target cargo check -p fsqlite-vdbe -p fsqlite-core`
+  passed.
+- Result: rejected and reverted. The insert-only weighted score regressed
+  `1.6759 -> 1.6944`, average ratio regressed `2.3289x -> 2.3467x`, p99
+  regressed `3.7410x -> 3.9032x`, and write-single geomean regressed
+  `1.4928x -> 1.5151x`. The target large rows did not improve:
+  single-transaction `large_10col` profile had commit roundtrip worsen
+  `16.27 ms -> 17.06 ms`, and record-size `large_10col` had B-tree insert
+  worsen `7.53 ms -> 8.48 ms` with commit roundtrip still about `17.05 ms`.
+- Do not retry caching `page_size` on `SharedTxnPageIo` as a standalone
+  optimization. The borrow was visible in code but not a matrix-level bottleneck.

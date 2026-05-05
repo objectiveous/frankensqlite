@@ -903,3 +903,33 @@ Primary CASS evidence for the stale-target and false-lead guardrails:
   fresh bytecode profile proves division dispatch itself dominates the current
   workload and a same-window A/B improves FrankenSQLite absolute medians at
   all row counts plus the read-section weighted score.
+
+## 2026-05-05 - Explicit transaction retained count/sum insert hook early return
+
+- Target: insert throughput e2e matrix, especially explicit
+  single-transaction insert rows.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`.
+- Candidate shape: return early from
+  `retained_autocommit_count_sum_cache_note_insert` when
+  `self.in_transaction.get()` is true, on the theory that retained autocommit
+  count/sum cache maintenance is irrelevant inside explicit transactions.
+- Evidence:
+  - Baseline:
+    `tests/artifacts/perf/insert-countsum-explicit-baseline-cyangorge-20260505T0925Z/report.json`.
+  - First candidate:
+    `tests/artifacts/perf/insert-countsum-explicit-candidate-cyangorge-20260505T0931Z/report.json`.
+  - Repeat baseline:
+    `tests/artifacts/perf/insert-countsum-explicit-repeat-cyangorge-20260505T0932Z-baseline/report.json`.
+  - Repeat candidate:
+    `tests/artifacts/perf/insert-countsum-explicit-repeat-cyangorge-20260505T0933Z-candidate/report.json`.
+- Result: rejected and reverted. The first pass looked mildly positive, but
+  the repeat run failed the keep bar. Repeat candidate worsened primary
+  weighted score from `1.9154` to `1.9516`, geomean ratio from `2.6390x` to
+  `2.7181x`, FrankenSQLite absolute geomean from `2.3051 ms` to
+  `2.3575 ms` (`+2.28%`), and FrankenSQLite absolute average from
+  `6.3954 ms` to `6.5695 ms` (`+2.72%`). The largest repeat regression was
+  record-size comparison 10K large_10col, `35.059 ms` to `37.517 ms`
+  (`+7.01%`).
+- Do not retry this as a standalone branch-elision micro-optimization.
+  Reconsider only if retained autocommit cache maintenance is redesigned or a
+  profile shows this exact hook dominating a retained-autocommit-only workload.

@@ -96,6 +96,27 @@ Primary CASS evidence:
   sizes and a close A/B read-section run improves the section score or every
   affected group row.
 
+## 2026-05-05 - Direct single-rowid DELETE lowering
+
+- Target: `UPDATE/DELETEThroughput`, especially prepared
+  `DELETE FROM bench WHERE id = ?1`.
+- Touched: `crates/fsqlite-vdbe/src/codegen.rs`.
+- Candidate shape: when DELETE has a simple rowid equality predicate, skip the
+  one-row `RowSetAdd`/`RowSetRead` two-pass plan and emit direct
+  `SeekRowid`/`Delete` code, leaving non-rowid predicates on the two-pass path.
+- Evidence:
+  - Baseline: `tests/artifacts/perf/update-delete-current-cyangorge-20260505T0058Z/report.json`.
+  - Candidate: `tests/artifacts/perf/update-delete-direct-delete-candidate-cyangorge-20260505T0100Z/report.json`.
+- Result: rejected before commit and reverted. The average section ratio moved
+  from `4.36x` to `4.03x`, but the targeted DELETE medians regressed at the
+  smaller, high-signal sizes: `100 rows / delete 5 rows` worsened from
+  `617.6 us` to `765.2 us`, and `1000 rows / delete 50 rows` worsened from
+  `1.34 ms` to `1.58 ms`. The 10000-row DELETE improvement was only a small
+  `10.30 ms` to `10.06 ms` move and does not justify the small-row loss.
+- Do not retry as a simple RowSet skip. Reconsider only with an opcode-level
+  profile proving RowSet overhead dominates DELETE and with a close A/B where
+  FrankenSQLite DELETE medians improve at all three row counts.
+
 ## 2026-05-04 - Single-value insert serialization specialization
 
 - Target: insert throughput, especially tiny/small single-column and small-record rows.

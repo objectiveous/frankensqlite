@@ -139,6 +139,34 @@ kept out of the tree but did not yet have a ledger entry.
   Keep the guarded path shape; do not remove the density/table-size guard based
   on small-row wins alone.
 
+## 2026-05-05 - Direct INSERT transient heap TEXT pooling
+
+- Target: `INSERTThroughput` quick insert matrix, especially 10K single-txn
+  medium/large record rows where `row_build_ns` spends milliseconds building
+  concat-derived TEXT values.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` and
+  `crates/fsqlite-types/src/value.rs`.
+- Candidate shape: expose the `SmallText` inline capacity, acquire a reusable
+  heap `SqliteValue::Text` from the existing thread-local value pool for
+  direct-simple INSERT concat chains, and return discarded transient row values
+  to the same pool on write-only lazy MemDB paths.
+- Evidence:
+  - Baseline:
+    `tests/artifacts/perf/insert-profile-current-purplecoast-20260505T060835Z/report.json`.
+  - Candidate:
+    `tests/artifacts/perf/direct-insert-text-pool-purplecoast-20260505T063845Z/report.json`.
+  - Focused proof passed:
+    `cargo test -p fsqlite-core test_prepared_direct_simple_insert_returns_transient_heap_text_to_pool --profile release-perf -- --nocapture`.
+- Result: rejected and manually reverted before commit. The proof showed the
+  write-only direct INSERT path could return a heap TEXT slot to the pool, but
+  the real insert matrix moved the wrong way: average ratio worsened from
+  `3.127x` to `3.226x`, geomean worsened from `2.894x` to `3.018x`, and the
+  record-size `large_10col` 10K row regressed from `35.902 ms` to `42.537 ms`
+  (`3.652x` to `4.068x` vs C SQLite). Do not retry this value-pool handoff
+  unless a later design can prove lower per-row overhead and an insert-section
+  A/B improves the primary ratios, not just a unit proof.
+
 ## 2026-05-05 - Prepared indexed-equality schema microbatch carry
 
 - Target: `Read-After-Write Query Performance`, especially repeated prepared

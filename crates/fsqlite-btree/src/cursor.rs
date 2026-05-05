@@ -13589,6 +13589,47 @@ mod tests {
     }
 
     #[test]
+    fn test_cached_rightmost_leaf_hint_with_writer_updates_retained_hint() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let payload = b"retained-writer-payload";
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+
+        cursor.table_insert(&cx, 1, b"seed").unwrap();
+        let mut hint = cursor
+            .table_cached_rightmost_leaf_hint()
+            .expect("first append should seed a retained rightmost-leaf hint");
+
+        cursor.pager.clear_reads();
+        let appended = cursor
+            .table_try_append_cached_rightmost_leaf_hint_with_writer(
+                &cx,
+                &mut hint,
+                2,
+                payload.len(),
+                |dst| {
+                    dst.copy_from_slice(payload);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert!(appended, "retained writer hint should accept rowid 2");
+        assert!(
+            cursor.pager.read_pages().is_empty(),
+            "retained writer append should not re-read the hinted leaf"
+        );
+        assert_eq!(hint.last_rowid(), 2);
+        assert!(
+            hint.retains_page_data(),
+            "explicit-transaction callers reuse the retained leaf image"
+        );
+        assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
+        assert_eq!(cursor.payload(&cx).unwrap(), payload);
+    }
+
+    #[test]
     fn test_table_append_after_last_position_with_writer_error_does_not_publish_cell() {
         let cx = Cx::new();
         let root = pn(2);

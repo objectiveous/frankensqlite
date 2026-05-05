@@ -702,3 +702,38 @@ kept out of the tree but did not yet have a ledger entry.
   cleanup. Reconsider only if a same-window insert and update A/B both improve
   FrankenSQLite absolute medians, or if the stale page-one cleanup is isolated
   away from insert-heavy write paths.
+
+## 2026-05-05 - B-tree staged-page mutation for same-size UPDATE overwrite
+
+- Target: direct simple UPDATE rows where
+  `BtCursor::table_overwrite_current_payload_same_size_no_overflow` appeared
+  under the update profile and wrote an already-staged leaf page back through
+  `write_page_data`.
+- Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs`.
+- Candidate shape: after validating the current leaf-table cell and patching
+  the cursor stack page image, call `PageWriter::try_mutate_staged_page_data`
+  to patch the transaction-owned staged page payload in place. This avoided the
+  full-page `write_page_data` path when the same page had already been staged
+  by an earlier update in the transaction.
+- Evidence:
+  - Correctness:
+    `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-cyangorge-btree-target cargo test -p fsqlite-btree table_overwrite_current_payload_same_size_no_overflow -- --nocapture`
+    passed both focused overwrite tests, including the added staged-page proof.
+    RCH then hung retrieving target artifacts and was interrupted after the
+    successful test result was printed.
+  - Build:
+    `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-cyangorge-btree-local-target RUSTFLAGS='-C force-frame-pointers=yes' cargo build -p fsqlite-e2e --bin perf-update-delete --profile release-perf`
+    passed.
+  - A/B artifact:
+    `tests/artifacts/perf/btree-same-size-overwrite-cyangorge-20260505T0755Z/hyperfine-update.json`.
+- Result: rejected and reverted. On the exact update workload,
+  `perf-update-delete 10000 40 update`, the clean baseline mean was
+  `353.2 ms +/- 4.6 ms` while the candidate mean was
+  `357.3 ms +/- 5.4 ms`; hyperfine reported the baseline as
+  `1.01 +/- 0.02` times faster. The extra staged-page mutation hook and second
+  payload copy did not beat the existing full-page overwrite-steal path.
+- Do not retry staged-page mutation for same-size UPDATE as a standalone B-tree
+  change. Reconsider only if the direct UPDATE caller can supply a payload-slice
+  patch that avoids rebuilding the full record first, or if a profile shows
+  `write_page_data` copying itself dominates after connection-level payload
+  construction is removed.

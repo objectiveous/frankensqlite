@@ -969,6 +969,44 @@ Primary CASS evidence:
   Reconsider only if retained autocommit cache maintenance is redesigned or a
   profile shows this exact hook dominating a retained-autocommit-only workload.
 
+## 2026-05-05 - Exact transaction-control `execute` parse bypass
+
+- Target: insert throughput e2e matrix, especially explicit
+  single-transaction insert rows that call `execute("BEGIN;")` and
+  `execute("COMMIT;")`.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`.
+- Candidate shape: add an exact-string fast path in `Connection::execute` for
+  `BEGIN`, `BEGIN;`, `COMMIT`, `COMMIT;`, `ROLLBACK`, and `ROLLBACK;`, calling
+  the existing direct transaction helpers after `background_status()` and
+  incrementing `note_connection_statement_execution_count(1)` only after the
+  operation succeeds.
+- Evidence:
+  - Correctness proof passed before rejection:
+    `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-purplecoast-exact-txn-test-target cargo test -p fsqlite-core test_execute_exact_transaction_controls_skip_sql_parse_and_count_success -- --nocapture`
+    showed zero parser calls and correct successful-execution stats. RCH then
+    hung in post-test target artifact retrieval; the test body itself passed.
+  - Existing guard still passed:
+    `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-purplecoast-exact-txn-test-target cargo test -p fsqlite-core test_file_backed_begin_transaction_api_skips_sql_parse -- --nocapture`.
+  - Same-window baseline log:
+    `tests/artifacts/perf/insert-exact-txn-baseline-purplecoast-20260505T101018Z/run.log`.
+  - Same-window candidate log:
+    `tests/artifacts/perf/insert-exact-txn-candidate-purplecoast-20260505T103455Z/run.log`.
+    RCH did not retrieve the ignored JSON reports for this run, so treat these
+    logs as the measurement artifact.
+- Result: rejected and reverted. The local proof was real, but the matrix did
+  not move in the right direction. Average time ratio worsened from `2.36x` to
+  `2.55x`. Targeted FrankenSQLite medians were mixed or worse: single-txn
+  tiny_1col 100 rows regressed from `299.9 us` to `336.1 us`, 1000 rows
+  improved only from `836.0 us` to `805.4 us`, and 10000 rows regressed from
+  `4.65 ms` to `4.87 ms`. Transaction-strategy small_3col single-txn rows
+  regressed at all measured sizes: `219.1 us` to `267.1 us`, `1.04 ms` to
+  `1.08 ms`, and `6.81 ms` to `7.12 ms`.
+- Do not retry exact transaction-control parse bypass as a standalone
+  optimization. Reconsider only if fresh profiles show `BEGIN`/`COMMIT` SQL
+  parsing itself dominates the current insert workload and a repeated
+  same-window A/B improves the absolute FrankenSQLite medians plus the
+  insert-section score.
+
 ## 2026-05-05 - CASS last-60-day no-retry expansion
 
 Scope: follow-up `cass` archaeology over the last 60 days, using a session set

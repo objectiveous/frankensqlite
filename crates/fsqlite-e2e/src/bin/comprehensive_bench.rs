@@ -2819,7 +2819,7 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                         let base = tid as i64 * CONCURRENT_RANGE_SIZE;
                         let mut retry_count = 0_u32;
                         const TXN_MAX_RETRIES: u32 = 64;
-                        const TXN_BACKOFF_MS: u64 = 5;
+                        const TXN_BACKOFF_MS: u64 = 1;
                         'txn: loop {
                             if let Err(e) = conn.execute(begin_sql) {
                                 if e.is_transient() && retry_count < TXN_MAX_RETRIES {

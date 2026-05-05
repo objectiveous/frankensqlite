@@ -434,7 +434,12 @@ pub fn default_parallel_wal_lane_count() -> usize {
 
 #[must_use]
 pub fn resolve_parallel_wal_control_surface_from_env() -> ParallelWalControlSurface {
-    let mut control = ParallelWalControlSurface::default();
+    let mut control = ParallelWalControlSurface {
+        // Default runtime policy favors the raw ordered append path; operators
+        // can still opt into lane-local staging with FSQLITE_PARALLEL_WAL_MODE=auto.
+        mode: ParallelWalOperatingMode::Conservative,
+        ..ParallelWalControlSurface::default()
+    };
 
     if let Ok(mode) = env::var("FSQLITE_PARALLEL_WAL_MODE") {
         control.mode = match mode.trim().to_ascii_lowercase().as_str() {

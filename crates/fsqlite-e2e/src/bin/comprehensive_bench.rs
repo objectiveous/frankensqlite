@@ -335,6 +335,12 @@ fn fs_stmt_execute_with_params(
     })
 }
 
+fn bench_env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 fn collect_rusqlite_rows<P: rusqlite::Params>(
     stmt: &mut rusqlite::Statement<'_>,
     params: P,
@@ -3414,6 +3420,106 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
 
 // ─── Section 6: Update and delete throughput ───────────────────────────
 
+fn profile_fsqlite_update_delete_dml(
+    record_size: RecordSize,
+    count: usize,
+    mutation_count: usize,
+    kind: &str,
+) {
+    let conn = fsqlite::Connection::open(":memory:").unwrap();
+    apply_pragmas_fsqlite(&conn);
+
+    let setup_start = Instant::now();
+    fs_execute(&conn, record_size.create_table_sql());
+    fs_execute(&conn, "BEGIN");
+    #[allow(clippy::cast_possible_wrap)]
+    let insert = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
+    #[allow(clippy::cast_possible_wrap)]
+    for i in 0..count as i64 {
+        fs_stmt_execute_with_params(&insert, &[fsqlite::SqliteValue::Integer(i)]);
+    }
+    fs_execute(&conn, "COMMIT");
+    let setup_us = setup_start.elapsed().as_secs_f64() * 1_000_000.0;
+
+    let previous_hot_path_profile_enabled = hot_path_profile_enabled();
+    set_hot_path_profile_enabled(true);
+    reset_hot_path_profile();
+
+    let begin_start = Instant::now();
+    fs_execute(&conn, "BEGIN");
+    let begin_us = begin_start.elapsed().as_secs_f64() * 1_000_000.0;
+
+    let prepare_start = Instant::now();
+    let statement = match kind {
+        "update" => conn
+            .prepare("UPDATE bench SET value = ?2 WHERE id = ?1")
+            .unwrap(),
+        "delete" => conn.prepare("DELETE FROM bench WHERE id = ?1").unwrap(),
+        _ => unreachable!("known DML profile kind"),
+    };
+    let prepare_us = prepare_start.elapsed().as_secs_f64() * 1_000_000.0;
+
+    let mutate_start = Instant::now();
+    #[allow(clippy::cast_possible_wrap)]
+    for i in 0..mutation_count as i64 {
+        let id = if kind == "update" { i * 10 } else { i * 20 };
+        match kind {
+            "update" => fs_stmt_execute_with_params(
+                &statement,
+                &[
+                    fsqlite::SqliteValue::Integer(id),
+                    fsqlite::SqliteValue::Float(999.99),
+                ],
+            ),
+            "delete" => {
+                fs_stmt_execute_with_params(&statement, &[fsqlite::SqliteValue::Integer(id)])
+            }
+            _ => unreachable!("known DML profile kind"),
+        };
+    }
+    let mutate_us = mutate_start.elapsed().as_secs_f64() * 1_000_000.0;
+
+    let commit_start = Instant::now();
+    fs_execute(&conn, "COMMIT");
+    let commit_us = commit_start.elapsed().as_secs_f64() * 1_000_000.0;
+
+    let profile = hot_path_profile_snapshot();
+    set_hot_path_profile_enabled(previous_hot_path_profile_enabled);
+
+    eprintln!(
+        "    [fs_{kind}_{count}] dml_profile setup_us={setup_us:.1} begin_us={begin_us:.1} prepare_us={prepare_us:.1} mutate_us={mutate_us:.1} commit_us={commit_us:.1} mutations={mutation_count} direct_update={} direct_delete={} fast={} slow={} ud_fast_lane={} ud_instrumented_lane={} schema_refreshes={} schema_refresh_ns={} begin_ns={} execute_body_ns={} commit_pre_ns={} commit_roundtrip_ns={} commit_finalize_ns={} commit_handle_ns={} post_write_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} record_parse_into={} record_decode_ns={} btree_payload_copy_calls={} btree_payload_copy_bytes={} btree_cell_assembly_calls={} btree_cell_assembly_bytes={} vdbe_opcodes={} vdbe_statements={} vdbe_make_record={}",
+        profile.prepared_direct_update_executions,
+        profile.prepared_direct_delete_executions,
+        profile.parser.fast_path_executions,
+        profile.parser.slow_path_executions,
+        profile.prepared_update_delete_fast_lane_hits,
+        profile.prepared_update_delete_instrumented_lane_hits,
+        profile.prepared_schema_refreshes,
+        profile.prepared_schema_refresh_time_ns,
+        profile.begin_setup_time_ns,
+        profile.execute_body_time_ns,
+        profile.commit_pre_txn_time_ns,
+        profile.commit_txn_roundtrip_time_ns,
+        profile.commit_finalize_seq_time_ns,
+        profile.commit_handle_finalize_time_ns,
+        profile.commit_post_write_maintenance_time_ns,
+        profile.memdb_refresh_count,
+        profile.cached_write_txn_reuses,
+        profile.cached_write_txn_parks,
+        profile.page_buffer_pool_hits,
+        profile.page_buffer_pool_misses,
+        profile.record_decode.parse_record_into_calls,
+        profile.record_decode.decode_time_ns,
+        profile.btree_copy_kernels.local_payload_copy_calls,
+        profile.btree_copy_kernels.local_payload_copy_bytes,
+        profile.btree_copy_kernels.table_leaf_cell_assembly_calls,
+        profile.btree_copy_kernels.table_leaf_cell_assembly_bytes,
+        profile.vdbe.opcodes_executed_total,
+        profile.vdbe.statements_total,
+        profile.vdbe.make_record_calls_total,
+    );
+}
+
 fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
     let section = report.add_section(
         "UPDATE/DELETEThroughput",
@@ -3421,6 +3527,7 @@ fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
     );
 
     let record_size = RecordSize::Small;
+    let profile_dml_enabled = bench_env_flag("FSQLITE_BENCH_PROFILE_DML");
 
     for &count in row_counts {
         if count > 100_000 {
@@ -3493,6 +3600,9 @@ fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
                 fs_execute(&conn, "COMMIT");
             })
         };
+        if profile_dml_enabled {
+            profile_fsqlite_update_delete_dml(record_size, count, update_count, "update");
+        }
 
         eprintln!(
             "C={} F={}",
@@ -3558,6 +3668,9 @@ fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
                 fs_execute(&conn, "COMMIT");
             })
         };
+        if profile_dml_enabled {
+            profile_fsqlite_update_delete_dml(record_size, count, delete_count, "delete");
+        }
 
         eprintln!(
             "C={} F={}",

@@ -2363,3 +2363,36 @@ CASS evidence:
   a standalone INSERT optimization. Revisit only with a selective policy that
   improves the same-window insert matrix and preserves the lane-staging
   correctness/shadow-compare contract.
+
+## 2026-05-05 - Strict last-60-day CASS resweep
+
+Scope: user-requested resweep for abandoned or losing optimization ideas,
+restricted to last-60-day CASS history tied to `/data/projects/frankensqlite`.
+The direct CASS workspace filter was stale/sparse and returned zero hits for
+the first negative terms, so the pass used the stricter explicit-path session
+set: sessions found by
+`cass search '/data/projects/frankensqlite' --days 60 --robot-format sessions`.
+
+- Direct workspace spot checks:
+  `cass search 'rejected' --workspace /data/projects/frankensqlite --days 60`,
+  plus `reverted`, `slower`, and `didn't help`, returned no hits.
+- Explicit-path seed set: `51` sessions. Negative vocabulary searched inside
+  that set included `rejected`, `reverted`, `slower`, `regressed`,
+  `didn't help`, `did not help`, `abandoned`, `abandones`, `within noise`,
+  `no improvement`, `rollback`, `worse`, `failed to improve`, `not worth`,
+  `gave up`, `no measurable`, `keep gate`, `failed the keep`, `rolled back`,
+  and `backed out`.
+- Focused perf query pass searched combinations such as `perf rejected`,
+  `benchmark slower`, `candidate rejected`, `matrix regressed`,
+  `weighted score regressed`, `not a keep`, and `do not retry`.
+- No new artifact-backed rejected performance shapes were found beyond entries
+  already present in this ledger. Useful hits routed back to existing no-retry
+  fences: broad VDBE/public `SmallVec` sweeps, stale raw `bench_insert`
+  optimization work, page-1 synthetic hint state, WAL publication/checksum
+  candidates, direct INSERT row-build candidates, and benchmark-policy rejects.
+- Excluded hits were multi-repo commit/sync sessions, issue triage summaries,
+  accepted correctness fixes, ephemeral-file decisions, or negative words from
+  skill text rather than FrankenSQLite performance candidates.
+- CASS index state at the time of this resweep was stale but usable
+  (`database.exists=true`, `index.stale=true`, no active rebuild). Refresh the
+  index before relying on this note for sessions created after this date.

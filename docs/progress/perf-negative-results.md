@@ -82,6 +82,41 @@ time in B-tree append and quick-balance work.
   proves the internal post-split cache entry itself is dominant and a same-window
   insert matrix improves absolute FrankenSQLite medians.
 
+## 2026-05-05 - SharedTxnPageIo synthetic page-one cleanup maybe-stale flag
+
+Scope: `comprehensive-bench --quick --filter insert`, after a perf sample showed
+`SharedTxnPageIo::clear_stale_synthetic_pending_commit_surface` in the direct
+INSERT write path and existing tests covered page-one synthetic cleanup
+invariants.
+
+- Touched during rejected candidate: `crates/fsqlite-vdbe/src/engine.rs`;
+  source was reverted after measurement.
+- Candidate shape: add a shared `Rc<Cell<bool>>` maybe-stale flag to
+  `SharedTxnPageIo`, initialize it from the concurrent handle, set it when
+  page-one synthetic conflict tracking is installed, and skip the per-write
+  synthetic page-one lock/probe unless the flag is set.
+- Correctness proof passed:
+  `CARGO_TARGET_DIR=.rch-target cargo test -p fsqlite-vdbe shared_txn_page_io -- --nocapture`
+  (`15` tests). An earlier RCH run reached the same green test result, but the
+  RCH artifact retrieval wrapper was interrupted after tests completed.
+- Evidence artifacts:
+  `tests/artifacts/perf/synthetic-pageone-clear-candidate-cyangorge-20260505T2120Z/report.json`,
+  `tests/artifacts/perf/synthetic-pageone-clear-candidate-cyangorge-20260505T2120Z/stdout.log`,
+  `tests/artifacts/perf/synthetic-pageone-clear-candidate-cyangorge-20260505T2120Z/stderr.log`;
+  CPU sampling lead:
+  `tests/artifacts/perf/insert-cpu-profile-cyangorge-20260505T2111Z/perf.data`
+  and
+  `tests/artifacts/perf/insert-cpu-profile-cyangorge-20260505T2111Z/report.json`.
+- Result: rejected. The quick insert weighted score improved
+  `1.7652 -> 1.6954` and geomean moved slightly `2.4209x -> 2.4086x`, but the
+  target slow row did not improve: `large_10col` 10K single transaction
+  regressed from `38.36 ms` to `39.61 ms`, p99 worsened from `3.95x` to
+  `4.58x`, and absolute FSQLite medians were mixed (`13` better, `12` worse).
+- Do not retry a synthetic page-one cleanup maybe-stale flag as a standalone
+  direct INSERT optimization. Revisit only if a focused profile shows this
+  cleanup dominates a target workload and the slow large-row rows improve in the
+  same-window matrix.
+
 ## 2026-05-05 - CASS synonym sweep coverage note
 
 Scope: user-requested CASS search restricted to FrankenSQLite session history

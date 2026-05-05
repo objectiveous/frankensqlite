@@ -1342,3 +1342,36 @@ builder in `crates/fsqlite-core/src/connection.rs`.
   micro-optimization. The skipped expression is too cheap relative to row text
   construction, B-tree work, and commit publication, and the codegen perturbation
   did not move the matrix.
+
+## 2026-05-05 - Direct INSERT concat owned-text move
+
+Scope: `comprehensive-bench --quick --filter insert` with
+`FSQLITE_BENCH_PROFILE_INSERT=1`, targeting the direct-simple INSERT concat
+row builder in `crates/fsqlite-core/src/connection.rs` after profiles showed
+large-row `row_build_ns` around 5-6 ms for 10K-row large-record inserts.
+
+- Candidate shape: keep inline-size concat strings on the existing borrowed
+  `SmallText::new` path, but for longer concat results move the reusable
+  `String` scratch into `SmallText::from_string` instead of copying
+  `text_scratch.as_str()` into a second heap string.
+- Evidence: same-window baseline
+  `tests/artifacts/perf/insert-concat-owned-text-baseline-cyangorge-20260505T124529Z/`;
+  candidate
+  `tests/artifacts/perf/insert-concat-owned-text-cyangorge-20260505T125310Z/`.
+  Focused proof tests passed before the A/B:
+  `cargo test -p fsqlite-core test_prepared_direct_simple_insert_autocommit_profile_breakdown -- --nocapture`
+  and
+  `cargo test -p fsqlite-core test_prepared_direct_insert_without_change_tracking_skips_tls_sync -- --nocapture`.
+- Result: rejected and reverted. Insert geomean regressed
+  `2.2471x -> 2.5245x`, weighted score regressed `1.6366 -> 1.7467`,
+  and p99 regressed `3.7572x -> 4.4258x`. The target large rows also
+  regressed in absolute FrankenSQLite medians:
+  `large_10col` single-transaction 10K `35.292 ms -> 43.055 ms`, and
+  record-size `large_10col` 10K `36.379 ms -> 41.902 ms`.
+- Do not retry concat owned-string moving as a standalone direct INSERT row
+  builder optimization. The root cause is allocator locality: moving the
+  scratch avoids one copy but destroys scratch-capacity reuse, forcing the hot
+  concat builder to reallocate repeatedly. Future row-build work should avoid
+  materializing transient `SqliteValue::Text` for lazy `:memory:` inserts or
+  serialize concat output directly into a record/page destination with a
+  same-window insert matrix win.

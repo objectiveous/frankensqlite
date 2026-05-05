@@ -1438,3 +1438,94 @@ direct-simple INSERT.
   cache maintenance as a standalone direct INSERT optimization. The cache path
   is logically redundant for this workload, but the branch/codegen perturbation
   was not free and the benchmark matrix moved the wrong way.
+
+## 2026-05-05 - Agent Mail CASS/git addenda: remaining no-retry shapes
+
+Scope: patch-ready peer handoff from the last-60-day CASS/git negative-result
+expansion while this agent held `docs/progress/perf-negative-results.md`.
+Direct `/data/projects/frankensqlite` CASS workspace searches were sparse, so
+the useful leads came from `cass search "frankensqlite <term>" --days 60`,
+archived Gemini FrankenSQLite sessions, preserved artifacts, and recent revert
+commits. Entries already present in this ledger were not duplicated.
+
+- Broad and parent-only structural preclaim: rejected and reverted on the
+  flagship `commutative_inserts_disjoint_keys / frankensqlite / c8` row. The
+  broad shape preclaimed structural pages before split/rebalance writes via
+  `crates/fsqlite-btree/src/cursor.rs` plus VDBE preclaim/rollback plumbing;
+  the parent-only narrowing was even worse. Evidence includes
+  `artifacts/perf/20260314_direct_handle_owned_fastpath_pass3/disjoint_c8_release_perf_both.jsonl`,
+  `artifacts/perf/20260314_direct_handle_owned_fastpath_v2/disjoint_c8_release_perf_both.jsonl`,
+  `artifacts/perf/20260314_structural_preclaim/disjoint_c8_release_perf_both.jsonl`,
+  `artifacts/perf/20260314_parent_preclaim/disjoint_c8_release_perf_both.jsonl`,
+  and `docs/planning/STATE_OF_THE_CODEBASE_AND_NEXT_STEPS.md`. Do not retry
+  earlier deterministic claiming of shared B-tree structure as the concurrency
+  fix; it lengthened the convoy and widened the effective choke point. Future
+  work must reduce shared structural work, shorten hold duration, or change
+  physical layout, and rerun the full focused c1/c4/c8 family.
+- Quotient-filter build-on-first-consult for direct UPDATE/DELETE: rejected as
+  a severe benchmark regression. The lazy build-on-first-consult path scanned
+  the full table at the first DELETE/UPDATE after `Connection::open`; commit
+  `4ea55010` records `update-deletethroughput__100-rows-delete-5-rows`
+  regressing by about `369x` because a roughly `30 ms` scan was added to a
+  roughly `0.1 ms` delete. Do not lazily build rowid membership filters on
+  first DML consult for existing tables. Retry only with an explicit activation
+  policy where build cost is known-zero or amortized outside the target
+  operation, and prove the UPDATE/DELETE matrix moves.
+- Mechanical `SqliteValue` Arc conversion via Python/cargo-fix traversal: do
+  not repeat it. March CASS shows the text/blob Arc idea was attempted as a
+  broad conversion across tests, property macros, and record/value helpers; it
+  caused serde/type mismatches, mangled `record.rs` / `value.rs` patterns and
+  test assertions, and required reverting to `String` / `Vec<u8>`. This is the
+  process-specific variant of the broader Arc no-retry rule: retry only with a
+  designed serde/API migration and narrow hand-edited proof, never as a
+  mechanical repo sweep.
+- Read-heavy `query_row_with_params()` wrapper swap: rejected. The
+  `mt_read_bench` pass changed the FSQLite side from `query_with_params()` to
+  `query_row_with_params()` and made the remote matrix worse (`0.05x`,
+  `0.06x`, `0.07x`, `0.25x`), then reverted it before closeout. Evidence:
+  `tests/artifacts/perf/read-heavy-20260430T021702Z/RESULT.md`. Do not retry a
+  query/query_row wrapper substitution; the documented next lever is
+  file-backed prepared MemDB direct lookup after read-state refresh.
+- `concat_ws` pre-sizing scan: rejected as slower than the accepted direct
+  append path. The direct append candidate measured `24,453,767 ns`, while the
+  pre-sizing pass measured `34,885,096 ns` because the extra scan outweighed
+  saved growth for the 24-text-argument benchmark. Evidence:
+  `tests/artifacts/perf/20260428T2100Z-icybluff-concat-ws-direct/RESULT.md`.
+  Keep the direct-append implementation; do not add a pre-size scan unless a
+  new workload has much larger output growth and proves the scan pays for
+  itself.
+- Mixed-OLTP omitted rowid-alias projection remapping: rejected. The
+  double-parse version averaged only about `0.6%` absolute FrankenSQLite
+  improvement and the one-pass rewrite regressed repeat measurements, so both
+  were rolled back. Evidence:
+  `tests/artifacts/perf/20260425T1921Z-azurepine-alias-projection-fastpath/summary.md`.
+  Do not retry IPK-alias projection remapping as an isolated COUNT/SUM lever
+  unless the mixed matrix moves beyond the keep threshold.
+- Manual integer decode assembly in `decode_big_endian_signed`: rejected.
+  Absolute FrankenSQLite movement stayed under `1%` and normalized F/C ratio
+  worsened despite passing direct sign-extension and integer-boundary proofs.
+  Evidence:
+  `tests/artifacts/perf/20260425T1921Z-azurepine-alias-projection-fastpath/summary.md`.
+  Do not replace the current integer decoder with hand assembly for scalar
+  microbench reasons alone.
+- Rowid-only local leaf fast path for retained dirty-overlay range counting:
+  rejected. F median improved, but the two-run average was only about `2.2%`
+  faster than the accepted local-leaf payload-prefix baseline and stayed below
+  the keep threshold; the patch was rolled back. Evidence:
+  `tests/artifacts/perf/20260425T1921Z-azurepine-alias-projection-fastpath/summary.md`.
+  Do not re-add a rowid-only local-leaf branch unless the retained range-count
+  row is again a top matrix gap and clears the threshold.
+- `xxh3_64` to `crc32c` for `page_mutation_counter`: rejected on this host.
+  The April profiling handoff records the T5a experiment as reverted because
+  `crc32c` was `28%` slower for 4 KiB inputs. Evidence:
+  `tests/artifacts/perf/profiling-handoff-20260423T155542Z/campaign-summary.md`
+  and `tests/artifacts/perf/bd-cnk5d-2t-cliff-verify-20260424/summary.md`.
+  Do not swap hash functions because CRC32C sounds hardware-accelerated;
+  require a same-host checksum/profile proof and a matrix win.
+- `PublishedPagerState::new` / connection-open cost as a standalone target:
+  false lead for production-style workloads. The profiling handoff marks it as
+  connection-open cost visible in microbenches that open fresh connections, not
+  an operation-count cost for long-lived connections. Evidence:
+  `tests/artifacts/perf/profiling-handoff-20260423T155542Z/hypothesis-ledger.md`.
+  Do not spend a perf pass optimizing this in isolation unless a connection
+  pool or open-heavy workload is the explicit benchmark target.

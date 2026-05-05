@@ -73,6 +73,29 @@ Primary CASS evidence:
   a specific workload and a clean A/B run improves FrankenSQLite absolute
   medians, not just C/FrankenSQLite ratios.
 
+## 2026-05-05 - Direct REAL accumulator for rowid-bucket SUM GROUP BY
+
+- Target: `Read-After-Write Query Performance`, especially
+  `SUM + GROUP BY (~10 groups)` rows.
+- Touched: `crates/fsqlite-vdbe/src/codegen.rs`.
+- Candidate shape: for `SUM(<REAL NOT NULL column>)` grouped by a rowid bucket,
+  replace generic `AggStep`/`AggFinal` dispatch with a direct `REAL 0.0`
+  accumulator and `Add` opcode in the rowid-bucket sorter-bypass plan.
+- Candidate commits: `7ec9d6b1 perf(codegen): direct REAL accumulator for GROUP BY rowid-bucket SUM`
+  and `a0f674c6 test(codegen): swap rowid-bucket SUM test divisors back`.
+- Evidence:
+  - Baseline: `tests/artifacts/perf/read-indexed-baseline-cyangorge-20260504T2355Z/report.json`.
+  - Candidate: `tests/artifacts/perf/read-groupby-direct-real-sum-cyangorge-20260505T0019Z/report.json`.
+- Result: rejected and reverted. The 10000-row group row improved
+  (`4.436 ms` to `3.888 ms`, ratio `3.44x` to `2.77x`), but the 1000-row
+  group row regressed badly (`0.350 ms` to `0.800 ms`, ratio `2.77x` to
+  `5.47x`), the 100-row group row slightly worsened, and the read-section
+  average ratio worsened from `3.08x` to `3.56x`.
+- Do not retry the direct accumulator as a narrow opcode substitution. Revisit
+  only if a profile proves generic aggregate dispatch dominates all target group
+  sizes and a close A/B read-section run improves the section score or every
+  affected group row.
+
 ## 2026-05-04 - Single-value insert serialization specialization
 
 - Target: insert throughput, especially tiny/small single-column and small-record rows.

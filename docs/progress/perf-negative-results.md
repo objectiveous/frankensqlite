@@ -1191,6 +1191,32 @@ serve as search handles for future agents.
   `tests/artifacts/perf/subquery-current-head-cte-rowid-carry-reverted-local-20260501T0530Z/`.
   Do not retry by preserving per-category rowid vectors unless the subquery/CTE
   row improves in a same-window run and memory growth is bounded.
+- Prepared ORDER BY LIMIT winner-maintenance path: rejected by `3bfd8fa1` and
+  removed again by `0cb0379e`. The candidate kept the winners vector sorted via
+  `partition_point` / insert on every replacement; the reverted shape returned
+  to unsorted winner replacement plus one final sort. Do not retry per-row
+  sorted winner insertion for the prepared ORDER BY LIMIT path unless a
+  same-window read/order benchmark proves the maintenance cost is hot and
+  absolute FrankenSQLite medians improve.
+- Stack-layout record serializer cache: reverted by `be75bb57`. The candidate
+  added fixed stack arrays for up to 16 values in `serialize_record_iter_into_impl`
+  to cache value refs, serial types, and payload lengths, then was removed from
+  `crates/fsqlite-types/src/record.rs`. Do not retry this stack-layout serializer
+  cache as a generic record-write optimization; use the existing record
+  serializer entries and require a record/insert matrix win before reintroducing
+  stack layout state.
+- Integer-key fast path for inner-join grouped aggregate: reverted by
+  `19f0b188`. The candidate added `memdb_integer_join_key_with_source`,
+  `PreparedJoinGroupState`, and an integer-key grouped-join implementation
+  beside the generic hash-key path, then was dropped back to the generic grouping
+  flow. Do not retry a separate integer-only join grouping path unless join
+  artifacts show generic `HashableJoinKey` construction dominates and all
+  affected grouped-join rows improve.
+- Direct DML cursor scratch routing: reverted by `80777b6b`; artifact bundle
+  `tests/artifacts/perf/20260428T1743Z-sapphirecrane-direct-dml-cursor-scratch/RESULT-direct-dml-cursor-scratch.md`
+  was preserved. This reinforces the existing direct-DML scratch no-retry rule:
+  do not route INSERT/UPDATE/DELETE through shared cursor scratch as a local
+  hot-path cleanup without a full correctness and update/delete matrix proof.
 
 ## 2026-05-05 - Conservative WAL raw append for large INSERT commits
 
@@ -1255,3 +1281,33 @@ publication.
   Revisit only with a same-window proof that improves absolute FrankenSQLite
   medians and the insert-section score; ratio-only gains are suspect because
   the C SQLite denominator can move enough to hide FrankenSQLite regressions.
+
+## 2026-05-05 - PageData shared-pair quick-balance handoff
+
+Scope: full `comprehensive-bench --filter insert` after the exact-divider
+quick-balance win, targeting the full-page clone in
+`crates/fsqlite-btree/src/balance.rs::balance_quick_known_divider_rowid`.
+
+- Candidate shape: add `PageData::into_shared_pair()` in
+  `crates/fsqlite-types/src/lib.rs` and use it to move the freshly split right
+  sibling page into one `Arc<[u8]>`, handing one shared handle to the writer and
+  one shared handle back to the rightmost-leaf cache.
+- Evidence: first run
+  `tests/artifacts/perf/insert-pagedata-shared-pair-cyangorge-20260505T121337Z/`;
+  rerun
+  `tests/artifacts/perf/insert-pagedata-shared-pair-rerun-cyangorge-20260505T121651Z/`;
+  baseline
+  `tests/artifacts/perf/insert-quick-balance-exact-space-cyangorge-20260505T115109Z/`.
+- Result: rejected and reverted. The aggregate ratio moved in the right
+  direction on the rerun (`geomean_ratio 2.3519x -> 2.1634x`, weighted score
+  `1.7141 -> 1.6914`), but the split-heavy absolute FrankenSQLite medians
+  regressed: `large_10col` single-transaction 10K
+  `34.756 ms -> 38.651 ms`, and 100K `415.902 ms -> 444.772 ms`.
+  The root cause is representation semantics: the existing `PageData::clone()`
+  path pays one snapshot clone but keeps the cursor's new rightmost page backed
+  by owned mutable bytes; the shared-pair variant made the cursor cache shared
+  too, so the next append to that page pays copy-on-write.
+- Do not retry by making both split-page handles shared. A future version would
+  need a writer handoff that preserves an owned mutable page for the cursor, or
+  a different rightmost-cache design, and must improve the large-row absolute
+  medians in the same insert matrix.

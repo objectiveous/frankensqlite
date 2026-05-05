@@ -80,6 +80,34 @@ signals such as `rejected`, `reverted`, `slower`, `regressed`, `didn't help`,
   roughly `20-25%` slower results. Do not repeat toolchain/profile flag
   exploration for insert throughput unless the profile setup itself changes.
 
+## 2026-05-05 - Quick-balance one-cell pointer Vec pooling
+
+Scope: insert-only comprehensive e2e matrix after
+`199bd14b perf(btree/balance): gate balance_quick on the exact divider size`,
+targeting the quick-balance success path in
+`crates/fsqlite-btree/src/cursor.rs`.
+
+- Candidate shape: add a helper that takes a `Vec<u16>` from the existing
+  thread-local cell-pointer pool and pushes the single new-cell pointer,
+  replacing the two `vec![result.new_cell_ptr]` allocations used after
+  `balance_quick_known_divider_rowid` succeeds.
+- Behavior proof: `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-cyangorge-check-target
+  cargo test -p fsqlite-btree rightmost_leaf_hint -- --nocapture` passed
+  (8 tests).
+- Evidence: baseline artifact
+  `tests/artifacts/perf/insert-quick-balance-exact-space-cyangorge-20260505T115109Z/report.json`;
+  candidate artifact
+  `tests/artifacts/perf/insert-quick-balance-pointer-pool-cyangorge-20260505T120405Z/report.json`
+  and `run.log`.
+- Result: rejected and reverted. The summary ratios looked better, but they
+  were distorted by C SQLite variance. Engine-side medians regressed on the
+  split-heavy single-transaction rows (`large_10col` 10K `34.756 ms` ->
+  `37.287 ms`, 100K `415.902 ms` -> `451.660 ms`) and the hot counter moved
+  the wrong way (`btree_quick_balance_ns` for `large_10col` 10K `4.309 ms` ->
+  `5.262 ms`). Do not retry the one-cell pooled-Vec helper unless allocator
+  profiling proves those tiny `Vec` allocations dominate and the thread-local
+  pool access can be made cheaper than allocation.
+
 ## 2026-05-05 - Direct UPDATE fixed-width REAL one-byte header offset
 
 Scope: `perf-update-delete 10000 40 update`, targeting the prepared

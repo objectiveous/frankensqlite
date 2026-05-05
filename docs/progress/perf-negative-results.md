@@ -12,6 +12,39 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-05 - Quick-balance staged-parent handoff
+
+Scope: `comprehensive-bench --quick --filter insert`, targeting rightmost
+B-tree quick-balance during INSERT after commit-phase profiles pointed at page
+representation/copy costs.
+
+- Touched during rejected candidate: `crates/fsqlite-btree/src/balance.rs`;
+  source was reverted after measurement.
+- Candidate shape: have `balance_quick_known_divider_rowid` try
+  `PageWriter::try_take_staged_page_data(parent_page_no)` before reading the
+  parent page, mutate that parent image directly, and restore it through
+  `restore_staged_page_data` instead of writing a second parent image.
+- Correctness proof passed in the candidate checkout:
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-proudanchor-qb-parent-target cargo test -p fsqlite-btree balance_quick -- --nocapture`
+  (`6` tests). The RCH wrapper was interrupted only after tests completed
+  because artifact retrieval hung.
+- Evidence artifacts:
+  `tests/artifacts/perf/qb-staged-parent-proudanchor-20260505T215458Z/baseline-report.json`,
+  `baseline2-report.json`, `baseline3-report.json`,
+  `candidate-clean1-report.json`, `candidate-clean2-report.json`, and
+  `candidate-clean3-report.json`.
+- Result: rejected. In the clean same-window A/B, the 3-run median primary
+  weighted score improved `1.8298 -> 1.7478`, but the rest of the signal did
+  not justify the complexity: average ratio worsened `2.4612x -> 2.4792x`,
+  p90 worsened `3.5893x -> 3.7946x`, p99 worsened `3.8592x -> 3.9710x`,
+  absolute FSQLite medians regressed on `18/25` rows, and the target
+  `large_10col` 10K single-transaction row regressed
+  `36.649 ms -> 38.196 ms`.
+- Do not retry staged-parent quick-balance handoff as a standalone INSERT
+  optimization. Revisit only if a profile shows parent page materialization
+  dominating a specific workload and a clean same-window matrix improves the
+  large-row absolute medians without p90/p99 regression.
+
 ## 2026-05-05 - Prepared direct DELETE scratch-reset narrowing
 
 Scope: isolated prepared direct DELETE after

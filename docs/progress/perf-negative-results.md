@@ -1311,3 +1311,34 @@ quick-balance win, targeting the full-page clone in
   need a writer handoff that preserves an owned mutable page for the cursor, or
   a different rightmost-cache design, and must improve the large-row absolute
   medians in the same insert matrix.
+
+## 2026-05-05 - Direct INSERT rowid-alias double-eval skip
+
+Scope: `comprehensive-bench --quick --filter insert` after the current
+`237261d2` full quick matrix showed the remaining biggest ratios clustered in
+write-heavy insert rows. The candidate targeted the compiled direct-insert row
+builder in `crates/fsqlite-core/src/connection.rs`.
+
+- Candidate shape: after `eval_prepared_direct_simple_insert_explicit_rowid_only`
+  had already evaluated the INTEGER PRIMARY KEY alias expression for append
+  routing, skip re-evaluating the same compiled rowid/IPK expression in the
+  row-build loop and push the storage `NULL` placeholder directly.
+- Evidence: baseline insert profile
+  `tests/artifacts/perf/insert-profile-current-head-cyangorge-20260505T122449Z/`;
+  candidate
+  `tests/artifacts/perf/insert-rowid-alias-skip-cyangorge-20260505T123625Z/`.
+  Focused tests passed before the A/B:
+  `cargo test -p fsqlite-core test_prepared_direct_simple_insert_autocommit_profile_breakdown -- --nocapture`
+  and
+  `cargo test -p fsqlite-core test_prepared_direct_insert_without_change_tracking_skips_tls_sync -- --nocapture`.
+- Result: rejected and reverted. The insert section regressed
+  (`geomean_ratio 2.3623x -> 2.4502x`, weighted score
+  `1.6991 -> 1.7605`, p99 `4.1407x -> 4.3519x`). The targeted
+  `large_10col` single-transaction 10K median improved only slightly
+  (`36.165 ms -> 35.335 ms`) while the record-size `large_10col` 10K row
+  regressed (`37.056 ms -> 37.477 ms`) and multiple smaller insert rows
+  worsened.
+- Do not retry rowid-alias double-eval skipping as a standalone direct-insert
+  micro-optimization. The skipped expression is too cheap relative to row text
+  construction, B-tree work, and commit publication, and the codegen perturbation
+  did not move the matrix.

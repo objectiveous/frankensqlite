@@ -5630,9 +5630,6 @@ impl<P: PageWriter> BtCursor<P> {
                 })?;
             }
             ptrs.remove(delete_idx);
-            if new_content_offset > ptr_array_end {
-                page_bytes[ptr_array_end..new_content_offset].fill(0);
-            }
             header.first_freeblock = 0;
             header.fragmented_free_bytes = 0;
             header.cell_content_offset =
@@ -5739,9 +5736,6 @@ impl<P: PageWriter> BtCursor<P> {
                 page_bytes.copy_within(old_content_offset..deleted_ptr, new_content_offset);
             }
             ptrs.remove(delete_idx);
-            if new_content_offset > ptr_array_end {
-                page_bytes[ptr_array_end..new_content_offset].fill(0);
-            }
             header.first_freeblock = 0;
             header.fragmented_free_bytes = 0;
             header.cell_content_offset =
@@ -5845,9 +5839,6 @@ impl<P: PageWriter> BtCursor<P> {
                     })?;
                 }
 
-                if new_content_offset > ptr_array_end {
-                    page_bytes[ptr_array_end..new_content_offset].fill(0);
-                }
                 header.first_freeblock = 0;
                 header.fragmented_free_bytes = 0;
                 header.cell_content_offset = u32::try_from(new_content_offset).map_err(|_| {

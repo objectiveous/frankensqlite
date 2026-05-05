@@ -319,31 +319,25 @@ pub(crate) fn balance_quick_known_divider_rowid<W: PageWriter>(
     let parent_offset = header_offset_for_page(parent_page_no);
     let parent_header = parse_page_header(parent_data.as_bytes(), parent_page_no)?;
 
-    // Calculate required space for the divider cell.
-    // Divider: [4-byte child ptr] [rowid varint]
-    // We don't know the exact divider rowid yet (depends on leaf content),
-    // but we can upper-bound it or estimate it.
-    // Actually, we can read the leaf to get the exact divider rowid,
-    // OR we can just use a conservative estimate (max varint size = 9).
-    // Let's read the leaf first, as we need it anyway for the divider.
-    // But `balance_quick` is an optimization, avoiding the leaf read if parent is full is better?
-    // No, we need to know if parent is full.
-    // Let's assume max divider size (4 + 9 = 13) + 2 byte pointer = 15 bytes.
-    // If parent has < 15 bytes free, abort.
+    // Build the exact divider up front so the quick-balance gate uses the
+    // space the parent will actually consume, not the worst-case varint size.
+    let mut divider = [0u8; 13]; // 4-byte child pointer + up to 9-byte varint.
+    divider[0..4].copy_from_slice(&leaf_page_no.get().to_be_bytes());
+    #[allow(clippy::cast_sign_loss)]
+    let rowid_u64 = divider_rowid as u64;
+    let varint_size = write_varint(&mut divider[4..], rowid_u64);
+    let divider_size = 4 + varint_size;
+    let required_parent_space = usize::from(CELL_POINTER_SIZE) + divider_size;
 
     let parent_used = parent_offset
         + usize::from(parent_header.page_type.header_size())
-        + (usize::from(parent_header.cell_count) * 2);
+        + (usize::from(parent_header.cell_count) * usize::from(CELL_POINTER_SIZE));
 
     let free_space = parent_header
         .content_offset(usable_size)
         .saturating_sub(parent_used);
 
-    // We need space for:
-    // 1. The new cell pointer (2 bytes)
-    // 2. The divider cell (4 bytes + varint). Max varint is 9.
-    // Total max requirement: 2 + 4 + 9 = 15 bytes.
-    if free_space < 15 {
+    if free_space < required_parent_space {
         return Ok(None);
     }
 
@@ -388,14 +382,6 @@ pub(crate) fn balance_quick_known_divider_rowid<W: PageWriter>(
         let _ = writer.free_page(cx, new_pgno);
         return Err(err);
     }
-
-    // Build a divider cell for the parent: [4-byte child ptr] [rowid varint].
-    let mut divider = [0u8; 13]; // 4 + up to 9 varint bytes
-    divider[0..4].copy_from_slice(&leaf_page_no.get().to_be_bytes());
-    #[allow(clippy::cast_sign_loss)]
-    let rowid_u64 = divider_rowid as u64;
-    let varint_size = write_varint(&mut divider[4..], rowid_u64);
-    let divider_size = 4 + varint_size;
 
     let new_parent_content_offset = parent_header
         .content_offset(usable_size)
@@ -2907,10 +2893,9 @@ mod tests {
         let mut store = MemPageStore::new(20);
 
         // Create a parent page that is almost full.
-        // We'll fill it with cells so that only < 15 bytes remain.
-        // Header size = 12.
-        // Set cell_content_offset = 20. Free space = 20 - 12 = 8 bytes.
-        // That's < 15, so balance_quick should fail.
+        // With one existing pointer, cell_content_offset = 20 leaves 6 bytes
+        // of pointer/content gap. Even the smallest divider needs 7 bytes, so
+        // balance_quick should fail.
         let mut full_parent = vec![0u8; USABLE as usize];
         let header = BtreePageHeader {
             page_type: BtreePageType::InteriorTable,
@@ -2941,6 +2926,55 @@ mod tests {
             result.is_none(),
             "balance_quick should return None when parent is full"
         );
+    }
+
+    #[test]
+    fn test_balance_quick_uses_exact_divider_space() {
+        let cx = Cx::new();
+        let mut store = MemPageStore::new(20);
+
+        // One existing pointer plus cell_content_offset = 22 leaves 8 bytes
+        // for the new pointer and divider. The old worst-case gate required
+        // 15 bytes, but rowid 10 has a one-byte varint, so the actual divider
+        // update needs only 7 bytes.
+        let mut parent = vec![0u8; USABLE as usize];
+        let header = BtreePageHeader {
+            page_type: BtreePageType::InteriorTable,
+            first_freeblock: 0,
+            cell_count: 1,
+            cell_content_offset: 22,
+            fragmented_free_bytes: 0,
+            right_child: Some(pn(3)),
+        };
+        header.write(&mut parent, 0);
+        store.pages.insert(2, parent);
+        store.pages.insert(3, build_leaf_table(&[(10, b"ten")]));
+
+        let mut overflow_cell = [0u8; 64];
+        let mut pos = 0;
+        pos += write_varint(&mut overflow_cell[pos..], 5);
+        pos += write_varint(&mut overflow_cell[pos..], 30);
+        overflow_cell[pos..pos + 5].copy_from_slice(b"hello");
+        pos += 5;
+
+        let new_pgno = balance_quick(
+            &cx,
+            &mut store,
+            pn(2),
+            pn(3),
+            &overflow_cell[..pos],
+            30,
+            USABLE,
+            USABLE,
+        )
+        .expect("quick balance should not fail")
+        .expect("exact divider space should allow quick balance");
+
+        let parent_data = store.pages.get(&2).unwrap();
+        let parent_header = BtreePageHeader::parse(parent_data, 0).unwrap();
+        assert_eq!(parent_header.cell_count, 2);
+        assert_eq!(parent_header.cell_content_offset, 17);
+        assert_eq!(parent_header.right_child, Some(new_pgno));
     }
 
     #[test]

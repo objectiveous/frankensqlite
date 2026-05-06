@@ -636,8 +636,8 @@ fn unicode61_tokenizer_from_args(args: &[String]) -> Unicode61Tokenizer {
 
     while let Some((key, value)) = take_tokenizer_option(args, &mut index) {
         match key.to_ascii_lowercase().as_str() {
-            "tokenchars" | "token_chars" => tokenizer.token_chars = value.to_owned(),
-            "separators" => tokenizer.separators = value.to_owned(),
+            "tokenchars" | "token_chars" => value.clone_into(&mut tokenizer.token_chars),
+            "separators" => value.clone_into(&mut tokenizer.separators),
             "remove_diacritics" => {
                 tokenizer.remove_diacritics = value.parse().unwrap_or(tokenizer.remove_diacritics);
             }
@@ -2398,7 +2398,7 @@ impl VirtualTable for Fts5Table {
                     let value_unquoted = value_unquoted_raw.to_ascii_lowercase();
                     match key_lower.as_str() {
                         "tokenize" => {
-                            tokenizer_name = value_unquoted_raw.to_owned();
+                            value_unquoted_raw.clone_into(&mut tokenizer_name);
                         }
                         "content" => {
                             if value_unquoted.is_empty() {

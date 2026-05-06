@@ -7439,6 +7439,100 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(false)
     }
 
+    fn try_append_on_external_rightmost_leaf_hint_with_writer<W>(
+        &mut self,
+        cx: &Cx,
+        hint: &mut TableAppendHint,
+        rowid: i64,
+        payload_len: usize,
+        writer: W,
+    ) -> Result<bool>
+    where
+        W: FnOnce(&mut [u8]) -> Result<()>,
+    {
+        observe_cursor_cancellation(cx)?;
+        self.last_known_depth = Some(hint.tree_depth);
+        self.stack.clear();
+        self.at_eof = true;
+
+        if rowid <= hint.last_rowid
+            || hint.header.page_type != cell::BtreePageType::LeafTable
+            || hint.header.cell_count == 0
+        {
+            return Ok(false);
+        }
+
+        self.record_range_page_witness(hint.leaf_page);
+        let mut writer_slot = Some(writer);
+        let usable_size = self.usable_size;
+        let mut mutate_payload_result: Result<Option<(u16, u16)>> = Ok(None);
+        let mut mutate_payload_only = |staged_page: &mut PageData| {
+            let Some(writer) = writer_slot.take() else {
+                mutate_payload_result = Err(FrankenError::internal(
+                    "retained writer append attempted to consume writer twice",
+                ));
+                return;
+            };
+            mutate_payload_result =
+                Self::try_append_table_leaf_payload_in_place_no_overflow_mutate_only_with_writer(
+                    usable_size,
+                    hint.leaf_page,
+                    staged_page,
+                    &mut hint.header,
+                    rowid,
+                    payload_len,
+                    writer,
+                );
+        };
+        if self
+            .pager
+            .try_mutate_staged_page_data(hint.leaf_page, &mut mutate_payload_only)
+        {
+            if mutate_payload_result?.is_some() {
+                self.last_insert_rowid = Some(rowid);
+                self.last_known_depth = Some(hint.tree_depth);
+                hint.last_rowid = rowid;
+                hint.clear_page_data();
+                self.clear_rightmost_leaf_cache();
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+
+        let Some(writer) = writer_slot.take() else {
+            return Err(FrankenError::internal(
+                "retained writer append lost writer without staged mutation",
+            ));
+        };
+        let Some(mut page_data) = hint.page_data.take() else {
+            return Ok(false);
+        };
+
+        let append_result =
+            Self::try_append_table_leaf_payload_in_place_no_overflow_mutate_only_with_writer(
+                self.usable_size,
+                hint.leaf_page,
+                &mut page_data,
+                &mut hint.header,
+                rowid,
+                payload_len,
+                writer,
+            );
+        hint.page_data = Some(page_data);
+
+        match append_result {
+            Ok(Some(_)) => {
+                self.last_insert_rowid = Some(rowid);
+                self.last_known_depth = Some(hint.tree_depth);
+                hint.last_rowid = rowid;
+                self.clear_rightmost_leaf_cache();
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     fn try_append_on_external_rightmost_leaf_hint_page_data(
         &mut self,
         cx: &Cx,
@@ -7914,6 +8008,41 @@ impl<P: PageWriter> BtCursor<P> {
     ) -> Result<bool> {
         let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
             cursor.try_append_on_external_rightmost_leaf_hint(cx, hint, rowid, data)
+        });
+        if matches!(result, Ok(true)) {
+            self.bump_row_image_epoch();
+        }
+        result
+    }
+
+    /// Writer-callback variant of
+    /// [`Self::table_try_append_cached_rightmost_leaf_hint`].
+    ///
+    /// This only succeeds while the retained hint still owns a hot page image.
+    /// It deliberately does not fall through to staged-page or quick-balance
+    /// paths, because the one-shot writer cannot be replayed after a failed
+    /// fit check. Callers should fall back to the byte-slice API when this
+    /// returns `Ok(false)`.
+    #[doc(hidden)]
+    pub fn table_try_append_cached_rightmost_leaf_hint_with_writer<W>(
+        &mut self,
+        cx: &Cx,
+        hint: &mut TableAppendHint,
+        rowid: i64,
+        payload_len: usize,
+        writer: W,
+    ) -> Result<bool>
+    where
+        W: FnOnce(&mut [u8]) -> Result<()>,
+    {
+        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+            cursor.try_append_on_external_rightmost_leaf_hint_with_writer(
+                cx,
+                hint,
+                rowid,
+                payload_len,
+                writer,
+            )
         });
         if matches!(result, Ok(true)) {
             self.bump_row_image_epoch();
@@ -13337,6 +13466,131 @@ mod tests {
             }
         }
         assert!(!cursor.next(&cx).unwrap());
+    }
+
+    #[test]
+    fn test_table_try_append_cached_rightmost_leaf_hint_with_writer_mutates_staged_leaf() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = StagedMutationStore::new(MemPageStore::with_empty_table(root, USABLE));
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        cursor.table_insert_rightmost_hint(&cx, 1, b"seed").unwrap();
+
+        let mut hint = cursor
+            .table_cached_rightmost_leaf_hint()
+            .expect("seed append should capture a retained rightmost-leaf image");
+        let payload = b"direct-retained-page-payload";
+        let appended = cursor
+            .table_try_append_cached_rightmost_leaf_hint_with_writer(
+                &cx,
+                &mut hint,
+                2,
+                payload.len(),
+                |dst| {
+                    dst.copy_from_slice(payload);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert!(
+            appended,
+            "writer should append directly into the retained rightmost leaf image"
+        );
+        assert_eq!(hint.last_rowid(), 2);
+        assert!(
+            !hint.retains_page_data(),
+            "staged-page writer append should drop the stale retained page image"
+        );
+        assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
+        assert_eq!(cursor.payload(&cx).unwrap(), payload);
+    }
+
+    #[test]
+    fn test_table_try_append_cached_rightmost_leaf_hint_with_writer_updates_retained_page_image() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        cursor.table_insert_rightmost_hint(&cx, 1, b"seed").unwrap();
+
+        let mut hint = cursor
+            .table_cached_rightmost_leaf_hint()
+            .expect("seed append should capture a retained rightmost-leaf image");
+        let payload = b"direct-retained-page-payload";
+        let appended = cursor
+            .table_try_append_cached_rightmost_leaf_hint_with_writer(
+                &cx,
+                &mut hint,
+                2,
+                payload.len(),
+                |dst| {
+                    dst.copy_from_slice(payload);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert!(
+            appended,
+            "writer should append directly into the retained rightmost leaf image"
+        );
+        assert_eq!(hint.last_rowid(), 2);
+        let retained_page = hint
+            .page_data
+            .as_ref()
+            .expect("retained writer append should preserve a hot page image")
+            .as_bytes()
+            .to_vec();
+
+        let mut retained_store = MemPageStore::new(USABLE);
+        retained_store
+            .pages
+            .insert(hint.leaf_page().get(), retained_page);
+        let mut retained_cursor = BtCursor::new(retained_store, pn(2), USABLE, true);
+        assert!(retained_cursor.table_move_to(&cx, 2).unwrap().is_found());
+        assert_eq!(retained_cursor.payload(&cx).unwrap(), payload);
+    }
+
+    #[test]
+    fn test_table_try_append_cached_rightmost_leaf_hint_with_writer_error_does_not_publish_cell() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, true);
+        cursor.table_insert_rightmost_hint(&cx, 1, b"seed").unwrap();
+
+        let mut hint = cursor
+            .table_cached_rightmost_leaf_hint()
+            .expect("seed append should capture a retained rightmost-leaf image");
+        let error = cursor
+            .table_try_append_cached_rightmost_leaf_hint_with_writer(&cx, &mut hint, 2, 8, |dst| {
+                dst.copy_from_slice(b"partial!");
+                Err(FrankenError::internal("forced retained writer failure"))
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("forced retained writer failure"));
+        assert_eq!(hint.last_rowid(), 1);
+        assert!(
+            hint.retains_page_data(),
+            "failed writer should preserve the retained pre-append page image for fallback"
+        );
+        assert!(
+            !cursor.table_move_to(&cx, 2).unwrap().is_found(),
+            "failed retained writer append must not publish a new row"
+        );
+
+        assert!(
+            cursor
+                .table_try_append_cached_rightmost_leaf_hint(&cx, &mut hint, 2, b"fallback")
+                .unwrap(),
+            "byte-slice fallback should still be able to use the retained hint"
+        );
+        assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
+        assert_eq!(cursor.payload(&cx).unwrap(), b"fallback");
     }
 
     #[test]

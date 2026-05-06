@@ -2552,3 +2552,28 @@ set: sessions found by
   Revisit only with a design that mutates in place without remove/restore and
   write-page round trips, then improves absolute FrankenSQLite medians on the
   current prepared INSERT matrix.
+
+## 2026-05-05 - WAL prepared checksum-transform copy removal
+
+- Target: prepared WAL commit/frame-finalization overhead after INSERT profiles
+  showed multi-ms `commit_prepare_us`, `commit_batch_build_us`, and
+  `commit_flush_frame_prep_us` on 10K large-record rows.
+- Candidate shape: in
+  `crates/fsqlite-core/src/wal_adapter.rs::finalize_prepared_batch_against_current_state`,
+  pass the prepared checksum transforms directly to
+  `WalFile::finalize_prepared_frame_bytes` instead of copying them into a fresh
+  `Vec<WalChecksumTransform>`. Source was reverted after measurement.
+- Correctness proof passed:
+  `rch exec -- env CARGO_TARGET_DIR=.rch-target cargo test -p fsqlite-core --lib append -- --nocapture`
+  (`17` tests).
+- Evidence artifacts:
+  `tests/artifacts/perf/wal-transform-slice-cyangorge-20260505T2350Z/report.json`,
+  `report-repeat.json`, and `summary.md`; baseline
+  `tests/artifacts/perf/insert-current-head-profile-cyangorge-20260505T2340Z/report.json`.
+- Result: rejected. The first candidate run improved weighted INSERT score
+  `1.7491 -> 1.6877` but worsened write-bulk geomean `2.4461x -> 2.4612x`
+  and p99 `4.0792x -> 4.3231x`; the repeat regressed weighted score
+  `1.7491 -> 1.7528` and write-bulk geomean `2.4461x -> 2.5072x`.
+- Do not retry removing the prepared checksum-transform copy as a standalone
+  WAL optimization unless a fresh profile proves the copy dominates and an
+  interleaved A/B improves both weighted INSERT score and write-bulk geomean.

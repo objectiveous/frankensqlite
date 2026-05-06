@@ -6960,11 +6960,19 @@ impl<P: PageWriter> BtCursor<P> {
                 &mut hint.header,
                 &cell_data,
             );
-            self.cell_buf = cell_data;
-            self.pager
-                .restore_staged_page_data(cx, hint.leaf_page, page_data)?;
+            if let Err(error) = self
+                .pager
+                .restore_staged_page_data(cx, hint.leaf_page, page_data)
+            {
+                self.cell_buf = cell_data;
+                if let Some(first) = overflow_head {
+                    let _ = self.free_overflow_chain(cx, first);
+                }
+                return Err(error);
+            }
             match append_result {
                 Ok(Some(_)) => {
+                    self.cell_buf = cell_data;
                     self.last_insert_rowid = Some(rowid);
                     self.last_known_depth = Some(hint.tree_depth);
                     hint.last_rowid = rowid;
@@ -6972,12 +6980,29 @@ impl<P: PageWriter> BtCursor<P> {
                     return Ok(true);
                 }
                 Ok(None) => {
-                    if let Some(first) = overflow_head {
-                        self.free_overflow_chain(cx, first)?;
+                    let quick_balance_result = self
+                        .try_quick_balance_on_external_rightmost_leaf_hint(
+                            cx, hint, rowid, &cell_data,
+                        );
+                    self.cell_buf = cell_data;
+                    match quick_balance_result {
+                        Ok(true) => return Ok(true),
+                        Ok(false) => {
+                            if let Some(first) = overflow_head {
+                                self.free_overflow_chain(cx, first)?;
+                            }
+                            return Ok(false);
+                        }
+                        Err(error) => {
+                            if let Some(first) = overflow_head {
+                                let _ = self.free_overflow_chain(cx, first);
+                            }
+                            return Err(error);
+                        }
                     }
-                    return Ok(false);
                 }
                 Err(error) => {
+                    self.cell_buf = cell_data;
                     if let Some(first) = overflow_head {
                         let _ = self.free_overflow_chain(cx, first);
                     }

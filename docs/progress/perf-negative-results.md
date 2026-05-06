@@ -12,6 +12,44 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-06 - Direct UPDATE/DELETE reusable SharedTxnPageIo shell
+
+Scope: `UPDATE/DELETEThroughput`, especially the current worst full-matrix row
+`100 rows / delete 5 rows` after `7d6117e1`, where FrankenSQLite measured
+`0.425427 ms` vs C SQLite `0.092583 ms` (`4.595x`).
+
+- Touched during rejected candidate: `crates/fsqlite-vdbe/src/engine.rs` and
+  `crates/fsqlite-core/src/connection.rs`; source was reverted after
+  measurement.
+- Candidate shape: keep a reusable, drained `SharedTxnPageIo` shell on
+  `Connection` and refill it for repeated direct-simple UPDATE/DELETE
+  executions inside explicit concurrent transactions. This preserved page-level
+  MVCC but tried to avoid per-row Rc/RefCell wrapper allocation.
+- Profile evidence: delayed `perf record` on
+  `perf-update-delete 100 20000 delete fsqlite isolated` showed DELETE-loop
+  costs in `TransactionKind::get_page` (`14.59%`),
+  `__memmove_avx_unaligned_erms` (`13.48%`),
+  `BtCursor<SharedTxnPageIo>::delete` (`11.22%`), `_int_malloc` (`8.42%`),
+  `TransactionKind::write_page_data` (`5.62%`), and
+  `SharedTxnPageIo::clear_stale_synthetic_pending_commit_surface` (`4.11%`).
+- Evidence artifacts:
+  `tests/artifacts/perf/update-delete-next-proudanchor-20260506T0212Z/summary.md`,
+  `baseline-delete100-compare-isolated.log`,
+  `candidate-delete100-compare-isolated.log`, and
+  `delete100-fsqlite-isolated-delay-perf-report.txt`.
+- Result: rejected. Same-target A/B moved absolute FrankenSQLite delete time
+  from `1580 ns/delete` to `1613 ns/delete` (about `2.1%` slower). The
+  C/FrankenSQLite ratio improved only because the C SQLite denominator slowed
+  from `293 ns/delete` to `334 ns/delete`.
+- Peer review caveat: the pre-candidate `SharedTxnPageIo::into_inner()` path
+  used `Rc::try_unwrap` to catch outstanding cursor/storage references. Any
+  future reuse attempt must preserve that stray-reference diagnostic before
+  draining or stashing the shell.
+- Do not retry reusable `SharedTxnPageIo` shell caching for direct UPDATE/DELETE
+  as a standalone optimization. Reconsider only if an allocation profile proves
+  wrapper allocation dominates and a same-window A/B improves absolute
+  FrankenSQLite update/delete medians.
+
 ## 2026-05-06 - CASS last-two-month failure-vocabulary addendum
 
 Scope: user-requested CASS resweep restricted to FrankenSQLite history from
@@ -58,6 +96,41 @@ the last two months, looking for terms such as `rejected`, `reverted`,
 - Recent commit-manager CASS hits were mostly summaries of landed commits,
   correctness work, or ephemeral-file triage. They did not add a new
   artifact-backed performance reject beyond the entries already below.
+
+## 2026-05-06 - CASS chained project-session refresh
+
+Scope: follow-up to the user request to expand this ledger by searching recent
+CASS history for failed or abandoned optimization ideas, restricted to sessions
+that mention `/data/projects/frankensqlite` since 2026-03-05.
+
+- Search method:
+  `cass search "/data/projects/frankensqlite" --since 2026-03-05 --robot-format sessions --limit 0 --mode lexical`
+  returned `67` source paths in the current CASS index. The index was usable
+  but actively rebuilding (`healthy=false`, `index.rebuilding=true`), so this
+  pass did not force another index refresh.
+- Negative vocabulary was searched through that session set with
+  `cass search <term> --sessions-from /tmp/frankensqlite-cass-project-sessions.txt --since 2026-03-05 --mode lexical`.
+  Useful hit totals included `rejected` (`45`), `reverted` (`29`),
+  `abandoned` (`9`), `slower` (`10`), `didn't help` (`8`),
+  `did not help` (`139`), `regression` (`171`), `rollback` (`149`),
+  `no improvement` (`225`), `did not move` (`150`),
+  `failed to improve` (`33`), and `revert` (`152`). The misspelling
+  `abandones` returned no hits.
+- Result: no new distinct artifact-backed performance reject was found beyond
+  the many entries already in this ledger. High-signal hits routed back to the
+  existing no-retry fences for broad VDBE/page-size/`SmallVec`/`SqliteValue`
+  `Arc` sweeps, stale raw `bench_insert` evidence, prepared-DML bypass ideas,
+  benchmark fairness changes, direct INSERT/DELETE micro-candidates, and WAL
+  publication/checksum experiments.
+- Verification note: CASS returned archived `source_path`s that no longer exist
+  on disk, so `rg` over those paths is not a reliable follow-up method. Future
+  agents should use CASS-native `view`, `expand`, or `export` when inspecting
+  this session set.
+- Do not treat a sparse direct `--workspace /data/projects/frankensqlite`
+  search as proof that the history is empty. Use the explicit path session set
+  plus `--sessions-from`, then only record a no-retry item when a hit names a
+  concrete candidate and is backed by benchmark artifacts, commit history, or a
+  clear correctness-abandonment rationale.
 
 ## 2026-05-05 - Recursive CTE direct SUM streaming did not close the gap
 

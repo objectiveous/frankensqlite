@@ -137,6 +137,12 @@ well as benchmark-rejected ideas. If the ledger is reserved by another agent, do
 not edit through the lock; send patch-ready entries to the reservation holder
 and record the blocker in your handoff.
 
+The most reliable CASS shape is to first build a session set from explicit repo
+path hits, then search inside that set with `--sessions-from`. Do not use `rg`
+over returned `source_path`s as the primary verification path: CASS can return
+archived source paths that no longer exist locally, so use `cass view`,
+`cass expand`, or `cass export` for follow-up inspection.
+
 If a direct CASS workspace filter for `/data/projects/frankensqlite` returns no
 hits, do not conclude there is no history. Search for `frankensqlite <term>` and
 accept only hits whose source path or title clearly maps to this repo, such as

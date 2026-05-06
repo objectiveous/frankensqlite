@@ -149,6 +149,44 @@ the exact `/data/projects/frankensqlite` workspace filter.
   `source_path`s may be archived and exact workspace filters remain
   sparse/noisy.
 
+## 2026-05-06 - B-tree bulk page direct pointer writes
+
+- Target: `comprehensive-bench --quick --filter insert`, especially
+  page-run-backed INSERT rows where the empty-root bulk page builder allocates
+  a temporary `cell_offsets` vector, fills it, then writes the pointer array
+  into the page.
+- Candidate shape: in `crates/fsqlite-btree/src/cursor.rs`, write each
+  leaf/interior cell pointer directly into the destination page while laying
+  out bulk table cells, removing the temporary `Vec<u16>` and final
+  `cell::write_cell_pointers` call. The candidate was manually reverted and
+  not committed.
+- Evidence artifacts:
+  - Current-main insert baseline:
+    `/data/tmp/frankensqlite-purpleotter-current-20260506T164206Z/insert-current.json`
+    and `insert-current.out`.
+  - Current-main full baseline:
+    `/data/tmp/frankensqlite-purpleotter-current-20260506T164206Z/full-current.json`
+    and `full-current.out`.
+  - Candidate insert slice:
+    `/data/tmp/frankensqlite-purpleotter-current-20260506T164206Z/insert-direct-pointers.json`
+    and `insert-direct-pointers.out`.
+  - Candidate full quick:
+    `/data/tmp/frankensqlite-purpleotter-current-20260506T164206Z/full-direct-pointers.json`
+    and `full-direct-pointers.out`.
+- Result: rejected and reverted. The insert slice worsened on the broad
+  section gates: average ratio `1.6577 -> 1.6919`, geomean
+  `1.6073 -> 1.6519`, and write-bulk average `1.6674 -> 1.7199`.
+  It did improve the partial weighted insert score (`1.5912 -> 1.5295`),
+  but that came with a severe large-row regression, including
+  `large_10col` 10K single-transaction FSQLite median `13.30 ms -> 21.38 ms`
+  in the profiled insert slice. The full candidate run was also contaminated
+  by concurrent unowned `connection.rs` edits, so it is not valid keep evidence
+  for the pointer-write change.
+- Do not retry plain direct pointer writes in the bulk page builders as a
+  standalone optimization. Revisit only with an isolated same-window A/B and a
+  design that preserves the optimized chunked pointer write behavior while
+  proving both the insert section and full quick matrix improve.
+
 ## 2026-05-06 - Direct INSERT rowid-presence certificate no-op diagnostic
 
 - Target: `comprehensive-bench --quick --filter insert`, especially fixed-cost

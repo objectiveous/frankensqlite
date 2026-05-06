@@ -37,6 +37,8 @@ pub mod source_block_partition;
 pub mod symbol_log;
 pub mod symbol_size_policy;
 pub mod tiered_storage;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod time_travel_history;
 pub mod transaction;
 pub mod vacuum;
 pub mod wal_adapter;

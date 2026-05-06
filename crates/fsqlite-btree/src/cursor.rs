@@ -2888,6 +2888,14 @@ impl<P: PageReader> BtCursor<P> {
             std::cmp::Ordering::Greater => return Ok(BinarySearchResult::NotFound(count)),
         }
 
+        if first_rowid.checked_add(i64::from(count) - 1) == Some(last_rowid) {
+            let offset = u16::try_from(target - first_rowid)
+                .map_err(|_| FrankenError::internal("dense table leaf seek offset overflow"))?;
+            if Self::table_leaf_rowid_at(entry, offset)? == target {
+                return Ok(BinarySearchResult::Found(offset));
+            }
+        }
+
         let mut lo = 0u16;
         let mut hi = count;
         let mut lo_rowid = first_rowid;

@@ -293,6 +293,37 @@ the exact `/data/projects/frankensqlite` workspace filter.
   `source_path`s may be archived and exact workspace filters remain
   sparse/noisy.
 
+## 2026-05-06 - Direct `std::thread` launch in comprehensive concurrent benchmark
+
+- Target: `comprehensive-bench --quick --filter concurrent`, after a perf
+  sample of the dirty page-run tree showed the concurrent filter dominated by
+  thread creation / `asupersync::RuntimeBuilder` setup rather than MVCC work.
+- Candidate shape: in `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`,
+  replace the measured concurrent section's `RuntimeBuilder` + `spawn_blocking`
+  helper with a direct `std::thread::spawn` wrapper for both the C SQLite and
+  FrankenSQLite arms. This was a benchmark-harness parity attempt, not an
+  engine change. Source was manually reverted after measurement and was not
+  applied to the shared checkout.
+- Evidence artifacts:
+  - Baseline/candidate A/B:
+    `/data/tmp/frankensqlite-purpleotter-stdthread-ab-20260506T182458Z/baseline-concurrent.json`
+    and
+    `/data/tmp/frankensqlite-purpleotter-stdthread-ab-20260506T182458Z/candidate-concurrent.json`.
+  - Pre-candidate perf lead:
+    `/data/tmp/frankensqlite-purpleotter-concurrent-profile-20260506T181221Z/perf-concurrent-flat.txt`
+    and
+    `/data/tmp/frankensqlite-purpleotter-concurrent-profile-20260506T181221Z/perf-concurrent-children.txt`.
+- Result: rejected and manually reverted. The candidate made both engines
+  faster, but C SQLite benefited more at low concurrency, so the concurrent
+  score worsened: baseline score `0.7431861039` versus candidate
+  `0.8397287843`. Row detail: `2 writers x 1000 rows` ratio worsened
+  `1.0286 -> 1.7133`; `4 writers x 1000 rows` worsened `1.0266 -> 1.0384`;
+  only `8 writers x 1000 rows` improved `0.3887 -> 0.3328`.
+- Do not retry replacing the concurrent section runtime wrapper as a standalone
+  perf keep. Revisit only if the benchmark methodology changes to exclude
+  thread-launch/setup from both engines and the full quick matrix score
+  improves in the same window.
+
 ## 2026-05-06 - B-tree bulk page direct pointer writes
 
 - Target: `comprehensive-bench --quick --filter insert`, especially
@@ -359,6 +390,35 @@ the exact `/data/projects/frankensqlite` workspace filter.
   certificate as a standalone perf win. Revisit only if a current profile
   proves certificate maintenance dominates and the same-window insert matrix
   improves.
+
+## 2026-05-06 - `write_varint` 2/3-byte encoder fast path
+
+- Target: prepared direct INSERT record serialization after the dirty-tree
+  insert profile still showed row-build/record serialization cost and direct
+  INSERT calls `write_varint` for header sizes and serial types.
+- Touched during rejected candidate: `crates/fsqlite-types/src/serial_type.rs`;
+  source was manually reverted after measurement.
+- Candidate shape: add explicit 1-, 2-, and 3-byte branches to `write_varint`,
+  falling back to the existing loop only for 4-9 byte varints. This aimed to
+  remove `varint_len()` plus the reverse loop from common text/blob serial
+  types in medium/large direct INSERT rows.
+- Correctness proof:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-purpleotter-varint cargo test -p fsqlite-types varint -- --nocapture`
+  passed before the A/B (`33 passed`).
+- Evidence artifacts:
+  `/data/tmp/frankensqlite-purpleotter-varint-ab-20260506T183709Z/baseline-insert.json`
+  and
+  `/data/tmp/frankensqlite-purpleotter-varint-ab-20260506T183709Z/candidate-insert.json`.
+- Result: rejected and manually reverted. Insert primary weighted score moved
+  only `1.438533 -> 1.431092`, while geomean worsened
+  `1.401992 -> 1.444521`, C-wins increased `19 -> 23`, and
+  FrankenSQLite-wins dropped `4 -> 1`. Row-level swings were too noisy and
+  included major tiny-row regressions, so the small primary-score improvement
+  is not a keep.
+- Retry condition: only reconsider with a focused microbenchmark or perf sample
+  proving `write_varint` itself is a top retained self-time hotspot, followed
+  by a same-window insert and full quick matrix improvement. Do not retry this
+  as a standalone direct INSERT lever.
 
 ## 2026-05-06 - Direct INSERT float-multiply evaluator fast path
 

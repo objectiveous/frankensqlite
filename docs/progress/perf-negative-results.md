@@ -12,6 +12,45 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-06 - Single-freeblock compact table-leaf DELETE
+
+- Target: `UPDATE/DELETEThroughput`, especially small direct DELETE rows where
+  profiles showed table-leaf DELETE paying page-copy/defrag costs after every
+  point rowid deletion.
+- Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs`; the
+  source was reverted immediately after measurement.
+- Candidate shape: in `remove_table_cell_from_leaf_deferred`, let an otherwise
+  compact table leaf avoid full defragmentation for one DELETE by either
+  advancing `cell_content_offset` when deleting the low physical boundary cell
+  or writing a single SQLite-format freeblock for the deleted cell. Pages that
+  already had a freeblock or fragmented bytes still used the existing eager
+  defrag path, avoiding the historical multi-freeblock-chain corruption mode
+  fixed by `5eed5a0a`.
+- Correctness/build proof before measurement:
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-purpleotter-single-freeblock-target cargo test -p fsqlite-btree cursor_delete -- --nocapture`
+  passed, and
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-purpleotter-single-freeblock-release cargo build --profile release-perf -p fsqlite-e2e --bin perf-update-delete --bin comprehensive-bench`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/delete-single-freeblock-purpleotter-20260506T2351Z/delete-100-standard.json`,
+  `tests/artifacts/perf/delete-single-freeblock-purpleotter-20260506T2351Z/update-baseline.json`,
+  and
+  `tests/artifacts/perf/delete-single-freeblock-purpleotter-20260506T2351Z/update-candidate.json`.
+- Result: rejected and reverted. The focused `perf-update-delete 100 20000
+  delete fsqlite standard` hyperfine probe showed only a noisy win
+  (`4.593s +/- 0.449s` baseline vs `4.386s +/- 0.220s` candidate,
+  `1.05x +/- 0.11`). The actual Section 6 same-window gate rejected it:
+  average ratio worsened `1.84x -> 2.01x`, and absolute FrankenSQLite medians
+  worsened on every row (`100` update `235.4us -> 330.9us`, `100` delete
+  `223.0us -> 337.7us`, `1K` update `624.5us -> 724.1us`, `1K` delete
+  `627.8us -> 697.8us`, `10K` update `4.47ms -> 5.44ms`, `10K` delete
+  `4.13ms -> 5.46ms`).
+- Do not retry a standalone single-freeblock shortcut for compact table-leaf
+  DELETE. Revisit table-leaf freeblocks only with a correctness proof that
+  exercises SQLite `btreeComputeFreeSpace()`-compatible layouts and a
+  same-window Section 6 matrix improvement in absolute FrankenSQLite medians,
+  not just a focused harness win.
+
 ## 2026-05-06 - Contiguous repeated-record page-run bulk loader
 
 - Target: remaining tiny/small INSERT gaps after the thread-local parse cache

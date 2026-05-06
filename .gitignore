@@ -220,10 +220,9 @@ clippy_output.*
 
 # Artifacts directories (CI/E2E/validation run outputs)
 artifacts/
-# Perf evidence should stay compact in Git. Existing curated summaries/reports
-# remain tracked, but new run artifacts under tests/artifacts/perf/ stay local
-# by default. Force-add the rare Markdown or JSON artifact that is worth
-# preserving.
+# Perf evidence should stay compact in Git. Run artifacts under
+# tests/artifacts/perf/ stay local by default. Force-add only the rare
+# Markdown or JSON proof artifact that has durable project value.
 !tests/artifacts/
 !tests/artifacts/perf/
 tests/artifacts/perf/**/*

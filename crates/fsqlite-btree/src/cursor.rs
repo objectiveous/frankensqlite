@@ -3779,9 +3779,9 @@ impl<P: PageWriter> BtCursor<P> {
         ptr_array_end <= new_content_offset
     }
 
-    fn bulk_table_leaf_groups(
+    fn bulk_table_leaf_groups<R: AsRef<[u8]>>(
         &self,
-        records: &[(i64, Vec<u8>)],
+        records: &[(i64, R)],
         header_offset: usize,
     ) -> Result<Option<Vec<BulkTableGroup>>> {
         let mut groups = Vec::new();
@@ -3789,13 +3789,14 @@ impl<P: PageWriter> BtCursor<P> {
         let mut group_cell_count = 0usize;
         let mut content_offset = self.usable_size as usize;
 
-        for (idx, &(rowid, ref payload)) in records.iter().enumerate() {
+        for (idx, (rowid, payload)) in records.iter().enumerate() {
+            let payload = payload.as_ref();
             let payload_size = u32::try_from(payload.len()).map_err(|_| FrankenError::TooBig)?;
             if cell::has_overflow(payload_size, self.usable_size, BtreePageType::LeafTable) {
                 return Ok(None);
             }
 
-            let cell_len = Self::table_leaf_cell_len(rowid, payload)?;
+            let cell_len = Self::table_leaf_cell_len(*rowid, payload)?;
             if group_cell_count > 0
                 && !Self::bulk_page_can_append_cell(
                     header_offset,
@@ -3903,11 +3904,11 @@ impl<P: PageWriter> BtCursor<P> {
         Some(groups)
     }
 
-    fn build_bulk_table_leaf_page(
+    fn build_bulk_table_leaf_page<R: AsRef<[u8]>>(
         &self,
         page_no: PageNumber,
         prefix: Option<&[u8]>,
-        records: &[(i64, Vec<u8>)],
+        records: &[(i64, R)],
     ) -> Result<PageData> {
         let header_offset = cell::header_offset_for_page(page_no);
         let mut page = vec![0u8; self.page_size as usize];
@@ -3920,7 +3921,8 @@ impl<P: PageWriter> BtCursor<P> {
         let mut payload_varint = [0u8; 9];
         let mut rowid_varint = [0u8; 9];
 
-        for &(rowid, ref payload) in records {
+        for (rowid, payload) in records {
+            let payload = payload.as_ref();
             let payload_len = write_varint(
                 &mut payload_varint,
                 u64::try_from(payload.len()).map_err(|_| FrankenError::TooBig)?,
@@ -4034,10 +4036,10 @@ impl<P: PageWriter> BtCursor<P> {
     /// that need overflow pages, duplicate rowids, non-table trees, or a
     /// non-empty root return `Ok(false)` so callers can replay through the
     /// normal insertion path.
-    pub fn table_bulk_load_empty_root_sorted_records(
+    pub fn table_bulk_load_empty_root_sorted_records<R: AsRef<[u8]>>(
         &mut self,
         cx: &Cx,
-        records: &[(i64, Vec<u8>)],
+        records: &[(i64, R)],
     ) -> Result<bool> {
         if !self.is_table || records.is_empty() {
             return Ok(false);

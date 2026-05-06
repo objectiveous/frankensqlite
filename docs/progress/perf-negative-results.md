@@ -503,6 +503,43 @@ the exact `/data/projects/frankensqlite` workspace filter.
   builder fusion that proves both absolute `large_10col` medians and the
   weighted insert score in same-window repeat runs.
 
+## 2026-05-06 - Medium page-run admission over-broad arena bands
+
+- Target: `comprehensive-bench --quick --filter insert` after the active
+  prepared-direct INSERT page-run append fast path, especially
+  single-transaction and record-size `medium_6col` 10K rows.
+- Candidate shape: lower the prepared direct INSERT page-run admission gate
+  from `512` bytes to `128` bytes in `crates/fsqlite-core/src/connection.rs`,
+  and teach `crates/fsqlite-btree/src/cursor.rs` to bulk-load borrowed
+  records so a pending page-run can store medium payloads in one contiguous
+  arena. Rejected variants included:
+  - `128` byte admission with owned `Vec<u8>` records for all admitted runs.
+  - borrowed arena records for all admitted runs up to `512` bytes.
+  - borrowed arena records only below `256` bytes.
+- Evidence artifacts:
+  - Owned `128` threshold:
+    `tests/artifacts/perf/page-run-threshold128-active-append-crimsongorge-20260506T171751Z/report-insert-threshold128-active-append.json`
+    and repeat
+    `tests/artifacts/perf/page-run-threshold128-active-append-repeat-crimsongorge-20260506T172245Z/report-insert-threshold128-active-append-repeat.json`.
+  - All-arena `128..512` threshold:
+    `tests/artifacts/perf/page-run-borrowed-threshold128-crimsongorge-20260506T173312Z/report-insert-borrowed-threshold128.json`
+    and full-matrix check
+    `tests/artifacts/perf/page-run-hybrid-threshold128-full-crimsongorge-20260506T175132Z/report-full-hybrid-threshold128.json`.
+  - Too-narrow arena cap:
+    `tests/artifacts/perf/page-run-hybrid-threshold128-arena256-insert-crimsongorge-20260506T175709Z/report-insert-hybrid-threshold128-arena256.json`.
+- Result: rejected as over-broad arena/admission bands, not as the final
+  record-band policy. The owned `128` threshold and all-arena variants made
+  medium rows faster but regressed large rows sharply: for example the
+  all-arena full matrix pushed record-size `large_10col` to
+  `20.65 ms` / `2.22x` versus C SQLite. The `256` byte arena cap protected
+  large rows better, but lost too much of the medium single-transaction win
+  (`medium_6col` 10K single transaction stayed `1.41x` slower than C SQLite).
+- Do not retry broad `128` admission or all-arena page-run buffering as a
+  standalone optimization. The only measured keepable form from this pass is
+  record-band isolation: page-run admission at `128` bytes, arena storage below
+  `384` bytes, and the existing owned-record storage above that cap, with both
+  insert-only and full quick matrix proof.
+
 ## 2026-05-06 - Prepare-time direct-INSERT record template
 
 - Target: fixed-cost and row-build-heavy `INSERTThroughput --quick --filter

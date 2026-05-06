@@ -12,6 +12,56 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-06 - CASS strict alias/session-set resweep: broad March bundles are not perf proof
+
+Scope: user-requested CASS expansion of this ledger, restricted to
+FrankenSQLite session history from the last 60 days and failure vocabulary such
+as `rejected`, `reverted`, `abandoned`, `slower`, `didn't help`,
+`did not help`, `regressed`, `rollback`, `no improvement`,
+`failed to improve`, `worse`, `within noise`, `no measurable`, and
+`keep gate`.
+
+- Search method: built a CASS session set from both explicit repo path aliases,
+  because direct `--workspace /data/projects/frankensqlite` remains sparse in
+  the stale-but-usable index:
+  `cass search "/data/projects/frankensqlite" --days 60 --robot-format sessions --limit 1000 --mode lexical`
+  returned `51` sessions, `/dp/frankensqlite` returned `26`, and the combined
+  de-duplicated set had `68` sessions. Negative-vocabulary searches then used
+  `--sessions-from /tmp/frankensqlite-cass-combined-sessions-violetcove.txt`.
+- Useful hit totals inside that strict session set included `rejected` (`39`),
+  `reverted` (`29`), `abandoned` (`6`), `slower` (`10`), `didn't help` (`6`),
+  `did not help` (`117`), `regressed` (`3`), `rollback` (`137`),
+  `no improvement` (`219`), `did not move` (`126`),
+  `failed to improve` (`31`), `within noise` (`4`), `no measurable` (`2`),
+  and `keep gate` (`5`). The misspelling `abandones` returned `0`.
+- High-signal CASS views inspected:
+  `/home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-9581ae40.json`
+  around lines `81` and `138`,
+  `/home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-07T20-25-52485ea5.json`
+  around line `13`,
+  `/home/ubuntu/.claude/projects/-data-projects/026c17f8-4543-415c-9a12-6eb30204a189.jsonl`
+  around line `35`, and
+  `/home/ubuntu/.claude/projects/-data-projects/45256a1f-8025-445a-8a4c-4f68bc208028.jsonl`
+  around line `335`.
+- Guardrail: do not treat the March Gemini "extreme optimization" bundle as a
+  reusable accepted or rejected perf patch. It mixed hardcoded page-size
+  plumbing, `SmallVec` register/program rewrites, hot register helper changes,
+  B-tree direct rowid/target-record parsing changes, prepared PK benchmark
+  fairness changes, and asupersync/async-VFS planning in one narrative. The
+  session history shows repeated stale file views, failed replacements, and
+  "engine.rs reverted" confusion, with no same-window matrix proof tying the
+  bundle to a durable C SQLite gap closure.
+- Guardrail: multi-repo commit-manager CASS hits are not performance evidence.
+  The high-ranking `rejected`/`slower` hits around March commit summaries mostly
+  describe logical commit grouping, correctness fixes, API renames, rustfmt, or
+  ephemeral-file triage. Use them only to locate commits, not to justify a perf
+  retry or skip.
+- Result: no new distinct artifact-backed performance reject was found beyond
+  the existing entries in this ledger. Future agents should only revive an idea
+  from these CASS hits after isolating one current code path, proving a current
+  profile signal, and running the exact target row against a same-window
+  baseline/candidate matrix.
+
 ## 2026-05-06 - Direct DELETE tier0 already-staged MVCC marker skip
 
 Scope: `UPDATE/DELETEThroughput`, especially the current worst full-matrix row

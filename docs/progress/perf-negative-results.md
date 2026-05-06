@@ -12,6 +12,49 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-06 - Contiguous repeated-record page-run bulk loader
+
+- Target: remaining tiny/small INSERT gaps after the thread-local parse cache
+  and retained writer work, especially `INSERTThroughput — Single Transaction —
+  tiny_1col` at 100 rows and small-row page-run fixed costs.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` and
+  `crates/fsqlite-btree/src/cursor.rs`; the code was briefly committed as
+  `bbfc6ddb` and then reverted after the full quick matrix rejected it.
+- Candidate shape: split `PendingDirectInsertPageRunRecords::Repeated` into a
+  contiguous `RepeatedRange` representation plus a non-contiguous rowid fallback,
+  and add a B-tree empty-root bulk loader that accepts
+  `(first_rowid, len, repeated_record)` directly. This avoided materializing a
+  `Vec<i64>` while buffering monotone rowids and avoided building a temporary
+  `Vec<(rowid, payload)>` at flush time for repeated-record page runs.
+- Correctness proof passed before measurement:
+  `cargo fmt --check`,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-local-profile-target cargo check -p fsqlite-core -p fsqlite-btree --lib`,
+  `cargo test -p fsqlite-btree table_bulk_load_empty_root_repeated_record_range -- --nocapture`,
+  and
+  `cargo test -p fsqlite-core test_prepared_direct_insert_repeated_constant_page_run_flushes_before_read -- --nocapture`.
+- Evidence artifacts:
+  - Baseline INSERT profile:
+    `tests/artifacts/perf/next-profile-crimsongorge-20260506T2253Z/report-insert.json`.
+  - Candidate INSERT profile:
+    `tests/artifacts/perf/repeated-range-candidate-crimsongorge-20260506T2308Z/report-insert.json`.
+  - Candidate full quick:
+    `tests/artifacts/perf/repeated-range-candidate-crimsongorge-20260506T2308Z/report-full.json`.
+  - Baseline full quick comparator:
+    `tests/artifacts/perf/thread-parse-cache-full-repeat-purpleotter-20260506T2228Z/report-full-thread-cache-repeat.json`.
+- Result: rejected and reverted. The candidate improved the targeted INSERT
+  p99 and write-bulk geomean in the insert-only run (`p99 3.3385 -> 1.8103`,
+  write-bulk geomean `1.1322 -> 1.0816`) and moved the worst tiny 100-row
+  single-transaction ratio from `3.3385x` to `1.8103x`. The full quick matrix
+  still missed the keep gate: primary weighted score regressed
+  `0.4328 -> 0.4368`, geomean regressed `0.3341 -> 0.3409`, p90 regressed
+  `1.4339 -> 1.4871`, and write-bulk geomean regressed
+  `1.1572 -> 1.1679`, despite p99 improving `2.7900 -> 2.5077`.
+- Do not retry a standalone repeated-record range representation or repeated
+  empty-root bulk-loader as a keep. Reconsider only if paired with a broader
+  write-bulk fix that preserves the tiny-row p99 improvement while improving
+  the full quick primary score and write-bulk geomean on repeat.
+
 ## 2026-05-06 - Engine-side exact benchmark PRAGMA fast path
 
 - Target: fixed setup overhead on the remaining 100-row and 1000-row INSERT

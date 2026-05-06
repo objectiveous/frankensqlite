@@ -128,14 +128,17 @@ the target workload, files touched, evidence artifacts, measured result, and the
 condition under which it is worth retrying. This is mandatory: failed
 optimization ideas must be durable so future agents do not repeat them.
 
-For major perf campaigns, also mine recent `$cass` session history, recent
-commits, and perf artifacts for terms like `rejected`, `reverted`, `slower`,
-`regressed`, `did not help`, and `within noise`, scoped to this repo and recent
-history. Include CASS workspace aliases that clearly map to this repo (for
-example archived Gemini workspaces), and record correctness-abandoned ideas as
-well as benchmark-rejected ideas. If the ledger is reserved by another agent, do
-not edit through the lock; send patch-ready entries to the reservation holder
-and record the blocker in your handoff.
+For major perf campaigns, also mine the last 60 days of `$cass` session history,
+recent commits, and perf artifacts for failure terms like `rejected`,
+`reverted`, `abandoned`, `abandones`, `slower`, `regressed`, `didn't help`,
+`did not help`, `within noise`, `no improvement`, `no measurable`,
+`failed to improve`, `rolled back`, `backed out`, `not a keep`, and
+`keep gate`, scoped to this repo.
+Include CASS workspace aliases that clearly map to this repo (for example
+archived Gemini workspaces), and record correctness-abandoned ideas as well as
+benchmark-rejected ideas. If the ledger is reserved by another agent, do not
+edit through the lock; send patch-ready entries to the reservation holder and
+record the blocker in your handoff.
 
 The most reliable CASS shape is to first build a session set from explicit repo
 path hits, then search inside that set with `--sessions-from`. Do not use `rg`

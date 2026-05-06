@@ -12,6 +12,80 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-06 - Follow-up strict CASS negative-result sweep
+
+Scope: user-requested follow-up to mine the last two months of CASS history for
+failed, abandoned, reverted, or slower performance ideas without repeating them.
+The sweep was scoped to sessions that explicitly map to FrankenSQLite since
+`2026-03-06`.
+
+- Search artifact directory:
+  `/data/tmp/frankensqlite-cass-ledger-deep-20260506T192044Z`.
+- CASS state: `cass 0.4.2`; `cass status` reported a stale but usable index.
+  A bounded `timeout 180 cass index --json` refresh was stopped after it stayed
+  in `preparing` with `discovered_agents=0` for roughly 36 seconds, matching
+  the known stale-index failure mode. The existing index was used with
+  CASS-native `view` follow-up.
+- Session-set construction:
+  - `/data/projects/frankensqlite` explicit path search returned `51`
+    sessions.
+  - `/dp/frankensqlite` explicit path search returned `26` sessions.
+  - exact `--workspace /data/projects/frankensqlite` returned `0` sessions.
+  - explicit `/home/ubuntu/.gemini/tmp/frankensqlite` path search returned
+    `0` sessions, but broad `frankensqlite` results filtered to source paths
+    under `/home/ubuntu/.gemini/tmp/frankensqlite` returned `32`.
+  - combined strict de-duplicated set: `95` sessions.
+- Negative vocabulary searched through that set included `rejected`,
+  `reverted`, `abandoned`, `abandones`, `slower`, `regressed`,
+  `didn't help`, `did not help`, `within noise`, `no improvement`,
+  `no measurable`, `failed to improve`, `rolled back`, `rollback`,
+  `backed out`, `not a keep`, `keep gate`, `not worth keeping`,
+  `did not move`, `matrix rejected`, `rejected and reverted`,
+  `manually reverted`, `reverted before commit`, `gave up`, `worse`,
+  `candidate failed`, `lost to baseline`, `failed the keep gate`,
+  `not retry`, `do not retry`, and `do not revive`.
+- Useful hit totals included `rejected` (`39`), `reverted` (`29`),
+  `abandoned` (`6`), `slower` (`10`), `regressed` (`3`),
+  `didn't help` (`6`), `did not help` (`117`), `within noise` (`4`),
+  `no improvement` (`219`), `no measurable` (`2`),
+  `failed to improve` (`31`), `rolled back` (`11`), `rollback` (`138`),
+  `backed out` (`42`), `not a keep` (`37`), `not worth keeping` (`38`),
+  `did not move` (`126`), `worse` (`7`), `candidate failed` (`5`), and
+  `failed the keep gate` (`18`). Very large `not retry` / `do not retry` /
+  `do not revive` counts were mostly self-referential echoes of this ledger and
+  recent agent handoffs, not independent evidence.
+- High-signal CASS views inspected:
+  - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-a1108e5a.json -n 120 -C 45`
+  - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-07T06-15-8b4e37ea.json -n 8 -C 35`
+  - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-08T22-16-466c7bcd.json -n 150 -C 45`
+  - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-08T22-16-80b8129f.json -n 76 -C 45`
+  - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-08T22-16-ee1022e3.json -n 30 -C 45`
+  - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-07T20-25-52485ea5.json -n 13 -C 35`
+- Result: no new distinct artifact-backed performance rejection was found
+  beyond entries already in this ledger. This pass adds three concrete
+  guardrails:
+  - March raw-`bench_insert` serializer/VFS/foldhash/cache summaries are stale
+    evidence. They reported only `0.271 s -> 0.265 s` on a raw unique-SQL
+    benchmark that intentionally thrashed parse/codegen. Do not use those
+    sessions to justify current serializer, SQL-cache, `MemoryFile::write`,
+    `PageCache`, `MemPageStore`, or foldhash work without a fresh current
+    matrix/profile.
+  - Broad Phase-1 optimization-plan summaries mix changes that are already
+    present in the current tree, later reverted/public-API-rejected ideas, and
+    unmeasured plan text: `Arc` parse/compiled-cache entries, `Arc<VdbeProgram>`
+    prepared statements, internal VDBE `SmallVec`, public-row `SmallVec`,
+    `execute_params`, prepared-DML VDBE bypass, and IPK `SeekRowid` lowering.
+    Do not revive the bundle from CASS prose. Check current code and this
+    ledger for the exact subfamily, then measure the one remaining lever.
+  - True-asupersync async VFS/Pager/VDBE migration appears in CASS as plan-space
+    bead creation, not as a tried-and-rejected micro-optimization. Treat it as
+    architecture backlog unless a future session records concrete code and
+    benchmark artifacts.
+- Retry condition: only add or revive a CASS-derived candidate when
+  `cass view`/`cass expand` names a specific code shape and a current commit,
+  perf artifact, or correctness-abandonment rationale backs the result. Raw hit
+  counts and compaction summaries are triage leads only.
+
 ## 2026-05-06 - Direct INSERT text append force-inline annotation
 
 - Target: `comprehensive-bench --quick --filter INSERT` after the clean

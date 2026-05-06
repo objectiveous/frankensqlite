@@ -2527,7 +2527,24 @@ impl<P: PageReader> BtCursor<P> {
                 // There is a successor. Reset eof and use advance_next to reach it.
                 self.at_eof = false;
                 let advanced = self.advance_next(cx)?;
-                if !advanced {
+                if advanced {
+                    let successor = self
+                        .stack
+                        .last()
+                        .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
+                    let successor_rowid = Self::table_leaf_rowid_at(successor, successor.cell_idx)?;
+                    if successor_rowid == target_rowid {
+                        let successor_page = self
+                            .current_page()
+                            .map_or_else(|| "unknown".to_owned(), |page_no| page_no.to_string());
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "table rowid seek on root {} missed scan-visible rowid {} on successor page {}",
+                                self.root_page, target_rowid, successor_page
+                            ),
+                        });
+                    }
+                } else {
                     self.at_eof = true;
                 }
             }
@@ -14884,6 +14901,49 @@ mod tests {
 
         assert!(cursor.table_move_to(&cx, 15).unwrap().is_found());
         assert_eq!(cursor.payload(&cx).unwrap(), b"d");
+    }
+
+    #[test]
+    fn test_table_seek_fails_closed_when_successor_contains_missed_rowid() {
+        // Mirrors frankensqlite#73: a stale interior separator routes the
+        // equality seek into the left child, while a forward scan reaches the
+        // same rowid in the successor leaf. This must not silently return
+        // NotFound, because UPDATE/DELETE callers would no-op a scan-visible row.
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"a"), (4, b"d")]));
+        store
+            .pages
+            .insert(4, build_leaf_table(&[(5, b"e"), (10, b"j")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+        let mut scanned = Vec::new();
+        assert!(cursor.first(&cx).unwrap());
+        loop {
+            scanned.push(cursor.rowid(&cx).unwrap());
+            if !cursor.next(&cx).unwrap() {
+                break;
+            }
+        }
+        assert_eq!(scanned, vec![1, 4, 5, 10]);
+
+        let err = cursor
+            .table_move_to(&cx, 5)
+            .expect_err("stale separator must fail closed");
+        assert!(
+            matches!(
+                err,
+                FrankenError::DatabaseCorrupt { ref detail }
+                    if detail.contains("missed scan-visible rowid 5")
+            ),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

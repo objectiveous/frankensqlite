@@ -12,6 +12,44 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-06 - Connection-only prepared INSERT direct record writer
+
+- Target: prepared direct INSERT small-row and record-size rows after the
+  insert profile still showed `try_serialize_prepared_direct_simple_insert_record`
+  and row serialization cost under `Connection::execute_prepared_direct_simple_insert`.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  source was manually reverted after measurement. `crates/fsqlite-btree/src/cursor.rs`
+  was intentionally left to the concurrent correctness fix on frankensqlite#73.
+- Candidate shape: pre-plan each prepared direct INSERT record in `connection.rs`
+  and, for small append-shaped rows, feed that plan into the existing
+  `table_append_after_last_position_with_writer` path so record bytes are
+  written directly into the leaf cell. Larger/fallback rows kept the existing
+  `record_scratch` serialization path.
+- Correctness proof passed on the candidate before measurement:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-direct-writer-check cargo check -p fsqlite-core --lib`
+  and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-direct-writer-check cargo test -p fsqlite-core test_prepared_direct_simple_insert -- --nocapture`.
+- Evidence artifacts:
+  - Baseline:
+    `tests/artifacts/perf/insert-section-perf-crimsongorge-20260506T1920Z/report-insert.json`.
+  - Candidate:
+    `tests/artifacts/perf/direct-writer-insert-crimsongorge-20260506T2008Z/report-insert.json`
+    plus sibling `bench.stdout` and `bench.stderr`.
+- Result: rejected and reverted. The insert-section weighted score regressed
+  from `1.4597` to `1.6675`, geomean regressed from `1.4457` to `1.9495`,
+  and write-bulk geomean regressed from `1.4431` to `2.0084`. The target
+  `small_3col` 10K single-transaction row regressed from roughly `5.61 ms` in
+  the earlier current profile to `11.93 ms`; the record-size `small_3col` 10K
+  row measured `12.28 ms`.
+- Root-cause read: this saved a record-buffer copy in the connection layer but
+  lost more important right-edge locality by entering the existing writer path
+  without a retained cached append hint. The hot cost moved into repeated append
+  preflight / positioning rather than disappearing.
+- Do not retry a connection-only direct record writer. Reconsider only if the
+  B-tree exposes a retained cached-hint writer with no duplicate right-edge
+  descent, and only keep it after a same-window INSERT-section and full quick
+  matrix improvement.
+
 ## 2026-05-06 - Follow-up strict CASS negative-result sweep
 
 Scope: user-requested follow-up to mine the last two months of CASS history for

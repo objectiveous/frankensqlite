@@ -1,8 +1,0 @@
-{
-  "total_scenarios": 25,
-  "avg_ratio": 2.460951500548569,
-  "geomean_ratio": 2.362302327915986,
-  "weighted": 1.6990525499541396,
-  "write_bulk": 2.5153480151513237,
-  "write_single": 1.4907668315199687
-}

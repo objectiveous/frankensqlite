@@ -65,6 +65,38 @@ of CASS history, restricted to sessions that clearly map to this project.
   record or revive an idea only after `cass view`/`cass expand` identifies a
   concrete candidate and code, commits, or benchmark artifacts back the result.
 
+## 2026-05-06 - VDBE uppercase SUM aggregate sidecar
+
+- Target: `comprehensive-bench --quick --filter Read`
+  `Read-After-Write Query Performance`, especially the remaining C-SQLite-win
+  row `100 rows / SUM + GROUP BY (~10 groups)`.
+- Candidate shape: add an engine-level `FastSumState` sidecar in
+  `crates/fsqlite-vdbe/src/engine.rs` for internal uppercase non-DISTINCT
+  one-argument `SUM` aggregate opcodes, bypassing aggregate-registry trait
+  dispatch while preserving generic/lowercase aggregate behavior.
+- Evidence artifacts:
+  - Patch snapshot:
+    `/data/tmp/frankensqlite-purpleotter-sumfast-20260506T1710Z/sumfast.diff`.
+  - First pair:
+    `/data/tmp/frankensqlite-purpleotter-sumfast-20260506T1710Z/read-baseline-probe.json`
+    and
+    `/data/tmp/frankensqlite-purpleotter-sumfast-20260506T1710Z/read-candidate.json`.
+  - Same-window repeat:
+    `/data/tmp/frankensqlite-purpleotter-sumfast-20260506T1710Z/read-baseline-repeat.json`
+    and
+    `/data/tmp/frankensqlite-purpleotter-sumfast-20260506T1710Z/read-candidate-repeat.json`.
+- Result: rejected and manually reverted before commit. The first pair showed
+  only small target-row movement (`1.5219 -> 1.4697`, `0.9395 -> 0.9329`,
+  `0.8524 -> 0.8460` for 100/1K/10K row SUM+GROUP BY ratios), and the paired
+  repeat did not hold (`1.4569 -> 1.4663`, `0.9368 -> 0.9409`,
+  `0.8346 -> 0.8549`). The section weighted score moved slightly in the
+  candidate's favor on repeat (`0.24194 -> 0.23863`), but not because the
+  targeted remaining gap improved.
+- Do not retry a generic engine-level SUM sidecar as a local patch. Revisit
+  only if profiling shows aggregate trait dispatch dominates a larger
+  C-SQLite-win row and the same-window target rows, not just the section
+  aggregate, move in the intended direction.
+
 ## 2026-05-06 - Certified direct UPDATE/DELETE pending-run buffer
 
 - Target: `comprehensive-bench --quick --filter update` Section 6

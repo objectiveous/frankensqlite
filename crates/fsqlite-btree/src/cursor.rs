@@ -1134,6 +1134,18 @@ impl From<&RightmostLeafCacheEntry> for TableAppendHint {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BulkTableChild {
+    page_no: PageNumber,
+    max_rowid: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BulkTableGroup {
+    start: usize,
+    end: usize,
+}
+
 /// A B-tree cursor that navigates through B-tree pages using a page stack.
 ///
 /// Generic over the page I/O backend for testability.
@@ -3733,6 +3745,389 @@ impl<P: PageWriter> BtCursor<P> {
         self.stack.clear();
         self.at_eof = true;
         Ok(())
+    }
+
+    fn varint_len(value: u64) -> usize {
+        let mut buf = [0u8; 9];
+        write_varint(&mut buf, value)
+    }
+
+    fn table_leaf_cell_len(rowid: i64, payload: &[u8]) -> Result<usize> {
+        let payload_len = u64::try_from(payload.len()).map_err(|_| FrankenError::TooBig)?;
+        Ok(Self::varint_len(payload_len)
+            + Self::varint_len(u64::from_ne_bytes(rowid.to_ne_bytes()))
+            + payload.len())
+    }
+
+    fn table_interior_cell_len(rowid: i64) -> usize {
+        4 + Self::varint_len(u64::from_ne_bytes(rowid.to_ne_bytes()))
+    }
+
+    fn bulk_page_can_append_cell(
+        header_offset: usize,
+        page_type: BtreePageType,
+        cell_count: usize,
+        content_offset: usize,
+        cell_len: usize,
+    ) -> bool {
+        let Some(new_content_offset) = content_offset.checked_sub(cell_len) else {
+            return false;
+        };
+        let ptr_array_end = header_offset
+            + usize::from(page_type.header_size())
+            + (cell_count + 1) * usize::from(fsqlite_types::limits::CELL_POINTER_SIZE);
+        ptr_array_end <= new_content_offset
+    }
+
+    fn bulk_table_leaf_groups(
+        &self,
+        records: &[(i64, Vec<u8>)],
+        header_offset: usize,
+    ) -> Result<Option<Vec<BulkTableGroup>>> {
+        let mut groups = Vec::new();
+        let mut group_start = 0usize;
+        let mut group_cell_count = 0usize;
+        let mut content_offset = self.usable_size as usize;
+
+        for (idx, &(rowid, ref payload)) in records.iter().enumerate() {
+            let payload_size = u32::try_from(payload.len()).map_err(|_| FrankenError::TooBig)?;
+            if cell::has_overflow(payload_size, self.usable_size, BtreePageType::LeafTable) {
+                return Ok(None);
+            }
+
+            let cell_len = Self::table_leaf_cell_len(rowid, payload)?;
+            if group_cell_count > 0
+                && !Self::bulk_page_can_append_cell(
+                    header_offset,
+                    BtreePageType::LeafTable,
+                    group_cell_count,
+                    content_offset,
+                    cell_len,
+                )
+            {
+                groups.push(BulkTableGroup {
+                    start: group_start,
+                    end: idx,
+                });
+                group_start = idx;
+                group_cell_count = 0;
+                content_offset = self.usable_size as usize;
+            }
+
+            if !Self::bulk_page_can_append_cell(
+                header_offset,
+                BtreePageType::LeafTable,
+                group_cell_count,
+                content_offset,
+                cell_len,
+            ) {
+                return Ok(None);
+            }
+            content_offset -= cell_len;
+            group_cell_count += 1;
+        }
+
+        if group_start < records.len() {
+            groups.push(BulkTableGroup {
+                start: group_start,
+                end: records.len(),
+            });
+        }
+        Ok(Some(groups))
+    }
+
+    fn bulk_table_interior_groups(
+        &self,
+        children: &[BulkTableChild],
+        header_offset: usize,
+    ) -> Option<Vec<BulkTableGroup>> {
+        if children.is_empty() {
+            return Some(Vec::new());
+        }
+
+        let mut groups = Vec::new();
+        let mut group_start = 0usize;
+        let mut cell_count = 0usize;
+        let mut content_offset = self.usable_size as usize;
+
+        for child_idx in 1..children.len() {
+            let divider_len = Self::table_interior_cell_len(children[child_idx - 1].max_rowid);
+            if cell_count > 0
+                && !Self::bulk_page_can_append_cell(
+                    header_offset,
+                    BtreePageType::InteriorTable,
+                    cell_count,
+                    content_offset,
+                    divider_len,
+                )
+            {
+                groups.push(BulkTableGroup {
+                    start: group_start,
+                    end: child_idx,
+                });
+                group_start = child_idx;
+                cell_count = 0;
+                content_offset = self.usable_size as usize;
+                continue;
+            }
+
+            if !Self::bulk_page_can_append_cell(
+                header_offset,
+                BtreePageType::InteriorTable,
+                cell_count,
+                content_offset,
+                divider_len,
+            ) {
+                return None;
+            }
+            content_offset -= divider_len;
+            cell_count += 1;
+        }
+
+        groups.push(BulkTableGroup {
+            start: group_start,
+            end: children.len(),
+        });
+        if groups.len() > 1
+            && let Some(last) = groups.last()
+            && last.end == last.start + 1
+        {
+            let prev_idx = groups.len() - 2;
+            if groups[prev_idx].end <= groups[prev_idx].start + 2 {
+                return None;
+            }
+            groups[prev_idx].end -= 1;
+            let last_idx = groups.len() - 1;
+            groups[last_idx].start -= 1;
+        }
+        Some(groups)
+    }
+
+    fn build_bulk_table_leaf_page(
+        &self,
+        page_no: PageNumber,
+        prefix: Option<&[u8]>,
+        records: &[(i64, Vec<u8>)],
+    ) -> Result<PageData> {
+        let header_offset = cell::header_offset_for_page(page_no);
+        let mut page = vec![0u8; self.page_size as usize];
+        if let Some(prefix) = prefix {
+            page[..header_offset].copy_from_slice(prefix);
+        }
+
+        let mut content_offset = self.usable_size as usize;
+        let mut cell_offsets = Vec::with_capacity(records.len());
+        let mut payload_varint = [0u8; 9];
+        let mut rowid_varint = [0u8; 9];
+
+        for &(rowid, ref payload) in records {
+            let payload_len = write_varint(
+                &mut payload_varint,
+                u64::try_from(payload.len()).map_err(|_| FrankenError::TooBig)?,
+            );
+            let rowid_len =
+                write_varint(&mut rowid_varint, u64::from_ne_bytes(rowid.to_ne_bytes()));
+            let cell_len = payload_len + rowid_len + payload.len();
+            content_offset = content_offset
+                .checked_sub(cell_len)
+                .ok_or(FrankenError::TooBig)?;
+            let cell_offset =
+                u16::try_from(content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "bulk leaf cell offset {} exceeds u16 range on page {}",
+                        content_offset,
+                        page_no.get()
+                    ),
+                })?;
+
+            let mut write_offset = content_offset;
+            page[write_offset..write_offset + payload_len]
+                .copy_from_slice(&payload_varint[..payload_len]);
+            write_offset += payload_len;
+            page[write_offset..write_offset + rowid_len]
+                .copy_from_slice(&rowid_varint[..rowid_len]);
+            write_offset += rowid_len;
+            page[write_offset..write_offset + payload.len()].copy_from_slice(payload);
+            cell_offsets.push(cell_offset);
+        }
+
+        let header = BtreePageHeader {
+            page_type: BtreePageType::LeafTable,
+            first_freeblock: 0,
+            cell_count: u16::try_from(records.len()).map_err(|_| FrankenError::TooBig)?,
+            cell_content_offset: u32::try_from(content_offset).map_err(|_| FrankenError::TooBig)?,
+            fragmented_free_bytes: 0,
+            right_child: None,
+        };
+        header.write(&mut page, header_offset);
+        cell::write_cell_pointers(&mut page, header_offset, &header, &cell_offsets);
+        Ok(PageData::from_vec(page))
+    }
+
+    fn build_bulk_table_interior_page(
+        &self,
+        page_no: PageNumber,
+        prefix: Option<&[u8]>,
+        children: &[BulkTableChild],
+    ) -> Result<PageData> {
+        let header_offset = cell::header_offset_for_page(page_no);
+        let mut page = vec![0u8; self.page_size as usize];
+        if let Some(prefix) = prefix {
+            page[..header_offset].copy_from_slice(prefix);
+        }
+
+        let right_child = children.last().map(|child| child.page_no).ok_or_else(|| {
+            FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "bulk interior page {} cannot be built without children",
+                    page_no.get()
+                ),
+            }
+        })?;
+        let mut content_offset = self.usable_size as usize;
+        let mut cell_offsets = Vec::with_capacity(children.len().saturating_sub(1));
+        let mut rowid_varint = [0u8; 9];
+
+        for child in &children[..children.len() - 1] {
+            let rowid_len = write_varint(
+                &mut rowid_varint,
+                u64::from_ne_bytes(child.max_rowid.to_ne_bytes()),
+            );
+            let cell_len = 4 + rowid_len;
+            content_offset = content_offset
+                .checked_sub(cell_len)
+                .ok_or(FrankenError::TooBig)?;
+            let cell_offset =
+                u16::try_from(content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "bulk interior cell offset {} exceeds u16 range on page {}",
+                        content_offset,
+                        page_no.get()
+                    ),
+                })?;
+            page[content_offset..content_offset + 4]
+                .copy_from_slice(&child.page_no.get().to_be_bytes());
+            page[content_offset + 4..content_offset + cell_len]
+                .copy_from_slice(&rowid_varint[..rowid_len]);
+            cell_offsets.push(cell_offset);
+        }
+
+        let header = BtreePageHeader {
+            page_type: BtreePageType::InteriorTable,
+            first_freeblock: 0,
+            cell_count: u16::try_from(children.len().saturating_sub(1))
+                .map_err(|_| FrankenError::TooBig)?,
+            cell_content_offset: u32::try_from(content_offset).map_err(|_| FrankenError::TooBig)?,
+            fragmented_free_bytes: 0,
+            right_child: Some(right_child),
+        };
+        header.write(&mut page, header_offset);
+        cell::write_cell_pointers(&mut page, header_offset, &header, &cell_offsets);
+        Ok(PageData::from_vec(page))
+    }
+
+    /// Bulk-build an empty table B-tree from strictly increasing rowid records.
+    ///
+    /// This is a narrow Bε-tree-style batching primitive for monotonic append
+    /// runs: all rows are laid out into leaf pages and parent divider pages
+    /// once, avoiding one cursor descent / quick-balance cycle per row. Shapes
+    /// that need overflow pages, duplicate rowids, non-table trees, or a
+    /// non-empty root return `Ok(false)` so callers can replay through the
+    /// normal insertion path.
+    pub fn table_bulk_load_empty_root_sorted_records(
+        &mut self,
+        cx: &Cx,
+        records: &[(i64, Vec<u8>)],
+    ) -> Result<bool> {
+        if !self.is_table || records.is_empty() {
+            return Ok(false);
+        }
+        if records.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Ok(false);
+        }
+
+        let root_data = self.pager.read_page_data(cx, self.root_page)?;
+        let root_header = cell::parse_page_header(root_data.as_bytes(), self.root_page)?;
+        if root_header.page_type != BtreePageType::LeafTable || root_header.cell_count != 0 {
+            return Ok(false);
+        }
+
+        let root_header_offset = cell::header_offset_for_page(self.root_page);
+        let Some(root_leaf_groups) = self.bulk_table_leaf_groups(records, root_header_offset)?
+        else {
+            return Ok(false);
+        };
+        let root_prefix = root_data.as_bytes().get(..root_header_offset);
+        if root_leaf_groups.len() == 1 {
+            let root_page =
+                self.build_bulk_table_leaf_page(self.root_page, root_prefix, records)?;
+            self.pager.write_page_data(cx, self.root_page, root_page)?;
+            self.stack.clear();
+            self.at_eof = true;
+            self.last_insert_rowid = records.last().map(|record| record.0);
+            self.clear_rightmost_leaf_cache();
+            self.clear_seek_cache();
+            self.cell_slot_cache.get_mut().clear();
+            self.last_known_depth = Some(1);
+            self.bump_row_image_epoch();
+            return Ok(true);
+        }
+
+        let Some(leaf_groups) = self.bulk_table_leaf_groups(records, 0)? else {
+            return Ok(false);
+        };
+        let mut current_level = Vec::with_capacity(leaf_groups.len());
+        for group in leaf_groups {
+            let page_no = self.pager.allocate_page(cx)?;
+            let page =
+                self.build_bulk_table_leaf_page(page_no, None, &records[group.start..group.end])?;
+            self.pager.write_page_data(cx, page_no, page)?;
+            current_level.push(BulkTableChild {
+                page_no,
+                max_rowid: records[group.end - 1].0,
+            });
+        }
+
+        let mut depth = 2usize;
+        loop {
+            let root_groups = self
+                .bulk_table_interior_groups(&current_level, root_header_offset)
+                .ok_or(FrankenError::TooBig)?;
+            if root_groups.len() == 1 {
+                let root_page = self.build_bulk_table_interior_page(
+                    self.root_page,
+                    root_prefix,
+                    &current_level,
+                )?;
+                self.pager.write_page_data(cx, self.root_page, root_page)?;
+                self.stack.clear();
+                self.at_eof = true;
+                self.last_insert_rowid = records.last().map(|record| record.0);
+                self.clear_rightmost_leaf_cache();
+                self.clear_seek_cache();
+                self.cell_slot_cache.get_mut().clear();
+                self.last_known_depth = Some(depth);
+                self.bump_row_image_epoch();
+                return Ok(true);
+            }
+
+            let interior_groups = self
+                .bulk_table_interior_groups(&current_level, 0)
+                .ok_or(FrankenError::TooBig)?;
+            let mut next_level = Vec::with_capacity(interior_groups.len());
+            for group in interior_groups {
+                let page_no = self.pager.allocate_page(cx)?;
+                let group_children = &current_level[group.start..group.end];
+                let page = self.build_bulk_table_interior_page(page_no, None, group_children)?;
+                self.pager.write_page_data(cx, page_no, page)?;
+                next_level.push(BulkTableChild {
+                    page_no,
+                    max_rowid: group_children.last().ok_or(FrankenError::TooBig)?.max_rowid,
+                });
+            }
+            current_level = next_level;
+            depth += 1;
+        }
     }
 
     fn refresh_rightmost_leaf_cache_after_insert(&mut self, cx: &Cx, rowid: i64) -> Result<()> {
@@ -15533,6 +15928,53 @@ mod tests {
                 .expect("seek after deep count should succeed")
                 .is_found(),
             "rightmost row must remain reachable after count_all_rows"
+        );
+    }
+
+    #[test]
+    fn test_table_bulk_load_empty_root_sorted_records_builds_reachable_tree() {
+        const USABLE: u32 = 4096;
+        let cx = Cx::new();
+        let root = PageNumber::new(2).unwrap();
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        let records: Vec<(i64, Vec<u8>)> = (1_i64..=10_000_i64)
+            .map(|rowid| {
+                let byte = u8::try_from(rowid % 251).unwrap();
+                (
+                    rowid,
+                    vec![byte; 220 + usize::try_from(rowid % 31).unwrap()],
+                )
+            })
+            .collect();
+
+        assert!(
+            cursor
+                .table_bulk_load_empty_root_sorted_records(&cx, &records)
+                .unwrap(),
+            "bulk load should accept sorted no-overflow records for an empty table"
+        );
+        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 10_000);
+        assert!(
+            measure_tree_depth(&cursor.pager, root, USABLE) >= 3,
+            "test data should force at least one interior page split below the root"
+        );
+
+        assert!(cursor.first(&cx).unwrap());
+        for (expected_rowid, expected_payload) in &records {
+            assert_eq!(cursor.rowid(&cx).unwrap(), *expected_rowid);
+            assert_eq!(cursor.payload(&cx).unwrap(), *expected_payload);
+            if *expected_rowid < 10_000 {
+                assert!(cursor.next(&cx).unwrap());
+            }
+        }
+        assert!(!cursor.next(&cx).unwrap());
+
+        assert!(
+            !cursor
+                .table_bulk_load_empty_root_sorted_records(&cx, &records)
+                .unwrap(),
+            "bulk load must fall back once the root is no longer an empty leaf"
         );
     }
 

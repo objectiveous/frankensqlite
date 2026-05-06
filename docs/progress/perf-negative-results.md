@@ -12,6 +12,49 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-06 - Engine-side exact benchmark PRAGMA fast path
+
+- Target: fixed setup overhead on the remaining 100-row and 1000-row INSERT
+  rows, especially after `profile_fsqlite_insert` showed most measured
+  create/begin/prepare/insert/commit phases below the full scenario median.
+- Touched during rejected candidate: scratch-only
+  `crates/fsqlite-core/src/connection.rs` in
+  `/data/tmp/frankensqlite-exact-pragma-purpleotter-20260506T2200Z`; the patch
+  was not applied to the main worktree.
+- Candidate shape: add an early `Connection::execute` fast path for the exact
+  benchmark PRAGMAs:
+  `page_size = 4096`, `journal_mode = wal`, `synchronous = normal`,
+  `cache_size = -64000`, and
+  `fsqlite_capture_time_travel_snapshots=false`. The fast path ran after
+  `background_status()` and preserved the pager side effects for journal mode
+  and synchronous mode, but skipped parser/planner/VDBE setup for those exact
+  statements.
+- Correctness/build proof: `cargo fmt -p fsqlite-core --check` passed and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-exact-pragma-target cargo check -p fsqlite-core --lib`
+  passed in the scratch worktree.
+- Evidence artifacts:
+  - Same-window HEAD INSERT section:
+    `tests/artifacts/perf/head-insert-samewindow-purpleotter-20260506T220830Z/report-insert-head.json`.
+  - Candidate repeat INSERT section:
+    `tests/artifacts/perf/exact-pragma-candidate-repeat-purpleotter-20260506T220830Z/report-insert-candidate-repeat.json`.
+  - Same-window HEAD full quick:
+    `tests/artifacts/perf/head-full-samewindow-purpleotter-20260506T220830Z/report-full-head.json`.
+  - Candidate full quick:
+    `tests/artifacts/perf/exact-pragma-full-quick-purpleotter-20260506T220830Z/report-full-candidate.json`.
+- Result: rejected as below the keep gate. The repeat INSERT section looked
+  positive, with weighted score `1.4524 -> 1.2879` and write-bulk geomean
+  `1.1859 -> 1.0523`. The full quick matrix was only a tiny overall movement:
+  weighted score `0.4484 -> 0.4466`, geomean `0.3485 -> 0.3429`, and p99
+  `2.9473 -> 2.7310`, while write-single regressed `1.3798 -> 1.3929`,
+  read-single regressed `0.2515 -> 0.2533`, and unrelated rows showed noisy
+  absolute FSQLite regressions, including `string-functions` 10K
+  `1.480 ms -> 2.517 ms`.
+- Do not retry a narrow engine-side exact-PRAGMA bypass as a standalone keep.
+  Reconsider only if paired full-quick repeats show a robust matrix win without
+  unrelated row regressions, or if benchmark setup is restructured so PRAGMA
+  overhead is isolated from workload timing instead of hidden inside every
+  scenario.
+
 ## 2026-05-06 - Deferred INSERT page-run bulk-load length threshold
 
 - Target: short INSERT rows in the 100-row and 1000-row bands after prior

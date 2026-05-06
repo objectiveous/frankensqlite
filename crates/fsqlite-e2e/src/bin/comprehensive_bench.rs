@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::{Arc, Barrier, OnceLock, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 use asupersync::runtime::{BlockingTaskHandle, Runtime, RuntimeBuilder};
@@ -54,6 +54,7 @@ const CI_CATEGORY_GEOMEAN_MAX_REGRESSION_PCT: f64 = 0.10;
 const CI_P90_MAX_REGRESSION_PCT: f64 = 0.15;
 const CONCURRENT_WRITERS_SECTION_TITLE: &str =
     "Concurrent Writers — C SQLite WAL vs FrankenSQLite MVCC";
+const DEFAULT_BENCH_PAGE_SIZE_BYTES: u32 = 4096;
 
 // ─── Record size definitions ───────────────────────────────────────────
 
@@ -401,18 +402,51 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
 
 // ─── PRAGMA helpers ────────────────────────────────────────────────────
 
+fn is_valid_benchmark_page_size(bytes: u32) -> bool {
+    matches!(
+        bytes,
+        512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536
+    )
+}
+
+fn benchmark_page_size_bytes() -> u32 {
+    static PAGE_SIZE_BYTES: OnceLock<u32> = OnceLock::new();
+    *PAGE_SIZE_BYTES.get_or_init(|| {
+        let Ok(raw_page_size) = std::env::var("FSQLITE_BENCH_PAGE_SIZE") else {
+            return DEFAULT_BENCH_PAGE_SIZE_BYTES;
+        };
+        let page_size = raw_page_size
+            .parse::<u32>()
+            .expect("FSQLITE_BENCH_PAGE_SIZE must be an integer byte count");
+        assert!(
+            is_valid_benchmark_page_size(page_size),
+            "FSQLITE_BENCH_PAGE_SIZE must be one of 512, 1024, 2048, 4096, 8192, 16384, 32768, or 65536"
+        );
+        page_size
+    })
+}
+
+fn open_fsqlite_memory_connection_for_benchmark() -> fsqlite::Connection {
+    let page_size = benchmark_page_size_bytes();
+    if page_size == DEFAULT_BENCH_PAGE_SIZE_BYTES {
+        fsqlite::Connection::open(":memory:").unwrap()
+    } else {
+        fsqlite::Connection::open_with_page_size(":memory:", page_size).unwrap()
+    }
+}
+
 fn apply_pragmas_csqlite(conn: &rusqlite::Connection) {
-    conn.execute_batch(
-        "PRAGMA page_size = 4096;\
+    conn.execute_batch(&format!(
+        "PRAGMA page_size = {};\
          PRAGMA journal_mode = WAL;\
          PRAGMA synchronous = NORMAL;\
          PRAGMA cache_size = -64000;",
-    )
+        benchmark_page_size_bytes()
+    ))
     .ok();
 }
 
 const FSQLITE_BENCHMARK_PRAGMAS: &[&str] = &[
-    "PRAGMA page_size = 4096;",
     "PRAGMA journal_mode = WAL;",
     "PRAGMA synchronous = NORMAL;",
     "PRAGMA cache_size = -64000;",
@@ -423,6 +457,7 @@ const FSQLITE_BENCHMARK_PRAGMAS: &[&str] = &[
 ];
 
 fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
+    let _ = conn.execute(format!("PRAGMA page_size = {};", benchmark_page_size_bytes()).as_str());
     for pragma in FSQLITE_BENCHMARK_PRAGMAS {
         let _ = conn.execute(pragma);
     }
@@ -2188,7 +2223,7 @@ fn bench_insert_by_row_count(
         let fsqlite_m = {
             let create_sql = record_size.create_table_sql();
             measure(&format!("fsqlite_{count}"), count, || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                let conn = open_fsqlite_memory_connection_for_benchmark();
                 apply_pragmas_fsqlite(&conn);
                 fs_execute(&conn, create_sql);
                 fs_execute(&conn, "BEGIN");
@@ -2251,7 +2286,7 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
             let fs = {
                 let create_sql = record_size.create_table_sql();
                 measure(&format!("fs_auto_{count}"), count, || {
-                    let conn = fsqlite::Connection::open(":memory:").unwrap();
+                    let conn = open_fsqlite_memory_connection_for_benchmark();
                     apply_pragmas_fsqlite(&conn);
                     fs_execute(&conn, create_sql);
                     let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
@@ -2298,7 +2333,7 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
         let fs = {
             let create_sql = record_size.create_table_sql();
             measure(&format!("fs_batch_{count}"), count, || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                let conn = open_fsqlite_memory_connection_for_benchmark();
                 apply_pragmas_fsqlite(&conn);
                 fs_execute(&conn, create_sql);
                 let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
@@ -2350,7 +2385,7 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
         let fs = {
             let create_sql = record_size.create_table_sql();
             measure(&format!("fs_txn_{count}"), count, || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                let conn = open_fsqlite_memory_connection_for_benchmark();
                 apply_pragmas_fsqlite(&conn);
                 fs_execute(&conn, create_sql);
                 fs_execute(&conn, "BEGIN");
@@ -2409,7 +2444,7 @@ fn bench_insert_by_record_size(report: &mut BenchReport) {
         let fs = {
             let create_sql = record_size.create_table_sql();
             measure(&format!("fs_{}", record_size.name()), count, || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                let conn = open_fsqlite_memory_connection_for_benchmark();
                 apply_pragmas_fsqlite(&conn);
                 fs_execute(&conn, create_sql);
                 fs_execute(&conn, "BEGIN");
@@ -2443,7 +2478,7 @@ fn metric_delta(after: u64, before: u64) -> u64 {
 }
 
 fn profile_fsqlite_insert(record_size: RecordSize, count: usize, label: &str) {
-    let conn = fsqlite::Connection::open(":memory:").unwrap();
+    let conn = open_fsqlite_memory_connection_for_benchmark();
     apply_pragmas_fsqlite(&conn);
 
     let previous_hot_path_profile_enabled = hot_path_profile_enabled();
@@ -3415,7 +3450,7 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
 
         // Set up FrankenSQLite.
         let fs_conn = {
-            let conn = fsqlite::Connection::open(":memory:").unwrap();
+            let conn = open_fsqlite_memory_connection_for_benchmark();
             apply_pragmas_fsqlite(&conn);
             fs_execute(&conn, record_size.create_table_sql());
             fs_execute(&conn, "BEGIN");
@@ -3686,7 +3721,7 @@ fn profile_fsqlite_update_delete_dml(
     mutation_count: usize,
     kind: &str,
 ) {
-    let conn = fsqlite::Connection::open(":memory:").unwrap();
+    let conn = open_fsqlite_memory_connection_for_benchmark();
     apply_pragmas_fsqlite(&conn);
 
     let setup_start = Instant::now();
@@ -3831,7 +3866,7 @@ fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
         let fs = {
             let create_sql = record_size.create_table_sql();
             measure(&format!("fs_update_{count}"), update_count, || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                let conn = open_fsqlite_memory_connection_for_benchmark();
                 apply_pragmas_fsqlite(&conn);
                 fs_execute(&conn, create_sql);
                 fs_execute(&conn, "BEGIN");
@@ -3907,7 +3942,7 @@ fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
         let fs = {
             let create_sql = record_size.create_table_sql();
             measure(&format!("fs_delete_{count}"), delete_count, || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                let conn = open_fsqlite_memory_connection_for_benchmark();
                 apply_pragmas_fsqlite(&conn);
                 fs_execute(&conn, create_sql);
                 fs_execute(&conn, "BEGIN");
@@ -4055,7 +4090,7 @@ fn bench_mixed_oltp(report: &mut BenchReport) {
     eprint!("  Benchmarking mixed OLTP FrankenSQLite... ");
 
     let fs = measure("fs_oltp", ops, || {
-        let conn = fsqlite::Connection::open(":memory:").unwrap();
+        let conn = open_fsqlite_memory_connection_for_benchmark();
         apply_pragmas_fsqlite(&conn);
         fs_execute(
             &conn,
@@ -4172,7 +4207,7 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
         };
 
         let fs_conn = {
-            let conn = fsqlite::Connection::open(":memory:").unwrap();
+            let conn = open_fsqlite_memory_connection_for_benchmark();
             apply_pragmas_fsqlite(&conn);
             fs_execute(
                 &conn,
@@ -4366,7 +4401,7 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
 
         let cat_count = (count / 20).max(5);
         let fs_conn = {
-            let conn = fsqlite::Connection::open(":memory:").unwrap();
+            let conn = open_fsqlite_memory_connection_for_benchmark();
             apply_pragmas_fsqlite(&conn);
             fs_execute(
                 &conn,
@@ -4523,7 +4558,7 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
         })
     };
     let fs = {
-        let fs_conn = fsqlite::Connection::open(":memory:").unwrap();
+        let fs_conn = open_fsqlite_memory_connection_for_benchmark();
         let stmt = fs_conn
             .prepare(
                 "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 1000) SELECT SUM(x) FROM cnt",
@@ -4581,7 +4616,7 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
         };
 
         let fs_conn = {
-            let conn = fsqlite::Connection::open(":memory:").unwrap();
+            let conn = open_fsqlite_memory_connection_for_benchmark();
             apply_pragmas_fsqlite(&conn);
             fs_execute(
                 &conn,

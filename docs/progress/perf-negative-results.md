@@ -12,6 +12,39 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-06 - Direct INSERT text append force-inline annotation
+
+- Target: `comprehensive-bench --quick --filter INSERT` after the clean
+  `d9c098ae` record-band page-run commit still showed
+  `Connection::append_prepared_direct_simple_insert_text` and
+  `Connection::try_serialize_prepared_direct_simple_insert_record` in the
+  insert `perf` top symbols.
+- Candidate shape: add only `#[inline(always)]` to
+  `Connection::append_prepared_direct_simple_insert_text` in
+  `crates/fsqlite-core/src/connection.rs`, aiming to remove a hot helper call
+  under direct INSERT row construction without changing semantics.
+- Evidence artifacts:
+  - Fresh-head baseline build/profile:
+    `/data/tmp/frankensqlite-purpleotter-head-d9c098ae-profile-20260506T1907Z/insert-profile-head.json`
+    and `perf-insert-head-flat.txt`.
+  - Candidate insert slice:
+    `/data/tmp/frankensqlite-purpleotter-head-d9c098ae-profile-20260506T1907Z/insert-profile-inline-append.json`.
+  - Candidate full matrix:
+    `/data/tmp/frankensqlite-purpleotter-head-d9c098ae-profile-20260506T1907Z/full-inline-append.json`.
+  - Restored full matrix after manual revert:
+    `/data/tmp/frankensqlite-purpleotter-head-d9c098ae-profile-20260506T1907Z/full-restored-after-inline-revert.json`.
+- Result: rejected and manually reverted. The insert-only profile run improved
+  some aggregate insert metrics (`score 1.4715 -> 1.3995`, geomean
+  `1.3471x -> 1.3039x`) but worsened the small fixed-cost tail
+  (`tiny_1col` 100 rows `2.8769x -> 2.9647x`). The full quick matrix rejected
+  the candidate: primary score worsened `0.4883 -> 0.4998`, p99 worsened
+  `3.0031x -> 3.2346x`, and the write-single category worsened
+  `1.7295x -> 1.7877x`.
+- Do not retry standalone `#[inline(always)]` annotations on direct INSERT
+  text append/serializer helpers as a perf keep. Reconsider only as part of a
+  broader profile-guided compiler-layout pass that proves the full quick matrix
+  and small fixed-cost rows improve in the same benchmark window.
+
 ## 2026-05-06 - CASS strict-plus-alias failure-vocabulary resweep
 
 Scope: user-requested expansion of this ledger from the last two months of

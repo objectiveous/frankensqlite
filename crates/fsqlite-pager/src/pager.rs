@@ -8148,7 +8148,9 @@ where
             // shared-cache round-trips on the next statement.
             return Ok(cached.clone());
         }
-        let read_start = Instant::now();
+        let trace_read_start =
+            tracing::enabled!(target: "fsqlite.snapshot_publication", tracing::Level::TRACE)
+                .then(Instant::now);
         let mut published_retry_count = 0_usize;
         while self.published.page_plane_visible_commit_seq()
             == self.published_visible_commit_seq.get()
@@ -8166,8 +8168,10 @@ where
                         publication_mode = SNAPSHOT_PUBLICATION_MODE,
                         read_retry_count = self.published.read_retry_count(),
                         page_set_size = snapshot.page_set_size,
-                        elapsed_ns =
-                            u64::try_from(read_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                        elapsed_ns = trace_read_start
+                            .map_or(0, |start| {
+                                u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                            }),
                         "resolved zero-filled page from published metadata"
                     );
                     return Ok(PageData::from_vec(vec![0_u8; self.pool.page_size()]));
@@ -8195,8 +8199,10 @@ where
                         publication_mode = SNAPSHOT_PUBLICATION_MODE,
                         read_retry_count = self.published.read_retry_count(),
                         page_set_size = snapshot.page_set_size,
-                        elapsed_ns =
-                            u64::try_from(read_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                        elapsed_ns = trace_read_start
+                            .map_or(0, |start| {
+                                u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                            }),
                         "served page from published snapshot"
                     );
                     return Ok(page);

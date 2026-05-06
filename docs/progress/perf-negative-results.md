@@ -47,6 +47,44 @@ Each entry should include:
   work and with an interleaved A/B that improves absolute FrankenSQLite medians
   on the current INSERT matrix.
 
+## 2026-05-06 - Broad preserialized direct-INSERT guard relaxation
+
+- Target: direct INSERT row-build/serialization cost after commit `b86786f6`
+  added a preserialized-record lane in
+  `crates/fsqlite-core/src/connection.rs`.
+- Candidate shape: relaxed the committed guard from explicit lazy-MemDB
+  transactions to any `:memory:` direct INSERT where materialized row values
+  appeared unused after B-tree insertion:
+  `!track_memdb_delta || defer_lazy_memdb_materialization`, while still
+  excluding FK checks, `REPLACE`, deferred MemDB upserts, and retained
+  count/sum cache state. Source was reverted after measurement.
+- Evidence artifacts:
+  - Baseline/dirty current run:
+    `tests/artifacts/perf/current-insert-violetlotus-20260506T033241Z/report.json`.
+  - Narrow committed guard run:
+    `tests/artifacts/perf/direct-serialize-violetlotus-20260506T035628Z/report.json`.
+  - Broad guard candidate:
+    `tests/artifacts/perf/direct-serialize-violetlotus-guard2-20260506T040116Z/report.json`.
+- Correctness/build proof before measurement:
+  `cargo fmt --check`,
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-violetlotus-direct-serialize-target cargo check -p fsqlite-core --lib`
+  passed remotely, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-violetlotus-target cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`
+  passed locally for the benchmark binary.
+- Result: rejected. The broad guard did activate (`serialize_ns=0` on the
+  profiled `large_10col` rows), but it did not produce a clean matrix win:
+  average ratio regressed `2.2230x -> 2.2379x`, geomean improved only
+  marginally `2.0911x -> 2.0810x`, p90 regressed `3.9923x -> 4.0412x`,
+  and p99 regressed `4.0194x -> 4.2779x`. Key absolute FrankenSQLite medians
+  were mixed: `large_10col` 1K improved `2.012 ms -> 1.776 ms`, but
+  `large_10col` 10K worsened `38.595 ms -> 38.963 ms`, `small_3col` 100
+  worsened `0.194 ms -> 0.266 ms`, and `medium_6col` 100 worsened
+  `0.275 ms -> 0.368 ms`.
+- Do not retry broadly enabling the preserialized direct-INSERT lane merely
+  because materialized row values are unused. Revisit only with a narrower
+  row-shape/row-count predictor or an interleaved A/B that improves absolute
+  FrankenSQLite medians on the target rows without p90/p99 regressions.
+
 ## 2026-05-06 - CASS strict alias/session-set resweep: broad March bundles are not perf proof
 
 Scope: user-requested CASS expansion of this ledger, restricted to

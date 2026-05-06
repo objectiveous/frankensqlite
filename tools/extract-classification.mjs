@@ -5,17 +5,18 @@
  *
  * Usage:
  *   node tools/extract-classification.mjs \
- *     --html visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html \
- *     --out spec_evolution_classification_v1.json
+ *     --html site/spec-evolution/visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html \
+ *     --out site/spec-evolution/spec_evolution_classification_v1.json
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import vm from "node:vm";
 
 const args = process.argv.slice(2);
 const flags = {
-  html: "visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html",
-  out: "spec_evolution_classification_v1.json",
+  html: "site/spec-evolution/visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html",
+  out: "site/spec-evolution/spec_evolution_classification_v1.json",
 };
 
 for (let i = 0; i < args.length; i++) {
@@ -99,5 +100,6 @@ const out = {
   late,
 };
 
+mkdirSync(dirname(flags.out), { recursive: true });
 writeFileSync(flags.out, JSON.stringify(out, null, 2) + "\n", "utf-8");
 console.log(`[extract] Wrote ${flags.out} (early=${early.length}, middle=${middle.length}, late=${late.length})`);

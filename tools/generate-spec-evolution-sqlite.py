@@ -6,12 +6,12 @@ This moves the heavy data blobs out of the HTML and into a queryable DB, using
 the same "sql.js WASM loads a .sqlite3 file" approach used in /dp/beads_viewer.
 
 Inputs:
-  - spec_evolution_data_v1.json.gz (commits/base_doc/patches)
-  - spec_evolution_classification_v1.json (CLASS_EARLY/MIDDLE/LATE extracted)
+  - site/spec-evolution/spec_evolution_data_v1.json.gz (commits/base_doc/patches)
+  - site/spec-evolution/spec_evolution_classification_v1.json (CLASS_EARLY/MIDDLE/LATE extracted)
 
 Outputs (defaults):
-  - spec_evolution_v1.sqlite3
-  - spec_evolution_v1.sqlite3.config.json  (hash for OPFS caching / cache busting)
+  - site/spec-evolution/spec_evolution_v1.sqlite3
+  - site/spec-evolution/spec_evolution_v1.sqlite3.config.json  (hash for OPFS caching / cache busting)
 """
 
 from __future__ import annotations
@@ -199,10 +199,10 @@ def normalize_classification(classification: dict[str, Any]) -> dict[str, dict[s
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="spec_evolution_data_v1.json.gz")
-    ap.add_argument("--classification", default="spec_evolution_classification_v1.json")
-    ap.add_argument("--out-db", default="spec_evolution_v1.sqlite3")
-    ap.add_argument("--out-config", default="spec_evolution_v1.sqlite3.config.json")
+    ap.add_argument("--dataset", default="site/spec-evolution/spec_evolution_data_v1.json.gz")
+    ap.add_argument("--classification", default="site/spec-evolution/spec_evolution_classification_v1.json")
+    ap.add_argument("--out-db", default="site/spec-evolution/spec_evolution_v1.sqlite3")
+    ap.add_argument("--out-config", default="site/spec-evolution/spec_evolution_v1.sqlite3.config.json")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -250,6 +250,13 @@ def main() -> int:
         return 0
 
     # Create DB file.
+    out_db_dir = os.path.dirname(args.out_db)
+    if out_db_dir:
+        os.makedirs(out_db_dir, exist_ok=True)
+    out_config_dir = os.path.dirname(args.out_config)
+    if out_config_dir:
+        os.makedirs(out_config_dir, exist_ok=True)
+
     conn = sqlite3.connect(args.out_db)
     try:
         conn.execute("PRAGMA journal_mode=OFF;")

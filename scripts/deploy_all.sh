@@ -1,17 +1,16 @@
 #!/bin/bash
-set -e
+set -euo pipefail
+
+SITE_DIR="site/spec-evolution"
+
 echo "Starting deployment sequence..."
-git add .
-git commit -m "feat(viz): full reanimation of specification evolution with nerve-center metrics and immersive theme"
-git push origin main
-git push origin main:master
 mkdir -p dist
-cp visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html dist/index.html
-cp spec_evolution_v1.sqlite3 dist/
-cp spec_evolution_v1.sqlite3.config.json dist/
-cp og-image.png dist/
-cp twitter-image.png dist/
-cp frankensqlite_illustration.webp dist/
-cp frankensqlite_diagram.webp dist/
+cp "$SITE_DIR/visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html" dist/index.html
+cp "$SITE_DIR/spec_evolution_v1.sqlite3" dist/
+cp "$SITE_DIR/spec_evolution_v1.sqlite3.config.json" dist/
+cp "$SITE_DIR/og-image.png" dist/
+cp "$SITE_DIR/twitter-image.png" dist/
+cp "$SITE_DIR/frankensqlite_illustration.webp" dist/
+cp "$SITE_DIR/frankensqlite_diagram.webp" dist/
 npx wrangler pages deploy dist --project-name frankensqlite-spec-evolution --branch main --commit-dirty=true
 echo "Deployment sequence completed."

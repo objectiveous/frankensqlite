@@ -1,8 +1,10 @@
 import re
-import os
+from pathlib import Path
 
-INPUT_FILE = "visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html"
-OUTPUT_FILE = "visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html"
+SITE_DIR = Path("site/spec-evolution")
+HTML_FILE = SITE_DIR / "visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html"
+INPUT_FILE = HTML_FILE
+OUTPUT_FILE = HTML_FILE
 
 def read_file(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -43,8 +45,8 @@ js_content = re.sub(
 
 # 2. bucketToggleItem template
 js_content = js_content.replace(
-    'btn.className =
-          "focus-ring flex items-start gap-3 rounded-2xl border border-slate-900/10 bg-white/70 px-3 py-2 text-left hover:bg-white";',
+    '''btn.className =
+          "focus-ring flex items-start gap-3 rounded-2xl border border-slate-900/10 bg-white/70 px-3 py-2 text-left hover:bg-white";''',
     'btn.className = "tui-btn-toggle flex items-start gap-3 text-left w-full mb-2";'
 )
 js_content = js_content.replace(
@@ -192,7 +194,7 @@ new_html = """<!doctype html>
         <div class="flex gap-2">
             <button id="btnFilters">Filters</button>
             <button id="btnGalaxy">Galaxy Brain</button>
-            <a href="https://github.com/Dicklesworthstone/frankensqlite" target="_blank"><button>GitHub</button></a>
+            <a href="https://github.com/Dicklesworthstone/frankensqlite" target="_blank" rel="noopener noreferrer"><button>GitHub</button></a>
         </div>
     </header>
 

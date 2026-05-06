@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="frankensqlite_illustration.webp" alt="FrankenSQLite — a Frankenstein monster building a database engine at his workbench">
+  <img src="site/spec-evolution/frankensqlite_illustration.webp" alt="FrankenSQLite — a Frankenstein monster building a database engine at his workbench">
 </div>
 
 <h1 align="center">FrankenSQLite</h1>
@@ -97,7 +97,7 @@ Database engines live and die by cache behavior and I/O patterns. All page buffe
 FrankenSQLite is organized as a 27-member Cargo workspace with strict layered dependencies:
 
 <div align="center">
-  <img src="frankensqlite_diagram.webp" alt="FrankenSQLite architecture diagram — 27-member layered workspace" width="512">
+  <img src="site/spec-evolution/frankensqlite_diagram.webp" alt="FrankenSQLite architecture diagram — 27-member layered workspace" width="512">
 </div>
 
 ### Crate Map

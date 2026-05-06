@@ -1,7 +1,10 @@
 import re
+from pathlib import Path
 
-INPUT_FILE = "visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html"
-OUTPUT_FILE = "visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html"
+SITE_DIR = Path("site/spec-evolution")
+HTML_FILE = SITE_DIR / "visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html"
+INPUT_FILE = HTML_FILE
+OUTPUT_FILE = HTML_FILE
 
 def read_file(path):
     with open(path, "r", encoding="utf-8") as f:

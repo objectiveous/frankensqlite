@@ -1,8 +1,11 @@
 
 import re
+from pathlib import Path
 
-INPUT_FILE = "visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html"
-OUTPUT_FILE = "visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html"
+SITE_DIR = Path("site/spec-evolution")
+HTML_FILE = SITE_DIR / "visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html"
+INPUT_FILE = HTML_FILE
+OUTPUT_FILE = HTML_FILE
 
 def read_file(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -326,8 +329,7 @@ js_injections = """
 """
 
 # Inject before init()
-new_html = new_html.replace('init();', js_injections + '
-    init();')
+new_html = new_html.replace('init();', js_injections + '\n    init();')
 
 # 5. Fix loader hide call
 new_html = new_html.replace('document.getElementById("loadingOverlay").classList.add("hidden");', 'hideLoader();')

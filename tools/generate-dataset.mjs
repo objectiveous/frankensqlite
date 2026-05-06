@@ -2,7 +2,7 @@
 /**
  * Dataset generation tool for FrankenSQLite spec evolution visualization (bd-24q.6.3).
  *
- * Produces deterministic gzipped JSON: spec_evolution_data_v1.json.gz
+ * Produces deterministic gzipped JSON: site/spec-evolution/spec_evolution_data_v1.json.gz
  *
  * Features:
  *   - Deterministic output (sorted keys, no gzip timestamp, stable ordering)
@@ -15,7 +15,7 @@
  *
  * Options:
  *   --spec-path PATH   Path to spec file (default: COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md)
- *   --output PATH      Output file (default: spec_evolution_data_v1.json.gz)
+ *   --output PATH      Output file (default: site/spec-evolution/spec_evolution_data_v1.json.gz)
  *   --append           Append new commits to existing dataset
  *   --dry-run          Print stats without writing
  *   --help             Show this help
@@ -34,7 +34,8 @@
 
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import { gzipSync, gunzipSync } from "node:zlib";
 
 const SCHEMA_VERSION = 1;
@@ -43,7 +44,7 @@ const SCHEMA_VERSION = 1;
 const args = process.argv.slice(2);
 const flags = {
   specPath: "COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md",
-  output: "spec_evolution_data_v1.json.gz",
+  output: "site/spec-evolution/spec_evolution_data_v1.json.gz",
   append: false,
   dryRun: false,
   help: false,
@@ -218,6 +219,7 @@ if (flags.dryRun) {
 
 const json = deterministicJson(dataset);
 const gz = deterministicGzip(Buffer.from(json, "utf-8"));
+mkdirSync(dirname(flags.output), { recursive: true });
 writeFileSync(flags.output, gz);
 console.log(`[dataset] Written ${flags.output} (${(gz.length / 1024).toFixed(1)} KB gzipped, ${(json.length / 1024).toFixed(1)} KB raw)`);
 

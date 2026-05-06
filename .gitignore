@@ -51,8 +51,8 @@ fuzz/artifacts/
 
 # Source PNGs (webp versions are committed)
 *.png
-!og-image.png
-!twitter-image.png
+!site/spec-evolution/og-image.png
+!site/spec-evolution/twitter-image.png
 
 # Claude Code / AI agent ephemeral files
 .claude/
@@ -60,8 +60,18 @@ fuzz/artifacts/
 # Local analysis artifacts
 spec_review_findings.md
 #
-# NOTE: `ANALYSIS_OF_SPEC_DOC_DIFFS.md` and `spec_evolution_data_v1.json.gz` are intentionally tracked:
-# they are required inputs for the spec-evolution visualization.
+# Spec-evolution visualization sources are intentionally tracked under
+# site/spec-evolution/. Root copies are generated deployment detritus.
+/ANALYSIS_OF_SPEC_DOC_DIFFS.md
+/frankensqlite_diagram.webp
+/frankensqlite_illustration.webp
+/frankentui.css
+/levenshtein_bytes.wasm
+/spec_evolution_classification_v1.json
+/spec_evolution_data_v1.json.gz
+/spec_evolution_v1.sqlite3
+/spec_evolution_v1.sqlite3.config.json
+/visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html
 
 # Local scratch SQLite DBs (never tracked)
 storage.sqlite3

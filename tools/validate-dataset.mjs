@@ -13,7 +13,7 @@
  *   node tools/validate-dataset.mjs [options]
  *
  * Options:
- *   --input PATH       Dataset file (default: spec_evolution_data_v1.json.gz)
+ *   --input PATH       Dataset file (default: site/spec-evolution/spec_evolution_data_v1.json.gz)
  *   --spec-path PATH   Override spec path (default: read from dataset)
  *   --skip-git         Skip git metadata verification (for CI without full history)
  *   --skip-snapshot    Skip final snapshot verification against git
@@ -28,7 +28,7 @@ import { gunzipSync } from "node:zlib";
 // --- CLI arg parsing ---
 const args = process.argv.slice(2);
 const flags = {
-  input: "spec_evolution_data_v1.json.gz",
+  input: "site/spec-evolution/spec_evolution_data_v1.json.gz",
   specPath: null,
   skipGit: false,
   skipSnapshot: false,
@@ -162,7 +162,7 @@ if (data.schema_version === 1) {
 
 // --- Check 2: Required fields ---
 for (const field of ["base_commit", "base_doc", "commits", "patches", "generated_from", "spec_path", "schema_version"]) {
-  if (data[field] != null) pass(`required field '${field}' present`);
+  if (data[field] !== null && data[field] !== undefined) pass(`required field '${field}' present`);
   else fail(`required field '${field}' missing`);
 }
 

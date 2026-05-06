@@ -6,7 +6,9 @@ set -euo pipefail
 
 CANONICAL_DOMAIN="https://frankensqlite.com"
 MIRROR_DOMAINS=("https://www.frankensqlite.com" "https://frankensqlite-spec-evolution.pages.dev")
+SITE_DIR="site/spec-evolution"
 SQLITE_FILE="spec_evolution_v1.sqlite3"
+SQLITE_PATH="$SITE_DIR/$SQLITE_FILE"
 EXPECTED_DB_URL="$CANONICAL_DOMAIN/$SQLITE_FILE"
 PROJECT_NAME="frankensqlite-spec-evolution"
 DEPLOY_BRANCH="main"
@@ -22,11 +24,11 @@ build_health_payload() {
     local db_hash
 
     generated_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    db_magic=$(head -c 15 "$SQLITE_FILE")
-    db_sha256=$(sha256sum "$SQLITE_FILE" | awk '{print $1}')
-    schema_version=$(jq -r '.schema_version' "${SQLITE_FILE}.config.json")
-    dataset_hash=$(jq -r '.dataset_hash' "${SQLITE_FILE}.config.json")
-    db_hash=$(jq -r '.hash' "${SQLITE_FILE}.config.json")
+    db_magic=$(head -c 15 "$SQLITE_PATH")
+    db_sha256=$(sha256sum "$SQLITE_PATH" | awk '{print $1}')
+    schema_version=$(jq -r '.schema_version' "${SQLITE_PATH}.config.json")
+    dataset_hash=$(jq -r '.dataset_hash' "${SQLITE_PATH}.config.json")
+    db_hash=$(jq -r '.hash' "${SQLITE_PATH}.config.json")
 
     jq -n \
         --arg status "ok" \
@@ -55,14 +57,14 @@ build_health_payload() {
 
 # Ensure dist exists and is populated
 mkdir -p dist
-cp visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html dist/index.html
-cp visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html dist/spec_evolution.html
-cp spec_evolution_v1.sqlite3 dist/
-cp spec_evolution_v1.sqlite3.config.json dist/
-cp og-image.png dist/
-cp twitter-image.png dist/
-cp frankensqlite_illustration.webp dist/
-cp frankensqlite_diagram.webp dist/
+cp "$SITE_DIR/visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html" dist/index.html
+cp "$SITE_DIR/visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html" dist/spec_evolution.html
+cp "$SQLITE_PATH" dist/
+cp "${SQLITE_PATH}.config.json" dist/
+cp "$SITE_DIR/og-image.png" dist/
+cp "$SITE_DIR/twitter-image.png" dist/
+cp "$SITE_DIR/frankensqlite_illustration.webp" dist/
+cp "$SITE_DIR/frankensqlite_diagram.webp" dist/
 cp _headers dist/
 cp _routes.json dist/
 health_payload=$(build_health_payload)

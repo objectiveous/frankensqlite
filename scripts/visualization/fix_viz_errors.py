@@ -1,8 +1,11 @@
 
 import re
+from pathlib import Path
 
-INPUT_FILE = "visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html"
-OUTPUT_FILE = "visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html"
+SITE_DIR = Path("site/spec-evolution")
+HTML_FILE = SITE_DIR / "visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html"
+INPUT_FILE = HTML_FILE
+OUTPUT_FILE = HTML_FILE
 
 # CSS content from the previous turn (FrankenTUI)
 FRANKENTUI_CSS = """
@@ -237,8 +240,7 @@ else:
 
 # 3. Clean up any double-injected scripts from previous turns if they exist
 # (enhance_viz injected before init(), potentially leaving old init calls?)
-# The previous script did `new_html.replace('init();', js_injections + '
-    init();')`
+# The previous script replaced init() with injected JS plus a new init() call.
 # We should ensure we don't have multiple `init()` calls if we run this multiple times.
 # But since we are reading the file fresh, it should be the state *after* enhance_viz.
 

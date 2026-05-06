@@ -41,6 +41,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 #[cfg(target_arch = "x86_64")]
 use std::intrinsics::prefetch_read_data;
+use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// OPT-1: process-wide shared default `CollationRegistry`.
@@ -3787,6 +3788,11 @@ impl<P: PageWriter> BtCursor<P> {
             + payload.len())
     }
 
+    fn repeated_rowid(first_rowid: i64, offset: usize) -> Result<i64> {
+        let delta = i64::try_from(offset).map_err(|_| FrankenError::TooBig)?;
+        first_rowid.checked_add(delta).ok_or(FrankenError::TooBig)
+    }
+
     fn table_interior_cell_len(rowid: i64) -> usize {
         4 + Self::varint_len(u64::from_ne_bytes(rowid.to_ne_bytes()))
     }
@@ -3860,6 +3866,66 @@ impl<P: PageWriter> BtCursor<P> {
             groups.push(BulkTableGroup {
                 start: group_start,
                 end: records.len(),
+            });
+        }
+        Ok(Some(groups))
+    }
+
+    fn bulk_table_leaf_groups_repeated_record(
+        &self,
+        first_rowid: i64,
+        len: usize,
+        payload: &[u8],
+        header_offset: usize,
+    ) -> Result<Option<Vec<BulkTableGroup>>> {
+        let payload_size = u32::try_from(payload.len()).map_err(|_| FrankenError::TooBig)?;
+        if cell::has_overflow(payload_size, self.usable_size, BtreePageType::LeafTable) {
+            return Ok(None);
+        }
+
+        let mut groups = Vec::new();
+        let mut group_start = 0usize;
+        let mut group_cell_count = 0usize;
+        let mut content_offset = self.usable_size as usize;
+
+        for idx in 0..len {
+            let rowid = Self::repeated_rowid(first_rowid, idx)?;
+            let cell_len = Self::table_leaf_cell_len(rowid, payload)?;
+            if group_cell_count > 0
+                && !Self::bulk_page_can_append_cell(
+                    header_offset,
+                    BtreePageType::LeafTable,
+                    group_cell_count,
+                    content_offset,
+                    cell_len,
+                )
+            {
+                groups.push(BulkTableGroup {
+                    start: group_start,
+                    end: idx,
+                });
+                group_start = idx;
+                group_cell_count = 0;
+                content_offset = self.usable_size as usize;
+            }
+
+            if !Self::bulk_page_can_append_cell(
+                header_offset,
+                BtreePageType::LeafTable,
+                group_cell_count,
+                content_offset,
+                cell_len,
+            ) {
+                return Ok(None);
+            }
+            content_offset -= cell_len;
+            group_cell_count += 1;
+        }
+
+        if group_start < len {
+            groups.push(BulkTableGroup {
+                start: group_start,
+                end: len,
             });
         }
         Ok(Some(groups))
@@ -3985,6 +4051,70 @@ impl<P: PageWriter> BtCursor<P> {
             page_type: BtreePageType::LeafTable,
             first_freeblock: 0,
             cell_count: u16::try_from(records.len()).map_err(|_| FrankenError::TooBig)?,
+            cell_content_offset: u32::try_from(content_offset).map_err(|_| FrankenError::TooBig)?,
+            fragmented_free_bytes: 0,
+            right_child: None,
+        };
+        header.write(&mut page, header_offset);
+        cell::write_cell_pointers(&mut page, header_offset, &header, &cell_offsets);
+        Ok(PageData::from_vec(page))
+    }
+
+    fn build_bulk_table_leaf_page_repeated_record(
+        &self,
+        page_no: PageNumber,
+        prefix: Option<&[u8]>,
+        first_rowid: i64,
+        range: Range<usize>,
+        payload: &[u8],
+    ) -> Result<PageData> {
+        let header_offset = cell::header_offset_for_page(page_no);
+        let mut page = vec![0u8; self.page_size as usize];
+        if let Some(prefix) = prefix {
+            page[..header_offset].copy_from_slice(prefix);
+        }
+
+        let mut content_offset = self.usable_size as usize;
+        let mut cell_offsets = Vec::with_capacity(range.len());
+        let mut payload_varint = [0u8; 9];
+        let mut rowid_varint = [0u8; 9];
+        let payload_len = write_varint(
+            &mut payload_varint,
+            u64::try_from(payload.len()).map_err(|_| FrankenError::TooBig)?,
+        );
+
+        for idx in range {
+            let rowid = Self::repeated_rowid(first_rowid, idx)?;
+            let rowid_len =
+                write_varint(&mut rowid_varint, u64::from_ne_bytes(rowid.to_ne_bytes()));
+            let cell_len = payload_len + rowid_len + payload.len();
+            content_offset = content_offset
+                .checked_sub(cell_len)
+                .ok_or(FrankenError::TooBig)?;
+            let cell_offset =
+                u16::try_from(content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "bulk repeated leaf cell offset {} exceeds u16 range on page {}",
+                        content_offset,
+                        page_no.get()
+                    ),
+                })?;
+
+            let mut write_offset = content_offset;
+            page[write_offset..write_offset + payload_len]
+                .copy_from_slice(&payload_varint[..payload_len]);
+            write_offset += payload_len;
+            page[write_offset..write_offset + rowid_len]
+                .copy_from_slice(&rowid_varint[..rowid_len]);
+            write_offset += rowid_len;
+            page[write_offset..write_offset + payload.len()].copy_from_slice(payload);
+            cell_offsets.push(cell_offset);
+        }
+
+        let header = BtreePageHeader {
+            page_type: BtreePageType::LeafTable,
+            first_freeblock: 0,
+            cell_count: u16::try_from(cell_offsets.len()).map_err(|_| FrankenError::TooBig)?,
             cell_content_offset: u32::try_from(content_offset).map_err(|_| FrankenError::TooBig)?,
             fragmented_free_bytes: 0,
             right_child: None,
@@ -4133,6 +4263,124 @@ impl<P: PageWriter> BtCursor<P> {
                 self.stack.clear();
                 self.at_eof = true;
                 self.last_insert_rowid = records.last().map(|record| record.0);
+                self.clear_rightmost_leaf_cache();
+                self.clear_seek_cache();
+                self.cell_slot_cache.get_mut().clear();
+                self.last_known_depth = Some(depth);
+                self.bump_row_image_epoch();
+                return Ok(true);
+            }
+
+            let interior_groups = self
+                .bulk_table_interior_groups(&current_level, 0)
+                .ok_or(FrankenError::TooBig)?;
+            let mut next_level = Vec::with_capacity(interior_groups.len());
+            for group in interior_groups {
+                let page_no = self.pager.allocate_page(cx)?;
+                let group_children = &current_level[group.start..group.end];
+                let page = self.build_bulk_table_interior_page(page_no, None, group_children)?;
+                self.pager.write_page_data(cx, page_no, page)?;
+                next_level.push(BulkTableChild {
+                    page_no,
+                    max_rowid: group_children.last().ok_or(FrankenError::TooBig)?.max_rowid,
+                });
+            }
+            current_level = next_level;
+            depth += 1;
+        }
+    }
+
+    /// Bulk-build an empty table B-tree from a contiguous rowid range where
+    /// every row has the same record payload.
+    ///
+    /// Returns `Ok(false)` when the shape is not a safe empty-root, no-overflow
+    /// table build so the caller can fall back to the generic append path.
+    pub fn table_bulk_load_empty_root_repeated_record_range(
+        &mut self,
+        cx: &Cx,
+        first_rowid: i64,
+        len: usize,
+        record: &[u8],
+    ) -> Result<bool> {
+        if !self.is_table || len == 0 {
+            return Ok(false);
+        }
+
+        let last_rowid = Self::repeated_rowid(first_rowid, len - 1)?;
+        let root_data = self.pager.read_page_data(cx, self.root_page)?;
+        let root_header = cell::parse_page_header(root_data.as_bytes(), self.root_page)?;
+        if root_header.page_type != BtreePageType::LeafTable || root_header.cell_count != 0 {
+            return Ok(false);
+        }
+
+        let root_header_offset = cell::header_offset_for_page(self.root_page);
+        let Some(root_leaf_groups) = self.bulk_table_leaf_groups_repeated_record(
+            first_rowid,
+            len,
+            record,
+            root_header_offset,
+        )?
+        else {
+            return Ok(false);
+        };
+        let root_prefix = root_data.as_bytes().get(..root_header_offset);
+        if root_leaf_groups.len() == 1 {
+            let root_page = self.build_bulk_table_leaf_page_repeated_record(
+                self.root_page,
+                root_prefix,
+                first_rowid,
+                0..len,
+                record,
+            )?;
+            self.pager.write_page_data(cx, self.root_page, root_page)?;
+            self.stack.clear();
+            self.at_eof = true;
+            self.last_insert_rowid = Some(last_rowid);
+            self.clear_rightmost_leaf_cache();
+            self.clear_seek_cache();
+            self.cell_slot_cache.get_mut().clear();
+            self.last_known_depth = Some(1);
+            self.bump_row_image_epoch();
+            return Ok(true);
+        }
+
+        let Some(leaf_groups) =
+            self.bulk_table_leaf_groups_repeated_record(first_rowid, len, record, 0)?
+        else {
+            return Ok(false);
+        };
+        let mut current_level = Vec::with_capacity(leaf_groups.len());
+        for group in leaf_groups {
+            let page_no = self.pager.allocate_page(cx)?;
+            let page = self.build_bulk_table_leaf_page_repeated_record(
+                page_no,
+                None,
+                first_rowid,
+                group.start..group.end,
+                record,
+            )?;
+            self.pager.write_page_data(cx, page_no, page)?;
+            current_level.push(BulkTableChild {
+                page_no,
+                max_rowid: Self::repeated_rowid(first_rowid, group.end - 1)?,
+            });
+        }
+
+        let mut depth = 2usize;
+        loop {
+            let root_groups = self
+                .bulk_table_interior_groups(&current_level, root_header_offset)
+                .ok_or(FrankenError::TooBig)?;
+            if root_groups.len() == 1 {
+                let root_page = self.build_bulk_table_interior_page(
+                    self.root_page,
+                    root_prefix,
+                    &current_level,
+                )?;
+                self.pager.write_page_data(cx, self.root_page, root_page)?;
+                self.stack.clear();
+                self.at_eof = true;
+                self.last_insert_rowid = Some(last_rowid);
                 self.clear_rightmost_leaf_cache();
                 self.clear_seek_cache();
                 self.cell_slot_cache.get_mut().clear();
@@ -16300,6 +16548,45 @@ mod tests {
         assert!(
             !cursor
                 .table_bulk_load_empty_root_sorted_records(&cx, &records)
+                .unwrap(),
+            "bulk load must fall back once the root is no longer an empty leaf"
+        );
+    }
+
+    #[test]
+    fn test_table_bulk_load_empty_root_repeated_record_range_builds_reachable_tree() {
+        const USABLE: u32 = 4096;
+        let cx = Cx::new();
+        let root = PageNumber::new(2).unwrap();
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        let payload = b"\x02\0";
+
+        assert!(
+            cursor
+                .table_bulk_load_empty_root_repeated_record_range(&cx, 7, 10_000, payload)
+                .unwrap(),
+            "bulk load should accept a contiguous repeated-record range"
+        );
+        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 10_000);
+        assert!(
+            measure_tree_depth(&cursor.pager, root, USABLE) >= 2,
+            "test data should force at least one child leaf"
+        );
+
+        assert!(cursor.first(&cx).unwrap());
+        for expected_rowid in 7_i64..10_007_i64 {
+            assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
+            assert_eq!(cursor.payload(&cx).unwrap(), payload);
+            if expected_rowid < 10_006 {
+                assert!(cursor.next(&cx).unwrap());
+            }
+        }
+        assert!(!cursor.next(&cx).unwrap());
+
+        assert!(
+            !cursor
+                .table_bulk_load_empty_root_repeated_record_range(&cx, 1, 1, payload)
                 .unwrap(),
             "bulk load must fall back once the root is no longer an empty leaf"
         );

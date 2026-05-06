@@ -12,6 +12,40 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-06 - Deferred INSERT page-run bulk-load length threshold
+
+- Target: short INSERT rows in the 100-row and 1000-row bands after prior
+  page-run work improved 10K medium/large rows but left small/medium short-run
+  regressions versus C SQLite.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`; source was manually reverted after
+  the correctness gate failed. The peer-owned dirty
+  `crates/fsqlite-btree/src/cursor.rs` file was not edited.
+- Candidate shape: add a
+  `PREPARED_DIRECT_INSERT_PAGE_RUN_BULK_LOAD_MIN_RECORDS = 2048` threshold so
+  deferred page-runs below that length would skip
+  `table_bulk_load_empty_root_sorted_records` and replay through the existing
+  append path, avoiding the borrowed-record vector and bulk-loader setup for
+  short runs. A follow-up repair tried seeding the first non-bulk replay row
+  through `table_insert` before appending the rest.
+- Correctness evidence: `cargo fmt -p fsqlite-core --check` and
+  `git diff --check -- crates/fsqlite-core/src/connection.rs` passed, and
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-bulk-threshold-check2 cargo check -p fsqlite-core --lib`
+  passed. The focused page-run test failed before benchmarking:
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-bulk-threshold-test2 cargo test -p fsqlite-core prepared_direct_insert_page_run -- --nocapture`
+  reported
+  `test_prepared_direct_insert_page_run_flushes_before_read ... FAILED` with
+  `BusySnapshot { conflicting_pages: "page 2184127750 > snapshot db_size 2 (latest: 2)" }`.
+- Result: correctness-abandoned and reverted before any benchmark keep gate.
+  The failure shows the deferred empty-root page-run flush relies on the bulk
+  loader for more than speed: replaying a pending run through the normal append
+  APIs from a fresh cursor can corrupt the transaction write set / page image
+  enough for the read boundary to observe an impossible page number.
+- Do not retry a connection-only "skip bulk load for short pending page-runs"
+  threshold. Reconsider only if the B-tree layer grows a proven safe non-bulk
+  replay primitive for deferred empty-root runs, with focused visibility,
+  savepoint, and rollback tests passing before insert/full-matrix measurement.
+
 ## 2026-05-06 - Connection-only prepared INSERT direct record writer
 
 - Target: prepared direct INSERT small-row and record-size rows after the

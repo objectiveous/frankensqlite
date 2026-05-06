@@ -50,6 +50,38 @@ Each entry should include:
   descent, and only keep it after a same-window INSERT-section and full quick
   matrix improvement.
 
+## 2026-05-06 - Batched FSQLite benchmark PRAGMA setup
+
+- Target: 100-row and 1000-row INSERT rows where the profile showed large fixed
+  setup cost outside the measured create/begin/prepare/insert/commit phase.
+- Touched during rejected candidate:
+  `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`; source was manually
+  reverted after the repeat matrix rejected it.
+- Candidate shape: change `apply_pragmas_fsqlite` to apply the FSQLite benchmark
+  PRAGMAs through one `execute_batch` call, matching the C SQLite harness shape,
+  and skip the SQL `PRAGMA page_size` call when the benchmark page size is the
+  default already selected by `Connection::open(":memory:")`.
+- Correctness/build proof: `cargo fmt -p fsqlite-e2e --check` passed, and
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-pragmas-test cargo test -p fsqlite-e2e --bin comprehensive-bench benchmark_pragmas_disable_time_travel_capture -- --nocapture`
+  passed before measurement.
+- Evidence artifacts:
+  - Baseline:
+    `tests/artifacts/perf/current-full-baseline-crimsongorge-20260506T1911Z/report-full-baseline.json`.
+  - Candidate first run:
+    `tests/artifacts/perf/batched-pragmas-crimsongorge-20260506T2030Z/report-full.json`.
+  - Candidate repeat:
+    `tests/artifacts/perf/batched-pragmas-repeat-crimsongorge-20260506T2032Z/report-full.json`.
+- Result: rejected and reverted. The first quick matrix looked mildly positive
+  (`primary 0.4809 -> 0.4754`, write-bulk geomean `1.4065 -> 1.3738`), but
+  the immediate repeat lost the keep gate: primary score regressed to `0.4846`,
+  write-bulk geomean to `1.4511`, write-single geomean to `1.7286`, and p99 to
+  `3.0923`.
+- Do not retry harness-side PRAGMA batching or default-page-size elision as a
+  standalone perf keep. Reconsider only with a same-window baseline/candidate
+  pair showing repeatable full-quick improvement, or with an engine-level
+  exact-PRAGMA fast path that preserves `execute_pragma` boundary semantics and
+  improves the full matrix.
+
 ## 2026-05-06 - Follow-up strict CASS negative-result sweep
 
 Scope: user-requested follow-up to mine the last two months of CASS history for

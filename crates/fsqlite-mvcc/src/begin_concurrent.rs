@@ -1513,6 +1513,16 @@ pub fn concurrent_page_read_state(
     }
 }
 
+/// Compound status lookup for callers that need write-set visibility without
+/// cloning staged page bytes.
+#[must_use]
+pub fn concurrent_page_read_status(handle: &ConcurrentHandle, page: PageNumber) -> (bool, bool) {
+    match handle.page_state(page) {
+        Some(state) => (state.is_freed, state.staged_data.is_some()),
+        None => (false, false),
+    }
+}
+
 /// Fast predicate used by read callers to skip compound page-state lookups
 /// on read-only transactions (where `page_states` is empty).
 #[must_use]

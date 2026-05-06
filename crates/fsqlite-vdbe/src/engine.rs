@@ -152,8 +152,8 @@ use fsqlite_mvcc::{
     AllocatorKey, CommitIndex, CommitLog, ConcurrentRowIdAllocator, InProcessPageLockTable,
     MvccError, SharedConcurrentHandle, TimeTravelSnapshot, TimeTravelTarget, VersionStore,
     concurrent_clear_page_state, concurrent_free_page, concurrent_has_page_state,
-    concurrent_page_is_synthetic_conflict_only, concurrent_page_read_state, concurrent_page_state,
-    concurrent_prepare_write_page, concurrent_restore_page_state,
+    concurrent_page_is_synthetic_conflict_only, concurrent_page_read_status,
+    concurrent_page_state, concurrent_prepare_write_page, concurrent_restore_page_state,
     concurrent_stage_prepared_write_page, concurrent_track_write_conflict_page,
     create_time_travel_snapshot,
 };
@@ -1905,7 +1905,11 @@ impl SharedTxnPageIo {
         let mut handle = ctx.handle.lock();
         let prior_state = concurrent_page_state(&handle, page_no);
         if let Err(stage_error) =
-            concurrent_stage_prepared_write_page(&mut handle, page_no, page_data_base.clone())
+            concurrent_stage_prepared_write_page(
+                &mut handle,
+                page_no,
+                concurrent_tracking_page_snapshot(&page_data_base),
+            )
         {
             return Err(FrankenError::Internal(format!(
                 "MVCC fast-path staging failed: {stage_error}"
@@ -2078,7 +2082,11 @@ impl SharedTxnPageIo {
         {
             let mut handle = ctx.handle.lock();
             if let Err(stage_error) =
-                concurrent_stage_prepared_write_page(&mut handle, page_no, page_data_base.clone())
+                concurrent_stage_prepared_write_page(
+                    &mut handle,
+                    page_no,
+                    concurrent_tracking_page_snapshot(&page_data_base),
+                )
             {
                 Self::restore_concurrent_page_state(
                     ctx,
@@ -2293,7 +2301,11 @@ impl SharedTxnPageIo {
 
         let stage_result = {
             let mut handle = ctx.handle.lock();
-            concurrent_stage_prepared_write_page(&mut handle, page_no, page_data_base.clone())
+            concurrent_stage_prepared_write_page(
+                &mut handle,
+                page_no,
+                concurrent_tracking_page_snapshot(&page_data_base),
+            )
         };
         if let Err(stage_error) = stage_result {
             let error = FrankenError::Internal(format!("MVCC write staging failed: {stage_error}"));
@@ -2369,6 +2381,14 @@ impl SharedTxnPageIo {
 
 const PAGE_LOCK_WAIT_CANCELLATION_POLL: Duration = Duration::from_millis(5);
 const PAGE_LOCK_WAIT_FULL_CHECKPOINT_POLL: Duration = Duration::from_millis(50);
+
+fn concurrent_tracking_page_snapshot(data: &PageData) -> PageData {
+    if data.is_single_owner_owned() {
+        PageData::from_vec(data.as_bytes().to_vec())
+    } else {
+        data.clone()
+    }
+}
 
 fn normalize_owned_page_data(page_size: usize, data: &[u8]) -> Result<PageData> {
     let metrics_enabled = vdbe_metrics_enabled();
@@ -2683,14 +2703,19 @@ impl PageReader for SharedTxnPageIo {
     fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
         if let Some(ctx) = self.concurrent_context() {
             // Read-own-writes visibility: if this txn already wrote the page,
-            // return that version first and still record the read for SSI.
+            // return the pager transaction's authoritative staged image first
+            // and still record the read for SSI.
             let txn_id = ctx.txn_id;
             let snapshot_high = ctx.snapshot_high.get();
-            let mut handle = ctx.handle.lock();
-            // Read-only transactions never stage page state, so skip the
-            // compound probe entirely on the empty-map fast path.
-            let write_set_page = if concurrent_has_page_state(&handle) {
-                let (is_freed, staged) = concurrent_page_read_state(&handle, page_no);
+            let (handle, has_staged_write) = {
+                let mut handle = ctx.handle.lock();
+                // Read-only transactions never stage page state, so skip the
+                // compound probe entirely on the empty-map fast path.
+                let (is_freed, has_staged_write) = if concurrent_has_page_state(&handle) {
+                    concurrent_page_read_status(&handle, page_no)
+                } else {
+                    (false, false)
+                };
                 if is_freed {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -2700,13 +2725,13 @@ impl PageReader for SharedTxnPageIo {
                         ),
                     });
                 }
-                staged
-            } else {
-                None
+                handle.record_read(page_no);
+                (handle, has_staged_write)
             };
-            handle.record_read(page_no);
+            drop(handle);
 
-            if let Some(page) = write_set_page {
+            if has_staged_write {
+                let page = self.txn.borrow().get_page(cx, page_no)?;
                 tracing::debug!(
                     txn_id,
                     commit_seq = snapshot_high,
@@ -2738,9 +2763,13 @@ impl PageReader for SharedTxnPageIo {
     // default read_page_data wraps in PageData — wasteful 4KB alloc+copy).
     fn read_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
         if let Some(ctx) = self.concurrent_context() {
-            let mut handle = ctx.handle.lock();
-            let write_set_page = if concurrent_has_page_state(&handle) {
-                let (is_freed, staged) = concurrent_page_read_state(&handle, page_no);
+            let has_staged_write = {
+                let mut handle = ctx.handle.lock();
+                let (is_freed, has_staged_write) = if concurrent_has_page_state(&handle) {
+                    concurrent_page_read_status(&handle, page_no)
+                } else {
+                    (false, false)
+                };
                 if is_freed {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -2750,13 +2779,12 @@ impl PageReader for SharedTxnPageIo {
                         ),
                     });
                 }
-                staged
-            } else {
-                None
+                handle.record_read(page_no);
+                has_staged_write
             };
-            handle.record_read(page_no);
-            if let Some(page) = write_set_page {
-                return Ok(page);
+
+            if has_staged_write {
+                return self.txn.borrow().get_page(cx, page_no);
             }
         }
         self.txn.borrow().get_page(cx, page_no)
@@ -2787,6 +2815,26 @@ impl PageWriter for SharedTxnPageIo {
         let page_size = self.txn.borrow().page_size().as_usize();
         let page_data = normalize_page_data_to_size(page_size, data)?;
         self.write_page_internal(cx, page_no, page_data)
+    }
+
+    fn try_mutate_staged_page_data(
+        &mut self,
+        page_no: PageNumber,
+        f: &mut dyn FnMut(&mut PageData),
+    ) -> bool {
+        if let Some(ctx) = self.concurrent_context() {
+            let has_staged_write = {
+                let handle = ctx.handle.lock();
+                let (is_freed, has_staged_write) = concurrent_page_read_status(&handle, page_no);
+                !is_freed && has_staged_write
+            };
+            if !has_staged_write {
+                return false;
+            }
+        }
+        self.txn
+            .borrow_mut()
+            .try_mutate_staged_page_data(page_no, f)
     }
 
     fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
@@ -31873,6 +31921,104 @@ mod tests {
         assert!(
             bytes[expected.len()..].iter().all(|byte| *byte == 0),
             "concurrent owned writes should zero-fill any unwritten tail bytes"
+        );
+    }
+
+    #[test]
+    fn test_shared_txn_page_io_try_mutate_staged_page_data_updates_read_your_writes() {
+        use std::path::PathBuf;
+
+        use fsqlite_pager::{MvccPager as _, SimplePager, TransactionMode};
+        use fsqlite_types::Snapshot;
+        use fsqlite_vfs::MemoryVfs;
+
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/shared_txn_page_io_try_mutate_staged_page_data.db");
+        let cx = Cx::new();
+        let pager = SimplePager::open_with_cx(&cx, vfs, &path, PageSize::MIN).unwrap();
+        let txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+
+        let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
+        let lock_table = Arc::new(InProcessPageLockTable::new());
+        let commit_index = Arc::new(CommitIndex::new());
+        let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
+
+        let (session_id, handle) = {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let session_id = guard
+                .begin_concurrent(snapshot)
+                .expect("session should register");
+            let handle = guard
+                .handle(session_id)
+                .expect("session handle must be present");
+            (session_id, handle)
+        };
+
+        let mut page_io = SharedTxnPageIo::with_concurrent(
+            txn,
+            session_id,
+            handle,
+            Arc::clone(&lock_table),
+            Arc::clone(&commit_index),
+            0,
+        );
+        let page_no = PageNumber::new(2).expect("page number must be non-zero");
+        let mut page = vec![0x11; PageSize::MIN.as_usize()];
+
+        page_io
+            .write_page_data(&cx, page_no, PageData::from_vec(page.clone()))
+            .expect("initial concurrent owned write should succeed");
+
+        let mut missing_page_closure_called = false;
+        assert!(
+            !page_io.try_mutate_staged_page_data(
+                PageNumber::new(3).expect("page number must be non-zero"),
+                &mut |data| {
+                    missing_page_closure_called = true;
+                    data.as_bytes_mut()[0] = 0xEE;
+                },
+            ),
+            "unstaged pages should not report a successful mutation"
+        );
+        assert!(
+            !missing_page_closure_called,
+            "unstaged-page mutation must not invoke the caller closure"
+        );
+
+        assert!(
+            page_io.try_mutate_staged_page_data(page_no, &mut |data| {
+                let bytes = data.as_bytes_mut();
+                bytes[0] = 0xA5;
+                bytes[PageSize::MIN.as_usize() - 1] = 0x5A;
+            }),
+            "staged concurrent pages should support in-place pager mutation"
+        );
+        page[0] = 0xA5;
+        page[PageSize::MIN.as_usize() - 1] = 0x5A;
+
+        let read_back = page_io
+            .read_page_data(&cx, page_no)
+            .expect("read-your-writes should use the mutated pager image");
+        assert_eq!(read_back.as_bytes(), page.as_slice());
+
+        let guard = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let writer = guard
+            .get(session_id)
+            .expect("writer session should remain registered");
+        assert!(
+            writer.write_set().contains_key(&page_no),
+            "in-place mutation must preserve the concurrent write-set surface"
+        );
+        assert!(
+            writer.held_locks().contains(&page_no),
+            "in-place mutation must preserve the page lock"
         );
     }
 

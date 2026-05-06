@@ -12,6 +12,65 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-06 - CASS strict-plus-alias failure-vocabulary resweep
+
+Scope: user-requested expansion of this ledger from the last two months of
+CASS history, restricted to FrankenSQLite sessions and failure terms such as
+`rejected`, `reverted`, `abandoned`, `abandones`, `slower`, `regressed`,
+`didn't help`, `did not help`, `within noise`, `no improvement`,
+`no measurable`, `failed to improve`, `rolled back`, `backed out`,
+`not a keep`, `keep gate`, `not worth keeping`, and `did not move`.
+
+- Search artifact directory:
+  `/data/tmp/frankensqlite-cass-ledger-expanded-20260506T172948Z`.
+- CASS state: `cass 0.4.2`; `cass status` reported a usable but stale lexical
+  index. A capped refresh attempt stayed in `preparing` with no discovered
+  agents, so it was stopped and the stale-but-usable index was used with
+  CASS-native `view` follow-up.
+- Session-set construction:
+  - `/data/projects/frankensqlite` explicit path search returned `51`
+    sessions.
+  - `/dp/frankensqlite` explicit path search returned `26` sessions.
+  - exact `--workspace /data/projects/frankensqlite` returned `0` sessions.
+  - archived Gemini workspace `/home/ubuntu/.gemini/tmp/frankensqlite`
+    returned `97` sessions.
+  - broad `/data/projects` workspace plus `frankensqlite` returned `34`
+    sessions.
+  - combined de-duplicated strict-plus-alias set: `148` sessions.
+- Useful hit totals inside that set included `rejected` (`39`), `reverted`
+  (`29`), `abandoned` (`6`), `slower` (`10`), `didn't help` (`6`),
+  `did not help` (`117`), `regression` (`156`), `rollback` (`138`),
+  `no improvement` (`219`), `did not move` (`126`),
+  `failed to improve` (`31`), `not a keep` (`37`),
+  `not worth keeping` (`38`), and `failed the keep gate` (`18`). The
+  misspelling `abandones`, `matrix rejected`, and `rejected and reverted`
+  returned no useful hits. The huge `do not retry` / `do not revive` counts
+  were self-referential echoes of this ledger and agent summaries, not new
+  evidence.
+- High-signal CASS views inspected:
+  - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-9581ae40.json -n 120 -C 95`
+    and `-n 220 -C 75`
+  - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-854547a1.json -n 35 -C 60`
+  - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-09-1bf54aa9.json -n 230 -C 80`
+  - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-12T00-04-d1f1806b.json -n 260 -C 45`
+  - recent multi-repo commit-manager summaries under
+    `/home/ubuntu/.claude/projects/-data-projects/16128d2b-9c1f-4615-85ec-babcb706a4a8.jsonl`,
+    `/home/ubuntu/.claude/projects/-data-projects/45256a1f-8025-445a-8a4c-4f68bc208028.jsonl`,
+    and
+    `/home/ubuntu/.claude/projects/-data-projects/09c3f0c0-3833-4514-99e0-0a89c5c41440.jsonl`.
+- Result: no new distinct artifact-backed performance reject was found beyond
+  the existing explicit entries below. The pass strengthens the existing
+  guardrail against broad March "optimize everything" bundles that mixed
+  VDBE page-size plumbing, `SmallVec` register/program rewrites, hot register
+  helper changes, B-tree seek tweaks, `SqliteValue` `Arc` conversion, and
+  benchmark fairness edits while showing stale-file confusion, repeated failed
+  replacements, and no same-window matrix proof.
+- Do not revive any broad CASS bundle from these hits. Only retry a surviving
+  idea after isolating one current code path, proving a current profile signal,
+  checking this ledger for that exact family, and running a same-window target
+  row plus full-matrix keep gate. Treat commit-manager hits as pointers to
+  commits or artifacts only, not as performance evidence.
+
 ## 2026-05-06 - Fresh strict CASS failure-vocabulary rerun
 
 Scope: explicit user follow-up to expand this ledger from the last two months

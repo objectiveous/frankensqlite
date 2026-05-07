@@ -12,6 +12,44 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - Lazy fallback page-lock shard allocation
+
+- Target: remaining fresh `:memory:` connection/open fixed cost after profiles
+  showed allocator time under `SharedMvccState::new` and after the accepted
+  lower `LOCK_TABLE_SHARDS` fanout still left eager fallback lock-shard
+  construction in `InProcessPageLockTable::new`.
+- Touched during rejected candidate: `crates/fsqlite-mvcc/src/core_types.rs`;
+  source was reverted before commit.
+- Candidate shape: change `InProcessPageLockTable.shards` from eager
+  `Box<[LockShard; LOCK_TABLE_SHARDS]>` to `OnceLock<Box<[LockShard; ...]>>`,
+  allocate fallback shards only on first page number above
+  `FAST_LOCK_ARRAY_SIZE`, keep fast-array page locks allocation-free, and make
+  count/holder/release paths avoid allocating when the fallback table is absent.
+  Rebuild paths used `OnceLock::take()` to rotate an empty table only when
+  maintenance requested it.
+- Correctness/build proof before measurement:
+  - `cargo fmt -p fsqlite-mvcc --check` passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-lazy-fallback-shards-target cargo test -p fsqlite-mvcc in_process_lock_table -- --nocapture`
+    passed 8 matching lock-table tests, with 1 ignored microbench.
+  - Candidate release-perf build passed with
+    `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-lazy-fallback-shards-target cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete`.
+- Evidence:
+  `tests/artifacts/perf/lazy-fallback-lock-shards-crimsongorge-20260507T0820Z/`
+  compared the candidate against the read-only private page-cache shard
+  candidate baseline in
+  `tests/artifacts/perf/private-page-cache-shards-crimsongorge-20260507T0755Z/candidate-full.json`.
+- Result: rejected. The focused transaction section improved
+  (`1.2336445211 -> 1.0683985850` weighted score), but the full quick matrix
+  failed the project keep gate: primary weighted score regressed
+  (`0.3716428852 -> 0.3828360498`), average ratio regressed
+  (`0.4890234668 -> 0.5240485468`), C-faster rows worsened (`14 -> 17`),
+  `write_bulk` geomean worsened (`0.8545908879 -> 0.9616011325`), and
+  `write_single` geomean worsened (`1.1470306548 -> 1.2589710874`).
+- Do not retry standalone lazy fallback page-lock shard allocation. Reconsider
+  only as part of a broader lock-table redesign that removes the fallback map
+  from open-state entirely and demonstrates a same-window full quick matrix
+  improvement, not just a transaction-section win.
+
 ## 2026-05-07 - Private memory retained-autocommit flush threshold 256 -> 1024
 
 - Target: remaining `INSERTThroughput - Transaction Strategy Comparison

@@ -5533,3 +5533,70 @@ set: sessions found by
   redesigned so write-only batches can prove cache absence without extra borrow
   checks, and require same-window improvement in transaction primary score,
   write-bulk geomean, and write-single geomean before a full quick matrix.
+
+## 2026-05-07 - Staged table-leaf delete mutation before clone fallback
+
+- Target: `comprehensive-bench --quick --filter update` UPDATE/DELETE
+  throughput matrix, focused on direct DELETE rows.
+- Candidate shape: in `crates/fsqlite-btree/src/cursor.rs`, before the
+  existing compact table-leaf delete cloned and rewrote `page_data`, check
+  whether the leaf page is already staged in the pager and mutate that staged
+  page in place, delaying the fallback page clone until after the staged check.
+  Source was reverted after measurement.
+- Correctness/build evidence passed on the candidate:
+  `cargo fmt -p fsqlite-btree`,
+  `cargo test -p fsqlite-btree table_delete -- --nocapture`,
+  `cargo test -p fsqlite-btree cursor_delete -- --nocapture`,
+  `cargo test -p fsqlite-btree insert_delete -- --nocapture`, and a candidate
+  e2e binary built from clean detached worktree
+  `/data/tmp/frankensqlite-btree-delete-staged-20260507T1214Z` because the
+  shared `connection.rs` was dirty during the run.
+- Evidence artifacts:
+  `tests/artifacts/perf/update-delete-profile-crimsongorge-20260507T111220Z/report-update-delete-staged-delete-baseline*.json`,
+  `tests/artifacts/perf/update-delete-profile-crimsongorge-20260507T111220Z/report-update-delete-staged-delete-candidate*.json`,
+  and matching stdout/stderr files. The rejection is also summarized in
+  `tests/artifacts/perf/update-delete-profile-crimsongorge-20260507T111220Z/summary.md`.
+- Result: rejected. Average section geomean ratio worsened from
+  `1.2061965067269436` baseline to `1.2818079817497139` candidate. FSQLite-only
+  median average improved from `1.7101946111111108 ms` to
+  `1.5841585555555557 ms`, but the C-relative matrix worsened on five of six
+  rows on average; only `10000 rows / delete 500 rows` improved
+  (`1.2050318401507203 -> 1.1801234201419353`).
+- Do not retry staged-page table-leaf delete mutation as a standalone
+  optimization. Revisit only as part of a larger retained-cursor or
+  leaf-batched delete kernel that removes per-row root descent and compacts
+  each touched leaf once.
+
+## 2026-05-07 - Connection-only retained fixed REAL UPDATE run
+
+- Target: isolated direct UPDATE/DELETE rowid workloads, especially repeated
+  monotone `UPDATE ... SET value = ? WHERE id = ?` on a fixed-width REAL
+  column where profiles showed remaining per-row cursor/seek work after VDBE
+  dispatch had already been bypassed.
+- Candidate shape: in `crates/fsqlite-core/src/connection.rs`, buffer monotone
+  explicit-transaction direct UPDATEs of one fixed-width REAL column when the
+  exact `MemDatabase` row mirror proves row existence, then flush the buffered
+  run with one retained B-tree cursor at read, commit, savepoint, release, DDL,
+  and table-program boundaries. The source candidate was reverted after the
+  isolated matrix rejected it.
+- Correctness proof passed on the candidate:
+  `env TMPDIR=/data/tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-purpleotter-coretest-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_direct_fixed_real_update_run_flushes_on_read_and_commit -- --nocapture`,
+  plus existing direct UPDATE/DELETE guards:
+  `test_direct_simple_update_single_real_column_patches_payload_without_decode`,
+  `test_direct_simple_update_delete_fast_path_executes_and_is_correct`, and
+  `test_fast_path_update_delete_ddl_invalidation`.
+- Evidence artifacts:
+  `tests/artifacts/perf/retained-direct-real-update-purpleotter-20260507T123741Z/summary.md`
+  and the raw `perf-update-delete` baseline/candidate logs in the same
+  directory. Baseline and candidate worktrees were both built from
+  `5b36871d`, and the candidate carried only the `connection.rs` patch.
+- Result: rejected. Saved isolated timings showed update 100 at
+  `656 ns -> 642 ns`, update 1000 at `869 ns -> 838 ns`, but update 10000
+  regressed `888 ns -> 910 ns`. Untargeted delete rows also moved the wrong
+  way (`1123 ns -> 1247 ns`, `1176 ns -> 1247 ns`,
+  `1254 ns -> 1289 ns`), so the candidate failed the real keep gate despite a
+  focused correctness win.
+- Do not retry connection-only fixed-REAL UPDATE buffering as a standalone
+  optimization. Revisit only if profiling first proves the real workload keeps
+  the exact row mirror hot for long monotone runs and a same-window isolated
+  matrix improves update 1000/10000 without delete regressions.

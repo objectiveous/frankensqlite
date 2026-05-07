@@ -12,6 +12,44 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - Prepared param-one integer/float binary INSERT specialization
+
+- Target: `comprehensive-bench --quick --filter insert`, after the clean current
+  INSERT profile still attributed much of the small/medium row gap to direct
+  prepared INSERT row-building and expression/value ceremony.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs` in
+  scratch worktree
+  `/data/tmp/frankensqlite-paramone-intop-crimsongorge-20260507T2112Z`. The
+  shared checkout was not edited because `connection.rs` was peer-reserved for
+  a separate DML investigation.
+- Candidate shape: add `PreparedDirectSimpleInsertExpr` variants for simple
+  `?1 <op> literal` templates, specializing integer `+`, `-`, `*`, `%` and
+  float `+`, `-`, `*`, `/` so direct INSERT row construction can avoid recursive
+  expression walking and temporary generic value evaluation for benchmark
+  row-template columns.
+- Correctness/build proof before measurement: the scratch candidate passed
+  `cargo test -p fsqlite-core prepared_direct_simple_insert_concat_chain -- --nocapture`;
+  both baseline and candidate release-perf `comprehensive-bench` binaries built
+  locally with isolated `CARGO_TARGET_DIR`s.
+- Evidence artifacts:
+  `tests/artifacts/perf/paramone-intop-crimsongorge-20260507T2112Z/summary.md`,
+  `baseline-insert.json`, `candidate-insert.json`,
+  `baseline-insert-repeat.json`, `candidate-insert-repeat.json`,
+  `candidate-paramone-intop.diff`, `repeat-row-compare.tsv`, and `stdout/`.
+- Result: rejected and not applied. The first paired run moved the focused
+  INSERT primary score `0.8089982083854728 -> 0.7984313729504148` and reduced
+  C-faster rows `7 -> 6`, but p99 worsened
+  `1.2738419349924275 -> 1.405180687400819`. The repeat again moved the
+  primary score slightly `0.7832648833059592 -> 0.7755839688181437`, but
+  average/geomean worsened `0.7872773218359899 / 0.7596132132504774` to
+  `0.8593629832333529 / 0.8243556684656996`, p99 worsened
+  `1.1944813874447535 -> 1.7589035182387223`, and C-faster rows worsened
+  `4 -> 6`.
+- Do not retry single-expression `?1 op literal` direct INSERT specialization
+  as a standalone micro-optimization. Reconsider only as part of a broader
+  prepared row-template VM that precomputes the whole direct INSERT column
+  program and proves same-window INSERT geomean and p99 wins.
+
 ## 2026-05-07 - Direct INSERT page-run admission floor 16 -> 128
 
 - Target: `comprehensive-bench --quick --filter insert`, after the current

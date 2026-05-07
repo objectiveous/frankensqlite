@@ -12,6 +12,40 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - Right-edge byte-slice payload append from current cursor
+
+- Target: transaction-strategy INSERT rows and write-single/write-bulk matrix
+  rows where the current profile showed autocommit staying on
+  `btree_leaf_full_cell_appends` while explicit/batched paths could use the
+  cheaper table-leaf payload append kernel.
+- Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs`; the
+  source was manually removed before this ledger entry was committed.
+- Candidate shape: add a byte-slice variant of the existing right-edge
+  `try_append_table_leaf_payload_in_place_no_overflow` path and route
+  `table_append_after_last_position` through it before falling back to the
+  normal full-cell insert path. This was distinct from the previously rejected
+  writer-callback/direct-record append candidates.
+- Correctness/build proof before measurement:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-table-append-payload-target cargo test -p fsqlite-btree test_table_append_after_last_position_uses_payload_append_when_leaf_has_room -- --nocapture`
+  passed, and the candidate release-perf build succeeded at
+  `/data/tmp/frankensqlite-table-append-payload-candidate-target/release-perf/comprehensive-bench`.
+- Evidence artifacts:
+  `tests/artifacts/perf/table-append-payload-purpleotter-20260507T0900Z/summary.md`,
+  `baseline-insert.json`, `candidate-insert.json`, `candidate-full.json`,
+  `baseline-full-repeat.json`, `candidate-full-repeat.stderr`, and
+  `candidate-full-repeat2.stderr`.
+- Result: rejected/abandoned. The insert section improved primary score
+  `1.187148 -> 1.166217` and geomean `0.945056 -> 0.911234`; the first full
+  quick run also looked promising with primary score `0.380185 -> 0.358372`.
+  The mandatory full-matrix repeat failed twice before producing JSON, both
+  times panicking in the 8-writer concurrent benchmark with
+  `fsqlite COMMIT ... failed: database is busy (snapshot conflict on pages: ) (retry_count=64)`.
+- Do not retry this as a local right-edge byte-slice append patch unless the
+  design includes an explicit concurrent-writer correctness proof, a focused
+  multi-writer stress gate, and a same-window full quick repeat that completes
+  successfully. The first-run score is not a keep signal when repeat matrix
+  completion fails.
+
 ## 2026-05-07 - Private memory page-cache fallback shard fanout
 
 - Target: remaining small private `:memory:` setup cost in UPDATE/DELETE and

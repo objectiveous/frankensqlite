@@ -640,7 +640,7 @@ mod tests {
         fn new(symbols: Vec<Symbol>) -> Self {
             let q = symbols
                 .into_iter()
-                .map(|symbol| AuthenticatedSymbol::new_verified(symbol, AuthenticationTag::zero()))
+                .map(|symbol| AuthenticatedSymbol::from_parts(symbol, AuthenticationTag::zero()))
                 .collect();
             Self { q }
         }
@@ -1645,7 +1645,7 @@ mod tests {
         );
 
         let repair_esi = u32::try_from(k).expect("k fits u32");
-        let (columns, coefficients) = decoder.repair_equation(repair_esi);
+        let (columns, coefficients) = decoder.repair_equation_rfc6330(repair_esi);
         let repair_data = encoder.repair_symbol(repair_esi);
         received.push(ReceivedSymbol::repair(
             repair_esi,

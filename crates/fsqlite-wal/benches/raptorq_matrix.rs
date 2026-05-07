@@ -225,7 +225,7 @@ fn make_decode_fixture(case: MatrixCase) -> DecodeFixture {
 
         while offset < max_repair_count {
             let esi = u32::try_from(case.k_source + offset).expect("repair ESI fits in u32");
-            let (columns, coefficients) = decoder.repair_equation(esi);
+            let (columns, coefficients) = decoder.repair_equation_rfc6330(esi);
             let repair_data = encoder.repair_symbol(esi);
             received_symbols.push(ReceivedSymbol::repair(
                 esi,

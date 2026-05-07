@@ -742,6 +742,19 @@ pub fn attempt_page_repair(
     let decoder = asupersync::raptorq::decoder::InactivationDecoder::new(k_usize, page_size, seed);
 
     let mut received = decoder.constraint_symbols();
+    let repair_padding_delta = {
+        let params = decoder.params();
+        params
+            .k_prime
+            .checked_sub(params.k)
+            .and_then(|delta| u32::try_from(delta).ok())
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "page {target_pgno}: invalid RaptorQ padding domain: K={} K'={}",
+                    params.k, params.k_prime
+                ),
+            })?
+    };
 
     for (esi, data) in &available {
         if (*esi as usize) < k_usize {
@@ -754,7 +767,13 @@ pub fn attempt_page_repair(
                 data: data.clone(),
             });
         } else {
-            let (cols, coefs) = decoder.repair_equation(*esi);
+            esi.checked_add(repair_padding_delta)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "page {target_pgno}: invalid RaptorQ repair ESI {esi}: overflow"
+                    ),
+                })?;
+            let (cols, coefs) = decoder.repair_equation_rfc6330(*esi);
             received.push(asupersync::raptorq::decoder::ReceivedSymbol::repair(
                 *esi,
                 cols,

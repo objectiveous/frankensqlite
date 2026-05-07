@@ -927,7 +927,7 @@ mod tests {
         fn new(symbols: Vec<Symbol>) -> Self {
             let symbols = symbols
                 .into_iter()
-                .map(|symbol| AuthenticatedSymbol::new_verified(symbol, AuthenticationTag::zero()))
+                .map(|symbol| AuthenticatedSymbol::from_parts(symbol, AuthenticationTag::zero()))
                 .collect();
             Self { symbols }
         }

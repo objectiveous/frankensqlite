@@ -274,7 +274,7 @@ fn test_bd_1eog_decode_with_loss_succeeds() {
     let repair_budget = dropped.len() + decoder.params().s + decoder.params().h + 8;
     for offset in 0..repair_budget {
         let esi = u32::try_from(k + offset).expect("repair ESI fits u32");
-        let (columns, coefficients) = decoder.repair_equation(esi);
+        let (columns, coefficients) = decoder.repair_equation_rfc6330(esi);
         let repair_data = encoder.repair_symbol(esi);
         received.push(ReceivedSymbol::repair(
             esi,

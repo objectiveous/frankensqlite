@@ -1157,7 +1157,7 @@ mod tests {
     fn packet_symbol(esi: u32, wire_bytes: Vec<u8>) -> AuthenticatedSymbol {
         let symbol_id = SymbolId::new_for_test(0xBEEF, 0, esi);
         let symbol = Symbol::new(symbol_id, wire_bytes, SymbolKind::Source);
-        AuthenticatedSymbol::new_verified(symbol, AuthenticationTag::zero())
+        AuthenticatedSymbol::from_parts(symbol, AuthenticationTag::zero())
     }
 
     fn transmit_packets_simnetwork(

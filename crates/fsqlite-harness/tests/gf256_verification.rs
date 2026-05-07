@@ -374,7 +374,7 @@ impl VecStream {
         let q = symbols
             .into_iter()
             .map(|s| {
-                asupersync::security::authenticated::AuthenticatedSymbol::new_verified(
+                asupersync::security::authenticated::AuthenticatedSymbol::from_parts(
                     s,
                     asupersync::security::AuthenticationTag::zero(),
                 )

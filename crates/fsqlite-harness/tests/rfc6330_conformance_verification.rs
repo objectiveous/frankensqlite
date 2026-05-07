@@ -191,7 +191,7 @@ fn build_full_decode_input(
     #[allow(clippy::cast_possible_truncation)]
     let l_u32 = params.l as u32;
     for esi in k_u32..l_u32 {
-        let (cols, coeffs) = decoder.repair_equation(esi);
+        let (cols, coeffs) = decoder.repair_equation_rfc6330(esi);
         let repair_data = encoder.repair_symbol(esi);
         received.push(ReceivedSymbol::repair(esi, cols, coeffs, repair_data));
     }
@@ -244,7 +244,7 @@ fn build_decode_with_erasures(
     let repair_count = drop_indices.len() + params.s + params.h;
     #[allow(clippy::cast_possible_truncation)]
     for esi in k_u32..k_u32 + repair_count as u32 {
-        let (cols, coeffs) = decoder.repair_equation(esi);
+        let (cols, coeffs) = decoder.repair_equation_rfc6330(esi);
         let repair_data = encoder.repair_symbol(esi);
         received.push(ReceivedSymbol::repair(esi, cols, coeffs, repair_data));
     }

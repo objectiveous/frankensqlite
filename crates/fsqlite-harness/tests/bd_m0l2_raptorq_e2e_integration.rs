@@ -87,7 +87,7 @@ impl VecStream {
         let q = symbols
             .into_iter()
             .map(|s| {
-                asupersync::security::authenticated::AuthenticatedSymbol::new_verified(
+                asupersync::security::authenticated::AuthenticatedSymbol::from_parts(
                     s,
                     asupersync::security::AuthenticationTag::zero(),
                 )
@@ -458,7 +458,7 @@ fn test_e2e_raptorq_decoder_repair_symbol_path() {
     }));
     received.extend(
         (k as u32..(decoder.params().l as u32 + k as u32 / 2)).map(|esi| {
-            let (columns, coefficients) = decoder.repair_equation(esi);
+            let (columns, coefficients) = decoder.repair_equation_rfc6330(esi);
             let repair_data = encoder.repair_symbol(esi);
             ReceivedSymbol::repair(esi, columns, coefficients, repair_data)
         }),

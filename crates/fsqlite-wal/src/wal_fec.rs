@@ -2025,6 +2025,19 @@ pub fn wal_fec_raptorq_decode(
 
     // Start with constraint symbols (LDPC + HDPC with zero data).
     let mut received = decoder.constraint_symbols();
+    let repair_padding_delta = {
+        let params = decoder.params();
+        params
+            .k_prime
+            .checked_sub(params.k)
+            .and_then(|delta| u32::try_from(delta).ok())
+            .ok_or_else(|| FrankenError::WalCorrupt {
+                detail: format!(
+                    "invalid RaptorQ padding domain: K={} K'={}",
+                    params.k, params.k_prime
+                ),
+            })?
+    };
 
     // Convert caller-provided (esi, data) pairs into ReceivedSymbol entries.
     for &(esi, ref data) in symbols {
@@ -2039,7 +2052,11 @@ pub fn wal_fec_raptorq_decode(
                 data: data.clone(),
             });
         } else {
-            let (cols, coefs) = decoder.repair_equation(esi);
+            esi.checked_add(repair_padding_delta)
+                .ok_or_else(|| FrankenError::WalCorrupt {
+                    detail: format!("invalid RaptorQ repair ESI {esi}: overflow"),
+                })?;
+            let (cols, coefs) = decoder.repair_equation_rfc6330(esi);
             received.push(asupersync::raptorq::decoder::ReceivedSymbol::repair(
                 esi,
                 cols,

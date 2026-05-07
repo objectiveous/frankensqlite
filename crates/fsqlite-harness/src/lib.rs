@@ -654,7 +654,7 @@ mod gf256_verification {
 
         // Add enough repair symbols to reach L total.
         for esi in k_u32..l_u32 {
-            let (cols, coefs) = decoder.repair_equation(esi);
+            let (cols, coefs) = decoder.repair_equation_rfc6330(esi);
             assert_eq!(
                 cols.len(),
                 coefs.len(),

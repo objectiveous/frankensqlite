@@ -78,9 +78,10 @@ Its loss is not explicit BEGIN/COMMIT time (`begin_us=42.7`, `commit_us=174.2`);
 it is the direct INSERT body after the first empty-root batch stops using the
 single-transaction bulk/page-run shape.
 
-This points to a future non-empty-root bulk append/run builder or a connection
-row-build layout reuse change. The negative ledger already rejects
-connection-only page-run threshold changes and retained-autocommit page-run
-widening, so the next candidate should not be another threshold toggle. It
-needs to either remove the duplicate prepared row layout pass or batch non-empty
-right-edge appends with a correctness proof before matrix measurement.
+This points to a future non-empty-root bulk append/run builder. The negative
+ledger already rejects connection-only page-run threshold changes,
+retained-autocommit page-run widening, and standalone direct-record layout
+reuse, so the next candidate should not be another threshold toggle or isolated
+row-build reshuffle. It needs to batch non-empty right-edge appends, or fuse row
+layout into such a page builder, with a correctness proof before matrix
+measurement.

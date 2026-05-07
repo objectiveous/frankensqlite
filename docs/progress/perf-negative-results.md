@@ -12,6 +12,30 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - Retained autocommit direct INSERT page-run widening
+
+- Target: remaining `:memory:` autocommit INSERT transaction-strategy gap where
+  profiles showed repeated cursor setup and full-cell assembly in prepared
+  direct INSERT.
+- Touched during abandoned candidate: `crates/fsqlite-core/src/connection.rs`
+  in scratch worktree
+  `/data/tmp/frankensqlite-retained-pagerun-crimsongorge-20260507T0904Z`;
+  source was not applied to the shared checkout.
+- Candidate shape: widen direct page-run buffering eligibility to retained
+  autocommit prepared inserts and add a flush bridge so pending runs would be
+  applied before retained autocommit reads.
+- Correctness result: abandoned before measurement. The focused test
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-retained-pagerun-crimsongorge-target cargo test -p fsqlite-core test_prepared_direct_insert_retained_autocommit_page_run_flushes_before_read -- --nocapture`
+  failed because no pending page run materialized.
+- Root cause: retained autocommit prepared INSERT already uses the append-hint
+  path after the first row, while page-run buffering requires
+  `prepared_append_hint.is_none()`. Trying to make page-run cross retained
+  autocommit was the wrong seam for this workload.
+- Do not retry retained-autocommit page-run widening as a standalone
+  optimization. Reconsider only if profiles show append hints cannot apply for
+  a specific prepared INSERT shape and a correctness proof shows the page-run
+  flush boundary is read-your-own-write safe.
+
 ## 2026-05-07 - Right-edge byte-slice payload append from current cursor
 
 - Target: transaction-strategy INSERT rows and write-single/write-bulk matrix

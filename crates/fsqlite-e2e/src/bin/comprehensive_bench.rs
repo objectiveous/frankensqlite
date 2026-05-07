@@ -2258,6 +2258,7 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
     );
 
     let record_size = RecordSize::Small;
+    let profile_insert_enabled = bench_env_flag("FSQLITE_BENCH_PROFILE_INSERT");
 
     for &count in row_counts {
         // Skip autocommit for large counts (too slow).
@@ -2302,6 +2303,14 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
                 format_duration(cs.median()),
                 format_duration(fs.median())
             );
+            if profile_insert_enabled {
+                profile_fsqlite_insert_with_strategy(
+                    record_size,
+                    count,
+                    "txn_autocommit",
+                    InsertProfileStrategy::Autocommit,
+                );
+            }
             section.add_row(&format!("{count} rows / autocommit"), Some(cs), Some(fs));
         }
 
@@ -2356,6 +2365,14 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
             format_duration(cs.median()),
             format_duration(fs.median())
         );
+        if profile_insert_enabled {
+            profile_fsqlite_insert_with_strategy(
+                record_size,
+                count,
+                "txn_batched",
+                InsertProfileStrategy::Batched { batch_size },
+            );
+        }
         section.add_row(
             &format!("{count} rows / batched ({batch_size}/txn)"),
             Some(cs),
@@ -2403,6 +2420,14 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
             format_duration(cs.median()),
             format_duration(fs.median())
         );
+        if profile_insert_enabled {
+            profile_fsqlite_insert_with_strategy(
+                record_size,
+                count,
+                "txn_single",
+                InsertProfileStrategy::SingleTxn,
+            );
+        }
         section.add_row(&format!("{count} rows / single txn"), Some(cs), Some(fs));
     }
 }
@@ -2477,7 +2502,28 @@ fn metric_delta(after: u64, before: u64) -> u64 {
     after.saturating_sub(before)
 }
 
+#[derive(Clone, Copy)]
+enum InsertProfileStrategy {
+    Autocommit,
+    Batched { batch_size: usize },
+    SingleTxn,
+}
+
 fn profile_fsqlite_insert(record_size: RecordSize, count: usize, label: &str) {
+    profile_fsqlite_insert_with_strategy(
+        record_size,
+        count,
+        label,
+        InsertProfileStrategy::SingleTxn,
+    );
+}
+
+fn profile_fsqlite_insert_with_strategy(
+    record_size: RecordSize,
+    count: usize,
+    label: &str,
+    strategy: InsertProfileStrategy,
+) {
     let conn = open_fsqlite_memory_connection_for_benchmark();
     apply_pragmas_fsqlite(&conn);
 
@@ -2492,24 +2538,56 @@ fn profile_fsqlite_insert(record_size: RecordSize, count: usize, label: &str) {
     reset_hot_path_profile();
     let wal_before = fsqlite_wal::wal_telemetry_snapshot();
 
-    let begin_start = Instant::now();
-    fs_execute(&conn, "BEGIN");
-    let begin_us = begin_start.elapsed().as_secs_f64() * 1_000_000.0;
+    let mut begin_us = 0.0;
+    if matches!(strategy, InsertProfileStrategy::SingleTxn) {
+        let begin_start = Instant::now();
+        fs_execute(&conn, "BEGIN");
+        begin_us = begin_start.elapsed().as_secs_f64() * 1_000_000.0;
+    }
 
     let prepare_start = Instant::now();
     let statement = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
     let prepare_us = prepare_start.elapsed().as_secs_f64() * 1_000_000.0;
 
-    let insert_start = Instant::now();
+    let mut insert_us = 0.0;
+    let mut commit_us = 0.0;
     #[allow(clippy::cast_possible_wrap)]
-    for i in 0..count as i64 {
-        fs_stmt_execute_with_params(&statement, &[fsqlite::SqliteValue::Integer(i)]);
-    }
-    let insert_us = insert_start.elapsed().as_secs_f64() * 1_000_000.0;
+    match strategy {
+        InsertProfileStrategy::Autocommit | InsertProfileStrategy::SingleTxn => {
+            let insert_start = Instant::now();
+            for i in 0..count as i64 {
+                fs_stmt_execute_with_params(&statement, &[fsqlite::SqliteValue::Integer(i)]);
+            }
+            insert_us = insert_start.elapsed().as_secs_f64() * 1_000_000.0;
+        }
+        InsertProfileStrategy::Batched { batch_size } => {
+            let batch_size = batch_size.max(1);
+            let num_batches = count.div_ceil(batch_size);
+            for batch in 0..num_batches {
+                let begin_start = Instant::now();
+                fs_execute(&conn, "BEGIN");
+                begin_us += begin_start.elapsed().as_secs_f64() * 1_000_000.0;
 
-    let commit_start = Instant::now();
-    fs_execute(&conn, "COMMIT");
-    let commit_us = commit_start.elapsed().as_secs_f64() * 1_000_000.0;
+                let start = (batch * batch_size) as i64;
+                let end = ((batch + 1) * batch_size).min(count) as i64;
+                let insert_start = Instant::now();
+                for i in start..end {
+                    fs_stmt_execute_with_params(&statement, &[fsqlite::SqliteValue::Integer(i)]);
+                }
+                insert_us += insert_start.elapsed().as_secs_f64() * 1_000_000.0;
+
+                let commit_start = Instant::now();
+                fs_execute(&conn, "COMMIT");
+                commit_us += commit_start.elapsed().as_secs_f64() * 1_000_000.0;
+            }
+        }
+    }
+
+    if matches!(strategy, InsertProfileStrategy::SingleTxn) {
+        let commit_start = Instant::now();
+        fs_execute(&conn, "COMMIT");
+        commit_us = commit_start.elapsed().as_secs_f64() * 1_000_000.0;
+    }
 
     let wal_after = fsqlite_wal::wal_telemetry_snapshot();
     let wal_frames = metric_delta(

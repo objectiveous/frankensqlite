@@ -12,6 +12,33 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - CommitIndex lazy-chunk get-first subvariant
+
+- Target: `CommitIndex` lazy fast-array chunks after the broader lazy-chunk
+  candidate improved `SharedMvccState::new` fixed costs in the full quick
+  matrix.
+- Touched during rejected subvariant: `crates/fsqlite-mvcc/src/core_types.rs`;
+  the subvariant was reverted before commit.
+- Candidate shape: change `CommitIndex::fast_slot` to call `OnceLock::get()`
+  before falling back to `get_or_init()`, trying to trim steady-state
+  `get_or_init` overhead after a chunk had already been allocated.
+- Correctness proof before measurement:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-lazycommit-target cargo test -p fsqlite-mvcc commit_index -- --nocapture`
+  passed.
+- Evidence artifacts:
+  - Better lazy-chunk baseline:
+    `tests/artifacts/perf/lazy-commit-index-chunks-crimsongorge-20260507T0506Z/report-full.json`.
+  - Rejected get-first subvariant:
+    `tests/artifacts/perf/lazy-commit-index-chunks-fastget-crimsongorge-20260507T0516Z/report-full.json`.
+- Result: rejected. The full quick matrix moved the primary score in the wrong
+  direction (`0.3781791993813428 -> 0.39347654243834473`) and worsened
+  C-faster rows (`15 -> 19`). The `write_single` geomean regressed
+  `1.1537259815867404 -> 1.2854579276323546`, with 100-row update/delete back
+  above `1.59x`.
+- Do not retry this standalone `get()`-first `OnceLock` subvariant. Reconsider
+  only as part of a larger measured commit-index batch writer that reduces
+  per-page chunk lookup work without hurting the full quick matrix.
+
 ## 2026-05-06 - Single-freeblock compact table-leaf DELETE
 
 - Target: `UPDATE/DELETEThroughput`, especially small direct DELETE rows where

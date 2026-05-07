@@ -12,6 +12,42 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - SharedTxnPageIo borrowed concurrent-context clean retry
+
+- Target: `UPDATE/DELETEThroughput`, after fresh isolated `perf record`
+  samples for direct-simple DML showed repeated page I/O through
+  `SharedTxnPageIo::{read_page_data,write_page_internal}` and per-access
+  `ConcurrentContext` cloning on top of the newer direct-INSERT-layout
+  baseline. This was a clean retry of the earlier
+  `SharedTxnPageIo borrowed concurrent context` rejection because the current
+  profile again put the same mechanism near the top of the direct-DML kernel.
+- Touched during rejected candidate: `crates/fsqlite-vdbe/src/engine.rs`; the
+  source was manually restored after the focused and full matrix gates rejected
+  the change.
+- Candidate shape: borrow `SharedTxnPageIo.concurrent` during hot page-reader
+  and page-writer operations instead of cloning the `ConcurrentContext` and its
+  shared handles for every page read, page write, dirty check, and witness
+  record. A second variant extended the same borrow-only shape to page
+  allocation/free and write-witness hooks.
+- Evidence artifacts:
+  `tests/artifacts/perf/update-delete-kernel-crimsongorge-20260507T2010Z/summary.md`,
+  `baseline-update.json`, `candidate-update.json`, `candidate2-update.json`,
+  `candidate-full-quick*.json`, `candidate2-full-quick.json`, isolated
+  `perf-update-delete` stdout/stderr, and `perf-*-report.txt`.
+- Result: rejected and reverted. The first narrow variant improved the focused
+  UPDATE/DELETE section score `1.1138800909357498 -> 1.0819806080388363` and
+  improved isolated `10k` mutation from about `987/1384 ns` per UPDATE/DELETE
+  row to `902/1322 ns`, but its first full quick run was effectively flat to
+  slightly worse than the current keep artifact (`0.3445386401431955 ->
+  0.3447992353725705`) and the repeat was worse (`0.3526452109208745`). The
+  expanded variant regressed the focused section to `1.1803042031243598` and
+  the full quick score to `0.3548895417230123`, so the matrix keep gate failed.
+- Do not retry a standalone `ConcurrentContext` borrow-vs-clone cleanup in
+  `SharedTxnPageIo`; this now has two rejected baselines. Reconsider only as
+  part of a larger direct-DML batching design that amortizes page I/O setup
+  across many row mutations and proves a full quick matrix improvement, not
+  only an isolated mutation micro-win.
+
 ## 2026-05-07 - Lazy fallback page-lock shard allocation clean retry
 
 - Target: `UPDATE/DELETEThroughput`, after a clean retry of a prior MVCC

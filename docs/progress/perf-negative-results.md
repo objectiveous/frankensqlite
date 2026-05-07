@@ -5219,3 +5219,38 @@ set: sessions found by
   that removes per-row quick-balance, page-image churn, and row-template
   construction together, then wins both absolute `large_10col` medians and the
   same-window INSERT weighted score.
+
+## 2026-05-07 - Retained autocommit repeated dirty-table mark fast path
+
+- Target: `INSERTThroughput — Transaction Strategy Comparison (small_3col)`,
+  especially autocommit write-single rows where profiles showed repeated direct
+  INSERT work under retained autocommit.
+- Candidate shape: in `crates/fsqlite-core/src/connection.rs`, add an early
+  return to `Connection::retained_autocommit_mark_dirty` when the table name is
+  already lowercase, the retained count/sum cache and indexed-equality cache are
+  absent, no preserve-next-write flag is set, and the table is already in the
+  retained dirty set. A focused safety test proved the fast path must stay below
+  cache invalidation: if the indexed-equality cache is populated, a repeated
+  dirty mark still clears it; mixed-case names still canonicalize through the
+  existing path.
+- Correctness proof passed on the candidate:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-dirty-mark-local-target cargo test -p fsqlite-core test_retained_autocommit_dirty_mark_repeated_table_still_clears_overlay_cache -- --nocapture`.
+  Source was reverted after the current-HEAD matrix rejected it.
+- Evidence artifacts:
+  `tests/artifacts/perf/insert-txn-perf-purpleotter-20260507T0816Z/current0f6-baseline-dirtymark-transaction.json`,
+  `tests/artifacts/perf/insert-txn-perf-purpleotter-20260507T0816Z/current0f6-candidate-dirtymark-transaction.json`,
+  plus stdout/stderr logs in the same directory. The current source baseline and
+  candidate worktrees were both built from `0f6a2fd6`, with the candidate
+  carrying only this `connection.rs` patch.
+- Result: rejected. On the current `0f6a2fd6` transaction section, the primary
+  weighted score regressed `1.1329 -> 1.1551`, geomean regressed
+  `1.0102 -> 1.0731`, and write-bulk geomean regressed `0.9216 -> 1.0117`.
+  Some target autocommit medians improved (`1000` rows
+  `1.136870 ms -> 1.100120 ms`, `10000` rows
+  `11.397552 ms -> 10.866708 ms`), but batched/single transaction rows
+  regressed enough to fail the section keep gate.
+- Do not retry repeated dirty-table mark elision as a standalone retained
+  autocommit optimization. Revisit only if the dirty/invalidation state is
+  redesigned so write-only batches can prove cache absence without extra borrow
+  checks, and require same-window improvement in transaction primary score,
+  write-bulk geomean, and write-single geomean before a full quick matrix.

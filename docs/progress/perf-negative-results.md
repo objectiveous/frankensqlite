@@ -12,6 +12,40 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - Prepared direct INSERT lazy param-one text cache
+
+- Target: `comprehensive-bench --quick --filter insert`, especially tiny and
+  medium direct prepared INSERT rows after profiling still showed
+  `Connection::try_serialize_prepared_direct_simple_insert_record` in the
+  INSERT hot path.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`
+  in scratch worktree
+  `/data/tmp/frankensqlite-param-cache-clean-candidate-tanbear-20260507T2225Z`.
+  The shared checkout candidate was manually reverted; no source change was
+  kept.
+- Candidate shape: add a prepare-time boolean that detects whether a direct
+  INSERT expression tree contains a concat chain using `?1`, then format the
+  cached `?1` integer text only for those prepared statements instead of
+  eagerly formatting it for every integer first parameter.
+- Correctness proof before rejection: the shared candidate passed
+  `cargo test -p fsqlite-core test_prepared_insert_ -- --nocapture`, and
+  `cargo fmt -p fsqlite-core --check` passed after the candidate was reverted.
+- Evidence artifacts:
+  `tests/artifacts/perf/direct-insert-param-cache-tanbear-20260507T2225Z/baseline-insert.json`,
+  `clean-candidate-insert.json`, and `stdout/`.
+- Result: rejected and not applied. The clean paired run improved the aggregate
+  INSERT average/geomean/p90 ratios from
+  `0.8049063998434616 / 0.7782382910450526 / 1.1104506479272773` to
+  `0.7944056357714977 / 0.7669999933973539 / 1.100055809067332`, but worsened
+  p99 from `1.1792240414399875` to `1.2243380377350952`. The target-ish
+  `medium_6col 1000 rows` case regressed badly, with FrankenSQLite median
+  `0.491230 -> 0.735477` and ratio `0.836522 -> 1.224338`; `tiny_1col 10000`
+  also regressed, with FrankenSQLite median `1.258667 -> 1.486874`.
+- Do not retry lazy param-one text caching as a standalone micro-optimization.
+  Reconsider only inside a broader prepared row-template or bulk builder that
+  removes row-template construction and page-run/page costs together while
+  proving INSERT p99 neutrality in the same benchmark window.
+
 ## 2026-05-07 - Prepared param-one integer/float binary INSERT specialization
 
 - Target: `comprehensive-bench --quick --filter insert`, after the clean current

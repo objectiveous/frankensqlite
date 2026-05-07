@@ -929,9 +929,7 @@ impl InProcessPageLockTable {
         // Fast path: pages 1..=65536 are served entirely from the flat array.
         // Rolling rebuild state only applies to the sharded fallback table.
         if pgno <= FAST_LOCK_ARRAY_SIZE {
-            let Some(slot) = self.fast_lock_slot_if_allocated(pgno) else {
-                return None;
-            };
+            let slot = self.fast_lock_slot_if_allocated(pgno)?;
             let val = slot.load(Ordering::Acquire);
             return if val == 0 {
                 None

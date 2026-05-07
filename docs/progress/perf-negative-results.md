@@ -12,6 +12,36 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - Lazy conflict ring-buffer allocation
+
+- Target: repeated `SharedMvccState::new` cost in small `:memory:` write and
+  update/delete rows, after profiles showed connection-open allocation cost.
+- Touched during rejected candidate:
+  `crates/fsqlite-observability/src/lib.rs`; the candidate was never applied to
+  the main checkout.
+- Candidate shape: change `ConflictRingBuffer` construction from
+  `Vec::with_capacity(capacity)` to `Vec::new()`, preserving the configured
+  ring capacity while deferring the event storage allocation until the first
+  conflict event.
+- Correctness proof before measurement:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-observer-candidate-test cargo test -p fsqlite-observability ring -- --nocapture`
+  passed all 11 matching observability/ring tests.
+- Focused evidence: `perf-update-delete 100 5000 delete fsqlite standard`
+  stayed within noise at `2304ns` per deleted row in
+  `tests/artifacts/perf/lazy-conflict-ring-crimsongorge-20260507T0552Z/perf-delete-100-fsqlite-standard.txt`.
+- Matrix evidence:
+  - Baseline:
+    `tests/artifacts/perf/lazy-commit-index-chunks-crimsongorge-20260507T0506Z/report-full.json`.
+  - Candidate:
+    `tests/artifacts/perf/lazy-conflict-ring-crimsongorge-20260507T0552Z/report-full.json`.
+- Result: rejected. The full quick matrix moved the primary score in the wrong
+  direction (`0.3781791993813428 -> 0.39476918213037665`), worsened p99
+  (`1.5325130971275822 -> 2.2593567303940096`), and worsened C-faster rows
+  (`15 -> 18`).
+- Do not retry this standalone lazy ring-buffer allocation. Reconsider only if
+  conflict observability is redesigned as a fully lazy/optional subsystem and
+  the full quick matrix improves.
+
 ## 2026-05-07 - Stack-backed empty page-1 bootstrap
 
 - Target: small `:memory:` write/update/delete rows where profiles showed

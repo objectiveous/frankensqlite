@@ -5635,3 +5635,39 @@ set: sessions found by
   builder that lays out the non-empty right-edge run and parent updates in one
   batch, and require an absolute FSQLite median improvement on
   `10000 rows / batched (1000/txn)` before any full-matrix repeat.
+
+## 2026-05-07 - Direct DML fixed-width UPDATE leaf hint
+
+- Target: `comprehensive-bench --quick --filter update` UPDATE/DELETE
+  throughput, especially repeated `UPDATE bench SET value = ? WHERE id = ?`
+  on the fixed-width REAL direct-simple path.
+- Candidate shape: commit `6e13684f` added `PreparedDirectDmlLeafHint`
+  (`root_page` + `leaf_page`) on `Connection` and
+  `BtCursor::table_move_to_leaf_hint`, so a same-size fixed-width REAL payload
+  overwrite could seed a leaf-page hint for the next UPDATE against the same
+  table root. The hint was cleared on direct INSERT, direct DELETE, mixed-shape
+  UPDATE, and delete+insert fallback paths. Source was reverted after the
+  focused matrix rejected it.
+- Correctness proof passed on the candidate:
+  `env TMPDIR=/data/tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-dml-leafhint-test-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-btree test_table_move_to_leaf_hint_uses_hinted_leaf_when_bounds_match -- --nocapture`
+  and
+  `env TMPDIR=/data/tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-dml-leafhint-test-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core direct_simple_update -- --nocapture`.
+- Evidence artifacts:
+  `tests/artifacts/perf/direct-dml-leaf-hint-calmdeer-20260507T132114Z/summary.md`,
+  `baseline-update.json`, `candidate-update.json`,
+  `baseline-update-repeat.json`, `candidate-update-repeat.json`, and matching
+  build/stdout/stderr logs. Baseline was built from parent `5af003c1`; candidate
+  was built from `6e13684f`.
+- Result: rejected. Primary focused run improved only the tiny update row
+  (`0.144170 ms -> 0.130484 ms`) while regressing the larger update rows and
+  all delete rows: `1000 rows / update 100 rows` moved
+  `0.439974 ms -> 0.452818 ms`, `10000 rows / update 1000 rows` moved
+  `3.985014 ms -> 4.497334 ms`, and `100 rows / delete 5 rows` moved
+  `0.123081 ms -> 0.151113 ms`. The repeat left update rows noisy/mixed and
+  still worsened small delete rows (`0.122349 ms -> 0.163867 ms`,
+  `0.395791 ms -> 0.420177 ms`).
+- Do not retry a connection-level "last leaf page" hint as a standalone direct
+  UPDATE optimization. Revisit only as part of a true retained-cursor direct DML
+  kernel that keeps the cursor object positioned across a monotone rowid run,
+  proves no delete-path overhead in the same benchmark slice, and improves
+  update 1000/10000 plus the UPDATE/DELETE section score in same-window runs.

@@ -1802,64 +1802,6 @@ impl<P: PageReader> BtCursor<P> {
         })
     }
 
-    /// Seek a table rowid by probing a caller-retained leaf page first.
-    ///
-    /// Returns `Ok(None)` when the hint is unusable and the caller should fall
-    /// back to the normal root descent. A usable hinted page must still be a
-    /// table leaf and its rowid bounds must contain the target rowid.
-    #[doc(hidden)]
-    pub fn table_move_to_leaf_hint(
-        &mut self,
-        cx: &Cx,
-        hinted_leaf_page: PageNumber,
-        rowid: i64,
-    ) -> Result<Option<SeekResult>> {
-        self.with_btree_op(cx, BtreeOpType::Seek, |cursor| {
-            observe_cursor_cancellation(cx)?;
-
-            let entry = cursor.load_page(cx, hinted_leaf_page)?;
-            if !(entry.header.page_type.is_leaf() && entry.header.page_type.is_table()) {
-                return Ok(None);
-            }
-            let Some((min_rowid, max_rowid)) = Self::table_leaf_rowid_bounds(&entry)? else {
-                return Ok(None);
-            };
-            if rowid < min_rowid || rowid > max_rowid {
-                return Ok(None);
-            }
-
-            let page_no = entry.page_no;
-            let search = Self::search_integer_key_table_leaf(cx, &entry, rowid)?;
-            let mut entry = entry;
-            let seek_result = match search {
-                BinarySearchResult::Found(idx) => {
-                    entry.cell_idx = idx;
-                    SeekResult::Found
-                }
-                BinarySearchResult::NotFound(idx) => {
-                    entry.cell_idx = idx.min(entry.header.cell_count.saturating_sub(1));
-                    SeekResult::NotFound
-                }
-            };
-
-            cursor.stack.clear();
-            cursor.stack.push(entry);
-            cursor.at_eof = false;
-            let positioned_cell_idx = cursor
-                .stack
-                .last()
-                .ok_or_else(|| FrankenError::internal("cursor stack empty"))?
-                .cell_idx;
-            cursor.remember_table_seek(rowid, page_no, positioned_cell_idx);
-            cursor.record_point_witness(WitnessKey::Cell {
-                btree_root: cursor.root_page,
-                leaf_page: page_no,
-                tag: Self::cell_tag_from_rowid(rowid),
-            });
-            Ok(Some(seek_result))
-        })
-    }
-
     /// Issue an explicit best-effort prefetch hint for `page_no`.
     ///
     /// This is a non-blocking hint only; callers must not rely on it for
@@ -14991,41 +14933,6 @@ mod tests {
                 .all(|key| matches!(key, WitnessKey::Cell { .. })),
             "advance_to must remain a point probe and avoid page witnesses"
         );
-    }
-
-    #[test]
-    fn test_table_move_to_leaf_hint_uses_hinted_leaf_when_bounds_match() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 15)], pn(4)));
-        store.pages.insert(
-            3,
-            build_leaf_table(&[(1, b"L1"), (10, b"L10"), (15, b"L15")]),
-        );
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(20, b"L20"), (30, b"L30")]));
-
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-
-        let hinted = cursor.table_move_to_leaf_hint(&cx, pn(3), 10).unwrap();
-        assert_eq!(hinted, Some(SeekResult::Found));
-        assert_eq!(cursor.current_page(), Some(pn(3)));
-        assert_eq!(cursor.rowid(&cx).unwrap(), 10);
-
-        let miss_inside_leaf = cursor.table_move_to_leaf_hint(&cx, pn(3), 12).unwrap();
-        assert_eq!(miss_inside_leaf, Some(SeekResult::NotFound));
-        assert_eq!(cursor.current_page(), Some(pn(3)));
-        assert_eq!(
-            cursor.rowid(&cx).unwrap(),
-            15,
-            "not-found hint probe should leave the cursor on the successor cell"
-        );
-
-        let outside_leaf = cursor.table_move_to_leaf_hint(&cx, pn(3), 30).unwrap();
-        assert_eq!(outside_leaf, None);
     }
 
     #[test]

@@ -91,6 +91,25 @@ record-header parse around a tiny copied payload. The source changes were
 removed; `report-update-delete-candidate.json`, `stdout-candidate.txt`, and
 `stderr-candidate.txt` are kept here as rejection evidence.
 
+## Rejected Follow-up: Per-row Scratch Reset Removal
+
+I also tried removing `PreparedDirectInsertScratchResetGuard` from direct
+UPDATE/DELETE execution. The direct DML paths already clear their scratch
+buffers at point of use, so this tested whether the per-row guard was just
+ceremony. Correctness gates passed, but the focused benchmark rejected it:
+
+| Metric | Baseline | Candidate |
+| --- | ---: | ---: |
+| Section geomean ratio | `1.1514568045449403` | `1.1827616752954908` |
+| `100 rows / update 10 rows` | `0.132028 ms`, `1.5145515239810492` | `0.126537 ms`, `1.428247324935663` |
+| `10000 rows / update 1000 rows` | `4.282235 ms`, `1.16851603333226` | `4.374428 ms`, `1.1500152479099848` |
+| `10000 rows / delete 500 rows` | `3.942168 ms`, `1.1384892008417877` | `4.068265 ms`, `1.1455357987592527` |
+
+The small update row improved, but the section aggregate and large rows moved
+the wrong way. The source change was removed; `report-update-delete-scratchreset-candidate.json`,
+`stdout-scratchreset-candidate.txt`, and `stderr-scratchreset-candidate.txt`
+are kept here as rejection evidence.
+
 ## Next Lever
 
 Do not spend this lane on VDBE dispatch or parser work; the counters already show those are bypassed. The next plausible step-change lever is a B-tree/core direct-DML retained cursor kernel:

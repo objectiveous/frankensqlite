@@ -12,6 +12,40 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - Direct UPDATE/DELETE per-row scratch reset removal
+
+- Target: `UPDATE/DELETEThroughput`, especially direct UPDATE/DELETE per-row
+  ceremony in prepared statement loops.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  the source was manually restored after the focused benchmark lost.
+- Candidate shape: remove `PreparedDirectInsertScratchResetGuard` from
+  `execute_prepared_direct_simple_update` and
+  `execute_prepared_direct_simple_delete`, relying on each direct DML path's
+  existing scratch clears plus commit-time statement-lookaside reset.
+- Correctness/build proof before measurement:
+  - `TMPDIR=/data/tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-review-target cargo fmt -p fsqlite-core --check`
+    passed.
+  - `TMPDIR=/data/tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-review-target cargo test -p fsqlite-core direct_simple_update -- --nocapture`
+    passed, with the expected temporary dead-code warning because the guard
+    became unused during the candidate.
+  - `TMPDIR=/data/tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-patch-target cargo build -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete --profile release-perf`
+    passed, with the same temporary warning.
+- Evidence artifacts:
+  `tests/artifacts/perf/update-delete-profile-crimsongorge-20260507T111220Z/summary.md`,
+  `report-update-delete.json`, `report-update-delete-scratchreset-candidate.json`,
+  `stderr-scratchreset-candidate.txt`, and
+  `stdout-scratchreset-candidate.txt`.
+- Result: rejected. The candidate had mixed row noise and worsened the section:
+  geomean ratio `1.1514568045449403 -> 1.1827616752954908`, `10000 rows /
+  update 1000 rows` `4.282235 ms` / `1.16851603333226 -> 4.374428 ms` /
+  `1.1500152479099848`, and `10000 rows / delete 500 rows` `3.942168 ms` /
+  `1.1384892008417877 -> 4.068265 ms` / `1.1455357987592527`. The small
+  update row improved (`0.132028 ms -> 0.126537 ms`) but not enough to justify
+  the broader regression.
+- Do not retry removing the direct UPDATE/DELETE scratch reset as a standalone
+  ceremony trim. Reconsider only if paired with a larger retained-cursor design
+  and revalidated on the full `UPDATE/DELETEThroughput` section.
+
 ## 2026-05-07 - Direct UPDATE fixed-width REAL leaf-payload patch
 
 - Target: `UPDATE/DELETEThroughput`, especially the top full-matrix gap

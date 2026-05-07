@@ -12,6 +12,44 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - Lazy page-lock waiter-shard allocation
+
+- Target: remaining fixed allocation/open cost in small `:memory:`
+  UPDATE/DELETE rows after profiles still showed allocator and
+  `SharedMvccState::new` / `InProcessPageLockTable` setup cost.
+- Touched during rejected candidate: `crates/fsqlite-mvcc/src/core_types.rs`;
+  source was reverted before commit.
+- Candidate shape: change `InProcessPageLockTable` waiter queues from eagerly
+  allocated `Box<[WaiterShard; LOCK_TABLE_SHARDS]>` to a `OnceLock` directory,
+  allocating a waiter shard only when `register_waiter` actually parks a thread
+  on a page lock. `waiter_count == 0` fast paths and targeted wake semantics
+  were preserved.
+- Correctness proof before measurement:
+  - `cargo fmt -p fsqlite-mvcc --check` passed.
+  - `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-lazy-waiter-target cargo test -p fsqlite-mvcc in_process_lock_table -- --nocapture`
+    printed `7 passed; 0 failed; 1 ignored`; the RCH wrapper later hung in
+    artifact retrieval after the green test result and was terminated locally.
+- Focused evidence:
+  `tests/artifacts/perf/lazy-waiter-shards-crimsongorge-20260507T0715Z/`
+  compared the candidate against the current-HEAD baseline binary at
+  `/data/tmp/frankensqlite-purpleotter-lockshards64-perf-target`. 100-row
+  UPDATE moved only `1538ns -> 1520ns` per updated row, while 100-row DELETE
+  regressed `2417ns -> 2453ns` per deleted row.
+- Matrix evidence:
+  - Baseline:
+    `tests/artifacts/perf/lock-table-shards-64-purpleotter-20260507T064123Z/report-full.json`.
+  - Candidate:
+    `tests/artifacts/perf/lazy-waiter-shards-crimsongorge-20260507T0715Z/report-full.json`.
+- Result: rejected. The full quick matrix moved the primary score in the wrong
+  direction (`0.3705736243 -> 0.3818466951`), worsened geomean
+  (`0.2773103795 -> 0.2876165270`), worsened C-faster rows (`14 -> 17`), and
+  worsened `write_single` geomean (`1.1928924299 -> 1.2099582428`). A small
+  `write_bulk` geomean improvement did not offset the matrix regression.
+- Do not retry standalone lazy waiter-shard allocation. Reconsider only if a
+  future profile shows waiter-shard construction as retained self-time after a
+  broader lock-table/open-state redesign, and require a same-window full quick
+  matrix improvement.
+
 ## 2026-05-07 - Lazy conflict ring-buffer allocation
 
 - Target: repeated `SharedMvccState::new` cost in small `:memory:` write and

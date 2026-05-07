@@ -12,6 +12,43 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - Private memory retained-autocommit flush threshold 256 -> 1024
+
+- Target: remaining `INSERTThroughput - Transaction Strategy Comparison
+  (small_3col)` gap where 10K `autocommit` and `batched (1000/txn)` rows still
+  trail C SQLite while single-transaction rows are already faster.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  source was reverted before commit.
+- Candidate shape: keep mixed read/write retained-autocommit flushing at `16`
+  statements and file-backed pure writes at `256`, but raise the pure-write
+  private `:memory:` threshold to `1024` so long insert loops pay fewer retained
+  flush boundaries.
+- Correctness/build proof before measurement:
+  - `cargo fmt -p fsqlite-core --check` passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-autocommit-threshold-target cargo test -p fsqlite-core retained_autocommit_adaptive_flush -- --nocapture`
+    passed the retained-autocommit adaptive-threshold tests, including a
+    temporary memory-specific assertion for the candidate.
+  - Candidate release-perf build passed with
+    `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-autocommit-threshold-target cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`.
+- Same-window evidence:
+  `tests/artifacts/perf/private-autocommit-threshold-crimsongorge-20260507T0750Z/`
+  compared `comprehensive-bench --quick --filter transaction` against the
+  current baseline binary at
+  `/data/tmp/frankensqlite-purpleotter-lockshards64-perf-target`.
+- Result: rejected. The apparent 10K autocommit ratio improvement
+  (`1.345x -> 1.263x`) came from a slower C SQLite median in the candidate run;
+  absolute FrankenSQLite time worsened (`11.044968 ms -> 11.279396 ms`).
+  Other target rows also regressed, including 100-row autocommit
+  (`0.147657 ms -> 0.153147 ms`), 100-row batched
+  (`0.092022 ms -> 0.117490 ms`), and 1K autocommit
+  (`1.129896 ms -> 1.189378 ms`). The only target-family win was a tiny 10K
+  batched improvement (`4.501872 ms -> 4.481204 ms`), not enough to justify the
+  broader regressions.
+- Do not retry a standalone retained-autocommit threshold increase. Reconsider
+  only if a phase profile proves retained flush boundaries dominate the actual
+  autocommit row and a same-window transaction-section/full-quick A/B improves
+  absolute FrankenSQLite medians, not just ratios.
+
 ## 2026-05-07 - Lazy page-lock waiter-shard allocation
 
 - Target: remaining fixed allocation/open cost in small `:memory:`

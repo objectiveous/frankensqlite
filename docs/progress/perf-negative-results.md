@@ -5619,7 +5619,9 @@ set: sessions found by
   `tests/artifacts/perf/right-edge-pagebuilder-purpleotter-20260507T125157Z/summary.md`,
   `baseline-transaction.json`, `candidate-transaction.json`, and matching
   stdout/stderr logs. Baseline worktree was built from `7660b8da`; candidate
-  carried only the `connection.rs` patch.
+  carried only the `connection.rs` patch. Supplemental read-only confirmation:
+  `tests/artifacts/perf/payload-writer-pagerun-crimsongorge-20260507T1251Z/summary.md`
+  and `candidate-insert.json`.
 - Result: rejected. The primary weighted score improved
   `0.9403114839 -> 0.9287374158`, but geomean regressed
   `0.9786733776 -> 1.0159826210` and write-bulk geomean regressed

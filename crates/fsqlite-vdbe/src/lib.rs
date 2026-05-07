@@ -811,6 +811,7 @@ impl ProgramBuilder {
             );
         }
         let requires_attached_memdb = compute_requires_attached_memdb(&ops);
+        let requires_version_store = ops.iter().any(|op| op.opcode == Opcode::SetSnapshot);
         let program = VdbeProgram {
             ops,
             register_count: self.regs.count().max(inferred_register_count),
@@ -818,6 +819,7 @@ impl ProgramBuilder {
             table_index_meta: Arc::new(table_index_meta),
             has_insert,
             requires_attached_memdb,
+            requires_version_store,
         };
         program.verify_control_flow_targets()?;
         Ok(program)
@@ -1010,6 +1012,8 @@ pub struct VdbeProgram {
     /// Precomputed flag: true when execution still needs an attached
     /// `MemDatabase` to preserve current opcode semantics.
     requires_attached_memdb: bool,
+    /// Precomputed flag: true when execution can request historical pages.
+    requires_version_store: bool,
 }
 
 impl VdbeProgram {
@@ -1185,6 +1189,11 @@ impl VdbeProgram {
     /// `MemDatabase` for opcode semantics.
     pub fn requires_attached_memdb(&self) -> bool {
         self.requires_attached_memdb
+    }
+
+    /// Returns `true` when this program can read historical page versions.
+    pub fn requires_version_store(&self) -> bool {
+        self.requires_version_store
     }
 
     /// Disassemble the program to a human-readable string.

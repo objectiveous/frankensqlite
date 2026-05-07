@@ -5717,3 +5717,33 @@ set: sessions found by
   kernel that keeps the cursor object positioned across a monotone rowid run,
   proves no delete-path overhead in the same benchmark slice, and improves
   update 1000/10000 plus the UPDATE/DELETE section score in same-window runs.
+
+## 2026-05-07 - Param-one concat direct INSERT encoder
+
+- Target: `INSERTThroughput - Single Transaction - medium_6col`,
+  especially `1000 rows`, after profiling showed row construction as the
+  largest remaining in-row hot slice for the measured gap.
+- Candidate shape: in `crates/fsqlite-core/src/connection.rs`, compile
+  text-literal/`?1` concat chains such as `'prefix_' || ?1 || '_suffix'` into a
+  compact `ParamOneTextConcat(Vec<String>)` prepared-direct expression. The
+  encoder reused the already cached text form of integer `?1`, preserved SQLite
+  NULL concat semantics, and fell back to the existing `ConcatChain` for every
+  other expression shape. Source was reverted after the full quick matrix
+  rejected it.
+- Correctness proof passed on the candidate:
+  `cargo fmt -p fsqlite-core --check` and
+  `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-next-gap-check-target CARGO_BUILD_JOBS=16 cargo test -p fsqlite-core test_prepared_insert_ -- --nocapture`.
+- Evidence artifacts:
+  `tests/artifacts/perf/medium-single-gap-crimsongorge-20260507T1515Z/insert-profile.json`,
+  `insert-paramconcat-candidate.json`, `full-paramconcat-candidate.json`, and
+  matching stdout/stderr logs.
+- Result: rejected. The focused insert matrix moved the target row in the
+  right direction (`medium_6col / 1000 rows` FSQLite median
+  `0.742511 ms -> 0.684553 ms`, ratio `1.3865 -> 1.2507`) and reduced its
+  attributed `row_build_ns` (`248814 -> 201460`). The full quick matrix still
+  failed the project keep gate: average ratio worsened `0.496253 -> 0.503004`,
+  C-faster rows moved `13 -> 14`, and p99 worsened `1.509348 -> 1.536446`.
+- Do not retry a param-one-only concat expression variant as a standalone
+  optimization. Revisit only if it is folded into a broader row-template encoder
+  that proves full-matrix neutrality or better, not just a single insert-row
+  win.

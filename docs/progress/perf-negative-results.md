@@ -6119,3 +6119,40 @@ set: sessions found by
   direct DELETE optimization. Reconsider only as part of a real same-leaf batch
   mutation primitive that writes each leaf once and proves an UPDATE/DELETE
   section geomean win.
+
+## 2026-05-07 - Same-leaf fixed-width REAL UPDATE batch run
+
+- Target: `UPDATE/DELETEThroughput`, especially monotone explicit-transaction
+  fixed-width REAL direct UPDATE rows that seemed eligible for one-write-per-leaf
+  batching.
+- Touched during rejected shared-worktree candidate:
+  `crates/fsqlite-core/src/connection.rs` and
+  `crates/fsqlite-btree/src/cursor.rs`; those source files were exclusively
+  reserved by TanBear during CrimsonGorge's read-only benchmark review.
+- Candidate shape: buffer monotone fixed-width REAL direct UPDATE records in an
+  explicit transaction, keep a pending run on `Connection`, and flush through a
+  new `BtCursor::table_overwrite_sorted_payloads_same_size_no_overflow`
+  primitive that patches same-size no-overflow payloads and writes each dirty
+  leaf once. The candidate also carried MemDatabase mirror handling and focused
+  btree/core regression tests.
+- Correctness proof passed read-only on the current dirty candidate:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-peer-dml-current-target CARGO_BUILD_JOBS=10 cargo test -p fsqlite-core test_direct_fixed_real_update_run_flushes_on_read_and_commit -- --nocapture`,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-peer-dml-current-target CARGO_BUILD_JOBS=10 cargo test -p fsqlite-btree test_table_overwrite_sorted_payloads_same_size_no_overflow -- --nocapture`,
+  `git diff --check -- crates/fsqlite-btree/src/cursor.rs crates/fsqlite-core/src/connection.rs`,
+  and `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-peer-dml-current-target CARGO_BUILD_JOBS=10 cargo fmt --check`.
+- Evidence artifacts:
+  `tests/artifacts/perf/dml-batch-current-review-crimsongorge-20260507T2200Z/summary.md`
+  and `stdout/perf-update-delete-*.out`.
+- Result: rejected by the isolated mutation keep gate. Against the prior
+  isolated baseline in
+  `tests/artifacts/perf/update-delete-isolated-current-tanbear-20260507T1544Z/summary.md`,
+  UPDATE regressed at every measured size: `100` rows moved
+  `788 ns/row -> 1079 ns/row`, `1000` rows moved
+  `913 ns/row -> 1409 ns/row` with a repeat at `1381 ns/row`, and `10000`
+  rows moved `916 ns/row -> 1636 ns/row`. DELETE was noise-flat to worse:
+  `1233 -> 1203`, `1209 -> 1200/1235`, and `1328 -> 1364 ns/row`.
+- Do not retry a connection-level pending fixed-width REAL UPDATE run plus
+  same-size leaf overwrite as a standalone DML optimization. Reconsider only if
+  the design also removes the per-row admission/payload projection/mirror costs
+  or is replaced with a true leaf-run operator that proves an isolated
+  UPDATE/DELETE win before any broader matrix run.

@@ -12,6 +12,32 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - Lazy fallback page-lock shard allocation clean retry
+
+- Target: `UPDATE/DELETEThroughput`, after a clean retry of a prior MVCC
+  page-lock allocation idea.
+- Touched during rejected candidate: `crates/fsqlite-mvcc/src/core_types.rs`;
+  the candidate was reverted before this ledger entry was added.
+- Candidate shape: change `InProcessPageLockTable.shards` to
+  `OnceLock<Box<[LockShard; 64]>>`, preserving the inline fast-lock array and
+  allocating fallback hash shards only after the first page above
+  `FAST_LOCK_ARRAY_SIZE`.
+- Evidence artifacts:
+  `tests/artifacts/perf/lazy-fallback-lock-shards-clean-tanbear-20260507T1919Z/summary.md`,
+  `candidate-update.json`, and `stdout/`.
+- Result: rejected and reverted. Correctness target tests printed green
+  (`7 passed; 0 failed; 1 ignored`), and release-perf benchmark build passed,
+  but the focused update/delete gate worsened from baseline avg/geomean
+  `1.0936760649761197` / `1.073350192601591` to candidate avg/geomean
+  `1.1602136307342483` / `1.1419623214888621`. The p90 improved
+  `1.5749222579455016 -> 1.5029391100702576`, but the 10K update/delete rows
+  flipped from faster to slower (`0.9287127409358253 -> 1.0145355153667168`,
+  `0.8785038934276055 -> 1.0715147023000497`), so the matrix keep gate failed.
+- Do not retry as a standalone MVCC lock-table allocation change. Reconsider
+  only if a future profile proves cold fallback-shard construction dominates a
+  startup-only workload and the benchmark gate is intentionally scoped away
+  from steady-state 10K DML rows.
+
 ## 2026-05-07 - SharedTxnPageIo synthetic page-one cleanup negative cache
 
 - Target: `UPDATE/DELETEThroughput`, after an isolated `perf record` sample

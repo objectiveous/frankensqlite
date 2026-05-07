@@ -513,6 +513,7 @@ fn sync_native_cx_cancel(inner: &CxInner, reason: CancelReason) {
 
 #[cfg(feature = "native")]
 #[must_use]
+#[allow(dead_code)]
 fn native_budget_from_local(budget: Budget) -> NativeBudget {
     let mut native_budget = NativeBudget::new()
         .with_poll_quota(budget.poll_quota)
@@ -528,6 +529,7 @@ fn native_budget_from_local(budget: Budget) -> NativeBudget {
 
 #[cfg(feature = "native")]
 #[must_use]
+#[allow(dead_code)]
 fn wall_clock_now_since_epoch() -> Duration {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -536,6 +538,7 @@ fn wall_clock_now_since_epoch() -> Duration {
 
 #[cfg(feature = "native")]
 #[must_use]
+#[allow(dead_code)]
 fn local_deadline_to_native_time(deadline: Duration) -> NativeTime {
     let absolute_deadline = wall_clock_now_since_epoch()
         .checked_add(deadline)
@@ -639,6 +642,7 @@ impl Cx<FullCaps> {
 impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     #[cfg(feature = "native")]
     #[must_use]
+    #[allow(dead_code)]
     fn effective_native_cx(&self) -> NativeCx {
         let attached_native = self
             .inner
@@ -664,6 +668,19 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
                 native
             })
             .clone()
+    }
+
+    #[cfg(feature = "native")]
+    #[must_use]
+    fn native_cx_for_checkpoint(&self) -> Option<NativeCx> {
+        let attached_native = self
+            .inner
+            .attached_native_cx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned();
+        attached_native.or_else(|| self.inner.fallback_native_cx.get().cloned())
     }
 
     #[must_use]
@@ -968,7 +985,9 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     #[cfg(feature = "native")]
     #[must_use]
     fn maybe_cancel_via_native_cx(&self, masked: bool) -> bool {
-        let native = self.effective_native_cx();
+        let Some(native) = self.native_cx_for_checkpoint() else {
+            return false;
+        };
 
         if masked {
             if native.is_cancel_requested() {
@@ -1656,6 +1675,16 @@ mod tests {
         let native = cx.effective_native_cx();
         assert!(cx.attached_native_cx().is_none());
         assert!(native.checkpoint().is_ok());
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_cx_checkpoint_without_native_context_does_not_create_fallback() {
+        let cx = Cx::<FullCaps>::new();
+
+        assert!(cx.inner.fallback_native_cx.get().is_none());
+        assert!(cx.checkpoint().is_ok());
+        assert!(cx.inner.fallback_native_cx.get().is_none());
     }
 
     #[cfg(feature = "native")]

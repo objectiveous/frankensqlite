@@ -10,8 +10,8 @@
 use fsqlite_types::sync_primitives::{Condvar, Mutex, RwLock};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, Thread, ThreadId};
 use std::time::{Duration, Instant};
 
@@ -344,9 +344,13 @@ impl std::fmt::Debug for VersionArena {
 /// Number of shards in the lock table (power of 2 for fast modular indexing).
 pub const LOCK_TABLE_SHARDS: usize = 256;
 
-/// Size of the flat atomic lock array covering page numbers 1..=FAST_LOCK_ARRAY_SIZE.
-/// 65536 entries × 8 bytes = 512 KiB, same footprint as the CommitIndex fast array.
+/// Size of the fast atomic lock address space covering page numbers
+/// 1..=FAST_LOCK_ARRAY_SIZE.
 const FAST_LOCK_ARRAY_SIZE: usize = 65536;
+/// Lazily allocate the fast-lock address space in small atomic chunks so a
+/// new connection does not zero the full 512 KiB table before touching a page.
+const FAST_LOCK_CHUNK_SIZE: usize = 1024;
+const FAST_LOCK_CHUNKS: usize = FAST_LOCK_ARRAY_SIZE / FAST_LOCK_CHUNK_SIZE;
 
 /// A single cache-line-aligned lock table shard.
 type LockShard = CacheAligned<Mutex<HashMap<PageNumber, TxnId, PageNumberBuildHasher>>>;
@@ -387,9 +391,9 @@ type WaiterShard = CacheAligned<Mutex<HashMap<PageNumber, WaiterQueue, PageNumbe
 /// place and are cleaned separately during full rebuilds, avoiding
 /// stop-the-world abort storms during maintenance.
 pub struct InProcessPageLockTable {
-    /// Lock-free fast path: flat atomic array for pages 1..=65536.
+    /// Lock-free fast path: lazily allocated atomic chunks for pages 1..=65536.
     /// Slot value 0 = unlocked; non-zero = TxnId.get() of the holder.
-    fast_locks: Box<[AtomicU64]>,
+    fast_locks: Box<[OnceLock<Box<[AtomicU64]>>; FAST_LOCK_CHUNKS]>,
     /// Sharded fallback for pages > 65536. When the `mvcc-flat-combining`
     /// feature is enabled, the active fallback path routes through
     /// [`Self::fc_shards`] instead; this field remains as the storage backing
@@ -504,12 +508,39 @@ pub enum RebuildError {
 }
 
 impl InProcessPageLockTable {
-    /// Allocate the flat atomic lock array (shared by all constructors).
-    fn alloc_fast_locks() -> Box<[AtomicU64]> {
-        let v: Vec<AtomicU64> = (0..FAST_LOCK_ARRAY_SIZE)
+    /// Allocate the lightweight fast-lock chunk directory.
+    fn alloc_fast_locks() -> Box<[OnceLock<Box<[AtomicU64]>>; FAST_LOCK_CHUNKS]> {
+        Box::new(std::array::from_fn(|_| OnceLock::new()))
+    }
+
+    fn alloc_fast_lock_chunk() -> Box<[AtomicU64]> {
+        let v: Vec<AtomicU64> = (0..FAST_LOCK_CHUNK_SIZE)
             .map(|_| AtomicU64::new(0))
             .collect();
         v.into_boxed_slice()
+    }
+
+    fn fast_lock_slot(&self, pgno: usize) -> Option<&AtomicU64> {
+        if pgno == 0 || pgno > FAST_LOCK_ARRAY_SIZE {
+            return None;
+        }
+        let index = pgno - 1;
+        let chunk_index = index / FAST_LOCK_CHUNK_SIZE;
+        let chunk_offset = index % FAST_LOCK_CHUNK_SIZE;
+        let chunk = self.fast_locks[chunk_index].get_or_init(Self::alloc_fast_lock_chunk);
+        Some(&chunk[chunk_offset])
+    }
+
+    fn fast_lock_slot_if_allocated(&self, pgno: usize) -> Option<&AtomicU64> {
+        if pgno == 0 || pgno > FAST_LOCK_ARRAY_SIZE {
+            return None;
+        }
+        let index = pgno - 1;
+        let chunk_index = index / FAST_LOCK_CHUNK_SIZE;
+        let chunk_offset = index % FAST_LOCK_CHUNK_SIZE;
+        self.fast_locks[chunk_index]
+            .get()
+            .map(|chunk| &chunk[chunk_offset])
     }
 
     /// Allocate sharded waiter queues (D4, bd-3wop3.4).
@@ -636,7 +667,9 @@ impl InProcessPageLockTable {
         // Step 1 (Hekaton fast path): For pages 1..=65536, use lock-free CAS
         // on the flat atomic array — no Mutex, no HashMap, zero contention.
         if pgno <= FAST_LOCK_ARRAY_SIZE {
-            let slot = &self.fast_locks[pgno - 1];
+            let slot = self
+                .fast_lock_slot(pgno)
+                .expect("fast lock page number in range must have a slot");
             let txn_raw = txn.get();
             // CAS: 0 (unlocked) → txn_raw (locked by us).
             match slot.compare_exchange(0, txn_raw, Ordering::AcqRel, Ordering::Acquire) {
@@ -712,15 +745,16 @@ impl InProcessPageLockTable {
 
         // Fast path: pages 1..=65536 use lock-free CAS on the flat array.
         if pgno <= FAST_LOCK_ARRAY_SIZE {
-            let slot = &self.fast_locks[pgno - 1];
-            let txn_raw = txn.get();
-            // CAS: txn_raw (our lock) → 0 (unlocked).
-            if slot
-                .compare_exchange(txn_raw, 0, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                self.notify_waiters_for_page(page);
-                return true;
+            if let Some(slot) = self.fast_lock_slot_if_allocated(pgno) {
+                let txn_raw = txn.get();
+                // CAS: txn_raw (our lock) → 0 (unlocked).
+                if slot
+                    .compare_exchange(txn_raw, 0, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    self.notify_waiters_for_page(page);
+                    return true;
+                }
             }
             // Not held by us — fast-array pages never live in draining.
         }
@@ -777,12 +811,14 @@ impl InProcessPageLockTable {
         let mut released_any = false;
         // Scan the fast lock array for entries held by this txn.
         let txn_raw = txn.get();
-        for slot in self.fast_locks.iter() {
-            if slot
-                .compare_exchange(txn_raw, 0, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                released_any = true;
+        for chunk in self.fast_locks.iter().filter_map(OnceLock::get) {
+            for slot in chunk.iter() {
+                if slot
+                    .compare_exchange(txn_raw, 0, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    released_any = true;
+                }
             }
         }
         // Scan sharded tables for pages > 65536.
@@ -836,10 +872,10 @@ impl InProcessPageLockTable {
             let pgno = page.get() as usize;
             // Fast path for pages 1..=65536.
             if pgno <= FAST_LOCK_ARRAY_SIZE {
-                if self.fast_locks[pgno - 1]
-                    .compare_exchange(txn_raw, 0, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-                {
+                if self.fast_lock_slot_if_allocated(pgno).is_some_and(|slot| {
+                    slot.compare_exchange(txn_raw, 0, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                }) {
                     released_any = true;
                 }
                 continue;
@@ -893,7 +929,10 @@ impl InProcessPageLockTable {
         // Fast path: pages 1..=65536 are served entirely from the flat array.
         // Rolling rebuild state only applies to the sharded fallback table.
         if pgno <= FAST_LOCK_ARRAY_SIZE {
-            let val = self.fast_locks[pgno - 1].load(Ordering::Acquire);
+            let Some(slot) = self.fast_lock_slot_if_allocated(pgno) else {
+                return None;
+            };
+            let val = slot.load(Ordering::Acquire);
             return if val == 0 {
                 None
             } else {
@@ -1063,7 +1102,9 @@ impl InProcessPageLockTable {
         let fast_count = self
             .fast_locks
             .iter()
-            .filter(|s| s.load(Ordering::Relaxed) != 0)
+            .filter_map(OnceLock::get)
+            .flat_map(|chunk| chunk.iter())
+            .filter(|slot| slot.load(Ordering::Relaxed) != 0)
             .count();
         #[cfg(feature = "mvcc-flat-combining")]
         let shard_count: usize = self.fc_shards.iter().map(|s| s.len()).sum();
@@ -1338,14 +1379,17 @@ impl InProcessPageLockTable {
         // the shard tables.  This ensures stale locks from crashed transactions
         // are cleared regardless of whether they were in the fast path or the
         // sharded fallback path.
-        for slot in self.fast_locks.iter() {
-            let raw = slot.load(Ordering::Relaxed);
-            if raw != 0 {
-                if let Some(holder) = TxnId::new(raw) {
-                    if !is_active_txn(holder) {
-                        // Orphaned: CAS to 0.  Failure means another thread
-                        // already released or re-acquired — both are fine.
-                        let _ = slot.compare_exchange(raw, 0, Ordering::AcqRel, Ordering::Relaxed);
+        for chunk in self.fast_locks.iter().filter_map(OnceLock::get) {
+            for slot in chunk.iter() {
+                let raw = slot.load(Ordering::Relaxed);
+                if raw != 0 {
+                    if let Some(holder) = TxnId::new(raw) {
+                        if !is_active_txn(holder) {
+                            // Orphaned: CAS to 0.  Failure means another thread
+                            // already released or re-acquired — both are fine.
+                            let _ =
+                                slot.compare_exchange(raw, 0, Ordering::AcqRel, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -4492,7 +4536,7 @@ mod tests {
     #[test]
     fn test_lock_table_lookup_no_alloc() {
         // bd-22n.8: InProcessPageLockTable::holder() is allocation-free.
-        // It only reads through a Mutex<HashMap> with no intermediate containers.
+        // It only reads already-allocated storage with no intermediate containers.
         let table = InProcessPageLockTable::new();
         let txn = TxnId::new(1).unwrap();
         let page = PageNumber::new(42).unwrap();

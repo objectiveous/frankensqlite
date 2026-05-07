@@ -12,6 +12,47 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - Private memory page-cache fallback shard fanout
+
+- Target: remaining small private `:memory:` setup cost in UPDATE/DELETE and
+  transaction-strategy rows where profiles showed pager/page-cache construction
+  and fresh database fixed costs.
+- Touched during rejected candidate: `crates/fsqlite-pager/src/page_cache.rs`
+  and `crates/fsqlite-pager/src/pager.rs`; the reservation holder reverted the
+  source before commit.
+- Candidate shape: route private `/:memory:` pager opens to a
+  single-connection page-cache constructor that uses `MIN_PAGE_CACHE_SHARDS` for
+  the sharded fallback tier before the flat-array fast path takes over. Normal
+  file-backed/shared pager construction kept the default page-cache fanout.
+- Correctness/build proof reported by PurpleOtter:
+  - `cargo fmt -p fsqlite-pager --check` passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-page-cache-shards-local-target cargo test -p fsqlite-pager single_connection_initial_page_hint_keeps_fallback_shards_small -- --nocapture`
+    passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-page-cache-shards-local-target cargo check -p fsqlite-pager -p fsqlite-core`
+    passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-page-cache-shards-local-target cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete`
+    passed.
+- Conflicting evidence:
+  - PurpleOtter's focused UPDATE/DELETE repeats in
+    `tests/artifacts/perf/memory-page-cache-shards-purpleotter-20260507T080110Z/`
+    worsened section score twice (`1.176988 -> 1.207445` and
+    `1.071504 -> 1.272281`), with the 10K update row regressing.
+  - CrimsonGorge's read-only full quick matrix in
+    `tests/artifacts/perf/private-page-cache-shards-crimsongorge-20260507T0755Z/`
+    improved the primary weighted score (`0.3746319462 -> 0.3716428852`),
+    C-faster rows (`16 -> 14`), p90 (`1.2032368062 -> 1.1215995512`), and
+    write-single geomean (`1.2265527627 -> 1.1470306548`), while geomean
+    slightly worsened (`0.2763330429 -> 0.2775776435`).
+- Result: rejected/abandoned by the reservation holder because focused
+  UPDATE/DELETE failed and the source was reverted. Treat the current evidence
+  as inconclusive rather than a clean universal negative: the focused section
+  and full matrix disagreed.
+- Do not retry this as a standalone private page-cache shard reduction unless a
+  same-window run includes both repeated UPDATE/DELETE focused gates and a full
+  quick matrix, with both moving in the right direction. A future retry should
+  also include the candidate artifact in Git so the exact source diff and
+  benchmark basis are reproducible.
+
 ## 2026-05-07 - Lazy fallback page-lock shard allocation
 
 - Target: remaining fresh `:memory:` connection/open fixed cost after profiles

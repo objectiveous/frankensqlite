@@ -5,22 +5,35 @@ Agent: TanBear
 
 ## Scope
 
-Measured the already-dirty `crates/fsqlite-core/src/connection.rs` candidate
-that makes quotient-filter consultation explicitly dormant by returning
-`Ok(false)` before borrowing the per-table filter map. I did not author or
+Measured a peer-owned, already-dirty `crates/fsqlite-core/src/connection.rs`
+candidate related to dormant quotient-filter consultation. I did not author or
 stage the source diff. The worktree was dirty during measurement.
+
+Important attribution caveat: while this artifact was being produced,
+`crates/fsqlite-btree/src/cursor.rs` also became dirty under another agent's
+reservation. The benchmark binary may therefore include only the QF
+consultation candidate or a partially overlapping peer `cursor.rs` candidate,
+depending on Cargo's compile timing. Treat this bundle as a dirty-state
+no-keep signal and a secondary confirmation of the neighboring
+CrimsonGorge measurement, not as the authoritative standalone QF A/B.
 
 The candidate overlaps prior no-retry territory around QF maintenance /
 consultation, so the keep gate was the focused update/delete matrix before any
 source ownership decision.
 
-## Candidate diff shape
+## Candidate diff shape at initial inspection
 
 - Adds `QUOTIENT_FILTER_CONSULTATION_ENABLED: bool = false`.
 - Makes `qf_maybe_short_circuit_for_rowid` return `Ok(false)` immediately when
   disabled.
 - Rewrites the focused QF tests to assert that absent rowids still use the
   normal B-tree lookup path and record zero QF short-circuits.
+
+The authoritative same-window QF-only rejection is in
+`tests/artifacts/perf/update-delete-next-crimsongorge-20260507T1710Z/update-qf-dormant-consult.json`
+and the corresponding dirty negative-ledger entry. That run measured geomean
+`1.1564512197233796 -> 1.2592198894797841` and average
+`1.1677116353247705 -> 1.2930116072309275`.
 
 ## Correctness and build proof
 
@@ -65,6 +78,8 @@ Result JSON: `update-qf-dormant.json`
 
 Comparison reference: nearby clean focused baseline
 `tests/artifacts/perf/update-delete-next-crimsongorge-20260507T1710Z/update-current.json`.
+Because the worktree had concurrent dirty source changes, this comparison is
+not a pure source A/B.
 
 | Metric | Baseline | QF dormant candidate |
 | --- | ---: | ---: |
@@ -89,16 +104,18 @@ Per-row ratios:
 
 ## Decision
 
-Rejected as a standalone performance optimization. It improves one delete row
-and one large update row in this remeasure, but the focused section gate moves
-the wrong way overall: average/geomean regress and the tail ratio worsens.
+Rejected as a standalone performance optimization / dirty-state keep candidate.
+It improves one delete row and one large update row in this remeasure, but the
+focused section gate moves the wrong way overall: average/geomean regress and
+the tail ratio worsens. Because of the concurrent `cursor.rs` dirty change,
+this artifact should not be used to attribute the regression exclusively to QF.
 
 Do not retry explicit dormant QF consultation as a standalone optimization.
 Reconsider only if the QF feature is removed or redesigned for semantic reasons
 and a same-window update/delete plus full quick matrix shows neutral-or-better
 results.
 
-Patch-ready ledger note, if the ledger owner wants to add it:
+Patch-ready ledger note, if the ledger owner wants a secondary addendum:
 
 ```md
 ## 2026-05-07 - Explicitly dormant QF consultation

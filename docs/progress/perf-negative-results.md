@@ -12,6 +12,35 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - Stack-backed empty page-1 bootstrap
+
+- Target: small `:memory:` write/update/delete rows where profiles showed
+  repeated empty-database open cost, including `vec![0; page_size]` page-1
+  bootstrap allocation under `Connection::open_with_page_size_and_env`.
+- Touched during rejected candidate: `crates/fsqlite-pager/src/pager.rs`; the
+  candidate was reverted before commit.
+- Candidate shape: use a stack `[u8; 4096]` scratch page for empty database
+  bootstrap when `page_size <= PageSize::DEFAULT`, falling back to the existing
+  heap `Vec` for larger pages.
+- Focused evidence: `perf-update-delete 100 5000 delete fsqlite standard`
+  improved from the accepted lazy-commit-index profile run's `2310ns` per
+  deleted row to `2253ns` in
+  `tests/artifacts/perf/stack-bootstrap-page1-crimsongorge-20260507T0543Z/perf-delete-100-fsqlite-standard.txt`.
+- Matrix evidence:
+  - Baseline:
+    `tests/artifacts/perf/lazy-commit-index-chunks-crimsongorge-20260507T0506Z/report-full.json`.
+  - Candidate:
+    `tests/artifacts/perf/stack-bootstrap-page1-crimsongorge-20260507T0543Z/report-full.json`.
+- Result: rejected. The full quick matrix moved the primary score in the wrong
+  direction (`0.3781791993813428 -> 0.38512660315341524`), worsened
+  C-faster rows (`15 -> 19`), and regressed `write_single` geomean
+  (`1.1537259815867404 -> 1.2390301694080836`) despite the focused DELETE
+  probe looking better.
+- Do not retry stack-only page-1 bootstrap. Reconsider only as part of a larger
+  empty-open redesign that also reduces the surrounding VFS write/sync and
+  `SharedMvccState::new` costs, and keep it only if the full quick matrix
+  improves.
+
 ## 2026-05-07 - CommitIndex lazy-chunk get-first subvariant
 
 - Target: `CommitIndex` lazy fast-array chunks after the broader lazy-chunk

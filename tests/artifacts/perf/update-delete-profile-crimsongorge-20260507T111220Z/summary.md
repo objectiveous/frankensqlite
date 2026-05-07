@@ -156,3 +156,48 @@ Do not spend this lane on VDBE dispatch or parser work; the counters already sho
 3. Leaf-batched delete: when a run touches multiple cells on one leaf, compact the leaf once.
 
 This needs `crates/fsqlite-core/src/connection.rs` and likely `crates/fsqlite-btree/src/cursor.rs`. A standalone payload-byte patch is now fenced in the negative-results ledger.
+
+## Rejected Follow-up: Staged Table-Leaf Delete Mutation
+
+I tried a B-tree-only fallback while `connection.rs` was reserved: before the
+existing compact table-leaf delete cloned and rewrote `page_data`, the candidate
+checked whether the leaf page was already staged in the pager and mutated that
+staged page in place. It also delayed the fallback page clone until after the
+staged check. The intended win was to avoid one 4 KiB clone/write path for
+repeated direct DELETEs that already dirty the same leaf.
+
+Correctness gates passed in the shared worktree:
+
+- `cargo fmt -p fsqlite-btree`
+- `cargo test -p fsqlite-btree table_delete -- --nocapture`
+- `cargo test -p fsqlite-btree cursor_delete -- --nocapture`
+- `cargo test -p fsqlite-btree insert_delete -- --nocapture`
+
+The shared worktree had unrelated dirty `connection.rs` changes owned by another
+agent that failed the e2e build (`PendingDirectFixedRealUpdateRun::matches_shape`
+was `const fn` but compared non-const `PageSize` equality). I notified the
+owner and built the candidate from clean detached worktree
+`/data/tmp/frankensqlite-btree-delete-staged-20260507T1214Z` with only this
+B-tree patch applied.
+
+The benchmark rejected it on the primary C-relative matrix score:
+
+| Run | Baseline geomean ratio | Candidate geomean ratio |
+| --- | ---: | ---: |
+| 1 | `1.1766710923558232` | `1.284262164227931` |
+| 2 | `1.223223615798477` | `1.2568081393964907` |
+| 3 | `1.2186948120265304` | `1.3043536416247195` |
+
+Average section geomean ratio worsened from `1.2061965067269436` to
+`1.2818079817497139`. The FSQLite-only median average improved from
+`1.7101946111111108 ms` to `1.5841585555555557 ms`, but the project gate is the
+C-relative update/delete matrix; ratio worsened on five of six rows on average,
+with only `10000 rows / delete 500 rows` improving (`1.2050318401507203` to
+`1.1801234201419353`).
+
+The source change was removed. Evidence is kept in
+`report-update-delete-staged-delete-baseline*.json`,
+`report-update-delete-staged-delete-candidate*.json`,
+`stdout-staged-delete-baseline*.txt`, `stderr-staged-delete-baseline*.txt`,
+`stdout-staged-delete-candidate*.txt`, and
+`stderr-staged-delete-candidate*.txt`.

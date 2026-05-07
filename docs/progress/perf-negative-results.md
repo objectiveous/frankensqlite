@@ -12,6 +12,48 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - Depth-2 non-empty right-edge bulk append flush hook
+
+- Target: `INSERTThroughput - Transaction Strategy Comparison (small_3col)`,
+  especially the remaining `10000 rows / batched (1000/txn)` gap versus C
+  SQLite.
+- Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs` and
+  `crates/fsqlite-core/src/connection.rs`; the source was manually removed
+  after the focused measurement lost on the target row.
+- Candidate shape: add a narrow
+  `table_bulk_append_depth2_right_edge_sorted_records` primitive for monotonic
+  appends after a depth-2 table root, then call it from direct INSERT page-run
+  flush paths after the existing empty-root bulk loader and before row-at-a-time
+  append replay.
+- Correctness/build proof before measurement:
+  - `TMPDIR=/data/tmp cargo fmt -p fsqlite-btree -p fsqlite-core` passed.
+  - `TMPDIR=/data/tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-bulkappend-target cargo test -p fsqlite-btree test_table_bulk_append_depth2_right_edge_sorted_records_extends_tree -- --nocapture`
+    passed.
+  - `TMPDIR=/data/tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-bulkappend-target cargo test -p fsqlite-core test_prepared_direct_insert_page_run_flushes_before_read -- --nocapture`
+    passed.
+  - `TMPDIR=/data/tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-bulkappend-target cargo test -p fsqlite-core test_prepared_direct_simple_insert_executes_inside_explicit_transaction -- --nocapture`
+    passed.
+  - `TMPDIR=/data/tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-bulkappend-perf-target cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/current-gap-refresh-purpleotter-20260507T1000Z/summary.md`,
+  `report-transaction.json`, `candidate-transaction.json`, `stdout.txt`,
+  `stderr.txt`, `candidate-stdout.txt`, and `candidate-stderr.txt`.
+- Result: rejected. The transaction-section aggregate improved
+  (`primary weighted score 1.0031958927979898 -> 0.9054630878224692`), but the
+  target row moved the wrong way: FSQLite median worsened
+  `4.305162 ms -> 4.376543 ms`, and the ratio worsened
+  `1.2894486040035198 -> 1.3574438929737422`. The hot-row profile counters
+  stayed effectively unchanged (`btree_leaf_payload_appends=8934`,
+  `btree_quick_balance_hits=57`, `btree_conservative_reloads=57` in both
+  runs), which indicates the new flush hook did not materially affect the row
+  it was meant to fix.
+- Do not retry this as a btree-only primitive plus flush hook. Reconsider only
+  after connection-level buffering can safely form non-empty monotonic INSERT
+  runs and a focused proof shows the new primitive is actually invoked and the
+  `10000 rows / batched (1000/txn)` FSQLite median improves before a full quick
+  matrix repeat.
+
 ## 2026-05-07 - Retained autocommit direct INSERT page-run widening
 
 - Target: remaining `:memory:` autocommit INSERT transaction-strategy gap where

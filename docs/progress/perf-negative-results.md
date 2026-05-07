@@ -12,6 +12,75 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - Prepared direct INSERT append-hint active bit
+
+- Target: `comprehensive-bench --quick --filter insert`, especially page-run
+  direct INSERT shapes where the connection crosses generic append-hint
+  clear/take sites while the retained table-local hint is usually empty.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  the source was manually restored after the correctness gate failed, before
+  any benchmark run.
+- Candidate shape: add a `Cell<bool>` beside
+  `prepared_direct_insert_append_hint` so clear/take sites can skip the
+  `RefCell` borrow when no append hint is parked.
+- Correctness proof before measurement: rejected. The focused gate
+  `cargo test -p fsqlite-core prepared_direct_simple_insert -- --nocapture`
+  failed in
+  `test_prepared_direct_simple_insert_autocommit_retains_memory_append_hint`
+  before benchmarking. Re-running the same focused test after restoring the
+  candidate source showed the failure was already present in the current tree
+  because the test still expected retained page bytes after the newer B-tree
+  staged-page mutation path deliberately clears duplicate page data.
+- Result: not a keep. No benchmark was run because the candidate did not clear
+  the correctness gate and the code shape adds state that can get out of sync
+  with the owned append hint during take/store control flow.
+- Do not retry an out-of-band active bit around
+  `prepared_direct_insert_append_hint` as a standalone micro-optimization.
+  Reconsider only if the hint is refactored into a single owned state machine
+  where the presence bit and value cannot diverge.
+
+## 2026-05-07 - Direct UPDATE/DELETE autocommit probe gate hoist
+
+- Target: `comprehensive-bench --quick --filter update`, especially the
+  remaining small explicit-transaction direct UPDATE/DELETE rows where fixed
+  per-call ceremony is visible after the direct DML fast path.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  the source was manually restored immediately after the focused benchmark
+  rejected the candidate.
+- Candidate shape: compute the `fsqlite.statement_reuse` tracing gate once in
+  `execute_precompiled_prepared_update_or_delete`, and skip the autocommit-only
+  direct-DML probe when `in_txn_confirmed` is already true. The intent was to
+  remove redundant route checks before the explicit-transaction direct lane.
+- Correctness proof before measurement:
+  - `cargo fmt -p fsqlite-core --check` passed.
+  - `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-dml-gate-hoist-target CARGO_BUILD_JOBS=10 cargo test -p fsqlite-core test_direct_simple_update_delete_fast_path_executes_and_is_correct -- --nocapture`
+    passed.
+  - `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-dml-gate-hoist-bench-target CARGO_BUILD_JOBS=10 cargo build -p fsqlite-e2e --bin comprehensive-bench --profile release-perf`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/full-quick-current-crimsongorge-20260507T2242Z/update-baseline-rerun-report.json`,
+  `update-dml-gate-hoist-report.json`,
+  `stdout/update-baseline-rerun.err`, `stdout/update-dml-gate-hoist.err`,
+  `stdout/build-dml-gate-hoist.out`, and `stdout/build-dml-gate-hoist.err`.
+  Post-run status also showed an unowned dirty
+  `crates/fsqlite-btree/src/cursor.rs` SmallVec candidate in the shared
+  checkout, so treat this as a no-keep signal for the route-hoist shape rather
+  than a clean standalone A/B proof.
+- Result: rejected. Same-window focused update/delete geomean ratio worsened
+  from `1.0406236970466178` to `1.2087296154254785`, average ratio worsened
+  from `1.0661450609718544` to `1.2287248777917592`, and the high-signal
+  small rows regressed (`100 rows / update 10 rows` `0.128681 ms ->
+  0.131146 ms`, `100 rows / delete 5 rows` `0.115717 ms -> 0.119514 ms`).
+  Larger rows also moved the wrong way, including `10000 rows / update 1000
+  rows` `3.751505 ms -> 3.80204 ms` and `10000 rows / delete 500 rows`
+  `3.604911 ms -> 3.529159 ms` absolute FSQLite but worse ratios because
+  C SQLite moved more in the same window.
+- Do not retry this route-check hoist or statement-reuse tracing gate caching
+  as a standalone direct UPDATE/DELETE optimization. Reconsider only inside a
+  broader retained direct-DML execution design that removes cursor/root-descent
+  and route ceremony together, and keep it only if the focused section and full
+  quick matrix both improve in the same A/B window.
+
 ## 2026-05-07 - Prepared direct INSERT lazy param-one text cache
 
 - Target: `comprehensive-bench --quick --filter insert`, especially tiny and

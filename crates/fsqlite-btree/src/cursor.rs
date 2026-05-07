@@ -3953,7 +3953,7 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         let mut content_offset = self.usable_size as usize;
-        let mut cell_offsets = Vec::with_capacity(records.len());
+        let mut cell_offsets: SmallVec<[u16; 256]> = SmallVec::with_capacity(records.len());
         let mut payload_varint = [0u8; 9];
         let mut rowid_varint = [0u8; 9];
 
@@ -4023,7 +4023,8 @@ impl<P: PageWriter> BtCursor<P> {
             }
         })?;
         let mut content_offset = self.usable_size as usize;
-        let mut cell_offsets = Vec::with_capacity(children.len().saturating_sub(1));
+        let mut cell_offsets: SmallVec<[u16; 256]> =
+            SmallVec::with_capacity(children.len().saturating_sub(1));
         let mut rowid_varint = [0u8; 9];
 
         for child in &children[..children.len() - 1] {

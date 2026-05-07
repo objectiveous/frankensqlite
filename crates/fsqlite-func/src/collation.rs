@@ -18,7 +18,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tracing::{debug, info};
 
@@ -100,6 +100,29 @@ fn strip_trailing_spaces(s: &[u8]) -> &[u8] {
     &s[..end]
 }
 
+fn builtin_collation(name: &str) -> Option<Arc<dyn CollationFunction>> {
+    type BuiltinCollations = (
+        Arc<dyn CollationFunction>,
+        Arc<dyn CollationFunction>,
+        Arc<dyn CollationFunction>,
+    );
+
+    static BUILTINS: OnceLock<BuiltinCollations> = OnceLock::new();
+    let (binary, nocase, rtrim) = BUILTINS.get_or_init(|| {
+        (
+            Arc::new(BinaryCollation) as Arc<dyn CollationFunction>,
+            Arc::new(NoCaseCollation) as Arc<dyn CollationFunction>,
+            Arc::new(RtrimCollation) as Arc<dyn CollationFunction>,
+        )
+    });
+    match name {
+        "BINARY" => Some(Arc::clone(binary)),
+        "NOCASE" => Some(Arc::clone(nocase)),
+        "RTRIM" => Some(Arc::clone(rtrim)),
+        _ => None,
+    }
+}
+
 // ── Collation registry ─────────────────────────────────────────────────
 
 /// Registry for collation functions, keyed by case-insensitive name.
@@ -108,15 +131,13 @@ fn strip_trailing_spaces(s: &[u8]) -> &[u8] {
 /// Custom collations can be registered via [`CollationRegistry::register`].
 #[derive(Clone)]
 pub struct CollationRegistry {
-    collations: HashMap<String, Arc<dyn CollationFunction>>,
+    custom_collations: HashMap<String, Arc<dyn CollationFunction>>,
 }
 
 impl std::fmt::Debug for CollationRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut names = self.collations.keys().cloned().collect::<Vec<_>>();
-        names.sort_unstable();
         f.debug_struct("CollationRegistry")
-            .field("collations", &names)
+            .field("collations", &self.names())
             .finish()
     }
 }
@@ -131,20 +152,9 @@ impl CollationRegistry {
     /// Create a new registry pre-populated with BINARY, NOCASE, and RTRIM.
     #[must_use]
     pub fn new() -> Self {
-        let mut collations = HashMap::with_capacity(3);
-        collations.insert(
-            "BINARY".to_owned(),
-            Arc::new(BinaryCollation) as Arc<dyn CollationFunction>,
-        );
-        collations.insert(
-            "NOCASE".to_owned(),
-            Arc::new(NoCaseCollation) as Arc<dyn CollationFunction>,
-        );
-        collations.insert(
-            "RTRIM".to_owned(),
-            Arc::new(RtrimCollation) as Arc<dyn CollationFunction>,
-        );
-        Self { collations }
+        Self {
+            custom_collations: HashMap::new(),
+        }
     }
 
     /// Register a custom collation. Returns the previous collation with the
@@ -157,7 +167,9 @@ impl CollationRegistry {
     ) -> Option<Arc<dyn CollationFunction>> {
         let name = collation.name().to_ascii_uppercase();
         info!(collation_name = %name, deterministic = true, "custom collation registration");
-        self.collations.insert(name, Arc::new(collation))
+        self.custom_collations
+            .insert(name.clone(), Arc::new(collation))
+            .or_else(|| builtin_collation(&name))
     }
 
     /// Look up a collation by name (case-insensitive).
@@ -166,7 +178,11 @@ impl CollationRegistry {
     #[must_use]
     pub fn find(&self, name: &str) -> Option<Arc<dyn CollationFunction>> {
         let canon = name.to_ascii_uppercase();
-        let result = self.collations.get(&canon).cloned();
+        let result = self
+            .custom_collations
+            .get(&canon)
+            .cloned()
+            .or_else(|| builtin_collation(&canon));
         debug!(
             collation = %canon,
             hit = result.is_some(),
@@ -178,7 +194,8 @@ impl CollationRegistry {
     /// Check whether a collation with the given name is registered.
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
-        self.collations.contains_key(&name.to_ascii_uppercase())
+        let canon = name.to_ascii_uppercase();
+        self.custom_collations.contains_key(&canon) || builtin_collation(&canon).is_some()
     }
 
     /// Return registered collation names in stable display order.
@@ -190,7 +207,7 @@ impl CollationRegistry {
     pub fn names(&self) -> Vec<String> {
         let mut names = vec!["BINARY".to_owned(), "NOCASE".to_owned(), "RTRIM".to_owned()];
         let mut custom: Vec<String> = self
-            .collations
+            .custom_collations
             .keys()
             .filter(|name| !matches!(name.as_str(), "BINARY" | "NOCASE" | "RTRIM"))
             .cloned()

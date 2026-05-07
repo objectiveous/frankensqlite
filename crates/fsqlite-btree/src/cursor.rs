@@ -4168,6 +4168,240 @@ impl<P: PageWriter> BtCursor<P> {
         }
     }
 
+    /// Return whether one new right-edge table record matches the narrow
+    /// depth-2 bulk-append shape.
+    pub fn table_can_bulk_append_depth2_right_edge_record(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        payload: &[u8],
+    ) -> Result<bool> {
+        if !self.is_table {
+            return Ok(false);
+        }
+        let payload_size = u32::try_from(payload.len()).map_err(|_| FrankenError::TooBig)?;
+        if cell::has_overflow(payload_size, self.usable_size, BtreePageType::LeafTable) {
+            return Ok(false);
+        }
+
+        let root_data = self.pager.read_page_data(cx, self.root_page)?;
+        let root_header = cell::parse_page_header(root_data.as_bytes(), self.root_page)?;
+        if root_header.page_type != BtreePageType::InteriorTable || root_header.cell_count == 0 {
+            return Ok(false);
+        }
+        if root_header.first_freeblock != 0 || root_header.fragmented_free_bytes != 0 {
+            return Ok(false);
+        }
+        let Some(old_right_child) = root_header.right_child else {
+            return Ok(false);
+        };
+
+        let old_right_data = self.pager.read_page_data(cx, old_right_child)?;
+        let old_right_header = cell::parse_page_header(old_right_data.as_bytes(), old_right_child)?;
+        if old_right_header.page_type != BtreePageType::LeafTable
+            || old_right_header.cell_count == 0
+        {
+            return Ok(false);
+        }
+        let old_right_header_offset = cell::header_offset_for_page(old_right_child);
+        let old_right_ptrs = cell::read_cell_pointers(
+            old_right_data.as_bytes(),
+            &old_right_header,
+            old_right_header_offset,
+        )?;
+        let Some(last_ptr) = old_right_ptrs.last().copied() else {
+            return Ok(false);
+        };
+        let Some(old_max_rowid) =
+            cell::read_table_leaf_rowid_at_offset(old_right_data.as_bytes(), usize::from(last_ptr))
+        else {
+            return Ok(false);
+        };
+        if rowid <= old_max_rowid {
+            return Ok(false);
+        }
+
+        let root_header_offset = cell::header_offset_for_page(self.root_page);
+        let root_content_offset =
+            usize::try_from(root_header.cell_content_offset).map_err(|_| FrankenError::TooBig)?;
+        if root_content_offset == 0 {
+            return Ok(false);
+        }
+        Ok(Self::bulk_page_can_append_cell(
+            root_header_offset,
+            BtreePageType::InteriorTable,
+            usize::from(root_header.cell_count),
+            root_content_offset,
+            Self::table_interior_cell_len(old_max_rowid),
+        ))
+    }
+
+    /// Bulk-append sorted table records to the right edge of a depth-2 table.
+    ///
+    /// This deliberately handles only the common benchmark-shaped case where
+    /// the root is an interior-table page whose right child is the current
+    /// rightmost leaf and the root has enough free space for the new child
+    /// separators. Deeper trees, root splits, overflow payloads, and unordered
+    /// rows return `Ok(false)` so callers can fall back to normal append logic.
+    pub fn table_bulk_append_depth2_right_edge_sorted_records<R: AsRef<[u8]>>(
+        &mut self,
+        cx: &Cx,
+        records: &[(i64, R)],
+    ) -> Result<bool> {
+        if !self.is_table || records.is_empty() {
+            return Ok(false);
+        }
+        if records.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Ok(false);
+        }
+
+        let root_data = self.pager.read_page_data(cx, self.root_page)?;
+        let root_header = cell::parse_page_header(root_data.as_bytes(), self.root_page)?;
+        if root_header.page_type != BtreePageType::InteriorTable || root_header.cell_count == 0 {
+            return Ok(false);
+        }
+        if root_header.first_freeblock != 0 || root_header.fragmented_free_bytes != 0 {
+            return Ok(false);
+        }
+        let Some(old_right_child) = root_header.right_child else {
+            return Ok(false);
+        };
+
+        let old_right_data = self.pager.read_page_data(cx, old_right_child)?;
+        let old_right_header = cell::parse_page_header(old_right_data.as_bytes(), old_right_child)?;
+        if old_right_header.page_type != BtreePageType::LeafTable
+            || old_right_header.cell_count == 0
+        {
+            return Ok(false);
+        }
+        let old_right_header_offset = cell::header_offset_for_page(old_right_child);
+        let old_right_ptrs = cell::read_cell_pointers(
+            old_right_data.as_bytes(),
+            &old_right_header,
+            old_right_header_offset,
+        )?;
+        let Some(last_ptr) = old_right_ptrs.last().copied() else {
+            return Ok(false);
+        };
+        let Some(old_max_rowid) =
+            cell::read_table_leaf_rowid_at_offset(old_right_data.as_bytes(), usize::from(last_ptr))
+        else {
+            return Ok(false);
+        };
+        if records[0].0 <= old_max_rowid {
+            return Ok(false);
+        }
+
+        let Some(leaf_groups) = self.bulk_table_leaf_groups(records, 0)? else {
+            return Ok(false);
+        };
+
+        let root_header_offset = cell::header_offset_for_page(self.root_page);
+        let initial_root_cell_count = usize::from(root_header.cell_count);
+        let mut root_content_offset =
+            usize::try_from(root_header.cell_content_offset).map_err(|_| FrankenError::TooBig)?;
+        if root_content_offset == 0 {
+            return Ok(false);
+        }
+        let mut divider_keys = Vec::with_capacity(leaf_groups.len());
+        divider_keys.push(old_max_rowid);
+        divider_keys.extend(
+            leaf_groups
+                .iter()
+                .take(leaf_groups.len().saturating_sub(1))
+                .map(|group| records[group.end - 1].0),
+        );
+        for (root_cell_count, divider_key) in (initial_root_cell_count..).zip(divider_keys.iter()) {
+            let divider_len = Self::table_interior_cell_len(*divider_key);
+            if !Self::bulk_page_can_append_cell(
+                root_header_offset,
+                BtreePageType::InteriorTable,
+                root_cell_count,
+                root_content_offset,
+                divider_len,
+            ) {
+                return Ok(false);
+            }
+            root_content_offset -= divider_len;
+        }
+
+        let mut new_children = Vec::with_capacity(leaf_groups.len());
+        for group in &leaf_groups {
+            let page_no = self.pager.allocate_page(cx)?;
+            let page =
+                self.build_bulk_table_leaf_page(page_no, None, &records[group.start..group.end])?;
+            self.pager.write_page_data(cx, page_no, page)?;
+            new_children.push(BulkTableChild {
+                page_no,
+                max_rowid: records[group.end - 1].0,
+            });
+        }
+
+        let mut root_page = root_data.into_vec();
+        let mut root_ptrs = cell::read_cell_pointers(&root_page, &root_header, root_header_offset)?;
+        let mut write_offset =
+            usize::try_from(root_header.cell_content_offset).map_err(|_| FrankenError::TooBig)?;
+        let mut rowid_varint = [0u8; 9];
+        let mut append_cell = |child_page: PageNumber, divider_key: i64| -> Result<()> {
+            let rowid_len = write_varint(
+                &mut rowid_varint,
+                u64::from_ne_bytes(divider_key.to_ne_bytes()),
+            );
+            let cell_len = 4 + rowid_len;
+            write_offset = write_offset
+                .checked_sub(cell_len)
+                .ok_or(FrankenError::TooBig)?;
+            let cell_offset =
+                u16::try_from(write_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "bulk append root cell offset {} exceeds u16 range on page {}",
+                        write_offset,
+                        self.root_page.get()
+                    ),
+                })?;
+            root_page[write_offset..write_offset + 4]
+                .copy_from_slice(&child_page.get().to_be_bytes());
+            root_page[write_offset + 4..write_offset + cell_len]
+                .copy_from_slice(&rowid_varint[..rowid_len]);
+            root_ptrs.push(cell_offset);
+            Ok(())
+        };
+
+        append_cell(old_right_child, old_max_rowid)?;
+        for child in new_children
+            .iter()
+            .take(new_children.len().saturating_sub(1))
+        {
+            append_cell(child.page_no, child.max_rowid)?;
+        }
+        let new_right_child = new_children
+            .last()
+            .map(|child| child.page_no)
+            .ok_or(FrankenError::TooBig)?;
+        let new_header = BtreePageHeader {
+            page_type: BtreePageType::InteriorTable,
+            first_freeblock: root_header.first_freeblock,
+            cell_count: u16::try_from(root_ptrs.len()).map_err(|_| FrankenError::TooBig)?,
+            cell_content_offset: u32::try_from(write_offset).map_err(|_| FrankenError::TooBig)?,
+            fragmented_free_bytes: root_header.fragmented_free_bytes,
+            right_child: Some(new_right_child),
+        };
+        new_header.write(&mut root_page, root_header_offset);
+        cell::write_cell_pointers(&mut root_page, root_header_offset, &new_header, &root_ptrs);
+        self.pager
+            .write_page_data(cx, self.root_page, PageData::from_vec(root_page))?;
+
+        self.stack.clear();
+        self.at_eof = true;
+        self.last_insert_rowid = records.last().map(|record| record.0);
+        self.clear_rightmost_leaf_cache();
+        self.clear_seek_cache();
+        self.cell_slot_cache.get_mut().clear();
+        self.last_known_depth = Some(2);
+        self.bump_row_image_epoch();
+        Ok(true)
+    }
+
     fn refresh_rightmost_leaf_cache_after_insert(&mut self, cx: &Cx, rowid: i64) -> Result<()> {
         if let Some(cached) = self
             .rightmost_leaf_cache
@@ -16338,6 +16572,72 @@ mod tests {
                 .table_bulk_load_empty_root_sorted_records(&cx, &records)
                 .unwrap(),
             "bulk load must fall back once the root is no longer an empty leaf"
+        );
+    }
+
+    #[test]
+    fn test_table_bulk_append_depth2_right_edge_sorted_records_extends_tree() {
+        const USABLE: u32 = 4096;
+        let cx = Cx::new();
+        let root = PageNumber::new(2).unwrap();
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        let initial: Vec<(i64, Vec<u8>)> = (1_i64..=1_000_i64)
+            .map(|rowid| (rowid, vec![u8::try_from(rowid % 251).unwrap(); 220]))
+            .collect();
+        let appended: Vec<(i64, Vec<u8>)> = (1_001_i64..=2_000_i64)
+            .map(|rowid| (rowid, vec![u8::try_from(rowid % 251).unwrap(); 220]))
+            .collect();
+
+        assert!(
+            cursor
+                .table_bulk_load_empty_root_sorted_records(&cx, &initial)
+                .unwrap(),
+            "initial rows should bulk-load into an empty table"
+        );
+        assert_eq!(measure_tree_depth(&cursor.pager, root, USABLE), 2);
+        assert!(
+            cursor
+                .table_can_bulk_append_depth2_right_edge_record(
+                    &cx,
+                    appended[0].0,
+                    appended[0].1.as_slice()
+                )
+                .unwrap(),
+            "right-edge admission probe should accept the next sorted row"
+        );
+        assert!(
+            cursor
+                .table_bulk_append_depth2_right_edge_sorted_records(&cx, &appended)
+                .unwrap(),
+            "depth-2 right-edge append should accept sorted rows above the old max"
+        );
+        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 2_000);
+
+        assert!(cursor.first(&cx).unwrap());
+        for (expected_rowid, expected_payload) in initial.iter().chain(appended.iter()) {
+            assert_eq!(cursor.rowid(&cx).unwrap(), *expected_rowid);
+            assert_eq!(cursor.payload(&cx).unwrap(), *expected_payload);
+            if *expected_rowid < 2_000 {
+                assert!(cursor.next(&cx).unwrap());
+            }
+        }
+        assert!(!cursor.next(&cx).unwrap());
+        assert!(
+            !cursor
+                .table_can_bulk_append_depth2_right_edge_record(
+                    &cx,
+                    initial[0].0,
+                    initial[0].1.as_slice()
+                )
+                .unwrap(),
+            "right-edge admission probe must reject records below the old max"
+        );
+        assert!(
+            !cursor
+                .table_bulk_append_depth2_right_edge_sorted_records(&cx, &initial)
+                .unwrap(),
+            "append primitive must reject rows that do not sort after the old max"
         );
     }
 

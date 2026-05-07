@@ -1231,6 +1231,42 @@ pub fn sql_like_fast_path_matches(kind: SqlLikeFastPathKind, literal: &str, text
     }
 }
 
+/// Reusable matcher for simple LIKE patterns classified by `classify_sql_like_fast_path`.
+pub struct SqlLikeFastPathMatcher<'a> {
+    kind: SqlLikeFastPathKind,
+    literal: &'a str,
+    contains_finder: Option<memmem::Finder<'a>>,
+}
+
+impl<'a> SqlLikeFastPathMatcher<'a> {
+    #[must_use]
+    pub fn new(kind: SqlLikeFastPathKind, literal: &'a str) -> Self {
+        let contains_finder = (kind == SqlLikeFastPathKind::Contains && !literal.is_empty())
+            .then(|| memmem::Finder::new(literal.as_bytes()));
+        Self {
+            kind,
+            literal,
+            contains_finder,
+        }
+    }
+
+    #[must_use]
+    pub fn matches(&self, text: &str) -> bool {
+        if let (SqlLikeFastPathKind::Contains, Some(finder)) = (self.kind, &self.contains_finder) {
+            let text_bytes = text.as_bytes();
+            let needle_bytes = self.literal.as_bytes();
+            if needle_bytes.len() > text_bytes.len() {
+                return false;
+            }
+            if finder.find(text_bytes).is_some() {
+                return true;
+            }
+            return ascii_ci_contains_folded_scan(text_bytes, needle_bytes);
+        }
+        sql_like_fast_path_matches(self.kind, self.literal, text)
+    }
+}
+
 #[must_use]
 pub fn classify_sql_like_fast_path(
     pattern: &str,
@@ -1393,6 +1429,16 @@ fn ascii_ci_contains(text: &str, needle: &str) -> bool {
         return true;
     }
 
+    ascii_ci_contains_folded_scan(text, needle)
+}
+
+fn ascii_ci_contains_folded_scan(text: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > text.len() {
+        return false;
+    }
     let max_start = text.len() - needle.len();
     let first = needle[0];
     let first_folded = ascii_fold_byte(first);

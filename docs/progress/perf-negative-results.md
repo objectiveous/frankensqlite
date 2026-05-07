@@ -5600,3 +5600,36 @@ set: sessions found by
   optimization. Revisit only if profiling first proves the real workload keeps
   the exact row mirror hot for long monotone runs and a same-window isolated
   matrix improves update 1000/10000 without delete regressions.
+
+## 2026-05-07 - Non-empty page-run writer flush replay
+
+- Target: `INSERTThroughput - Transaction Strategy Comparison (small_3col)`,
+  especially `10000 rows / batched (1000/txn)` where profiles showed repeated
+  right-edge cursor/setup and append work.
+- Candidate shape: in `crates/fsqlite-core/src/connection.rs`, allow direct
+  INSERT page-runs to start on a non-empty right edge when the next explicit
+  rowid is greater than the table's last rowid, then flush records through the
+  existing `table_append_after_last_position_with_writer` payload-writer kernel
+  before falling back to byte-slice append. Source was reverted after the
+  transaction keep gate rejected it.
+- Correctness proof passed on the candidate:
+  `cargo fmt -p fsqlite-core` and
+  `env TMPDIR=/data/tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-pagebuilder-coretest-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core prepared_direct_insert_page_run -- --nocapture`.
+- Evidence artifacts:
+  `tests/artifacts/perf/right-edge-pagebuilder-purpleotter-20260507T125157Z/summary.md`,
+  `baseline-transaction.json`, `candidate-transaction.json`, and matching
+  stdout/stderr logs. Baseline worktree was built from `7660b8da`; candidate
+  carried only the `connection.rs` patch.
+- Result: rejected. The primary weighted score improved
+  `0.9403114839 -> 0.9287374158`, but geomean regressed
+  `0.9786733776 -> 1.0159826210` and write-bulk geomean regressed
+  `1.0104867009 -> 1.0916437903`. The target row worsened in absolute time and
+  ratio: `10000 rows / batched (1000/txn)` moved from `4.548586 ms` /
+  `1.3666644733` to `4.686143 ms` / `1.4288776944`. The candidate reduced
+  `cursor_setup_ns` and `btree_insert_ns`, but moved work into commit
+  (`commit_us=160.0 -> 3186.4`).
+- Do not retry non-empty page-run buffering plus writer-flush replay as a
+  standalone connection-level optimization. Revisit only with a true page
+  builder that lays out the non-empty right-edge run and parent updates in one
+  batch, and require an absolute FSQLite median improvement on
+  `10000 rows / batched (1000/txn)` before any full-matrix repeat.

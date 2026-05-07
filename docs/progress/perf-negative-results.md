@@ -40,13 +40,23 @@ Each entry should include:
   `stdout-samewindow-baseline*.txt`,
   `stderr-samewindow-baseline*.txt`,
   `stdout-microbatch-candidate*.txt`, and
-  `stderr-microbatch-candidate*.txt`.
+  `stderr-microbatch-candidate*.txt`. Repeat paired A/B follow-up:
+  `tests/artifacts/perf/direct-update-delete-microbatch-purpleotter-20260507T1159Z/summary.md`,
+  `baseline-update.json`, `candidate-update.json`,
+  `baseline-update-profile.json`, `candidate-update-profile.json`, and
+  `baseline-perf-*` / `candidate-perf-*`.
 - Result: rejected. Three same-window A/B pairs had average section geomean
   ratio `1.2150058278690452` for baseline versus
   `1.247387599103826` for candidate, and average FSQLite-only geomean
   worsened from `0.6078380658848437 ms` to `0.6189310105900363 ms`. Large
   delete sometimes improved, but medium rows regressed and the ratio-to-C gate
-  lost on two of three runs.
+  lost on two of three runs. The PurpleOtter repeat showed the same stop
+  condition in a cleaner paired run: no-profile section geomean moved
+  `1.2245037883938406 -> 1.1289754225301574`, but the isolated per-row harness
+  rejected the candidate on the target update path (`635 -> 694 ns/row` at 100
+  rows, `782 -> 827 ns/row` at 1000 rows, `844 -> 907 ns/row` at 10000 rows)
+  and delete also failed to improve (`1156 -> 1161`, `1103 -> 1164`,
+  `1221 -> 1248 ns/row`).
 - Do not retry schema-proof carry for direct UPDATE/DELETE as a standalone
   optimization. The avoided schema proof is not the dominant cost; revisit
   only if it falls out naturally inside a retained direct-DML cursor/run design

@@ -89,6 +89,191 @@ Each entry should include:
   same-window INSERT plus UPDATE/DELETE section win before applying it to the
   main worktree.
 
+## 2026-05-07 - sqlite_master rightmost rowid allocation
+
+- Target: fixed CREATE TABLE/setup overhead on the remaining small INSERT and
+  UPDATE/DELETE rows after profiling showed the DML mutation itself was already
+  fast and setup/insert dominated the gap.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  source was reverted immediately after the focused INSERT gate rejected it.
+- Candidate shape: replace the defensive full sqlite_master cursor scan in
+  `insert_sqlite_master_row_with_sql` and writable-schema raw sqlite_master
+  insertion with a rightmost-row lookup, floor `next_master_rowid` against that
+  max rowid, then append through `table_append_after_last_position`. This kept
+  the stale-counter and schema-hole invariant while avoiding O(n) sqlite_master
+  scans on ordinary DDL.
+- Correctness proof before measurement:
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-master-rowid-target cargo test -p fsqlite-core next_master_rowid -- --nocapture`
+  passed the schema reload and schema-hole rowid tests. The test command itself
+  finished successfully; a later `rch` artifact retrieval rsync hung and was
+  terminated after the green test result.
+- Evidence artifacts:
+  - Baseline current INSERT profile:
+    `tests/artifacts/perf/current-insert-profile-crimsongorge-20260507T0232Z/report-insert.json`.
+  - Candidate INSERT section:
+    `tests/artifacts/perf/sqlite-master-rowid-rightmost-crimsongorge-20260507T0310Z/report-insert.json`.
+- Result: rejected and reverted. The focused INSERT primary score regressed
+  `1.31098 -> 1.42125`, geomean regressed `1.09237 -> 1.23222`,
+  C-faster rows increased `14 -> 17`, write-bulk regressed
+  `1.05507 -> 1.19917`, and write-single regressed `1.40941 -> 1.50406`.
+  Absolute FrankenSQLite medians also regressed in too many rows, including
+  `small_3col` 100 rows (`0.123301 ms -> 0.248335 ms`), `medium_6col` 1000
+  rows (`0.561542 ms -> 0.756547 ms`), and `large_10col` 10K rows
+  (`11.917479 ms -> 14.639497 ms`), despite a few fixed-cost rows improving.
+- Do not retry sqlite_master full-scan replacement, rightmost-row allocation,
+  or append-position reuse as a standalone setup optimization. Revisit only if
+  a CREATE TABLE-specific profile shows sqlite_master rowid allocation as
+  retained self-time and a same-window full quick run improves both the primary
+  score and the write-bulk/write-single category scores.
+
+## 2026-05-07 - Pager committed-cache direct insertion
+
+- Target: INSERT commit overhead after profiling on clean `edccd638` showed
+  `SimpleTransaction<MemoryVfs>::commit`, `flush_write_set_to_db_file_batch`,
+  and `drain_committed_cache_pages` under the remaining write-bulk rows.
+- Touched during rejected candidate: `crates/fsqlite-pager/src/pager.rs`;
+  source was reverted after measurement.
+- Candidate shape: replace
+  `drain_committed_cache_pages() -> Vec<(PageNumber, PageBuf)>` with direct
+  insertion of drained staged pages into `self.cache` while checking
+  `inner.commit_seq`, avoiding the temporary committed-page vector allocation.
+- Correctness/build proof before measurement: `cargo fmt -p fsqlite-pager --check`
+  passed after formatting, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-pager-cache-clean-target cargo check -p fsqlite-pager --lib`
+  passed in the clean `edccd638` worktree.
+- Evidence artifacts:
+  - Clean baseline full quick:
+    `tests/artifacts/perf/clean-edccd-full-purpleotter-20260507T013900Z/report-full.json`.
+  - Candidate insert section:
+    `tests/artifacts/perf/pager-cache-direct-purpleotter-20260507T0201Z/report-insert.json`.
+- Result: rejected and reverted. Insert-only average ratio worsened to `1.36x`;
+  C-faster rows increased to `16/25`. Large-row regressions dominated the
+  result: `large_10col` 10K single transaction worsened from `12.011853 ms`
+  in the clean full baseline to `21.604153 ms`, and record-size `large_10col`
+  worsened from `11.486259 ms` to `21.567394 ms`. Smaller rows were mixed and
+  did not justify touching commit/cache semantics.
+- Do not retry direct cache insertion or temporary-Vec removal in this pager
+  path as a standalone perf change. Revisit only if a profile shows
+  `drain_committed_cache_pages` itself, not downstream cache insertion/page
+  ownership, as dominant retained self-time and a same-window INSERT plus full
+  quick A/B improves absolute FrankenSQLite medians.
+
+## 2026-05-07 - Empty-root bulk-loader duplicate leaf grouping reuse
+
+- Target: remaining multi-page explicit INSERT page-run flush cost after the
+  current profile showed large/medium 10K rows still paying commit/page-build
+  work even though per-row B-tree insertion was already batched.
+- Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs`;
+  source was reverted after the same-window INSERT section rejected it.
+- Candidate shape: in `BtCursor::table_bulk_load_empty_root_sorted_records`,
+  reuse the already-computed root leaf groups as the ordinary leaf groups when
+  `root_header_offset == 0`. Ordinary table roots do not carry SQLite's page-1
+  database header prefix, so the root-fit planning pass and the child-leaf
+  planning pass produce the same groups. Page-1 roots kept the existing
+  recomputation path.
+- Correctness/build proof before measurement: `cargo fmt -p fsqlite-btree --check`
+  passed,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-bulkgroup-target cargo test -p fsqlite-btree table_bulk_load_empty_root_sorted_records -- --nocapture`
+  passed the focused reachable-tree test,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-bulkgroup-target cargo check -p fsqlite-btree --lib`
+  passed, and the release-perf `comprehensive-bench` binary built.
+- Evidence artifacts:
+  - Candidate INSERT section:
+    `tests/artifacts/perf/bulkgroup-reuse-crimsongorge-20260507T0339Z/report-insert.json`.
+  - Same-window restored-baseline INSERT section:
+    `tests/artifacts/perf/bulkgroup-reuse-baseline-crimsongorge-20260507T0347Z/report-insert.json`.
+- Result: rejected and reverted. The focused INSERT primary score worsened
+  `1.31251 -> 1.35832`, geomean worsened `1.06435 -> 1.10294`,
+  average ratio worsened `1.12949 -> 1.17948`, p90 worsened
+  `1.52685 -> 1.62401`, and p99 worsened `2.29999 -> 2.50693`.
+  Write-bulk geomean worsened `1.02270 -> 1.06005`, write-single geomean
+  worsened `1.42633 -> 1.47535`, and absolute FrankenSQLite medians worsened
+  in `17/25` insert rows. The target large rows regressed materially:
+  record-size `large_10col` 10K worsened by `1.153270 ms`, and single-transaction
+  `large_10col` 10K worsened by `1.409400 ms`, despite isolated improvements
+  such as `medium_6col` 1000 rows improving by `0.185448 ms`.
+- Do not retry leaf-group planning reuse or duplicate grouping removal inside
+  the existing empty-root bulk loader as a standalone optimization. Revisit
+  only with a true fused planner/page builder that avoids both the grouping pass
+  and per-page payload rewrites, and require a same-window INSERT section win
+  before running the full quick matrix.
+
+## 2026-05-07 - Direct INSERT record-cell layout reuse
+
+- Target: prepared direct INSERT row-build/record serialization after perf
+  profiles showed `Connection::try_serialize_prepared_direct_simple_insert_record`
+  and direct-record layout work in the INSERT hot path.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`
+  in scratch worktrees only; the shared checkout was not edited because the file
+  was reserved.
+- Candidate shape: replace the serializer's separate
+  `SmallVec<[(serial_type, payload_len); 16]>` layout pass with a
+  `PreparedDirectInsertRecordCell { value, serial_type, payload_len }` collected
+  during `try_serialize_prepared_direct_simple_insert_record`, so serialization
+  reuses the layout computed after affinity application.
+- Correctness/build proof before measurement: `cargo fmt -p fsqlite-core --check`
+  passed in scratch, and
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-layoutreuse-check-target cargo check -p fsqlite-core --lib`
+  passed. The broad `test_prepared_direct_simple_insert` group had one
+  pre-existing clean-main failure in
+  `test_prepared_direct_simple_insert_executes_inside_explicit_transaction`, so
+  it was not candidate-specific.
+- Evidence artifacts:
+  - Scratch worktree:
+    `/data/projects/frankensqlite-layoutreuse-purpleotter-rch-20260507T0340Z`.
+  - Baseline INSERT section:
+    `/data/tmp/frankensqlite-layoutreuse-purpleotter-20260507T0340Z/baseline-insert.json`.
+  - Candidate INSERT section:
+    `/data/tmp/frankensqlite-layoutreuse-purpleotter-20260507T0340Z/candidate-insert.json`.
+- Result: rejected. The candidate improved insert avg/geomean
+  (`1.26249 -> 1.23337`, `1.17377 -> 1.13823`) and some large rows, but failed
+  the project keep gate: primary weighted score worsened `1.35791 -> 1.37669`,
+  write-single geomean worsened `1.43874 -> 1.48463`, p90 worsened
+  `1.63282 -> 1.75325`, and p99 worsened slightly `2.56035 -> 2.56613`.
+  Notable absolute FSQLite regressions included `small_3col` 1000
+  single transaction (`0.331651 ms -> 0.443140 ms`) and 10K batched
+  (`4.341832 ms -> 4.587422 ms`).
+- Do not retry direct-record layout reuse as a standalone connection-layer
+  change. Revisit only if the same idea is part of a fused bulk page/record
+  builder and a same-window full quick run improves primary score plus
+  write-bulk/write-single category scores.
+
+## 2026-05-07 - FunctionRegistry copy-on-write map clone
+
+- Target: fixed per-connection startup overhead after 100-row INSERT and
+  UPDATE/DELETE profiles showed the remaining gap was dominated by connection,
+  schema, setup, and prepare costs rather than mutation time.
+- Touched during rejected candidate: `crates/fsqlite-func/src/lib.rs`; source
+  was reverted immediately after the full quick matrix rejected it.
+- Candidate shape: change `FunctionRegistry`'s scalar, aggregate, and window
+  maps from owned `HashMap`s to `Arc<HashMap>` and use `Arc::make_mut` for
+  registration. This made `FunctionRegistry::clone_from_arc` cheap for maps
+  that a connection does not mutate, while preserving the public registry API.
+- Correctness/build proof before measurement: `cargo fmt -p fsqlite-func --check`
+  passed,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-func-cow-target cargo check -p fsqlite-func --lib`
+  passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-func-cow-target cargo test -p fsqlite-func`
+  passed with `404` tests, `0` failures, and `13` ignored perf tests.
+- Evidence artifacts:
+  - Baseline full quick:
+    `tests/artifacts/perf/current-clean-full-crimsongorge-20260507T0252Z/report-full.json`.
+  - Candidate full quick:
+    `tests/artifacts/perf/function-registry-cow-crimsongorge-20260507T0400Z/report-full.json`.
+- Result: rejected and reverted. The full quick primary weighted score
+  regressed `0.4256727367 -> 0.4275996880`; average ratio regressed
+  `0.6289344096 -> 0.6745824780`; p99 regressed
+  `2.5838276864 -> 4.5616830120`; write-bulk geomean regressed
+  `1.1826104374 -> 1.2775170175`; and write-single geomean regressed
+  `1.2880277067 -> 1.4351847605`. The worst fixed-cost target row,
+  `tiny_1col` 100-row single transaction, worsened to `4.56x` over C SQLite,
+  and large 10K rows also regressed badly.
+- Do not retry internal `FunctionRegistry` COW map cloning as a standalone
+  startup optimization. Revisit function-registry cloning only if a direct
+  connection-open profile shows registry map cloning as retained self-time and
+  a same-window full quick run improves both primary score and write category
+  geomeans.
+
 ## 2026-05-07 - SharedTxnPageIo borrowed concurrent context
 
 - Target: hot page I/O in INSERT and UPDATE/DELETE after profiles showed

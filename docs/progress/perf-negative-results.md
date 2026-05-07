@@ -12,6 +12,213 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - SharedTxnPageIo synthetic page-one cleanup negative cache
+
+- Target: `UPDATE/DELETEThroughput`, after an isolated `perf record` sample
+  showed `SharedTxnPageIo::clear_stale_synthetic_pending_commit_surface` in the
+  top hot symbols during repeated direct-simple UPDATE.
+- Touched during rejected candidate: `crates/fsqlite-vdbe/src/engine.rs`; the
+  source was manually restored after the focused section rejected the change.
+- Candidate shape: add a shared `Cell<bool>` negative cache to `SharedTxnPageIo`
+  so concurrent page I/O starts conservative, probes page-one synthetic
+  conflict tracking once, then skips repeated cleanup probes until allocator,
+  free-page, or page-one tracking paths mark cleanup as possible again.
+- Correctness/build proof before measurement:
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-update-delete-next-target CARGO_BUILD_JOBS=16 cargo fmt -p fsqlite-vdbe --check`
+    passed.
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-update-delete-next-target CARGO_BUILD_JOBS=16 cargo test -p fsqlite-vdbe page_one -- --nocapture`
+    passed locally after an RCH retrieval wrapper hung post-pass.
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-update-delete-next-target CARGO_BUILD_JOBS=16 cargo build -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete --profile release-perf`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/update-delete-next-crimsongorge-20260507T1710Z/update-current.json`,
+  `update-pageone-negative-cache.json`,
+  `stdout/update-pageone-negative-cache.out`, and
+  `stdout/update-pageone-negative-cache.err`.
+- Result: rejected. The focused section gate moved the wrong way: geomean ratio
+  `1.1564512197233796 -> 1.2540719758886116`, average ratio
+  `1.1677116353247705 -> 1.2694155421623223`, comparable rows `2 -> 0`, and
+  C SQLite faster rows `4 -> 6`. Some large FSQLite medians improved
+  (`10000 update` `4.281429 ms -> 3.986017 ms`, `10000 delete`
+  `3.927927 ms -> 3.683761 ms`), but the small-row rows regressed and the
+  section matrix failed.
+- Do not retry a per-adapter boolean negative cache for page-one synthetic
+  cleanup as a standalone direct UPDATE/DELETE optimization. Reconsider only if
+  paired with a lower-level write-surface redesign that removes the per-row
+  write-page ceremony without adding a hot branch to every write.
+
+## 2026-05-07 - Same-size UPDATE staged-page overwrite probe
+
+- Target: `UPDATE/DELETEThroughput`, especially fixed-width REAL direct UPDATE
+  rows where an isolated `perf record` sample showed self-time in
+  `PageData::as_bytes_mut`, `write_page_internal`, and staged write-surface
+  maintenance under `table_overwrite_current_payload_same_size_no_overflow`.
+- Touched during rejected candidates:
+  `crates/fsqlite-btree/src/cursor.rs` and, for the adaptive retry,
+  `crates/fsqlite-core/src/connection.rs`. The source was manually restored
+  after the focused section rejected both variants.
+- Candidate shapes:
+  - Unconditional B-tree variant: before cloning and re-submitting the whole
+    leaf page for a same-size overwrite, call `try_mutate_staged_page_data` and
+    patch an already-staged leaf image in place.
+  - Adaptive retry: keep the default overwrite path for the first 64 executions
+    of a prepared fixed-width REAL direct UPDATE, then switch repeated loops to
+    the staged-page probe via a separate prefer-staged overwrite method.
+- Correctness/build proof before measurement:
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-update-delete-next-target CARGO_BUILD_JOBS=16 cargo fmt -p fsqlite-btree -p fsqlite-core --check`
+    passed.
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-update-delete-next-target CARGO_BUILD_JOBS=16 cargo test -p fsqlite-btree table_overwrite_current_payload_same_size_no_overflow -- --nocapture`
+    passed.
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-update-delete-next-target CARGO_BUILD_JOBS=16 cargo test -p fsqlite-core direct_simple_update -- --nocapture`
+    passed for the adaptive retry.
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-update-delete-next-target CARGO_BUILD_JOBS=16 cargo build -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete --profile release-perf`
+    passed for both measured variants.
+- Evidence artifacts:
+  `tests/artifacts/perf/update-delete-next-crimsongorge-20260507T1710Z/update-current.json`,
+  `update-staged-overwrite.json`, `update-adaptive-staged-overwrite.json`,
+  `stdout/update-staged-overwrite.err`,
+  `stdout/update-adaptive-staged-overwrite.err`,
+  `stdout/perf-update-delete-staged-overwrite-isolated.err`, and
+  `stdout/perf-update-delete-adaptive-staged-overwrite-isolated.err`.
+- Result: rejected. The unconditional variant improved some large absolute
+  FSQLite medians (`10000 rows / update 1000 rows` `4.281429 ms ->
+  3.806522 ms`, `10000 rows / delete 500 rows` `3.927927 ms -> 3.470382 ms`)
+  but failed the section gate: geomean ratio
+  `1.1564512197233796 -> 1.1706410749024634`, average ratio
+  `1.1677116353247705 -> 1.1885956679385385`, and small-row ratios worsened.
+  The adaptive retry was worse: geomean ratio
+  `1.1564512197233796 -> 1.274136716373797`, average ratio
+  `1.1677116353247705 -> 1.336137408656441`, and the 100-row DELETE row
+  regressed from `0.120676 ms` to `0.188122 ms`.
+- Do not retry staged-page same-size overwrite probing as a standalone direct
+  UPDATE optimization. Reconsider only if the B-tree/pager API can patch the
+  authoritative staged page and cursor stack without triggering `PageData`
+  copy-on-write or extra control branches, and require same-window improvement
+  in the focused section, not just large-row absolute medians.
+
+## 2026-05-07 - Hard-disable dormant QF consultation in direct UPDATE/DELETE
+
+- Target: `UPDATE/DELETEThroughput`, especially the per-row direct-simple
+  UPDATE/DELETE path that still calls `qf_maybe_short_circuit_for_rowid` even
+  though build-on-first-consult was disabled by `4ea55010` after a severe
+  full-table scan regression.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`.
+  The performance part was manually reverted after measurement. The stale
+  quotient-filter tests were separately corrected to assert the current
+  disabled build-on-first-consult semantics.
+- Candidate shape: add an explicit always-false
+  `QUOTIENT_FILTER_CONSULTATION_ENABLED` guard at the top of
+  `qf_maybe_short_circuit_for_rowid`, so direct UPDATE/DELETE avoids even the
+  dormant `RefCell<HashMap<...>>` lookup when no current production path creates
+  quotient-filter entries.
+- Correctness/build proof before measurement:
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-update-delete-next-target CARGO_BUILD_JOBS=16 cargo fmt -p fsqlite-core --check`
+    passed.
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-update-delete-next-target CARGO_BUILD_JOBS=16 cargo test -p fsqlite-core quotient_filter -- --nocapture`
+    passed after updating the stale QF tests.
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-update-delete-next-target CARGO_BUILD_JOBS=16 cargo build -p fsqlite-e2e --bin comprehensive-bench --profile release-perf`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/update-delete-next-crimsongorge-20260507T1710Z/update-current.json`,
+  `update-qf-dormant-consult.json`, `stdout/update-current.err`, and
+  `stdout/update-qf-dormant-consult.err`.
+- Result: rejected. The focused section moved the wrong way: geomean ratio
+  `1.1564512197233796 -> 1.2592198894797841`, average ratio
+  `1.1677116353247705 -> 1.2930116072309275`, p90
+  `1.4506585635858391 -> 1.9091211450460472`. The 100-row UPDATE row worsened
+  from `0.128421 ms` to `0.166462 ms`, and the 10000-row DELETE row worsened
+  from `3.927927 ms` to `4.079655 ms`, despite 1000-row rows moving slightly
+  faster in the noisy candidate run.
+- Do not retry an unconditional hard-off QF consultation branch as a standalone
+  direct UPDATE/DELETE optimization. Reconsider QF only with a complete
+  activation redesign where entry creation, absent-key benefit, and present-key
+  overhead are all measured in the same real benchmark slice.
+
+## 2026-05-07 - Lazy VDBE fallback compilation for direct UPDATE/DELETE
+
+- Target: `UPDATE/DELETEThroughput`, especially the small prepared direct
+  UPDATE/DELETE rows where `prepare_us` is a visible part of total time.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  the source was restored with manual reverse patches after the focused
+  benchmark rejected the candidate.
+- Candidate shape: for prepared direct-simple UPDATE/DELETE statements, store
+  the shared placeholder `VdbeProgram` at prepare time and compile the real
+  table UPDATE/DELETE program lazily only if forced fallback, tracing, or a
+  direct-path `NotImplemented` bailout reaches the reusable table-program
+  dispatcher.
+- Correctness/build proof before measurement:
+  - `cargo fmt -p fsqlite-core` passed.
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-update-delete-next-target CARGO_BUILD_JOBS=16 rch exec -- cargo test -p fsqlite-core test_prepared_update_delete_precompute_statement_savepoint_skip_hint -- --nocapture`
+    passed.
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-update-delete-next-target CARGO_BUILD_JOBS=16 cargo test -p fsqlite-core test_prepared_update_delete_forced_fallback_use_instrumented_lane -- --nocapture`
+    passed after proving the lazy fallback execution path.
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-update-delete-next-target CARGO_BUILD_JOBS=16 cargo test -p fsqlite-core test_direct_simple_update_delete_fast_path_executes_and_is_correct -- --nocapture`
+    passed.
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-update-delete-next-target CARGO_BUILD_JOBS=16 cargo check -p fsqlite-core --all-targets`
+    passed.
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-update-delete-next-target CARGO_BUILD_JOBS=16 cargo build -p fsqlite-e2e --bin comprehensive-bench --profile release-perf`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/update-delete-next-crimsongorge-20260507T1710Z/update-current.json`,
+  `update-lazy-ud-program.json`, `stdout/update-current.err`, and
+  `stdout/update-lazy-ud-program.err`.
+- Result: rejected. The candidate did reduce measured prepare ceremony on the
+  smallest UPDATE row (`fs_update_100 prepare_us` about `24.7 -> 13.1`), but
+  the section gate moved the wrong way: geomean ratio
+  `1.1564512197233796 -> 1.2736550244705815`, average ratio
+  `1.1677116353247705 -> 1.2812755890557856`, comparable rows `2 -> 0`, and
+  C SQLite faster rows `4 -> 6`. The 100-row UPDATE/DELETE rows measured
+  `0.128421 ms` / `0.120676 ms` at baseline versus `0.1179 ms` /
+  `0.1177 ms` in the noisy candidate run, but the larger rows regressed enough
+  to fail the matrix gate, including `1000 delete 50` `0.409336 ms ->
+  0.5102 ms`.
+- Do not retry lazy UPDATE/DELETE fallback compilation by itself. The saved
+  prepare work is not the dominant section cost once full-row setup, mutation,
+  and commit timing are measured together. Reconsider only if paired with a
+  fallback-free direct DML plan where the reusable table-program path is no
+  longer needed for forced/traced execution.
+
+## 2026-05-07 - Retained direct UPDATE/DELETE cursor shell
+
+- Target: `UPDATE/DELETEThroughput`, especially repeated prepared rowid
+  UPDATE/DELETE loops inside one explicit concurrent transaction.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`
+  and `crates/fsqlite-vdbe/src/engine.rs`; the source was restored with a
+  reverse patch after the matrix rejected the candidate.
+- Candidate shape: expose the existing `SharedTxnPageIo` drain/refill pattern
+  used by retained VDBE storage cursors, then keep a connection-local
+  `BtCursor<SharedTxnPageIo>` for direct-simple UPDATE/DELETE. The cache was
+  gated by root page, page size, reserved bytes, schema generation, concurrent
+  session id, and `total_changes`, and reused `BtCursor::advance_to` on later
+  rowid probes to avoid root descent.
+- Correctness/build proof before measurement:
+  - `cargo fmt --check` passed.
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-update-delete-next-target CARGO_BUILD_JOBS=16 rch exec -- cargo check -p fsqlite-core --all-targets`
+    passed.
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-update-delete-next-target CARGO_BUILD_JOBS=16 rch exec -- cargo test -p fsqlite-core test_direct_simple_update_delete -- --nocapture`
+    passed.
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-update-delete-next-target CARGO_BUILD_JOBS=16 rch exec -- cargo build -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete --profile release-perf`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/update-delete-next-crimsongorge-20260507T1710Z/update-current.json`,
+  `update-retained-dml.json`, `stdout/update-current.err`,
+  `stdout/update-retained-dml.err`, `stdout/rebuild-retained-dml.err`, and
+  the earlier `perf-update-delete` isolated outputs in the same artifact
+  bundle.
+- Result: rejected. The focused update/delete matrix worsened materially:
+  summary geomean ratio `1.1564512197233796 -> 1.3768322577729717`, average
+  ratio `1.1677116353247705 -> 1.392106249500981`, comparable rows `2 -> 0`,
+  and C SQLite faster rows `4 -> 6`. FrankenSQLite row timings worsened on
+  every measured row, including `100 update 10` `0.128421 ms -> 0.1447 ms`,
+  `1000 update 100` `0.447378 ms -> 0.4926 ms`, and `10000 update 1000`
+  `4.281429 ms -> 5.14 ms`.
+- Do not retry a connection-local retained direct-DML cursor shell as a
+  standalone optimization, even when it uses `advance_to`. A retry is only
+  justified if the design also changes the mutation primitive itself, for
+  example a same-leaf batch update/delete API that avoids per-row
+  drain/refill, payload copy, and delete rebalance ceremony under one cursor
+  borrow.
+
 ## 2026-05-07 - Direct UPDATE/DELETE microbatch schema-proof carry
 
 - Target: `UPDATE/DELETEThroughput`, especially repeated prepared rowid

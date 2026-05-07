@@ -233,6 +233,52 @@ Each entry should include:
   `10000 rows / batched (1000/txn)` FSQLite median improves before a full quick
   matrix repeat.
 
+## 2026-05-07 - Broad depth-2 right-edge page-builder admission
+
+- Target: the same non-empty right-edge transaction row,
+  `INSERTThroughput - Transaction Strategy Comparison (small_3col)` /
+  `10000 rows / batched (1000/txn)`, plus the broader INSERT section.
+- Touched during candidate: `crates/fsqlite-btree/src/cursor.rs` and
+  `crates/fsqlite-core/src/connection.rs` in CrimsonGorge's dirty shared
+  worktree. TanBear measured the candidate read-only and did not edit, stage,
+  or revert those files.
+- Candidate shape: retry the depth-2 primitive with the missing
+  connection-level run formation, so pending direct INSERT page-runs are
+  materialized as whole right-edge leaf pages and parent divider cells instead
+  of replaying rows through `table_append_after_last_position`.
+- Legacy SQLite comparison: `sqlite3BtreeInsert()` uses `BTREE_APPEND` to bias
+  the cursor seek, and `balance_quick()` handles the append split by moving one
+  overflow cell to one new right sibling and inserting one parent divider cell.
+  The dirty candidate is more aggressive: it admits a whole buffered run and
+  splices multiple new leaves into the depth-2 parent. That is the right retry
+  direction for the target row, but the matrix shows the broad admission is too
+  coarse as-is.
+- Evidence artifacts:
+  `tests/artifacts/perf/right-edge-depth2-tanbear-20260507T1417Z/summary.md`,
+  `clean-fullquick.json`, `dirty-fullquick.json`,
+  `dirty-transaction-repeat.json`, `dirty-update-profile.json`, and the focused
+  repeat in
+  `tests/artifacts/perf/right-edge-depth2-insert-repeat-tanbear-20260507T1431Z/summary.md`,
+  `clean-insert.json`, and `dirty-insert.json`.
+- Result: not safe to land as a broad standalone admission. The full quick
+  same-window run improved the primary weighted score `0.370335 -> 0.368076`
+  and the target row moved sharply in the right direction (`4.475514 ms` /
+  `1.354616x` to `2.502868 ms` / `0.779247x`). The INSERT-only repeat
+  confirmed the target win (`4.336625 ms -> 2.507627 ms`) but worsened the
+  INSERT-section primary score `0.902771 -> 0.921972` and increased C-faster
+  INSERT rows `8 -> 9`. Regressions included `1000 rows / autocommit`
+  `0.728394 ms -> 1.012487 ms`, `tiny_1col` 100 rows
+  `0.069290 ms -> 0.081132 ms`, `large_10col` 100 rows
+  `0.169909 ms -> 0.184546 ms`, record-size `large_10col` 10K
+  `10.815963 ms -> 11.579393 ms`, and `small_3col` 10K single transaction
+  `2.895064 ms -> 3.001402 ms`.
+- Do not retry or land the broad depth-2 page-builder admission based on the
+  target row alone. Revisit only by narrowing admission so it fires for the
+  proven batched non-empty right-edge row while excluding the small-row,
+  autocommit, and large-record shapes that regressed, then publish a fresh
+  source-owned full quick matrix showing the weighted score and INSERT section
+  both clear the keep gate.
+
 ## 2026-05-07 - Retained autocommit direct INSERT page-run widening
 
 - Target: remaining `:memory:` autocommit INSERT transaction-strategy gap where

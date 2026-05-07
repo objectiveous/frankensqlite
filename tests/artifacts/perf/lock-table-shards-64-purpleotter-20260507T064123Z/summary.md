@@ -1,13 +1,12 @@
-# Current HEAD small-DML focused regression
+# Current HEAD shard/version-store matrix check
 
 Candidate state measured from local `HEAD` after two peer commits:
 
 - `a18bc551 perf(mvcc): drop LOCK_TABLE_SHARDS from 256 to 64 to cut fresh-DB open allocation`
 - `05d5eac5 perf(connection,vdbe): lazy-allocate VersionStore and skip Arc clone for programs that can't read snapshots`
 
-The focused measurement below rejects the combined local `HEAD` state against
-the earlier baseline binary. It should not be read as isolated attribution to
-the shard-fanout commit alone.
+The focused probe below looked worse than the earlier baseline binary, but the
+full quick matrix improved. Treat the matrix result as the keep gate.
 
 ## Scope
 
@@ -40,11 +39,29 @@ Results:
 | 100-row DELETE standard | 2351 ns/deleted row | 2522 ns/deleted row | regressed 7.3% |
 | 100-row UPDATE standard | 1425 ns/updated row | 1597 ns/updated row | regressed 12.1% |
 
+## Full quick matrix
+
+Command:
+
+- `/data/tmp/frankensqlite-purpleotter-lockshards64-perf-target/release-perf/comprehensive-bench --quick --json-out tests/artifacts/perf/lock-table-shards-64-purpleotter-20260507T064123Z/report-full.json --no-html`
+
+Compared with `tests/artifacts/perf/current-head-after-autocommit-preserialize-purpleotter-20260507T0615Z/report-full.json`:
+
+| Metric | Baseline | Candidate local `HEAD` | Direction |
+| --- | ---: | ---: | --- |
+| Primary weighted score | 0.390728 | 0.370574 | improved |
+| Geomean ratio | 0.290045 | 0.277310 | improved |
+| Median ratio | 0.307856 | 0.292624 | improved |
+| C SQLite faster rows | 20 | 14 | improved |
+| FrankenSQLite faster rows | 70 | 73 | improved |
+| Write-single geomean | 1.250352 | 1.192892 | improved |
+| Write-bulk geomean | 0.967384 | 0.951178 | improved |
+| Concurrent-writers geomean | 0.770590 | 0.742122 | improved |
+
 ## Disposition
 
-Rejected on the focused target before full-matrix promotion for the combined
-local `HEAD` binary. Because `05d5eac5` landed between the old baseline binary
-and this build, isolate `a18bc551` and `05d5eac5` before assigning blame or
-adding a final negative-ledger entry for either individual idea. Do not treat
-the current local `HEAD` small-DML result as a keep without a same-window
-Section 6 and full quick matrix win that outweigh these focused regressions.
+Keep at the matrix level for the combined local `HEAD` state. The focused
+100-row `perf-update-delete` probe regressed, but the full quick matrix improved
+the primary score and reduced C-faster rows. Because `a18bc551` and `05d5eac5`
+were not isolated here, do not attribute the matrix win to either individual
+commit without an isolated same-window run.

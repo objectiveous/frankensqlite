@@ -12,6 +12,53 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - Non-empty direct INSERT page-run via append hint
+
+- Target: `INSERTThroughput - Transaction Strategy Comparison (small_3col)`,
+  especially the remaining `10000 rows / batched (1000/txn)` gap versus C
+  SQLite.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`
+  and `crates/fsqlite-btree/src/cursor.rs`. The connection-level buffering
+  source was removed after measurement. The B-tree cursor-stack guard and
+  regression test discovered during correctness testing were kept as a separate
+  correctness fix.
+- Candidate shape: after the first normal right-edge insert established a
+  retained append hint, start a pending direct INSERT page-run for subsequent
+  explicit rowids that are strictly greater than the hint's last rowid, then
+  flush that non-empty run at the normal read/savepoint/commit boundary by
+  replaying rows through one hot cursor.
+- Correctness/build proof before measurement:
+  - `TMPDIR=/data/tmp cargo fmt -p fsqlite-btree -p fsqlite-core --check`
+    passed.
+  - `TMPDIR=/data/tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-nonempty-pagerun-btree-target cargo test -p fsqlite-btree test_table_append_after_last_position_repeated_after_existing_rows_crosses_split -- --nocapture`
+    passed after adding the cursor-stack guard.
+  - `TMPDIR=/data/tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-nonempty-pagerun-target cargo test -p fsqlite-core prepared_direct_insert_page_run -- --nocapture`
+    passed before measurement and passed again after the rejected
+    `connection.rs` changes were removed.
+  - `TMPDIR=/data/tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-nonempty-pagerun-perf-target cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/nonempty-pagerun-purpleotter-20260507T1030Z/summary.md`,
+  `candidate-transaction.json`, `candidate-stdout.txt`,
+  `candidate-stderr.txt`, `btreeguard-transaction.json`, and
+  `btreeguard-full.json`.
+- Result: rejected. The candidate reduced target-row cursor setup
+  (`cursor_setup_ns` from about `410210` to `14856`) but worsened the target
+  row in absolute time and ratio: retained append-hint baseline
+  `4.289494 ms` / `1.3290062724722278` became `4.76 ms` /
+  `1.4408254018260138`. Profile counters show the work moved to commit-time
+  full-cell replay: `commit_us=3524.8`, `btree_cell_assembly_calls=9000`,
+  `btree_leaf_full_cell_appends=8943`, and `btree_leaf_payload_appends=0`.
+  With the rejected `connection.rs` changes removed, the retained B-tree guard
+  did not reproduce this regression: the focused transaction row measured
+  `4.251529 ms` / `1.2777334488590038`, and the full quick matrix completed
+  with primary weighted score `0.36394897123082987`.
+- Do not retry append-hint-started non-empty page-run buffering if the flush
+  path replays row-at-a-time full-cell appends at commit. Reconsider only with a
+  true non-empty page builder or direct payload-writer flush that preserves the
+  payload-append kernel, and require an absolute FSQLite median improvement on
+  `10000 rows / batched (1000/txn)` before any full-matrix repeat.
+
 ## 2026-05-07 - Depth-2 non-empty right-edge bulk append flush hook
 
 - Target: `INSERTThroughput - Transaction Strategy Comparison (small_3col)`,

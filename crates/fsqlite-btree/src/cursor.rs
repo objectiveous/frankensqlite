@@ -1350,6 +1350,14 @@ impl<P> BtCursor<P> {
         let Some((leaf, ancestors)) = self.stack.split_last() else {
             return false;
         };
+        if let Some(depth) = self.last_known_depth
+            && self.stack.len() < depth
+        {
+            return false;
+        }
+        if leaf.page_no != self.root_page && ancestors.is_empty() {
+            return false;
+        }
         if !leaf.header.page_type.is_leaf() {
             return false;
         }
@@ -14248,6 +14256,34 @@ mod tests {
             .unwrap();
 
         assert_eq!(cursor.rowid(&cx).unwrap(), 129);
+    }
+
+    #[test]
+    fn test_table_append_after_last_position_repeated_after_existing_rows_crosses_split() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let payload = vec![b'R'; 180];
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+
+        for rowid in 1_i64..=8_i64 {
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+        }
+        assert!(cursor.last(&cx).unwrap());
+
+        for rowid in 9_i64..=72_i64 {
+            cursor
+                .table_append_after_last_position(&cx, rowid, &payload)
+                .unwrap();
+        }
+
+        for rowid in 1_i64..=72_i64 {
+            let seek = cursor
+                .table_move_to(&cx, rowid)
+                .expect("rowid seek should succeed after repeated append");
+            assert!(seek.is_found(), "rowid {rowid} should remain reachable");
+            assert_eq!(cursor.payload(&cx).unwrap(), payload.as_slice());
+        }
     }
 
     #[test]

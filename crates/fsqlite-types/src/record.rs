@@ -1868,6 +1868,12 @@ pub fn try_build_runtime_precomputed_record_header(
 /// Compute the total header size (including the header-size varint itself).
 #[allow(clippy::cast_possible_truncation)]
 fn compute_header_size(content_size: usize) -> usize {
+    // If content plus the size byte is <= 127, the header-size varint is
+    // exactly one byte. Most INSERT rows have only a few serial-type bytes.
+    if content_size <= 126 {
+        return content_size + 1;
+    }
+
     // Start with a guess and iterate.
     let mut header_size = content_size + 1; // +1 for the minimum varint
     loop {

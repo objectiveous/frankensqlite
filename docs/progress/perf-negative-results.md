@@ -76,20 +76,19 @@ Each entry should include:
     `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-lazy-fallback-shards-target cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete`.
 - Evidence:
   `tests/artifacts/perf/lazy-fallback-lock-shards-crimsongorge-20260507T0820Z/`
-  compared the candidate against the read-only private page-cache shard
-  candidate baseline in
-  `tests/artifacts/perf/private-page-cache-shards-crimsongorge-20260507T0755Z/candidate-full.json`.
-- Result: rejected. The focused transaction section improved
-  (`1.2336445211 -> 1.0683985850` weighted score), but the full quick matrix
-  failed the project keep gate: primary weighted score regressed
-  (`0.3716428852 -> 0.3828360498`), average ratio regressed
-  (`0.4890234668 -> 0.5240485468`), C-faster rows worsened (`14 -> 17`),
-  `write_bulk` geomean worsened (`0.8545908879 -> 0.9616011325`), and
-  `write_single` geomean worsened (`1.1470306548 -> 1.2589710874`).
-- Do not retry standalone lazy fallback page-lock shard allocation. Reconsider
-  only as part of a broader lock-table redesign that removes the fallback map
-  from open-state entirely and demonstrates a same-window full quick matrix
-  improvement, not just a transaction-section win.
+  records the attempted measurement, but the benchmark basis is confounded:
+  while the candidate was being built, the private page-cache shard diff used
+  as the intended baseline was reverted in the shared tree and a separate dirty
+  `crates/fsqlite-core/src/connection.rs` candidate appeared. The JSON is
+  retained for audit only, not as standalone performance proof.
+- Result: abandoned and reverted, with correctness proven but no valid
+  same-source A/B. The recorded focused transaction/full quick numbers compare
+  different dirty-tree states and must not be used as the reason to keep or
+  reject the idea.
+- Do not retry standalone lazy fallback page-lock shard allocation from this
+  artifact. Reconsider only in a clean worktree or after the active
+  `connection.rs` candidate lands/reverts, with baseline and candidate source
+  states pinned and a same-window full quick matrix.
 
 ## 2026-05-07 - Private memory retained-autocommit flush threshold 256 -> 1024
 

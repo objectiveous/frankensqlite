@@ -21,12 +21,18 @@ quick matrix failed the keep gate.
 - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-lazy-fallback-shards-target cargo test -p fsqlite-mvcc in_process_lock_table -- --nocapture` passed: 8 passed, 1 ignored.
 - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-lazy-fallback-shards-target cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete` passed.
 
-## Measurement
+## Measurement Caveat
 
-Baseline was the read-only private page-cache shard candidate:
+This artifact is retained for audit only. It is not a valid standalone A/B
+result.
+
+The intended baseline was the read-only private page-cache shard candidate:
 `tests/artifacts/perf/private-page-cache-shards-crimsongorge-20260507T0755Z/candidate-full.json`.
+While this candidate was being built, that pager diff was reverted in the shared
+tree and a separate dirty `crates/fsqlite-core/src/connection.rs` candidate
+appeared. The candidate binary therefore compared different dirty-tree states.
 
-Candidate:
+Candidate JSON:
 `tests/artifacts/perf/lazy-fallback-lock-shards-crimsongorge-20260507T0820Z/candidate-full.json`.
 
 | Metric | Baseline | Candidate |
@@ -43,5 +49,6 @@ Candidate:
 | Write-bulk geomean | 0.854591 | 0.961601 |
 | Write-single geomean | 1.147031 | 1.258971 |
 
-The focused transaction section improved, but the full matrix regressed. This is
-not a keep.
+These numbers are not a keep/reject proof for the lazy fallback lock-shard idea.
+The source patch was reverted; retry only from a clean worktree or after active
+peer-owned dirty source has landed or reverted.

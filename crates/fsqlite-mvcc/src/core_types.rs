@@ -2354,9 +2354,7 @@ impl CommitIndex {
     pub fn latest(&self, page: PageNumber) -> Option<CommitSeq> {
         let pgno = page.get() as usize;
         if pgno <= FAST_COMMIT_ARRAY_SIZE {
-            let Some(slot) = self.fast_slot_if_allocated(pgno) else {
-                return None;
-            };
+            let slot = self.fast_slot_if_allocated(pgno)?;
             let val = slot.load(Ordering::Acquire);
             return if val == 0 {
                 None

@@ -579,6 +579,10 @@ struct DetectedEnvironment {
     cargo_version: Option<String>,
     git_commit_sha: Option<String>,
     git_branch: Option<String>,
+    git_head_unix_ts: Option<u64>,
+    git_dirty: Option<bool>,
+    benchmark_binary_modified_unix_ts: Option<u64>,
+    benchmark_binary_older_than_git_head: Option<bool>,
     build_profile: String,
 }
 
@@ -1009,6 +1013,12 @@ impl DetectedEnvironment {
                 .filter(|stdout| !stdout.is_empty())
         }
 
+        fn system_time_unix_secs(time: SystemTime) -> Option<u64> {
+            time.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_secs())
+        }
+
         let os = std::fs::read_to_string("/etc/os-release")
             .ok()
             .and_then(|os_release| {
@@ -1062,6 +1072,26 @@ impl DetectedEnvironment {
         let cargo_version = command_stdout("cargo", &["--version"]);
         let git_commit_sha = command_stdout("git", &["rev-parse", "HEAD"]);
         let git_branch = command_stdout("git", &["branch", "--show-current"]);
+        let git_head_unix_ts = command_stdout("git", &["show", "-s", "--format=%ct", "HEAD"])
+            .and_then(|timestamp| timestamp.parse::<u64>().ok());
+        let git_dirty = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| !output.stdout.is_empty());
+        let benchmark_binary_modified_unix_ts = std::env::current_exe()
+            .ok()
+            .and_then(|exe| std::fs::metadata(exe).ok())
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(system_time_unix_secs);
+        let benchmark_binary_older_than_git_head =
+            match (benchmark_binary_modified_unix_ts, git_head_unix_ts) {
+                (Some(binary_modified), Some(head_timestamp)) => {
+                    Some(binary_modified < head_timestamp)
+                }
+                _ => None,
+            };
 
         Self {
             os,
@@ -1075,6 +1105,10 @@ impl DetectedEnvironment {
             cargo_version,
             git_commit_sha,
             git_branch,
+            git_head_unix_ts,
+            git_dirty,
+            benchmark_binary_modified_unix_ts,
+            benchmark_binary_older_than_git_head,
             build_profile: "release-perf".to_owned(),
         }
     }
@@ -1114,6 +1148,21 @@ impl DetectedEnvironment {
                 }
                 None => emit_line(to_stdout, format!("  Git: {git_commit_sha}")),
             }
+        }
+        if self.git_dirty == Some(true) {
+            emit_line(to_stdout, "  Git dirty: yes");
+        }
+        if let Some(modified) = self.benchmark_binary_modified_unix_ts {
+            emit_line(
+                to_stdout,
+                format!("  Binary modified: {}", format_unix_utc(modified)),
+            );
+        }
+        if self.benchmark_binary_older_than_git_head == Some(true) {
+            emit_line(
+                to_stdout,
+                "  Warning: benchmark binary predates Git HEAD; rebuild before trusting results",
+            );
         }
         emit_line(
             to_stdout,
@@ -1999,9 +2048,13 @@ fn chrono_stamp() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    format_unix_utc(now)
+}
+
+fn format_unix_utc(timestamp: u64) -> String {
     // Convert unix timestamp to readable date.
-    let days = now / 86400;
-    let secs_in_day = now % 86400;
+    let days = timestamp / 86400;
+    let secs_in_day = timestamp % 86400;
     let hours = secs_in_day / 3600;
     let mins = (secs_in_day % 3600) / 60;
     let secs = secs_in_day % 60;
@@ -3300,11 +3353,25 @@ mod tests {
                 cargo_version: Some("cargo test".to_owned()),
                 git_commit_sha: Some("0123456789abcdef".to_owned()),
                 git_branch: Some("main".to_owned()),
+                git_head_unix_ts: Some(1_700_000_000),
+                git_dirty: Some(false),
+                benchmark_binary_modified_unix_ts: Some(1_700_000_001),
+                benchmark_binary_older_than_git_head: Some(false),
                 build_profile: "release-perf".to_owned(),
             },
         );
 
         assert_eq!(json.schema_version, JSON_REPORT_SCHEMA_V3);
+        assert_eq!(json.environment.git_head_unix_ts, Some(1_700_000_000));
+        assert_eq!(json.environment.git_dirty, Some(false));
+        assert_eq!(
+            json.environment.benchmark_binary_modified_unix_ts,
+            Some(1_700_000_001)
+        );
+        assert_eq!(
+            json.environment.benchmark_binary_older_than_git_head,
+            Some(false)
+        );
         assert_eq!(json.summary.total_scenarios, 1);
         assert_eq!(json.summary.primary_metric, "per_category_weighted.score");
         assert_eq!(json.summary.per_category["write_bulk"].n, 1);
@@ -3379,6 +3446,10 @@ mod tests {
                 cargo_version: None,
                 git_commit_sha: None,
                 git_branch: Some("main".to_owned()),
+                git_head_unix_ts: None,
+                git_dirty: Some(false),
+                benchmark_binary_modified_unix_ts: None,
+                benchmark_binary_older_than_git_head: None,
                 build_profile: "release-perf".to_owned(),
             },
         );
@@ -3439,6 +3510,10 @@ mod tests {
                 cargo_version: None,
                 git_commit_sha: None,
                 git_branch: Some("main".to_owned()),
+                git_head_unix_ts: None,
+                git_dirty: Some(false),
+                benchmark_binary_modified_unix_ts: None,
+                benchmark_binary_older_than_git_head: None,
                 build_profile: "release-perf".to_owned(),
             },
         );

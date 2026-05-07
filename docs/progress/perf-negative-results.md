@@ -51,6 +51,205 @@ Each entry should include:
   same-window Section 6 matrix improvement in absolute FrankenSQLite medians,
   not just a focused harness win.
 
+## 2026-05-07 - Direct DML lookaside growth guard elision
+
+- Target: remaining small prepared direct INSERT/UPDATE/DELETE gaps where
+  per-row `StatementLookasideGrowthGuard` construction/drop still performed
+  dormant hot-path profiling checks with profiling disabled.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs` in
+  detached scratch worktree
+  `/data/tmp/frankensqlite-crimsongorge-lookaside-20260506T2355`; the main
+  worktree was not changed.
+- Candidate shape: add
+  `StatementLookasideGrowthGuard::new_when_profiled(conn, profile_enabled) ->
+  Option<Self>` and use it in prepared direct INSERT/UPDATE/DELETE so the normal
+  non-profiling path avoids the guard's drop-time retained-byte sampling check.
+- Correctness/build proof before measurement:
+  `cargo fmt -p fsqlite-core --check` passed in the scratch worktree, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-lookaside-target cargo check -p fsqlite-core --lib`
+  passed.
+- Evidence artifacts:
+  - Baseline clean HEAD full quick:
+    `tests/artifacts/perf/current-head-after-revert-crimsongorge-20260506T2329Z/report-full.json`.
+  - Candidate scratch INSERT:
+    `tests/artifacts/perf/lookaside-guard-scratch-crimsongorge-20260506T2357Z/report-insert.json`.
+  - Candidate scratch UPDATE/DELETE:
+    `tests/artifacts/perf/lookaside-guard-scratch-crimsongorge-20260506T2357Z/report-update.json`.
+- Result: rejected. INSERT was mixed and too small to justify touching the hot
+  path: 100-row tiny improved only `0.180638 ms -> 0.175158 ms`, while 100-row
+  small regressed `0.188052 ms -> 0.191478 ms` and 100-row transaction-strategy
+  single-txn regressed `0.111549 ms -> 0.112912 ms`. The target UPDATE/DELETE
+  rows moved sharply the wrong way: 100-row update regressed
+  `0.151935 ms -> 0.248596 ms`, and 100-row delete regressed
+  `0.145312 ms -> 0.241422 ms` with high candidate CVs.
+- Do not retry standalone `StatementLookasideGrowthGuard` elision or
+  `Option<Guard>` plumbing in direct DML. Revisit lookaside profiling overhead
+  only if a profile with profiling disabled shows the guard or
+  `note_statement_lookaside_alloc_growth` as retained self-time, and require a
+  same-window INSERT plus UPDATE/DELETE section win before applying it to the
+  main worktree.
+
+## 2026-05-07 - SharedTxnPageIo borrowed concurrent context
+
+- Target: hot page I/O in INSERT and UPDATE/DELETE after profiles showed
+  `TransactionKind::get_page` and shared transaction page-state checks on the
+  remaining write-side gap rows.
+- Touched during rejected candidate: `crates/fsqlite-vdbe/src/engine.rs`;
+  source was reverted after the full quick matrix rejected it.
+- Candidate shape: replace repeated `SharedTxnPageIo::concurrent_context()`
+  clones in read/write witness probes, dirty checks, staged mutation, and page
+  read/write paths with scoped immutable borrows of the `RefCell<Option<_>>`,
+  keeping the same concurrent-writer defaults and page-level MVCC behavior.
+- Correctness/build proof before measurement: `cargo fmt -p fsqlite-vdbe --check`
+  passed, `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-vdbe-context-target cargo check -p fsqlite-vdbe --lib`
+  passed, `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-vdbe-context-target cargo clippy -p fsqlite-vdbe --lib -- -D warnings`
+  passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-vdbe-context-target cargo test -p fsqlite-vdbe shared_txn_page_io -- --nocapture --test-threads=1`
+  passed.
+- Evidence artifacts:
+  - Baseline with the retained rowid-bucket SUM fast path:
+    `tests/artifacts/perf/rowid-bucket-sum-main-full-crimsongorge-20260507T0035Z/report-full.json`.
+  - Candidate focused UPDATE/DELETE:
+    `tests/artifacts/perf/vdbe-context-borrow-crimsongorge-20260507T0120Z/update-delete-report.json`.
+  - Candidate full quick:
+    `tests/artifacts/perf/vdbe-context-borrow-crimsongorge-20260507T0120Z/report-full.json`.
+- Result: rejected. The full quick weighted score regressed
+  `0.419154 -> 0.442052`, C-faster rows increased `21 -> 23`, p90 regressed
+  `1.4466 -> 1.5119`, p99 regressed `2.9264 -> 4.7195`, write-bulk geomean
+  regressed `1.2056 -> 1.2306`, and write-single geomean regressed
+  `1.3334 -> 1.4426`. The 100-row update row became much worse
+  (`0.211296 ms -> 0.524753 ms` FSQLite median, ratio
+  `1.617x -> 4.719x`), despite a few larger UPDATE/DELETE rows moving within
+  noise.
+- Do not retry standalone `SharedTxnPageIo` concurrent-context clone removal.
+  Revisit only if a profile shows `concurrent_context()` cloning as retained
+  self-time and the replacement can avoid broad `RefCell` borrow lifetimes while
+  winning the same-window full quick weighted score.
+
+## 2026-05-07 - Exact connection PRAGMA execute fast path
+
+- Target: small INSERT and transaction-strategy gaps where every benchmark
+  connection pays parser/planner/VDBE setup for repeated exact connection PRAGMA
+  setters before the measured work begins.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  source was reverted after the focused INSERT matrix rejected it.
+- Candidate shape: add a narrow `Connection::execute` pre-parse fast path for
+  exact `PRAGMA name = value` assignments covering `page_size`, `journal_mode`,
+  `synchronous`, `cache_size`, and the time-travel capture flag. Anything with
+  quoted values, extra statements, comments, invalid values, or query semantics
+  fell back to the normal parser path.
+- Correctness/build proof before measurement:
+  `cargo fmt -p fsqlite-core` passed after formatting,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-pragma-fastpath-target cargo check -p fsqlite-core --lib`
+  passed,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-pragma-fastpath-target cargo test -p fsqlite-core test_exact_connection_pragma_execute_fast_path_updates_state -- --nocapture`
+  passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-pragma-fastpath-target cargo clippy -p fsqlite-core --lib -- -D warnings`
+  passed.
+- Evidence artifacts:
+  - Baseline with the retained rowid-bucket SUM fast path:
+    `tests/artifacts/perf/rowid-bucket-sum-main-full-crimsongorge-20260507T0035Z/report-full.json`.
+  - Candidate focused INSERT:
+    `tests/artifacts/perf/exact-pragma-fastpath-crimsongorge-20260507T0120Z/report-insert.json`.
+- Result: rejected. The focused INSERT report still had C SQLite faster in
+  `16/25` rows, with weighted score `1.2329`, geomean `1.1586`, p90 `1.4344`,
+  p99 `2.9919`, write-bulk geomean `1.1449`, and write-single geomean
+  `1.2637`. Against the current full-matrix baseline rows, ratios improved in
+  only `11/25` INSERT rows and worsened in `14/25`; absolute FrankenSQLite
+  medians worsened in `22/25` rows. The target small rows were mixed: 100-row
+  medium improved by ratio (`2.9264x -> 1.3870x`) and large improved
+  (`2.1649x -> 1.0196x`), but tiny worsened (`2.4459x -> 2.9919x`) and most
+  larger rows moved the wrong way.
+- Do not retry engine-level exact PRAGMA setter bypass as a standalone
+  benchmark optimization. Revisit PRAGMA setup only if a profile shows measured
+  benchmark time, not setup time, is actually dominated by connection PRAGMA
+  execution, and require a same-window full quick improvement before keeping it.
+
+## 2026-05-07 - Prepared direct INSERT param-literal arithmetic variant
+
+- Target: prepared direct INSERT row-building cost after
+  `FSQLITE_BENCH_PROFILE_INSERT=1` showed `prepared_direct_insert_row_build`
+  dominating the remaining large INSERT path: about `1.73 ms` for 10K
+  `small_3col`, `2.96 ms` for 10K `medium_6col`, and `5.98 ms` for 10K
+  `large_10col`, while B-tree insert time was much smaller.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  source was reverted after the focused INSERT matrix rejected it.
+- Candidate shape: add a compiled `PreparedDirectSimpleInsertExpr` variant for
+  `?N <arithmetic-op> literal` and `literal <arithmetic-op> ?N`, so benchmark
+  expressions such as `?1 * 0.137`, `?1 * 7`, `?1 * 13`, and `?1 % 20` avoid
+  recursive boxed `BinaryOp` evaluation inside the direct-record serializer.
+- Correctness/build proof before measurement:
+  `cargo fmt -p fsqlite-core` passed,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-expr-specialize-target cargo check -p fsqlite-core --lib`
+  passed,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-expr-specialize-target cargo test -p fsqlite-core test_prepared_insert_precomputes_direct_simple_insert_plan -- --nocapture`
+  passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-expr-specialize-target cargo clippy -p fsqlite-core --lib -- -D warnings`
+  passed.
+- Evidence artifacts:
+  - Profile lead:
+    `tests/artifacts/perf/insert-profile-current-crimsongorge-20260507T0135Z/report.json`.
+  - Baseline with the retained rowid-bucket SUM fast path:
+    `tests/artifacts/perf/rowid-bucket-sum-main-full-crimsongorge-20260507T0035Z/report-full.json`.
+  - Candidate focused INSERT:
+    `tests/artifacts/perf/param-literal-expr-specialize-crimsongorge-20260507T0140Z/report-insert.json`.
+- Result: rejected. The focused INSERT report had weighted score `1.2873`,
+  geomean `1.1560`, p90 `1.9553`, p99 `3.3952`, write-bulk geomean `1.1326`,
+  and write-single geomean `1.3434`. Against the retained baseline rows,
+  ratios improved in `17/25` INSERT rows, but absolute FrankenSQLite medians
+  worsened in `21/25`, including target rows such as 1K `small_3col`
+  (`0.425377 ms -> 0.762548 ms`), 1K `medium_6col`
+  (`0.510446 ms -> 0.814745 ms`), and 10K `large_10col`
+  (`11.618710 ms -> 12.921337 ms`). The headline worst rows also remained bad:
+  tiny 100 regressed by ratio (`2.4459x -> 3.3952x`) and 100-row batched
+  transaction strategy regressed (`1.6883x -> 3.1575x`).
+- Do not retry a standalone param-literal arithmetic enum variant in prepared
+  direct INSERT. Revisit row construction only with a broader template/fused
+  serializer that proves lower absolute FrankenSQLite medians on the focused
+  INSERT section and then wins the full quick weighted score.
+
+## 2026-05-07 - Exact transaction-control execute fast path
+
+- Target: remaining 100-row INSERT and transaction-strategy gaps where the
+  measured work includes exact `BEGIN`/`COMMIT` calls through
+  `Connection::execute`.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  source was reverted after the focused INSERT matrix rejected it.
+- Candidate shape: add a narrow pre-parse recognizer for exact transaction
+  commands (`BEGIN`, `BEGIN TRANSACTION`, `BEGIN CONCURRENT`, `COMMIT`/`END`,
+  and exact `ROLLBACK`) and dispatch them straight to the existing transaction
+  helpers. Comment-bearing SQL, multi-statements, savepoint forms, and
+  `BEGIN IMMEDIATE`/`EXCLUSIVE`/`DEFERRED` fell back to the parser. Plain
+  `BEGIN` still called `execute_begin` with `mode: None`, preserving
+  `concurrent_mode_default` auto-promotion.
+- Correctness/build proof before measurement:
+  `cargo fmt -p fsqlite-core --check` passed,
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-txn-fastpath-target cargo test -p fsqlite-core test_exact_transaction_execute_skips_sql_parse -- --nocapture`
+  passed,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-txn-fastpath-target cargo check -p fsqlite-core --lib`
+  passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-txn-fastpath-target cargo clippy -p fsqlite-core --lib -- -D warnings`
+  passed.
+- Evidence artifacts:
+  - Baseline with the retained rowid-bucket SUM fast path:
+    `tests/artifacts/perf/rowid-bucket-sum-main-full-crimsongorge-20260507T0035Z/report-full.json`.
+  - Candidate focused INSERT:
+    `tests/artifacts/perf/exact-txn-fastpath-crimsongorge-20260507T0215Z/report-insert.json`.
+- Result: rejected. The focused INSERT report had weighted score `1.6036`,
+  geomean `1.1419`, p90 `1.7562`, p99 `2.8941`, write-bulk geomean
+  `1.0704`, and write-single geomean `1.8349`. Against the retained baseline
+  INSERT rows, ratios improved in `12/25` rows and worsened in `13/25`, but
+  absolute FrankenSQLite medians worsened in `23/25` rows. Notable regressions
+  included 100-row autocommit (`0.186940 ms -> 0.493755 ms`), 1K
+  `medium_6col` (`0.510446 ms -> 1.014921 ms`), 10K `large_10col`
+  (`11.618710 ms -> 14.872844 ms`), and 10K batched transaction strategy
+  (`4.542798 ms -> 5.406996 ms`).
+- Do not retry a standalone exact transaction-control bypass in
+  `Connection::execute`. Revisit transaction fixed costs only if a profile
+  shows parser/cache lookup inside measured `BEGIN`/`COMMIT` is retained
+  self-time and a same-window INSERT section proves lower absolute
+  FrankenSQLite medians before any full-matrix run.
+
 ## 2026-05-06 - Contiguous repeated-record page-run bulk loader
 
 - Target: remaining tiny/small INSERT gaps after the thread-local parse cache

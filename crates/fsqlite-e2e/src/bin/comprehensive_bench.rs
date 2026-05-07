@@ -2538,12 +2538,13 @@ fn profile_fsqlite_insert_with_strategy(
     reset_hot_path_profile();
     let wal_before = fsqlite_wal::wal_telemetry_snapshot();
 
-    let mut begin_us = 0.0;
-    if matches!(strategy, InsertProfileStrategy::SingleTxn) {
+    let mut begin_us = if matches!(strategy, InsertProfileStrategy::SingleTxn) {
         let begin_start = Instant::now();
         fs_execute(&conn, "BEGIN");
-        begin_us = begin_start.elapsed().as_secs_f64() * 1_000_000.0;
-    }
+        begin_start.elapsed().as_secs_f64() * 1_000_000.0
+    } else {
+        0.0
+    };
 
     let prepare_start = Instant::now();
     let statement = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
@@ -2566,7 +2567,10 @@ fn profile_fsqlite_insert_with_strategy(
             for batch in 0..num_batches {
                 let begin_start = Instant::now();
                 fs_execute(&conn, "BEGIN");
-                begin_us += begin_start.elapsed().as_secs_f64() * 1_000_000.0;
+                begin_us = begin_start
+                    .elapsed()
+                    .as_secs_f64()
+                    .mul_add(1_000_000.0, begin_us);
 
                 let start = (batch * batch_size) as i64;
                 let end = ((batch + 1) * batch_size).min(count) as i64;
@@ -2574,11 +2578,17 @@ fn profile_fsqlite_insert_with_strategy(
                 for i in start..end {
                     fs_stmt_execute_with_params(&statement, &[fsqlite::SqliteValue::Integer(i)]);
                 }
-                insert_us += insert_start.elapsed().as_secs_f64() * 1_000_000.0;
+                insert_us = insert_start
+                    .elapsed()
+                    .as_secs_f64()
+                    .mul_add(1_000_000.0, insert_us);
 
                 let commit_start = Instant::now();
                 fs_execute(&conn, "COMMIT");
-                commit_us += commit_start.elapsed().as_secs_f64() * 1_000_000.0;
+                commit_us = commit_start
+                    .elapsed()
+                    .as_secs_f64()
+                    .mul_add(1_000_000.0, commit_us);
             }
         }
     }

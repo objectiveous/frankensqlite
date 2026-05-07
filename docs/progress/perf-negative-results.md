@@ -6055,3 +6055,29 @@ set: sessions found by
   optimization. Revisit only if it is folded into a broader row-template encoder
   that proves full-matrix neutrality or better, not just a single insert-row
   win.
+
+## 2026-05-07 - Direct DELETE no-rebalance leaf primitive
+
+- Target: `UPDATE/DELETEThroughput`, especially direct-simple DELETE rows where
+  generic `BtCursor::delete` pays separator/anchor ceremony even when the
+  current leaf will remain non-empty and the deleted cell is not the leaf max.
+- Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs` and
+  `crates/fsqlite-core/src/connection.rs`; source was manually restored after
+  the focused DML gate rejected the change.
+- Candidate shape: add a narrow table-leaf DELETE primitive that accepts only
+  non-max table leaf cells on leaves with more than one cell, calls the existing
+  eager-defrag `remove_table_cell_from_leaf_deferred`, and falls back to generic
+  `delete()` for all structural/separator/rebalance cases.
+- Evidence artifacts:
+  `tests/artifacts/perf/direct-delete-leaf-no-rebalance-tanbear-20260507T2055Z/summary.md`,
+  `baseline-update.json`, `candidate-update.json`, and `stdout/`.
+- Result: rejected and reverted. Focused DML average/geomean worsened
+  `1.1771902588843643 / 1.1533073165550498` to
+  `1.2530378457971052 / 1.225724573854313`. The 100-row DELETE row improved
+  slightly (`0.118893 ms -> 0.116718 ms`) and 10K rows improved, but
+  `1000 rows / delete 50 rows` regressed sharply
+  `0.353662 ms -> 0.577712 ms`, so the section keep gate failed.
+- Do not retry non-max/no-rebalance table-leaf DELETE bypass as a standalone
+  direct DELETE optimization. Reconsider only as part of a real same-leaf batch
+  mutation primitive that writes each leaf once and proves an UPDATE/DELETE
+  section geomean win.

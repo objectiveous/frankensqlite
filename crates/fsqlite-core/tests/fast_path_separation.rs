@@ -786,17 +786,17 @@ fn test_fast_path_prepared_update() {
     let after = hot_path_profile_snapshot();
 
     let (fast_delta, _) = fast_slow_delta(&before.parser, &after.parser);
-    let ud_fast = after
-        .prepared_update_delete_fast_lane_hits
-        .saturating_sub(before.prepared_update_delete_fast_lane_hits);
-    eprintln!("[T9] UPDATE: fast_delta={fast_delta}, ud_fast_lane_delta={ud_fast}");
+    let direct_update = after
+        .prepared_direct_update_executions
+        .saturating_sub(before.prepared_direct_update_executions);
+    eprintln!("[T9] UPDATE: fast_delta={fast_delta}, direct_update_delta={direct_update}");
     assert!(
         fast_delta >= 2,
         "prepared UPDATE should use fast path: fast_delta={fast_delta}"
     );
     assert!(
-        ud_fast >= 2,
-        "prepared UPDATE should hit update/delete fast lane: ud_fast={ud_fast}"
+        direct_update >= 2,
+        "prepared UPDATE should hit the direct UPDATE lane: direct_update={direct_update}"
     );
 
     // Correctness.
@@ -842,17 +842,17 @@ fn test_fast_path_prepared_delete() {
     let after = hot_path_profile_snapshot();
 
     let (fast_delta, _) = fast_slow_delta(&before.parser, &after.parser);
-    let ud_fast = after
-        .prepared_update_delete_fast_lane_hits
-        .saturating_sub(before.prepared_update_delete_fast_lane_hits);
-    eprintln!("[T10] DELETE: fast_delta={fast_delta}, ud_fast_lane_delta={ud_fast}");
+    let direct_delete = after
+        .prepared_direct_delete_executions
+        .saturating_sub(before.prepared_direct_delete_executions);
+    eprintln!("[T10] DELETE: fast_delta={fast_delta}, direct_delete_delta={direct_delete}");
     assert!(
         fast_delta >= 2,
         "prepared DELETE should use fast path: fast_delta={fast_delta}"
     );
     assert!(
-        ud_fast >= 2,
-        "prepared DELETE should hit update/delete fast lane: ud_fast={ud_fast}"
+        direct_delete >= 2,
+        "prepared DELETE should hit the direct DELETE lane: direct_delete={direct_delete}"
     );
 
     // Correctness.

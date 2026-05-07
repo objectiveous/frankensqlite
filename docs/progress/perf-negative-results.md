@@ -12,6 +12,44 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - Direct UPDATE fixed-width REAL leaf-payload patch
+
+- Target: `UPDATE/DELETEThroughput`, especially the top full-matrix gap
+  `100 rows / update 10 rows`, and the isolated direct UPDATE mutation loop.
+- Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs` and
+  `crates/fsqlite-core/src/connection.rs`; the source was manually removed
+  after the focused benchmark lost.
+- Candidate shape: add a B-tree primitive that parses the current leaf-table
+  record payload in-place, verifies the target column is a fixed-width REAL
+  serial type, and patches only the 8 value bytes. Call it from
+  `try_execute_prepared_direct_simple_update_fixed_width_real` before the
+  existing `payload_into` plus whole-payload overwrite fallback.
+- Correctness/build proof before measurement:
+  - `TMPDIR=/data/tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-review-target cargo test -p fsqlite-btree test_table_patch_current_payload_fixed_width_real_updates_only_target_column -- --nocapture`
+    passed.
+  - `TMPDIR=/data/tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-review-target cargo test -p fsqlite-core direct_simple_update -- --nocapture`
+    passed.
+  - `TMPDIR=/data/tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-patch-target cargo build -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete --profile release-perf`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/update-delete-profile-crimsongorge-20260507T111220Z/summary.md`,
+  `report-update-delete.json`, `report-update-delete-candidate.json`,
+  `stderr.txt`, `stderr-candidate.txt`, `stdout.txt`, and
+  `stdout-candidate.txt`.
+- Result: rejected. The candidate eliminated payload-copy counters on UPDATE
+  (`btree_payload_copy_calls=1000` / `btree_payload_copy_bytes=20889` became
+  `0 / 0` on `fs_update_10000`) but worsened the focused section:
+  geomean ratio `1.1514568045449403 -> 1.2399807521821862`, `100 rows /
+  update 10 rows` `0.132028 ms` / `1.5145515239810492 -> 0.134542 ms` /
+  `1.5662448632728374`, and `10000 rows / update 1000 rows` `4.282235 ms` /
+  `1.16851603333226 -> 4.337518 ms` / `1.173031026575702`.
+- Do not retry a standalone leaf-payload byte patch for fixed-width REAL
+  direct UPDATE. The copied payload is too small to justify the extra B-tree
+  primitive and record-header parse in isolation. Reconsider only as part of a
+  retained direct-DML cursor/run design that also removes per-row cursor
+  construction/root descent and can cache the payload offset across repeated
+  prepared executions.
+
 ## 2026-05-07 - Non-empty direct INSERT page-run via append hint
 
 - Target: `INSERTThroughput - Transaction Strategy Comparison (small_3col)`,

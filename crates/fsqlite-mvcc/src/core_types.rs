@@ -341,8 +341,14 @@ impl std::fmt::Debug for VersionArena {
 // InProcessPageLockTable
 // ---------------------------------------------------------------------------
 
-/// Number of shards in the lock table (power of 2 for fast modular indexing).
-pub const LOCK_TABLE_SHARDS: usize = 256;
+/// Number of fallback shards in the lock and commit tables.
+///
+/// The page ranges used by normal small/medium databases are served by direct
+/// atomic fast arrays; these shards cover large page numbers and rebuild
+/// bookkeeping. Keep this power-of-two fanout high enough for fallback
+/// concurrency without making every fresh database pay a large open-time
+/// allocation cost.
+pub const LOCK_TABLE_SHARDS: usize = 64;
 
 /// Size of the fast atomic lock address space covering page numbers
 /// 1..=FAST_LOCK_ARRAY_SIZE.
@@ -431,7 +437,7 @@ pub struct InProcessPageLockTable {
     waiter_shards: Box<[WaiterShard; LOCK_TABLE_SHARDS]>,
     /// Total live waiter entries across all `waiter_shards`. Read by the
     /// fast-path skip in `notify_all_waiters` / `notify_waiters_for_page`
-    /// to avoid 256 (or 1) per-shard mutex acquires when no thread is
+    /// to avoid per-shard mutex acquires when no thread is
     /// parked. Synchronization with `register_waiter` is established via
     /// paired SeqCst fences (Dekker), so the load and modify can both
     /// remain `Relaxed`. Over-counting (e.g., from a panicking waiter that
@@ -1553,7 +1559,7 @@ impl InProcessPageLockTable {
     fn notify_all_waiters(&self) {
         // Pairs with the SeqCst fence in `register_waiter`; see Dekker note
         // on `notify_waiters_for_page`. When `waiter_count == 0` we skip
-        // the 256-shard mutex iteration entirely — this is the common case
+        // the fallback-shard mutex iteration entirely — this is the common case
         // on commit/release_all when no thread is parked on a page lock.
         std::sync::atomic::fence(Ordering::SeqCst);
         if self.waiter_count.load(Ordering::Relaxed) > 0 {

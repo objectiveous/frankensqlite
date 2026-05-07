@@ -12,6 +12,45 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - Direct INSERT page-run admission floor 16 -> 128
+
+- Target: `comprehensive-bench --quick --filter insert`, after the current
+  INSERT profile still showed small `single_txn` / transaction-strategy rows
+  lagging C SQLite and the existing B-epsilon-style page-run buffer admitted
+  almost every no-overflow direct INSERT record at `16` bytes.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`
+  in scratch worktree
+  `/data/tmp/frankensqlite-pagerun-admission-crimsongorge-20260507T2145Z`.
+  The shared checkout was not edited because `connection.rs` and
+  `cursor.rs` were exclusively reserved by another agent.
+- Candidate shape: raise
+  `PREPARED_DIRECT_INSERT_PAGE_RUN_MIN_RECORD_BYTES` from `16` to `128`, while
+  leaving `PREPARED_DIRECT_INSERT_PAGE_RUN_ARENA_MAX_RECORD_BYTES` at `384`.
+  This tested whether the current admission policy over-buffered small records
+  whose batch-buffer overhead outweighed avoided B-tree work.
+- Correctness/build proof before measurement: `cargo fmt -p fsqlite-core
+  --check` passed in the scratch worktree, and the release-perf
+  `comprehensive-bench` binary built successfully. RCH could not normalize the
+  `/data/tmp` scratch path and failed open to a local build.
+- Evidence artifacts:
+  `tests/artifacts/perf/page-run-admission-crimsongorge-20260507T2130Z/summary.md`,
+  `candidate-insert-threshold128.json`, `candidate-threshold128.diff`, and
+  stdout/stderr under the same directory.
+- Result: rejected. The focused INSERT primary score worsened from the current
+  profile's `0.8190610418616213` to `0.843813033391191`, average ratio
+  worsened `0.8473685692287133 -> 1.0182896196063238`, geomean worsened
+  `0.8178930649378039 -> 0.9698058208226569`, p90 worsened
+  `1.1504490521484194 -> 1.3905761933793013`, p99 worsened
+  `1.2309899121331915 -> 1.5402874678696952`, and C SQLite faster rows
+  increased `8 -> 11`. The only headline improvement was `write_single`
+  geomean `0.8195249868923463 -> 0.7984774849670893`, which was outweighed by
+  write-bulk geomean worsening `0.8176707820510124 -> 0.9958567986163313`.
+- Do not raise the direct INSERT page-run admission floor to `128` as a
+  standalone expected-loss tweak. Revisit admission only with a richer
+  per-record or per-run policy that uses row count, estimated leaf occupancy,
+  and flush target shape, and require an INSERT-section win before a full quick
+  gate.
+
 ## 2026-05-07 - SharedTxnPageIo borrowed concurrent-context clean retry
 
 - Target: `UPDATE/DELETEThroughput`, after fresh isolated `perf record`

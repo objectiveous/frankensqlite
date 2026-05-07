@@ -221,4 +221,3 @@
 
   Total scenarios: 93  |  FrankenSQLite faster: 70  |  Comparable: 3  |  C SQLite faster: 20
   Average time ratio (FrankenSQLite / C SQLite): 0.53x
-

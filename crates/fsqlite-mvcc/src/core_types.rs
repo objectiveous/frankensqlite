@@ -2182,11 +2182,16 @@ type CommitShard = CacheAligned<LeftRightCommitIndexShard>;
 ///
 /// For page numbers in `1..=FAST_COMMIT_ARRAY_SIZE`, `latest()` is a single
 /// `AtomicU64::load(Acquire)` — no locks, no hashing, no reader tracking.
-/// 65536 entries x 8 bytes = 512 KiB, negligible on modern systems.
+/// The array is split into lazily allocated 1024-entry chunks so empty
+/// short-lived databases do not pay a 512 KiB zero-fill cost at connection
+/// open.  A touched chunk remains a direct-indexed array, preserving the hot
+/// read/write path after first publication.
 ///
 /// Inspired by MICA (Lim et al., NSDI 2014): when keys are bounded integers,
 /// replace hash maps with direct-indexed arrays for O(1) access.
 const FAST_COMMIT_ARRAY_SIZE: usize = 65536;
+const FAST_COMMIT_CHUNK_SIZE: usize = 1024;
+const FAST_COMMIT_CHUNKS: usize = FAST_COMMIT_ARRAY_SIZE / FAST_COMMIT_CHUNK_SIZE;
 
 /// Index mapping each page to its latest committed `CommitSeq`.
 ///
@@ -2211,7 +2216,7 @@ pub struct CommitIndex {
     /// O(1) atomic read/write for small page numbers.
     /// Index `i` stores the raw `CommitSeq` value for page `i + 1`.
     /// Value 0 means no committed version exists.
-    fast_array: Box<[AtomicU64]>,
+    fast_array: Box<[OnceLock<Box<[AtomicU64]>>; FAST_COMMIT_CHUNKS]>,
     /// Fallback sharded LeftRight path for large page numbers and iteration.
     shards: Box<[CommitShard; LOCK_TABLE_SHARDS]>,
 }
@@ -2219,16 +2224,49 @@ pub struct CommitIndex {
 impl CommitIndex {
     #[must_use]
     pub fn new() -> Self {
-        let fast_array: Vec<AtomicU64> = (0..FAST_COMMIT_ARRAY_SIZE)
-            .map(|_| AtomicU64::new(0))
-            .collect();
         Self {
             latest_global: AtomicU64::new(0),
-            fast_array: fast_array.into_boxed_slice(),
+            fast_array: Self::alloc_fast_array(),
             shards: Box::new(std::array::from_fn(|_| {
                 CacheAligned::new(LeftRightCommitIndexShard::new())
             })),
         }
+    }
+
+    fn alloc_fast_array() -> Box<[OnceLock<Box<[AtomicU64]>>; FAST_COMMIT_CHUNKS]> {
+        Box::new(std::array::from_fn(|_| OnceLock::new()))
+    }
+
+    fn alloc_fast_chunk() -> Box<[AtomicU64]> {
+        let chunk: Vec<AtomicU64> = (0..FAST_COMMIT_CHUNK_SIZE)
+            .map(|_| AtomicU64::new(0))
+            .collect();
+        chunk.into_boxed_slice()
+    }
+
+    #[inline]
+    fn fast_slot(&self, pgno: usize) -> Option<&AtomicU64> {
+        if pgno == 0 || pgno > FAST_COMMIT_ARRAY_SIZE {
+            return None;
+        }
+        let index = pgno - 1;
+        let chunk_index = index / FAST_COMMIT_CHUNK_SIZE;
+        let chunk_offset = index % FAST_COMMIT_CHUNK_SIZE;
+        let chunk = self.fast_array[chunk_index].get_or_init(Self::alloc_fast_chunk);
+        Some(&chunk[chunk_offset])
+    }
+
+    #[inline]
+    fn fast_slot_if_allocated(&self, pgno: usize) -> Option<&AtomicU64> {
+        if pgno == 0 || pgno > FAST_COMMIT_ARRAY_SIZE {
+            return None;
+        }
+        let index = pgno - 1;
+        let chunk_index = index / FAST_COMMIT_CHUNK_SIZE;
+        let chunk_offset = index % FAST_COMMIT_CHUNK_SIZE;
+        self.fast_array[chunk_index]
+            .get()
+            .map(|chunk| &chunk[chunk_offset])
     }
 
     /// Record that `page` was last committed at `seq`.
@@ -2251,7 +2289,9 @@ impl CommitIndex {
             // reads exclusively from the fast array for pages ≤ 65536.
             // The sharded path is only needed for len()/debug/diagnostics,
             // which can lazily scan the fast array instead.
-            self.fast_array[pgno - 1].store(seq.get(), Ordering::Release);
+            if let Some(slot) = self.fast_slot(pgno) {
+                slot.store(seq.get(), Ordering::Release);
+            }
             return;
         }
         // Fallback: large page numbers use the sharded path.
@@ -2296,7 +2336,9 @@ impl CommitIndex {
             if pgno <= FAST_COMMIT_ARRAY_SIZE {
                 // Safe to use Relaxed: the Release fence above already
                 // guarantees ordering for all stores that follow.
-                self.fast_array[pgno - 1].store(raw, Ordering::Relaxed);
+                if let Some(slot) = self.fast_slot(pgno) {
+                    slot.store(raw, Ordering::Relaxed);
+                }
             } else {
                 let shard = &self.shards[self.shard_index(page)];
                 shard.update(page, seq);
@@ -2312,7 +2354,10 @@ impl CommitIndex {
     pub fn latest(&self, page: PageNumber) -> Option<CommitSeq> {
         let pgno = page.get() as usize;
         if pgno <= FAST_COMMIT_ARRAY_SIZE {
-            let val = self.fast_array[pgno - 1].load(Ordering::Acquire);
+            let Some(slot) = self.fast_slot_if_allocated(pgno) else {
+                return None;
+            };
+            let val = slot.load(Ordering::Acquire);
             return if val == 0 {
                 None
             } else {
@@ -2353,13 +2398,21 @@ impl std::fmt::Debug for CommitIndex {
         let fast_populated = self
             .fast_array
             .iter()
+            .filter_map(OnceLock::get)
+            .flat_map(|chunk| chunk.iter())
             .filter(|a| a.load(Ordering::Relaxed) != 0)
+            .count();
+        let fast_chunks_allocated = self
+            .fast_array
+            .iter()
+            .filter(|chunk| chunk.get().is_some())
             .count();
         f.debug_struct("CommitIndex")
             .field("page_count", &(sharded_pages + fast_populated))
             .field("sharded_page_count", &sharded_pages)
             .field("fast_array_populated", &fast_populated)
-            .field("fast_array_capacity", &self.fast_array.len())
+            .field("fast_array_chunks_allocated", &fast_chunks_allocated)
+            .field("fast_array_capacity", &FAST_COMMIT_ARRAY_SIZE)
             .field("latest_global", &self.latest_global.load(Ordering::Relaxed))
             .finish()
     }
@@ -4140,6 +4193,7 @@ mod tests {
         assert!(debug.contains("page_count: 2"));
         assert!(debug.contains("sharded_page_count: 1"));
         assert!(debug.contains("fast_array_populated: 1"));
+        assert!(debug.contains("fast_array_chunks_allocated: 1"));
     }
 
     #[test]
@@ -4563,9 +4617,17 @@ mod tests {
     #[test]
     fn test_commit_index_lookup_no_alloc() {
         // bd-22n.8: CommitIndex::latest() is allocation-free.
-        // RwLock read + HashMap get → no allocation.
+        // It only reads from already-allocated fast chunks or sharded maps.
         let index = CommitIndex::new();
         let page = PageNumber::new(7).unwrap();
+
+        // Miss path on an unallocated fast chunk must also stay allocation-free
+        // and return None.
+        let cold_miss = index.latest(page);
+        assert_eq!(
+            cold_miss, None,
+            "bead_id={BEAD_22N8} case=commit_index_cold_miss_no_alloc"
+        );
 
         index.update(page, CommitSeq::new(42));
         let latest = index.latest(page);

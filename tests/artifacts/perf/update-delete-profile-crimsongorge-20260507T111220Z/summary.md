@@ -110,6 +110,43 @@ the wrong way. The source change was removed; `report-update-delete-scratchreset
 `stdout-scratchreset-candidate.txt`, and `stderr-scratchreset-candidate.txt`
 are kept here as rejection evidence.
 
+## Rejected Follow-up: Direct UPDATE/DELETE Microbatch Carry
+
+I tried extending the prepared-statement microbatcher to direct-simple
+UPDATE/DELETE. The first hook missed the real path because prepared
+UPDATE/DELETE direct dispatch uses the deferred-DML fast branch, not the INSERT
+precompiled branch. After moving the hook, the focused proof test passed:
+`test_stmt_microbatch_coalesces_repeated_direct_update_delete`.
+
+Correctness/build gates also passed:
+
+- `cargo fmt -p fsqlite-core --check`
+- `cargo test -p fsqlite-core test_stmt_microbatch_coalesces_repeated_direct_update_delete -- --nocapture`
+- `cargo test -p fsqlite-core direct_simple_update -- --nocapture`
+- `cargo build -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete --profile release-perf`
+
+The benchmark rejected it. I built a clean same-window baseline from detached
+`HEAD` in `/data/tmp/frankensqlite-microbatch-baseline-20260507T1156Z` because
+the stored baseline and C timings were too noisy for this small section.
+
+| Run | Baseline geomean ratio | Candidate geomean ratio |
+| --- | ---: | ---: |
+| 1 | `1.1779083933861776` | `1.2057825793891777` |
+| 2 | `1.2328029254649469` | `1.2273656526110164` |
+| 3 | `1.2343061647560114` | `1.3090145653112837` |
+
+Average section geomean ratio worsened from `1.2150058278690452` to
+`1.247387599103826`. Average FSQLite-only geomean also worsened from
+`0.6078380658848437 ms` to `0.6189310105900363 ms`. Large delete sometimes
+improved, but medium rows regressed and the ratio-to-C gate lost overall.
+
+The source change was removed. Evidence is kept in
+`report-update-delete-samewindow-baseline*.json`,
+`report-update-delete-microbatch-candidate*.json`,
+`stdout-samewindow-baseline*.txt`, `stderr-samewindow-baseline*.txt`,
+`stdout-microbatch-candidate*.txt`, and
+`stderr-microbatch-candidate*.txt`.
+
 ## Next Lever
 
 Do not spend this lane on VDBE dispatch or parser work; the counters already show those are bypassed. The next plausible step-change lever is a B-tree/core direct-DML retained cursor kernel:

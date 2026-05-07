@@ -12,6 +12,46 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-07 - Direct UPDATE/DELETE microbatch schema-proof carry
+
+- Target: `UPDATE/DELETEThroughput`, especially repeated prepared rowid
+  UPDATE/DELETE loops inside one explicit transaction.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  the source was manually restored after the repeat A/B benchmark lost.
+- Candidate shape: allow the statement microbatcher to carry the
+  schema/function proof for direct-simple UPDATE/DELETE despite the
+  conservative `may_observe_change_tracking` flag, gated by the existing
+  direct-simple eligibility, statement-savepoint elision, fused-entry auto
+  mode, no rollback conflict action, and an active explicit transaction.
+- Correctness/build proof before measurement:
+  - `cargo fmt -p fsqlite-core --check` passed before the candidate was
+    formatted.
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-review-target CARGO_BUILD_JOBS=16 cargo test -p fsqlite-core test_stmt_microbatch_coalesces_repeated_direct_update_delete -- --nocapture`
+    passed after moving the hook from the INSERT precompiled branch to the
+    actual deferred direct-DML fast branch.
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-review-target CARGO_BUILD_JOBS=16 cargo test -p fsqlite-core direct_simple_update -- --nocapture`
+    passed.
+  - `env TMPDIR=/data/tmp/frankensqlite-crimsongorge-tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-crimsongorge-patch-target CARGO_BUILD_JOBS=16 cargo build -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete --profile release-perf`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/update-delete-profile-crimsongorge-20260507T111220Z/summary.md`,
+  `report-update-delete-samewindow-baseline*.json`,
+  `report-update-delete-microbatch-candidate*.json`,
+  `stdout-samewindow-baseline*.txt`,
+  `stderr-samewindow-baseline*.txt`,
+  `stdout-microbatch-candidate*.txt`, and
+  `stderr-microbatch-candidate*.txt`.
+- Result: rejected. Three same-window A/B pairs had average section geomean
+  ratio `1.2150058278690452` for baseline versus
+  `1.247387599103826` for candidate, and average FSQLite-only geomean
+  worsened from `0.6078380658848437 ms` to `0.6189310105900363 ms`. Large
+  delete sometimes improved, but medium rows regressed and the ratio-to-C gate
+  lost on two of three runs.
+- Do not retry schema-proof carry for direct UPDATE/DELETE as a standalone
+  optimization. The avoided schema proof is not the dominant cost; revisit
+  only if it falls out naturally inside a retained direct-DML cursor/run design
+  that removes per-row cursor construction/root descent.
+
 ## 2026-05-07 - Direct UPDATE/DELETE per-row scratch reset removal
 
 - Target: `UPDATE/DELETEThroughput`, especially direct UPDATE/DELETE per-row
@@ -69,14 +109,24 @@ Each entry should include:
   `tests/artifacts/perf/update-delete-profile-crimsongorge-20260507T111220Z/summary.md`,
   `report-update-delete.json`, `report-update-delete-candidate.json`,
   `stderr.txt`, `stderr-candidate.txt`, `stdout.txt`, and
-  `stdout-candidate.txt`.
+  `stdout-candidate.txt`. Read-only repeat/no-profile follow-up:
+  `tests/artifacts/perf/fixed-real-update-purpleotter-20260507T1128Z/summary.md`,
+  `report-update.json`, `report-update-noprofile.json`, and
+  `perf-10000-update.txt`.
 - Result: rejected. The candidate eliminated payload-copy counters on UPDATE
   (`btree_payload_copy_calls=1000` / `btree_payload_copy_bytes=20889` became
   `0 / 0` on `fs_update_10000`) but worsened the focused section:
   geomean ratio `1.1514568045449403 -> 1.2399807521821862`, `100 rows /
   update 10 rows` `0.132028 ms` / `1.5145515239810492 -> 0.134542 ms` /
   `1.5662448632728374`, and `10000 rows / update 1000 rows` `4.282235 ms` /
-  `1.16851603333226 -> 4.337518 ms` / `1.173031026575702`.
+  `1.16851603333226 -> 4.337518 ms` / `1.173031026575702`. The repeat
+  evaluation also rejected it: profiled update-filter geomean only moved
+  `1.1514568045449403 -> 1.1494521577224535` (within noise), while the
+  no-profile update filter reported geomean `1.1983325033541927` and regressed
+  the latest full-matrix large rows from `0.975043` / `0.935698`
+  (10K update/delete) to `1.157850` / `1.152931`. Isolated
+  `perf-update-delete` still measured FSQLite update at `641 ns`/row for the
+  100-row workload and `892 ns`/row for the 10K workload.
 - Do not retry a standalone leaf-payload byte patch for fixed-width REAL
   direct UPDATE. The copied payload is too small to justify the extra B-tree
   primitive and record-header parse in isolation. Reconsider only as part of a

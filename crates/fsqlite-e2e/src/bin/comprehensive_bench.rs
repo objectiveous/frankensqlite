@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
-use std::sync::{Arc, Barrier, OnceLock, mpsc};
+use std::sync::{mpsc, Arc, Barrier, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use asupersync::runtime::{BlockingTaskHandle, Runtime, RuntimeBuilder};
@@ -1472,6 +1472,13 @@ fn print_benchmark_json_schema() {
             eprintln!("ERROR: Could not serialize benchmark JSON schema: {err}");
             std::process::exit(1);
         }
+    }
+}
+
+fn section_filter_matches(filter_lower: Option<&str>, aliases: &[&str]) -> bool {
+    match filter_lower {
+        Some(filter) => aliases.iter().any(|alias| alias.contains(filter)),
+        None => true,
     }
 }
 
@@ -3231,6 +3238,34 @@ mod tests {
     }
 
     #[test]
+    fn section_filter_matches_update_delete_aliases() {
+        let aliases = [
+            "update",
+            "delete",
+            "update-delete",
+            "update-deletethroughput",
+            "update/delete",
+            "dml",
+        ];
+
+        for filter in [
+            "update",
+            "delete",
+            "update-delete",
+            "update-deletethroughput",
+            "update/delete",
+            "dml",
+        ] {
+            assert!(
+                section_filter_matches(Some(filter), &aliases),
+                "filter {filter} should select the UPDATE/DELETE section",
+            );
+        }
+        assert!(section_filter_matches(None, &aliases));
+        assert!(!section_filter_matches(Some("insert"), &aliases));
+    }
+
+    #[test]
     fn scenario_categories_use_canonical_ids() {
         assert_eq!(ScenarioCategory::MixedOltp.id(), "mixed");
         assert_eq!(
@@ -3550,8 +3585,8 @@ mod tests {
             "per_category_weighted.score"
         );
         assert_eq!(
-            schema["properties"]["ci_regression_gate"]["properties"]["thresholds"]["properties"]["primary_score_max_regression_pct"]
-                ["type"],
+            schema["properties"]["ci_regression_gate"]["properties"]["thresholds"]["properties"]
+                ["primary_score_max_regression_pct"]["type"],
             "number"
         );
         assert_eq!(
@@ -3565,8 +3600,8 @@ mod tests {
             "mixed"
         );
         assert_eq!(
-            schema["properties"]["ci_regression_gate"]["properties"]["observed"]["properties"]["primary_score"]
-                ["type"][0],
+            schema["properties"]["ci_regression_gate"]["properties"]["observed"]["properties"]
+                ["primary_score"]["type"][0],
             "number"
         );
     }
@@ -4992,12 +5027,10 @@ fn main() {
     };
     let filter_lower = options.filter.as_ref().map(|filter| filter.to_lowercase());
 
-    let should_run = |name: &str| -> bool {
-        match &filter_lower {
-            Some(filter) => name.to_lowercase().contains(filter),
-            None => true,
-        }
-    };
+    let should_run =
+        |name: &str| -> bool { section_filter_matches(filter_lower.as_deref(), &[name]) };
+    let should_run_any =
+        |aliases: &[&str]| -> bool { section_filter_matches(filter_lower.as_deref(), aliases) };
 
     let bench_start = Instant::now();
     let environment = DetectedEnvironment::detect();
@@ -5045,7 +5078,14 @@ fn main() {
     }
 
     // Section 6: Update/delete.
-    if should_run("update") || should_run("delete") {
+    if should_run_any(&[
+        "update",
+        "delete",
+        "update-delete",
+        "update-deletethroughput",
+        "update/delete",
+        "dml",
+    ]) {
         section_num += 1;
         eprintln!("\n[{section_num}/{total_sections}] UPDATE/DELETE throughput");
         bench_update_delete(&mut report, row_counts);

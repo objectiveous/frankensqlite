@@ -12,6 +12,45 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-08 - MVCC prepared concurrent-commit page-set `SmallVec`
+
+- Target: low-thread concurrent writer gaps in
+  `mt-mvcc-bench --rows-per-thread=1000 --threads=1,2,4,8` and
+  `comprehensive-bench --quick --filter concurrent`, especially the remaining
+  `2 writers x 1000 rows` row.
+- Touched during rejected candidate:
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs`; source was restored after
+  measurement.
+- Candidate shape: keep `PreparedConcurrentCommit::write_set_pages` and
+  `held_lock_pages` as `SmallVec<[PageNumber; 16]>` instead of converting the
+  common small write/lock page sets into heap `Vec`s. This was narrower than the
+  previously rejected one-pass `page_states` scan and did not change validation
+  or lock-release semantics.
+- Correctness/build proof before measurement:
+  - `cargo fmt -p fsqlite-mvcc --check` passed.
+  - `cargo test -p fsqlite-mvcc commit_updates_commit_index -- --nocapture`
+    passed.
+  - `cargo test -p fsqlite-mvcc test_prepare_captures_held_lock_pages_separately_from_write_set -- --nocapture`
+    passed.
+  - `cargo build --profile release-perf -p fsqlite-e2e --bin mt-mvcc-bench --bin comprehensive-bench`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/concurrent-profile-calmthrush-20260508T033930Z/summary.md`,
+  baseline and candidate `mt-mvcc` JSON/Markdown reports, baseline and
+  candidate comprehensive concurrent JSON reports, `perf-mt-2t.data`, and
+  `perf-mt-2t-report.txt`.
+- Result: rejected and reverted. The focused comprehensive concurrent geomean
+  improved `0.7988046779013424 -> 0.7666347556689922`, and the 4/8-writer rows
+  improved, but the actual remaining 2-writer gap worsened in both gates:
+  standalone throughput ratio `0.73x -> 0.70x` with FSQLite time
+  `3.27 ms -> 3.33 ms`, and comprehensive ratio
+  `1.0990786735212943 -> 1.1265801605368253` with FSQLite time
+  `13.259783 ms -> 14.328216 ms`.
+- Do not retry standalone prepared-commit page-set `SmallVec` conversion.
+  Reconsider only if a same-window profile proves heap conversion dominates
+  low-thread commit cost and the 2-writer row improves without sacrificing the
+  4/8-writer rows.
+
 ## 2026-05-08 - Prepared direct INSERT row-template executor
 
 - Target: remaining prepared direct INSERT row-build overhead after the

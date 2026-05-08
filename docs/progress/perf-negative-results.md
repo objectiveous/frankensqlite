@@ -12,6 +12,45 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-08 - Default page-size PRAGMA setup skip
+
+- Target: measured benchmark setup overhead in
+  `comprehensive-bench --quick --filter insert` and
+  `comprehensive-bench --quick --filter update`, especially the 100-row write
+  rows where setup remains a visible part of the measured closure.
+- Touched during rejected candidate:
+  `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs` and
+  `crates/fsqlite-e2e/src/bin/perf_update_delete.rs`; the source patch was
+  manually restored after the same-window gates rejected it.
+- Candidate shape: skip the explicit default `PRAGMA page_size = 4096` in the
+  benchmark harness setup, while still emitting a page-size PRAGMA for
+  non-default page-size experiments. The focused standalone
+  `perf_update_delete` harness also dropped its fixed page-size PRAGMA from
+  both C SQLite and FSQLite setup.
+- Evidence artifacts:
+  `tests/artifacts/perf/swiftgate-page-size-pragmas-20260508T1842Z/summary.md`,
+  `baseline-insert.json`, `candidate-insert-rerun.json`,
+  `baseline-update.json`, `candidate-update.json`, and `stdout/`. The
+  candidate binary initially had to be rerun from `.rch-target` after the
+  custom `/data/tmp` target path was unavailable; the failed `127` stdout is
+  preserved in the artifact directory.
+- Result: rejected and not applied. The same-window INSERT focused run was
+  mixed and failed the keep gate: clean baseline average/geomean/weighted/p90/p99
+  was `0.8196315648` / `0.7957682955` / `0.7701934312` /
+  `1.1152752480` / `1.1218613772`, while the candidate measured
+  `0.8020402350` / `0.7762532618` / `0.7921862328` /
+  `1.1105214365` / `1.1533843404`. The UPDATE/DELETE focused gate worsened
+  outright: clean baseline average/geomean/weighted/p90/p99 was
+  `0.9880400096` / `0.9661435934` / `0.9661435934` /
+  `1.2963600941` / `1.2963600941`, while the candidate measured
+  `1.0352160705` / `1.0133651619` / `1.0133651619` /
+  `1.3488429318` / `1.3488429318`.
+- Do not retry default page-size PRAGMA skipping as a standalone benchmark
+  setup cleanup. Reconsider only if the harness contract changes to move setup
+  outside the measured closure entirely, and a same-window run improves focused
+  INSERT, focused UPDATE/DELETE, and the full quick matrix weighted and tail
+  ratios.
+
 ## 2026-05-08 - Fixed-width REAL update page-local payload patch
 
 - Target: `UPDATE/DELETEThroughput` direct-simple UPDATE rows, especially

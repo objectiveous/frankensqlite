@@ -12,6 +12,40 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-08 - Drop retained direct-compiled INSERT AST row values
+
+- Target: prepared direct INSERT setup/prepare overhead after current profiles
+  still showed small and medium INSERT rows behind C SQLite, while the direct
+  compiled lane never reads `PreparedDirectSimpleInsert::row_values` during
+  execution.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  source was reverted after the focused INSERT matrix rejected it.
+- Candidate shape: in `prepared_direct_simple_insert_plan`, keep
+  `row_values: Vec<Expr>` only for `ReusableTableProgram` direct INSERT plans and
+  store an empty vector for `DirectCompiled` plans. Lazy table-program fallback
+  still recompiles from the original statement, so the candidate only removed
+  unused carried AST state from direct-compiled prepared metadata.
+- Correctness proof before measurement:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-programless-dml-bench-target CARGO_BUILD_JOBS=16 cargo test -p fsqlite-core test_prepared_insert_precomputes_direct_simple_insert_plan -- --nocapture`
+  passed.
+- Evidence artifacts:
+  - Current baseline:
+    `tests/artifacts/perf/concurrent-writers-current-crimsongorge-20260508T0110Z/insert-profile-current.json`.
+  - Candidate:
+    `tests/artifacts/perf/direct-insert-drop-row-values-crimsongorge-20260508T0135Z/insert-candidate.json`
+    plus matching stdout/stderr logs.
+- Result: rejected and reverted. The target rows were mixed, but the INSERT
+  section worsened overall: average ratio `0.8136 -> 0.9000`, geomean
+  `0.7874 -> 0.8278`, C-faster rows `7 -> 8`, and only `13/25` absolute
+  FrankenSQLite medians improved. Large direct INSERT rows regressed badly,
+  including `large_10col` single transaction 10K rows
+  `8.702911 ms -> 21.235385 ms` and record-size `large_10col` 10K rows
+  `9.057424 ms -> 19.119013 ms`.
+- Do not retry dropping or sparsifying retained direct-compiled INSERT AST row
+  values as a standalone prepare-state cleanup. Revisit prepared INSERT metadata
+  size only if a same-window profile proves prepare metadata allocation, not
+  execution/page-write work, dominates and the focused INSERT section improves.
+
 ## 2026-05-08 - CellSlotCache full-entry pre-evict
 
 - Target: `comprehensive-bench --quick --filter update`, after the current

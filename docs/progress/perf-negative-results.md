@@ -12,6 +12,44 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-08 - Private-memory direct UPDATE/DELETE `SharedTxnPageIo` bypass
+
+- Target: remaining setup-heavy `UPDATE/DELETEThroughput` rows for private
+  `:memory:` benchmark databases, especially the 100-row update/delete tail.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`.
+  The diff was already present in the shared worktree before measurement and
+  was left unstaged/uncommitted by BoldLion after rejection.
+- Candidate shape: add a private-memory-only
+  `direct_update_delete_page_io_context()` helper that returns `None` for
+  `self.path == ":memory:" && self.pager.is_memory()`, routing prepared direct
+  UPDATE/DELETE through the plain active `TransactionKind` cursor instead of
+  constructing `SharedTxnPageIo`. File-backed and non-private memory databases
+  still use `concurrent_page_io_context()`.
+- Correctness/build proof before measurement:
+  - `cargo fmt -p fsqlite-core --check` passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-boldlion-private-dml-check-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_entry_proof_no_publication_for_memory_update_delete -- --nocapture`
+    passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-boldlion-private-dml-check-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_direct_simple_update_delete_fast_path_executes_and_is_correct -- --nocapture`
+    passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/cargo-target CARGO_BUILD_JOBS=8 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/boldlion-private-dml-pageio-20260508T0820Z/summary.md`,
+  `candidate-update.json`, and `candidate-update-repeat.json`.
+- Result: rejected. First focused UPDATE/DELETE run improved the section
+  geomean versus the published focused DML baseline (`1.0564291964 ->
+  0.9733515023`) but regressed the 100-row delete tail to `1.7454228976x`
+  with `52.8%` FSQLITE CV. The immediate repeat rejected the candidate more
+  clearly: average/geomean were `1.1308286150`/`1.1042288976`, p90/p99
+  `1.6349627785`, 100-row update `1.3087941304x`, 100-row delete
+  `1.6349627785x`, and the larger 10K rows fell back to parity rather than a
+  durable win.
+- Do not retry private-memory direct UPDATE/DELETE `SharedTxnPageIo` bypass as
+  a standalone optimization. Reconsider only as part of a broader batch/leaf-run
+  DML operator that reduces fixed setup and mutation work together, and require
+  repeated focused UPDATE/DELETE gates plus a full quick matrix where the
+  100-row update/delete tails both improve.
+
 ## 2026-05-08 - Prepared direct INSERT indexed schema lookup
 
 - Target: fixed prepared direct INSERT setup cost in the remaining 100-row

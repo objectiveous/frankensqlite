@@ -12,6 +12,42 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-08 - File-backed direct INSERT preserialized-record widening
+
+- Target: the remaining low-thread file-backed concurrent writer gap,
+  especially `mt-mvcc-bench --rows-per-thread=1000 --threads=2` and the
+  comprehensive `2 writers x 1000 rows` concurrent row.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  source was restored after the comprehensive concurrent gate rejected it.
+- Candidate shape: allow the existing prepared-direct INSERT borrowed-parameter
+  record serializer on file-backed explicit transactions when the MemDatabase
+  row mirror is already unloaded/stale (`in_transaction && !track_memdb_delta`),
+  leaving page-run buffering and exact MemDB-delta policies unchanged. The goal
+  was to skip cloned `SqliteValue` row construction for write-only concurrent
+  transactions without changing storage semantics.
+- Correctness/build proof before measurement:
+  - `cargo fmt -p fsqlite-core` passed.
+  - `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-file-preserialize-target CARGO_BUILD_JOBS=10 cargo test -p fsqlite-core prepared_direct_simple_insert -- --nocapture`
+    passed.
+  - `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-file-preserialize-perf-target CARGO_BUILD_JOBS=10 cargo build -p fsqlite-e2e --bin mt-mvcc-bench --profile release-perf`
+    passed.
+  - `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-file-preserialize-perf-target CARGO_BUILD_JOBS=10 cargo build -p fsqlite-e2e --bin comprehensive-bench --profile release-perf`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/file-preserialize-concurrent-crimsongorge-20260508T023131Z/summary.md`,
+  `baseline-mt-2t-30.json`, `candidate-mt-2t-30.json`,
+  `baseline-concurrent.json`, and `candidate-concurrent.json`.
+- Result: rejected and reverted. The standalone 30-iteration `mt-mvcc-bench`
+  row improved slightly (FSQLite `4.04 ms -> 3.95 ms`, time ratio
+  `1.72x -> 1.65x`), but the comprehensive concurrent filter rejected it:
+  `2 writers x 1000 rows` ratio worsened `1.058592 -> 1.117501`, `4 writers`
+  ratio worsened `0.974043 -> 1.030069`, and the `8 writers` FSQLite median
+  regressed `35.757045 ms -> 44.320340 ms`.
+- Do not retry file-backed preserialized-record widening as a standalone
+  direct-INSERT optimization. Revisit only with a design that also protects the
+  8-writer concurrent row in the same-window comprehensive concurrent filter,
+  not just the standalone 2-writer mt harness.
+
 ## 2026-05-08 - Concurrent worker PRAGMA fairness probe
 
 - Target: `comprehensive-bench --quick --filter concurrent`, after the current

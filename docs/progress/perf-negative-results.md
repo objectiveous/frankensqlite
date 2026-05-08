@@ -12,6 +12,116 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-08 - Concurrent worker PRAGMA fairness probe
+
+- Target: `comprehensive-bench --quick --filter concurrent`, after the current
+  concurrent-filter baseline still showed 2-writer and 4-writer ratios near or
+  above C SQLite even though the 8-writer row was substantially faster.
+- Touched during rejected candidate:
+  `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`; source was manually
+  restored after the same-window full quick matrix rejected the candidate.
+- Candidate shape: add a concurrent-worker helper that disables time-travel
+  snapshot capture, enables `fsqlite.concurrent_mode`, and applies the
+  `busy_timeout` on each worker connection in one path. The intent was to remove
+  per-worker control-flow variance and make worker setup match the desired
+  concurrent mode before the hot loop starts.
+- Correctness/build proof before measurement:
+  - `cargo fmt -p fsqlite-e2e --check` passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-programless-dml-bench-target CARGO_BUILD_JOBS=16 cargo build -p fsqlite-e2e --bin comprehensive-bench --profile release-perf`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/concurrent-worker-pragmas-crimsongorge-20260508T0155Z/`
+  contains the focused concurrent candidate, same-window full candidate,
+  restored-source same-window full baseline, and stdout/stderr logs.
+- Result: rejected and reverted. The focused concurrent-only run looked
+  promising, but the same-window full quick gate rejected it: primary score
+  `0.34107371391864744 -> 0.3630189530149729`, average ratio
+  `0.4390016064403414 -> 0.4747587072842754`, geomean
+  `0.2634635702889211 -> 0.27568183747093883`, p90
+  `0.9699926676890772 -> 1.0625893284142927`, p99
+  `1.3974866213697312 -> 1.4108089057410917`, and C-faster rows
+  `8 -> 11`. The concurrent rows also worsened in the same full run, including
+  8 writers `0.36940401507009746 -> 0.4996207413967345`.
+- Do not retry worker PRAGMA ordering or helper consolidation as a standalone
+  concurrent benchmark optimization. Reconsider only if a same-window profile
+  proves worker setup dominates and the full quick matrix, not just
+  `--filter concurrent`, improves.
+
+## 2026-05-08 - Direct prepared INSERT header-size fast path
+
+- Target: `comprehensive-bench --quick --filter insert`, after the direct
+  prepared INSERT serializer still had its own
+  `prepared_direct_insert_record_header_size()` fixed-point loop even though the
+  record-layer one-byte header fast path had already landed.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` in scratch worktree
+  `/data/tmp/frankensqlite-direct-header-fastpath-tanbear-20260508T0045Z`; the
+  shared checkout was not edited because `connection.rs` was dirty and
+  reservation-sensitive.
+- Candidate shape: in
+  `Connection::prepared_direct_insert_record_header_size(content_size)`, return
+  `content_size + 1` immediately for `content_size <= 126`. The proof was that
+  the existing loop starts at that value; it is at most 127, so the header-size
+  varint is one byte and the loop returns the same value on the first iteration.
+- Correctness/build proof before measurement:
+  - `cargo fmt -p fsqlite-core --check` passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-direct-header-fastpath-target CARGO_BUILD_JOBS=10 cargo test -p fsqlite-core prepared_direct_simple_insert -- --nocapture`
+    passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-direct-header-fastpath-target CARGO_BUILD_JOBS=10 cargo build -p fsqlite-e2e --bin comprehensive-bench --profile release-perf`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/direct-insert-header-fastpath-tanbear-20260508T0045Z/summary.md`,
+  `baseline-insert*.json`, `candidate-insert*.json`,
+  `direct-header-fastpath.diff`, and `stdout/`.
+- Result: rejected. Three alternating focused INSERT pairs showed p99 and some
+  non-weighted aggregates improving, but the primary weighted INSERT score was
+  worse in all three pairs: `0.803945 -> 0.805853`,
+  `0.800119 -> 0.803174`, and `0.763483 -> 0.803002`.
+- Do not retry the direct-serializer one-byte header-size shortcut as a
+  standalone micro-optimization. Reconsider only if it is folded into a broader
+  prepared row-template/page-run writer that wins the focused INSERT score and
+  full matrix together.
+
+## 2026-05-08 - Prepared direct INSERT fixed cell array staging
+
+- Target: `comprehensive-bench --quick --filter insert` and `--filter update`,
+  after direct INSERT profiling still showed
+  `Connection::try_serialize_prepared_direct_simple_insert_record` in the
+  row-builder path and UPDATE/DELETE setup remained one of the larger remaining
+  gaps.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` in scratch worktree
+  `/data/tmp/frankensqlite-direct-cell-array-tanbear-20260508T0025Z`; the shared
+  checkout was not edited because `connection.rs` was dirty and
+  reservation-sensitive.
+- Candidate shape: replace
+  `SmallVec<[PreparedDirectInsertRecordCell; 16]>` staging in
+  `try_serialize_prepared_direct_simple_insert_record` with a fixed
+  `[PreparedDirectInsertRecordCell; 16]` plus `cell_count`, falling back to
+  generic dispatch for prepared direct INSERTs with more than 16 columns.
+  Intended equivalence for up to 16 columns was identical cell order, serial
+  types, header/body sizing, and rowid extraction, with less staging overhead.
+- Correctness/build proof before measurement:
+  - `cargo fmt -p fsqlite-core --check` passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-direct-cell-array-target CARGO_BUILD_JOBS=10 cargo test -p fsqlite-core prepared_direct_simple_insert -- --nocapture`
+    passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-direct-cell-array-target CARGO_BUILD_JOBS=10 cargo build -p fsqlite-e2e --bin comprehensive-bench --profile release-perf`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/record-size-profile-tanbear-20260508T0020Z/direct-cell-array-ab/summary.md`,
+  `baseline-insert*.json`, `candidate-insert*.json`,
+  `baseline-update*.json`, `candidate-update*.json`,
+  `candidate-direct-cell-array.diff`, and `stdout/`.
+- Result: rejected. Three same-window focused pairs did not show a reliable
+  primary-score win. INSERT non-weighted average, geomean, p90, and p99 mostly
+  improved, but weighted score was worse in runs 1 and 3 and only better in run
+  2. UPDATE/DELETE was flat to slightly worse versus C SQLite, with C-faster
+  rows increasing in the repeat gate.
+- Do not retry fixed-array row-cell staging as a standalone `SmallVec` removal.
+  Reconsider only inside a broader prepared row-template/direct-DML setup design
+  that also preserves the direct fast path for more than 16-column INSERTs and
+  proves focused INSERT plus UPDATE/DELETE improvement in the same A/B window.
+
 ## 2026-05-08 - Drop retained direct-compiled INSERT AST row values
 
 - Target: prepared direct INSERT setup/prepare overhead after current profiles

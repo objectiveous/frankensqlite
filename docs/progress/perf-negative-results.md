@@ -6932,3 +6932,39 @@ set: sessions found by
   optimization. Reconsider only if it also removes the per-row admission/seek
   cost or proves a stable win on the focused update/delete matrix against a
   same-time clean baseline.
+
+## 2026-05-08 - Fixed-width REAL UPDATE leaf-local field patch
+
+- Target: the remaining `UPDATE/DELETEThroughput` UPDATE rows after the prior
+  payload-range page patch rejection showed full-payload copying still visible
+  in the direct fixed-width REAL update counter path.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` and
+  `crates/fsqlite-btree/src/cursor.rs`. The source patch was manually unwound
+  after the final same-window benchmark gate moved the wrong way.
+- Candidate shape: add a btree helper that parses the in-page table record
+  header for the currently positioned local, non-overflow row and patches only
+  the serial-type-7 REAL field bytes in the staged leaf page. The direct UPDATE
+  fast path tried this helper before falling back to the existing full-payload
+  overwrite.
+- Correctness proof passed before benchmark rejection:
+  `cargo fmt --check -p fsqlite-btree -p fsqlite-core`,
+  `cargo check --workspace --all-targets`,
+  `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo test -p fsqlite-btree test_table_overwrite_current_real_column_same_size_no_overflow_patches_in_place -- --nocapture`,
+  and
+  `cargo test -p fsqlite-core test_direct_simple_update_single_real_column_patches_payload_without_decode -- --nocapture --test-threads=1`.
+- Evidence artifact:
+  `tests/artifacts/perf/rusticgrove-realpatch-20260508T1246Z/summary.md`.
+- Result: rejected by the final isolated same-window update-filter matrix. The
+  candidate still removed `btree_payload_copy_calls` from the direct UPDATE rows,
+  but FSQLite UPDATE medians regressed against the clean baseline repeat:
+  `0.116348 ms -> 0.117840 ms` for 100 rows,
+  `0.382126 ms -> 0.401081 ms` for 1000 rows, and
+  `3.419356 ms -> 3.583383 ms` for 10000 rows. The first final candidate run
+  also had high CV on the 100-row and 1000-row UPDATE rows, so the already-built
+  final candidate binary was repeated before rejection.
+- Do not retry a leaf-local fixed-width REAL field patch as a standalone
+  optimization. Reconsider only if it also removes per-row admission/seek or
+  commit-side cost in the same change and wins the focused update/delete matrix
+  against a same-time clean baseline.

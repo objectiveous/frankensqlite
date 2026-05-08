@@ -6860,3 +6860,34 @@ set: sessions found by
   optimization. Revisit only with an isolated allocator proof that actually
   reduces `page_pool_misses` or allocator samples on the large-row workload, and
   keep it only if the focused INSERT and full quick matrix both improve.
+
+## 2026-05-08 - Pending direct DELETE leaf-run buffer via repeated seeks
+
+- Target: the remaining `UPDATE/DELETEThroughput` 100-row DELETE tail, after
+  the clean frontier showed the gap is a real direct-DML mutation-kernel cost
+  rather than population/setup time.
+- Touched during rejected shared-worktree candidate:
+  `crates/fsqlite-core/src/connection.rs` and
+  `crates/fsqlite-btree/src/cursor.rs`; both files were exclusively reserved by
+  WindyIbis during SilverAnchor's read-only smoke review.
+- Candidate shape observed in the dirty worktree: buffer proven monotone
+  prepared direct DELETE rowids in `PendingDirectDeleteLeafRun`, retain the
+  current leaf page and maximum rowid, and flush through
+  `BtCursor::table_delete_current_leaf_rowids_no_rebalance` so the leaf is
+  compacted and written once at the next observation boundary. Each row still
+  performs the ordinary root-to-leaf seek before being admitted to the pending
+  run.
+- Correctness proof available before rejection: read-only compile passed with
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-silveranchor-leafrun-check CARGO_BUILD_JOBS=12 cargo check -p fsqlite-btree -p fsqlite-core --lib`.
+- Evidence artifact:
+  `tests/artifacts/perf/silveranchor-wal-pipeline-review-20260508T1115Z/summary.md`.
+- Result: rejected by the isolated mutation smoke. The dirty candidate measured
+  `perf-update-delete 100 20000 delete fsqlite isolated` at `3203ns/delete`,
+  while the current clean baseline from
+  `tests/artifacts/perf/boldlion-setup-mutation-review-20260508T1040Z/summary.md`
+  was `1754ns/delete` for the same family. This is about `1.83x` slower before
+  any focused DML or full-quick gate.
+- Do not land or retry this specific pending direct DELETE leaf-run shape as a
+  standalone optimization. Reconsider DELETE leaf-run batching only if it avoids
+  the per-row root-to-leaf admission cost or otherwise proves an isolated
+  DELETE-kernel win before running the focused `UPDATE/DELETEThroughput` matrix.

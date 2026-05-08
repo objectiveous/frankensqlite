@@ -12,6 +12,47 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-08 - Prepared direct DML root `PageNumber` predecode
+
+- Target: prepared direct DML fixed ceremony in the remaining INSERT and
+  UPDATE/DELETE rows, especially small direct INSERT rows and the
+  `UPDATE/DELETEThroughput` 100-row setup-heavy rows.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  source was restored by the reservation holder after measurement.
+- Candidate shape: keep the legacy `root_page: i32` in prepared direct INSERT,
+  UPDATE, and DELETE metadata, add a cached `PageNumber root`, decode it once at
+  prepare time, and use the cached root during direct execution instead of
+  calling `page_number_from_schema_root(...)` for every prepared direct DML
+  execution.
+- Correctness/build proof before measurement:
+  - `cargo fmt -p fsqlite-core --check` passed.
+  - `cargo test -p fsqlite-core prepared_direct_simple_insert -- --nocapture --test-threads=1`
+    passed with 28 tests.
+  - `cargo test -p fsqlite-core direct_simple_update -- --nocapture --test-threads=1`
+    passed with 5 tests.
+  - `cargo test -p fsqlite-core direct_simple_delete -- --nocapture`
+    passed with 1 test.
+  - `cargo build -p fsqlite-e2e --bin comprehensive-bench --profile release-perf`
+    passed for both clean baseline and candidate binaries.
+- Evidence artifacts:
+  `tests/artifacts/perf/prepared-root-page-crimsongorge-20260508T035302Z/summary.md`
+  and
+  `tests/artifacts/perf/root-page-predecode-calmthrush-20260508T0400Z/summary.md`
+  with baseline/candidate focused and full-quick JSON reports.
+- Result: rejected. CrimsonGorge's focused UPDATE/DELETE gate worsened weighted
+  score `1.1015072810860902 -> 1.2277880043578617`, average ratio
+  `1.1138399195630244 -> 1.2418121222187701`, p90/p99
+  `1.3975804587368041 -> 1.5230680435137203`, and C-faster rows `2 -> 4`.
+  CalmThrush's first full quick looked promising, but the reverse-order repeat
+  rejected it: weighted score worsened `0.344815755555221 ->
+  0.3498281962295187`, average ratio worsened `0.4497896322365449 ->
+  0.4546914761817618`, p90 worsened `1.0229615071185465 ->
+  1.0513673719630703`, and C-faster rows increased `9 -> 10`.
+- Do not retry prepare-time root `PageNumber` caching as a standalone prepared
+  direct DML optimization. Reconsider root metadata only if it is part of a
+  broader retained-cursor or row/page-builder design whose same-window full
+  quick gate wins on repeat.
+
 ## 2026-05-08 - MVCC prepared concurrent-commit page-set `SmallVec`
 
 - Target: low-thread concurrent writer gaps in

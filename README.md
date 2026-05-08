@@ -1151,20 +1151,26 @@ Current benchmark source of truth: `comprehensive-bench --quick` in
 at commit `953959cb`. Ratios are FrankenSQLite time divided by C SQLite
 time, so values below `1.0x` are faster for FrankenSQLite.
 
+Separate-table writer scaling is measured by `mt-mvcc-bench --separate-tables`
+in `tests/artifacts/perf/rusticgrove-mt-mvcc-separate-tables-20260508T1508Z/`.
+That harness reports throughput ratio as FrankenSQLite writes/sec divided by C
+SQLite writes/sec, so values above `1.0x` are faster for FrankenSQLite.
+
 | Workload | Current measured status |
 |----------|-------------------------|
 | 2 writers, same table, non-overlapping rowid ranges | `1.00x` (parity): C `13.947 ms`, F `13.943 ms` |
 | 4 writers, same table, non-overlapping rowid ranges | `0.98x`: C `20.972 ms`, F `20.580 ms` |
 | 8 writers, same table, non-overlapping rowid ranges | `0.46x`: C `92.460 ms`, F `42.270 ms` |
+| 8 writers, separate tables, 250 rows/thread | `28.98x` F/C throughput: C `80.387 ms`, F `2.774 ms` |
 | Mixed OLTP, 5K ops on a 5K-row table, 80% reads / 20% writes | `0.21x`: C `225.112 ms`, F `46.247 ms` |
 | Single-threaded writes | Still tracked as a gap: current full quick has several C-faster 100-row DML/INSERT tails, worst `1.38x` |
 
 The sweet spot is multiple writers touching different parts of the database
 simultaneously. Pathological cases where all writers hammer the same leaf page
 degrade toward single-writer behavior because every write conflicts. Separate
-table writer scaling and hot-row conflict scaling are not yet represented in
-the current comprehensive matrix; they should be measured before assigning a
-numeric speedup.
+table writer scaling is covered by the `mt-mvcc-bench --separate-tables`
+artifact above; hot-row conflict scaling is not yet represented in the current
+comprehensive matrix and should be measured before assigning a numeric speedup.
 
 ### Memory Overhead
 
@@ -1175,7 +1181,7 @@ MVCC adds memory overhead proportional to the number of concurrent active versio
 | Metric | Expected |
 |--------|----------|
 | Single-row INSERT throughput (1 writer) | Near parity overall, with remaining measured tails in the current quick matrix |
-| Single-row INSERT throughput (8 writers, separate tables) | Unmeasured in the current comprehensive matrix; same-table 8-writer row is `0.46x` F/C |
+| Single-row INSERT throughput (8 writers, separate tables) | Measured in `mt-mvcc-bench --separate-tables`: `28.98x` F/C throughput at 250 rows/thread |
 | Point SELECT by rowid | Faster in current read-after-write rows: `0.15x` to `0.20x` F/C |
 | Full table scan | Faster in current read-after-write rows: `0.22x` to `0.26x` F/C |
 | WAL checkpoint latency | Slightly higher (must check active snapshots) |

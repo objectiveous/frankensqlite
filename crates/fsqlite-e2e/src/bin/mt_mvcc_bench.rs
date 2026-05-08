@@ -16,10 +16,12 @@
 //!   - C SQLite (rusqlite) file-backed WAL, one Connection per thread,
 //!     `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`.
 //!
-//! Each thread inserts `--rows-per-thread` rows into the shared table
-//! `bench(id INTEGER PRIMARY KEY, payload TEXT)` using disjoint rowid
-//! ranges (`thread_id * 1_000_000 + i`) so there are no logical row
-//! conflicts — only page-level contention on the table's btree.
+//! By default, each thread inserts `--rows-per-thread` rows into the shared
+//! table `bench(id INTEGER PRIMARY KEY, payload TEXT)` using disjoint rowid
+//! ranges (`thread_id * 1_000_000 + i`) so there are no logical row conflicts
+//! — only page-level contention on the table's btree. `--separate-tables`
+//! gives each worker its own `bench_N` table to measure the no-shared-btree
+//! concurrent writer shape.
 //!
 //! Output is a tab-separated table suitable for grepping / redirection:
 //!
@@ -37,6 +39,7 @@
 //! ```text
 //! mt-mvcc-bench [--rows-per-thread=1000] [--threads=1,2,4,8,16] [--iters=3]
 //! [--json-output=PATH] [--summary-md=PATH]
+//! [--separate-tables]
 //! ```
 //!
 //! ## Caveats
@@ -66,13 +69,16 @@ const DEFAULT_ROWS_PER_THREAD: usize = 1_000;
 const DEFAULT_THREADS: &[usize] = &[1, 2, 4, 8, 16];
 const DEFAULT_ITERS: usize = 3;
 const DEFAULT_HISTORY_JSON: &str = ".bench-history/mt-mvcc-bench.latest.json";
+const DEFAULT_SEPARATE_TABLES_HISTORY_JSON: &str =
+    ".bench-history/mt-mvcc-bench.separate-tables.latest.json";
 const ROWID_BASE_STRIDE: i64 = 1_000_000;
 const MAX_RETRIES: usize = 32;
 const RETRY_SLEEP_MS: u64 = 1;
+const SHARED_INSERT_SQL: &str = "INSERT INTO bench (id, payload) VALUES (?1, ?2)";
 const STARTUP_COORDINATION_TIMEOUT: Duration = Duration::from_secs(5);
 const PASS_OVER_PASS_SCHEMA_V1: &str = "fsqlite-e2e.mt_mvcc_bench.pass_over_pass.v1";
 const PASS_OVER_PASS_MAX_RATIO_DROP_PCT: f64 = 5.0;
-const REPORT_SCHEMA_V2: &str = "fsqlite-e2e.mt_mvcc_bench_report.v2";
+const REPORT_SCHEMA_V3: &str = "fsqlite-e2e.mt_mvcc_bench_report.v3";
 
 // ─── CLI parsing (manual — no clap in workspace) ─────────────────────────
 
@@ -85,6 +91,7 @@ struct Options {
     summary_md: Option<PathBuf>,
     history_json: PathBuf,
     apples_to_apples: bool,
+    separate_tables: bool,
 }
 
 impl Default for Options {
@@ -97,6 +104,7 @@ impl Default for Options {
             summary_md: None,
             history_json: PathBuf::from(DEFAULT_HISTORY_JSON),
             apples_to_apples: false,
+            separate_tables: false,
         }
     }
 }
@@ -104,7 +112,8 @@ impl Default for Options {
 fn print_usage_and_exit(code: i32) -> ! {
     eprintln!(
         "usage: mt-mvcc-bench [--rows-per-thread=N] [--threads=N,N,...] [--iters=N] \\\n\
-         [--json-output=PATH] [--summary-md=PATH] [--history-json=PATH] [--apples-to-apples]\n\
+         [--json-output=PATH] [--summary-md=PATH] [--history-json=PATH] [--apples-to-apples] \\\n\
+         [--separate-tables]\n\
          \n\
          defaults: --rows-per-thread={DEFAULT_ROWS_PER_THREAD} \
          --threads=1,2,4,8,16 --iters={DEFAULT_ITERS}\n\
@@ -122,6 +131,10 @@ fn parse_args() -> Options {
     while let Some(arg) = args.next() {
         if arg == "--apples-to-apples" {
             opts.apples_to_apples = true;
+            continue;
+        }
+        if arg == "--separate-tables" {
+            opts.separate_tables = true;
             continue;
         }
         let (key, val) = if let Some(eq) = arg.find('=') {
@@ -176,6 +189,9 @@ fn parse_args() -> Options {
                 print_usage_and_exit(2);
             }
         }
+    }
+    if opts.separate_tables && opts.history_json == Path::new(DEFAULT_HISTORY_JSON) {
+        opts.history_json = PathBuf::from(DEFAULT_SEPARATE_TABLES_HISTORY_JSON);
     }
     opts
 }
@@ -278,6 +294,7 @@ struct ThreadComparisonReport {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct MtMvccBenchReport {
     schema_version: &'static str,
+    workload_shape: &'static str,
     rows_per_thread: usize,
     iterations: usize,
     thread_results: Vec<ThreadComparisonReport>,
@@ -384,6 +401,7 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
 fn render_markdown_summary(report: &MtMvccBenchReport) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "# mt-mvcc-bench Summary\n");
+    let _ = writeln!(out, "- Workload shape: `{}`", report.workload_shape);
     let _ = writeln!(out, "- Rows per thread: `{}`", report.rows_per_thread);
     let _ = writeln!(out, "- Iterations: `{}`", report.iterations);
     let _ = writeln!(out, "- Schema: `{}`\n", report.schema_version);
@@ -516,7 +534,52 @@ fn format_startup_failures(label: &str, failures: &[StartupFailure]) -> String {
     format!("{label} startup failed before synchronized start: {details}")
 }
 
-fn prepare_fsqlite_schema(path: &str) -> Result<(), String> {
+fn workload_shape(separate_tables: bool) -> &'static str {
+    if separate_tables {
+        "separate_tables"
+    } else {
+        "shared_table"
+    }
+}
+
+fn worker_table_count(threads: usize, separate_tables: bool) -> usize {
+    if separate_tables { threads } else { 1 }
+}
+
+fn worker_table_name(tid: usize, separate_tables: bool) -> String {
+    if separate_tables {
+        format!("bench_{tid}")
+    } else {
+        "bench".to_owned()
+    }
+}
+
+fn create_table_sql(table_name: &str) -> String {
+    format!("CREATE TABLE IF NOT EXISTS {table_name} (id INTEGER PRIMARY KEY, payload TEXT);")
+}
+
+fn create_tables_sql(threads: usize, separate_tables: bool) -> String {
+    let table_count = worker_table_count(threads, separate_tables);
+    let mut sql = String::new();
+    for tid in 0..table_count {
+        let table_name = worker_table_name(tid, separate_tables);
+        sql.push_str(&create_table_sql(&table_name));
+    }
+    sql
+}
+
+fn worker_insert_sql(tid: usize, separate_tables: bool) -> String {
+    // SQL identifiers cannot be bound as parameters. The only dynamic
+    // identifier here is generated from the zero-based worker index, not from
+    // user text, so it cannot escape the `bench_N` table-name shape.
+    if separate_tables {
+        format!("INSERT INTO bench_{tid} (id, payload) VALUES (?1, ?2)")
+    } else {
+        SHARED_INSERT_SQL.to_owned()
+    }
+}
+
+fn prepare_fsqlite_schema(path: &str, threads: usize, separate_tables: bool) -> Result<(), String> {
     let conn = fsqlite::Connection::open(path.to_owned())
         .map_err(|error| format!("fsqlite open (init): {error}"))?;
     for pragma in [
@@ -527,8 +590,12 @@ fn prepare_fsqlite_schema(path: &str) -> Result<(), String> {
     ] {
         let _ = conn.execute(pragma);
     }
-    conn.execute("CREATE TABLE IF NOT EXISTS bench (id INTEGER PRIMARY KEY, payload TEXT)")
-        .map_err(|error| format!("create table: {error}"))?;
+    for tid in 0..worker_table_count(threads, separate_tables) {
+        let table_name = worker_table_name(tid, separate_tables);
+        let create_sql = create_table_sql(&table_name);
+        conn.execute(&create_sql)
+            .map_err(|error| format!("create table {table_name}: {error}"))?;
+    }
     Ok(())
 }
 
@@ -561,7 +628,11 @@ fn open_fsqlite_worker(path: &str) -> Result<(fsqlite::Connection, bool), String
     Ok((conn, concurrent_ok))
 }
 
-fn run_fsqlite(threads: usize, rows_per_thread: usize) -> Result<RunResult, String> {
+fn run_fsqlite(
+    threads: usize,
+    rows_per_thread: usize,
+    separate_tables: bool,
+) -> Result<RunResult, String> {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     let path = tmp
         .path()
@@ -569,7 +640,7 @@ fn run_fsqlite(threads: usize, rows_per_thread: usize) -> Result<RunResult, Stri
         .expect("tempfile path is utf-8")
         .to_owned();
 
-    prepare_fsqlite_schema(&path)?;
+    prepare_fsqlite_schema(&path, threads, separate_tables)?;
 
     let path = Arc::new(path);
     let barrier = Arc::new(Barrier::new(threads));
@@ -624,7 +695,11 @@ fn run_fsqlite(threads: usize, rows_per_thread: usize) -> Result<RunResult, Stri
             let start = Instant::now();
 
             #[allow(clippy::cast_possible_wrap)]
-            let base = tid as i64 * ROWID_BASE_STRIDE;
+            let base = if separate_tables {
+                0
+            } else {
+                tid as i64 * ROWID_BASE_STRIDE
+            };
             let mut failed = 0usize;
 
             // Prepare the INSERT once per transaction attempt; bind params per
@@ -636,7 +711,7 @@ fn run_fsqlite(threads: usize, rows_per_thread: usize) -> Result<RunResult, Stri
             // apples-to-oranges artifact that pinned `Lexer::tokenize_into`
             // at 2.53% self-time and drove 12%+ allocator churn on MT 8t
             // (2026-04-23 capture `fsqlite-t3b-validation-185110`).
-            let insert_sql = "INSERT INTO bench (id, payload) VALUES (?1, ?2)";
+            let insert_sql = worker_insert_sql(tid, separate_tables);
 
             // Single transaction spanning all rows; retry on transient
             // conflicts by rolling back and reopening the transaction.
@@ -656,7 +731,7 @@ fn run_fsqlite(threads: usize, rows_per_thread: usize) -> Result<RunResult, Stri
                     return Err(format!("[fsqlite t{tid}] BEGIN failed: {e}"));
                 }
 
-                let stmt = match conn.prepare(insert_sql) {
+                let stmt = match conn.prepare(&insert_sql) {
                     Ok(s) => s,
                     Err(e) => {
                         let _ = conn.execute("ROLLBACK");
@@ -762,7 +837,7 @@ fn run_fsqlite(threads: usize, rows_per_thread: usize) -> Result<RunResult, Stri
 
 // ─── C SQLite (rusqlite) workload ────────────────────────────────────────
 
-fn run_rusqlite(threads: usize, rows_per_thread: usize) -> RunResult {
+fn run_rusqlite(threads: usize, rows_per_thread: usize, separate_tables: bool) -> RunResult {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     let path = tmp
         .path()
@@ -772,14 +847,13 @@ fn run_rusqlite(threads: usize, rows_per_thread: usize) -> RunResult {
 
     {
         let conn = rusqlite::Connection::open(&path).expect("rusqlite open (init)");
-        conn.execute_batch(
-            "PRAGMA page_size=4096;\
+        let mut schema_sql = "PRAGMA page_size=4096;\
              PRAGMA journal_mode=WAL;\
              PRAGMA synchronous=NORMAL;\
-             PRAGMA cache_size=-64000;\
-             CREATE TABLE IF NOT EXISTS bench (id INTEGER PRIMARY KEY, payload TEXT);",
-        )
-        .expect("init schema");
+             PRAGMA cache_size=-64000;"
+            .to_owned();
+        schema_sql.push_str(&create_tables_sql(threads, separate_tables));
+        conn.execute_batch(&schema_sql).expect("init schema");
     }
 
     let path = Arc::new(path);
@@ -807,14 +881,17 @@ fn run_rusqlite(threads: usize, rows_per_thread: usize) -> RunResult {
             barrier.wait();
 
             #[allow(clippy::cast_possible_wrap)]
-            let base = tid as i64 * ROWID_BASE_STRIDE;
+            let base = if separate_tables {
+                0
+            } else {
+                tid as i64 * ROWID_BASE_STRIDE
+            };
             let mut failed = 0usize;
+            let insert_sql = worker_insert_sql(tid, separate_tables);
 
             conn.execute_batch("BEGIN").expect("BEGIN");
             {
-                let mut stmt = conn
-                    .prepare("INSERT INTO bench (id, payload) VALUES (?1, ?2)")
-                    .expect("prepare");
+                let mut stmt = conn.prepare(&insert_sql).expect("prepare");
                 #[allow(clippy::cast_possible_wrap)]
                 for i in 0..rows_per_thread as i64 {
                     let id = base + i;
@@ -917,8 +994,8 @@ fn run() -> Result<(), String> {
     let opts = parse_args();
 
     eprintln!(
-        "mt-mvcc-bench: rows_per_thread={} threads={:?} iters={} apples_to_apples={}",
-        opts.rows_per_thread, opts.threads, opts.iters, opts.apples_to_apples,
+        "mt-mvcc-bench: rows_per_thread={} threads={:?} iters={} apples_to_apples={} separate_tables={}",
+        opts.rows_per_thread, opts.threads, opts.iters, opts.apples_to_apples, opts.separate_tables,
     );
 
     println!(
@@ -929,8 +1006,12 @@ fn run() -> Result<(), String> {
         if n == 0 {
             continue;
         }
-        let fs = collect_samples(opts.iters, || run_fsqlite(n, opts.rows_per_thread))?;
-        let cs = collect_samples(opts.iters, || Ok(run_rusqlite(n, opts.rows_per_thread)))?;
+        let fs = collect_samples(opts.iters, || {
+            run_fsqlite(n, opts.rows_per_thread, opts.separate_tables)
+        })?;
+        let cs = collect_samples(opts.iters, || {
+            Ok(run_rusqlite(n, opts.rows_per_thread, opts.separate_tables))
+        })?;
         let report = build_thread_report(n, &fs, &cs);
 
         println!(
@@ -963,7 +1044,8 @@ fn run() -> Result<(), String> {
     );
 
     let full_report = MtMvccBenchReport {
-        schema_version: REPORT_SCHEMA_V2,
+        schema_version: REPORT_SCHEMA_V3,
+        workload_shape: workload_shape(opts.separate_tables),
         rows_per_thread: opts.rows_per_thread,
         iterations: opts.iters,
         thread_results,
@@ -1038,7 +1120,8 @@ mod tests {
     #[test]
     fn markdown_summary_renders_thread_rows() {
         let report = MtMvccBenchReport {
-            schema_version: REPORT_SCHEMA_V2,
+            schema_version: REPORT_SCHEMA_V3,
+            workload_shape: "shared_table",
             rows_per_thread: 250,
             iterations: 1,
             thread_results: vec![ThreadComparisonReport {
@@ -1073,8 +1156,50 @@ mod tests {
         let rendered = render_markdown_summary(&report);
 
         assert!(rendered.contains("# mt-mvcc-bench Summary"));
+        assert!(rendered.contains("- Workload shape: `shared_table`"));
         assert!(rendered.contains("| 8 | 6090 | 55406 | 0.11x |"));
         assert!(rendered.contains("Pass-over-pass gate"));
+    }
+
+    #[test]
+    fn separate_tables_schema_uses_one_table_per_worker() {
+        let sql = create_tables_sql(3, true);
+
+        assert!(sql.contains(
+            "CREATE TABLE IF NOT EXISTS bench_0 (id INTEGER PRIMARY KEY, payload TEXT);"
+        ));
+        assert!(sql.contains(
+            "CREATE TABLE IF NOT EXISTS bench_1 (id INTEGER PRIMARY KEY, payload TEXT);"
+        ));
+        assert!(sql.contains(
+            "CREATE TABLE IF NOT EXISTS bench_2 (id INTEGER PRIMARY KEY, payload TEXT);"
+        ));
+        assert!(!sql.contains("CREATE TABLE IF NOT EXISTS bench ("));
+    }
+
+    #[test]
+    fn shared_table_schema_uses_single_bench_table() {
+        let sql = create_tables_sql(8, false);
+
+        assert_eq!(sql.matches("CREATE TABLE IF NOT EXISTS bench ").count(), 1);
+        assert!(
+            sql.contains(
+                "CREATE TABLE IF NOT EXISTS bench (id INTEGER PRIMARY KEY, payload TEXT);"
+            )
+        );
+        assert!(!sql.contains("bench_0"));
+    }
+
+    #[test]
+    fn worker_insert_sql_matches_workload_shape() {
+        assert_eq!(
+            worker_insert_sql(7, false),
+            "INSERT INTO bench (id, payload) VALUES (?1, ?2)"
+        );
+        assert_eq!(
+            worker_insert_sql(7, true),
+            "INSERT INTO bench_7 (id, payload) VALUES (?1, ?2)"
+        );
     }
 
     #[test]

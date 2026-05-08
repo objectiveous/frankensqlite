@@ -7008,3 +7008,48 @@ set: sessions found by
   optimization. Reconsider only if it also removes per-row admission/seek or
   commit-side cost in the same change and wins the focused update/delete matrix
   against a same-time clean baseline.
+
+## 2026-05-08 - Engine-level exact benchmark PRAGMA execute fast path
+
+- Target: fixed setup cost visible in the remaining 100-row INSERT and DML
+  tails, specifically the repeated `apply_pragmas_fsqlite` calls before each
+  benchmark connection setup.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The source patch and focused tests
+  were manually unwound after rejection; only this ledger entry and artifacts
+  remain.
+- Candidate shape: add a `Connection::execute` pre-parse fast path for the
+  exact benchmark setup PRAGMAs:
+  `PRAGMA page_size = 4096;`, `PRAGMA journal_mode = WAL;`,
+  `PRAGMA synchronous = NORMAL;`, `PRAGMA cache_size = -64000;`, and
+  `PRAGMA fsqlite_capture_time_travel_snapshots=false;`. The path was guarded
+  to fall back when trace hooks, tracing, retained autocommit state,
+  cached-write state, pending direct page-runs, or dirty MemDB refresh state
+  could make full statement-boundary dispatch observable. File-backed
+  `journal_mode = WAL` also fell back to normal dispatch.
+- Correctness proof passed before benchmark rejection:
+  `cargo test -p fsqlite-core exact_benchmark_pragma -- --nocapture` through
+  RCH passed the memory fast-path test before artifact retrieval was
+  interrupted; the file-backed journal fallback test then passed locally. After
+  replacing the initial `sql.trim()` guard with exact string matching,
+  `cargo test -p fsqlite-core exact_benchmark -- --nocapture` passed locally
+  with both focused tests.
+- Evidence artifacts:
+  `tests/artifacts/perf/swiftgate-pragma-fastpath-20260508T1530Z/candidate-insert.json`,
+  `tests/artifacts/perf/swiftgate-pragma-fastpath-20260508T1530Z/candidate-insert-repeat.json`,
+  `tests/artifacts/perf/swiftgate-pragma-fastpath-20260508T1530Z/candidate-exact-insert.json`,
+  and
+  `tests/artifacts/perf/swiftgate-pragma-fastpath-20260508T1530Z/summary.md`.
+- Result: rejected by the focused insert matrix. Against the frontier
+  `rusticgrove-full-quick-current-20260508T1510Z/insert-profile.json`, the
+  exact-match candidate had fewer faster rows and worse distribution metrics:
+  faster/comparable/C-faster `17/2/6 -> 14/3/8`, average ratio
+  `0.803142 -> 0.911731`, geomean `0.780274 -> 0.876027`, median
+  `0.725773 -> 0.879209`, p90 `1.074184 -> 1.141296`, and p99
+  `1.132336 -> 1.809162`. The earlier `trim()` guard was also rejected:
+  its first run worsened average/geomean/median/p90/p99, and its repeat still
+  worsened average/geomean/median/p90/p99 despite a better weighted subscore.
+- Do not retry an engine-level exact benchmark PRAGMA fast path as a standalone
+  optimization. Reconsider only if benchmark setup is removed without adding an
+  `execute` guard to every statement, or if a same-window full quick matrix
+  proves that the setup win outweighs the dispatch guard cost.

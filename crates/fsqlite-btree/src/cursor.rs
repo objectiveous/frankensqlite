@@ -1300,7 +1300,7 @@ impl TableLeafPayloadPatchRun {
     }
 
     fn into_page(self) -> (PageNumber, PageData) {
-        (self.entry.page_no, self.entry.page_data)
+        (self.entry.page_no, self.entry.page_data.clone())
     }
 }
 

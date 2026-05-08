@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
-use std::sync::{mpsc, Arc, Barrier, OnceLock};
+use std::sync::{Arc, Barrier, OnceLock, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 use asupersync::runtime::{BlockingTaskHandle, Runtime, RuntimeBuilder};
@@ -287,6 +287,8 @@ const BENCH_BUSY_MAX_RETRIES: u32 = 32;
 /// Starting backoff in microseconds (doubles each attempt, capped at
 /// ~100ms via the `min(10)` shift clamp).
 const BENCH_BUSY_BACKOFF_US: u64 = 100;
+/// Deterministic per-thread jitter window for concurrent writer retries.
+const BENCH_BUSY_JITTER_US: u64 = 1_000;
 
 fn is_busy_like(err: &fsqlite::FrankenError) -> bool {
     matches!(
@@ -297,6 +299,24 @@ fn is_busy_like(err: &fsqlite::FrankenError) -> bool {
             | fsqlite::FrankenError::DatabaseLocked { .. }
             | fsqlite::FrankenError::LockFailed { .. }
     )
+}
+
+fn bench_busy_backoff_delay(attempt: u32, jitter_salt: u64) -> Duration {
+    let shift = attempt.min(10);
+    let base_us = BENCH_BUSY_BACKOFF_US << shift;
+    let jitter_us = if jitter_salt == 0 {
+        0
+    } else {
+        jitter_salt
+            .wrapping_mul(37)
+            .wrapping_add(u64::from(attempt).wrapping_mul(17))
+            % BENCH_BUSY_JITTER_US
+    };
+    Duration::from_micros(base_us.saturating_add(jitter_us))
+}
+
+fn sleep_bench_busy_backoff(attempt: u32, jitter_salt: u64) {
+    std::thread::sleep(bench_busy_backoff_delay(attempt, jitter_salt));
 }
 
 /// Retry `op` with bounded exponential backoff while it returns a
@@ -310,9 +330,7 @@ where
         match op() {
             Ok(v) => return Ok(v),
             Err(e) if is_busy_like(&e) && attempt < BENCH_BUSY_MAX_RETRIES => {
-                let shift = attempt.min(10);
-                let wait_us = BENCH_BUSY_BACKOFF_US << shift;
-                std::thread::sleep(Duration::from_micros(wait_us));
+                sleep_bench_busy_backoff(attempt, 0);
                 attempt += 1;
             }
             Err(e) => return Err(e),
@@ -3001,15 +3019,14 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                         #[allow(clippy::cast_possible_wrap)]
                         let base = tid as i64 * CONCURRENT_RANGE_SIZE;
                         let mut retry_count = 0_u32;
-                        const TXN_MAX_RETRIES: u32 = 64;
-                        const TXN_BACKOFF_MS: u64 = 1;
+                        const TXN_MAX_RETRIES: u32 = 128;
+                        let jitter_salt =
+                            u64::try_from(tid).map_or(u64::MAX, |value| value.saturating_add(1));
                         'txn: loop {
                             if let Err(e) = conn.execute(begin_sql) {
                                 if e.is_transient() && retry_count < TXN_MAX_RETRIES {
+                                    sleep_bench_busy_backoff(retry_count, jitter_salt);
                                     retry_count += 1;
-                                    std::thread::sleep(std::time::Duration::from_millis(
-                                        TXN_BACKOFF_MS,
-                                    ));
                                     continue;
                                 }
                                 panic!("fsqlite BEGIN failed after retries: {e}");
@@ -3025,10 +3042,8 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                                     Ok(_) => {}
                                     Err(e) if e.is_transient() && retry_count < TXN_MAX_RETRIES => {
                                         let _ = conn.execute("ROLLBACK");
+                                        sleep_bench_busy_backoff(retry_count, jitter_salt);
                                         retry_count += 1;
-                                        std::thread::sleep(std::time::Duration::from_millis(
-                                            TXN_BACKOFF_MS,
-                                        ));
                                         continue 'txn;
                                     }
                                     Err(e) => panic!(
@@ -3041,10 +3056,8 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                                 Ok(_) => break 'txn,
                                 Err(e) if e.is_transient() && retry_count < TXN_MAX_RETRIES => {
                                     let _ = conn.execute("ROLLBACK");
+                                    sleep_bench_busy_backoff(retry_count, jitter_salt);
                                     retry_count += 1;
-                                    std::thread::sleep(std::time::Duration::from_millis(
-                                        TXN_BACKOFF_MS,
-                                    ));
                                 }
                                 Err(e) => panic!(
                                     "fsqlite COMMIT tid={tid} failed: {e} \
@@ -3153,6 +3166,29 @@ mod tests {
             FSQLITE_BENCHMARK_PRAGMAS.iter().any(|pragma| pragma
                 .eq_ignore_ascii_case("PRAGMA fsqlite_capture_time_travel_snapshots=false;")),
             "comprehensive-bench should profile benchmark workloads, not optional time-travel snapshot cloning"
+        );
+    }
+
+    #[test]
+    fn busy_backoff_delay_caps_and_jitters_deterministically() {
+        assert_eq!(bench_busy_backoff_delay(0, 0), Duration::from_micros(100));
+        assert_eq!(
+            bench_busy_backoff_delay(10, 0),
+            bench_busy_backoff_delay(11, 0),
+            "base exponential backoff should cap at attempt 10",
+        );
+
+        let no_jitter = bench_busy_backoff_delay(3, 0);
+        let jittered = bench_busy_backoff_delay(3, 5);
+        assert!(jittered > no_jitter);
+        assert!(
+            jittered < no_jitter + Duration::from_micros(BENCH_BUSY_JITTER_US),
+            "jitter should stay inside the configured window",
+        );
+        assert_eq!(
+            bench_busy_backoff_delay(3, 5),
+            jittered,
+            "same attempt and salt should produce stable jitter",
         );
     }
 
@@ -3585,8 +3621,8 @@ mod tests {
             "per_category_weighted.score"
         );
         assert_eq!(
-            schema["properties"]["ci_regression_gate"]["properties"]["thresholds"]["properties"]
-                ["primary_score_max_regression_pct"]["type"],
+            schema["properties"]["ci_regression_gate"]["properties"]["thresholds"]["properties"]["primary_score_max_regression_pct"]
+                ["type"],
             "number"
         );
         assert_eq!(
@@ -3600,8 +3636,8 @@ mod tests {
             "mixed"
         );
         assert_eq!(
-            schema["properties"]["ci_regression_gate"]["properties"]["observed"]["properties"]
-                ["primary_score"]["type"][0],
+            schema["properties"]["ci_regression_gate"]["properties"]["observed"]["properties"]["primary_score"]
+                ["type"][0],
             "number"
         );
     }

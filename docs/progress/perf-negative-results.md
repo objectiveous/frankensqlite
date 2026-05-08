@@ -6634,3 +6634,44 @@ set: sessions found by
   the design also removes the per-row admission/payload projection/mirror costs
   or is replaced with a true leaf-run operator that proves an isolated
   UPDATE/DELETE win before any broader matrix run.
+
+## 2026-05-08 - Global page-buffer recycle capacity 256 -> 2048
+
+- Target: page-buffer allocator churn in INSERT-heavy workloads, especially
+  large 10-column inserts whose profile showed `page_pool_misses=2006` with the
+  256-entry global recycle cap.
+- Touched during landed/shared candidate: `crates/fsqlite-pager/src/page_buf.rs`
+  (`GLOBAL_PAGE_BUF_RECYCLE_CAPACITY` raised from `256` to `2048` in
+  `41a950b6`).
+- Candidate shape: increase the bounded global `PageBuf` recycle list so a
+  wider dropped-pool working set can be retained before falling back to the
+  allocator. This was intentionally distinct from the previously rejected
+  batched-drain locking change.
+- Correctness proof passed before benchmark rejection:
+  `cargo fmt -p fsqlite-pager --check` and
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-windyibis-pagebuf-cap2048-test-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-pager page_buf -- --nocapture`.
+- Evidence artifacts:
+  `tests/artifacts/perf/windyibis-pagebuf-cap2048-20260508T062615Z/insert-profile.json`
+  and `tests/artifacts/perf/windyibis-head-0f1b85eb-full-quick-20260508T0700Z/full-quick.json`.
+- Result: rejected by the focused INSERT gate. Against the prior keeper
+  artifact, focused INSERT worsened on every summary guard:
+  weighted score `0.7767315568388111 -> 0.8170165218916904`,
+  average `0.7714626475032516 -> 0.9271209597934807`,
+  geomean `0.7459511333726486 -> 0.8792631315813308`, p90
+  `1.0760814249363868 -> 1.2516524592352403`, and p99
+  `1.0984144114228789 -> 2.042096610168269`. The target large 10-column
+  record-size row regressed from prior keeper ratio `~1.10x` to `2.04x`
+  slower (`9.706411 ms` C SQLite vs `19.821429 ms` FrankenSQLite), and the
+  profile still showed `page_pool_misses=2006`, so the larger cap did not
+  address the measured miss source.
+- Supporting full quick check at `0f1b85eb` was also worse than the prior
+  keeper: weighted score `0.3358994390491727 -> 0.3552972206567397`, average
+  `0.4420352710879217 -> 0.49071440245809644`, and p99
+  `1.2422341250364553 -> 2.2697406591196656`. That run reported the harness
+  "binary predates Git HEAD" warning because the commit timestamp postdated the
+  release-perf binary mtime, though the changed source mtimes predated the
+  binary.
+- Do not retry a larger single global page-buffer recycle cap as a standalone
+  optimization. Revisit only with an isolated allocator proof that actually
+  reduces `page_pool_misses` or allocator samples on the large-row workload, and
+  keep it only if the focused INSERT and full quick matrix both improve.

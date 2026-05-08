@@ -453,13 +453,22 @@ fn test_lock_convoy() {
 
         // Touch rows 1-50, then sleep to hold locks
         for id in 1..=50 {
-            if let Err(e) = conn.execute(&format!(
+            match conn.execute(&format!(
                 "UPDATE accounts SET balance = balance + 1 WHERE id = {id};"
             )) {
-                hard_failures.push(format!("slow UPDATE id={id}: {e}"));
-                rollback_best_effort(&conn);
-                slow_flag.store(true, Ordering::Release);
-                return hard_failures;
+                Ok(_) => {}
+                Err(e) if e.is_transient() => {
+                    // Fast writers can make the slow writer's snapshot stale before COMMIT.
+                    rollback_best_effort(&conn);
+                    slow_flag.store(true, Ordering::Release);
+                    return hard_failures;
+                }
+                Err(e) => {
+                    hard_failures.push(format!("slow UPDATE id={id}: {e}"));
+                    rollback_best_effort(&conn);
+                    slow_flag.store(true, Ordering::Release);
+                    return hard_failures;
+                }
             }
         }
 

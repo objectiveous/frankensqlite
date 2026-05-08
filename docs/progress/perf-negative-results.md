@@ -12,6 +12,46 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-08 - Direct INSERT concat record-body encoder
+
+- Target: `comprehensive-bench --quick --filter insert`, especially the
+  remaining `large_10col` 10K rows where the current profile still attributes
+  several milliseconds to prepared direct INSERT row building.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  the source diff was manually restored after the insert matrix rejected the
+  candidate.
+- Candidate shape: add a `TextConcat` prepared direct-record value so
+  `try_serialize_prepared_direct_simple_insert_record` could compute concat
+  payload length first, then serialize concat text directly into the SQLite
+  record body. The existing `text_scratch` materialization path remained the
+  fallback for unsupported/lossy blob concat values and non-text affinity
+  coercion. This was the broader direct-serialization retry condition from the
+  prior param-one text-cache and concat-specialization rejects, not another
+  cache-only variant.
+- Correctness/build proof before rejection:
+  `cargo fmt -p fsqlite-core --check` passed after the candidate was restored;
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-silveranchor-direct-concat-target CARGO_BUILD_JOBS=16 cargo test -p fsqlite-core prepared_direct_simple_insert_concat_chain -- --nocapture`
+  passed 3 targeted concat-chain tests on the candidate; and
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-silveranchor-direct-concat-bench-target CARGO_BUILD_JOBS=16 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/direct-concat-candidate-silveranchor-20260508T1454Z/summary.md`,
+  `candidate-insert.json`, and `stdout/`.
+- Result: rejected and not applied. Against the current insert-filter artifact
+  `tests/artifacts/perf/rusticgrove-full-quick-current-20260508T1510Z/insert-profile.json`,
+  aggregate INSERT average/geomean/p90/p99 ratios worsened from
+  `0.803142 / 0.780274 / 1.074184 / 1.132336` to
+  `0.857085 / 0.823145 / 1.176456 / 1.264681`. The frontier
+  `large_10col` rows regressed too: single-txn 10K ratio
+  `1.023510 -> 1.135677`, and record-size 10K ratio
+  `1.083482 -> 1.176456`. Small tail rows also moved the wrong way, including
+  `tiny_1col` single-txn 100 (`1.063987 -> 1.264681`) and
+  small_3col 100-row batched (`1.132336 -> 1.189669`).
+- Do not retry a direct concat length-pass/body-append encoder as a standalone
+  prepared INSERT optimization. Reconsider only as part of a true whole-row
+  template/page builder that reduces row construction and page-run costs
+  together while improving INSERT geomean and p99 in the same A/B window.
+
 ## 2026-05-08 - WAL prepared transform coefficient precompute
 
 - Target: low-thread concurrent-writer gap where

@@ -12,6 +12,39 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-08 - Prepared direct INSERT indexed schema lookup
+
+- Target: fixed prepared direct INSERT setup cost in the remaining 100-row
+  INSERT rows and the UPDATE/DELETE setup phase that prepopulates through the
+  same direct INSERT path.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  source was restored after measurement.
+- Candidate shape: in `prepared_direct_simple_insert_plan`, replace the
+  per-prepare `schema.iter().find(|table| table.name.eq_ignore_ascii_case(...))`
+  scan with the existing `schema_index_of(...)` side-index lookup, leaving all
+  direct INSERT eligibility checks unchanged.
+- Correctness/build proof before measurement:
+  - `cargo fmt -p fsqlite-core --check` passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-boldlion-schema-check-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_prepared_insert_precomputes_direct_simple_insert_plan -- --nocapture`
+    passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/cargo-target CARGO_BUILD_JOBS=8 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/boldlion-schema-lookup-20260508T0736Z/summary.md`,
+  `candidate-insert.json`, and `candidate-update.json`.
+- Result: rejected and reverted. The focused INSERT filter was mixed versus the
+  prior post-pagebuf artifact: average/geomean improved
+  `0.8442288062 -> 0.8281973547` and `0.8145695151 -> 0.7982037686`, but
+  p90/p99 worsened `1.1272106776 -> 1.1662110161` and
+  `1.2931548041 -> 1.3405968544`. The focused UPDATE/DELETE gate rejected the
+  candidate outright: the 100-row delete row worsened to `1.6681464056x`, the
+  100-row update row was `1.4013856256x`, and DML p99 was worse than the current
+  full quick tail (`1.6681464056` vs `1.4337080362`).
+- Do not retry prepared direct INSERT schema side-index lookup as a standalone
+  optimization. Reconsider only if it is absorbed into a broader prepared
+  statement setup redesign that proves lower 100-row DML tails and better p90/p99
+  in a same-window full quick matrix.
+
 ## 2026-05-08 - Prepared direct DML root `PageNumber` predecode
 
 - Target: prepared direct DML fixed ceremony in the remaining INSERT and

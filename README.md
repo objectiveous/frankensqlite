@@ -1147,30 +1147,91 @@ The human-readable scope lock for that contract lives in
 ### Workloads That Benefit Most from MVCC
 
 Current benchmark source of truth: `comprehensive-bench --quick` in
-`tests/artifacts/perf/rusticgrove-full-quick-current-20260508T1510Z/`
-at commit `953959cb`. Ratios are FrankenSQLite time divided by C SQLite
-time, so values below `1.0x` are faster for FrankenSQLite.
+`tests/artifacts/perf/may8-current-gap-audit-20260508T2330Z/full-quick.json`
+at commit `cc3f6f42`. Time ratios below report FrankenSQLite time divided by
+C SQLite time, so values **below `1.0x` are faster for FrankenSQLite**.
 
-Separate-table writer scaling is measured by `mt-mvcc-bench --separate-tables`
-in `tests/artifacts/perf/rusticgrove-mt-mvcc-separate-tables-20260508T1508Z/`.
-That harness reports throughput ratio as FrankenSQLite writes/sec divided by C
-SQLite writes/sec, so values above `1.0x` are faster for FrankenSQLite.
+Concurrent-writer scaling is measured by `mt-mvcc-bench` in the same
+artifact directory (`mt-mvcc-separate-tables.json` and
+`mt-mvcc-shared-table.json`). That harness reports throughput as FrankenSQLite
+writes/sec divided by C SQLite writes/sec, so values **above `1.0x` are faster
+for FrankenSQLite**.
 
-| Workload | Current measured status |
-|----------|-------------------------|
-| 2 writers, same table, non-overlapping rowid ranges | `1.00x` (parity): C `13.947 ms`, F `13.943 ms` |
-| 4 writers, same table, non-overlapping rowid ranges | `0.98x`: C `20.972 ms`, F `20.580 ms` |
-| 8 writers, same table, non-overlapping rowid ranges | `0.46x`: C `92.460 ms`, F `42.270 ms` |
-| 8 writers, separate tables, 250 rows/thread | `28.98x` F/C throughput: C `80.387 ms`, F `2.774 ms` |
-| Mixed OLTP, 5K ops on a 5K-row table, 80% reads / 20% writes | `0.21x`: C `225.112 ms`, F `46.247 ms` |
-| Single-threaded writes | Still tracked as a gap: current full quick has several C-faster 100-row DML/INSERT tails, worst `1.38x` |
+#### Full-quick matrix headline (93 scenarios)
 
-The sweet spot is multiple writers touching different parts of the database
-simultaneously. Pathological cases where all writers hammer the same leaf page
-degrade toward single-writer behavior because every write conflicts. Separate
-table writer scaling is covered by the `mt-mvcc-bench --separate-tables`
-artifact above; hot-row conflict scaling is not yet represented in the current
-comprehensive matrix and should be measured before assigning a numeric speedup.
+| Aggregate | Value | Reading |
+|-----------|------:|---------|
+| FrankenSQLite faster / comparable / C SQLite faster | `79 / 5 / 9` | 85 % of scenarios are faster or comparable |
+| Geomean F/C time ratio | `0.267x` | ≈ 3.74× faster overall |
+| Median F/C time ratio | `0.310x` | ≈ 3.23× faster at the median |
+| Average F/C time ratio | `0.470x` | ≈ 2.13× faster on the arithmetic mean |
+| p90 F/C time ratio | `1.046x` | The 90th-percentile scenario is near parity |
+| p99 F/C time ratio | `2.160x` | One row at 43 % CV — noise spike, not a stable regression |
+| Per-category weighted score | `0.353` | Lower is better; weights favour single-row reads/writes |
+
+Per-category geomean F/C time ratio:
+
+| Category | n | Geomean F/C | Reading |
+|---|---:|---:|---|
+| read_aggregate | 25 | `0.073x` | ≈ 13.7× faster |
+| mixed | 1 | `0.184x` | ≈ 5.4× faster |
+| read_single | 33 | `0.216x` | ≈ 4.6× faster |
+| concurrent_writers | 3 | `0.721x` | ≈ 1.39× faster |
+| write_bulk | 22 | `0.815x` | ≈ 1.23× faster |
+| **write_single** | **9** | **`1.025x`** | **The remaining gap (per-row UPDATE/DELETE)** |
+
+#### Concurrent writers (the headline MVCC win)
+
+`mt-mvcc-bench --separate-tables` (250 rows/thread, 3 iters), the workload
+where each writer commits to its own table:
+
+| Threads | F writes/sec | C writes/sec | Throughput F/C | Reading |
+|---:|---:|---:|---:|---|
+| 1 | `264 918` | `623 830` | `0.42x` | C SQLite faster (per-row ceremony tax) |
+| 2 | `443 227` | `294 386` | `1.51x` | F faster |
+| 4 | `841 940` | `109 961` | `7.66x` | F much faster |
+| 8 | `1 022 049` | `24 936` | **`40.99x`** | F throughput crushes C — C SQLite serialises all 8 writers |
+
+`mt-mvcc-bench` shared-table (1 000 rows/thread, all writers writing the
+same table, non-overlapping rowid ranges):
+
+| Threads | F writes/sec | C writes/sec | Throughput F/C |
+|---:|---:|---:|---:|
+| 1 | `635 710` | `922 272` | `0.69x` |
+| 2 | `463 398` | `593 580` | `0.78x` |
+| 4 | `345 783` | `406 326` | `0.85x` |
+| 8 | `337 917` | `98 915` | **`3.42x`** |
+
+The 16-thread shared-table run currently fails with a `BUSY_SNAPSHOT`
+storm at thread 4 — this is in scope for the conflict-topology /
+DRO-SSI-abort-policy work, not for the per-thread perf gap.
+
+The pattern is consistent with the design: at 1–4 writers the per-row
+MVCC ceremony costs more than C SQLite's serialised path, but as soon as
+the lock-byte serialisation becomes the bottleneck (8+ writers, especially
+on separate tables), FrankenSQLite scales out while C SQLite plateaus.
+
+#### Mixed OLTP
+
+| Workload | C ms | F ms | F/C |
+|----------|-----:|-----:|----:|
+| 5 000 ops on a 5 000-row table, 80 % reads / 20 % writes | `225.112` | `46.247` | `0.184x` (≈ 5.4× faster) |
+
+#### Where the remaining gap lives
+
+All 9 C-faster rows in the full-quick matrix are small-N writes. The
+worst stable row is 100-row DELETE at `1.37x` F/C; the rest cluster
+between `1.05x` and `1.27x`. Per-row mutation primitives measured in
+isolation (`perf-update-delete 100 20000`) are `1.5 µs/UPDATE` and
+`2.1 µs/DELETE` for FrankenSQLite vs `0.3 µs` for C SQLite. The cause is
+per-row direct-DML cursor + `SharedTxnPageIo` ceremony (cursor
+construction, page-state checks, 4 KiB page memmove on `write_page_data`)
+that amortises beautifully across threads but charges per row in
+single-thread small-N loops. The remediation plan is documented in
+`tests/artifacts/perf/may8-current-gap-audit-20260508T2330Z/summary.md`
+and `tests/artifacts/perf/rusticgrove-dml-leafrun-boundary-20260508T2033Z/summary.md`;
+the structural lever is a same-leaf DML mutation-run operator that
+amortises admission and publication across multiple in-leaf rows.
 
 ### Memory Overhead
 
@@ -1178,14 +1239,17 @@ MVCC adds memory overhead proportional to the number of concurrent active versio
 
 ### Scaling Expectations
 
-| Metric | Expected |
-|--------|----------|
-| Single-row INSERT throughput (1 writer) | Near parity overall, with remaining measured tails in the current quick matrix |
-| Single-row INSERT throughput (8 writers, separate tables) | Measured in `mt-mvcc-bench --separate-tables`: `28.98x` F/C throughput at 250 rows/thread |
-| Point SELECT by rowid | Faster in current read-after-write rows: `0.15x` to `0.20x` F/C |
-| Full table scan | Faster in current read-after-write rows: `0.22x` to `0.26x` F/C |
+| Metric | Current measurement |
+|--------|---------------------|
+| Full-quick matrix headline | `79 / 5 / 9` faster/comparable/slower across 93 scenarios; geomean `0.267x` F/C (`may8-current-gap-audit-20260508T2330Z/full-quick.json`) |
+| Single-row INSERT throughput (1 writer, small-N) | Several `1.05x`–`1.27x` C-faster rows in the current quick matrix; gap concentrated in the prepared-statement per-row direct-DML ceremony |
+| Single-row INSERT throughput (8 writers, separate tables) | `mt-mvcc-bench --separate-tables`: `40.99x` F/C throughput at 250 rows/thread |
+| Single-row INSERT throughput (8 writers, shared table) | `mt-mvcc-bench` shared-table: `3.42x` F/C throughput at 1 000 rows/thread |
+| Point SELECT by rowid | `read_single` geomean `0.216x` F/C across 33 scenarios (≈ 4.6× faster) |
+| Aggregate / scan reads | `read_aggregate` geomean `0.073x` F/C across 25 scenarios (≈ 13.7× faster) |
+| Mixed OLTP (80 % reads / 20 % writes) | `0.184x` F/C on the 5 000-op / 5 000-row scenario (≈ 5.4× faster) |
 | WAL checkpoint latency | Slightly higher (must check active snapshots) |
-| Reader throughput under write load | Current mixed 80/20 row is faster overall; p99-specific read-latency claim still needs a dedicated harness |
+| Reader throughput under write load | The mixed 80/20 row above is faster overall; a p99-specific read-latency claim still needs a dedicated harness |
 
 ---
 

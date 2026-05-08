@@ -12,6 +12,48 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-08 - Prepared direct INSERT row-template executor
+
+- Target: remaining prepared direct INSERT row-build overhead after the
+  profile-guided direct INSERT passes, especially expression-shape branching in
+  the compiled row serializer.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  source was restored after the full quick matrix rejected it.
+- Candidate shape: build a per-column record template at prepare time and use
+  it to emit SQLite record bytes directly for literal, placeholder, numeric
+  binary, and concat expressions. Unsupported expression shapes fell back to the
+  existing compiled-row serializer. This applied the query-compilation/template
+  specialization idea without unsafe code or runtime JIT.
+- Correctness/build proof before measurement:
+  - `cargo fmt -p fsqlite-core --check` passed.
+  - `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-row-template-check-target CARGO_BUILD_JOBS=10 cargo test -p fsqlite-core prepared_direct_simple_insert -- --nocapture`
+    completed successfully with 28 tests passing. RCH artifact retrieval hung
+    after the remote command had completed, so the local RCH process group was
+    terminated.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-row-template-candidate-target CARGO_BUILD_JOBS=12 cargo build -p fsqlite-e2e --bin comprehensive-bench --profile release-perf`
+    passed in a clean scratch tree with only the candidate patch applied.
+- Evidence artifacts:
+  `tests/artifacts/perf/row-template-crimsongorge-20260508T032620Z/summary.md`,
+  `candidate-connection.diff`, same-window `baseline-insert.json`,
+  `candidate-insert.json`, `candidate-full-quick.json`, and stdout/stderr logs
+  under the same directory.
+- Result: rejected and reverted. Focused INSERT improved enough to look
+  tempting: weighted score `0.8030801931161379 -> 0.7915138891132704`,
+  average ratio `0.8290893302098494 -> 0.7957192322438452`, geomean
+  `0.8009900880092378 -> 0.7729268013969751`, p99
+  `1.2884507148302573 -> 1.1320620924604214`, and C-faster rows `7 -> 5`.
+  The full quick gate rejected it: weighted score worsened
+  `0.34593878641661835 -> 0.35679620885171676`, average ratio worsened
+  `0.4542606463918878 -> 0.4850687497684193`, geomean worsened
+  `0.2674752493298549 -> 0.2795497259901094`, p90 worsened
+  `0.9811588214938469 -> 1.0870772854107467`, p99 worsened
+  `1.4015153360781543 -> 2.091131458001714`, and C-faster rows increased
+  `8 -> 11`.
+- Do not retry the row-template executor as a standalone direct INSERT
+  optimization. Reconsider only as part of a larger row/page builder design that
+  protects the large-row full quick rows and wins the full quick weighted score
+  in the same A/B window.
+
 ## 2026-05-08 - Prepared direct INSERT no-FK guard cache
 
 - Target: remaining no-FK prepared direct INSERT fixed costs, especially

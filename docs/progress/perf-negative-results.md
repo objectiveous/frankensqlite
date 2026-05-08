@@ -6891,3 +6891,44 @@ set: sessions found by
   standalone optimization. Reconsider DELETE leaf-run batching only if it avoids
   the per-row root-to-leaf admission cost or otherwise proves an isolated
   DELETE-kernel win before running the focused `UPDATE/DELETEThroughput` matrix.
+
+## 2026-05-08 - Fixed-width REAL UPDATE payload-range page patch
+
+- Target: the remaining `UPDATE/DELETEThroughput` 100-row UPDATE tail, after
+  profiling showed `BtCursor::load_page`, staged-page writes, and payload copy
+  work inside the direct fixed-width REAL update lane.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` and
+  `crates/fsqlite-btree/src/cursor.rs`. Agent Mail reservation attempts for
+  this narrow surface and the artifact directory timed out before the edit, so
+  the candidate was kept short and then manually unwound after rejection.
+- Candidate shape: add
+  `BtCursor::table_overwrite_current_payload_range_same_size_no_overflow` and
+  route `Connection::try_execute_prepared_direct_simple_update_fixed_width_real`
+  through a payload-slice patch so the caller does not rebuild and rewrite the
+  unchanged prefix/suffix of a fixed-width record.
+- Correctness proof passed before benchmark rejection:
+  `cargo test -p fsqlite-btree test_table_overwrite_current_payload_range_same_size_no_overflow_patches_slice -- --nocapture`
+  and
+  `cargo test -p fsqlite-core test_direct_simple_update_single_real_column_patches_payload_without_decode -- --nocapture`
+  with
+  `CARGO_TARGET_DIR=/data/tmp/frankensqlite-silveranchor-insert-profile-target`.
+- Evidence artifacts:
+  `tests/artifacts/perf/silveranchor-dml-profile-20260508T1225Z/dml-profile-candidate.json`,
+  `tests/artifacts/perf/silveranchor-dml-profile-20260508T1225Z/dml-profile-clean-head-repeat.json`,
+  `tests/artifacts/perf/silveranchor-dml-profile-20260508T1225Z/perf-update-delete-100x1000-candidate.stderr`,
+  and
+  `tests/artifacts/perf/silveranchor-dml-profile-20260508T1225Z/summary.md`.
+- Result: rejected by the focused update/delete matrix against a clean
+  same-time `65d54751` baseline. Summary moved the wrong way:
+  average ratio `1.0023996891494373 -> 1.121703499721951`, geomean
+  `0.9891774494336053 -> 1.0981172488823585`, median
+  `0.9521782416313966 -> 1.2005915733983752`, and p90
+  `1.3360203368047023 -> 1.4432270168855534`. The 1000-row UPDATE and DELETE
+  rows regressed from `0.388989 ms -> 0.488295 ms` and
+  `0.347651 ms -> 0.409748 ms`, respectively, despite a small 100-row UPDATE
+  absolute improvement.
+- Do not retry a B-tree payload-range patch as a standalone fixed-width UPDATE
+  optimization. Reconsider only if it also removes the per-row admission/seek
+  cost or proves a stable win on the focused update/delete matrix against a
+  same-time clean baseline.

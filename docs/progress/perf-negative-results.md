@@ -7103,3 +7103,43 @@ set: sessions found by
   Reconsider only as part of a true fused record/body/page builder that removes
   row construction and page layout cost together and wins a same-window focused
   insert matrix before any full quick promotion.
+
+## 2026-05-08 - Direct DELETE scratch/lookaside guard trim
+
+- Target: the 100-row DELETE tail in the current full quick frontier, where
+  `UPDATE/DELETEThroughput` showed `100 rows / delete 5 rows` at ratio `1.381`
+  and DML profiling showed the direct DELETE mutate phase was only `8.3 us`
+  inside a much larger fixed-cost envelope.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The source patch was manually
+  unwound after the repeat focused DML benchmark rejected it; only this ledger
+  entry and artifacts remain.
+- Candidate shape: remove `StatementLookasideGrowthGuard` and
+  `PreparedDirectInsertScratchResetGuard` from
+  `execute_prepared_direct_simple_delete`. Direct DELETE does not use the
+  prepared direct INSERT/update scratch buffers, so this tested whether those
+  per-row guard costs were a measurable part of the small DELETE tail. Direct
+  UPDATE and INSERT were left unchanged.
+- Correctness proof passed before benchmark rejection:
+  `cargo fmt --check -p fsqlite-core` and
+  `cargo test -p fsqlite-core test_direct_simple_update_delete_fast_path_executes_and_is_correct -- --nocapture`.
+- Evidence artifacts:
+  `tests/artifacts/perf/swiftgate-direct-delete-guard-trim-20260508T1655Z/candidate-update.json`,
+  `tests/artifacts/perf/swiftgate-direct-delete-guard-trim-20260508T1655Z/candidate-update-repeat.json`,
+  and
+  `tests/artifacts/perf/swiftgate-direct-delete-guard-trim-20260508T1655Z/summary.md`.
+- Result: rejected by the focused update/delete matrix. Against the frontier
+  `rusticgrove-full-quick-current-20260508T1510Z/update-profile.json`, the
+  first candidate run moved the target `100 rows / delete 5 rows` F median from
+  `0.114064 ms` to `0.109335 ms`, but worsened the section gate:
+  faster/comparable/C-faster `4/0/2 -> 1/3/2`, average ratio
+  `1.022914 -> 1.080121`, geomean `1.005124 -> 1.066384`, median
+  `0.897000 -> 0.965554`, and weighted score `1.005124 -> 1.066384`.
+  The already-built candidate binary was repeated; repeat target F median was
+  `0.113553 ms`, and the section gate worsened further to average ratio
+  `1.114058`, geomean `1.095675`, median `0.998102`, p90/p99 `1.442364`, and
+  weighted score `1.095675`.
+- Do not retry direct DELETE scratch/lookaside guard removal as a standalone
+  optimization. Reconsider only if a profile shows the guard itself dominating
+  direct DELETE and a same-window focused DML matrix proves both the small-row
+  tail and the 10K DELETE row improve.

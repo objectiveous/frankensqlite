@@ -37,7 +37,7 @@ use fsqlite_vfs::GLOBAL_VFS_METRICS;
 use fsqlite_vfs::metrics::MetricsSnapshot as VfsMetricsSnapshot;
 use fsqlite_wal::{
     GLOBAL_CONSOLIDATION_METRICS, GLOBAL_GROUP_COMMIT_METRICS, GLOBAL_WAL_METRICS,
-    WalTelemetrySnapshot, wal_telemetry_snapshot,
+    WalTelemetrySnapshot, set_commit_phase_timing_enabled, wal_telemetry_snapshot,
 };
 
 use crate::oplog::{ExpectedResult, OpKind, OpLog, OpRecord};
@@ -247,6 +247,7 @@ struct HotPathMetricsCapture {
     prev_parse_metrics_enabled: bool,
     prev_vdbe_metrics_enabled: bool,
     prev_btree_metrics_enabled: bool,
+    prev_commit_phase_timing_enabled: bool,
     vfs_before: VfsMetricsSnapshot,
     wal_before: WalTelemetrySnapshot,
 }
@@ -256,11 +257,13 @@ impl HotPathMetricsCapture {
         let prev_parse_metrics_enabled = parse_metrics_enabled();
         let prev_vdbe_metrics_enabled = vdbe_metrics_enabled();
         let prev_btree_metrics_enabled = btree_metrics_enabled();
+        let prev_commit_phase_timing_enabled = set_commit_phase_timing_enabled(enabled);
         let mut capture = Self {
             enabled,
             prev_parse_metrics_enabled,
             prev_vdbe_metrics_enabled,
             prev_btree_metrics_enabled,
+            prev_commit_phase_timing_enabled,
             vfs_before: GLOBAL_VFS_METRICS.snapshot(),
             wal_before: wal_telemetry_snapshot(),
         };
@@ -317,6 +320,7 @@ impl Drop for HotPathMetricsCapture {
         set_parse_metrics_enabled(self.prev_parse_metrics_enabled);
         set_vdbe_metrics_enabled(self.prev_vdbe_metrics_enabled);
         set_btree_metrics_enabled(self.prev_btree_metrics_enabled);
+        set_commit_phase_timing_enabled(self.prev_commit_phase_timing_enabled);
     }
 }
 

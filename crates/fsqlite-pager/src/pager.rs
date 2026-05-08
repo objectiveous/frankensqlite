@@ -48,7 +48,7 @@ use fsqlite_wal::{
     ParallelWalFallbackReason, ParallelWalLaneBatch, ParallelWalLaneStager,
     ParallelWalOperatingMode, ParallelWalShadowVerdict, RecoveryFence, SubmitOutcome,
     TransactionConflictSnapshot, TransactionFrameBatch, TransactionFrameBatchContext, WalFile,
-    WalGenerationIdentity, detailed_consolidation_metrics_enabled,
+    WalGenerationIdentity, commit_phase_timing_enabled, detailed_consolidation_metrics_enabled,
     parallel_wal_fallback_reason_name, parallel_wal_mode_name, parallel_wal_shadow_verdict_name,
     parallel_wal_should_shadow_compare, resolve_parallel_wal_control_surface_from_env,
 };
@@ -7021,14 +7021,21 @@ where
         conflict_pages: &[PageNumber],
         queue: &GroupCommitQueueRef,
     ) -> Result<()> {
+        let detailed_metrics = detailed_consolidation_metrics_enabled();
+        let lane_staging_debug_enabled =
+            tracing::enabled!(target: "fsqlite::wal::lane_staging", tracing::Level::DEBUG);
+        let lock_scope_debug_enabled =
+            tracing::enabled!(target: "fsqlite::wal::lock_scope", tracing::Level::DEBUG);
+        let phase_timing =
+            commit_phase_timing_enabled() || lane_staging_debug_enabled || lock_scope_debug_enabled;
+
         // ── Phase timing instrumentation ──
-        let t_start = Instant::now();
+        let t_start = phase_timing.then(Instant::now);
 
         // Step 1: Build our batch with OWNED frame data.
         // The caller supplies the Phase A snapshot so production commits do not
         // re-acquire the pager mutex before entering the group-commit queue.
 
-        let detailed_metrics = detailed_consolidation_metrics_enabled();
         let t_batch_build_start = detailed_metrics.then(Instant::now);
         let (batch, _our_new_db_size) =
             match build_group_commit_batch(current_db_size, write_set, write_pages_sorted)? {
@@ -7046,8 +7053,6 @@ where
         let parallel_wal_control = queue.parallel_wal_control().clone();
         let batch_id = queue.next_parallel_wal_batch_id();
         let lane_id = queue.current_parallel_wal_lane_id();
-        let lane_staging_debug_enabled =
-            tracing::enabled!(target: "fsqlite::wal::lane_staging", tracing::Level::DEBUG);
         let mut staging_fallback_reason = if matches!(
             parallel_wal_control.mode,
             ParallelWalOperatingMode::Conservative
@@ -7147,24 +7152,20 @@ where
             );
         }
 
-        let t_prepare_done = Instant::now();
-        let prepare_us = t_prepare_done.duration_since(t_start).as_micros() as u64;
+        let prepare_us = elapsed_profile_us(t_start);
         let waiter_id = batch.context.batch_id;
         let waiter_frames_contributed = batch.frames.len();
 
         // Step 2: Submit batch to consolidator, get Flusher or Waiter role.
         // If phase is FLUSHING, wait for current flush to complete before submitting.
-        let t_consolidator_lock_start = Instant::now();
+        let t_consolidator_lock_start = phase_timing.then(Instant::now);
         let (outcome, our_epoch, consolidator_lock_wait_us, flushing_wait_us) = {
             let mut consolidator = queue
                 .consolidator
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-            let t_lock_acquired = Instant::now();
-            let lock_wait_us = t_lock_acquired
-                .duration_since(t_consolidator_lock_start)
-                .as_micros() as u64;
+            let lock_wait_us = elapsed_profile_us(t_consolidator_lock_start);
 
             // ── Epoch pipelining: NO waiting during FLUSHING ──
             // The consolidator now accepts submissions during FLUSHING,
@@ -7489,16 +7490,14 @@ where
                 let mut fsync_seq: u64 = 0;
 
                 for attempt in 0..MAX_FLUSH_RETRIES {
-                    let t_inner_lock_start = Instant::now();
+                    let t_inner_lock_start = phase_timing.then(Instant::now);
                     flush_result = (|| -> Result<()> {
                         let mut inner = inner_arc.lock().map_err(|_| {
                             FrankenError::internal("SimpleTransaction lock poisoned")
                         })?;
-                        inner_lock_wait_us = Instant::now()
-                            .duration_since(t_inner_lock_start)
-                            .as_micros() as u64;
+                        inner_lock_wait_us = elapsed_profile_us(t_inner_lock_start);
 
-                        let t_excl_start = Instant::now();
+                        let t_excl_start = phase_timing.then(Instant::now);
                         // WAL appends need a cross-process writer gate, but
                         // they must not wait for every concurrent reader or
                         // writer transaction that already holds SHARED on the
@@ -7506,8 +7505,7 @@ where
                         // narrow lock for this: one appender at a time, while
                         // peer SHARED holders keep running.
                         inner.db_file.lock(cx, LockLevel::Reserved)?;
-                        exclusive_lock_us =
-                            Instant::now().duration_since(t_excl_start).as_micros() as u64;
+                        exclusive_lock_us = elapsed_profile_us(t_excl_start);
                         let restore_lock_level = if inner.writer_active {
                             // Immediate/exclusive transactions enter commit
                             // already owning RESERVED. If WAL append fails,
@@ -7519,7 +7517,7 @@ where
                             LockLevel::Shared
                         };
 
-                        let t_append_start = Instant::now();
+                        let t_append_start = phase_timing.then(Instant::now);
                         let flush_io_result = (|| -> Result<()> {
                             with_wal_backend(wal_backend, |wal| {
                                 frames_written_start = u64::try_from(wal.frame_count())
@@ -7551,14 +7549,12 @@ where
                                     u64::try_from(wal.frame_count()).unwrap_or(u64::MAX);
                                 Ok(())
                             })?;
-                            wal_append_us =
-                                Instant::now().duration_since(t_append_start).as_micros() as u64;
+                            wal_append_us = elapsed_profile_us(t_append_start);
 
                             if sync_policy.should_sync_on_commit() {
-                                let t_sync_start = Instant::now();
+                                let t_sync_start = phase_timing.then(Instant::now);
                                 with_wal_backend(wal_backend, |wal| wal.sync(cx))?;
-                                wal_sync_us =
-                                    Instant::now().duration_since(t_sync_start).as_micros() as u64;
+                                wal_sync_us = elapsed_profile_us(t_sync_start);
                                 fsync_seq = GROUP_COMMIT_TRACE_FSYNC_SEQ
                                     .fetch_add(1, AtomicOrdering::Relaxed)
                                     .saturating_add(1);
@@ -7658,26 +7654,28 @@ where
                                 append_frames_us,
                             );
                         }
-                        GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
-                            if record_initial_metrics {
-                                prepare_us
-                            } else {
-                                0
-                            },
-                            if record_initial_metrics {
-                                consolidator_lock_wait_us
-                            } else {
-                                0
-                            },
-                            flushing_wait_us,
-                            true,
-                            arrival_wait_us,
-                            inner_lock_wait_us,
-                            exclusive_lock_us,
-                            wal_append_us,
-                            wal_sync_us,
-                            0,
-                        );
+                        if phase_timing {
+                            GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
+                                if record_initial_metrics {
+                                    prepare_us
+                                } else {
+                                    0
+                                },
+                                if record_initial_metrics {
+                                    consolidator_lock_wait_us
+                                } else {
+                                    0
+                                },
+                                flushing_wait_us,
+                                true,
+                                arrival_wait_us,
+                                inner_lock_wait_us,
+                                exclusive_lock_us,
+                                wal_append_us,
+                                wal_sync_us,
+                                0,
+                            );
+                        }
 
                         // bd-db300.3.8.2: per-flush structured event splitting
                         // lock-wait time from WAL service time.
@@ -7876,14 +7874,13 @@ where
                 // - Call complete_flush() which sets completed_epoch = N+1
                 //
                 // So we wait for completed_epoch >= N+1.
-                let t_waiter_start = Instant::now();
+                let t_waiter_start = phase_timing.then(Instant::now);
                 let guard = queue
                     .consolidator
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let wait_outcome = queue.wait_for_epoch_outcome(guard, target_epoch)?;
-                let waiter_epoch_wait_us =
-                    Instant::now().duration_since(t_waiter_start).as_micros() as u64;
+                let waiter_epoch_wait_us = elapsed_profile_us(t_waiter_start);
 
                 match wait_outcome {
                     WaitForEpochOutcome::Completed => {
@@ -7914,18 +7911,20 @@ where
                                 lane_prepare_us,
                             );
                         }
-                        GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
-                            prepare_us,
-                            consolidator_lock_wait_us,
-                            flushing_wait_us,
-                            false, // is_flusher
-                            0,     // arrival_wait_us (N/A for waiter)
-                            0,     // inner_lock_wait_us (N/A for waiter)
-                            0,     // exclusive_lock_us (N/A for waiter)
-                            0,     // wal_append_us (N/A for waiter)
-                            0,     // wal_sync_us (N/A for waiter)
-                            waiter_epoch_wait_us,
-                        );
+                        if phase_timing {
+                            GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
+                                prepare_us,
+                                consolidator_lock_wait_us,
+                                flushing_wait_us,
+                                false, // is_flusher
+                                0,     // arrival_wait_us (N/A for waiter)
+                                0,     // inner_lock_wait_us (N/A for waiter)
+                                0,     // exclusive_lock_us (N/A for waiter)
+                                0,     // wal_append_us (N/A for waiter)
+                                0,     // wal_sync_us (N/A for waiter)
+                                waiter_epoch_wait_us,
+                            );
+                        }
 
                         // bd-db300.3.8.2: per-waiter structured event showing
                         // time spent waiting for the flusher (all lock-wait,
@@ -8629,7 +8628,8 @@ where
         // =====================================================================
 
         // ── Full commit path timing instrumentation ──
-        let t_commit_start = Instant::now();
+        let phase_timing = commit_phase_timing_enabled();
+        let t_commit_start = phase_timing.then(Instant::now);
 
         // Phase A: Prepare write_set under inner lock (~20us)
         // Snapshot state needed for WAL I/O, then DROP inner.lock() immediately.
@@ -8757,7 +8757,7 @@ where
         let wal_current_db_size = inner.db_size;
         let wal_sync_policy = inner.wal_commit_sync_policy;
 
-        let t_phase_a_done = Instant::now();
+        let t_phase_a_done = phase_timing.then(Instant::now);
 
         // Phase B: Commit via WAL or journal
         // D1-CRITICAL: For WAL mode, we release inner.lock() here so other
@@ -8826,7 +8826,7 @@ where
             )
         };
 
-        let t_phase_b_done = Instant::now();
+        let t_phase_b_done = phase_timing.then(Instant::now);
 
         if commit_result.is_ok() {
             // Phase C1 (FAST, under inner.lock): Update metadata only.
@@ -8881,7 +8881,7 @@ where
             let _ = inner.db_file.unlock(cx, preserve_level);
             drop(inner);
 
-            let t_phase_c1_done = Instant::now();
+            let t_phase_c1_done = phase_timing.then(Instant::now);
 
             // H4 fault hook: crash during Phase C, after commit_seq update
             // but before snapshot publish. WAL frames are durable, commit_seq
@@ -8911,10 +8911,24 @@ where
                 .set(publish_update.visible_commit_seq);
             self.published_db_size.set(publish_update.db_size);
 
-            let t_phase_c2_done = Instant::now();
+            let t_phase_c2_done = phase_timing.then(Instant::now);
 
             // Record full commit path timing.
-            if self.journal_mode == JournalMode::Wal {
+            if self.journal_mode == JournalMode::Wal
+                && let (
+                    Some(t_commit_start),
+                    Some(t_phase_a_done),
+                    Some(t_phase_b_done),
+                    Some(t_phase_c1_done),
+                    Some(t_phase_c2_done),
+                ) = (
+                    t_commit_start,
+                    t_phase_a_done,
+                    t_phase_b_done,
+                    t_phase_c1_done,
+                    t_phase_c2_done,
+                )
+            {
                 let phase_a_us = t_phase_a_done.duration_since(t_commit_start).as_micros() as u64;
                 let phase_b_us = t_phase_b_done.duration_since(t_phase_a_done).as_micros() as u64;
                 let phase_c1_us = t_phase_c1_done.duration_since(t_phase_b_done).as_micros() as u64;

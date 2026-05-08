@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{
     LazyLock,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use fsqlite_error::{FrankenError, Result};
@@ -69,6 +69,23 @@ pub fn detailed_consolidation_metrics_enabled() -> bool {
                 .is_ok_and(|value| env_flag_enabled(&value))
     });
     *ENABLED
+}
+
+static COMMIT_PHASE_TIMING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable WAL commit phase timing for explicit profiling windows.
+///
+/// Normal commits still update correctness-critical WAL state and cheap frame
+/// counters, but they do not need to sample the wall clock for every phase
+/// unless a caller is collecting a hot-path profile or detailed WAL metrics.
+pub fn set_commit_phase_timing_enabled(enabled: bool) -> bool {
+    COMMIT_PHASE_TIMING_ENABLED.swap(enabled, Ordering::Relaxed)
+}
+
+/// Whether commit phase timing should sample `Instant::now()`.
+#[must_use]
+pub fn commit_phase_timing_enabled() -> bool {
+    detailed_consolidation_metrics_enabled() || COMMIT_PHASE_TIMING_ENABLED.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------

@@ -77,7 +77,8 @@ pub use group_commit::{
     GLOBAL_CONSOLIDATION_METRICS, GroupCommitConfig, GroupCommitConsolidator, PhaseHistogram,
     PhasePercentiles, SubmitOutcome, TransactionConflictSnapshot, TransactionFrameBatch,
     TransactionFrameBatchContext, WakeReasonCounters, WakeReasonSnapshot,
-    detailed_consolidation_metrics_enabled, write_consolidated_frames,
+    commit_phase_timing_enabled, detailed_consolidation_metrics_enabled,
+    set_commit_phase_timing_enabled, write_consolidated_frames,
 };
 pub use metrics::{
     GLOBAL_GROUP_COMMIT_METRICS, GLOBAL_WAL_FEC_REPAIR_METRICS, GLOBAL_WAL_METRICS,

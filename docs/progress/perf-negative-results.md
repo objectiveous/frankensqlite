@@ -12,6 +12,45 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-08 - Fixed-width REAL update page-local payload patch
+
+- Target: `UPDATE/DELETEThroughput` direct-simple UPDATE rows, especially
+  `UPDATE bench SET value = ?2 WHERE id = ?1`, after the current profile still
+  showed payload copying, `parse_record_projected_column_offsets`, and
+  same-size payload overwrite work in the fixed-width REAL update path.
+- Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs` and
+  `crates/fsqlite-core/src/connection.rs`; the source patch was restored after
+  the same-window matrix rejected it.
+- Candidate shape: add a hidden
+  `BtCursor::table_mutate_current_payload_same_size_no_overflow` primitive that
+  exposes the current local table payload as a mutable page-resident slice. The
+  fixed-width REAL direct UPDATE path parsed the record header from that slice
+  and patched the 8-byte REAL field in place, avoiding `payload_into` plus a
+  full payload copy back through
+  `table_overwrite_current_payload_same_size_no_overflow`.
+- Correctness/build proof before rejection:
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-swiftgate-payload-patch-btree CARGO_BUILD_JOBS=8 cargo test -p fsqlite-btree test_table_mutate_current_payload_same_size_no_overflow_patches_local_payload -- --nocapture`
+  passed, and
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-swiftgate-payload-patch-core CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_direct_simple_update_single_real_column_patches_payload_without_decode -- --nocapture --test-threads=1`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/swiftgate-payload-patch-20260508T1808Z/summary.md`,
+  `candidate-isolated-update.txt`, `candidate-update.json`,
+  `candidate-update-repeat.json`, `clean-update.json`, and `stdout/`.
+- Result: rejected and not applied. The isolated candidate UPDATE loop measured
+  `636 ns/update`, but the focused matrix failed the same-window keep gate.
+  Restored clean source measured average/geomean/p90/p99
+  `1.0410476491` / `1.0255034389` / `1.3191885268` /
+  `1.3191885268`. The candidate runs measured
+  `1.1541475349` / `1.1366021497` / `1.4638185577` /
+  `1.4638185577`, then `1.0661982520` / `1.0529987672` /
+  `1.3262300030` / `1.3262300030`. Both candidate runs were worse than the
+  clean same-window matrix on aggregate score and tail.
+- Do not retry a page-local payload patch for fixed-width REAL UPDATE as a
+  standalone optimization. Reconsider only inside a broader same-leaf batch
+  mutation primitive that avoids per-row page read/write ceremony across many
+  rows and wins repeated focused UPDATE/DELETE gates plus the full quick matrix.
+
 ## 2026-05-08 - Deferred UPDATE/DELETE microbatch carry
 
 - Target: `UPDATE/DELETEThroughput` 100-row direct UPDATE/DELETE tails and the

@@ -24,7 +24,7 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageSize;
 
 const PAGE_BUF_POOL_FREE_LIST_INITIAL_CAPACITY: usize = 64;
-const GLOBAL_PAGE_BUF_RECYCLE_CAPACITY: usize = 2048;
+const GLOBAL_PAGE_BUF_RECYCLE_CAPACITY: usize = 256;
 
 // ---------------------------------------------------------------------------
 // PageBuf

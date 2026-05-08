@@ -37,7 +37,8 @@ use fsqlite_vfs::GLOBAL_VFS_METRICS;
 use fsqlite_vfs::metrics::MetricsSnapshot as VfsMetricsSnapshot;
 use fsqlite_wal::{
     GLOBAL_CONSOLIDATION_METRICS, GLOBAL_GROUP_COMMIT_METRICS, GLOBAL_WAL_METRICS,
-    WalTelemetrySnapshot, set_commit_phase_timing_enabled, wal_telemetry_snapshot,
+    WalTelemetrySnapshot, commit_phase_timing_forced_enabled, set_commit_phase_timing_enabled,
+    wal_telemetry_snapshot,
 };
 
 use crate::oplog::{ExpectedResult, OpKind, OpLog, OpRecord};
@@ -257,7 +258,11 @@ impl HotPathMetricsCapture {
         let prev_parse_metrics_enabled = parse_metrics_enabled();
         let prev_vdbe_metrics_enabled = vdbe_metrics_enabled();
         let prev_btree_metrics_enabled = btree_metrics_enabled();
-        let prev_commit_phase_timing_enabled = set_commit_phase_timing_enabled(enabled);
+        let prev_commit_phase_timing_enabled = if enabled {
+            set_commit_phase_timing_enabled(true)
+        } else {
+            commit_phase_timing_forced_enabled()
+        };
         let mut capture = Self {
             enabled,
             prev_parse_metrics_enabled,

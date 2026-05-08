@@ -82,10 +82,16 @@ pub fn set_commit_phase_timing_enabled(enabled: bool) -> bool {
     COMMIT_PHASE_TIMING_ENABLED.swap(enabled, Ordering::Relaxed)
 }
 
+/// Whether commit phase timing has been explicitly enabled by a profiling caller.
+#[must_use]
+pub fn commit_phase_timing_forced_enabled() -> bool {
+    COMMIT_PHASE_TIMING_ENABLED.load(Ordering::Relaxed)
+}
+
 /// Whether commit phase timing should sample `Instant::now()`.
 #[must_use]
 pub fn commit_phase_timing_enabled() -> bool {
-    detailed_consolidation_metrics_enabled() || COMMIT_PHASE_TIMING_ENABLED.load(Ordering::Relaxed)
+    detailed_consolidation_metrics_enabled() || commit_phase_timing_forced_enabled()
 }
 
 // ---------------------------------------------------------------------------

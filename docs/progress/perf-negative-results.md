@@ -12,6 +12,45 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-08 - WAL prepared transform coefficient precompute
+
+- Target: low-thread concurrent-writer gap where
+  `WalChecksumTransform::for_wal_frame` remained visible in the clean
+  `mt-mvcc-bench` profile.
+- Touched during rejected scratch candidate:
+  `crates/fsqlite-wal/src/checksum.rs` and
+  `crates/fsqlite-wal/src/wal.rs`; source was only edited in detached scratch
+  worktree `/data/tmp/frankensqlite-windyibis-wal-pipeline-638e93f9` and was
+  not applied to `main`.
+- Candidate shape: precompute the WAL frame header and page-payload affine
+  checksum coefficients once per prepared WAL batch, then build the prepared
+  frame transform from the serialized first 8 header bytes plus the original
+  page payload slice instead of calling `WalChecksumTransform::for_wal_frame`
+  on the freshly copied frame bytes for every frame.
+- Correctness proof on the scratch candidate:
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-windyibis-wal-pipeline-target CARGO_BUILD_JOBS=10 cargo test -p fsqlite-wal checksum_transform -- --nocapture`
+  passed 3 checksum-transform tests. `rch` failed open to local execution
+  because the scratch worktree was outside the `/data/projects` canonical
+  remote root.
+- Evidence artifacts:
+  `tests/artifacts/perf/windyibis-wal-pipeline-precompute-20260508T102216Z/summary.md`,
+  `baseline-mt-mvcc-2t.json`, `candidate-mt-mvcc-2t.json`,
+  `baseline-concurrent-quick.json`, `candidate-concurrent-quick.json`, and
+  `candidate.diff`.
+- Result: rejected by the concurrent quick matrix. The standalone
+  `mt-mvcc-bench --threads=2 --iters=10` row improved in the same-window A/B
+  (`3.75 ms -> 3.35 ms` FSQLite p50 and time ratio
+  `1.5307x -> 1.3217x`), but `comprehensive-bench --quick --filter concurrent`
+  worsened the primary 2-writer row (`13.379 ms -> 13.638 ms`, ratio
+  `1.1312x -> 1.1521x`), worsened 4 writers (`19.410 ms -> 19.734 ms`), and
+  worsened aggregate concurrent average/geomean ratios
+  `0.825150 / 0.744574 -> 0.845684 / 0.759243`.
+- Do not retry per-batch WAL checksum coefficient precompute plus
+  source-payload prepared-transform construction as a standalone optimization.
+  Revisit WAL frame preparation only with a larger pipeline change that wins
+  `comprehensive-bench --quick --filter concurrent` and then the full quick
+  matrix in the same A/B window.
+
 ## 2026-05-08 - Direct REAL UPDATE numeric assignment shortcut
 
 - Target: focused `UPDATE/DELETEThroughput` fixed-width REAL direct UPDATE

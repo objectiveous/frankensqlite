@@ -2111,16 +2111,14 @@ fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
         }
     }
 
-    let mut page1 = ensure_page_one_in_write_set(cx, inner, cache, wal_backend, pool, write_set)?;
+    let mut page1 = ensure_page_one_in_write_set(cx, inner, cache, wal_backend, write_set)?;
 
-    page1[32..36].copy_from_slice(&first_trunk.to_be_bytes());
-    page1[36..40].copy_from_slice(&total_free.to_be_bytes());
-    insert_staged_page(
-        write_set,
-        write_pages_sorted,
-        PageNumber::ONE,
-        StagedPage::from_buf(page1),
-    );
+    {
+        let page1_bytes = page1.as_page_bytes_mut();
+        page1_bytes[32..36].copy_from_slice(&first_trunk.to_be_bytes());
+        page1_bytes[36..40].copy_from_slice(&total_free.to_be_bytes());
+    }
+    insert_staged_page(write_set, write_pages_sorted, PageNumber::ONE, page1);
 
     Ok(())
 }
@@ -2130,17 +2128,14 @@ fn ensure_page_one_in_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     inner: &mut PagerInner<F>,
     cache: &ShardedPageCache,
     wal_backend: &SharedWalBackend,
-    pool: &PageBufPool,
     write_set: &mut HashMap<PageNumber, StagedPage, S>,
-) -> Result<PageBuf> {
+) -> Result<StagedPage> {
     if let Some(staged) = write_set.remove(&PageNumber::ONE) {
-        return Ok(staged.into_buf(pool));
+        return Ok(staged);
     }
 
     let page1_vec = inner.read_page_copy(cx, cache, wal_backend, PageNumber::ONE)?;
-    let mut buf = pool.acquire()?;
-    buf.copy_from_slice(&page1_vec);
-    Ok(buf)
+    Ok(StagedPage::from_page_data(PageData::from_vec(page1_vec)))
 }
 
 fn insert_page_sorted(pages: &mut Vec<PageNumber>, page_no: PageNumber) {
@@ -5966,6 +5961,13 @@ impl StagedPage {
         }
     }
 
+    fn as_page_bytes_mut(&mut self) -> &mut [u8] {
+        match &mut self.backing {
+            StagedPageBacking::Buffered(buf) => buf.as_mut_slice(),
+            StagedPageBacking::Owned(data) => data.as_bytes_mut(),
+        }
+    }
+
     fn published_page(&self) -> PageData {
         self.published
             .get_or_init(|| match &self.backing {
@@ -8709,7 +8711,6 @@ where
                     &mut inner,
                     &self.cache,
                     &self.wal_backend,
-                    &self.pool,
                     &mut self.write_set,
                 ) {
                     Ok(p) => p,
@@ -8719,29 +8720,30 @@ where
                         return Err(e);
                     }
                 };
-                if page1.len() >= DATABASE_HEADER_SIZE {
+                let page1_bytes = page1.as_page_bytes_mut();
+                if page1_bytes.len() >= DATABASE_HEADER_SIZE {
                     let mut page_count_bytes = [0_u8; 4];
-                    page_count_bytes.copy_from_slice(&page1[28..32]);
+                    page_count_bytes.copy_from_slice(&page1_bytes[28..32]);
                     let existing_page_count = u32::from_be_bytes(page_count_bytes);
                     let new_change_counter = inner.commit_seq.get().wrapping_add(1) as u32;
 
                     // Offset 24..28: change counter (big-endian u32)
-                    page1[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
+                    page1_bytes[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
                     if self.journal_mode != JournalMode::Wal
                         || wal_page1_plan.requires_page_count_advance()
                     {
                         let new_db_size = committed_db_size.max(existing_page_count);
                         // Offset 28..32: page count (big-endian u32)
-                        page1[28..32].copy_from_slice(&new_db_size.to_be_bytes());
+                        page1_bytes[28..32].copy_from_slice(&new_db_size.to_be_bytes());
                     }
                     // Offset 92..96: version-valid-for
-                    page1[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
+                    page1_bytes[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
                 }
                 insert_staged_page(
                     &mut self.write_set,
                     &mut self.write_pages_sorted,
                     PageNumber::ONE,
-                    StagedPage::from_buf(page1),
+                    page1,
                 );
             }
             cross_process_conflict_pages = if self.journal_mode == JournalMode::Wal {
@@ -9101,7 +9103,6 @@ where
                     &mut inner,
                     &self.cache,
                     &self.wal_backend,
-                    &self.pool,
                     &mut self.write_set,
                 ) {
                     Ok(p) => p,
@@ -9111,25 +9112,26 @@ where
                         return Err(e);
                     }
                 };
-                if page1.len() >= DATABASE_HEADER_SIZE {
+                let page1_bytes = page1.as_page_bytes_mut();
+                if page1_bytes.len() >= DATABASE_HEADER_SIZE {
                     let mut page_count_bytes = [0_u8; 4];
-                    page_count_bytes.copy_from_slice(&page1[28..32]);
+                    page_count_bytes.copy_from_slice(&page1_bytes[28..32]);
                     let existing_page_count = u32::from_be_bytes(page_count_bytes);
                     let new_change_counter = inner.commit_seq.get().wrapping_add(1) as u32;
-                    page1[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
+                    page1_bytes[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
                     if self.journal_mode != JournalMode::Wal
                         || wal_page1_plan.requires_page_count_advance()
                     {
                         let new_db_size = committed_db_size.max(existing_page_count);
-                        page1[28..32].copy_from_slice(&new_db_size.to_be_bytes());
+                        page1_bytes[28..32].copy_from_slice(&new_db_size.to_be_bytes());
                     }
-                    page1[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
+                    page1_bytes[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
                 }
                 insert_staged_page(
                     &mut self.write_set,
                     &mut self.write_pages_sorted,
                     PageNumber::ONE,
-                    StagedPage::from_buf(page1),
+                    page1,
                 );
             }
             let cross_process_conflict_pages = if self.journal_mode == JournalMode::Wal {

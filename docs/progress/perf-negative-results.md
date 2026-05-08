@@ -7053,3 +7053,53 @@ set: sessions found by
   optimization. Reconsider only if benchmark setup is removed without adding an
   `execute` guard to every statement, or if a same-window full quick matrix
   proves that the setup win outweighs the dispatch guard cost.
+
+## 2026-05-08 - Prebuilt empty-root direct INSERT leaf page-run
+
+- Target: the remaining large-record INSERT tails after the current full quick
+  frontier showed `INSERT single txn large_10col 10K` at ratio `1.268` and
+  `INSERT record size large_10col 10K` at ratio `1.102`, with profiling pointing
+  at row construction, btree insert, commit roundtrip, and `2006` page-pool
+  misses.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`,
+  `crates/fsqlite-btree/src/lib.rs`, and
+  `crates/fsqlite-core/src/connection.rs`. The source patch was manually
+  unwound after the repeat insert benchmark rejected it; only this ledger entry
+  and artifacts remain.
+- Candidate shape: add a hidden btree `BulkTableLeafPageBuilder` that prebuilt
+  no-overflow table leaf pages for monotonic prepared direct INSERT page-runs
+  starting from an empty non-page-1 root, then bulk-load those leaf pages through
+  the existing interior-page builder. `Connection` admitted only large records
+  (`record_bytes.len() >= 384`) so small rows, repeated-record page-runs,
+  non-empty right-edge batches, autocommit, and existing owned/arena paths
+  stayed on their previous routes.
+- Correctness proof passed before benchmark rejection:
+  `cargo test -p fsqlite-btree test_table_bulk_load_empty_root_prebuilt_leaf_pages_builds_reachable_tree -- --nocapture`,
+  `cargo test -p fsqlite-core test_prepared_direct_insert_large_empty_page_run_uses_prebuilt_leaves -- --nocapture`,
+  `cargo fmt --check -p fsqlite-btree -p fsqlite-core`, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-swiftgate-prebuilt-leaf-check-target cargo check -p fsqlite-btree -p fsqlite-core --lib`.
+- Evidence artifacts:
+  `tests/artifacts/perf/swiftgate-prebuilt-leaf-pagerun-20260508T1625Z/candidate-insert.json`,
+  `tests/artifacts/perf/swiftgate-prebuilt-leaf-pagerun-20260508T1625Z/candidate-insert-repeat.json`,
+  and
+  `tests/artifacts/perf/swiftgate-prebuilt-leaf-pagerun-20260508T1625Z/summary.md`.
+- Result: rejected by the focused insert matrix. Against the frontier
+  `rusticgrove-full-quick-current-20260508T1510Z/insert-profile.json`, the first
+  candidate run worsened faster/comparable/C-faster `17/2/6 -> 16/2/7`,
+  average ratio `0.803142 -> 0.850594`, geomean `0.780274 -> 0.825594`, median
+  `0.725773 -> 0.810453`, p90 `1.074184 -> 1.133610`, p99
+  `1.132336 -> 1.150862`, and weighted score `0.788869 -> 0.879814`.
+  The already-built candidate binary was repeated because the first run had
+  mixed row-level signal; the repeat still lost the keep gate with average
+  ratio `0.841602`, geomean `0.815917`, median `0.805487`, p90 `1.144750`,
+  p99 `1.388409`, and weighted score `0.808149`.
+- The motivating `record-size large_10col 10K` row was unstable: frontier F
+  median `10.528151 ms`, first candidate `9.107507 ms`, repeat candidate
+  `12.076303 ms`. The `single-txn large_10col 10K` row improved modestly in
+  both candidate runs, but the section-level gate and target-row repeat did not
+  justify keeping the added page-builder path.
+- Do not retry a prebuilt empty-root leaf page-run as a standalone optimization.
+  Reconsider only as part of a true fused record/body/page builder that removes
+  row construction and page layout cost together and wins a same-window focused
+  insert matrix before any full quick promotion.

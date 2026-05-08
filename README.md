@@ -1146,15 +1146,25 @@ The human-readable scope lock for that contract lives in
 
 ### Workloads That Benefit Most from MVCC
 
-| Workload | Single-Writer SQLite | FrankenSQLite MVCC | Speedup |
-|----------|---------------------|-------------------|---------|
-| 8 threads writing to different tables | Serialized (1x) | Parallel (up to 8x) | ~8x |
-| 8 threads writing to same table, different row ranges | Serialized (1x) | Parallel if different leaf pages | 2-6x |
-| 8 threads writing to same table, same hot rows | Serialized (1x) | Serialized (page conflicts) | ~1x |
-| Mixed read/write (90% reads, 10% writes) | Writers block readers in non-WAL | Readers never block | Lower p99 read latency |
-| Single-threaded writes | Identical | Slight overhead from version tracking | ~0.95x |
+Current benchmark source of truth: `comprehensive-bench --quick` in
+`tests/artifacts/perf/rusticgrove-full-quick-current-20260508T1510Z/`
+at commit `953959cb`. Ratios are FrankenSQLite time divided by C SQLite
+time, so values below `1.0x` are faster for FrankenSQLite.
 
-The sweet spot is multiple writers touching different parts of the database simultaneously. Single-threaded workloads see negligible MVCC overhead. Pathological cases (all writers hammering the same leaf page) degrade to single-writer behavior because every write conflicts.
+| Workload | Current measured status |
+|----------|-------------------------|
+| 2 writers, same table, non-overlapping rowid ranges | `1.00x` (parity): C `13.947 ms`, F `13.943 ms` |
+| 4 writers, same table, non-overlapping rowid ranges | `0.98x`: C `20.972 ms`, F `20.580 ms` |
+| 8 writers, same table, non-overlapping rowid ranges | `0.46x`: C `92.460 ms`, F `42.270 ms` |
+| Mixed OLTP, 5K ops on a 5K-row table, 80% reads / 20% writes | `0.21x`: C `225.112 ms`, F `46.247 ms` |
+| Single-threaded writes | Still tracked as a gap: current full quick has several C-faster 100-row DML/INSERT tails, worst `1.38x` |
+
+The sweet spot is multiple writers touching different parts of the database
+simultaneously. Pathological cases where all writers hammer the same leaf page
+degrade toward single-writer behavior because every write conflicts. Separate
+table writer scaling and hot-row conflict scaling are not yet represented in
+the current comprehensive matrix; they should be measured before assigning a
+numeric speedup.
 
 ### Memory Overhead
 
@@ -1164,12 +1174,12 @@ MVCC adds memory overhead proportional to the number of concurrent active versio
 
 | Metric | Expected |
 |--------|----------|
-| Single-row INSERT throughput (1 writer) | Comparable to C SQLite |
-| Single-row INSERT throughput (8 writers, separate tables) | ~8x C SQLite |
-| Point SELECT by rowid | Comparable to C SQLite |
-| Full table scan | Comparable to C SQLite |
+| Single-row INSERT throughput (1 writer) | Near parity overall, with remaining measured tails in the current quick matrix |
+| Single-row INSERT throughput (8 writers, separate tables) | Unmeasured in the current comprehensive matrix; same-table 8-writer row is `0.46x` F/C |
+| Point SELECT by rowid | Faster in current read-after-write rows: `0.15x` to `0.20x` F/C |
+| Full table scan | Faster in current read-after-write rows: `0.22x` to `0.26x` F/C |
 | WAL checkpoint latency | Slightly higher (must check active snapshots) |
-| Reader throughput under write load | Higher (no `aReadMark` contention) |
+| Reader throughput under write load | Current mixed 80/20 row is faster overall; p99-specific read-latency claim still needs a dedicated harness |
 
 ---
 

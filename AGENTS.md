@@ -153,6 +153,15 @@ archived Gemini sessions under `/home/ubuntu/.gemini/tmp/frankensqlite`. Treat
 CASS summaries as leads until backed by code, commits, or benchmark artifacts;
 do not revive an old idea from CASS without checking the negative ledger first.
 
+### Documentation Invariants for Performance Claims
+
+Every numeric performance claim in `README.md` must name the benchmark or
+artifact that measures it, including the artifact path or commit and the date of
+the run. Do not describe a workload as "comparable", "faster", or "N x faster"
+unless the cited benchmark actually measures that workload shape. If the
+current matrix does not measure the claim, say it is unmeasured and file or
+reference the missing benchmark work instead of filling in an expected result.
+
 ---
 
 ## Code Editing Discipline

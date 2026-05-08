@@ -12,6 +12,44 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-08 - Prepared direct INSERT no-FK guard cache
+
+- Target: remaining no-FK prepared direct INSERT fixed costs, especially
+  100-row INSERT rows and the 100-row UPDATE/DELETE setup phase that
+  prepopulates through the same direct INSERT path.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  source was restored after the full quick matrix rejected it.
+- Candidate shape: cache `has_outbound_foreign_keys` in
+  `PreparedDirectSimpleInsert` at prepare time and consult
+  `PRAGMA foreign_keys` only when that bit is true. The proof obligation was
+  that prepared statement schema validation already protects the table FK
+  layout, while FK-enabled child tables still re-check the pragma dynamically.
+- Correctness/build proof before measurement:
+  - `cargo fmt -p fsqlite-core --check` passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-fk-direct-insert-candidate-target CARGO_BUILD_JOBS=16 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete`
+    passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-fk-direct-insert-candidate-target CARGO_BUILD_JOBS=16 cargo test -p fsqlite-core test_prepare_insert_with_foreign_keys_uses_direct_dispatch_and_checks_fk -- --nocapture`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/fk-direct-insert-crimsongorge-20260508T030239Z/summary.md`,
+  `baseline-insert.json`, `candidate-insert.json`, `baseline-update.json`,
+  `candidate-update.json`, `candidate-full.json`, and stdout/stderr logs under
+  the same directory.
+- Result: rejected and reverted. Focused UPDATE/DELETE improved geomean
+  `1.1388583327143484 -> 1.036956189091621`, but INSERT weighted score
+  worsened `0.784207453637674 -> 0.7884368705666973` and INSERT p99 worsened
+  `1.1516829824326136 -> 1.2355933953670204`. The full quick gate rejected the
+  candidate: primary weighted score worsened
+  `0.34593878641661835 -> 0.34861836969535076`, average ratio worsened
+  `0.4542606463918878 -> 0.4601152352147432`, geomean worsened
+  `0.2674752493298549 -> 0.2697448380388971`, p90 worsened
+  `0.9811588214938469 -> 1.0592658202932783`, and C-faster rows increased
+  `8 -> 10`.
+- Do not retry prepare-time no-FK guard caching as a standalone direct INSERT
+  optimization. Reconsider FK/no-FK metadata only if it is folded into a broader
+  prepared row-template or page-builder change that wins the full quick
+  weighted score in the same A/B window.
+
 ## 2026-05-08 - File-backed direct INSERT preserialized-record widening
 
 - Target: the remaining low-thread file-backed concurrent writer gap,

@@ -12,6 +12,43 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-08 - Direct UPDATE lazy row-scratch borrow
+
+- Target: remaining focused `UPDATE/DELETEThroughput` tail, especially the
+  fixed-width REAL direct UPDATE rows in
+  `UPDATE bench SET value = ?2 WHERE id = ?1`.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  source was restored after the repeat focused gate rejected the change.
+- Candidate shape: delay borrowing `prepared_direct_update_row_scratch` until
+  after `try_execute_prepared_direct_simple_update_fixed_width_real` declines,
+  removing one `RefCell` borrow from the benchmark's fixed-width REAL direct
+  UPDATE hot path while leaving DELETE, page I/O selection, cursor retention,
+  and concurrent-writer defaults unchanged.
+- Correctness proof before measurement:
+  - `cargo fmt -p fsqlite-core --check` passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-boldlion-dml-current-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_direct_simple_update_all_non_ipk_columns_skips_old_payload_decode -- --nocapture --test-threads=1`
+    passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-boldlion-dml-current-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_direct_simple_update_single_real_column_patches_payload_without_decode -- --nocapture --test-threads=1`
+    passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-boldlion-dml-current-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_direct_simple_update_delete_fast_path_executes_and_is_correct -- --nocapture --test-threads=1`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/boldlion-dml-current-20260508T0900Z/summary.md`,
+  `head-dml-profile.json`, `candidate-lazy-update-scratch.json`, and
+  `candidate-lazy-update-scratch-repeat.json`.
+- Result: rejected and restored. The first dirty candidate run looked
+  promising, moving focused DML average/geomean
+  `1.1203914638` / `1.1122084670` to
+  `1.0344792667` / `1.0225809144`, but the immediate repeat failed the
+  focused gate: average/geomean worsened to
+  `1.1957309163` / `1.1693177146`, p90/p99 worsened to
+  `1.6946494052`, the 100-row update row was `1.3924088986x`, and the
+  100-row delete row was `1.6946494052x`.
+- Do not retry lazy borrowing of the direct UPDATE row-value scratch as a
+  standalone optimization. Reconsider only if it falls out naturally inside a
+  broader DML run operator that removes larger per-row admission or mutation
+  work and wins repeated focused UPDATE/DELETE gates.
+
 ## 2026-05-08 - Private-memory direct UPDATE/DELETE `SharedTxnPageIo` bypass
 
 - Target: remaining setup-heavy `UPDATE/DELETEThroughput` rows for private

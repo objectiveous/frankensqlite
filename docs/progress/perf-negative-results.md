@@ -12,6 +12,40 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-08 - Deferred UPDATE/DELETE microbatch carry
+
+- Target: `UPDATE/DELETEThroughput` 100-row direct UPDATE/DELETE tails and the
+  isolated `perf-update-delete 100 ... compare isolated` mutation loop, after
+  profiling showed repeated direct DML mutation remained slower than C SQLite.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  the source patch was manually restored after the standard DML measurement
+  rejected the change.
+- Candidate shape: extend the existing AAC-P6 prepared-statement microbatch
+  carry from precompiled in-transaction INSERT to deferred direct-simple
+  UPDATE/DELETE. Repeated direct UPDATE/DELETE calls skipped
+  `ensure_schema_unchanged_with_prebound_publication()` after the first renewal
+  when statement identity, bind arity, schema identity, function-registry
+  generation, explicit transaction state, and concurrent session id matched.
+- Correctness proof before rejection:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-swiftgate-ud-microbatch-check CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_stmt_microbatch_coalesces_repeated_update_delete -- --nocapture`
+  passed on the candidate. `cargo fmt --check -p fsqlite-core` passed after
+  restoring the source.
+- Evidence artifacts:
+  `tests/artifacts/perf/swiftgate-current-dml-breakdown-20260508T1708Z/summary.md`,
+  `baseline-isolated-update.txt`, `baseline-isolated-delete.txt`,
+  `baseline-standard-both.txt`, `candidate-isolated-update.txt`,
+  `candidate-isolated-delete.txt`, and `candidate-standard-both.txt`.
+- Result: rejected and not applied. The isolated UPDATE loop improved only
+  slightly (`661 ns/update -> 651 ns/update`) and isolated DELETE was unchanged
+  (`1707 ns/delete -> 1706 ns/delete`). The standard 100-row DML run worsened:
+  FSQLite update rose from `1418 ns/update` to `1510 ns/update`, and delete
+  rose from `1768 ns/delete` to `1934 ns/delete`.
+- Do not retry deferred UPDATE/DELETE microbatch carry as a standalone
+  optimization. Reconsider only if a future profile shows
+  `ensure_schema_unchanged_with_prebound_publication()` dominating direct DML
+  mutation and a same-window focused UPDATE/DELETE matrix improves both
+  isolated mutation and the standard section gate.
+
 ## 2026-05-08 - Direct INSERT concat record-body encoder
 
 - Target: `comprehensive-bench --quick --filter insert`, especially the

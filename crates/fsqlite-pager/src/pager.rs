@@ -2111,7 +2111,7 @@ fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
         }
     }
 
-    let mut page1 = ensure_page_one_in_write_set(cx, inner, cache, wal_backend, write_set)?;
+    let mut page1 = ensure_page_one_in_write_set(cx, inner, cache, wal_backend, pool, write_set)?;
 
     {
         let page1_bytes = page1.as_page_bytes_mut();
@@ -2128,10 +2128,11 @@ fn ensure_page_one_in_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     inner: &mut PagerInner<F>,
     cache: &ShardedPageCache,
     wal_backend: &SharedWalBackend,
+    pool: &PageBufPool,
     write_set: &mut HashMap<PageNumber, StagedPage, S>,
 ) -> Result<StagedPage> {
     if let Some(staged) = write_set.remove(&PageNumber::ONE) {
-        return Ok(staged);
+        return Ok(staged.into_unpublished_for_mutation(pool));
     }
 
     let page1_vec = inner.read_page_copy(cx, cache, wal_backend, PageNumber::ONE)?;
@@ -5962,9 +5963,22 @@ impl StagedPage {
     }
 
     fn as_page_bytes_mut(&mut self) -> &mut [u8] {
+        debug_assert!(
+            self.published.get().is_none(),
+            "staged pages must be unpublished before in-place mutation"
+        );
         match &mut self.backing {
             StagedPageBacking::Buffered(buf) => buf.as_mut_slice(),
             StagedPageBacking::Owned(data) => data.as_bytes_mut(),
+        }
+    }
+
+    fn into_unpublished_for_mutation(self, pool: &PageBufPool) -> Self {
+        let has_published_snapshot = self.published.get().is_some();
+        if has_published_snapshot {
+            Self::from_buf(self.into_buf(pool))
+        } else {
+            self
         }
     }
 
@@ -8711,6 +8725,7 @@ where
                     &mut inner,
                     &self.cache,
                     &self.wal_backend,
+                    &self.pool,
                     &mut self.write_set,
                 ) {
                     Ok(p) => p,
@@ -9103,6 +9118,7 @@ where
                     &mut inner,
                     &self.cache,
                     &self.wal_backend,
+                    &self.pool,
                     &mut self.write_set,
                 ) {
                     Ok(p) => p,
@@ -23880,6 +23896,30 @@ mod tests {
             first.as_bytes().as_ptr(),
             second.as_bytes().as_ptr(),
             "bead_id=bd-db300.10.6 case=buffered_publication_reuses_shared_snapshot"
+        );
+    }
+
+    #[test]
+    fn test_staged_page_unpublishes_before_mutation() {
+        let pool = PageBufPool::new(PageSize::DEFAULT, 2);
+        let mut original = sample_page(0x42);
+        original[24] = 0x11;
+        let staged = StagedPage::from_page_data(PageData::from_vec(original));
+
+        let old_snapshot = staged.published_page();
+        let mut staged = staged.into_unpublished_for_mutation(&pool);
+        staged.as_page_bytes_mut()[24] = 0x99;
+        let final_page = staged.into_published_page();
+
+        assert_eq!(
+            old_snapshot.as_bytes()[24],
+            0x11,
+            "bead_id=bd-page1-staged-invariant case=old_snapshot_keeps_original_byte"
+        );
+        assert_eq!(
+            final_page.as_bytes()[24],
+            0x99,
+            "bead_id=bd-page1-staged-invariant case=final_publication_uses_mutated_byte"
         );
     }
 

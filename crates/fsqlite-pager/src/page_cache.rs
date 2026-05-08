@@ -21,8 +21,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 #[cfg(target_arch = "x86_64")]
 use core::intrinsics::prefetch_read_data;
@@ -69,6 +69,16 @@ fn prefetch_l1_read<T>(_ptr: *const T) {}
 /// [`PageCache::with_max_buffers`] / [`ShardedPageCache::with_max_buffers`].
 pub const DEFAULT_PAGE_BUFFER_MAX: usize = 262_144;
 
+fn default_page_buffer_max_from_env() -> usize {
+    static DEFAULT_FROM_ENV: OnceLock<usize> = OnceLock::new();
+    *DEFAULT_FROM_ENV.get_or_init(|| {
+        std::env::var("FSQLITE_PAGE_BUFFER_MAX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_PAGE_BUFFER_MAX)
+    })
+}
+
 /// Resolve the page-buffer-pool ceiling to use for a new cache.
 ///
 /// Resolution order:
@@ -80,12 +90,7 @@ pub const DEFAULT_PAGE_BUFFER_MAX: usize = 262_144;
 /// A value of `0` is silently promoted to `1` (a zero-capacity pool would be
 /// useless).
 pub fn resolve_page_buffer_max(explicit: Option<usize>) -> usize {
-    let raw = explicit.unwrap_or_else(|| {
-        std::env::var("FSQLITE_PAGE_BUFFER_MAX")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_PAGE_BUFFER_MAX)
-    });
+    let raw = explicit.unwrap_or_else(default_page_buffer_max_from_env);
     raw.max(1)
 }
 

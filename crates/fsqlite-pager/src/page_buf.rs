@@ -231,12 +231,9 @@ fn take_global_page_buf(page_size: usize) -> Option<(Vec<u8>, usize)> {
     Some((backing, offset))
 }
 
-fn recycle_global_page_bufs(page_size: usize, free: &mut Vec<(Vec<u8>, usize)>) {
+fn recycle_global_page_buf(page_size: usize, backing: Vec<u8>, offset: usize) {
     let mut recycle = global_page_buf_recycle().lock();
-    while recycle.len() < GLOBAL_PAGE_BUF_RECYCLE_CAPACITY {
-        let Some((backing, offset)) = free.pop() else {
-            break;
-        };
+    if recycle.len() < GLOBAL_PAGE_BUF_RECYCLE_CAPACITY {
         recycle.push(GlobalPageBuf {
             page_size,
             backing,
@@ -257,7 +254,9 @@ impl PageBufPoolInner {
 impl Drop for PageBufPoolInner {
     fn drop(&mut self) {
         let mut free = self.free.lock();
-        recycle_global_page_bufs(self.page_size, &mut free);
+        while let Some((backing, offset)) = free.pop() {
+            recycle_global_page_buf(self.page_size, backing, offset);
+        }
     }
 }
 

@@ -12,6 +12,44 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-08 - Direct REAL UPDATE numeric assignment shortcut
+
+- Target: focused `UPDATE/DELETEThroughput` fixed-width REAL direct UPDATE
+  rows, especially `UPDATE bench SET value = ?2 WHERE id = ?1` in the
+  100-row tail.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  source was restored after the repeat focused gate rejected the change.
+- Candidate shape: add a specialized
+  `prepared_direct_simple_update_assignment_real_value` helper for the
+  fixed-width REAL patch path so already-numeric RHS values (`Float` and
+  `Integer`) skip the generic `SqliteValue` clone plus `apply_affinity` route.
+  Nullable/non-REAL fallbacks, `NOT NULL` enforcement, DELETE, page I/O
+  selection, and concurrent-writer defaults were left unchanged.
+- Correctness proof before measurement:
+  - `cargo fmt -p fsqlite-core --check` passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-boldlion-real-assign-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_direct_simple_update_single_real_column_patches_payload_without_decode -- --nocapture --test-threads=1`
+    passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-boldlion-real-assign-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_direct_simple_update_delete_fast_path_executes_and_is_correct -- --nocapture --test-threads=1`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/boldlion-dml-setup-profile-20260508T0908Z/summary.md`,
+  `candidate-real-assignment-dml.json`,
+  `candidate-real-assignment-dml-repeat2.json`, and
+  `candidate-real-assignment-perf-update-100-long.err`.
+- Result: rejected and restored. The isolated mutation proof improved
+  `perf-update-delete 100 20000 update fsqlite isolated` from
+  `656ns/update` to `624ns/update`, but the focused matrix did not meet the
+  keep gate. Baseline focused DML average/geomean were
+  `1.0830375533` / `1.0667483392`. The first candidate run was
+  `1.0896454667` / `1.0663675452`, with p90/p99 `1.4364985741` and the
+  1000-row update row at `1.1296203196x` with `17.6%` FSQLite CV. The repeat
+  worsened to `1.1042726276` / `1.0843345531`, p90/p99 `1.4356310752`, and
+  the 10000-row update row regressed to `1.0461834268x`.
+- Do not retry numeric-only direct REAL assignment specialization as a
+  standalone optimization. Reconsider only if a broader DML batch/run operator
+  removes larger per-row mutation work and still wins repeated focused
+  UPDATE/DELETE gates plus the full quick matrix.
+
 ## 2026-05-08 - Direct UPDATE lazy row-scratch borrow
 
 - Target: remaining focused `UPDATE/DELETEThroughput` tail, especially the

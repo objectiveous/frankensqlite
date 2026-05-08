@@ -15,8 +15,8 @@
 
 use std::fmt;
 use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use fsqlite_types::sync_primitives::Mutex;
 
@@ -24,6 +24,7 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageSize;
 
 const PAGE_BUF_POOL_FREE_LIST_INITIAL_CAPACITY: usize = 64;
+const GLOBAL_PAGE_BUF_RECYCLE_CAPACITY: usize = 256;
 
 // ---------------------------------------------------------------------------
 // PageBuf
@@ -203,12 +204,59 @@ struct PageBufPoolInner {
     acquire_misses: AtomicUsize,
 }
 
+struct GlobalPageBuf {
+    page_size: usize,
+    backing: Vec<u8>,
+    offset: usize,
+}
+
+static GLOBAL_PAGE_BUF_RECYCLE: OnceLock<Mutex<Vec<GlobalPageBuf>>> = OnceLock::new();
+
+fn global_page_buf_recycle() -> &'static Mutex<Vec<GlobalPageBuf>> {
+    GLOBAL_PAGE_BUF_RECYCLE
+        .get_or_init(|| Mutex::new(Vec::with_capacity(GLOBAL_PAGE_BUF_RECYCLE_CAPACITY)))
+}
+
+fn take_global_page_buf(page_size: usize) -> Option<(Vec<u8>, usize)> {
+    let mut recycle = global_page_buf_recycle().lock();
+    let idx = recycle
+        .iter()
+        .rposition(|candidate| candidate.page_size == page_size)?;
+    let GlobalPageBuf {
+        mut backing,
+        offset,
+        ..
+    } = recycle.swap_remove(idx);
+    backing[offset..offset + page_size].fill(0);
+    Some((backing, offset))
+}
+
+fn recycle_global_page_buf(page_size: usize, backing: Vec<u8>, offset: usize) {
+    let mut recycle = global_page_buf_recycle().lock();
+    if recycle.len() < GLOBAL_PAGE_BUF_RECYCLE_CAPACITY {
+        recycle.push(GlobalPageBuf {
+            page_size,
+            backing,
+            offset,
+        });
+    }
+}
+
 impl PageBufPoolInner {
     /// Return a backing allocation to the free list (if not at capacity).
     fn return_buf(&self, backing: Vec<u8>, offset: usize) {
         let mut free = self.free.lock();
         free.push((backing, offset));
         drop(free);
+    }
+}
+
+impl Drop for PageBufPoolInner {
+    fn drop(&mut self) {
+        let mut free = self.free.lock();
+        while let Some((backing, offset)) = free.pop() {
+            recycle_global_page_buf(self.page_size, backing, offset);
+        }
     }
 }
 
@@ -315,7 +363,8 @@ impl PageBufPool {
 
         self.inner.acquire_misses.fetch_add(1, Ordering::Relaxed);
         FSQLITE_PAGE_BUFFER_POOL_MISSES_TOTAL.fetch_add(1, Ordering::Relaxed);
-        let (backing, offset) = allocate_aligned(page_size);
+        let (backing, offset) =
+            take_global_page_buf(page_size).unwrap_or_else(|| allocate_aligned(page_size));
         Ok(PageBuf {
             backing: Some(backing),
             offset,
@@ -571,6 +620,24 @@ mod tests {
 
         assert_eq!(pool_4k.available(), 1);
         assert_eq!(pool_8k.available(), 1);
+    }
+
+    #[test]
+    fn test_page_buf_pool_cross_pool_recycle_returns_zeroed_buffer() {
+        let ps = PageSize::new(32768).unwrap();
+        {
+            let pool = PageBufPool::new(ps, 1);
+            let mut buf = pool.acquire().unwrap();
+            buf.as_mut_slice()[0] = 0xAA;
+            buf.as_mut_slice()[ps.as_usize() - 1] = 0x55;
+        }
+
+        let pool = PageBufPool::new(ps, 1);
+        let buf = pool.acquire().unwrap();
+        assert!(
+            buf.as_slice().iter().all(|byte| *byte == 0),
+            "cross-pool recycled buffers must preserve first-acquire zero-fill semantics"
+        );
     }
 
     #[test]

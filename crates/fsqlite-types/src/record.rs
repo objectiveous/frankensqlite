@@ -1437,12 +1437,15 @@ where
     I: Iterator<Item = &'a SqliteValue>,
 {
     const STACK_PRECOMPUTED_RECORD_SLOTS: usize = 16;
+    const APPEND_PRECOMPUTED_RECORD_MAX_BODY_SIZE: usize = 384;
 
     if header.slots.len() == 1 {
         return serialize_single_slot_precomputed_record_into(values, header, buf);
     }
 
-    if header.slots.len() > STACK_PRECOMPUTED_RECORD_SLOTS {
+    if header.slots.len() > STACK_PRECOMPUTED_RECORD_SLOTS
+        || header.max_body_size <= APPEND_PRECOMPUTED_RECORD_MAX_BODY_SIZE
+    {
         return serialize_record_iter_with_precomputed_header_append_into(values, header, buf);
     }
 

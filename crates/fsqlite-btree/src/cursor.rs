@@ -31,6 +31,7 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::limits::BTREE_MAX_DEPTH;
 use fsqlite_types::record::{
     RecordProfileScope, enter_record_profile_scope, parse_record, parse_record_prefix,
+    parse_record_projected_column_offsets,
 };
 use fsqlite_types::serial_type::{
     SerialTypeClass, classify_serial_type, read_varint, serial_type_len, write_varint,
@@ -1131,6 +1132,173 @@ impl From<&RightmostLeafCacheEntry> for TableAppendHint {
             page_data: Some(value.page_data.clone()),
             header: value.header,
         }
+    }
+}
+
+/// Opaque same-leaf payload patch run for direct table UPDATEs.
+///
+/// This owns one decoded leaf image so a higher layer can apply several
+/// same-size, no-overflow payload patches before publishing the page once.
+/// It deliberately exposes only rowid-targeted fixed-width REAL mutation until
+/// the broader DML leaf-run operator has correctness and benchmark proof.
+#[derive(Debug, Clone)]
+pub struct TableLeafPayloadPatchRun {
+    entry: StackEntry,
+    dirty: bool,
+}
+
+impl TableLeafPayloadPatchRun {
+    #[must_use]
+    pub const fn leaf_page(&self) -> PageNumber {
+        self.entry.page_no
+    }
+
+    #[must_use]
+    pub const fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    fn table_leaf_rowid_at(entry: &StackEntry, cell_idx: u16) -> Result<i64> {
+        let idx = usize::from(cell_idx);
+        let offset = entry.cell_pointers.get(idx).copied().ok_or_else(|| {
+            FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table leaf cell index {} out of bounds ({})",
+                    cell_idx,
+                    entry.cell_pointers.len()
+                ),
+            }
+        })?;
+        let offset = usize::from(offset);
+        let cell_data = entry.page_data.as_bytes().get(offset..).ok_or_else(|| {
+            FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table leaf cell pointer {} points past page end (len {})",
+                    offset,
+                    entry.page_data.as_bytes().len()
+                ),
+            }
+        })?;
+        let Some((_, payload_varint_len)) = read_varint(cell_data) else {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "table leaf cell has invalid payload size varint".to_owned(),
+            });
+        };
+        let Some((rowid, _)) = read_varint(&cell_data[payload_varint_len..]) else {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "table leaf cell has invalid rowid varint".to_owned(),
+            });
+        };
+        #[allow(clippy::cast_possible_wrap)]
+        Ok(rowid as i64)
+    }
+
+    fn search_table_leaf(&self, cx: &Cx, target: i64) -> Result<Option<u16>> {
+        let entry = &self.entry;
+        let mut lo = 0u16;
+        let mut hi = entry.header.cell_count;
+        while lo < hi {
+            observe_cursor_cancellation(cx)?;
+            let mid = lo + (hi - lo) / 2;
+            let rowid = Self::table_leaf_rowid_at(entry, mid)?;
+            match rowid.cmp(&target) {
+                std::cmp::Ordering::Equal => return Ok(Some(mid)),
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        Ok(None)
+    }
+
+    /// Patch a fixed-width REAL column inside a local table payload.
+    ///
+    /// Returns `Ok(false)` when the row is not present on this retained leaf or
+    /// the cell shape is not the narrow same-size/no-overflow REAL case.
+    pub fn patch_fixed_width_real(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        column_index: usize,
+        column_count: usize,
+        next_value: f64,
+        usable_size: u32,
+    ) -> Result<bool> {
+        if next_value.is_nan() {
+            return Ok(false);
+        }
+        let Some(cell_idx) = self.search_table_leaf(cx, rowid)? else {
+            return Ok(false);
+        };
+        let cell_offset = usize::from(self.entry.cell_pointers[usize::from(cell_idx)]);
+        let cell = CellRef::parse(
+            self.entry.page_data.as_bytes(),
+            cell_offset,
+            self.entry.header.page_type,
+            usable_size,
+        )?;
+        if cell.rowid != Some(rowid)
+            || cell.overflow_page.is_some()
+            || cell.payload_size != cell.local_size
+        {
+            return Ok(false);
+        }
+        let payload_len = usize::try_from(cell.local_size).map_err(|_| {
+            FrankenError::DatabaseCorrupt {
+                detail: "fixed-width REAL patch local payload size exceeds usize".to_owned(),
+            }
+        })?;
+        let payload_end = cell
+            .payload_offset
+            .checked_add(payload_len)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "fixed-width REAL patch payload offset overflow".to_owned(),
+            })?;
+        let usable_size_usize = usize::try_from(usable_size).unwrap_or(usize::MAX);
+        if payload_end > self.entry.page_data.as_bytes().len() || payload_end > usable_size_usize {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "fixed-width REAL patch payload extends past usable page".to_owned(),
+            });
+        }
+        let payload = &self.entry.page_data.as_bytes()[cell.payload_offset..payload_end];
+        let projected = parse_record_projected_column_offsets(payload, column_index, None)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "fixed-width REAL patch failed to parse row payload".to_owned(),
+            })?;
+        if projected.column_count != column_count {
+            return Ok(false);
+        }
+        let Some(column_offset) = projected.primary else {
+            return Ok(false);
+        };
+        if column_offset.serial_type != 7 || column_offset.value_len != 8 {
+            return Ok(false);
+        }
+        let start_in_payload = usize::try_from(column_offset.body_offset).map_err(|_| {
+            FrankenError::DatabaseCorrupt {
+                detail: "fixed-width REAL patch column offset exceeds usize".to_owned(),
+            }
+        })?;
+        let start = cell
+            .payload_offset
+            .checked_add(start_in_payload)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "fixed-width REAL patch absolute offset overflow".to_owned(),
+            })?;
+        let end = start
+            .checked_add(8)
+            .filter(|end| *end <= payload_end)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "fixed-width REAL patch column extends past payload".to_owned(),
+            })?;
+        self.entry.page_data.as_bytes_mut()[start..end]
+            .copy_from_slice(&next_value.to_bits().to_be_bytes());
+        self.entry.mutation_counter = self.entry.page_data.image_token();
+        self.dirty = true;
+        Ok(true)
+    }
+
+    fn into_page(self) -> (PageNumber, PageData) {
+        (self.entry.page_no, self.entry.page_data)
     }
 }
 
@@ -8325,6 +8493,52 @@ impl<P: PageWriter> BtCursor<P> {
             self.bump_row_image_epoch();
         }
         result
+    }
+
+    /// Capture the currently positioned table leaf for batched payload patches.
+    ///
+    /// The returned run is private to the caller until it is flushed back
+    /// through [`Self::flush_table_leaf_payload_patch_run`]. Unsupported cursor
+    /// positions return `None` so callers can stay on the ordinary per-row path.
+    #[doc(hidden)]
+    pub fn table_leaf_payload_patch_run_current(
+        &mut self,
+        rowid: i64,
+    ) -> Result<Option<TableLeafPayloadPatchRun>> {
+        if self.at_eof {
+            return Ok(None);
+        }
+        let Some(entry) = self.stack.last() else {
+            return Ok(None);
+        };
+        if entry.header.page_type != BtreePageType::LeafTable || entry.header.cell_count == 0 {
+            return Ok(None);
+        }
+        if Self::table_leaf_rowid_at(entry, entry.cell_idx)? != rowid {
+            return Ok(None);
+        }
+        Ok(Some(TableLeafPayloadPatchRun {
+            entry: entry.clone(),
+            dirty: false,
+        }))
+    }
+
+    /// Publish a same-leaf payload patch run as one page write.
+    #[doc(hidden)]
+    pub fn flush_table_leaf_payload_patch_run(
+        &mut self,
+        cx: &Cx,
+        run: TableLeafPayloadPatchRun,
+    ) -> Result<()> {
+        let (leaf_page, page_data) = run.into_page();
+        self.pager.write_page_data(cx, leaf_page, page_data)?;
+        self.stack.clear();
+        self.at_eof = true;
+        self.clear_rightmost_leaf_cache();
+        self.clear_seek_cache();
+        self.cell_slot_cache.get_mut().clear();
+        self.bump_row_image_epoch();
+        Ok(())
     }
 
     /// Swap in or out an external reusable cell-assembly buffer.

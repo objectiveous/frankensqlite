@@ -12,6 +12,51 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-08 - Retained direct-DML cursor shell
+
+- Target: remaining `UPDATE/DELETEThroughput` direct-simple UPDATE/DELETE rows,
+  especially the isolated 100-row prepared statement loops where the current
+  frontier still loses to C SQLite despite bypassing VDBE dispatch.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`
+  and `crates/fsqlite-vdbe/src/engine.rs`; the source patch was restored after
+  the focused gate rejected it. The exact rejected diff is preserved at
+  `tests/artifacts/perf/swiftgate-retained-dml-cursor-20260508T1920Z/retained-dml-cursor-candidate.diff`.
+- Candidate shape: retain the actual `BtCursor<SharedTxnPageIo>` across
+  repeated prepared UPDATE/DELETE executions in an explicit concurrent
+  transaction, expose `SharedTxnPageIo` refill/drain helpers, refill the shared
+  page IO for each call, and use `BtCursor::advance_to` for monotone rowid
+  probes. The intent was to remove per-row cursor construction and root seek
+  work without changing concurrent-writer defaults.
+- Correctness proof before rejection:
+  `rch exec -- env CARGO_TARGET_DIR=/data/projects/frankensqlite/.rch-retained-dml-target CARGO_BUILD_JOBS=12 cargo test -p fsqlite-core test_retained_direct_dml_cursor -- --nocapture`
+  passed, as did
+  `env CARGO_TARGET_DIR=/data/projects/frankensqlite/.rch-retained-dml-target CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core test_direct_simple_update_delete_fast_path_executes_and_is_correct -- --nocapture`
+  and
+  `env CARGO_TARGET_DIR=/data/projects/frankensqlite/.rch-retained-dml-target CARGO_BUILD_JOBS=4 cargo test -p fsqlite-btree test_table_seek_fails_closed_when_successor_contains_missed_rowid -- --nocapture`.
+- Evidence artifacts:
+  `tests/artifacts/perf/swiftgate-retained-dml-cursor-20260508T1920Z/summary.md`,
+  `stdout/candidate-isolated-update-100.txt`,
+  `stdout/candidate-isolated-update-100-repeat.txt`,
+  `stdout/candidate-isolated-delete-100.txt`,
+  `stdout/candidate-isolated-delete-100-repeat.txt`, and
+  `stdout/candidate-isolated-both-100.txt`. The earlier clean binary path was
+  no longer present, so the failed same-window baseline attempts are preserved;
+  comparison used the immediately preceding current-frontier artifact
+  `tests/artifacts/perf/swiftgate-dml-setup-perf-20260508T1915Z/summary.md`.
+- Result: rejected and not applied. Clean current-frontier isolated update was
+  `681 ns/row` at `2.40x` vs C SQLite; the candidate measured
+  `1464 ns/row` and `1481 ns/row` on repeat (`5.18x` and `5.11x`). Clean
+  current-frontier isolated delete was `1666 ns/row` at `5.54x`; the candidate
+  measured `2031 ns/row` and `2105 ns/row` on repeat (`7.06x` and `7.16x`).
+  Mixed isolated worsened from `2.67x update` / `4.83x delete` to
+  `4.40x update` / `7.08x delete`.
+- Do not retry retaining the full direct-DML cursor shell as a standalone
+  optimization. Reconsider only as part of a broader same-leaf DML run operator
+  that owns decoded leaf state and applies multiple page-local mutations before
+  returning to the prepared-statement boundary, with read-after-write,
+  rollback/savepoint, schema drift, and concurrent-mode proof tests plus a
+  same-window focused matrix win.
+
 ## 2026-05-08 - Default page-size PRAGMA setup skip
 
 - Target: measured benchmark setup overhead in

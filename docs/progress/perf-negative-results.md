@@ -12,6 +12,41 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-08 - CellSlotCache full-entry pre-evict
+
+- Target: `comprehensive-bench --quick --filter update`, after the current
+  mixed write profile showed `RawVec<CellSlotCacheEntry>::grow_one` at 0.65%
+  self time and the remaining full quick matrix still had slow small
+  UPDATE/DELETE rows.
+- Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs`; the
+  source was manually restored after the focused benchmark rejected the change.
+- Candidate shape: in `CellSlotCache::insert_slow`, pop the LRU tail before
+  inserting a new MRU entry when the 64-entry cache is already full. The
+  intended equivalence was `insert new MRU then truncate tail` == `pop tail then
+  insert new MRU`, while avoiding a transient `Vec` growth from 64 to 128 large
+  `CellSlotCacheEntry` values.
+- Correctness/build proof before measurement:
+  - `cargo fmt -p fsqlite-btree --check` passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-cursor-candidate-baseline-target CARGO_BUILD_JOBS=10 cargo test -p fsqlite-btree cell_slot_cache_evicts_tail_before_full_new_entry_insert -- --nocapture`
+    passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-cell-slot-full-evict-target CARGO_BUILD_JOBS=10 cargo build -p fsqlite-e2e --bin comprehensive-bench --profile release-perf`
+    passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/cell-slot-full-evict-crimsongorge-20260508T0005Z/summary.md`,
+  `update-baseline.json`, `update-candidate.json`, and `stdout/`.
+- Result: rejected. Focused UPDATE/DELETE average/geomean worsened
+  `0.9809793061876931 / 0.9659518881677094` to
+  `1.172453260226592 / 1.1619765793212873`. The target small DELETE row ratio
+  improved slightly (`1.385192596298149 -> 1.3550513198997631`), but absolute
+  FSQLite time worsened (`0.116298 ms -> 0.118422 ms`), and the larger rows
+  regressed materially, including `10000 rows / update 1000 rows`
+  `3.450183 ms -> 4.230475 ms` and `10000 rows / delete 500 rows`
+  `3.184295 ms -> 4.007728 ms`.
+- Do not retry full-cache pre-eviction as a standalone `CellSlotCache`
+  micro-optimization. Reconsider only if a future profile proves the 64-to-128
+  growth itself dominates and the replacement changes the cache structure more
+  fundamentally, with a full matrix gate.
+
 ## 2026-05-07 - Prepared direct INSERT append-hint active bit
 
 - Target: `comprehensive-bench --quick --filter insert`, especially page-run

@@ -1160,15 +1160,18 @@ impl TableLeafPayloadPatchRun {
 
     fn table_leaf_rowid_at(entry: &StackEntry, cell_idx: u16) -> Result<i64> {
         let idx = usize::from(cell_idx);
-        let offset = entry.cell_pointers.get(idx).copied().ok_or_else(|| {
-            FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "table leaf cell index {} out of bounds ({})",
-                    cell_idx,
-                    entry.cell_pointers.len()
-                ),
-            }
-        })?;
+        let offset =
+            entry
+                .cell_pointers
+                .get(idx)
+                .copied()
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table leaf cell index {} out of bounds ({})",
+                        cell_idx,
+                        entry.cell_pointers.len()
+                    ),
+                })?;
         let offset = usize::from(offset);
         let cell_data = entry.page_data.as_bytes().get(offset..).ok_or_else(|| {
             FrankenError::DatabaseCorrupt {
@@ -1242,11 +1245,10 @@ impl TableLeafPayloadPatchRun {
         {
             return Ok(false);
         }
-        let payload_len = usize::try_from(cell.local_size).map_err(|_| {
-            FrankenError::DatabaseCorrupt {
+        let payload_len =
+            usize::try_from(cell.local_size).map_err(|_| FrankenError::DatabaseCorrupt {
                 detail: "fixed-width REAL patch local payload size exceeds usize".to_owned(),
-            }
-        })?;
+            })?;
         let payload_end = cell
             .payload_offset
             .checked_add(payload_len)
@@ -8514,7 +8516,7 @@ impl<P: PageWriter> BtCursor<P> {
         if entry.header.page_type != BtreePageType::LeafTable || entry.header.cell_count == 0 {
             return Ok(None);
         }
-        if Self::table_leaf_rowid_at(entry, entry.cell_idx)? != rowid {
+        if TableLeafPayloadPatchRun::table_leaf_rowid_at(entry, entry.cell_idx)? != rowid {
             return Ok(None);
         }
         Ok(Some(TableLeafPayloadPatchRun {

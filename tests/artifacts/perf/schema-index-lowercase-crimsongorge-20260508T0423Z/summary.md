@@ -1,12 +1,19 @@
-# Lowercase Schema Index Lookup Candidate
+# Lowercase Schema Index Lookup Attempt
 
 Date: 2026-05-08
 
-This was a read-only measurement of an unowned dirty
-`crates/fsqlite-core/src/connection.rs` diff in the shared checkout. I did not
-edit, stage, revert, or claim the source file.
+This bundle is retained as an invalidated read-only attempt, not a valid
+candidate rejection.
 
-## Candidate
+I initially observed an unowned dirty `crates/fsqlite-core/src/connection.rs`
+diff around `Connection::schema_index_of()` in the shared checkout and started a
+read-only measurement. Before the artifact bundle captured `candidate.diff`, the
+dirty source diff disappeared from the shared checkout. `candidate.diff` is
+therefore empty, and the release-perf binary was built from the restored
+baseline source. Treat the JSON files here as a noisy baseline rerun, not as
+evidence for or against the candidate.
+
+## Intended Candidate
 
 `Connection::schema_index_of()` skips allocating `name.to_ascii_lowercase()`
 when the incoming table name has no ASCII uppercase bytes:
@@ -26,7 +33,8 @@ drop across small write rows.
 
 ## Build
 
-Candidate build passed:
+The build passed, but it no longer represented the intended candidate because
+the source diff had vanished:
 
 ```text
 env CARGO_TARGET_DIR=/data/tmp/frankensqlite-private-shards-retry-target \
@@ -34,11 +42,11 @@ env CARGO_TARGET_DIR=/data/tmp/frankensqlite-private-shards-retry-target \
   cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench
 ```
 
-## Focused UPDATE/DELETE
+## Captured UPDATE/DELETE Rerun
 
 Baseline: `tests/artifacts/perf/current-post-dml-tanbear-20260508T0110Z/update-profile-current.json`.
 
-Candidate: `candidate-update.json`.
+Captured rerun: `candidate-update.json`.
 
 | Scenario | Baseline ratio | Candidate ratio | Baseline F ms | Candidate F ms |
 | --- | ---: | ---: | ---: | ---: |
@@ -49,15 +57,15 @@ Candidate: `candidate-update.json`.
 | 10000 rows / update 1000 rows | 1.050288 | 1.083403 | 3.867106 | 4.082236 |
 | 10000 rows / delete 500 rows | 1.074879 | 1.047201 | 3.475211 | 3.571098 |
 
-Focused average/geomean moved `1.157945 / 1.146025` to
-`1.171366 / 1.141453`; C-SQLite-faster rows improved `4 -> 3`. This was mixed,
-so I ran the full quick matrix.
+Average/geomean moved `1.157945 / 1.146025` to `1.171366 / 1.141453`;
+C-SQLite-faster rows improved `4 -> 3`. Because the source diff was gone, these
+numbers should be interpreted only as baseline noise.
 
-## Full Quick
+## Captured Full Quick Rerun
 
 Baseline: `tests/artifacts/perf/calmthrush-clean-noprofile-20260508T0219Z/full-quick-clean-noprofile.json`.
 
-Candidate: `candidate-full.json`.
+Captured rerun: `candidate-full.json`.
 
 | Metric | Baseline | Candidate |
 | --- | ---: | ---: |
@@ -72,12 +80,6 @@ Candidate: `candidate-full.json`.
 
 ## Disposition
 
-Rejected by the full quick keep gate. The candidate produced some geomean and
-mid-distribution wins, but worsened the primary weighted score, average ratio,
-p90/p99, and number of C-faster rows.
-
-Do not keep or retry lower-case-only `schema_index_of()` allocation elision as a
-standalone optimization. Reconsider only as part of a broader schema lookup
-cache that proves full quick primary-score and tail improvement in the same
-run.
-
+Invalidated. Do not cite this bundle as a rejection of lower-case-only
+`schema_index_of()` allocation elision. A valid test would need the source diff
+captured in `candidate.diff` before the build and then a fresh same-window A/B.

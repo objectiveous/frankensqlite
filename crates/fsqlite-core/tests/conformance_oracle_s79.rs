@@ -322,7 +322,6 @@ fn test_conformance_subquery_in_having_s79h() {
 // ── s79i: Window functions with COLLATE NOCASE ──
 
 #[test]
-#[ignore = "Window function ORDER BY does not respect column COLLATE NOCASE"]
 fn test_conformance_window_collate_nocase_s79i() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
@@ -350,7 +349,6 @@ fn test_conformance_window_collate_nocase_s79i() {
 // ── s79j: COLLATE NOCASE in UNION/INTERSECT/EXCEPT ──
 
 #[test]
-#[ignore = "Compound SELECT (UNION/INTERSECT/EXCEPT) does not deduplicate with COLLATE NOCASE"]
 fn test_conformance_collate_nocase_compound_s79j() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();

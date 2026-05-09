@@ -339,6 +339,8 @@ fn test_conformance_window_collate_nocase_s79i() {
         "SELECT name, age, ROW_NUMBER() OVER (ORDER BY name) FROM people ORDER BY name, age",
         "SELECT name, age, RANK() OVER (ORDER BY name) FROM people ORDER BY name, age",
         "SELECT name, age, RANK() OVER (ORDER BY name), DENSE_RANK() OVER (ORDER BY name), PERCENT_RANK() OVER (ORDER BY name), CUME_DIST() OVER (ORDER BY name) FROM people ORDER BY name, age",
+        "SELECT name, age, SUM(age) OVER (ORDER BY name RANGE BETWEEN CURRENT ROW AND CURRENT ROW) FROM people ORDER BY name, age",
+        "SELECT name, age, SUM(age) OVER (ORDER BY name, age RANGE BETWEEN CURRENT ROW AND CURRENT ROW) FROM people ORDER BY name, age",
         "SELECT name, COUNT(*), RANK() OVER (ORDER BY name), DENSE_RANK() OVER (ORDER BY name), PERCENT_RANK() OVER (ORDER BY name), CUME_DIST() OVER (ORDER BY name) FROM people GROUP BY name ORDER BY name",
     ];
 
@@ -632,5 +634,23 @@ fn test_conformance_coalesce_null_chain_s79t() {
     assert_no_mismatches(
         &oracle_compare(&fconn, &rconn, queries),
         "COALESCE NULL chain",
+    );
+}
+
+// ── s79u: leftmost VALUES compound ORDER BY with empty result ──
+
+#[test]
+fn test_conformance_values_compound_empty_order_s79u() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let queries = &[
+        "VALUES (1) EXCEPT SELECT 1 ORDER BY 1",
+        "VALUES (1,2) EXCEPT SELECT 1,2 ORDER BY 2",
+    ];
+
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "VALUES compound ORDER BY empty result",
     );
 }

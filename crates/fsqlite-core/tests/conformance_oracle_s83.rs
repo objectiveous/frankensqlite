@@ -253,7 +253,6 @@ fn test_conformance_self_join_store_comparison_s83i() {
 }
 
 #[test]
-#[ignore = "correlated EXISTS with multi-table JOIN in subquery: external column ref not detected through JOIN chains"]
 fn test_conformance_correlated_exists_multi_table_s83j() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
@@ -263,13 +262,14 @@ fn test_conformance_correlated_exists_multi_table_s83j() {
         &rconn,
         &[
             "SELECT r.name FROM regions r WHERE EXISTS (SELECT 1 FROM stores st JOIN sales s ON s.store_id = st.id WHERE st.region_id = r.id AND s.qty > 5) ORDER BY r.name",
+            "SELECT r.name FROM regions r WHERE EXISTS (SELECT 1 FROM stores st JOIN sales s ON s.store_id = st.id AND st.region_id = r.id WHERE s.qty > 5) ORDER BY r.name",
+            "SELECT st.name, s.qty FROM stores st JOIN sales s ON s.store_id = (SELECT st.id) WHERE s.qty > 5 ORDER BY st.name, s.qty",
         ],
     );
     assert_no_mismatches(&m, "correlated_exists_multi_table_s83j");
 }
 
 #[test]
-#[ignore = "IN subquery in JOIN ON clause not implemented"]
 fn test_conformance_cte_multi_join_s83k() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
@@ -361,7 +361,6 @@ fn test_conformance_left_join_null_agg_s83p() {
 }
 
 #[test]
-#[ignore = "DELETE WHERE IN (subquery with multi-table JOIN) doesn't evaluate subquery correctly"]
 fn test_conformance_delete_via_subquery_join_s83q() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
@@ -381,7 +380,6 @@ fn test_conformance_delete_via_subquery_join_s83q() {
 }
 
 #[test]
-#[ignore = "UPDATE WHERE IN (subquery with multi-table JOIN) doesn't evaluate subquery correctly"]
 fn test_conformance_update_via_subquery_join_s83r() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();

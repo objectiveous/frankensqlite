@@ -2936,6 +2936,8 @@ fn test_conformance_compound_order_limit() {
         "SELECT 3 AS n UNION ALL SELECT 1 UNION ALL SELECT 2 ORDER BY n",
         "SELECT 3 AS n UNION SELECT 1 UNION SELECT 2 ORDER BY n LIMIT 2",
         "SELECT 3 AS n UNION ALL SELECT 1 UNION ALL SELECT 2 ORDER BY n LIMIT 2 OFFSET 1",
+        // A leftmost VALUES compound core can still use positional ORDER BY.
+        "VALUES (2) UNION SELECT 1 ORDER BY 1",
         // UNION removes duplicates
         "SELECT 1 AS n UNION SELECT 1 UNION SELECT 2 ORDER BY n",
         // UNION ALL keeps duplicates
@@ -22430,7 +22432,6 @@ fn test_conformance_multiple_ctes_s270() {
 }
 
 #[test]
-#[ignore = "eval_join_expr cannot execute subqueries (no Connection access)"]
 fn test_conformance_cte_used_multiple_times_s271() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();

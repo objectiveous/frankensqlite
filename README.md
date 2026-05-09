@@ -1202,11 +1202,6 @@ same table, non-overlapping rowid ranges):
 | 4 | `345 783` | `406 326` | `0.85x` |
 | 8 | `337 917` | `98 915` | **`3.42x`** |
 
-The pattern is consistent with the design: at 1–4 writers the per-row
-MVCC ceremony costs more than C SQLite's serialised path, but as soon as
-the lock-byte serialisation becomes the bottleneck (8+ writers, especially
-on separate tables), FrankenSQLite scales out while C SQLite plateaus.
-
 #### Mixed OLTP
 
 | Workload | C ms | F ms | F/C |

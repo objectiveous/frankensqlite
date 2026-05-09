@@ -328,7 +328,7 @@ fn test_conformance_window_collate_nocase_s79i() {
 
     let setup = &[
         "CREATE TABLE people(name TEXT COLLATE NOCASE, age INTEGER)",
-        "INSERT INTO people VALUES('alice',30),('BOB',25),('Charlie',35),('alice',28)",
+        "INSERT INTO people VALUES('alice',30),('BOB',25),('Charlie',35),('alice',28),('Alice',29)",
     ];
     for s in setup {
         fconn.execute(s).unwrap();
@@ -338,6 +338,8 @@ fn test_conformance_window_collate_nocase_s79i() {
     let queries = &[
         "SELECT name, age, ROW_NUMBER() OVER (ORDER BY name) FROM people ORDER BY name, age",
         "SELECT name, age, RANK() OVER (ORDER BY name) FROM people ORDER BY name, age",
+        "SELECT name, age, RANK() OVER (ORDER BY name), DENSE_RANK() OVER (ORDER BY name), PERCENT_RANK() OVER (ORDER BY name), CUME_DIST() OVER (ORDER BY name) FROM people ORDER BY name, age",
+        "SELECT name, COUNT(*), RANK() OVER (ORDER BY name), DENSE_RANK() OVER (ORDER BY name), PERCENT_RANK() OVER (ORDER BY name), CUME_DIST() OVER (ORDER BY name) FROM people GROUP BY name ORDER BY name",
     ];
 
     assert_no_mismatches(

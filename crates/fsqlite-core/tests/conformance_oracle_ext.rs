@@ -28005,7 +28005,6 @@ fn test_conformance_complex_case_in_aggregate_s482() {
 }
 
 #[test]
-#[ignore = "connection-level evaluator always coerces TEXT to numeric; VDBE path handles correctly via P5 affinity"]
 fn test_conformance_type_affinity_comparison_s483() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();

@@ -264,6 +264,7 @@ fn test_conformance_correlated_exists_multi_table_s83j() {
             "SELECT r.name FROM regions r WHERE EXISTS (SELECT 1 FROM stores st JOIN sales s ON s.store_id = st.id WHERE st.region_id = r.id AND s.qty > 5) ORDER BY r.name",
             "SELECT r.name FROM regions r WHERE EXISTS (SELECT 1 FROM stores st JOIN sales s ON s.store_id = st.id AND st.region_id = r.id WHERE s.qty > 5) ORDER BY r.name",
             "SELECT st.name, s.qty FROM stores st JOIN sales s ON s.store_id = (SELECT st.id) WHERE s.qty > 5 ORDER BY st.name, s.qty",
+            "SELECT st.name FROM stores st WHERE (SELECT COUNT(*) FILTER (WHERE s.store_id = st.id) FROM sales s) > 0 ORDER BY st.name",
         ],
     );
     assert_no_mismatches(&m, "correlated_exists_multi_table_s83j");

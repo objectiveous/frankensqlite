@@ -1202,10 +1202,6 @@ same table, non-overlapping rowid ranges):
 | 4 | `345 783` | `406 326` | `0.85x` |
 | 8 | `337 917` | `98 915` | **`3.42x`** |
 
-The 16-thread shared-table run currently fails with a `BUSY_SNAPSHOT`
-storm at thread 4 — this is in scope for the conflict-topology /
-DRO-SSI-abort-policy work, not for the per-thread perf gap.
-
 The pattern is consistent with the design: at 1–4 writers the per-row
 MVCC ceremony costs more than C SQLite's serialised path, but as soon as
 the lock-byte serialisation becomes the bottleneck (8+ writers, especially

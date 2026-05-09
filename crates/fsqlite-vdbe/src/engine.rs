@@ -2766,6 +2766,34 @@ impl PageReader for SharedTxnPageIo {
         self.txn.borrow().get_page(cx, page_no)
     }
 
+    fn read_btree_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
+        if let Some(ctx) = self.concurrent_context() {
+            let has_staged_write = {
+                let handle = ctx.handle.lock();
+                let (is_freed, has_staged_write) = if concurrent_has_page_state(&handle) {
+                    concurrent_page_read_status(&handle, page_no)
+                } else {
+                    (false, false)
+                };
+                if is_freed {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "page {} was freed earlier in concurrent transaction {}",
+                            page_no.get(),
+                            ctx.txn_id
+                        ),
+                    });
+                }
+                has_staged_write
+            };
+
+            if has_staged_write {
+                return self.txn.borrow().get_page(cx, page_no);
+            }
+        }
+        self.txn.borrow().get_page(cx, page_no)
+    }
+
     fn record_read_witness(&self, _cx: &Cx, key: WitnessKey) {
         if let Some(ctx) = self.concurrent_context() {
             ctx.handle.lock().record_read_witness(key);
@@ -3170,6 +3198,38 @@ impl PageReader for TimeTravelPageIo {
              commit), falling through to txn"
         );
         self.inner.read_page(cx, page_no)
+    }
+
+    fn read_btree_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
+        let vs = &self.version_store;
+        if let Some(idx) = self.snapshot.resolve_page(vs, page_no)
+            && let Some(version) = vs.get_version(idx)
+        {
+            tracing::trace!(
+                page_id = page_no.get(),
+                commit_seq = self.snapshot.target_commit_seq().get(),
+                "time-travel: serving historical B-tree page from version store"
+            );
+            return Ok(version.data);
+        }
+
+        if vs.page_count() == 0 {
+            tracing::warn!(
+                page_id = page_no.get(),
+                commit_seq = self.snapshot.target_commit_seq().get(),
+                "time-travel: VersionStore is empty — cannot serve historical \
+                 B-tree page; historical data not available for this commit"
+            );
+            return Err(FrankenError::Internal(format!(
+                "time-travel query failed: historical data not available for \
+                 commit_seq={} (MVCC version store has no historical page \
+                 versions; the database may be running in compatibility mode \
+                 where time-travel is not yet supported)",
+                self.snapshot.target_commit_seq().get(),
+            )));
+        }
+
+        self.inner.read_btree_page_data(cx, page_no)
     }
 }
 
@@ -26066,6 +26126,73 @@ mod tests {
                 .write_witness_keys()
                 .contains(&WitnessKey::Page(PageNumber::ONE)),
             "retained clone must record writes on the refilled concurrent session"
+        );
+    }
+
+    #[test]
+    fn test_shared_txn_page_io_btree_read_defers_to_precise_witnesses() {
+        use fsqlite_mvcc::{CommitIndex, ConcurrentRegistry, InProcessPageLockTable};
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+        use fsqlite_types::{CommitSeq, PageNumber, SchemaEpoch, Snapshot, WitnessKey};
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+
+        let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
+        let lock_table = Arc::new(InProcessPageLockTable::new());
+        let commit_index = Arc::new(CommitIndex::new());
+        let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
+        let (session_id, handle) = {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let session_id = guard
+                .begin_concurrent(snapshot)
+                .expect("session should register");
+            let handle = guard
+                .handle(session_id)
+                .expect("session handle should exist");
+            (session_id, handle)
+        };
+
+        let page_io = SharedTxnPageIo::with_concurrent(
+            txn,
+            session_id,
+            Arc::clone(&handle),
+            Arc::clone(&lock_table),
+            Arc::clone(&commit_index),
+            0,
+        );
+
+        let _ = page_io
+            .read_btree_page_data(&cx, PageNumber::ONE)
+            .expect("B-tree page read should succeed");
+        {
+            let guard = handle.lock();
+            assert!(
+                guard.read_witness_keys().is_empty(),
+                "B-tree page loads must not publish coarse page read witnesses"
+            );
+        }
+
+        let cell_witness = WitnessKey::Cell {
+            btree_root: PageNumber::ONE,
+            leaf_page: PageNumber::ONE,
+            tag: 42,
+        };
+        page_io.record_read_witness(&cx, cell_witness.clone());
+
+        let guard = handle.lock();
+        assert!(
+            guard.read_witness_keys().contains(&cell_witness),
+            "cursor-supplied cell witness must be recorded on the concurrent handle"
+        );
+        assert!(
+            !guard
+                .read_witness_keys()
+                .contains(&WitnessKey::Page(PageNumber::ONE)),
+            "precise B-tree witness publication must not reintroduce coarse page reads"
         );
     }
 

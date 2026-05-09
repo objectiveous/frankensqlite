@@ -230,6 +230,15 @@ pub trait PageReader {
         Ok(PageData::from_vec(self.read_page(cx, page_no)?))
     }
 
+    /// Read a page for B-tree cursor traversal.
+    ///
+    /// Transaction-backed implementations may override this to avoid recording
+    /// a coarse SIREAD page witness while the cursor emits finer cell/range
+    /// witnesses for the logical B-tree operation.
+    fn read_btree_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
+        self.read_page_data(cx, page_no)
+    }
+
     /// Hint that a page is likely to be needed soon.
     ///
     /// Default implementation is a no-op so platforms without a safe prefetch
@@ -1995,7 +2004,7 @@ impl<P: PageReader> BtCursor<P> {
         hash
     }
 
-    fn record_point_witness(&mut self, key: WitnessKey) {
+    fn record_point_witness(&mut self, cx: &Cx, key: WitnessKey) {
         if let WitnessKey::Page(page) = key {
             warn!(
                 root_page = self.root_page.get(),
@@ -2003,10 +2012,11 @@ impl<P: PageReader> BtCursor<P> {
                 "policy violation: point operation emitted page-level witness"
             );
         }
+        self.pager.record_read_witness(cx, key.clone());
         self.read_witnesses.push(key);
     }
 
-    fn record_range_page_witness(&mut self, page_no: PageNumber) {
+    fn record_range_page_witness(&mut self, cx: &Cx, page_no: PageNumber) {
         if self
             .read_witnesses
             .last()
@@ -2014,7 +2024,9 @@ impl<P: PageReader> BtCursor<P> {
         {
             return;
         }
-        self.read_witnesses.push(WitnessKey::Page(page_no));
+        let key = WitnessKey::Page(page_no);
+        self.pager.record_read_witness(cx, key.clone());
+        self.read_witnesses.push(key);
     }
 
     fn issue_prefetch_hint(&self, cx: &Cx, page_no: PageNumber) {
@@ -2136,8 +2148,9 @@ impl<P: PageReader> BtCursor<P> {
         while let Some(current_page) = pending_pages.pop() {
             observe_cursor_cancellation(cx)?;
             self.note_page_visit(current_page);
+            self.record_range_page_witness(cx, current_page);
 
-            let page_data = self.pager.read_page_data(cx, current_page)?;
+            let page_data = self.pager.read_btree_page_data(cx, current_page)?;
             let page_bytes = page_data.as_bytes();
             let header = cell::parse_page_header(page_bytes, current_page)?;
 
@@ -2395,7 +2408,7 @@ impl<P: PageReader> BtCursor<P> {
         }
 
         self.note_page_visit(page_no);
-        let page_data = self.pager.read_page_data(cx, page_no)?;
+        let page_data = self.pager.read_btree_page_data(cx, page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
         let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
         let mut cell_pointers = take_pooled_cell_pointers();
@@ -2425,7 +2438,7 @@ impl<P: PageReader> BtCursor<P> {
         observe_cursor_cancellation(cx)?;
         self.note_page_visit(page_no);
         instrumentation::record_page_header_rebuild();
-        let page_data = self.pager.read_page_data(cx, page_no)?;
+        let page_data = self.pager.read_btree_page_data(cx, page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
         let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
         let mut cell_pointers = take_pooled_cell_pointers();
@@ -2546,7 +2559,7 @@ impl<P: PageReader> BtCursor<P> {
                     entry.cell_idx = 0;
                     self.stack.push(entry);
                     if record_leaf_witness {
-                        self.record_range_page_witness(leaf_page_no);
+                        self.record_range_page_witness(cx, leaf_page_no);
                     }
                     self.at_eof = false;
                     return self.advance_next_impl(cx, record_leaf_witness);
@@ -2554,7 +2567,7 @@ impl<P: PageReader> BtCursor<P> {
                 self.stack.push(entry);
                 self.at_eof = false;
                 if record_leaf_witness {
-                    self.record_range_page_witness(leaf_page_no);
+                    self.record_range_page_witness(cx, leaf_page_no);
                 }
                 return Ok(true);
             }
@@ -2607,7 +2620,7 @@ impl<P: PageReader> BtCursor<P> {
                     entry.cell_idx = 0;
                     self.stack.push(entry);
                     if record_leaf_witness {
-                        self.record_range_page_witness(leaf_page_no);
+                        self.record_range_page_witness(cx, leaf_page_no);
                     }
                     self.at_eof = false;
                     return self.advance_prev(cx);
@@ -2616,7 +2629,7 @@ impl<P: PageReader> BtCursor<P> {
                 self.stack.push(entry);
                 self.at_eof = false;
                 if record_leaf_witness {
-                    self.record_range_page_witness(leaf_page_no);
+                    self.record_range_page_witness(cx, leaf_page_no);
                 }
                 return Ok(true);
             }
@@ -2807,11 +2820,14 @@ impl<P: PageReader> BtCursor<P> {
                         self.stack.push(entry);
                         self.at_eof = false;
                         self.remember_table_seek(target_rowid, current_page, idx);
-                        self.record_point_witness(WitnessKey::Cell {
-                            btree_root: self.root_page,
-                            leaf_page: current_page,
-                            tag: Self::cell_tag_from_rowid(target_rowid),
-                        });
+                        self.record_point_witness(
+                            cx,
+                            WitnessKey::Cell {
+                                btree_root: self.root_page,
+                                leaf_page: current_page,
+                                tag: Self::cell_tag_from_rowid(target_rowid),
+                            },
+                        );
                         return Ok(SeekResult::Found);
                     }
                     BinarySearchResult::NotFound(idx) => {
@@ -2831,11 +2847,14 @@ impl<P: PageReader> BtCursor<P> {
                             self.at_eof = false;
                             self.remember_table_seek(target_rowid, current_page, idx);
                         }
-                        self.record_point_witness(WitnessKey::Cell {
-                            btree_root: self.root_page,
-                            leaf_page: current_page,
-                            tag: Self::cell_tag_from_rowid(target_rowid),
-                        });
+                        self.record_point_witness(
+                            cx,
+                            WitnessKey::Cell {
+                                btree_root: self.root_page,
+                                leaf_page: current_page,
+                                tag: Self::cell_tag_from_rowid(target_rowid),
+                            },
+                        );
                         return Ok(SeekResult::NotFound);
                     }
                 }
@@ -2880,11 +2899,14 @@ impl<P: PageReader> BtCursor<P> {
                     self.stack.push(entry);
                     self.at_eof = false;
                     self.remember_table_seek(target_rowid, cached.page_no, idx);
-                    self.record_point_witness(WitnessKey::Cell {
-                        btree_root: self.root_page,
-                        leaf_page: cached.page_no,
-                        tag: Self::cell_tag_from_rowid(target_rowid),
-                    });
+                    self.record_point_witness(
+                        cx,
+                        WitnessKey::Cell {
+                            btree_root: self.root_page,
+                            leaf_page: cached.page_no,
+                            tag: Self::cell_tag_from_rowid(target_rowid),
+                        },
+                    );
                     return Ok(Some(SeekResult::Found));
                 }
                 BinarySearchResult::NotFound(idx) if idx < entry.header.cell_count && idx > 0 => {
@@ -2894,11 +2916,14 @@ impl<P: PageReader> BtCursor<P> {
                     self.stack.push(entry);
                     self.at_eof = false;
                     self.remember_table_seek(target_rowid, cached.page_no, idx);
-                    self.record_point_witness(WitnessKey::Cell {
-                        btree_root: self.root_page,
-                        leaf_page: cached.page_no,
-                        tag: Self::cell_tag_from_rowid(target_rowid),
-                    });
+                    self.record_point_witness(
+                        cx,
+                        WitnessKey::Cell {
+                            btree_root: self.root_page,
+                            leaf_page: cached.page_no,
+                            tag: Self::cell_tag_from_rowid(target_rowid),
+                        },
+                    );
                     return Ok(Some(SeekResult::NotFound));
                 }
                 BinarySearchResult::NotFound(_) => {}
@@ -2966,11 +2991,14 @@ impl<P: PageReader> BtCursor<P> {
             .ok_or_else(|| FrankenError::internal("cursor stack empty"))?
             .cell_idx;
         self.remember_table_seek(target_rowid, page_no, positioned_cell_idx);
-        self.record_point_witness(WitnessKey::Cell {
-            btree_root: self.root_page,
-            leaf_page: page_no,
-            tag: Self::cell_tag_from_rowid(target_rowid),
-        });
+        self.record_point_witness(
+            cx,
+            WitnessKey::Cell {
+                btree_root: self.root_page,
+                leaf_page: page_no,
+                tag: Self::cell_tag_from_rowid(target_rowid),
+            },
+        );
         Ok(seek_result)
     }
 
@@ -3279,11 +3307,14 @@ impl<P: PageReader> BtCursor<P> {
                         entry.cell_idx = idx;
                         self.stack.push(entry);
                         self.at_eof = false;
-                        self.record_point_witness(WitnessKey::Cell {
-                            btree_root: self.root_page,
-                            leaf_page: current_page,
-                            tag: Self::cell_tag_from_index_key(target_key),
-                        });
+                        self.record_point_witness(
+                            cx,
+                            WitnessKey::Cell {
+                                btree_root: self.root_page,
+                                leaf_page: current_page,
+                                tag: Self::cell_tag_from_index_key(target_key),
+                            },
+                        );
                         return Ok(SeekResult::Found);
                     }
                     BinarySearchResult::NotFound(idx) => {
@@ -3300,11 +3331,14 @@ impl<P: PageReader> BtCursor<P> {
                             self.stack.push(entry);
                             self.at_eof = false;
                         }
-                        self.record_point_witness(WitnessKey::Cell {
-                            btree_root: self.root_page,
-                            leaf_page: current_page,
-                            tag: Self::cell_tag_from_index_key(target_key),
-                        });
+                        self.record_point_witness(
+                            cx,
+                            WitnessKey::Cell {
+                                btree_root: self.root_page,
+                                leaf_page: current_page,
+                                tag: Self::cell_tag_from_index_key(target_key),
+                            },
+                        );
                         return Ok(SeekResult::NotFound);
                     }
                 }
@@ -3318,11 +3352,14 @@ impl<P: PageReader> BtCursor<P> {
                     entry.cell_idx = idx;
                     self.stack.push(entry);
                     self.at_eof = false;
-                    self.record_point_witness(WitnessKey::Cell {
-                        btree_root: self.root_page,
-                        leaf_page: current_page,
-                        tag: Self::cell_tag_from_index_key(target_key),
-                    });
+                    self.record_point_witness(
+                        cx,
+                        WitnessKey::Cell {
+                            btree_root: self.root_page,
+                            leaf_page: current_page,
+                            tag: Self::cell_tag_from_index_key(target_key),
+                        },
+                    );
                     return Ok(SeekResult::Found);
                 }
                 BinarySearchResult::NotFound(idx) => {
@@ -3353,7 +3390,11 @@ impl<P: PageReader> BtCursor<P> {
                 first_overflow,
                 cell.payload_size,
                 self.usable_size,
-                &mut |pgno| self.pager.read_page_data(cx, pgno).map(PageData::into_vec),
+                &mut |pgno| {
+                    self.pager
+                        .read_btree_page_data(cx, pgno)
+                        .map(PageData::into_vec)
+                },
                 out,
             )
         } else {
@@ -3389,7 +3430,11 @@ impl<P: PageReader> BtCursor<P> {
                 cell.payload_size,
                 self.usable_size,
                 target_size,
-                &mut |pgno| self.pager.read_page_data(cx, pgno).map(PageData::into_vec),
+                &mut |pgno| {
+                    self.pager
+                        .read_btree_page_data(cx, pgno)
+                        .map(PageData::into_vec)
+                },
                 out,
             )
         } else {
@@ -3824,7 +3869,7 @@ impl<P: PageWriter> BtCursor<P> {
     /// and all child subtrees. Used by DROP TABLE / DROP INDEX to return
     /// every page of the dropped object to the pager freelist.
     pub fn free_subtree_pages(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-        let page_data = self.pager.read_page_data(cx, page_no)?;
+        let page_data = self.pager.read_btree_page_data(cx, page_no)?;
         let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
         let ptrs = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
@@ -4255,7 +4300,7 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         }
 
-        let root_data = self.pager.read_page_data(cx, self.root_page)?;
+        let root_data = self.pager.read_btree_page_data(cx, self.root_page)?;
         let root_header = cell::parse_page_header(root_data.as_bytes(), self.root_page)?;
         if root_header.page_type != BtreePageType::LeafTable || root_header.cell_count != 0 {
             return Ok(false);
@@ -4355,7 +4400,7 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         }
 
-        let root_data = self.pager.read_page_data(cx, self.root_page)?;
+        let root_data = self.pager.read_btree_page_data(cx, self.root_page)?;
         let root_header = cell::parse_page_header(root_data.as_bytes(), self.root_page)?;
         if root_header.page_type != BtreePageType::InteriorTable || root_header.cell_count == 0 {
             return Ok(false);
@@ -4367,7 +4412,7 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         };
 
-        let old_right_data = self.pager.read_page_data(cx, old_right_child)?;
+        let old_right_data = self.pager.read_btree_page_data(cx, old_right_child)?;
         let old_right_header = cell::parse_page_header(old_right_data.as_bytes(), old_right_child)?;
         if old_right_header.page_type != BtreePageType::LeafTable
             || old_right_header.cell_count == 0
@@ -4426,7 +4471,7 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         }
 
-        let root_data = self.pager.read_page_data(cx, self.root_page)?;
+        let root_data = self.pager.read_btree_page_data(cx, self.root_page)?;
         let root_header = cell::parse_page_header(root_data.as_bytes(), self.root_page)?;
         if root_header.page_type != BtreePageType::InteriorTable || root_header.cell_count == 0 {
             return Ok(false);
@@ -4438,7 +4483,7 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         };
 
-        let old_right_data = self.pager.read_page_data(cx, old_right_child)?;
+        let old_right_data = self.pager.read_btree_page_data(cx, old_right_child)?;
         let old_right_header = cell::parse_page_header(old_right_data.as_bytes(), old_right_child)?;
         if old_right_header.page_type != BtreePageType::LeafTable
             || old_right_header.cell_count == 0
@@ -4766,7 +4811,7 @@ impl<P: PageWriter> BtCursor<P> {
                 });
             }
 
-            let page = self.pager.read_page_data(cx, pgno)?;
+            let page = self.pager.read_btree_page_data(cx, pgno)?;
             let page_bytes = page.as_bytes();
             if page_bytes.len() < 4 {
                 warn!(
@@ -5976,7 +6021,7 @@ impl<P: PageWriter> BtCursor<P> {
 
             // Check whether the parent now has zero cells — if so, it
             // needs to be merged with its siblings at the next level up.
-            let parent_data = self.pager.read_page_data(cx, parent_page_no)?;
+            let parent_data = self.pager.read_btree_page_data(cx, parent_page_no)?;
             let parent_header = cell::parse_page_header(parent_data.as_bytes(), parent_page_no)?;
 
             if parent_header.cell_count == 0 && parent_header.page_type.is_interior() {
@@ -6037,7 +6082,7 @@ impl<P: PageWriter> BtCursor<P> {
         instrumentation::record_interior_cell_rebuild(new_cell.len());
 
         // Remove old cell from page and try to insert new cell.
-        let mut page_data = self.pager.read_page_data(cx, page_no)?;
+        let mut page_data = self.pager.read_btree_page_data(cx, page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
         let mut header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
         let mut ptrs = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
@@ -6778,7 +6823,7 @@ impl<P: PageWriter> BtCursor<P> {
         // If we update the leaf first and then fail to free the chain, we leak
         // pages but preserve database integrity. Leaks are recoverable (VACUUM);
         // corruption is not.
-        let mut page_data = self.pager.read_page_data(cx, leaf_page_no)?;
+        let mut page_data = self.pager.read_btree_page_data(cx, leaf_page_no)?;
         let header_offset = cell::header_offset_for_page(leaf_page_no);
         let mut header = cell::parse_page_header(page_data.as_bytes(), leaf_page_no)?;
         // OPT-A4: reuse the cursor-owned defrag scratch buffers so repeated
@@ -7027,7 +7072,7 @@ impl<P: PageWriter> BtCursor<P> {
 
         let page_no = entry.page_no;
         let header_offset = cell::header_offset_for_page(page_no);
-        let mut page_data = self.pager.read_page_data(cx, page_no)?;
+        let mut page_data = self.pager.read_btree_page_data(cx, page_no)?;
         let mut header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
         let mut ptrs = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
         if separator_idx_usize >= ptrs.len() {
@@ -7404,7 +7449,7 @@ impl<P: PageWriter> BtCursor<P> {
         entry.cell_idx = entry.header.cell_count - 1;
         self.stack.push(entry);
         self.at_eof = false;
-        self.record_range_page_witness(hinted_leaf_page);
+        self.record_range_page_witness(cx, hinted_leaf_page);
 
         // bd-wwqen.3: use cached rowid if available for this leaf page,
         // avoiding a cell parse just to read the last rowid.
@@ -7497,7 +7542,7 @@ impl<P: PageWriter> BtCursor<P> {
         self.stack.clear();
         self.at_eof = true;
 
-        let mut page_data = match self.pager.read_page_data(cx, hinted_leaf_page) {
+        let mut page_data = match self.pager.read_btree_page_data(cx, hinted_leaf_page) {
             Ok(page_data) => page_data,
             Err(_) => {
                 self.clear_rightmost_leaf_cache();
@@ -7516,7 +7561,7 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(None);
         }
 
-        self.record_range_page_witness(hinted_leaf_page);
+        self.record_range_page_witness(cx, hinted_leaf_page);
         if rowid <= hinted_last_rowid {
             self.clear_rightmost_leaf_cache();
             return Ok(None);
@@ -7718,7 +7763,7 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         }
 
-        self.record_range_page_witness(hint.leaf_page);
+        self.record_range_page_witness(cx, hint.leaf_page);
         let usable_size = self.usable_size;
         let mut mutate_payload_result: Result<Option<(u16, u16)>> = Ok(None);
         let mut mutate_payload_only = |staged_page: &mut PageData| {
@@ -7875,7 +7920,7 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         }
 
-        self.record_range_page_witness(hint.leaf_page);
+        self.record_range_page_witness(cx, hint.leaf_page);
         let mut writer_slot = Some(writer);
         let usable_size = self.usable_size;
         let mut mutate_payload_result: Result<Option<(u16, u16)>> = Ok(None);
@@ -9541,6 +9586,68 @@ mod tests {
     }
 
     impl PageWriter for PrefetchProbeStore {
+        fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+            self.inner.write_page(cx, page_no, data)
+        }
+
+        fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
+            self.inner.allocate_page(cx)
+        }
+
+        fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+            self.inner.free_page(cx, page_no)
+        }
+
+        fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
+    }
+
+    #[derive(Debug, Default)]
+    struct WitnessProbeState {
+        coarse_page_data_reads: usize,
+        btree_page_data_reads: usize,
+        read_witnesses: Vec<WitnessKey>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct WitnessProbeStore {
+        inner: MemPageStore,
+        state: Rc<RefCell<WitnessProbeState>>,
+    }
+
+    impl WitnessProbeStore {
+        fn new(inner: MemPageStore) -> Self {
+            Self {
+                inner,
+                state: Rc::new(RefCell::new(WitnessProbeState::default())),
+            }
+        }
+
+        fn state(&self) -> Rc<RefCell<WitnessProbeState>> {
+            Rc::clone(&self.state)
+        }
+    }
+
+    impl PageReader for WitnessProbeStore {
+        fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+            self.inner.read_page(cx, page_no)
+        }
+
+        fn read_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
+            self.state.borrow_mut().coarse_page_data_reads += 1;
+            self.inner.read_page_data(cx, page_no)
+        }
+
+        fn read_btree_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
+            self.state.borrow_mut().btree_page_data_reads += 1;
+            self.inner.read_page_data(cx, page_no)
+        }
+
+        fn record_read_witness(&self, _cx: &Cx, key: WitnessKey) {
+            self.state.borrow_mut().read_witnesses.push(key);
+        }
+    }
+
+    impl PageWriter for WitnessProbeStore {
         fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
             self.inner.write_page(cx, page_no, data)
         }
@@ -15401,6 +15508,81 @@ mod tests {
         assert!(result.is_found());
         assert_eq!(cursor.witness_keys().len(), 1);
         assert!(matches!(cursor.witness_keys()[0], WitnessKey::Cell { .. }));
+    }
+
+    #[test]
+    fn test_btree_page_reads_publish_precise_witness_without_coarse_page_read() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(
+            2,
+            build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten")]),
+        );
+
+        let cx = Cx::new();
+        let probe = WitnessProbeStore::new(store);
+        let state = probe.state();
+        let mut cursor = BtCursor::new(probe, pn(2), USABLE, true);
+
+        assert!(cursor.table_move_to(&cx, 5).unwrap().is_found());
+
+        let state = state.borrow();
+        assert_eq!(
+            state.coarse_page_data_reads, 0,
+            "B-tree traversal must not register coarse page reads before the cursor emits its logical witness"
+        );
+        assert!(
+            state.btree_page_data_reads > 0,
+            "cursor traversal should still read B-tree pages through the dedicated path"
+        );
+        assert_eq!(state.read_witnesses.as_slice(), cursor.witness_keys());
+        assert!(
+            state
+                .read_witnesses
+                .iter()
+                .all(|key| matches!(key, WitnessKey::Cell { .. })),
+            "point lookup should publish only cell witnesses"
+        );
+    }
+
+    #[test]
+    fn test_count_all_rows_publishes_page_witnesses_without_coarse_page_read() {
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
+        store
+            .pages
+            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
+
+        let cx = Cx::new();
+        let probe = WitnessProbeStore::new(store);
+        let state = probe.state();
+        let mut cursor = BtCursor::new(probe, pn(2), USABLE, true);
+
+        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 4);
+
+        let state = state.borrow();
+        assert_eq!(
+            state.coarse_page_data_reads, 0,
+            "COUNT traversal must not fall back to coarse raw page reads"
+        );
+        assert_eq!(state.btree_page_data_reads, 3);
+        assert!(
+            [pn(2), pn(3), pn(4)]
+                .into_iter()
+                .all(|page| state.read_witnesses.contains(&WitnessKey::Page(page))),
+            "COUNT traversal must publish page witnesses for every counted B-tree page"
+        );
+        assert!(
+            state
+                .read_witnesses
+                .iter()
+                .all(|key| matches!(key, WitnessKey::Page(_))),
+            "COUNT traversal should publish page witnesses rather than point-cell witnesses"
+        );
     }
 
     #[test]

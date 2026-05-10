@@ -12,6 +12,38 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-10 - Root-leaf retained DELETE run bypass
+
+- Target: narrow small-delete special case left open by the global retained
+  direct DELETE run disable screen, especially
+  `UPDATE/DELETEThroughput` `100 rows / delete 5 rows`.
+- Touched during rejected candidate, then reverted:
+  `crates/fsqlite-btree/src/cursor.rs`. The temporary test expectation edits
+  for root-leaf delete-run admission were also reverted.
+- Candidate shape: make `BtCursor::table_leaf_delete_run_current` decline
+  root-leaf table deletes (`tree_depth == 1`), forcing tiny root-leaf DELETEs
+  through the ordinary cursor delete path while preserving retained same-leaf
+  runs on non-root leaves.
+- Correctness proof before benchmark rejection:
+  `cargo fmt -p fsqlite-btree --check` passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-rootleaf-delete-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-btree table_leaf_delete_run -- --nocapture`
+  passed after adapting the temporary root-leaf materializer tests. The
+  `fsqlite-core` pending direct-delete tests then showed the expected behavior
+  mismatch because they assert root-leaf deletes remain buffered.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-root-leaf-delete-run-bypass-20260510T1932Z/`
+  contains same-window focused UPDATE/DELETE baseline and candidate JSON plus
+  stdout/stderr.
+- Result: rejected and source left reverted. The candidate slightly improved
+  focused geomean (`1.6169050307 -> 1.6039644124`) only because the noisy
+  50-row and 500-row DELETE medians improved in this run, but it worsened the
+  intended tiny DELETE row from FSQLite `0.008065 ms` (`3.4703x`) to
+  `0.010550 ms` (`4.4628x`) and worsened p90/p99 to the same `4.4628x`.
+- Do not retry a root-leaf retained-run bypass as a small-delete optimization.
+  Reconsider root-leaf policy only if a later transaction-level mutation
+  representation makes the ordinary root-leaf cursor path cheaper than retained
+  buffering while preserving the tiny DELETE row in the focused matrix.
+
 ## 2026-05-10 - Current-source INSERT red-row repeat source screen
 
 - Target: current full-quick INSERT red rows after

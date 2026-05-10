@@ -12,6 +12,33 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-10 - Multi-leaf prepared direct DELETE backlog candidate
+
+- Target: `UPDATE/DELETEThroughput` DELETE tail, especially
+  `1000 rows / delete 50 rows` and `10000 rows / delete 500 rows`.
+- Touched during candidate, then reverted:
+  `crates/fsqlite-core/src/connection.rs`.
+- Candidate shape screened: retain prior same-table prepared direct DELETE
+  leaf runs in a transaction-local backlog after crossing leaf boundaries, and
+  flush retained runs through the active cursor before an ordinary cursor
+  fallback delete.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-multileaf-delete-candidate-20260510T1530Z/summary.md`
+  and
+  `tests/artifacts/perf/codex-multileaf-delete-candidate-20260510T1530Z/candidate-update-delete-quick.json`.
+  Baseline comparison used
+  `tests/artifacts/perf/codex-fresh-frontier-full-quick-20260510T093306Z/full-quick.json`.
+- Result: rejected and source reverted. The candidate passed focused
+  `prepared_direct_delete_leaf_run` correctness tests, but the target matrix did
+  not improve: `delete 5/100` moved from `3.187x` to `3.427x` slower,
+  `delete 50/1000` stayed effectively flat (`2.007x` to `2.032x` slower), and
+  `delete 500/10000` regressed from `1.945x` to `2.332x` slower.
+- Do not retry a linear scanned backlog of same-leaf DELETE runs. Reconsider
+  only with a transaction-level many-leaf mutation representation that avoids
+  per-row backlog probing, preserves cursor fallback/read-your-writes/savepoint
+  semantics, and wins both focused UPDATE/DELETE and full quick in the same
+  measurement window.
+
 ## 2026-05-10 - Non-DML frontier micro-lever rescreen
 
 - Target: current non-DML C-faster frontier after the DML head refresh,

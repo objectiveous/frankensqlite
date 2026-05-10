@@ -12,6 +12,33 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-10 - Empty-root bulk-load root-fit early-exit probe
+
+- Target: non-DML INSERT frontier, especially `INSERTThroughput` large 10K
+  rows that flush one prepared direct INSERT page run through
+  `table_bulk_load_empty_root_sorted_records`.
+- Touched during candidate, then reverted:
+  `crates/fsqlite-btree/src/cursor.rs`.
+- Candidate shape screened: replace the initial empty-root bulk-load grouping
+  pass with an early-exit one-page fit probe, so multi-page bulk loads avoid
+  building a complete root-page group list that is immediately discarded before
+  the real leaf grouping pass.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-bulk-root-fit-candidate-20260510T1555Z/summary.md`,
+  `baseline-insert-quick.json`, `candidate-insert-quick.json`, and the matching
+  `.err` profile logs in the same directory.
+- Result: rejected and source left reverted. Focused INSERT weighted/geomean
+  improved (`0.829507599` to `0.821400045`, `0.836925529` to `0.823158003`),
+  but the row mix worsened from `17 / 1 / 7` to `17 / 0 / 8`, and large 10K
+  rows were mixed: `Single Transaction / large_10col / 10000 rows` regressed
+  from `10.842706 ms` FSQLite (`1.106135808x`) to `10.971507 ms`
+  (`1.167785863x`), while `Record Size / large_10col` improved from
+  `11.436718 ms` (`1.204984420x`) to `10.609499 ms` (`1.098141311x`).
+- Do not retry the root-fit early-exit probe as a standalone bulk-load
+  optimization. Reconsider only inside a larger fused record/page-builder
+  design that improves both large 10K rows and the full quick primary score in
+  the same A/B window.
+
 ## 2026-05-10 - Multi-leaf prepared direct DELETE backlog candidate
 
 - Target: `UPDATE/DELETEThroughput` DELETE tail, especially

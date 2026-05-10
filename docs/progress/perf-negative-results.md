@@ -12,6 +12,35 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-10 - Bulk leaf layout length cache
+
+- Target: focused INSERT red rows from
+  `tests/artifacts/perf/codex-current-full-quick-20260510T182554Z/full-quick.json`,
+  especially `large_10col` 10K single-transaction and record-size rows.
+- Touched during rejected candidate, then reverted:
+  `crates/fsqlite-btree/src/cursor.rs`.
+- Candidate shape: cache per-record table-leaf cell lengths for large
+  empty-root bulk loads (`records.len() >= 512`) so root-fit grouping, leaf
+  grouping, and page materialization do not recompute the same layout lengths.
+- Correctness proof before benchmark rejection:
+  `cargo fmt -p fsqlite-btree --check` passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-candidate-22361625-local-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-btree table_bulk -- --nocapture --test-threads=1`
+  passed.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-bulk-leaf-layout-cache-20260510T212616Z/`
+  contains exact `98aee4f8` baseline and candidate focused INSERT JSON plus
+  stdout/stderr.
+- Result: rejected and source left reverted. The target rows regressed in the
+  same benchmark window: `large_10col` 10K single-transaction FSQLite median
+  moved from `10.162639 ms` to `11.463003 ms`, and record-size `large_10col`
+  10K moved from `9.602149 ms` to `11.860357 ms`. Several medium/small rows
+  regressed as well, including `medium_6col` 10K (`3.598417 ms` to
+  `3.900554 ms`) and `small_3col` 10K (`2.663658 ms` to `2.794452 ms`).
+- Do not retry a standalone leaf-cell-length cache for empty-root bulk-load
+  grouping. Reconsider only as part of a larger fused record-body/page-layout
+  builder that removes the later varint rewrite and proves focused INSERT plus
+  full-quick movement in one measurement window.
+
 ## 2026-05-10 - Monotone multi-leaf direct DELETE backlog
 
 - Target: focused `UPDATE/DELETEThroughput` DELETE red rows from

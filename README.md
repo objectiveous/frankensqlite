@@ -1230,8 +1230,11 @@ worst row as `100 rows / delete 5 rows` at `3.187x` F/C, with
 `10000 rows / update 1000 rows` faster at `0.747x`.
 
 The current focused DML diagnostic artifact is
-`tests/artifacts/perf/codex-pager-cache-direct-drain-final-dml-20260510T051340Z/`,
-and the current rollback-isolated DELETE comparison is
+`tests/artifacts/perf/codex-dml-head-profile-20260510T144411Z/summary.md`.
+It refreshes the retained DML profile on `HEAD` and records why the remaining
+prepared-DML DELETE tail needs a broader transaction-level multi-leaf mutation
+primitive rather than another one-lever source patch. The current
+rollback-isolated DELETE comparison is
 `tests/artifacts/perf/codex-current-delete-isolation-20260510T041932Z/`.
 Those artifacts record the FSQLite DML profile separately; the benchmark rows
 themselves prepare the target statements before measurement for both engines.

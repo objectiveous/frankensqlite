@@ -12,6 +12,42 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-10 - DML head refresh and multi-leaf DELETE screen
+
+- Target: current `UPDATE/DELETEThroughput` tail on `HEAD`, especially
+  explicit-transaction `DELETE FROM bench WHERE id = ?1` after the retained
+  same-leaf direct DELETE run and commit-publication fixes.
+- Touched during measurement: no source files. The profile reused the retained
+  `FSQLITE_BENCH_PROFILE_DML=1` counters in
+  `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`.
+- Candidate shape screened: a Bε-tree-style transaction-level multi-leaf
+  DELETE buffer / next-leaf continuation as the next source change, instead of
+  another wrapper, parent-separator, cursorless-flush, compact-area, lifecycle
+  metric, or pager tiny-field trim.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-dml-head-profile-20260510T144411Z/summary.md`.
+  The remote run completed successfully and reported `1 / 0 / 5`
+  faster/comparable/C-faster with average ratio `2.19x`; the raw local stderr
+  capture was reduced to a tracked summary because target-directory retrieval
+  was stopped after the benchmark finished.
+- Result: rejected as an immediate one-lever source patch. The fresh profile
+  kept the same shape as the retained artifacts: `delete 5/100` used one
+  same-leaf run and one dirty flush (`delete_leaf_flush=1/1`,
+  `delete_leaf_flush_ns=2845`), while `delete 500/10000` used 64 dirty
+  leaf-run flushes (`delete_leaf_flush=64/64`, `delete_leaf_flush_ns=151339`)
+  with active misses dominated by out-of-leaf boundaries
+  (`delete_leaf_miss_out_of_leaf=60`, `delete_leaf_miss_last_cell=3`). Legacy
+  SQLite's local rowid DELETE path is still just cursor-positioned cell removal
+  plus balance gating; FrankenSQLite's remaining gap is the transaction/MVCC
+  publication representation around many leaf-local mutations, not an isolated
+  cell-delete primitive.
+- Do not retry standalone DML wrapper trimming, cursorless leaf-run flush,
+  parent-separator admission, lifecycle metric batching, or compact-area
+  caching from this profile. Reconsider multi-leaf DELETE buffering only as a
+  real transaction-level design with read-your-writes semantics, savepoint /
+  rollback behavior, MVCC publication proof tests, a focused UPDATE/DELETE A/B,
+  and a full quick primary-score win in the same measurement window.
+
 ## 2026-05-10 - File-backed concurrent INSERT page-run screen
 
 - Target: remaining low-writer concurrent rows in

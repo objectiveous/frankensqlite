@@ -12,6 +12,40 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-10 - Direct DELETE leaf-run stack-entry detach
+
+- Target: focused `UPDATE/DELETEThroughput` DELETE red rows from
+  `tests/artifacts/perf/codex-current-full-quick-20260510T182554Z/full-quick.json`,
+  especially `1000 rows / delete 50 rows` and
+  `10000 rows / delete 500 rows`.
+- Touched during rejected candidate, then reverted:
+  `crates/fsqlite-btree/src/cursor.rs`.
+- Candidate shape: move the current btree leaf `StackEntry` into
+  `TableLeafDeleteRun` instead of cloning it, then move the detached page image
+  into the pager write at flush time. The candidate included the necessary
+  first-delete prechecks so fallback paths would still keep the live cursor
+  positioned.
+- Correctness proof before benchmark rejection:
+  `cargo fmt -p fsqlite-btree --check` passed,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-dml-detach-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-btree table_leaf_delete_run -- --nocapture --test-threads=1`
+  passed, and the `fsqlite-core` prepared direct delete/update leaf-run
+  flush/rollback tests passed.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-dml-delete-detach-20260510T215825Z/`
+  contains the focused DML baseline, first detach-only candidate, and final
+  detach-plus-move candidate JSON/stdout/stderr.
+- Result: rejected and source left reverted. The final candidate improved the
+  noisy `1000 rows / delete 50 rows` FSQLite median in this window
+  (`0.055053 ms` to `0.033663 ms`) but worsened the tiny row (`0.007845 ms` to
+  `0.008466 ms`) and regressed the larger target row from `0.308358 ms` to
+  `0.351609 ms`. The 500-delete profile still showed `104742 ns` in delete
+  leaf-run flush, so ownership detaching did not remove the dominant retained
+  DELETE ceremony.
+- Do not retry stack-entry detach or page-image move as a standalone retained
+  DELETE fix. Reconsider only as part of a broader transaction-level DML
+  representation that avoids publishing one full dirty page image per leaf and
+  proves both 50-delete and 500-delete rows in the same benchmark window.
+
 ## 2026-05-10 - Bulk leaf layout length cache
 
 - Target: focused INSERT red rows from

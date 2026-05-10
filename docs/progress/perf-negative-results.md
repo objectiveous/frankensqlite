@@ -12,6 +12,36 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-10 - Current INSERT repeat after DML frontier profile
+
+- Target: current non-DML red rows after the DML DELETE frontier was fenced,
+  especially `large_10col` 10K single-transaction and record-size INSERT plus
+  the 100-row fixed-cost INSERT tails.
+- Touched during this pass: no source files. Measurement artifact only:
+  `tests/artifacts/perf/codex-insert-repeat-head-20260510T2300Z/`.
+- Evidence: `FSQLITE_BENCH_PROFILE_INSERT=1` with `--quick --filter insert` on
+  current `HEAD` (`6e40d540dc1bd620cce71b17b6fdd7bb3adc66e4`). The focused
+  INSERT slice reported `17` FSQLite-faster rows, `1` comparable row, and `7`
+  C-faster rows with weighted score `0.87217`. The top red rows were
+  `large_10col` 10K single-transaction (`1.21687x`), `large_10col` 10K
+  record-size (`1.21548x`), and `small_3col` 100 rows (`1.20190x`).
+- Profile attribution: prepared direct INSERT was active for every profiled
+  target (`direct_insert == fast`, `slow == 0`). The large 10-column 10K
+  record-size row used one owned empty-root page run (`page_run_flushes=1`,
+  `page_run_owned=1`, `page_run_empty_root=1`, `page_run_fallbacks=0`) and
+  split visible cost between row construction (`row_build_ns=4619953`), direct
+  page-run publication (`direct_flush_ns=3071141`), B-tree insertion
+  (`btree_insert_ns=818128`), and commit (`commit_us=5221.8`).
+- Result: no standalone source patch. This confirms the previous INSERT source
+  screen, but the obvious one-lever row-build/page-run publication families are
+  already rejected: concat/record serialization variants, page-run
+  threshold/arena changes, borrowed owned-record flushing, eager
+  error-restore clone removal, and empty-root leaf layout caching.
+- Worth retrying only as a broader fused record-body/page-layout builder that
+  removes duplicate large-row construction and page publication work while
+  improving the focused INSERT slice and full-quick primary score in the same
+  measurement window.
+
 ## 2026-05-10 - Current DML DELETE profile frontier no-source decision
 
 - Target: current `UPDATE/DELETEThroughput` DELETE red rows after the overlay

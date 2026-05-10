@@ -9739,3 +9739,47 @@ set: sessions found by
   optimization. Reconsider only if a same-window profile proves cache insertion
   dominates after the 100K large-row path is protected and the focused INSERT
   primary score plus p99 improve together.
+
+## 2026-05-10 - Fused empty-root direct-insert page builder
+
+- Target: large-record prepared INSERT page-run buffering in
+  `crates/fsqlite-core/src/connection.rs` and
+  `crates/fsqlite-btree/src/cursor.rs`, after the frontier INSERT profile
+  showed large 10K rows still losing to C SQLite despite existing empty-root
+  bulk-load support.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`,
+  `crates/fsqlite-btree/src/cursor.rs`, and
+  `crates/fsqlite-btree/src/lib.rs`. The candidate added a boxed
+  `FusedEmptyRoot` pending page-run variant plus a B-tree
+  `BulkTableLeafPageRun` that packed large sorted rowid records directly into
+  leaf page images during row execution. The source patch was manually unwound
+  after the focused INSERT benchmark failed the keep gate.
+- Candidate shape: avoid retaining one owned `Vec<u8>` per large inserted row
+  and avoid the later grouping/page-layout pass by building no-overflow table
+  leaf images incrementally, then publishing those images into the empty-root
+  B-tree at flush.
+- Correctness/build proof before rejection:
+  `cargo fmt -p fsqlite-btree -p fsqlite-core --check` passed;
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-fused-pagerun-local-btree CARGO_BUILD_JOBS=4 cargo test -p fsqlite-btree table_bulk_load_empty_root_leaf_page_run -- --nocapture`
+  passed; `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-fused-pagerun-local-core CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core fused_page_run -- --nocapture --test-threads=1`
+  passed; `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-fused-pagerun-local-check CARGO_BUILD_JOBS=4 cargo check -p fsqlite-btree -p fsqlite-core --all-targets`
+  passed; and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-fused-pagerun-local-clippy CARGO_BUILD_JOBS=4 cargo clippy -p fsqlite-btree -p fsqlite-core --all-targets -- -D warnings`
+  passed after boxing the large enum variant.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-fused-empty-root-pagerun-20260510T165017Z/`
+  contains the candidate INSERT quick JSON and summary. Compare against
+  `tests/artifacts/perf/codex-fresh-frontier-insert-profile-20260510T093306Z/insert.json`.
+- Result: rejected. The candidate did exercise the intended large-record fused
+  path, but the focused INSERT matrix worsened. Same-window FSQLite median
+  deltas included record-size `large_10col` 10K
+  `10.1973 ms -> 12.1962 ms` (+19.6%), single-txn `large_10col` 1K
+  `0.8805 ms -> 1.0009 ms` (+13.7%), transaction-strategy small 3col 1K
+  single-txn `0.2872 ms -> 0.4345 ms` (+51.3%), and transaction-strategy small
+  3col 100 batched `0.0872 ms -> 0.2165 ms` (+148.4%).
+- Do not retry fused direct page-image building as a standalone INSERT
+  optimization. Reconsider only with evidence that page-image construction can
+  be moved off the per-row execution path and that the focused INSERT primary
+  score, large-record rows, and transaction-strategy rows improve together in
+  the same measurement window.

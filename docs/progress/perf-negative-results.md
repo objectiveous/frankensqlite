@@ -10002,3 +10002,45 @@ set: sessions found by
   profile showing the binary search itself dominates after retained-run flush
   and pager commit costs are controlled, and only if the focused DML repeat
   improves the 50-row and 500-row DELETE rows in absolute FSQLite time.
+
+## 2026-05-10 - Prebound publication handoff for autocommit direct UPDATE/DELETE
+
+- Target: prepared direct UPDATE/DELETE autocommit entry in
+  `crates/fsqlite-core/src/connection.rs`, after the DML profile still showed
+  the 100-row UPDATE/DELETE rows behind C SQLite and the fused-entry proof
+  already carrying a schema-bound pager publication.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The candidate threaded
+  `PreparedDmlEntryProof.publication` into
+  `try_execute_precompiled_prepared_update_delete_autocommit_direct_simple_fast`
+  so `ensure_autocommit_txn_with_publication_hint` did not rebind with
+  `None`. The source patch and its focused regression test were manually
+  unwound after the focused DML benchmark failed the keep gate.
+- Candidate shape: complete the fused-entry publication handoff for the direct
+  UPDATE/DELETE autocommit helper. A targeted file-backed stale-publication test
+  confirmed the micro-effect: prepared direct UPDATE and DELETE each used one
+  pager publication refresh instead of rebinding during autocommit begin.
+- Correctness/build proof before rejection:
+  `cargo fmt --check` passed;
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-prebound-ud-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_prepared_file_backed_update_delete_reuse_schema_bound_publication_for_autocommit_begin -- --nocapture --test-threads=1`
+  passed; `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-prebound-ud-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core --test fast_path_separation test_file_backed_publication_refresh_counts -- --nocapture --test-threads=1`
+  passed; `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-prebound-ud-target CARGO_BUILD_JOBS=8 cargo check --workspace --all-targets`
+  passed; and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-prebound-ud-target CARGO_BUILD_JOBS=8 cargo clippy --workspace --all-targets -- -D warnings`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-dml-current-profile-20260510T184018Z/`
+  contains the current-source baseline DML profile, and
+  `tests/artifacts/perf/codex-prebound-ud-20260510T1857Z/` contains the
+  rejected candidate DML run plus summary.
+- Result: rejected. The candidate reduced duplicate publication binding, but
+  the focused DML matrix worsened versus the current-source baseline:
+  geomean `1.57221 -> 1.60098`, p90 `3.45938 -> 3.62947`, and p99
+  `3.45938 -> 3.62947`. Important rows also moved the wrong way: 100-row
+  DELETE `0.008005 ms -> 0.008326 ms`, 1000-row DELETE
+  `0.033152 ms -> 0.033733 ms`, and 100-row UPDATE
+  `0.006612 ms -> 0.006743 ms`.
+- Do not retry this publication-handoff patch as a standalone DML
+  optimization. Reconsider only as part of a broader retained direct-DML entry
+  redesign that removes enough fixed ceremony to improve the focused DML
+  geomean and tail rows in the same measurement window.

@@ -12,6 +12,36 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-10 - Current-source INSERT red-row repeat source screen
+
+- Target: current full-quick INSERT red rows after
+  `tests/artifacts/perf/codex-current-full-quick-20260510T182554Z/full-quick.json`,
+  especially `small_3col` 100-row rows, `large_10col` 100-row rows, and
+  `large_10col` 10K single-transaction / record-size rows.
+- Touched during measurement: no source files. Measurement artifact only under
+  `tests/artifacts/perf/codex-insert-red-repeat-20260510T183336Z/`.
+- Evidence: three same-binary `--quick --filter insert` repeats and one
+  `FSQLITE_BENCH_PROFILE_INSERT=1` profile pass. Repeats kept the INSERT section
+  around `17` faster rows and `6-7` C-faster rows. Stable C-faster families:
+  `small_3col` 100-row single/batched rows (`~1.09x-1.18x`),
+  `large_10col` 100-row single rows (`~1.05x-1.14x`), and
+  `large_10col` 10K single/record-size rows (`~1.04x-1.15x`).
+- Profile attribution: prepared direct INSERT stayed active for every profiled
+  target row (`direct_insert == fast`, `slow == 0`), and empty-root page-run
+  bulk load was used (`page_run_empty_root=1`, `page_run_fallbacks=0`). The
+  `large_10col` 10K rows still split cost between row construction
+  (`~4.05-4.10 ms`) and owned page-run flush (`~2.99-3.23 ms`) with about
+  `2004` page-pool misses.
+- Result: no standalone source patch. The obvious local levers are already
+  measured negative families: concat/param-one/template row-build variants,
+  direct page-run threshold/arena changes, arena-only large-record page-run
+  buffering, borrowed owned-record flushing, and prebuilt empty-root leaf
+  builders.
+- Do not retry those as standalone INSERT micro-optimizations from this
+  frontier. Reconsider only with the broader fused record-body and page-layout
+  builder that proves focused INSERT and full-quick primary-score movement in
+  the same measurement window.
+
 ## 2026-05-10 - Current-source low-thread concurrent repeat
 
 - Target: `Concurrent Writers - C SQLite WAL vs FrankenSQLite MVCC` after

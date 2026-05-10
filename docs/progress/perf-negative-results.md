@@ -12,6 +12,39 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-10 - Frontier scratch rejection import
+
+- Target: remaining INSERT, setup/open-state, and low-thread concurrent-writer
+  frontiers after the 2026-05-10 target-refresh and scratch probe sequence.
+- Touched during rejected scratch candidates, then reverted:
+  `crates/fsqlite-core/src/connection.rs`,
+  `crates/fsqlite-btree/src/cursor.rs`, `crates/fsqlite-mvcc` witness code,
+  and WAL-control env resolution in the pager/WAL path.
+- Candidate shapes imported from `bd-db300.10.10` comments `3705` through
+  `3712`: bulk leaf varint-length shortcut, direct INSERT page-run writer
+  storage, generated `?1` page-run payload source, file-backed page-run
+  admission, read-witness record-time dedup, exact transaction-control SQL fast
+  path, simple connection PRAGMA execute fast path, and WAL-control env cache.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-frontier-scratch-rejection-sync-20260510T1740Z/summary.md`.
+  It points to the original scratch summaries under
+  `/data/tmp/frankensqlite-codex-frontier-profile-20260510/tests/artifacts/perf/`.
+- Result: all imported candidates were rejected and reverted in the scratch
+  worktree. The notable failures were INSERT weighted score worsening for
+  varint-length and page-run-writer probes, generated page-run deferral
+  regressing batched `10000 rows / batched (1000/txn)` to `3.85x` slower,
+  file-backed page-run admission dropping the 2-thread throughput ratio
+  `0.59x -> 0.53x`, read-witness dedup worsening concurrent score
+  `0.864282 -> 0.957858`, transaction-control fast path leaving DML red
+  (`update` bucket `1.91x`, `delete` bucket `4.98x`), simple PRAGMA fast path
+  worsening DML quick/filter, and WAL-control env caching failing to repeat.
+- Do not retry these as standalone micro-optimizations. Reconsider only inside
+  broader representation changes: fused row/page construction for INSERT,
+  batched page construction plus MVCC publication for concurrent writers, or a
+  combined open-state redesign that moves `SharedMvccState`, pager/page-cache,
+  page-1 bootstrap, transaction/PRAGMA dispatch, and env/config resolution
+  together with repeated focused gates and full quick neutrality.
+
 ## 2026-05-10 - DML mutation design blocker after latest microprobe rejects
 
 - Target: remaining `UPDATE/DELETEThroughput` DELETE rows after the retained

@@ -12,6 +12,45 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-10 - Non-DML frontier micro-lever rescreen
+
+- Target: current non-DML C-faster frontier after the DML head refresh,
+  especially `large_10col` 10K INSERT, 100-row INSERT fixed-cost rows, and
+  low-writer concurrent rows in the full quick matrix.
+- Touched during measurement: no source files. This was a rescreen of current
+  artifacts and prior negative entries after confirming the retained direct
+  INSERT page-run policy already uses `16` byte admission with arena storage
+  below `384` bytes and owned storage above that cap.
+- Candidate shapes screened: standalone setup/open trimming, exact
+  PRAGMA/transaction bypasses, sqlite_master rowid allocation, function
+  registry cloning, concat / param-one / record-template row-build variants,
+  direct INSERT page-run threshold/arena variants, and file-backed concurrent
+  page-run admission or wait-slice tuning.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-nondml-frontier-rescreen-20260510T1506Z/summary.md`.
+  It cites the current full quick artifact
+  `tests/artifacts/perf/codex-fresh-frontier-full-quick-20260510T093306Z/full-quick.json`,
+  insert profile
+  `tests/artifacts/perf/codex-fresh-frontier-insert-profile-20260510T093306Z/`,
+  concurrent profile hook
+  `tests/artifacts/perf/codex-concurrent-profile-hook-20260510T1140Z/`,
+  and the corresponding negative-result families below.
+- Result: rejected as an immediate one-lever source patch. The remaining
+  non-DML rows are no longer explained by a fresh parser/setup/concat/page-run
+  microfamily that has not already been measured and rejected. The next
+  credible source change is a fused record/page builder that computes row
+  bodies and B-tree page layout together, then publishes the resulting pages
+  through the pager/MVCC path with focused INSERT and full quick proof. For the
+  low-writer concurrent rows, the design must also batch page construction and
+  MVCC page publication for file-backed `BEGIN CONCURRENT` without regressing
+  8-writer throughput.
+- Do not retry standalone non-DML setup/open, concat/param-one/template,
+  direct page-run threshold/arena, file-backed page-run admission, or
+  wait-slice tuning from these artifacts. Reconsider only with a fused
+  page-builder / MVCC-publication design that wins the focused INSERT or
+  focused concurrent rows and the full quick primary score in the same
+  measurement window.
+
 ## 2026-05-10 - DML head refresh and multi-leaf DELETE screen
 
 - Target: current `UPDATE/DELETEThroughput` tail on `HEAD`, especially

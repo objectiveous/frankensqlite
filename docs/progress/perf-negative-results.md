@@ -12,6 +12,32 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-10 - Frontier boundary rerank after DML detach rejection
+
+- Target: choose the next safe performance frontier after the current INSERT,
+  DML, and low-thread concurrent red-row screens from
+  `tests/artifacts/perf/codex-current-full-quick-20260510T182554Z/full-quick.json`.
+- Touched during this pass: no source files. Documentation/artifact only:
+  `tests/artifacts/perf/codex-frontier-boundary-20260510T221343Z/`.
+- Candidate shape rejected without a source attempt: any standalone tweak to
+  INSERT record/page-run construction, file-backed concurrent retry timing,
+  file-backed page-run admission, or retained DELETE leaf-run internals. These
+  families are already fenced by current same-window benchmark artifacts.
+- Evidence: the boundary artifact rechecked the current INSERT repeat/profile,
+  low-thread concurrent repeat/profile, DML head profile, scratch rejection
+  sync, and 16-thread shared-table verification. The README no longer contains
+  the stale `BUSY_SNAPSHOT` storm note, and the retained 16-thread shared-table
+  artifact reports `0` FSQLite failures.
+- Result: no source patch attempted. The only above-threshold next source
+  frontier is a transaction-local DML mutation operator that batches page-local
+  mutations while preserving read-your-writes, rollback, savepoints, schema
+  drift handling, duplicate/missing rowid semantics, and MVCC publication
+  correctness. Require focused `UPDATE/DELETEThroughput` wins for the 5-row,
+  50-row, and 500-row DELETE rows plus full-quick primary-score neutrality or
+  better before keeping such a patch.
+- Do not restart with another one-branch INSERT, concurrent backoff/admission,
+  or retained DELETE leaf-run micro-optimization from this frontier.
+
 ## 2026-05-10 - Direct DELETE leaf-run stack-entry detach
 
 - Target: focused `UPDATE/DELETEThroughput` DELETE red rows from

@@ -9783,3 +9783,31 @@ set: sessions found by
   be moved off the per-row execution path and that the focused INSERT primary
   score, large-record rows, and transaction-strategy rows improve together in
   the same measurement window.
+
+## 2026-05-10 - Disable retained direct DELETE leaf-run
+
+- Target: prepared direct DELETE in
+  `crates/fsqlite-core/src/connection.rs`, after a refreshed DML profile showed
+  the small DELETE row still behind C SQLite and the retained same-leaf
+  delete-run contributing visible start/active/flush work.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The candidate forced
+  `can_defer_prepared_direct_delete_leaf_run()` to return false so every direct
+  DELETE used the ordinary cursor delete path instead of the retained same-leaf
+  run. The source patch was manually unwound after the focused DML benchmark
+  failed the keep gate.
+- Candidate shape: determine whether the retained same-leaf delete-run was net
+  negative for small DELETE batches before spending effort on a narrower
+  variant.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-dml-profile-20260510T165812Z/`
+  contains the same-session baseline DML profile, and
+  `tests/artifacts/perf/codex-disable-delete-leaf-run-20260510T170227Z/`
+  contains the candidate DML JSON and summary.
+- Result: rejected. Disabling the run was roughly neutral only for the noisiest
+  5-row DELETE (`23.293 us -> 22.2 us`) and badly regressed larger DELETE rows:
+  50-row DELETE `79.258 us -> 107.1 us` (+35.1%) and 500-row DELETE
+  `368.549 us -> 993.2 us` (+169.5%).
+- Do not disable the retained direct DELETE leaf-run globally. Reconsider only
+  as a narrow small-delete special case that proves it does not harm the 50-row
+  and 500-row DELETE rows in the same focused DML matrix.

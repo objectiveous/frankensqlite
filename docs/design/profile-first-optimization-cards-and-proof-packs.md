@@ -399,6 +399,40 @@ tracing::info!(
 - **Rollback:** `PRAGMA fsqlite_ssi_risk_tolerance = 'low'` (conservative default)
 - **Policy fields:** expected_loss_model = CVaR, calibration_trigger = regime_shift, fallback = conservative_matrix
 
+### 8.4 bd-db300.11.1 (Transaction-Local DML Mutation Operator)
+
+- **Hotspot:** Current `UPDATE/DELETEThroughput` DELETE tail remains the
+  highest measured C SQLite-faster frontier. Evidence:
+  `tests/artifacts/perf/codex-dml-profile-head-20260510T224630Z/` and
+  `tests/artifacts/perf/codex-current-full-quick-20260510T182554Z/`.
+  The focused current-source profile reports DELETE ratios of `3.49891x`
+  slower for 5 rows, `2.15802x` slower for 50 rows, and `1.92630x`
+  slower for 500 rows while the prepared direct fast path is already active.
+- **Rejected smaller cards:** retained `TableLeafDeleteRun` materializer
+  tweaks, tombstone-only DELETE overlays, dense-rowid queued overlays,
+  standalone freed-page lookup changes, and direct flush wrappers are fenced in
+  `docs/progress/perf-negative-results.md`.
+- **Lever:** one transaction-local DML mutation operator that buffers
+  page-local rowid delete/update messages in logical key space, merges them at
+  a proven first-read or commit boundary, and publishes the same MVCC conflict
+  surface as physical row deletes. This is a B-epsilon-style message-buffer
+  lever; it is not a tombstone-only shortcut and it must not key by physical
+  cell index.
+- **Proof:** row-level oracle against rusqlite for affected-row counts,
+  duplicate and missing rowids, read-your-writes, rollback, savepoints,
+  schema drift, QF/count-cache invalidation, and MVCC publication. Concurrent
+  mode defaults in `Connection`, `HarnessSettings`, `FsqliteExecConfig`, and
+  `benchmark_settings()` remain true.
+- **Keep gate:** two focused `--quick --filter update` runs must improve the
+  5-row, 50-row, and 500-row DELETE medians without regressing UPDATE, followed
+  by two full quick matrix runs with primary-score neutrality or better and no
+  new critical red rows.
+- **Rollback:** revert the single optimization commit; no compatibility shim
+  or permanent off-by-default mode is acceptable.
+- **Card status:** open only for the broader mutation-operator lever above.
+  Any smaller overlay or retained-leaf-run attempt is blocked until a newer
+  profile invalidates the 2026-05-10 rejection artifacts.
+
 ---
 
 ## 9. Consequences for Downstream

@@ -12,6 +12,31 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-10 - Current DML DELETE profile frontier no-source decision
+
+- Target: current `UPDATE/DELETEThroughput` DELETE red rows after the overlay
+  and retained leaf-run micro-optimization families were rejected.
+- Touched during this pass: no source files. Documentation/artifact only:
+  `tests/artifacts/perf/codex-dml-profile-head-20260510T224630Z/`.
+- Evidence: current `HEAD` (`39559112e38d775fb19076a098c60ee8e9ba2fac`) was
+  profiled with `FSQLITE_BENCH_PROFILE_DML=1` and `--quick --filter update`.
+  DELETE still reports `3.49891x` slower at 5 rows, `2.15802x` slower at 50
+  rows, and `1.92630x` slower at 500 rows. All profiled DELETE rows use the
+  prepared direct fast path (`fast == direct_delete`, `slow == 0`). For the
+  500-row DELETE profile, the remaining visible work is
+  `delete_leaf_active_ns=49748`, `delete_leaf_flush_ns=108719`, and
+  `commit_us=31.9`; generic `direct_flush_ns` is only `1444`.
+- Result: do not attempt another standalone direct-write flush wrapper,
+  leaf-run threshold, next-cell hint, stack-entry move, direct writer
+  publication, or page-boundary admission tweak. This profile confirms the
+  next credible source frontier is still the broader transaction-local DML
+  mutation operator, not another retained `TableLeafDeleteRun` micro-patch.
+- Worth retrying only when the candidate removes per-leaf mutation/publication
+  ceremony while proving read-your-writes, rollback/savepoint behavior,
+  duplicate and missing rowid semantics, schema drift handling, QF/cache
+  invalidation, and MVCC publication before improving the 5-row, 50-row, and
+  500-row DELETE rows together.
+
 ## 2026-05-10 - DML DELETE overlay side-worktree rejection sync
 
 - Target: `bd-db300.11.1`, the committed leaf-delta/tombstone DELETE overlay

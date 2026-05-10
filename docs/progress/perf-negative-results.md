@@ -12,6 +12,40 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-10 - DML DELETE overlay side-worktree rejection sync
+
+- Target: `bd-db300.11.1`, the committed leaf-delta/tombstone DELETE overlay
+  family for focused `UPDATE/DELETEThroughput` DELETE red rows.
+- Touched during this sync: no source files. Documentation/artifact only:
+  `tests/artifacts/perf/codex-logical-tombstone-probe-20260510T0058Z/`,
+  `tests/artifacts/perf/codex-dense-rowid-delete-overlay-20260510T0115Z/`,
+  `tests/artifacts/perf/codex-frontier-profile-20260510T0148Z/`,
+  `tests/artifacts/perf/codex-frontier-delete-isolated-profile-20260510T0158Z/`,
+  and
+  `tests/artifacts/perf/codex-dml-overlay-rejection-sync-20260510T223610Z/`.
+- Candidate shapes rejected from side worktrees: a private `:memory:` logical
+  tombstone-only direct DELETE buffer and a dense-rowid queued DELETE overlay.
+  Both passed narrow local correctness/build gates, but neither met the
+  focused performance keep gate.
+- Evidence: the tombstone probe left FSQLite DELETE at `3.84x` slower for
+  standard 100-row DELETE, `2.00x` slower for standard 1000-row and 10000-row
+  DELETE, and `2.15x` slower for isolated 10000-row DELETE. The dense-rowid
+  queued overlay regressed the standard 100-row DELETE probe to `3244 ns`
+  per FSQLite DELETE versus `471 ns` for C SQLite (`6.89x` slower). The
+  isolated DELETE profile showed a real DELETE-body gap (`5.25x` slower at
+  100 rows and `6.18x` slower at 1000 rows), while isolated UPDATE was already
+  faster than C SQLite (`0.43x` ratio).
+- Result: reject tombstone-only DELETE overlays, dense-rowid queued DELETE
+  overlays, and standalone `freed_pages` lookup retries as the next patch.
+  The profile's top self-time frames were `TransactionKind::get_page`
+  (`35.96%`) and `TransactionKind::write_page_data` (`23.12%`), but
+  standalone freed-page lookup changes have already been rejected by the
+  current focused UPDATE/DELETE matrix.
+- Worth retrying only as part of a broader transaction-local DML mutation
+  operator that proves read-your-writes, rollback, savepoints, schema drift,
+  duplicate/missing rowids, and MVCC publication behavior before improving the
+  5-row, 50-row, and 500-row DELETE rows in one benchmark window.
+
 ## 2026-05-10 - Frontier boundary rerank after DML detach rejection
 
 - Target: choose the next safe performance frontier after the current INSERT,

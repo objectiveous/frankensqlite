@@ -12,6 +12,31 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-10 - DML mutation design blocker after latest microprobe rejects
+
+- Target: remaining `UPDATE/DELETEThroughput` DELETE rows after the retained
+  same-leaf DELETE run, multi-leaf backlog rejection, disable-run probe, and
+  next-cell hint probe.
+- Touched during measurement: no source files. This was a fresh reread of the
+  prepared direct DELETE path, pending write-run flush boundaries,
+  savepoint/rollback observation boundaries, existing INSERT bulk builder, C
+  SQLite's local delete path, and the same-session rejection artifacts.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-dml-mutation-design-20260510T173214Z/summary.md`.
+- Result: rejected as a safe immediate source patch. The current helper owns
+  one retained leaf-local mutation run; small admission/seek hints, disabling
+  the run, and linear retained multi-leaf backlogs are already measured
+  negatives. The remaining gap is the transaction representation boundary:
+  many rowid mutations must be represented and published as a transaction-level
+  mutation set rather than replayed as independent cursor/leaf episodes.
+- Do not retry standalone DELETE leaf-run admission tweaks, next-cell hints,
+  retained-cursor hints, scanned dirty-leaf backlogs, or disable-run variants
+  from this frontier. Reconsider only with a real transaction-level many-leaf
+  mutation representation that proves read-your-writes, savepoint/rollback,
+  failed-flush preservation, quotient-filter invalidation, and batched
+  pager/MVCC publication, then wins focused UPDATE/DELETE and full quick in the
+  same A/B window.
+
 ## 2026-05-10 - Frontier recon after root-fit and multi-leaf rejects
 
 - Target: remaining full-quick C-faster frontier after the DML head refresh,

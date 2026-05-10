@@ -12,6 +12,38 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-10 - Private memory write-coordinator region elision
+
+- Target: fresh private `:memory:` setup/open overhead visible in 100-row
+  INSERT and other setup-heavy rows, after profiles continued to show
+  `SharedMvccState::new` / `Connection::open_with_env_and_pager` fixed cost.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  the production source change was reverted after measurement.
+- Candidate shape: make `SharedRuntimeState.write_coordinator_region` optional
+  and skip creating the `WriteCoordinator` region for private `:memory:`
+  shared state, preserving file-backed write-coordinator behavior and
+  concurrent-mode defaults.
+- Correctness/build proof before rejection:
+  - `cargo fmt -p fsqlite-core` passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-lazy-coordinator-local-target cargo check -p fsqlite-core --lib`
+    passed.
+  - `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-lazy-coordinator-local-target cargo test -p fsqlite-core write_coordinator -- --nocapture`
+    passed locally with 11 matching tests.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-memory-open-lazy-coordinator-20260510T1758Z/summary.md`.
+- Result: rejected. The focused INSERT weighted score moved slightly
+  (`0.8363653414 -> 0.8259408672`), but p90/p99 worsened
+  (`1.1328306804 / 1.1746661185 -> 1.1668266858 / 1.2073917904`) and
+  absolute FrankenSQLite medians regressed across most compared rows,
+  including `small_3col` 10K single transaction
+  (`2.568016 ms -> 3.674636 ms`) and record-size `large_10col` 10K
+  (`10.197313 ms -> 11.481385 ms`).
+- Do not retry private-memory write-coordinator region elision as a standalone
+  setup/open optimization. Reconsider only inside a broader open-state redesign
+  with same-window baseline/candidate artifacts that improve absolute
+  FrankenSQLite medians on setup-heavy INSERT rows and do not worsen full quick
+  p90/p99.
+
 ## 2026-05-10 - Frontier scratch rejection import
 
 - Target: remaining INSERT, setup/open-state, and low-thread concurrent-writer

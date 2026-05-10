@@ -24,10 +24,10 @@ Each entry should include:
   file-backed page-run admission, or retained DELETE leaf-run internals. These
   families are already fenced by current same-window benchmark artifacts.
 - Evidence: the boundary artifact rechecked the current INSERT repeat/profile,
-  low-thread concurrent repeat/profile, DML head profile, scratch rejection
-  sync, and 16-thread shared-table verification. The README no longer contains
-  the stale `BUSY_SNAPSHOT` storm note, and the retained 16-thread shared-table
-  artifact reports `0` FSQLite failures.
+  low-thread concurrent repeat/profile, non-DML frontier rescreen, DML head
+  profile, scratch rejection sync, and 16-thread shared-table verification. The
+  README no longer contains the stale `BUSY_SNAPSHOT` storm note, and the
+  retained 16-thread shared-table artifact reports `0` FSQLite failures.
 - Result: no source patch attempted. The only above-threshold next source
   frontier is a transaction-local DML mutation operator that batches page-local
   mutations while preserving read-your-writes, rollback, savepoints, schema

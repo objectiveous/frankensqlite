@@ -13,6 +13,7 @@
   "reviewed_artifacts": [
     "tests/artifacts/perf/codex-current-full-quick-20260510T182554Z/full-quick.json",
     "tests/artifacts/perf/codex-insert-red-repeat-20260510T183336Z/summary.md",
+    "tests/artifacts/perf/codex-concurrent-repeat-after-63cf-20260510T181706Z/summary.md",
     "tests/artifacts/perf/codex-nondml-frontier-rescreen-20260510T1506Z/summary.md",
     "tests/artifacts/perf/codex-dml-head-profile-20260510T144411Z/summary.md",
     "tests/artifacts/perf/codex-frontier-scratch-rejection-sync-20260510T1740Z/summary.md",

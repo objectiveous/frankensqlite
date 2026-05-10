@@ -12,6 +12,28 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-10 - Frontier recon after root-fit and multi-leaf rejects
+
+- Target: remaining full-quick C-faster frontier after the DML head refresh,
+  non-DML rescreen, file-backed concurrent profile hook, multi-leaf DELETE
+  backlog rejection, and empty-root bulk-load root-fit rejection.
+- Touched during measurement: no source files. This was a fresh read of the
+  current artifacts, ledger, and relevant VDBE / connection / MVCC / pager /
+  B-tree paths.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-frontier-recon-20260510T161235Z/summary.md`.
+- Result: rejected as a safe immediate source patch. The obvious one-lever
+  candidates remain exhausted: per-statement concurrent retry, page-one conflict
+  trimming, standalone file-backed page-run admission, row-build/template/concat
+  trimming, wait-slice tuning, and linear retained multi-leaf DELETE backlogs.
+- Do not start another one-lever microprobe from this frontier unless a fresh
+  profile shows a new dominant source of cost. The next credible source work is
+  either a fused record/page builder with MVCC publication for non-DML and
+  concurrent rows, or a true transaction-level many-leaf DML mutation
+  representation with read-your-writes, savepoint/rollback, and MVCC publication
+  proof. Either path must win its focused workload and the full quick primary
+  score in the same A/B window.
+
 ## 2026-05-10 - Empty-root bulk-load root-fit early-exit probe
 
 - Target: non-DML INSERT frontier, especially `INSERTThroughput` large 10K

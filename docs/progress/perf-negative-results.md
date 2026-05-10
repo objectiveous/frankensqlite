@@ -12,6 +12,36 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-10 - Current-source low-thread concurrent repeat
+
+- Target: `Concurrent Writers - C SQLite WAL vs FrankenSQLite MVCC` after
+  `63cfcd95`, specifically the remaining `2 writers x 1000 rows` and
+  borderline `4 writers x 1000 rows` rows.
+- Touched during this pass: no source files. Measurement artifact only under
+  `tests/artifacts/perf/codex-concurrent-repeat-after-63cf-20260510T181706Z/`.
+- Evidence: current-source release-perf rebuild plus three clean same-binary
+  repeats and one profile-hook run. Clean repeat ratios were:
+  - 2 writers: `1.10136`, `1.11099`, `1.08203`.
+  - 4 writers: `1.02297`, `1.00475`, `1.07921`.
+  - 8 writers: `0.50409`, `0.51118`, `0.49618`.
+- Profile-hook attribution: direct INSERT fast path was active
+  (`fast=24012`, `slow=0` for the 2-writer profile), file-backed pending
+  page-runs stayed inactive (`page_run_flushes=0`), and the 2-writer row paid
+  `mvcc_page_lock_waits=12`, `mvcc_busy_retries=12`,
+  `mvcc_stale_snapshot=12`, and `mvcc_page_lock_wait_ns=17721247`.
+- Result: no standalone source patch. The 2-writer gap is a transaction-level
+  stale-snapshot replay cost, not parser/serialization/setup overhead.
+  Per-statement retry would be wrong after a transient error poisons the
+  transaction; start-gate staggering would change the workload; and
+  preemptive file/table-level admission would reintroduce writer
+  serialization.
+- Do not retry low-thread concurrent wait-slice tuning, transaction retry
+  reshaping, start-gate staggering, or standalone file-backed page-run
+  admission as independent optimizations. Reconsider only with a representation
+  change that batches file-backed page construction and MVCC publication
+  together while preserving first-committer-wins, proving the 2/4-writer rows
+  and not regressing the 8-writer row or full quick matrix.
+
 ## 2026-05-10 - Private memory write-coordinator region elision
 
 - Target: fresh private `:memory:` setup/open overhead visible in 100-row

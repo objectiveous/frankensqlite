@@ -9811,3 +9811,44 @@ set: sessions found by
 - Do not disable the retained direct DELETE leaf-run globally. Reconsider only
   as a narrow small-delete special case that proves it does not harm the 50-row
   and 500-row DELETE rows in the same focused DML matrix.
+
+## 2026-05-10 - Same-leaf DELETE next-cell search hint
+
+- Target: `TableLeafDeleteRun::search_table_leaf` in
+  `crates/fsqlite-btree/src/cursor.rs`, after the refreshed DML profile showed
+  retained direct DELETE leaf-run active search time on same-leaf batches.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`. The candidate tracked the last
+  accepted cell index in `TableLeafDeleteRun` and checked the next cell before
+  falling back to the existing binary search. The source patch and adjacent
+  rowid test tweak were manually unwound after the focused DML repeat failed
+  the keep gate.
+- Candidate shape: optimize the common monotonically increasing DELETE workload
+  by avoiding a binary search when the next DELETE rowid is in the next cell of
+  the same captured leaf page.
+- Correctness/build proof before rejection:
+  `cargo fmt -p fsqlite-btree --check` passed;
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-delete-hint-test CARGO_BUILD_JOBS=4 cargo test -p fsqlite-btree table_leaf_delete_run -- --nocapture`
+  passed; `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-delete-hint-test CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core prepared_direct_delete_leaf_run -- --nocapture --test-threads=1`
+  passed; `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-delete-hint-check CARGO_BUILD_JOBS=4 cargo check -p fsqlite-btree -p fsqlite-core --all-targets`
+  passed; and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-delete-hint-check CARGO_BUILD_JOBS=4 cargo clippy -p fsqlite-btree -p fsqlite-core --all-targets -- -D warnings`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-dml-profile-20260510T165812Z/`
+  contains the same-session baseline DML profile, and
+  `tests/artifacts/perf/codex-delete-leaf-next-hint-20260510T171758Z/`
+  contains two candidate DML runs plus a summary.
+- Result: rejected. The first candidate run improved the focused geomean
+  `1.4079632999 -> 1.3215911619`, but the important 500-row DELETE row
+  regressed in absolute FSQLite time `368.549 us -> 392.204 us` (+6.4%) and
+  active delete-run time rose `48.526 us -> 51.702 us`. The immediate repeat
+  failed harder: scenario counts moved to `1` faster / `5` C-faster, geomean
+  worsened to `1.6479249706`, 50-row DELETE regressed
+  `79.258 us -> 82.975 us` (+4.7%), and 500-row DELETE stayed regressed
+  `368.549 us -> 392.675 us` (+6.5%).
+- Do not retry a standalone next-cell rowid hint inside
+  `TableLeafDeleteRun::search_table_leaf`. Reconsider only with a lower-level
+  profile showing the binary search itself dominates after retained-run flush
+  and pager commit costs are controlled, and only if the focused DML repeat
+  improves the 50-row and 500-row DELETE rows in absolute FSQLite time.

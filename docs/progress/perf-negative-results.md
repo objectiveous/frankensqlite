@@ -12,6 +12,40 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-10 - Monotone multi-leaf direct DELETE backlog
+
+- Target: focused `UPDATE/DELETEThroughput` DELETE red rows from
+  `tests/artifacts/perf/codex-current-full-quick-20260510T182554Z/full-quick.json`,
+  especially `1000 rows / delete 50 rows` and
+  `10000 rows / delete 500 rows`.
+- Touched during rejected candidate, then reverted:
+  `crates/fsqlite-core/src/connection.rs`.
+- Candidate shape: extend the prepared direct DELETE retained leaf-run path
+  with a backlog of older dirty `TableLeafDeleteRun`s, parking a run on
+  monotone `RowidNotInLeaf` misses and flushing the backlog only at a read,
+  backward/duplicate rowid, shape mismatch, or transaction boundary.
+- Correctness proof before benchmark rejection:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-delete-backlog-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core direct_delete_leaf_run -- --nocapture --test-threads=1`
+  passed with the candidate in place.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-delete-multileaf-backlog-20260510T2035Z/`
+  contains parent baseline JSON, an invalid stale `.rch-target` candidate
+  attempt, and the decisive clean local candidate rebuild/run.
+- Result: rejected and reverted. The first candidate run appeared to win only
+  because it used a stale `.rch-target/release-perf/comprehensive-bench` binary
+  and also shifted C SQLite medians by about an order of magnitude, making the
+  ratios non-comparable. With a clean local candidate binary, repeat focused
+  DML geomean stayed worse than 1 (`1.68569` baseline repeat versus `1.60931`
+  candidate repeat), and the intended DELETE rows did not move in the right
+  direction: `1000 rows / delete 50 rows` was `2.09365x` baseline repeat versus
+  `2.11910x` candidate repeat, and `10000 rows / delete 500 rows` was
+  `1.87706x` versus `2.12305x`.
+- Do not retry a simple monotone retained DELETE leaf-run backlog as a
+  standalone DML fix. Reconsider only with a broader direct-DML representation
+  that avoids per-leaf flush ceremony without carrying many dirty page images
+  and proves focused DELETE plus full-quick movement in the same benchmark
+  window.
+
 ## 2026-05-10 - Root-leaf retained DELETE run bypass
 
 - Target: narrow small-delete special case left open by the global retained

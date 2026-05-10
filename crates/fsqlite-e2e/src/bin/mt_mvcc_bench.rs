@@ -1,14 +1,13 @@
 //! `mt-mvcc-bench` — real multi-threaded MVCC writer benchmark (IMPL-4a).
 //!
-//! Why this exists: `comprehensive_bench::bench_concurrent_writers` runs
-//! FrankenSQLite writers *sequentially* on ONE `Connection` because
-//! `Connection` is `!Send + !Sync`. That means the previously-reported
-//! "concurrent" FrankenSQLite numbers were really single-threaded loops
-//! compared against genuinely multi-threaded C SQLite WAL. This bench fixes
-//! that by spawning N OS threads, each with its OWN `Connection::open(path)`
-//! against the SAME shared file-backed database, so the MVCC page-lock
-//! table, commit coordinator, and SSI validator are exercised under real
-//! contention.
+//! Why this exists: it is the standalone scale harness for real multi-threaded
+//! MVCC writer runs. It spawns N OS threads, each with its OWN
+//! `Connection::open(path)` against the SAME shared file-backed database, so
+//! the MVCC page-lock table, commit coordinator, and SSI validator are
+//! exercised under real contention. The comprehensive benchmark now uses the
+//! same one-connection-per-thread shape for its full-matrix concurrent rows;
+//! this binary adds 16-thread coverage, separate-table mode, startup
+//! diagnostics, and pass-over-pass history gates.
 //!
 //! For each thread count we measure:
 //!   - FrankenSQLite file-backed database, one Connection per thread,
@@ -49,9 +48,10 @@
 //!   `crates/fsqlite-harness/tests/bd_3plop_4_lock_contention_storms.rs`).
 //!   If that PRAGMA fails on a given build, we fall back to plain `BEGIN`
 //!   and print a warning (honest measurement over a fake win).
-//! * We retry transient errors (`FrankenError::is_transient()`) per-row up
-//!   to `MAX_RETRIES`; hard failures are counted in `failed_rows` and
-//!   included in the report so you can tell when the numbers are bogus.
+//! * We retry transient errors (`FrankenError::is_transient()`) by rolling back
+//!   and reopening the whole transaction, up to `MAX_RETRIES`; hard row-level
+//!   failures are counted in `failed_rows` and included in the report so you
+//!   can tell when the numbers are bogus.
 //! * Each iteration creates a fresh tempfile so there's no state carried
 //!   across runs. `--iters=3` reports p50/p95/p99 across those 3 samples.
 

@@ -3,13 +3,14 @@
 ## TL;DR
 
 `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs::bench_concurrent_writers`
-runs FrankenSQLite writers *sequentially on a single Connection* and compares
-them against *multi-threaded* C SQLite WAL. Any speedup/slowdown ratio
-reported by that scenario is **apples-to-oranges** for evaluating
-multi-writer MVCC performance.
+now runs FrankenSQLite and C SQLite with the same shape: N OS threads, one
+connection per thread, one shared file-backed WAL database, and disjoint rowid
+ranges. Current full-matrix concurrent rows are therefore valid multi-writer
+MVCC measurements.
 
-Use `crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs` (IMPL-4a) when you want a
-real multi-threaded throughput number.
+Use `crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs` (IMPL-4a) when you want the
+standalone scale harness: 1/2/4/8/16-thread reports, separate-table mode,
+startup diagnostics, and pass-over-pass history gates.
 
 ## Background
 
@@ -22,21 +23,25 @@ API.
 
 `bench_concurrent_writers` was originally written against the `rusqlite`
 baseline, which *does* have a `Send` Connection. When the FrankenSQLite
-baseline was added, the loop iterating 1..N "writers" was left as a
-sequential for-loop over a single Connection, with each "writer"
-performing a transaction serially. The benchmark continued to report
-timing ratios, but the reported "fsqlite at 8 writers" was actually a
-single-threaded workload divided into 8 short sequential batches, while
-"sqlite3 at 8 writers" was 8 OS threads contending on the WAL_WRITE_LOCK.
+baseline was first added, the loop iterating 1..N "writers" was left as a
+sequential for-loop over a single Connection, with each "writer" performing a
+transaction serially. Those older artifacts are apples-to-oranges and should
+not be used for current MVCC claims.
+
+The current implementation has been corrected: each FrankenSQLite worker opens
+its own `Connection::open(path)` inside its worker thread, enables concurrent
+mode, and runs `BEGIN CONCURRENT` against the same file-backed database. That
+matches the current C SQLite WAL arm's one-connection-per-thread shape.
 
 ## Why this matters
 
 Several optimization items in the current campaign (IMPL-4 flat-combining
 page lock table, IMPL-14 Cicada read-ts batching, IMPL-15 Hekaton TID
 gap reservation, IMPL-16 Silo epoch group commit, IMPL-24 MICA
-partitioned commit log) target multi-writer contention. None of them
-can be measured accurately by `bench_concurrent_writers`. Evidence from
-the 2026-04-18 campaign:
+partitioned commit log) target multi-writer contention. Older
+`bench_concurrent_writers` artifacts cannot measure those accurately. Current
+artifacts can, but `mt_mvcc_bench` remains the preferred focused harness when
+the optimization is specifically about concurrent writer scaling.
 
 - `IMPL-4` (flat-combining) was **refused** by the implementing agent
   after discovering that the feature was already wired behind
@@ -62,17 +67,17 @@ the same count of OS threads performing the same count of transactions.
 | Use case | Use |
 |---|---|
 | Single-connection latency | `comprehensive_bench::bench_*` (all but concurrent_writers) |
-| Single-connection stmt ceremony | `comprehensive_bench::bench_concurrent_writers` (effectively) |
+| Full-matrix concurrent row | `comprehensive_bench::bench_concurrent_writers` |
 | Real multi-thread MVCC throughput | `mt_mvcc_bench` (IMPL-4a) |
 | Cross-process conflict | `swarm_multiprocess` / `swarm_peer_visibility` |
 
 ## Before you modify `bench_concurrent_writers`
 
-Do not rename it to something less misleading (like
-`bench_small_txn_ceremony`) until we've stopped citing its numbers in
-memory and release notes — grep the repo for mentions first. If the
-rename is worth it, do it in a separate commit with a deprecation note
-in the old name.
+Keep it aligned with `mt_mvcc_bench`: one connection per worker thread, shared
+file-backed database for shared-table mode, disjoint rowid ranges, prepared
+statements on both engines, and transaction-level retry for transient MVCC
+errors. If you change its workload shape, update this document and the README
+performance artifact citations in the same commit.
 
 ## Related
 

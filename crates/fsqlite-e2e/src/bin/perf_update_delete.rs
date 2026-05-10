@@ -9,13 +9,14 @@
 //!   perf-update-delete 100000 3 update
 //!   perf-update-delete 1000   5 delete compare
 //!   perf-update-delete 10000 250 delete fsqlite isolated
+//!   perf-update-delete 10000 250 delete fsqlite rollback-isolated
 //!
 //! Arguments:
 //!   [rows]   Number of rows to pre-populate (default 10_000)
 //!   [iters]  Number of outer iterations for profiling (default 10)
 //!   [which]  "update" | "delete" | "both" (default "both")
 //!   [engine] "fsqlite" | "sqlite" | "compare" (default "fsqlite")
-//!   [mode]   "standard" | "isolated" (default "standard")
+//!   [mode]   "standard" | "isolated" | "rollback-isolated" (default "standard")
 
 use std::fmt;
 use std::process::ExitCode;
@@ -123,6 +124,7 @@ impl fmt::Display for EngineKind {
 enum ProfileMode {
     Standard,
     Isolated,
+    RollbackIsolated,
 }
 
 impl ProfileMode {
@@ -130,8 +132,9 @@ impl ProfileMode {
         match raw {
             "standard" => Ok(Self::Standard),
             "isolated" => Ok(Self::Isolated),
+            "rollback-isolated" => Ok(Self::RollbackIsolated),
             other => Err(RunError::Usage(format!(
-                "invalid mode '{other}'; expected standard or isolated"
+                "invalid mode '{other}'; expected standard, isolated, or rollback-isolated"
             ))),
         }
     }
@@ -142,6 +145,7 @@ impl fmt::Display for ProfileMode {
         match self {
             Self::Standard => f.write_str("standard"),
             Self::Isolated => f.write_str("isolated"),
+            Self::RollbackIsolated => f.write_str("rollback-isolated"),
         }
     }
 }
@@ -220,7 +224,7 @@ where
     };
     if let Some(extra) = args.next() {
         return Err(RunError::Usage(format!(
-            "unexpected extra argument '{extra}'; usage: perf-update-delete [rows] [iters] [update|delete|both] [fsqlite|sqlite|compare] [standard|isolated]"
+            "unexpected extra argument '{extra}'; usage: perf-update-delete [rows] [iters] [update|delete|both] [fsqlite|sqlite|compare] [standard|isolated|rollback-isolated]"
         )));
     }
     if iters == 0 {
@@ -252,7 +256,7 @@ fn isolated_populate_rows_i64(
     rows_i64: i64,
     delete_count: usize,
 ) -> Result<i64, RunError> {
-    if !args.workload.do_delete() {
+    if !args.workload.do_delete() || args.profile_mode == ProfileMode::RollbackIsolated {
         return Ok(rows_i64);
     }
 
@@ -293,6 +297,16 @@ fn apply_benchmark_pragmas(conn: &fsqlite::Connection) -> Result<(), RunError> {
                 RunError::Runtime(format!("apply benchmark pragma {pragma}: {err}"))
             })?;
         }
+    }
+
+    if std::env::var("FSQLITE_BENCH_FUSED_FALLBACK")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        conn.execute("PRAGMA fsqlite.fused_entry_mode = forced_fallback;")
+            .map_err(|err| {
+                RunError::Runtime(format!("apply fused fallback benchmark pragma: {err}"))
+            })?;
     }
 
     Ok(())
@@ -343,7 +357,7 @@ fn run_benchmark(args: &BenchArgs) -> Result<(), RunError> {
             ProfileMode::Standard => {
                 run_fsqlite_benchmark(args, rows_i64, update_count, delete_count)?
             }
-            ProfileMode::Isolated => {
+            ProfileMode::Isolated | ProfileMode::RollbackIsolated => {
                 run_fsqlite_isolated_benchmark(args, rows_i64, update_count, delete_count)?
             }
         };
@@ -356,7 +370,7 @@ fn run_benchmark(args: &BenchArgs) -> Result<(), RunError> {
             ProfileMode::Standard => {
                 run_sqlite_benchmark(args, rows_i64, update_count, delete_count)?
             }
-            ProfileMode::Isolated => {
+            ProfileMode::Isolated | ProfileMode::RollbackIsolated => {
                 run_sqlite_isolated_benchmark(args, rows_i64, update_count, delete_count)?
             }
         };
@@ -520,25 +534,53 @@ fn run_fsqlite_isolated_benchmark(
         let delete = conn
             .prepare("DELETE FROM bench WHERE id = ?1")
             .map_err(|err| RunError::Runtime(format!("prepare delete statement: {err}")))?;
-        conn.execute("BEGIN").map_err(|err| {
-            RunError::Runtime(format!("begin isolated delete transaction: {err}"))
-        })?;
-        let t0 = Instant::now();
-        for iter in 0..args.iters {
-            for i in 0..delete_count {
-                let id = isolated_delete_id(iter, i, delete_count)?;
-                delete
-                    .execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
-                    .map_err(|err| RunError::Runtime(format!("delete row {id}: {err}")))?;
+        if args.profile_mode == ProfileMode::RollbackIsolated {
+            for iter in 0..args.iters {
+                conn.execute("BEGIN").map_err(|err| {
+                    RunError::Runtime(format!(
+                        "begin rollback-isolated delete transaction {iter}: {err}"
+                    ))
+                })?;
+                let t0 = Instant::now();
+                for i in 0..delete_count {
+                    let id = i64::try_from(i).map_err(|_| {
+                        RunError::Usage("delete_count index overflowed i64".to_string())
+                    })? * 20;
+                    delete
+                        .execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
+                        .map_err(|err| RunError::Runtime(format!("delete row {id}: {err}")))?;
+                }
+                total_delete_ns += t0.elapsed().as_nanos();
+                conn.execute("ROLLBACK").map_err(|err| {
+                    RunError::Runtime(format!(
+                        "rollback rollback-isolated delete transaction {iter}: {err}"
+                    ))
+                })?;
+                if iter == 0 {
+                    eprintln!("  (first rollback-isolated delete iter complete)");
+                }
             }
-            if iter == 0 {
-                eprintln!("  (first isolated delete iter complete)");
+        } else {
+            conn.execute("BEGIN").map_err(|err| {
+                RunError::Runtime(format!("begin isolated delete transaction: {err}"))
+            })?;
+            let t0 = Instant::now();
+            for iter in 0..args.iters {
+                for i in 0..delete_count {
+                    let id = isolated_delete_id(iter, i, delete_count)?;
+                    delete
+                        .execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
+                        .map_err(|err| RunError::Runtime(format!("delete row {id}: {err}")))?;
+                }
+                if iter == 0 {
+                    eprintln!("  (first isolated delete iter complete)");
+                }
             }
+            total_delete_ns = t0.elapsed().as_nanos();
+            conn.execute("COMMIT").map_err(|err| {
+                RunError::Runtime(format!("commit isolated delete transaction: {err}"))
+            })?;
         }
-        total_delete_ns = t0.elapsed().as_nanos();
-        conn.execute("COMMIT").map_err(|err| {
-            RunError::Runtime(format!("commit isolated delete transaction: {err}"))
-        })?;
     }
 
     Ok(TimingTotals {
@@ -708,27 +750,55 @@ fn run_sqlite_isolated_benchmark(
             .map_err(|err| {
                 RunError::Runtime(format!("prepare C SQLite delete statement: {err}"))
             })?;
-        conn.execute_batch("BEGIN").map_err(|err| {
-            RunError::Runtime(format!("begin C SQLite isolated delete transaction: {err}"))
-        })?;
-        let t0 = Instant::now();
-        for iter in 0..args.iters {
-            for i in 0..delete_count {
-                let id = isolated_delete_id(iter, i, delete_count)?;
-                delete
-                    .execute(rusqlite::params![id])
-                    .map_err(|err| RunError::Runtime(format!("delete C SQLite row {id}: {err}")))?;
+        if args.profile_mode == ProfileMode::RollbackIsolated {
+            for iter in 0..args.iters {
+                conn.execute_batch("BEGIN").map_err(|err| {
+                    RunError::Runtime(format!(
+                        "begin C SQLite rollback-isolated delete transaction {iter}: {err}"
+                    ))
+                })?;
+                let t0 = Instant::now();
+                for i in 0..delete_count {
+                    let id = i64::try_from(i).map_err(|_| {
+                        RunError::Usage("delete_count index overflowed i64".to_string())
+                    })? * 20;
+                    delete.execute(rusqlite::params![id]).map_err(|err| {
+                        RunError::Runtime(format!("delete C SQLite row {id}: {err}"))
+                    })?;
+                }
+                total_delete_ns += t0.elapsed().as_nanos();
+                conn.execute_batch("ROLLBACK").map_err(|err| {
+                    RunError::Runtime(format!(
+                        "rollback C SQLite rollback-isolated delete transaction {iter}: {err}"
+                    ))
+                })?;
+                if iter == 0 {
+                    eprintln!("  (first rollback-isolated sqlite delete iter complete)");
+                }
             }
-            if iter == 0 {
-                eprintln!("  (first isolated sqlite delete iter complete)");
+        } else {
+            conn.execute_batch("BEGIN").map_err(|err| {
+                RunError::Runtime(format!("begin C SQLite isolated delete transaction: {err}"))
+            })?;
+            let t0 = Instant::now();
+            for iter in 0..args.iters {
+                for i in 0..delete_count {
+                    let id = isolated_delete_id(iter, i, delete_count)?;
+                    delete.execute(rusqlite::params![id]).map_err(|err| {
+                        RunError::Runtime(format!("delete C SQLite row {id}: {err}"))
+                    })?;
+                }
+                if iter == 0 {
+                    eprintln!("  (first isolated sqlite delete iter complete)");
+                }
             }
+            total_delete_ns = t0.elapsed().as_nanos();
+            conn.execute_batch("COMMIT").map_err(|err| {
+                RunError::Runtime(format!(
+                    "commit C SQLite isolated delete transaction: {err}"
+                ))
+            })?;
         }
-        total_delete_ns = t0.elapsed().as_nanos();
-        conn.execute_batch("COMMIT").map_err(|err| {
-            RunError::Runtime(format!(
-                "commit C SQLite isolated delete transaction: {err}"
-            ))
-        })?;
     }
 
     Ok(TimingTotals {
@@ -898,6 +968,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_accepts_rollback_isolated_mode() {
+        assert_eq!(
+            parse_args([
+                "5".to_string(),
+                "3".to_string(),
+                "delete".to_string(),
+                "fsqlite".to_string(),
+                "rollback-isolated".to_string(),
+            ])
+            .unwrap(),
+            BenchArgs {
+                rows: 5,
+                iters: 3,
+                workload: WorkloadKind::Delete,
+                engine: EngineKind::Fsqlite,
+                profile_mode: ProfileMode::RollbackIsolated,
+            }
+        );
+    }
+
+    #[test]
     fn parse_args_rejects_invalid_engine() {
         let err = parse_args([
             "100".to_string(),
@@ -926,7 +1017,10 @@ mod tests {
         .expect_err("invalid profile mode should fail");
         assert_eq!(
             err,
-            RunError::Usage("invalid mode 'bogus'; expected standard or isolated".to_string())
+            RunError::Usage(
+                "invalid mode 'bogus'; expected standard, isolated, or rollback-isolated"
+                    .to_string()
+            )
         );
     }
 
@@ -961,5 +1055,17 @@ mod tests {
             profile_mode: ProfileMode::Standard,
         };
         run_benchmark(&args).expect("small smoke workload should succeed");
+    }
+
+    #[test]
+    fn run_benchmark_smoke_rollback_isolated_delete() {
+        let args = BenchArgs {
+            rows: 20,
+            iters: 2,
+            workload: WorkloadKind::Delete,
+            engine: EngineKind::Compare,
+            profile_mode: ProfileMode::RollbackIsolated,
+        };
+        run_benchmark(&args).expect("rollback-isolated delete workload should succeed");
     }
 }

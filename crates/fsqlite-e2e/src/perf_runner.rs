@@ -373,6 +373,8 @@ pub struct HotPathConnectionCeremonyProfile {
     pub commit_refresh_count: u64,
     pub memdb_refresh_count: u64,
     pub execute_body_time_ns: u64,
+    pub direct_write_flush_calls: u64,
+    pub direct_write_flush_time_ns: u64,
     pub commit_pre_txn_time_ns: u64,
     pub commit_txn_roundtrip_time_ns: u64,
     pub commit_finalize_seq_time_ns: u64,
@@ -1293,6 +1295,8 @@ fn build_hot_path_profile_report(
         commit_refresh_count: snapshot.commit_refresh_count,
         memdb_refresh_count: snapshot.memdb_refresh_count,
         execute_body_time_ns: snapshot.execute_body_time_ns,
+        direct_write_flush_calls: snapshot.direct_write_flush_calls,
+        direct_write_flush_time_ns: snapshot.direct_write_flush_time_ns,
         commit_pre_txn_time_ns: snapshot.commit_pre_txn_time_ns,
         commit_txn_roundtrip_time_ns: snapshot.commit_txn_roundtrip_time_ns,
         commit_finalize_seq_time_ns: snapshot.commit_finalize_seq_time_ns,
@@ -1804,6 +1808,12 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
         report
             .connection_ceremony
             .fallback_to_general_allocator_count
+    );
+    let _ = writeln!(
+        out,
+        "- Direct write flush calls/time_ns: {}/{}",
+        report.connection_ceremony.direct_write_flush_calls,
+        report.connection_ceremony.direct_write_flush_time_ns
     );
     let _ = writeln!(
         out,
@@ -4912,12 +4922,15 @@ mod tests {
             commit_refresh_count: 1,
             memdb_refresh_count: 1,
             execute_body_time_ns: 4_400,
+            direct_write_flush_calls: 2,
+            direct_write_flush_time_ns: 4_800,
             commit_pre_txn_time_ns: 5_500,
             commit_txn_roundtrip_time_ns: 6_600,
             commit_finalize_seq_time_ns: 700,
             commit_handle_finalize_time_ns: 800,
             commit_post_write_maintenance_time_ns: 900,
             finalize_post_publish_time_ns: 1_250,
+            pager_commit: fsqlite_pager::PagerCommitProfileSnapshot::default(),
             cached_write_txn_reuses: 1,
             cached_write_txn_parks: 1,
             retained_autocommit_reuses: 0,
@@ -4952,6 +4965,23 @@ mod tests {
             prepared_direct_insert_executions: 0,
             prepared_direct_update_executions: 0,
             prepared_direct_delete_executions: 0,
+            prepared_direct_delete_leaf_run_start_attempts: 0,
+            prepared_direct_delete_leaf_run_start_hits: 0,
+            prepared_direct_delete_leaf_run_start_time_ns: 0,
+            prepared_direct_delete_leaf_run_active_attempts: 0,
+            prepared_direct_delete_leaf_run_active_hits: 0,
+            prepared_direct_delete_leaf_run_active_misses: 0,
+            prepared_direct_delete_leaf_run_active_miss_shape_mismatches: 0,
+            prepared_direct_delete_leaf_run_active_miss_rowid_not_in_leaf: 0,
+            prepared_direct_delete_leaf_run_active_miss_already_deleted: 0,
+            prepared_direct_delete_leaf_run_active_miss_nonroot_would_empty_leaf: 0,
+            prepared_direct_delete_leaf_run_active_miss_nonroot_last_cell: 0,
+            prepared_direct_delete_leaf_run_active_miss_noncompact_cell_area: 0,
+            prepared_direct_delete_leaf_run_active_miss_cell_shape_or_overflow: 0,
+            prepared_direct_delete_leaf_run_active_time_ns: 0,
+            prepared_direct_delete_leaf_run_flushes: 0,
+            prepared_direct_delete_leaf_run_dirty_flushes: 0,
+            prepared_direct_delete_leaf_run_flush_time_ns: 0,
             prepared_direct_insert_row_build_time_ns: 0,
             prepared_direct_insert_cursor_setup_time_ns: 0,
             prepared_direct_insert_serialize_time_ns: 0,
@@ -4962,6 +4992,16 @@ mod tests {
             prepared_direct_insert_change_tracking_time_ns: 0,
             prepared_direct_insert_autocommit_resolve_time_ns: 0,
             prepared_direct_insert_autocommit_executions: 0,
+            prepared_direct_insert_page_run_flushes: 0,
+            prepared_direct_insert_page_run_records: 0,
+            prepared_direct_insert_page_run_bytes: 0,
+            prepared_direct_insert_page_run_owned_flushes: 0,
+            prepared_direct_insert_page_run_arena_flushes: 0,
+            prepared_direct_insert_page_run_repeated_flushes: 0,
+            prepared_direct_insert_page_run_empty_root_bulk_load_hits: 0,
+            prepared_direct_insert_page_run_depth2_bulk_append_hits: 0,
+            prepared_direct_insert_page_run_row_append_fallback_flushes: 0,
+            prepared_direct_insert_page_run_row_append_fallback_rows: 0,
             arena_alloc_bytes: 2_048,
             arena_reset_count: 3,
             fallback_to_general_allocator_count: 1,
@@ -5480,6 +5520,8 @@ mod tests {
         assert_eq!(report.connection_ceremony.prepared_lookup_time_ns, 1_100);
         assert_eq!(report.connection_ceremony.begin_setup_time_ns, 3_300);
         assert_eq!(report.connection_ceremony.execute_body_time_ns, 4_400);
+        assert_eq!(report.connection_ceremony.direct_write_flush_calls, 2);
+        assert_eq!(report.connection_ceremony.direct_write_flush_time_ns, 4_800);
         assert_eq!(report.connection_ceremony.commit_pre_txn_time_ns, 5_500);
         assert_eq!(
             report.connection_ceremony.commit_txn_roundtrip_time_ns,

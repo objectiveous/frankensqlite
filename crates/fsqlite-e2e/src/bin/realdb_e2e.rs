@@ -8220,6 +8220,8 @@ mod tests {
                 commit_refresh_count: 0,
                 memdb_refresh_count: 0,
                 execute_body_time_ns: 0,
+                direct_write_flush_calls: 0,
+                direct_write_flush_time_ns: 0,
                 commit_pre_txn_time_ns: 0,
                 commit_txn_roundtrip_time_ns: 0,
                 commit_finalize_seq_time_ns: 0,

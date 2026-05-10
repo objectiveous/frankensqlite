@@ -12,6 +12,1614 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-10 - File-backed concurrent INSERT page-run screen
+
+- Target: remaining low-writer concurrent rows in
+  `comprehensive-bench --quick --filter concurrent`, especially the
+  `2 writers x 1000 rows` and `4 writers x 1000 rows` shared-table cases.
+- Touched during measurement:
+  `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`. The retained change is
+  profiling-only: `FSQLITE_BENCH_PROFILE_CONCURRENT=1` now emits existing
+  direct-INSERT, pager, WAL, page-data, and MVCC retry counters for the
+  FSQLite concurrent arm.
+- Evidence artifacts:
+  fresh unprofiled concurrent baseline
+  `tests/artifacts/perf/codex-fresh-frontier-concurrent-profile-20260510T093306Z/concurrent.json`
+  and profiled counter run
+  `tests/artifacts/perf/codex-concurrent-profile-hook-20260510T1140Z/`.
+- Result: rejected as an immediate standalone source-code optimization. The
+  profiled run showed the benchmark stays on the prepared direct-INSERT fast
+  lane (`fast == direct_insert`, `slow == 0`) but file-backed concurrent INSERT
+  does not use the pending page-run path at all (`page_run_flushes=0` for 2/4/8
+  writers). The visible concurrent cost is page-lock wait plus transaction
+  retry/stale-snapshot churn (`mvcc_stale_snapshot` `12`, `72`, `318` for
+  2/4/8 writers), while direct page-run/preserialize microfamilies already have
+  adjacent full-quick rejections below. A file-backed concurrent page-run patch
+  would require a broader fused record/page builder plus correctness around
+  MemDatabase mirror admission, savepoints, and MVCC page-lock semantics; it is
+  not a safe one-lever follow-up from this profile.
+- Do not retry standalone file-backed concurrent page-run admission,
+  preserialized-record widening, or wait-slice tuning from this artifact.
+  Reconsider only with a design that batches page construction and MVCC page
+  publication together, has explicit correctness coverage for file-backed
+  `BEGIN CONCURRENT`, and wins the same-window focused concurrent rows plus the
+  full quick primary score.
+
+## 2026-05-10 - Single-connection cache batch insertion
+
+- Target: reduce the residual `pager_cache_finish_ns` component in focused
+  `UPDATE/DELETEThroughput` by holding the single-connection fast-array cache
+  lock once while draining committed staged pages, instead of calling
+  `ShardedPageCache::insert_buffer` once per page.
+- Touched during rejected candidate:
+  `crates/fsqlite-pager/src/page_cache.rs` and
+  `crates/fsqlite-pager/src/pager.rs`. The candidate added
+  `ShardedPageCache::insert_buffers`, routed
+  `drain_committed_cache_pages_into_cache` through it, and added focused
+  sharded/fast-path insert-buffer tests. The source patch was manually unwound
+  after the focused DML gate failed.
+- Correctness/build proof before rejection:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-cache-batch-local CARGO_BUILD_JOBS=4 cargo check -p fsqlite-pager --lib`
+  passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-cache-batch-local CARGO_BUILD_JOBS=4 cargo test -p fsqlite-pager insert_buffers -- --nocapture`
+  passed the two targeted batch-insert tests.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-cache-batch-dml-20260510T0935Z/`.
+  Compare against the retained direct-drain focused DML baseline
+  `tests/artifacts/perf/codex-pager-cache-direct-drain-final-dml-20260510T051340Z/update-delete.json`.
+- Result: rejected. The focused DML primary/geomean score worsened
+  `1.4857400131 -> 1.5283983683`, average ratio worsened
+  `1.6836746246 -> 1.7441854832`, and both DELETE mid/large rows regressed
+  (`delete 50/1000` F median `0.032632ms -> 0.033212ms`,
+  `delete 500/10000` `0.308757ms -> 0.322854ms`).
+- Do not retry a standalone fast-array batch insertion wrapper for committed
+  cache publication. Reconsider cache-publication batching only if it is paired
+  with a broader write-set/page-buffer ownership change and wins the
+  same-window focused DML geomean and DELETE rows.
+
+## 2026-05-10 - Page-cache insert clean-mark elision
+
+- Target: reduce the residual `pager_cache_finish_ns` component in focused
+  `UPDATE/DELETEThroughput` by avoiding the second lookup/lock in
+  `ShardedPageCache::insert_buffer` after a freshly inserted
+  `CachedPageEntry` is already clean.
+- Touched during rejected candidate:
+  `crates/fsqlite-pager/src/page_cache.rs`. The candidate removed both
+  `mark_page_clean` calls from `insert_buffer` and deleted the now-dead helper.
+  The source patch was manually unwound after the focused DML gate failed.
+- Correctness/build proof before rejection:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-cache-cleanmark-local CARGO_BUILD_JOBS=4 cargo check -p fsqlite-pager --lib`
+  passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-cache-cleanmark-local CARGO_BUILD_JOBS=4 cargo test -p fsqlite-pager insert_buffer -- --nocapture`
+  passed the two targeted insert-buffer tests.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-cache-cleanmark-dml-20260510T0920Z/`.
+  Compare against the retained direct-drain focused DML baseline
+  `tests/artifacts/perf/codex-pager-cache-direct-drain-final-dml-20260510T051340Z/update-delete.json`.
+- Result: rejected. The focused DML primary/geomean score worsened
+  `1.4857400131 -> 1.5319671638`, average ratio worsened
+  `1.6836746246 -> 1.7432908726`, and the 1k UPDATE/DELETE rows regressed
+  enough to fail the keep gate. The candidate trimmed some absolute FSQLite
+  medians, but not coherently across the benchmark-shaped rows.
+- Do not retry `insert_buffer` clean-mark elision as a standalone
+  `UPDATE/DELETEThroughput` optimization. Reconsider only as part of a broader
+  cache-publication rewrite that wins the same-window focused DML geomean and
+  does not regress the mid-size rows.
+
+## 2026-05-10 - Memory VFS write-page-batch no-allocation screen
+
+- Target: reduce the remaining `pager_mem_flush_ns` component in focused
+  `UPDATE/DELETEThroughput` by removing the temporary `Vec` allocation inside
+  `MemoryFile::write_page_batch` for multi-page memory commits.
+- Touched during measurement: `crates/fsqlite-vfs/src/memory.rs`. The candidate
+  used a two-pass validate/copy loop and was reverted after measurement.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-vfs-write-batch-noalloc-dml-20260510T055138Z/`.
+- Result: rejected. The focused UPDATE/DELETE gate worsened versus the retained
+  direct-drain baseline (`geomean 1.4857400131 -> 1.5196882354`, weighted score
+  same as geomean for this slice). The largest-row UPDATE median improved, but
+  the small/mid rows and delete rows did not, so it is not a keeper.
+- Do not retry the same temporary-`Vec` removal in `MemoryFile::write_page_batch`
+  as a standalone DML-tail optimization. Reconsider only if a same-window
+  profile proves allocator traffic in this exact helper dominates after the
+  memory flush and cache insertion costs have been reduced elsewhere.
+
+## 2026-05-10 - Pager commit subphase tiny-field screen
+
+- Target: explain the remaining explicit-transaction `UPDATE/DELETEThroughput`
+  commit envelope after parser/background attribution showed the cost had moved
+  into pager transaction roundtrip.
+- Touched during measurement:
+  `crates/fsqlite-pager/src/pager.rs`,
+  `crates/fsqlite-pager/src/lib.rs`,
+  `crates/fsqlite-core/src/connection.rs`,
+  `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`,
+  `crates/fsqlite-e2e/src/perf_runner.rs`, and `README.md`. The retained
+  engine change is narrow: isolated single-connection metadata-only commits
+  drain staged pages directly into the shared cache instead of first allocating
+  a temporary vector and rechecking `inner.commit_seq`.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-pager-commit-attribution-20260510T045124Z/`
+  (old guarded drain, focused DML attribution),
+  `tests/artifacts/perf/codex-pager-cache-direct-drain-20260510T045624Z/`
+  (direct-drain focused DML),
+  `tests/artifacts/perf/codex-pager-cache-direct-drain-final-dml-20260510T051340Z/`
+  (final direct-drain focused DML),
+  `tests/artifacts/perf/codex-pager-cache-direct-drain-full-quick-20260510T050213Z/`
+  (direct-drain full quick), and
+  `tests/artifacts/perf/codex-pager-cache-old-drain-full-quick-20260510T050700Z/`
+  (old guarded drain isolation with the same profiling counters).
+- Result: rejected file-size, unlock, publish, and metadata-only publication
+  micro-trimming as standalone DML-tail work. In the focused DML profile, those
+  subfields were tiny (`pager_file_size_ns` about `30ns`-`40ns`,
+  `pager_unlock_ns` about `20ns`-`30ns`, and `pager_publish_ns` about
+  `70ns`-`130ns`). The meaningful pager fields were
+  `pager_mem_flush_ns` and `pager_cache_finish_ns`; the direct-drain branch
+  trimmed the cache-finish side and improved the same-counter full quick score
+  versus the old guarded drain (`0.3990393243 -> 0.3754119178`), but the
+  remaining tail still sits in memory-page flush plus bulk cache insertion.
+- Do not spend another standalone pass on `db_file.file_size()`, unlock,
+  metadata-only publish, or parser/background wrappers for this DML tail. The
+  next credible attempt needs to reduce `pager_mem_flush_ns` or the residual
+  cache insertion cost while protecting the full quick weighted score and
+  write-single geomean in a same-window A/B.
+
+## 2026-05-10 - DML commit-envelope parser/background attribution
+
+- Target: explain the remaining `UPDATE/DELETEThroughput` explicit-transaction
+  `COMMIT` wall-time gap after the tiny DELETE mutation loop itself measured at
+  parity in rollback-isolated mode.
+- Touched during measurement:
+  `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs` only. The retained
+  change is profiling-only: it prints existing parser, background-status,
+  pager-publication, final-post-publish, and prepared-lookup counters in the
+  DML/INSERT profile lines. No engine behavior changed.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-commit-envelope-attribution-20260510T0520Z/`.
+- Result: rejected parser/background wrapper work as the next standalone DML
+  lever. The fresh 100-row DELETE profile showed `commit_us=7.3`,
+  `direct_flush_ns=2394`, `commit_roundtrip_ns=1203`,
+  `commit_finalize_ns=491`, `commit_handle_ns=681`,
+  `finalize_post_ns=821`, while parser/background attribution was small:
+  `parser_parse_ns=0`, `parser_rewrite_ns=261`, `bg_ns=262`, and
+  `prepared_lookup_ns=1703` across the whole profiled begin/prepare/mutate/commit
+  window. The larger 10k-row UPDATE/DELETE profiles showed background-status
+  cost scaling with prepared statement count (`~27ns/check`) but the dominant
+  commit-side term moved to pager transaction roundtrip
+  (`commit_roundtrip_ns` about `23.6us`-`29.1us`), not SQL parsing.
+- Do not retry exact transaction-control parser bypass, background-status
+  wrapper trimming, or prepared-lookup-only trimming as standalone fixes for
+  the current DML tail. Reconsider only with a same-window profile showing
+  those fields dominate after pager commit roundtrip and direct-run flush have
+  already been reduced, and require a focused UPDATE/DELETE gate plus full quick
+  primary-score protection.
+
+## 2026-05-10 - Direct DELETE parent-separator admission as next DML lever
+
+- Target: `UPDATE/DELETEThroughput` explicit-transaction DELETE rows after the
+  retained same-leaf delete run still flushed once per leaf and fell back at
+  active-run boundaries.
+- Touched during measurement:
+  `crates/fsqlite-btree/src/cursor.rs`,
+  `crates/fsqlite-core/src/connection.rs`,
+  `crates/fsqlite-e2e/src/perf_runner.rs`, and
+  `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`. The retained change is
+  profiling-only: it classifies active same-leaf direct DELETE run misses under
+  the existing hot-path profile flag.
+- Candidate shape screened: admit non-root leaf maximum deletes into
+  `TableLeafDeleteRun` by adding parent separator repair, instead of flushing
+  and falling back to the ordinary cursor delete path for those rows.
+- Correctness/build proof for the profiling surface:
+  `git diff --check` passed, scoped
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-direct-flush-local-test CARGO_BUILD_JOBS=4 cargo check -p fsqlite-core -p fsqlite-e2e --all-targets`
+  passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-direct-flush-release-perf CARGO_BUILD_JOBS=4 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-delete-miss-reasons-20260510T0241Z/` and
+  `tests/artifacts/perf/codex-delete-miss-reasons-profiled-20260510T0242Z/`.
+- Result: rejected as the next standalone optimization target. The profiled
+  10k-row DELETE case had 63 active misses, but only 3 were
+  `delete_leaf_miss_last_cell`; 60 were `delete_leaf_miss_out_of_leaf`. The
+  100k-row DELETE case had 678 active misses, but only 6 were last-cell misses
+  and 672 were out-of-leaf misses. Parent-separator admission would therefore
+  remove only a tiny minority of active misses while adding a broad B-tree
+  correctness surface.
+- Do not implement non-root last-cell/parent-separator repair for
+  `TableLeafDeleteRun` as a standalone perf tweak. Reconsider only if a future
+  workload shows last-cell misses dominating the active-miss split and the
+  candidate also reduces dirty leaf-run flush count or flush time in a
+  same-window focused UPDATE/DELETE matrix.
+
+## 2026-05-10 - Current frontier no-standalone-lever screen
+
+- Target: choose the next optimization after the retained
+  quotient-filter-dormant guard and same-leaf direct DELETE run, using a fresh
+  release-perf binary instead of stale retained artifacts.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-full-quick-refresh-20260510T041901Z/`,
+  `tests/artifacts/perf/codex-current-dml-tail-profile-20260510T041650Z/`,
+  `tests/artifacts/perf/codex-current-delete-isolation-20260510T041932Z/`,
+  and
+  `tests/artifacts/perf/codex-current-insert-profile-20260510T042005Z/`.
+- Result: rejected as a source-code change pass. The fresh full quick matrix
+  reported `80 / 2 / 11` faster/comparable/C-faster, primary weighted score
+  `0.3729250724`, and kept the worst row in corrected prepared-DML DELETE:
+  `100 rows / delete 5 rows` at `3.4816x` F/C. The focused DML profile showed
+  the 100-row DELETE path already using the direct fast lane and a single
+  retained same-leaf run flush (`direct_delete=5`, `delete_leaf_start=1/1`,
+  `delete_leaf_active=4/4`, `delete_leaf_flush=1/1`), with no active-run
+  misses. The rollback-isolated comparison then showed the tiny mutation loop
+  itself at parity: FSQLite `260ns/delete` versus C SQLite `269ns/delete`.
+  The remaining small-row gap is fixed transaction/write-publication ceremony,
+  whose exact transaction-control and wrapper-only flush variants are already
+  rejected above.
+- The top non-DML loser, large-record single-transaction INSERT, still points at
+  row construction plus owned page-run publication (`row_build_ns` about
+  `3.86ms`, `direct_flush_ns` about `2.73ms`, one owned page-run flush for
+  `large_10col` 10K). Those standalone families are already covered by the
+  owned page-run clone/borrow and concat/direct-serializer rejects. Do not start
+  another standalone small-DELETE transaction-control tweak or large-INSERT
+  owned-page-run/concat serializer tweak from these artifacts. The next viable
+  pass needs a broader design that protects the full quick primary score and
+  the write-single/concurrent-writer rows in the same measurement window.
+- Legacy SQLite comparison checked in `legacy_sqlite_code/sqlite/src/btree.c`
+  and `legacy_sqlite_code/sqlite/src/pager.c`: `dropCell()` removes the cell
+  pointer and returns deleted bytes to page free space, matching the already
+  rejected freeblock-materializer family; `sqlite3BtreeDelete()` avoids
+  balancing when remaining page free space is below the two-thirds threshold,
+  matching the retained conservative same-leaf gates; and
+  `sqlite3PagerCommitPhaseOne/Two()` have dirty/no-op and WAL dirty-list gates.
+  The current FSQLite small-DELETE evidence points beyond these SQLite-local
+  primitives: the tiny mutation loop is already parity, while the standard
+  benchmark pays the concurrent MVCC publication/session envelope around each
+  explicit transaction.
+
+## 2026-05-10 - Direct write flush wrapper as DML bottleneck
+
+- Target: `UPDATE/DELETEThroughput` explicit-transaction DML rows after the
+  profile split showed `commit_us` contained pending direct-write flush work
+  that was not visible in `commit_pre_ns` / `commit_roundtrip_ns`.
+- Touched during measurement:
+  `crates/fsqlite-core/src/connection.rs`,
+  `crates/fsqlite-e2e/src/perf_runner.rs`,
+  `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`, and
+  `crates/fsqlite-e2e/src/bin/realdb_e2e.rs`. The retained change is
+  profiling-only: it adds `direct_flush_calls` / `direct_flush_ns` counters
+  behind the existing hot-path profile flag.
+- Candidate shape screened: optimize the `flush_pending_direct_write_runs`
+  wrapper or its explicit-COMMIT boundary as the next DELETE gap lever.
+- Correctness/build proof for the profiling surface:
+  `cargo fmt --check`, `git diff --check`, scoped
+  `cargo check -p fsqlite-core -p fsqlite-e2e --all-targets` reached
+  `Finished`, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-direct-flush-local-test CARGO_BUILD_JOBS=4 cargo test -p fsqlite-e2e hot_path_profile_smoke_writes_artifacts -- --nocapture`
+  passed.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-direct-flush-profile-fresh-20260510T0222Z/`.
+- Result: rejected as the next optimization target. The fresh DML profile
+  reported `direct_flush_ns` around `2.3us` for `delete 5/100`, `1.8us` for
+  `delete 50/1000`, and `1.6us` for `delete 500/10000`. The same rows still
+  show `delete_leaf_flush_ns` around `2.0us`, `13.3us`, and `107.7us`
+  respectively, with the large row paying 64 dirty leaf-run flushes. This means
+  the large DELETE tail is in per-leaf retained-run publication/materialization,
+  not the top-level direct-write flush wrapper.
+- Do not retry wrapper-only direct-write flush gating or commit-boundary timing
+  cleanup as a standalone optimization. Reconsider only if a fresh profile shows
+  `direct_flush_ns` itself dominating while `delete_leaf_flush_ns` is flat, and
+  require a same-window focused UPDATE/DELETE gate before a full matrix.
+
+## 2026-05-10 - Direct DELETE forced VDBE fallback screen
+
+- Target: remaining `UPDATE/DELETEThroughput` direct-simple DELETE gap after
+  the same-leaf direct DELETE run and rollback-isolated timing harness showed
+  the direct path still around `1.3x-1.5x` slower than C SQLite on isolated
+  DELETE loops.
+- Touched during rejected candidate:
+  `crates/fsqlite-e2e/src/bin/perf_update_delete.rs` only. A benchmark-only
+  `FSQLITE_BENCH_FUSED_FALLBACK=1` toggle was added to apply
+  `PRAGMA fsqlite.fused_entry_mode = forced_fallback;` for measurement. No
+  engine behavior was changed.
+- Candidate shape: test whether the conservative reusable VDBE table-program
+  lane, with its existing RowSet/cursor-adjacent machinery, is a plausible
+  replacement for the direct-simple DELETE lane on monotone rowid DELETE loops.
+- Correctness/build proof before rejection:
+  `cargo fmt --check -p fsqlite-e2e`,
+  `cargo test -p fsqlite-e2e --bin perf-update-delete -- --nocapture`, and
+  `env CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-proceed-perf-20260509 cargo build --profile release-perf -p fsqlite-e2e --bin perf-update-delete`
+  passed.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-dml-fused-fallback-screen-20260510T0025Z/summary.md`.
+- Result: rejected. Same-window isolated 1000-row DELETE showed the direct
+  path at FSQLite `369ns/delete` versus C SQLite `281ns/delete` (`1.31x`),
+  while forced fallback measured FSQLite `119194ns/delete` versus C SQLite
+  `280ns/delete` (`426.17x`). A larger forced-fallback probe
+  (`10000 200 delete compare isolated`) was stopped after more than five
+  minutes because it was already orders of magnitude slower than the direct
+  path and had not reached the C SQLite half of the comparison.
+- Do not retry routing direct-simple DELETE through forced VDBE fallback as a
+  standalone optimization. Reconsider VDBE only if a prepared-program design
+  explicitly enables safe retained storage cursors and proves same-window
+  `UPDATE/DELETEThroughput` improvements; otherwise the remaining gap needs a
+  better direct/bulk mutation primitive.
+
+## 2026-05-09 - Pending direct DELETE freeblock-run materializer
+
+- Target: same-leaf pending direct `DELETE FROM bench WHERE id = ?1`
+  materialization in `TableLeafDeleteRun`, after C SQLite comparison showed
+  `dropCell()` removes the cell pointer and returns the deleted byte span to
+  page free space instead of eagerly moving surviving cell bodies.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`; the source patch was backed out after
+  the focused UPDATE/DELETE gate failed. The candidate left the ordinary cursor
+  delete path unchanged.
+- Candidate shape: add a delete-run materializer that derived compact-page cell
+  extents, removed deleted cell pointers, and wrote SQLite-format freeblock
+  chain entries for the deleted byte ranges, falling back to the retained eager
+  defrag path only when the free-space representation could not be encoded.
+- Correctness/build proof before rejection:
+  `cargo fmt -p fsqlite-btree --check`,
+  `git diff --check -- crates/fsqlite-btree/src/cursor.rs`,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-freeblock-run-test CARGO_BUILD_JOBS=4 cargo test -p fsqlite-btree test_table_leaf_delete_run -- --nocapture --test-threads=1`,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-freeblock-run-test CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core test_prepared_direct_delete_leaf_run -- --nocapture --test-threads=1`,
+  and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-freeblock-run-perf CARGO_BUILD_JOBS=4 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-delete-freeblock-run-20260509T234725Z/update-delete-baseline.json`
+  and
+  `tests/artifacts/perf/codex-delete-freeblock-run-20260509T234725Z/update-delete-candidate.json`.
+- Result: rejected. The focused UPDATE/DELETE geomean regressed
+  `1.3246056716 -> 1.5803811517`, average ratio regressed
+  `1.4480294575 -> 1.7151476405`, and faster/comparable/C-faster moved
+  `2/0/4 -> 1/0/5`. Every FSQLite absolute median worsened, including
+  `delete 5/100` `0.008186ms -> 0.009148ms`, `delete 50/1000`
+  `0.033092ms -> 0.040997ms`, and `delete 500/10000`
+  `0.313687ms -> 0.328856ms`.
+- Do not retry a pending direct DELETE freeblock-chain materializer as a
+  standalone replacement for eager delete-run defrag. Reconsider only if it is
+  paired with a faster freeblock allocator/restore path and the same-window
+  focused UPDATE/DELETE gate improves absolute FSQLite medians before any full
+  matrix run.
+
+## 2026-05-09 - Pager rolled-back-pages empty guard in get_page
+
+- Target: `TransactionKind::get_page` self-time in the isolated DELETE profile
+  after retained freed-page bounds still left pager reads as the dominant
+  sample.
+- Touched during rejected candidate:
+  `crates/fsqlite-pager/src/pager.rs`; the source patch was backed out after
+  the focused UPDATE/DELETE gate failed.
+- Candidate shape: guard the normal no-savepoint path with
+  `!rolled_back_pages.is_empty()` before calling
+  `rolled_back_pages.contains(&page_no)` in `SimpleTransaction::get_page`, so
+  ordinary transactions skip an empty `HashSet` lookup.
+- Correctness/build proof before rejection:
+  `cargo fmt --check`,
+  `git diff --check -- crates/fsqlite-pager/src/pager.rs`,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-proceed-check-target CARGO_BUILD_JOBS=4 cargo test -p fsqlite-pager freed_pages -- --nocapture --test-threads=1`,
+  and
+  `env CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-proceed-perf-20260509 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete`
+  passed.
+- Evidence artifacts:
+  current clean full-quick baseline
+  `tests/artifacts/perf/codex-clean-frontier-after-reject-20260509T225650Z/full-quick.json`;
+  candidate focused gate
+  `tests/artifacts/perf/codex-rolledback-pages-guard-20260509T2326Z/update-delete.json`.
+- Result: rejected. The candidate focused UPDATE/DELETE geomean landed at
+  `1.3677085347`, worse than the current clean full-quick UPDATE/DELETE rows'
+  `1.3520410742` derived from the same section. The average ratio was
+  effectively flat-to-worse (`1.4946142316 -> 1.4960963367`), and the
+  mid/large DELETE rows regressed (`delete 50/1000` `1.9101 -> 1.9560`,
+  `delete 500/10000` `1.8293 -> 1.9062`) despite small DELETE and small UPDATE
+  improving.
+- Do not retry an empty-`rolled_back_pages` guard in `get_page` as a standalone
+  pager optimization. Reconsider only if a profile isolates savepoint rollback
+  checks as retained self-time and a same-window full quick matrix improves the
+  primary score and all DELETE medians.
+
+## 2026-05-09 - Explicit write-commit duplicate lookaside reset removal
+
+- Target: fixed explicit-transaction commit cleanup in
+  `UPDATE/DELETEThroughput`, especially tiny direct DML rows where commit
+  ceremony is a material part of the measured envelope.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`; the source patch was backed out
+  after the full quick gate failed.
+- Candidate shape: remove the `reset_statement_lookaside()` call from
+  `clear_compilation_reuse_caches_after_write_commit()`, relying on the
+  immediately preceding explicit-commit `reset_transaction_lookaside()` to keep
+  the transaction-boundary scratch reset. This avoided the duplicate scratch
+  reset while preserving selective prepared-cache pruning after write commit.
+- Correctness/build proof before rejection:
+  `cargo fmt --check`,
+  `git diff --check -- crates/fsqlite-core/src/connection.rs`,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-proceed-check-target CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core test_prepared_direct_delete_leaf_run -- --nocapture --test-threads=1`,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-proceed-check-target CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core prepared_cache -- --nocapture --test-threads=1`,
+  and
+  `env CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-proceed-perf-20260509 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete`
+  passed.
+- Evidence artifacts:
+  baseline
+  `tests/artifacts/perf/codex-clean-frontier-after-reject-20260509T225650Z/full-quick.json`;
+  focused candidate
+  `tests/artifacts/perf/codex-lookaside-reset-candidate-20260509T231408Z/update-delete.json`;
+  full candidate
+  `tests/artifacts/perf/codex-lookaside-reset-candidate-full-20260509T231432Z/full-quick.json`.
+- Result: rejected. The focused UPDATE/DELETE slice was mixed:
+  write-single geomean moved `1.4063296151 -> 1.4040904466`, but average ratio
+  worsened `1.5336310404 -> 1.5549082934` and the `100 rows / update 10 rows`
+  FSQLite median worsened from about `7.1 us` to `9.3 us`. The full quick keep
+  gate failed: primary score worsened `0.3741156645 -> 0.3766061739`, even
+  though average/geomean improved. The write-single geomean and median also
+  worsened (`1.1531661461 -> 1.2202915517`, median
+  `0.8882116725 -> 1.4049012023`).
+- Do not retry removing the post-write cache-prune lookaside reset as a
+  standalone cleanup. Reconsider only if commit cleanup profiling shows the
+  duplicate reset as retained self-time and a same-window full quick matrix
+  improves the primary weighted score without worsening write-single geomean.
+
+## 2026-05-09 - Owned-record direct INSERT page-run borrowed flush
+
+- Target: large-record explicit-transaction prepared direct INSERT page-run
+  commit tail, especially full-quick `large_10col` 10K single-transaction and
+  record-size rows.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`; the source patch was backed out
+  after the full quick gate failed twice.
+- Candidate shape: keep the existing eager `run.clone()` restore path for
+  `Arena` and `Repeated` direct-insert page runs, but flush
+  `PendingDirectInsertPageRunRecords::Owned` by borrowing the owned record
+  vector. On error, the original run could still be restored; on success, the
+  large record payload clone was avoided. This was a narrower variant of the
+  earlier all-page-run clone-removal attempt, intended to be small-row neutral.
+- Correctness/build proof before rejection:
+  `cargo fmt -p fsqlite-core --check`,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-proceed-check-target CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core prepared_direct_insert_page_run -- --nocapture --test-threads=1`,
+  and
+  `env CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-proceed-perf-20260509 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete`
+  passed.
+- Evidence artifacts:
+  baseline
+  `tests/artifacts/perf/codex-clean-frontier-full-quick-20260509T223339Z/full-quick.json`;
+  candidate
+  `tests/artifacts/perf/codex-owned-pagerun-candidate-20260509T224527Z/insert.json`,
+  `tests/artifacts/perf/codex-owned-pagerun-candidate-20260509T224527Z/full-quick.json`,
+  and
+  `tests/artifacts/perf/codex-owned-pagerun-candidate-20260509T224527Z/full-quick-repeat.json`.
+- Result: rejected. Focused INSERT looked tempting: score moved
+  `0.8254406137 -> 0.8235160020`, geomean `0.8316219057 -> 0.8092028159`,
+  and the full-quick repeat improved `large_10col` 10K FSQLite medians
+  (`11.417427 ms -> 9.497460 ms`; record-size
+  `11.370329 ms -> 9.509031 ms`). The actual full quick keep gate failed:
+  primary score worsened on both candidate runs (`0.3743690645 ->`
+  `0.3784084405`, repeat `0.3766553785`), with 2-writer concurrent and
+  write-single DELETE rows not protected.
+- Do not retry owned-record borrowed page-run flushing as a standalone direct
+  INSERT optimization. Reconsider only as part of a broader design that also
+  protects concurrent-writer and write-single rows in the same full-quick
+  window while preserving the large-record win.
+
+## 2026-05-09 - Retained leaf-run PageData move before publish
+
+- Target: same-leaf retained direct UPDATE/DELETE page publication in
+  `UPDATE/DELETEThroughput`, after current profiling still showed
+  `delete_leaf_flush_ns` near `106 us` on the `delete 500/10000` row.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`; the source patch was backed out after
+  the focused UPDATE/DELETE gate did not show a clean FSQLite median win.
+- Candidate shape: make the consumed retained leaf-run `into_page` helpers move
+  their owned `PageData` out of `StackEntry` instead of cloning it before
+  `write_page_data`. Because `StackEntry` implements `Drop` only to recycle
+  cell-pointer buffers, the candidate used a local tombstone replacement to
+  avoid unsafe code while preserving the existing publication path.
+- Correctness/build proof before benchmark rejection:
+  `cargo fmt -p fsqlite-btree --check`,
+  `git diff --check -- crates/fsqlite-btree/src/cursor.rs`,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-move-page-target CARGO_BUILD_JOBS=4 cargo test -p fsqlite-btree test_table_leaf_delete_run -- --nocapture`,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-move-page-target CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core test_prepared_direct_delete_leaf_run -- --nocapture --test-threads=1`,
+  and
+  `env CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-proceed-perf-20260509 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete`
+  passed. A separate fresh release target was intentionally killed after it
+  spent minutes in dependency LTO; the warmed target held the benchmark binary.
+- Evidence artifacts:
+  baseline
+  `tests/artifacts/perf/codex-next-dml-profile-20260509T220253Z/update-delete.json`
+  and candidate
+  `tests/artifacts/perf/codex-delete-move-page-candidate-20260509T222315Z/update-delete.json`
+  plus matching `.err` profile captures.
+- Result: rejected. The candidate did not reduce the direct DELETE flush timer:
+  the 500-delete profile moved from about `106210 ns` to `107749 ns`. FSQLite
+  absolute medians were mixed: `delete 500/10000` improved
+  `0.311845 ms -> 0.300012 ms`, but `delete 50/1000` worsened
+  `0.033353 ms -> 0.033764 ms` and `delete 5/100` worsened
+  `0.008406 ms -> 0.008786 ms`. The apparent section geomean improvement was
+  partly ratio noise from slower C SQLite update medians in the candidate run,
+  so this failed the keep gate.
+- Do not retry moving retained leaf-run `PageData` out of `StackEntry` as a
+  standalone optimization. Reconsider only with a design that avoids the
+  earlier `StackEntry`/`PageData` clone at run capture and improves FSQLite
+  absolute medians across all focused DELETE rows in the same measurement
+  window.
+
+## 2026-05-09 - Precompiled DML microbatch root-Cx reuse
+
+- Target: reduce repeated prepared DML overhead in explicit-transaction
+  microbatches by skipping the `Cx::with_decision_id(next_decision_id())`
+  allocation on `stmt_microbatch_try_carry` hits while preserving the
+  e-process oracle refresh sampling.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` in the main checkout; the source
+  patch was backed out after the full quick rerun failed the keep gate.
+- Candidate shape: split the oracle-refresh counter out of
+  `op_cx_after_background_status()` into a standalone helper, use the
+  connection root `Cx` for microbatch-carry hits, and keep normal per-operation
+  derived contexts for non-carry prepared DML executions.
+- Correctness/build proof before rejection:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-microcx-target CARGO_BUILD_JOBS=4 cargo fmt -p fsqlite-core --check`
+  passed; `git diff --check -- crates/fsqlite-core/src/connection.rs` passed;
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-microcx-target CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core test_prepared_direct_simple_insert_autocommit_profile_breakdown -- --nocapture --test-threads=1`
+  passed; `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-microcx-target CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core test_stmt_microbatch -- --nocapture --test-threads=1`
+  passed all three matching tests; and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-microcx-target CARGO_BUILD_JOBS=4 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-microcx-candidate-20260509T2236Z/insert-candidate.json`,
+  `full-candidate.json`, `full-candidate-rerun.json`,
+  `update-candidate-rerun.json`, and their `.err` files, compared against the
+  current local baseline
+  `tests/artifacts/perf/codex-current-full-local-20260509T2125Z/full-current.json`.
+- Result: rejected. The first full quick candidate improved the primary
+  weighted score from `0.3804304224` to `0.3767932670`, average/geomean from
+  `0.5019216092 / 0.2814659031` to `0.4905773988 / 0.2758344916`, and
+  C-faster count from `13` to `10`, but the second full quick pass failed to
+  hold the improvement: primary weighted score worsened to `0.3822950605`,
+  average rose to `0.5067401108`, and C-faster count returned to `13`. The
+  focused INSERT slice was also mixed: average improved from `0.867804999` to
+  `0.8627141181`, but geomean and median worsened slightly
+  (`0.837511825 / 0.791746967` to `0.8394949867 / 0.8108968947`).
+- Do not retry root-`Cx` reuse for microbatch hits as a standalone
+  optimization. Reconsider only if paired with a measured reduction in the DML
+  execution body that improves the full quick primary weighted score and the
+  focused INSERT geomean across two same-window full-matrix passes without
+  worsening the UPDATE/DELETE tail.
+
+## 2026-05-09 - Direct INSERT concat segment record serialization retest
+
+- Target: retest the 2026-05-08 rejected direct concat record-body encoder on
+  the current dirty tree after the quick `INSERTThroughput --filter insert`
+  profile again showed concat-heavy `medium_6col` and `large_10col`
+  `row_build_ns` as a tempting lead.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` in the main checkout; the source
+  patch was backed out after the local same-window INSERT gate rejected it.
+- Candidate shape: repeat the earlier `TextConcat` record-cell value idea:
+  compute concat payload length first, then write concat segments directly into
+  the record buffer during serialization, avoiding the previous scratch-`String`
+  assembly followed by a second copy into the record body.
+- Correctness/build proof before rejection:
+  `cargo fmt -p fsqlite-core --check` passed; `git diff --check -- crates/fsqlite-core/src/connection.rs`
+  passed; `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-concat-direct-target CARGO_BUILD_JOBS=4 cargo check -p fsqlite-core --lib`
+  reached remote `exit=0` with no warnings before the local `rch` wrapper hung
+  retrieving the target directory; and the local fallback
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-concat-direct-local-target CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core prepared_direct_simple_insert -- --nocapture --test-threads=1`
+  passed all 28 matching tests.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-concat-direct-20260509T2113Z/insert-baseline.json`,
+  `insert-baseline.err`, `insert-candidate.json`, and
+  `insert-candidate.err`. The baseline/candidate were both run locally with
+  `--json-stdout` because `rch` repeatedly completed the remote command but
+  failed to return cleanly while retrieving `.rch-target`.
+- Result: rejected. The focused INSERT matrix worsened
+  faster/comparable/C-faster from `17/2/6` to `15/1/9`,
+  average/geomean from `0.8331182229 / 0.8062419447` to
+  `0.9215687607 / 0.8811454643`, median from `0.7596678681` to
+  `0.8433300288`, and p90/p99 from `1.1589456765 / 1.2458787751` to
+  `1.3072544744 / 1.4157160050`. The target write-bulk category also worsened
+  average/geomean from `0.8307029362 / 0.8006648367` to
+  `0.9387164914 / 0.8935817935`. The single `large_10col` 10k row regressed
+  from `12.217 ms` to `13.141 ms`, and profile counters moved the wrong way:
+  `single_txn_large_10col_10000` `row_build_ns` increased from about `4.45 ms`
+  to `5.70 ms` and `record_size_large_10col_10000` increased from about
+  `4.95 ms` to `6.01 ms`.
+- This confirms the 2026-05-08 negative result. Do not retry
+  direct concat-segment-to-record serialization as a standalone optimization.
+  Reconsider only if a new design avoids both repeated expression evaluation
+  and the scratch copy while improving the focused INSERT write-bulk geomean and
+  the large-row `row_build_ns` counters in the same measurement window.
+
+## 2026-05-09 - Prepared statement one-entry front cache
+
+- Target: fixed `Connection::prepare()` overhead in benchmark-shaped
+  UPDATE/DELETE loops that prepare the same direct DML SQL inside each measured
+  transaction.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` in the main checkout; the source
+  patch was backed out after the full quick matrix rejected it.
+- Candidate shape: add a one-entry `last_prepared_cache_entry` ahead of the
+  prepared-statement LRU so immediate repeated `prepare()` calls on the same SQL
+  could skip the LRU/hash-table lookup while still checking SQL text, schema
+  cookie/generation, and function-registry generation. The patch cleared the
+  one-entry cache on full compilation-cache clears and pruned it after write
+  commits with the same `can_survive_write_commit()` rule as the LRU.
+- Correctness proof before rejection:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-last-prepared-target CARGO_BUILD_JOBS=4 cargo fmt -p fsqlite-core --check`
+  passed; `git diff --check -- crates/fsqlite-core/src/connection.rs` passed;
+  and
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-last-prepared-target CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core prepared_cache -- --nocapture`
+  passed the prepared-cache invalidation, direct-DML cache survival, reuse trace,
+  and repeated-insert cache tests.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-last-prepared-cache-20260509T2043Z/update-baseline.json`,
+  `update-candidate.json`, `update-baseline-repeat.json`,
+  `update-candidate-repeat.json`, `full-baseline.json`, and
+  `full-candidate.json`.
+- Result: rejected. Focused UPDATE/DELETE fsqlite medians improved on most rows
+  in the first run and all six rows on repeat, but same-window ratios/geomean did
+  not clear the section gate. The decisive full quick matrix regressed:
+  faster/comparable/C-faster moved `78/2/13 -> 79/2/12`, but average/geomean
+  moved `0.5053577206 / 0.2818019450 -> 0.5163118056 / 0.2850943744`, p90/p99
+  moved `1.1167803990 / 2.5917444162 -> 1.1354601990 / 2.6780445473`, and the
+  primary weighted score moved `0.3806528040 -> 0.3829378036`.
+- Do not retry a standalone one-entry prepared-template front cache. Reconsider
+  only if paired with a broader prepare/transaction lifecycle change that wins
+  the full quick primary score, not just fsqlite medians in the focused DML
+  slice.
+
+## 2026-05-09 - Direct INSERT page-run eager error-restore clone removal
+
+- Target: large-record explicit-transaction prepared direct INSERT page-run
+  commit tail, especially the quick matrix `large_10col` 10k single-transaction
+  and record-size rows.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` in the main checkout; the source
+  patch was backed out after the focused INSERT matrix rejected it.
+- Candidate shape: make `flush_pending_direct_insert_page_run_with_cursor`
+  borrow `PendingDirectInsertPageRun` and move the original run back only on
+  error, removing the eager `restore_on_error = run.clone()` from the successful
+  flush path.
+- Correctness/build proof before rejection:
+  `cargo fmt -p fsqlite-core --check` passed;
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-pagerun-clone-target CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core prepared_direct_insert_page_run -- --nocapture --test-threads=1`
+  passed all four matching tests;
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-pagerun-clone-target CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core pending_direct_insert_page_run -- --nocapture --test-threads=1`
+  passed all three matching tests; and the release-perf comprehensive-bench
+  build passed.
+- Evidence artifacts:
+  baseline
+  `tests/artifacts/perf/codex-current-insert-profile-20260509T1845Z/insert-baseline.json`
+  plus its profile stderr; candidate
+  `tests/artifacts/perf/codex-pagerun-restore-clone-20260509T2115Z/insert-candidate.json`;
+  repeat
+  `tests/artifacts/perf/codex-pagerun-restore-clone-20260509T2115Z/insert-candidate-repeat.json`.
+- Result: rejected. The intended large rows improved: record-size
+  `large_10col` 10k FSQLite time moved from `10.934 ms` to `10.134 ms`
+  (`9.586 ms` on repeat), single-transaction `large_10col` 10k moved from
+  `10.747 ms` to `9.975 ms` (`9.897 ms` on repeat), and profiled commit time
+  moved from about `5303 us` to `4423 us` / `4204 us`. The section gate still
+  failed: focused INSERT primary worsened from `0.8175009494` to
+  `0.8563163806` (`0.8484268643` on repeat), and p99 worsened from
+  `1.2058470980` to `1.2936553762` (`1.4857287034` on repeat). The small and
+  medium 100-row rows regressed enough to reject the patch despite the target
+  large-row win.
+- Do not retry removing eager page-run error-restore cloning as a standalone
+  optimization. Reconsider only if it is paired with a small-row-neutral
+  page-run/layout change and the same-window focused INSERT primary and p99
+  both improve, or if a large-record-only benchmark becomes the explicit
+  target.
+
+## 2026-05-09 - Active same-leaf DELETE abandon/cache-note skip
+
+- Target: reduce repeated prepared direct DELETE same-leaf active-hit ceremony in
+  the UPDATE/DELETE quick slice, especially `1000 rows / delete 50 rows` and
+  `10000 rows / delete 500 rows`.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` in the main checkout; the source
+  patch was backed out after the focused matrix rejected it.
+- Candidate shape: after the first same-leaf direct DELETE starts a pending
+  leaf run, return active-run hits as `(1, false)` and skip the repeated
+  `retained_autocommit_count_sum_cache_note_delete(..., None)` /
+  `abandon_exact_memdb_row_mirror()` path. The attempted invariant was that
+  `can_defer_prepared_direct_delete_leaf_run()` only admits the run when the
+  retained count/sum cache is absent, and read boundaries flush pending runs.
+- Correctness proof before rejection:
+  `cargo fmt --check -p fsqlite-core` passed,
+  `git diff --check -- crates/fsqlite-core/src/connection.rs` passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-active-delete-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_prepared_direct_delete_leaf_run -- --nocapture --test-threads=1`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-active-delete-abandon-skip-20260509T1800Z/update-baseline.json`,
+  `tests/artifacts/perf/codex-active-delete-abandon-skip-20260509T1800Z/update-candidate.json`,
+  plus the matching `.err` profile logs in the same directory.
+- Result: rejected. The focused UPDATE/DELETE weighted/geomean score worsened
+  from `1.8569872887` to `1.9545866766`, faster/comparable/C-faster moved from
+  `2/0/4` to `1/0/5`, and average ratio worsened from `2.2915337780` to
+  `2.2996574633`. Row-level medians were mixed: `1000 rows / delete 50 rows`
+  improved from `0.044313 ms` to `0.042029 ms`, but `10000 rows / delete 500
+  rows` was flat/slightly worse (`0.330529 ms` to `0.331211 ms`) and the
+  100-row UPDATE row regressed visibly (`0.015499 ms` to `0.020078 ms`).
+- Do not retry skipping active same-leaf DELETE abandon/cache-note work as a
+  standalone lever. Reconsider only if the benchmark harness isolates DELETE
+  rows from same-run UPDATE noise and the full quick matrix primary score stays
+  neutral or improves.
+
+## 2026-05-09 - Active fixed-width UPDATE abandon/cache-note skip
+
+- Target: reduce repeated prepared direct UPDATE fixed-width REAL leaf-patch
+  active-hit ceremony in the UPDATE/DELETE quick slice, especially the
+  `1000 rows / update 100 rows` and `10000 rows / update 1000 rows` rows.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` in the main checkout; the source
+  patch was backed out after the focused matrix rejected it.
+- Candidate shape: after the first direct UPDATE starts a pending
+  `TableLeafPayloadPatchRun`, return active-run hits as `(1, false)` and skip
+  repeated `retained_autocommit_count_sum_cache_note_update(..., None, None)` /
+  `abandon_exact_memdb_row_mirror()` work. The attempted invariant matched the
+  DELETE experiment: `can_defer_prepared_direct_update_leaf_patch_run()` only
+  admits a run when the retained count/sum cache is absent, and read boundaries
+  flush pending runs.
+- Correctness/build proof before rejection:
+  `cargo fmt --check -p fsqlite-core` passed,
+  `git diff --check -- crates/fsqlite-core/src/connection.rs` passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-active-update-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_prepared_direct_update_leaf_patch_run -- --nocapture --test-threads=1`
+  passed. A fresh release-perf build in that target was killed by SIGTERM
+  during dependency compilation, so the benchmark binary was built in the
+  warmer `/data/tmp/frankensqlite-codex-active-delete-target` with
+  `CARGO_BUILD_JOBS=4`.
+- Evidence artifacts:
+  baseline
+  `tests/artifacts/perf/codex-active-delete-abandon-skip-20260509T1800Z/update-baseline.json`;
+  candidate
+  `tests/artifacts/perf/codex-active-update-abandon-skip-20260509T1816Z/update-candidate.json`,
+  plus the matching `.err` profile log.
+- Result: rejected. The focused UPDATE/DELETE weighted/geomean score worsened
+  from `1.8569872887` to `2.0248892395`, faster/comparable/C-faster moved from
+  `2/0/4` to `1/0/5`, and average ratio worsened from `2.2915337780` to
+  `2.3323510862`. The small UPDATE row improved only slightly (`0.015499 ms` to
+  `0.015309 ms`), while `1000 rows / update 100 rows` regressed from
+  `0.042840 ms` to `0.068148 ms`.
+- Do not retry skipping active fixed-width UPDATE abandon/cache-note work as a
+  standalone lever. It is only worth revisiting if a larger DML write-run
+  redesign removes the outer MemDB-abandon coupling without causing mid-sized
+  UPDATE codegen or branch-layout regressions.
+
+## 2026-05-09 - Pending UPDATE/DELETE run cached usable-size
+
+- Target: reduce active-hit overhead in the retained prepared direct
+  UPDATE/DELETE leaf-run paths by avoiding repeated
+  `btree_cursor_sizes_from_header()` calls per row.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` in the main checkout; the source
+  patch was backed out after the focused matrix rejected it. Agent Mail was
+  reachable when `connection.rs` was reserved, but the later ledger reservation
+  retry failed with a local MCP HTTP transport error; the last successful active
+  reservation check had no ledger conflict.
+- Candidate shape: add a cached `usable_size: u32` field to
+  `PendingDirectUpdateLeafPatchRun` and `PendingDirectDeleteLeafRun`, initialize
+  it when storing the pending run, and use it inside active UPDATE/DELETE hits
+  instead of recomputing from the cursor page-size header.
+- Correctness/build proof before rejection:
+  `cargo fmt --check -p fsqlite-core` passed,
+  `git diff --check -- crates/fsqlite-core/src/connection.rs` passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-active-delete-target CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core test_prepared_direct_ -- --nocapture --test-threads=1`
+  passed (`38` prepared-direct tests).
+- Evidence artifacts:
+  baseline
+  `tests/artifacts/perf/codex-active-delete-abandon-skip-20260509T1800Z/update-baseline.json`;
+  candidate
+  `tests/artifacts/perf/codex-pending-run-usable-size-20260509T1827Z/update-candidate.json`,
+  plus the matching `.err` profile log.
+- Result: rejected. The focused UPDATE/DELETE weighted/geomean score worsened
+  from `1.8569872887` to `2.0698774055`, faster/comparable/C-faster moved from
+  `2/0/4` to `1/0/5`, and average ratio worsened from `2.2915337780` to
+  `2.4920796739`. The 1k UPDATE and 1k/10k DELETE rows improved slightly, but
+  `100 rows / update 10 rows` regressed from `0.015499 ms` to `0.019537 ms`,
+  and `100 rows / delete 5 rows` also regressed.
+- Do not retry caching pending direct UPDATE/DELETE run `usable_size` as a
+  standalone lever. The per-row size calculation is too small relative to the
+  fixed tiny-row costs, and the extra pending-run state worsened the focused
+  matrix primary score.
+
+## 2026-05-09 - File-backed concurrent direct INSERT lazy MemDB mirror
+
+- Target: reduce low-writer concurrent prepared INSERT cost in
+  `mt-mvcc-bench` and `comprehensive-bench --quick --filter concurrent` by
+  avoiding short-lived owned MemDatabase row-image deltas inside file-backed
+  concurrent write transactions.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` in the main checkout; the source
+  patch was backed out after the full quick matrix rejected it.
+- Candidate shape: return `false` from
+  `should_track_prepared_direct_insert_memdb_delta()` for file-backed explicit
+  concurrent transactions (`in_transaction && concurrent_txn`), immediately
+  using lazy active-transaction MemDatabase reload instead of queueing the first
+  `64` pending direct upserts before abandoning the mirror.
+- Correctness/build proof before rejection:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-active-delete-target CARGO_BUILD_JOBS=4 cargo fmt -p fsqlite-core --check`
+  passed,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-active-delete-target CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core test_prepared_file_backed_concurrent_insert_keeps_memdb_lazy_until_read -- --nocapture --test-threads=1`
+  passed, and the release-perf benchmark binaries rebuilt before measurement.
+- Evidence artifacts:
+  standalone baseline
+  `tests/artifacts/perf/codex-current-mt-mvcc-20260509T1910Z/mt-baseline.json`,
+  focused concurrent baseline
+  `tests/artifacts/perf/codex-current-concurrent-20260509T1905Z/concurrent-baseline.json`,
+  full quick baseline
+  `tests/artifacts/perf/codex-current-full-quick-20260509T155911Z/full-quick.json`,
+  candidate standalone
+  `tests/artifacts/perf/codex-concurrent-lazy-memdb-20260509T1958Z/mt-candidate.json`,
+  candidate focused concurrent
+  `tests/artifacts/perf/codex-concurrent-lazy-memdb-20260509T1958Z/concurrent-candidate.json`,
+  and candidate full quick repeats
+  `tests/artifacts/perf/codex-concurrent-lazy-memdb-20260509T1958Z/full-candidate.json`
+  and
+  `tests/artifacts/perf/codex-concurrent-lazy-memdb-20260509T1958Z/full-candidate-repeat.json`.
+- Result: rejected. The standalone `mt-mvcc-bench` 2- and 4-writer rows
+  improved (`4.768 ms -> 4.056 ms` and `13.275 ms -> 11.852 ms`), while the
+  8-writer row was slightly worse (`29.873 ms -> 30.477 ms`). The focused
+  concurrent quick weighted/geomean score improved from `0.8425536875` to
+  `0.8321619872`, but the full quick matrix rejected the change twice:
+  primary weighted score worsened from `0.3786703993` to `0.4028236455`, then
+  `0.3929657939` on repeat, and p99 worsened from `2.4984256927` to
+  `4.8393858872`, then `4.5525508782`. The 100-row DML tail was the visible
+  rejector: DELETE rose to `4.84x` / `4.55x` and UPDATE to `2.29x` / `3.61x`.
+- Do not retry immediate lazy MemDatabase mirroring for all file-backed
+  concurrent transactions as a standalone lever. Revisit only with a narrower
+  admission rule or after the read-state/setup effects on the full DML matrix
+  are solved and the full quick matrix primary score passes.
+
+## 2026-05-09 - Pager freed_pages sorted membership for isolated DELETE
+
+- Target: reduce `TransactionKind::get_page` time in the isolated DELETE
+  profiler, where transaction-local `freed_pages` membership scans showed up
+  under `execute_prepared_direct_simple_delete`.
+- Touched during rejected candidate:
+  `crates/fsqlite-pager/src/pager.rs` in the main checkout; the sorted-list
+  source patch was backed out after the focused matrix rejected it.
+- Candidate shape: keep transaction-local `freed_pages` sorted, use binary
+  search for membership, and preserve ordering through sorted insert/remove and
+  commit-failure restore paths. A smaller precursor that only checked
+  `write_set` before scanning `freed_pages` was also rejected as flat.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-pager-freed-get-page-20260509T1400Z/hyperfine-delete-isolated-1000x30000.json`
+  showed the check-order-only candidate was flat (`1.232s +/- 0.006`
+  baseline versus `1.233s +/- 0.009` candidate).
+  `tests/artifacts/perf/codex-pager-freed-get-page-20260509T1400Z/hyperfine-delete-isolated-1000x30000-sorted.json`
+  showed the sorted-list candidate helped the isolated long transaction
+  (`1.237s +/- 0.013` baseline versus `1.136s +/- 0.005` candidate,
+  about `1.09x` faster).
+- Standard workload evidence:
+  `tests/artifacts/perf/codex-pager-freed-get-page-20260509T1400Z/hyperfine-delete-standard-1000x50-sorted.json`
+  was flat/slightly worse (`19.2ms +/- 0.9` baseline versus
+  `19.4ms +/- 0.7` candidate).
+- Focused matrix rejection:
+  `tests/artifacts/perf/codex-pager-freed-get-page-20260509T1400Z/update-delete-baseline.json`
+  reported `2 faster / 1 comparable / 3 C-faster` with average ratio
+  `1.47x`, while
+  `tests/artifacts/perf/codex-pager-freed-get-page-20260509T1400Z/update-delete-sorted-candidate.json`
+  reported `2 faster / 0 comparable / 4 C-faster` with average ratio
+  `1.52x`. The candidate flipped the 100-row UPDATE row slower and made the
+  100-row DELETE row visibly worse, despite slightly improving the 10k DELETE
+  row.
+- Do not retry sorted `freed_pages` membership for the current benchmark
+  matrix. Reconsider only for deliberately long-lived single-transaction
+  DELETE workloads, and only if a same-window focused matrix keeps the small
+  UPDATE/DELETE rows neutral.
+
+## 2026-05-09 - Exact BEGIN/COMMIT execute fast path for tiny DELETE
+
+- Target: reduce the fixed transaction-control cost that dominates the
+  remaining tiny pre-populated UPDATE/DELETE rows, especially
+  `100 rows / delete 5 rows`.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` in the main checkout; the source
+  change and regression test were backed out after the full matrix rejected it.
+- Candidate shape: detect exact `BEGIN` / `COMMIT` strings in
+  `Connection::execute` after `background_status()`, bypass parse/rewrite and
+  generic statement dispatch when no tracing or `trace_v2` callback was active,
+  and call `execute_begin` / `execute_commit_with_cx` directly while preserving
+  statement-count metrics.
+- Correctness proof before rejection:
+  `cargo fmt` passed and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-next-check CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core test_exact_transaction_control_fast_path_begin_commit -- --nocapture`
+  passed.
+- Focused evidence:
+  `tests/artifacts/perf/codex-txn-control-fastpath-20260509T123123Z/update-quick.json`
+  improved the UPDATE/DELETE-only quick slice from the prior profile artifact
+  `tests/artifacts/perf/codex-delete-tail-profile-20260509T121747Z/update-quick.json`:
+  faster/comparable/C-faster moved `2/0/4 -> 3/0/3`, geomean
+  `1.3674617519 -> 1.2333906826`, and `100 rows / delete 5 rows` moved from
+  about `8.6 us` to `7.5 us`.
+- Full-matrix rejection:
+  `tests/artifacts/perf/codex-txn-control-fastpath-full-20260509T123142Z/full-quick.json`
+  regressed against the kept batch-defrag baseline
+  `tests/artifacts/perf/codex-delete-batch-defrag-20260509T1205Z/full-quick-candidate.json`.
+  Overall counts moved `81/4/8 -> 79/2/12`, average/geomean moved
+  `0.4884036044 / 0.2721160643 -> 0.5016192077 / 0.2775053006`, p90 moved
+  `0.9877100950 -> 1.0834539891`, and weighted score moved
+  `0.3721386195 -> 0.3765926441`. The worst target-row regression was
+  `1000 rows / delete 50 rows`, ratio `1.8577556225 -> 2.5528863180`
+  with FSQLite median `0.032050 ms -> 0.043251 ms`.
+- Do not retry an exact SQL transaction-control bypass as a standalone lever.
+  It is only worth revisiting if the benchmark harness separately proves lower
+  variance for the 1k DELETE row or if a broader transaction lifecycle change
+  improves the primary full-matrix score, not just the smallest DELETE row.
+
+## 2026-05-09 - Same-leaf DELETE compactness admission hoist
+
+- Target: reduce per-row overhead in the retained same-leaf direct DELETE run
+  by avoiding repeated full cell-pointer scans in
+  `TableLeafDeleteRun::delete_rowid`.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs` in the main checkout; the source patch
+  was backed out after the focused UPDATE/DELETE gate rejected it.
+- Candidate shape: move the compact table-leaf cell-area check from each
+  retained-run `delete_rowid` call into `BtCursor::table_leaf_delete_run_current`
+  admission, leaving the materialization-time corrupt-shape guard in place.
+- Correctness/build proof before rejection:
+  `cargo fmt --check -p fsqlite-btree` passed,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-compact-admit-check CARGO_BUILD_JOBS=4 cargo test -p fsqlite-btree test_table_leaf_delete_run_defragments_multiple_root_leaf_cells -- --nocapture`
+  passed, and the release-perf `perf-update-delete` / `comprehensive-bench`
+  probe binaries built successfully in the same target dir.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-compact-admit-candidate-20260509T130414Z/hyperfine-delete-100.json`,
+  `tests/artifacts/perf/codex-compact-admit-candidate-20260509T130414Z/hyperfine-delete-1000.json`,
+  `tests/artifacts/perf/codex-compact-admit-candidate-20260509T130414Z/update-baseline.json`,
+  and
+  `tests/artifacts/perf/codex-compact-admit-candidate-20260509T130414Z/update-candidate.json`.
+- Result: rejected. Hyperfine saw only a noisy FSQLite-only total-time win
+  (`1.03x +/- 0.05` for 100-row isolated DELETE and `1.04x +/- 0.06` for
+  1000-row isolated DELETE). The focused UPDATE/DELETE matrix then worsened the
+  primary write-single geomean from `1.2606148514` to `1.3249452371` and moved
+  faster/comparable/C-faster from `3/0/3` to `2/0/4`. The worst visible
+  regression was `100 rows / update 10 rows`, where FSQLite median moved from
+  `0.006673 ms` to `0.011592 ms`.
+- Do not retry compactness-admission hoisting as a standalone
+  `TableLeafDeleteRun` tweak. Reconsider only if a lower-variance delete-only
+  microbenchmark proves this exact scan dominates and the same-window focused
+  UPDATE/DELETE matrix keeps write-single geomean and C-faster count flat or
+  better.
+
+## 2026-05-09 - Same-leaf DELETE positioned first-row admission
+
+- Target: reduce the retained same-leaf direct DELETE run's first-row overhead
+  by avoiding a duplicate binary search after the ordinary direct DELETE cursor
+  had already positioned on and verified the rowid.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs` and
+  `crates/fsqlite-core/src/connection.rs` in the main checkout; the source
+  patch was backed out after isolated DELETE probes rejected it.
+- Candidate shape: split `TableLeafDeleteRun::delete_rowid` into a searched
+  path and a positioned-current path, then have
+  `execute_prepared_direct_simple_delete_with_cursor` call the positioned path
+  for the first row immediately after `table_leaf_delete_run_current(rowid)`.
+  Later rows in the retained run still used the searched path.
+- Correctness/build proof before rejection:
+  `cargo fmt --check -p fsqlite-btree -p fsqlite-core` passed and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-compact-admit-check CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core test_prepared_direct_delete_leaf_run -- --nocapture --test-threads=1`
+  passed the two direct-delete leaf-run boundary tests. The release-perf
+  `perf-update-delete` / `comprehensive-bench` probe binaries then rebuilt
+  successfully in the same target dir.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-delete-current-rowid-20260509T131503Z/hyperfine-delete-100.json`
+  and
+  `tests/artifacts/perf/codex-delete-current-rowid-20260509T131503Z/hyperfine-delete-1000.json`.
+- Result: rejected before focused matrix promotion. The 100-row isolated DELETE
+  FSQLite-only probe was flat (`78.8 ms +/- 0.7` baseline versus
+  `78.8 ms +/- 2.0` candidate), and the 1000-row isolated DELETE probe
+  regressed within variance (`215.7 ms +/- 10.8` baseline versus
+  `225.0 ms +/- 13.8` candidate). This duplicate first-row search is not a
+  measurable standalone bottleneck.
+- Do not retry positioned first-row DELETE admission as a standalone tweak.
+  Reconsider only as part of a larger retained-cursor design that removes more
+  than the first redundant rowid lookup and first passes isolated DELETE probes.
+
+## 2026-05-09 - Same-leaf DELETE monotone duplicate-check skip
+
+- Target: reduce retained same-leaf direct DELETE run overhead by avoiding the
+  growing linear `deleted_cell_indices.contains(&cell_idx)` duplicate check
+  when accepted cell indices are still strictly ascending.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs` in the main checkout; the source patch
+  was backed out after isolated DELETE probes showed no measurable win.
+- Candidate shape: add one boolean to `TableLeafDeleteRun` tracking whether the
+  accepted delete indices remained strictly ascending. In ascending mode, a
+  new `cell_idx` greater than the previous accepted index skipped the linear
+  duplicate scan; non-monotone or repeated indices retained the existing
+  `contains` check, preserving arbitrary-order DELETE correctness.
+- Correctness/build proof before rejection:
+  `cargo fmt --check -p fsqlite-btree -p fsqlite-core` passed,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-compact-admit-check CARGO_BUILD_JOBS=4 cargo test -p fsqlite-btree test_table_leaf_delete_run_defragments_multiple_root_leaf_cells -- --nocapture`
+  passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-compact-admit-check CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core test_prepared_direct_delete_leaf_run -- --nocapture --test-threads=1`
+  passed the two pending-delete leaf-run boundary tests. The release-perf
+  `perf-update-delete` / `comprehensive-bench` probe binaries then rebuilt
+  successfully in the same target dir.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-delete-monotone-contains-20260509T132445Z/hyperfine-delete-100.json`
+  and
+  `tests/artifacts/perf/codex-delete-monotone-contains-20260509T132445Z/hyperfine-delete-1000.json`.
+- Result: rejected before focused matrix promotion. The 100-row isolated DELETE
+  FSQLite-only probe was flat (`77.0 ms +/- 0.8` baseline versus
+  `77.1 ms +/- 2.5` candidate). The 1000-row isolated DELETE probe was also
+  flat with high variance (`206.8 ms +/- 21.6` baseline versus
+  `207.2 ms +/- 29.2` candidate). The duplicate scan is not a measurable
+  standalone bottleneck in the current retained-run path.
+- Do not retry monotone duplicate-check skipping as a standalone
+  `TableLeafDeleteRun` tweak. Reconsider only if a low-level profile isolates
+  `deleted_cell_indices.contains` as dominant inside `delete_rowid` and the
+  candidate passes the isolated DELETE probes before any focused matrix run.
+
+## 2026-05-09 - Same-leaf direct DELETE run in-place cell-pointer mutation
+
+- Target: reduce per-row overhead in the remaining pre-populated DELETE rows by
+  removing the `TableLeafDeleteRun::delete_cell_at` clone of the owned
+  `StackEntry` cell-pointer vector.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs` in the main checkout; the source change
+  was backed out after the focused UPDATE/DELETE gate regressed.
+- Candidate shape: mutate `self.entry.cell_pointers` in place inside
+  `TableLeafDeleteRun::delete_cell_at` instead of cloning it into a temporary
+  `ptrs` vector and assigning it back after the page bytes and header were
+  rewritten. Extra preflight checks kept fallible offset conversions before
+  in-place mutation.
+- Correctness/build proof before rejection:
+  `cargo fmt -p fsqlite-btree --check` passed,
+  `cargo check -p fsqlite-btree -p fsqlite-core --all-targets` passed, and
+  `cargo test -p fsqlite-core test_prepared_direct_delete_leaf_run -- --nocapture`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-delete-run-inplace-ptrs-20260509T1059Z/update-quick.json`
+  and stdout/stderr captures under that directory.
+- Focused UPDATE/DELETE evidence rejected the candidate against the current
+  same-leaf run baseline
+  `tests/artifacts/perf/codex-delete-leaf-run-20260509T1035Z/update-quick.json`.
+  Faster/comparable/C-faster stayed `1/1/4`, but average/geomean moved from
+  `2.4010669916 / 2.0201104993` to `2.5064993870 / 2.1062225458`,
+  median moved `2.5065693431 -> 2.7517948911`, and p90/p99 moved
+  `4.6126013724 -> 4.6343561801`.
+- Representative row regressions: `1000 rows / delete 50 rows` ratio
+  `3.0251620962 -> 3.25` with FSQLite median `0.050856 ms -> 0.055744 ms`,
+  and `10000 rows / delete 500 rows` ratio `2.4679261512 -> 2.7517948911`
+  with FSQLite median `0.401692 ms -> 0.439624 ms`. Do not retry this as a
+  standalone mutation; if pointer-vector copying is revisited, first prove with
+  a low-level `TableLeafDeleteRun` microbenchmark that the in-place version
+  avoids clone cost without worse cache behavior or extra checks.
+
+## 2026-05-09 - Direct DELETE discard-position add-on after same-leaf run
+
+- Target: the remaining pre-populated direct DELETE tail after the same-leaf
+  direct DELETE run optimization had already moved the UPDATE/DELETE and
+  full-quick matrix.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs` and
+  `crates/fsqlite-core/src/connection.rs` in the main checkout; the
+  discard-position source changes were backed out after the matrix comparison.
+- Candidate shape: after the same-leaf delete-run path declined a row and when
+  no retained count/sum cache was active, add a narrow
+  `table_delete_current_discarding_position` primitive that admitted only a
+  current table-leaf row with more than one cell, matching rowid, and no parent
+  separator repair, then skipped the ordinary cursor successor-position repair
+  because the direct DELETE caller drops the cursor immediately.
+- Correctness/build proof before rejection:
+  `cargo fmt -p fsqlite-btree -p fsqlite-core --check` passed,
+  `cargo test -p fsqlite-btree table_delete -- --nocapture` passed,
+  `cargo test -p fsqlite-core test_direct_simple_update_delete_fast_path_executes_and_is_correct -- --nocapture`
+  passed,
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-direct-delete-discard-target CARGO_BUILD_JOBS=8 cargo check -p fsqlite-btree -p fsqlite-core --all-targets`
+  finished the remote compiler check successfully before RCH hung retrieving the
+  remote target cache, and local
+  `cargo clippy -p fsqlite-btree -p fsqlite-core --all-targets -- -D warnings`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-direct-delete-discard-20260509T1018Z/update-quick.json`,
+  `tests/artifacts/perf/codex-direct-delete-discard-20260509T1018Z/full-quick.json`,
+  and the local repeat
+  `tests/artifacts/perf/codex-direct-delete-discard-repeat-20260509T1033Z/full-quick.json`.
+- The candidate improved versus the older corrected timing-boundary baseline,
+  but that was no longer the right keep gate. Against the stronger same-leaf
+  run baseline in
+  `tests/artifacts/perf/codex-delete-leaf-run-20260509T1035Z/full-quick.json`,
+  the repeat moved the primary weighted score from `0.3954296538` to
+  `0.4085859727`, average/geomean from `0.5516794416 / 0.2743370248` to
+  `0.5568462311 / 0.2827296518`, and `write_single` geomean from
+  `1.5105398003` to `1.5620083184`. P99 improved
+  `4.9502487562 -> 4.8037120360` and scenario counts improved
+  `77/3/13 -> 78/3/12`, but the primary score and category geomeans regressed.
+- Do not retry a standalone "delete and discard cursor position" primitive on
+  top of same-leaf delete runs. Reconsider only if the same-window baseline is
+  the current same-leaf run artifact and the candidate improves the primary
+  full-quick score, `write_single` geomean, and p99 together.
+
+## 2026-05-09 - Direct INSERT page-run initial capacity 256 -> 128
+
+- Target: fixed allocation pressure in the remaining 100-row INSERT tails,
+  especially tiny/small direct INSERT page-runs, without changing page-run
+  admission or buffering semantics.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` in scratch worktree
+  `/data/tmp/frankensqlite-codex-pagerun-cap-20260509`; the source patch was not
+  applied to the main checkout.
+- Candidate shape: add
+  `PREPARED_DIRECT_INSERT_PAGE_RUN_INITIAL_RECORD_CAPACITY = 128` and replace
+  the hard-coded `256` capacities used for pending page-run rowid, owned-record,
+  arena-record, and arena-byte preallocation.
+- Correctness/build proof before rejection:
+  `cargo fmt -p fsqlite-core` was required after the first check,
+  `cargo fmt -p fsqlite-core --check` then passed,
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-pagerun-cap-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core prepared_direct_insert_page_run -- --nocapture`
+  passed the four matching page-run tests, and baseline/candidate
+  `comprehensive-bench` release-perf builds passed. RCH rejected `/data/tmp`
+  path normalization and ran these commands locally.
+- Evidence artifacts:
+  `/data/tmp/frankensqlite-codex-pagerun-cap-20260509/tests/artifacts/perf/codex-pagerun-cap-20260509T0949Z/summary.md`,
+  `baseline-insert.json`, `candidate-insert.json`, stdout/stderr captures, and
+  `candidate.diff`.
+- Focused INSERT evidence rejected the candidate. Same-window
+  `comprehensive-bench --quick --filter insert` with
+  `FSQLITE_BENCH_PROFILE_INSERT=1` moved faster/comparable/C-faster from
+  `18/2/5` to `17/0/8`, average/geomean from
+  `0.8214438884 / 0.7968332414` to `0.8321259489 / 0.8045359825`, and p90 from
+  `1.1053824730` to `1.1088159351`. P99 improved
+  `1.1807330026 -> 1.1296272477` and weighted score improved slightly
+  `0.7972806537 -> 0.7924601126`, but that did not outweigh the broader
+  distribution and C-faster regressions.
+- Representative row movement: `tiny_1col 100 rows` regressed from ratio
+  `0.7987228240` to `1.1088159351` with FSQLite median
+  `0.072044 ms -> 0.081162 ms`; `record-size large_10col 10K` regressed from
+  ratio `1.0463786802` to `1.1155357740` with FSQLite median
+  `10.003173 ms -> 10.977036 ms`; `large_10col 10K single txn` improved from
+  ratio `1.0970276418` to `1.0605116260`, but the focused matrix failed.
+- Do not retry page-run initial-capacity shrinking as a standalone
+  optimization. Reconsider only as part of an adaptive run-size policy that
+  proves lower allocation cost without increasing C-faster rows in a same-window
+  focused INSERT matrix and then the full quick matrix.
+
+## 2026-05-09 - Small-record page-run delayed admission
+
+- Target: the current 100-row tiny/small INSERT tails, without repeating the
+  already rejected blunt `PREPARED_DIRECT_INSERT_PAGE_RUN_MIN_RECORD_BYTES`
+  `16 -> 128` admission-floor change.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` in scratch worktree
+  `/data/tmp/frankensqlite-codex-small-pagerun-delay-20260509`; the source
+  patch was not applied to the main checkout.
+- Candidate shape: keep the existing medium/large page-run admission, but delay
+  page-run buffering for records below 128 bytes until a monotone direct-append
+  prefix of 128 rows had been observed through `PreparedDirectInsertAppendHint`.
+- Correctness/build proof before rejection:
+  `cargo fmt -p fsqlite-core --check` passed,
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-small-pagerun-delay-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core prepared_direct_insert_page_run -- --nocapture`
+  passed the four matching page-run tests,
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-small-pagerun-delay-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_prepared_direct_insert_repeated_constant_page_run_delays_tiny_prefix -- --nocapture`
+  passed, and
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-small-pagerun-delay-target CARGO_BUILD_JOBS=8 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`
+  passed. RCH rejected the `/data/tmp` worktree normalization and ran these
+  commands locally.
+- Evidence artifacts:
+  `/data/tmp/frankensqlite-codex-small-pagerun-delay-20260509/tests/artifacts/perf/codex-small-pagerun-delay-20260509T0915Z/summary.md`,
+  `baseline-insert.json`, `candidate-insert.json`, stdout/stderr captures, and
+  `candidate.diff`.
+- Focused INSERT evidence rejected the candidate. Same-window
+  `comprehensive-bench --quick --filter insert` with
+  `FSQLITE_BENCH_PROFILE_INSERT=1` moved faster/comparable/C-faster from
+  `18/3/4` to `14/3/8`, average/geomean from
+  `0.8034594395 / 0.7778958573` to `1.0071263001 / 0.9616735476`, p90/p99 from
+  `1.1016944814 / 1.1200290355` to `1.4415132169 / 2.0091193408`, and weighted
+  score from `0.7836057848` to `0.8560289316`.
+- Representative row regressions: `tiny_1col 1000 rows` ratio
+  `0.6074637402 -> 2.0091193408` with FSQLite median
+  `0.170379 ms -> 0.534482 ms`; `small_3col 100 rows` ratio
+  `1.0992051966 -> 1.3948978229` with FSQLite median
+  `0.083256 ms -> 0.104436 ms`; and transaction-strategy
+  `100 rows / single txn` ratio `1.1066878772 -> 1.5294117647` with FSQLite
+  median `0.084178 ms -> 0.113282 ms`.
+- Do not retry delayed small-record page-run admission as a standalone policy.
+  Reconsider only as part of a true fused small-record page builder that keeps
+  the current page-run win for 1000/10000-row tiny/small records while lowering
+  the 100-row fixed cost, with a same-window focused INSERT matrix win before
+  any full quick run.
+
+## 2026-05-09 - Explicit-transaction deferred e-process oracle refresh
+
+- Target: fixed setup and short explicit-transaction overhead in the remaining
+  100-row INSERT and UPDATE/DELETE tails.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` in scratch worktree
+  `/data/tmp/frankensqlite-codex-defer-oracle-20260509`; the source patch was
+  not applied to the main checkout.
+- Candidate shape: defer the periodic `refresh_eprocess_oracle()` call when the
+  64-statement threshold is crossed inside an explicit transaction, remember a
+  pending refresh flag, and flush once on successful commit, full rollback, or
+  the virtual-table sync failure rollback path.
+- Correctness/build proof before rejection:
+  `cargo fmt -p fsqlite-core --check` passed,
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-defer-oracle-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_eprocess_oracle_refresh_defers_inside_explicit_transaction -- --nocapture`
+  passed, and
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-defer-oracle-target CARGO_BUILD_JOBS=8 cargo check -p fsqlite-core --lib`
+  passed. Candidate and clean-baseline release-perf `comprehensive-bench`
+  binaries also built successfully. RCH rejected the `/data/tmp` worktree
+  normalization and ran the proof commands locally.
+- Evidence artifacts:
+  `/data/tmp/frankensqlite-codex-defer-oracle-20260509/tests/artifacts/perf/codex-defer-oracle-20260509T085633Z/summary.md`,
+  `baseline-insert.json`, `candidate-insert.json`, `baseline-update.json`,
+  `candidate-update.json`, stdout captures, and `candidate.diff`.
+- Focused INSERT evidence rejected the candidate. Same-window
+  `comprehensive-bench --quick --filter insert` with
+  `FSQLITE_BENCH_PROFILE_INSERT=1` moved average/geomean/weighted/p90/p99 from
+  `0.8368021451 / 0.8126281820 / 0.8022028800 / 1.1208395414 / 1.1549880308`
+  to
+  `0.8663550242 / 0.8479986596 / 0.8090044816 / 1.1357954102 / 1.1938446001`;
+  C-faster rows stayed `6`.
+- Focused UPDATE/DELETE evidence also rejected it. Same-window
+  `comprehensive-bench --quick --filter update` with
+  `FSQLITE_BENCH_PROFILE_DML=1` moved average/geomean/weighted/p90/p99 from
+  `0.9766248028 / 0.9202769713 / 0.9202769713 / 1.4434909347 / 1.4434909347`
+  to
+  `1.0676346436 / 1.0249806312 / 1.0249806312 / 1.6189818891 / 1.6189818891`.
+  The `100 rows / update 10 rows` FSQLite median regressed
+  `0.110808 ms -> 0.115958 ms`, and `100 rows / delete 5 rows` regressed
+  `0.114886 ms -> 0.136056 ms`.
+- The profile output showed the candidate moved work into setup and transaction
+  boundaries: `fs_update_100` setup regressed `61.2 us -> 107.9 us`, and
+  `fs_delete_100` setup regressed `53.3 us -> 88.3 us`.
+- Do not retry deferred e-process oracle refresh as a standalone optimization.
+  Reconsider only if the oracle refresh becomes opt-in or is driven by a
+  cheaper non-boundary signal, and a same-window focused INSERT plus
+  UPDATE/DELETE run and then the full quick matrix all improve without
+  increasing C-faster rows or p90/p99.
+
+## 2026-05-09 - Same-leaf direct DELETE leaf-run operator
+
+- Target: the current 100-row UPDATE/DELETE frontier, especially
+  `100 rows / delete 5 rows`, by replacing repeated direct DELETE root-to-leaf
+  admission with one retained compact table-leaf mutation run.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs` and
+  `crates/fsqlite-core/src/connection.rs` in scratch worktree
+  `/data/tmp/frankensqlite-codex-delete-leafrun-20260509`; the patch was not
+  applied to the main checkout.
+- Candidate shape: add `TableLeafDeleteRun`, capture the current compact
+  non-overflow table leaf from the direct-simple DELETE cursor, delete
+  compatible same-leaf non-max rowids from the retained page image, flush on
+  read/commit/rollback/incompatible-write boundaries, and fall back for
+  fragmented/overflow/leaf-draining/cross-leaf/cache-sensitive cases.
+- Correctness/build proof before rejection:
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-delete-leafrun-target cargo check -p fsqlite-btree -p fsqlite-core --all-targets`
+  passed, and
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-delete-leafrun-target cargo test -p fsqlite-core test_prepared_direct_delete_leaf_run -- --nocapture`
+  passed two added boundary tests for read flush and rollback clear. RCH
+  rejected the `/data/tmp` worktree normalization and ran these locally.
+- Isolated kernel evidence was promising: same-window
+  `perf-update-delete 100 10000 update fsqlite isolated` moved from
+  `133 ns/update` to `113 ns/update`, and
+  `perf-update-delete 100 10000 delete fsqlite isolated` moved from
+  `1507 ns/delete` to `609 ns/delete`.
+- Focused matrix evidence rejected the candidate. Same-window
+  `comprehensive-bench --quick --filter update` with
+  `FSQLITE_BENCH_PROFILE_DML=1` moved average/geomean/weighted/p90/p99 from
+  `0.8488488431 / 0.8422915640 / 0.8422915640 / 0.9825780748 / 0.9825780748`
+  to
+  `1.0221606931 / 0.9618915363 / 0.9618915363 / 1.6188881949 / 1.6188881949`,
+  and C-faster rows moved from `0` to `2`. The 100-row FSQLite medians
+  regressed from `108.794 us` to `129.743 us` for update and from
+  `107.171 us` to `129.592 us` for delete.
+- Do not retry this same-leaf DELETE mutation run as a standalone optimization.
+  It is only worth revisiting if paired with a setup/fixed-cost reduction that
+  preserves the isolated mutation gains while keeping the 100-row focused matrix
+  rows and p90/p99 at or below the clean baseline.
+
+## 2026-05-09 - Prepared INSERT microbatch proof threading
+
+- Target: INSERT fixed overhead in
+  `execute_precompiled_prepared_insert_fast`, especially the 100-row
+  single-transaction rows where the benchmark still spends meaningful time in
+  per-statement entry checks.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`; the source patch was restored after
+  the INSERT slice did not move in the intended direction.
+- Candidate shape: thread the existing `PreparedDmlEntryProof` into the
+  prepared INSERT fast lane so `microbatch_carry_verified_in_txn` can skip one
+  repeated `active_txn.borrow().is_some()` check after the caller's microbatch
+  carry already proved an explicit transaction is active.
+- Correctness proof before rejection:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-insert-carry-target CARGO_BUILD_JOBS=8 cargo check -p fsqlite-core --all-targets`
+  passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-insert-carry-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_stmt_microbatch_coalesces_repeated_inserts -- --nocapture`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-insert-microbatch-proof-thread-20260509T0910Z/candidate-insert-quick.json`
+  and
+  `tests/artifacts/perf/codex-insert-microbatch-proof-thread-20260509T0910Z/summary.md`.
+- Result: rejected. Against the clean
+  `tests/artifacts/perf/codex-current-dml-profile-20260509T0649Z/current-full-quick.json`
+  INSERT subset, avg/geomean/median/p90/p99 worsened from
+  `0.8138935703 / 0.7895774707 / 0.7542522600 / 1.0800296363 / 1.1071944086`
+  to
+  `0.9181299700 / 0.8670525269 / 0.8541641283 / 1.1739731068 / 1.6025378582`.
+  Same-scenario regressions included 100-row single-txn
+  `1.1076843667 -> 2.0917988142`, tiny 1-column 100-row
+  `0.9646941489 -> 1.6025378582`, and medium 6-column 1000-row
+  `0.7542522600 -> 1.1739731068`.
+- Do not retry proof-threading into prepared INSERT as a standalone
+  optimization. It is only worth revisiting if a profiler shows `active_txn`
+  RefCell borrows as a meaningful fraction of the prepared INSERT fast lane or
+  if a larger entry-control rewrite already changes the INSERT call boundary.
+
+## 2026-05-09 - MVCC committed-history prune no-op rebuild skip
+
+- Target: low-writer concurrent benchmark overhead in
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs`, after `perf` showed
+  `summarize_witness_keys` / committed-history index work in the concurrent
+  writer profile.
+- Touched during rejected candidate:
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs`; the source patch was restored
+  after the matrix did not prove a FrankenSQLite runtime win.
+- Candidate shape: track whether `prune_committed_conflict_history()` actually
+  removed committed reader/writer history entries, skip
+  `rebuild_committed_history_indexes()` when the retain pass was a no-op, and
+  return immediately after forced history clear because all indexes were already
+  empty.
+- Correctness proof before rejection:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-mvcc-prune-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-mvcc test_prune_committed_history_rebuilds_indexes_after_removal -- --nocapture`
+  passed with an added index-rebuild regression test, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-mvcc-prune-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-mvcc committed_ -- --nocapture`
+  passed after fixing the stale lifecycle test described in the artifact notes.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-mvcc-prune-skip-rebuild-20260509T082203Z/candidate-concurrent.json`
+  and
+  `tests/artifacts/perf/codex-mvcc-prune-skip-rebuild-20260509T082203Z/candidate-full-quick.json`.
+  The release-perf binary was built with
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-mvcc-prune-perf CARGO_BUILD_JOBS=8 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`.
+- Result: rejected. The focused concurrent ratio looked slightly better
+  (geomean `0.8151163831 -> 0.8131104356`, p99
+  `1.1224264174 -> 1.0371077388`), but the FrankenSQLite medians themselves
+  worsened on the focused run: 2/4/8 writers moved from `13.575156 ms /
+  19.308404 ms / 45.481706 ms` to `15.618967 ms / 21.641362 ms /
+  47.713326 ms`. The full quick matrix was also mixed: weighted score improved
+  only `0.3451750651 -> 0.3438564662`, while avg worsened
+  `0.4525069616 -> 0.4586621672`, p90 worsened
+  `1.0468303330 -> 1.1059237164`, p99 worsened
+  `1.3701179003 -> 1.3784240596`, and C-faster rows rose `9 -> 10`.
+- Do not retry no-op committed-history rebuild skipping as a standalone
+  optimization. Reconsider only with a same-window A/B that improves
+  FrankenSQLite medians, not just F/C ratios shifted by C SQLite noise, and
+  keeps the full quick p90/p99 and C-faster count from regressing.
+
+## 2026-05-09 - Synthetic page-one cleanup AtomicBool gate
+
+- Target: the remaining direct DML write rows where
+  `SharedTxnPageIo::clear_stale_synthetic_pending_commit_surface` still appears
+  as per-write overhead, especially the current 100-row UPDATE/DELETE frontier.
+- Touched during rejected candidate: `crates/fsqlite-mvcc/src/begin_concurrent.rs`
+  and `crates/fsqlite-vdbe/src/engine.rs` in scratch worktree
+  `/data/tmp/frankensqlite-codex-synthetic-gate-20260509T074934Z`; the patch was
+  not applied to the main checkout. The rejected diff is preserved at
+  `tests/artifacts/perf/codex-synthetic-gate-20260509T074934Z/candidate.diff`.
+- Candidate shape: add a lock-free `Arc<AtomicBool>` mirror to
+  `ConcurrentHandle` for the narrow predicate that page 1 is currently tracked
+  only as a synthetic conflict surface, clone the flag into `ConcurrentContext`,
+  and let `clear_stale_synthetic_pending_commit_surface` return before locking
+  the concurrent handle when the flag is false. The locked
+  `concurrent_page_is_synthetic_conflict_only` check remained authoritative
+  before any clear.
+- Correctness/build proof before rejection:
+  `cargo fmt -p fsqlite-mvcc -p fsqlite-vdbe --check` passed,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-synthetic-gate-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-mvcc page_state -- --nocapture`
+  passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-synthetic-gate-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-vdbe shared_txn_page_io -- --nocapture`
+  passed. The first release build hit incompatible nightly cache artifacts in
+  the target directory, so fresh baseline/candidate target directories were
+  used instead of cleaning.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-synthetic-gate-20260509T074934Z/summary.md`,
+  `candidate.diff`, and the baseline/candidate isolated UPDATE/DELETE stdout
+  files in that artifact's `stdout/` directory.
+- Result: rejected before focused UPDATE/DELETE or full quick. The isolated
+  100-row UPDATE probe improved on both runs (`123 -> 111 ns/update` and
+  `122 -> 116 ns/update`), but isolated 100-row DELETE regressed on both runs
+  (`1812 -> 2008 ns/delete` and `1861 -> 1997 ns/delete`). The current full
+  quick frontier's worst row is 100-row delete, so this split result fails the
+  keep gate.
+- Do not retry a standalone synthetic page-one cleanup presence flag. Reconsider
+  only if a broader direct-DML operator removes the delete-side page-state churn
+  that made the AtomicBool stores visible, or if a same-window focused
+  UPDATE/DELETE matrix improves both update and delete absolute medians before
+  full quick.
+
+## 2026-05-09 - Transaction lifecycle read/write metric batching
+
+- Target: per-row explicit-transaction DML overhead in
+  `crates/fsqlite-core/src/connection.rs`, especially the
+  `txn_metrics_note_read` / `txn_metrics_note_write` `RefCell` borrow on every
+  active transaction operation.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  the source patch was restored after focused correctness tests failed.
+- Candidate shape: add per-connection pending `read_ops` / `write_ops` cells,
+  update first-read/first-write timestamps on the first pending operation, and
+  flush the pending counters before `txn_stats`, live transaction rows,
+  `txn_advisor`, `txn_timeline_json`, and transaction finish.
+- Correctness evidence:
+  `cargo fmt --check` passed, but
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-txn-metric-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core txn_ -- --nocapture`
+  failed before any benchmark was run.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-txn-metric-batch-20260509T075751Z/summary.md`.
+- Result: abandoned before benchmarking. The candidate broke retained
+  autocommit boundary tests:
+  `test_retained_autocommit_explicit_begin_flushes_prior_batch`,
+  `test_retained_autocommit_savepoint_flushes_prior_batch`,
+  `test_retained_autocommit_pragma_table_info_flushes_prior_batch`,
+  `test_retained_autocommit_schema_change_flushes_prior_batch`, and
+  `test_retained_autocommit_attach_and_detach_flush_prior_batch`. Those
+  failures show transaction lifecycle write accounting is not currently a
+  telemetry-only surface for retained autocommit publish behavior.
+- Do not retry lifecycle read/write metric batching as a standalone hot-path
+  trim. Reconsider only after the retained-autocommit flush policy has an
+  explicit non-metric state flag/proof boundary that makes lifecycle diagnostics
+  independent from publish decisions.
+
+## 2026-05-09 - Connection-pool statement count batching
+
+- Target: fixed setup/row-loop cost shared by the remaining 100-row INSERT and
+  UPDATE/DELETE tails in
+  `tests/artifacts/perf/codex-current-dml-profile-20260509T0649Z/`.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  the source patch was restored after the full quick matrix rejected it.
+- Candidate shape: buffer `PRAGMA fsqlite.connection_stats` query-count
+  increments in a `Cell<u64>` while an explicit transaction is active, then
+  flush the accumulated count at transaction-finish, stats-read, and close
+  boundaries. This avoided one shared atomic counter increment per prepared DML
+  statement inside hot explicit-transaction loops while preserving stats
+  visibility at normal transaction boundaries.
+- Correctness proof before rejection:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-pool-count-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core connection_stats -- --nocapture`
+  passed with an added regression test for same-connection stats reads during
+  an active transaction, and `cargo fmt --check` plus `git diff --check`
+  passed after formatting.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-pool-count-20260509T000000Z/candidate-insert.json`,
+  `candidate-full-quick.json`, `candidate-insert.stdout`, and
+  `candidate-full-quick.stdout`. Release-perf binaries were built with
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-pool-count-perf CARGO_BUILD_JOBS=8 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete`.
+- Result: rejected by the full quick matrix. Against the current frontier
+  `tests/artifacts/perf/codex-current-dml-profile-20260509T0649Z/current-full-quick.json`,
+  the candidate changed faster/comparable/C-faster from `80/4/9` to `81/4/8`,
+  and improved p90 from `1.0468303330` to `1.0213940719`, but worsened the
+  keep-gate distribution: avg/geomean `0.4525069616 / 0.2676577770 ->
+  0.4663929282 / 0.2705283337`, p99 `1.3701179003 -> 1.3767354779`, and
+  weighted score `0.3451750651 -> 0.3483601262`. The focused insert run was
+  also mixed: C-faster rows fell `8 -> 5`, but avg/geomean regressed
+  `0.8475782594 / 0.8238727739 -> 0.8659905162 / 0.8372208661` and p99 jumped
+  `1.1439911886 -> 1.3955493184`.
+- Do not retry connection-pool statement-count batching as a standalone
+  optimization. Reconsider only if connection stats become opt-in or if a
+  same-window full quick matrix shows the telemetry accounting cost dominates
+  without regressing large-record INSERT tails.
+
+## 2026-05-09 - DML leaf-patch interpolation admission
+
+- Target: direct-simple fixed-width REAL UPDATE rows inside
+  `UPDATE/DELETEThroughput`, especially the active
+  `TableLeafPayloadPatchRun` path that still performed a plain binary search
+  inside the retained leaf image.
+- Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs`; the
+  source patch was restored after the full quick matrix rejected it.
+- Candidate shape: replace the patch-run's private binary rowid search with
+  the same dense/interpolation table-leaf admission used by normal table
+  cursor seeks, and share the extracted helper with
+  `BtCursor::search_integer_key_table_leaf`.
+- Correctness proof before rejection:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-dml-leafsearch-local-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-btree test_table_leaf_interpolation_search_matches_binary -- --nocapture`
+  passed, as did
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-dml-leafsearch-local-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_prepared_direct_update_leaf_patch_run_ -- --nocapture`
+  and `cargo fmt --check`.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-dml-leafsearch-20260509T0645Z/summary.md`,
+  `update-quick.json`, and `full-quick.json`. The immediate comparison
+  baseline was
+  `tests/artifacts/perf/swiftgate-current-frontier-rerun-20260508T1900Z/full-quick.json`.
+- Result: rejected. The isolated UPDATE micro-kernel moved in the intended
+  direction (`100` rows: FSQLite `106 ns/update` vs C SQLite `288 ns/update`;
+  `1000` rows: FSQLite `177 ns/update` vs C SQLite `339 ns/update`), but the
+  full quick keep gate failed. Baseline full quick was `82` faster / `4`
+  comparable / `7` C-faster with avg/geomean `0.4505594084` / `0.2643439387`;
+  the candidate measured `80` faster / `5` comparable / `8` C-faster with
+  avg/geomean `0.4750122553` / `0.2726144046`. p99 improved
+  `1.8367705191 -> 1.4775184328`, but the suite-level avg/geomean and
+  C-faster count did not pass the matrix gate.
+- Do not retry patch-run interpolation admission as a standalone optimization.
+  Reconsider only as part of a broader DML leaf-run operator that also removes
+  payload projection / mirror costs and proves a full quick matrix win, or
+  after the benchmark harness has a longer, lower-variance focused DML mode
+  that can serve as the agreed keep gate.
+
+## 2026-05-09 - DML patch-run local payload target parser
+
+- Target: the fixed-width REAL direct UPDATE tail in
+  `UPDATE/DELETEThroughput`, specifically the retained
+  `TableLeafPayloadPatchRun` path's found-cell `CellRef::parse` overhead after
+  binary leaf admission.
+- Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs`; the
+  source patch was restored after the focused micro-gate rejected it.
+- Candidate shape: replace the found-cell `CellRef::parse` call in
+  `TableLeafPayloadPatchRun::patch_fixed_width_real` with a narrow table-leaf
+  local payload target parser that reused the rowid-search varint work and kept
+  local/overflow bounds checks before patching the projected REAL column.
+- Correctness proof before rejection:
+  `cargo fmt --check`,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-payload-target-local CARGO_BUILD_JOBS=8 cargo test -p fsqlite-btree test_table_leaf_interpolation_search_matches_binary -- --nocapture`,
+  and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-payload-target-local CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_prepared_direct_update_leaf_patch_run_ -- --nocapture`
+  all passed.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-dml-payload-target-20260509T072645Z/summary.md`.
+  Release-perf binaries were built with
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-payload-target-perf CARGO_BUILD_JOBS=8 cargo build --profile release-perf -p fsqlite-e2e --bin perf-update-delete --bin comprehensive-bench`.
+- Result: rejected before full quick. The isolated 100-row UPDATE micro-kernel
+  was FSQLite `117 ns/update` vs C SQLite `302 ns/update` (`0.39x`), and the
+  isolated 1000-row UPDATE row was FSQLite `214 ns/update` vs C SQLite
+  `338 ns/update` (`0.64x`), but both worsened versus the preceding rejected
+  leaf-search candidate's `106 ns` / `177 ns` on the same isolated rows. The
+  standard 100-row UPDATE row stayed C-faster: FSQLite `849 ns/update` vs C
+  SQLite `438 ns/update` (`1.94x`).
+- Confirming retry: a same-basis scratch variant preserved at
+  `tests/artifacts/perf/codex-patchrun-fastpayload-20260509T0815Z/` moved only
+  the direct local payload-bound read into a private
+  `TableLeafPayloadPatchRun::table_leaf_local_payload_bounds_at` helper. It
+  passed `cargo fmt -p fsqlite-btree --check`, passed
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-patchrun-fastpayload-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_prepared_direct_update_leaf_patch_run -- --nocapture --test-threads=1`,
+  and built release-perf baseline/candidate binaries. The first keep gate still
+  failed: clean isolated 100-row UPDATE was FSQLite `126 ns/update` vs C SQLite
+  `299 ns/update` (`0.42x`), while the candidate worsened to FSQLite
+  `142 ns/update` vs C SQLite `307 ns/update` (`0.46x`). It was not widened to
+  focused UPDATE/DELETE or full quick.
+- Do not retry the local payload target parser as a standalone
+  `TableLeafPayloadPatchRun` optimization. Reconsider only if it is fused into a
+  broader DML leaf-run operator that removes row admission, payload projection,
+  and page publication costs together and wins the focused DML plus full quick
+  matrices.
+
+## 2026-05-09 - Pager publish direct-page batch collection
+
+- Target: insert-heavy rows that still spend meaningful time in commit/page
+  publication, especially the small and large insert cases in the current clean
+  frontier artifact
+  `tests/artifacts/perf/codex-current-dml-profile-20260509T0649Z/`.
+- Touched during rejected candidate: `crates/fsqlite-pager/src/pager.rs` in the
+  scratch worktree
+  `/data/tmp/frankensqlite-codex-publish-batch-20260509`; the patch was not
+  applied to the main checkout. The rejected diff is preserved at
+  `tests/artifacts/perf/codex-publish-batch-20260509T071527Z/candidate.diff`.
+- Candidate shape: stream accepted direct-slot pages from
+  `AtomicPublishedPages::insert_batch` under the existing `active_indices` lock
+  and collect only overflow pages into a caller-provided vector, removing the
+  separate direct-page vector allocation from `PublishedPages::insert_batch`
+  without changing publish serialization.
+- Correctness proof before rejection:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-publish-batch-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-pager test_published_pages_insert_batch_and_retain_track_page_count -- --nocapture`
+  passed, as did `cargo fmt -p fsqlite-pager --check` and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-publish-batch-target CARGO_BUILD_JOBS=16 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-publish-batch-20260509T071527Z/summary.md`,
+  `candidate-insert.json`, `candidate-update.json`, and `candidate.diff`.
+  The comparison baseline was
+  `tests/artifacts/perf/codex-current-dml-profile-20260509T0649Z/current-insert.json`
+  plus `current-update.json`.
+- Result: rejected. Insert-focused p99 improved
+  `1.2667693342 -> 1.1796835053`, but avg/geomean/score regressed
+  `0.8585200473 / 0.8296885039 / 0.8068014463 -> 0.8645965613 /
+  0.8429239167 / 0.8081003709`, p90 regressed
+  `1.1259827638 -> 1.1564665563`, and the C-faster count rose
+  `6 -> 7`. UPDATE/DELETE p99 improved only slightly
+  `1.3505559510 -> 1.3453755247`, while avg/geomean/median/score regressed
+  `0.9864502844 / 0.9553590275 / 0.9713879229 / 0.9553590275 ->
+  0.9947145101 / 0.9685535344 / 0.9862577741 / 0.9685535344`.
+- Do not retry direct-page batch collection as a standalone optimization.
+  Reconsider only with allocator/profile evidence that the direct-page vector
+  construction is dominant and a candidate that improves focused insert,
+  focused UPDATE/DELETE, and the full quick matrix together.
+
 ## 2026-05-08 - Retained direct-DML cursor shell
 
 - Target: remaining `UPDATE/DELETEThroughput` direct-simple UPDATE/DELETE rows,
@@ -7300,3 +8908,683 @@ set: sessions found by
   optimization. Reconsider only if a profile shows the guard itself dominating
   direct DELETE and a same-window focused DML matrix proves both the small-row
   tail and the 10K DELETE row improve.
+
+## 2026-05-09 - Same-leaf DELETE run search-hint narrowing
+
+- Target: the corrected `UPDATE/DELETEThroughput` tail after the retained
+  same-leaf direct DELETE run, especially `100 rows / delete 5 rows` and the
+  isolated `perf-update-delete 100 ... delete compare isolated` row.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`. The source patch was manually unwound
+  after the focused DML benchmark rejected it; only this ledger entry and
+  artifacts remain.
+- Candidate shape: make `TableLeafDeleteRun::search_table_leaf` probe the
+  run's current `cell_idx` before binary search and narrow the search to the
+  remaining half of the retained leaf. The hypothesis was that monotone prepared
+  DELETE loops should not re-search cells already passed by the same retained
+  page image.
+- Correctness proof before benchmark rejection:
+  `cargo fmt --check`, `git diff --check`, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-next-check CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core test_prepared_direct_delete_leaf_run -- --nocapture --test-threads=1`.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-delete-tail-next-20260509T1050Z/update-quick-baseline.json`,
+  `tests/artifacts/perf/codex-delete-tail-next-20260509T1050Z/update-quick-candidate.json`,
+  and
+  `tests/artifacts/perf/codex-delete-tail-next-20260509T1050Z/perf-delete-100.data`.
+- Result: rejected. The isolated DELETE checks regressed from `1.65x` to
+  `1.75x` F/C at 100 rows and from `1.82x` to `1.90x` F/C at 1000 rows. The
+  focused UPDATE/DELETE quick gate worsened average ratio from `2.37x` to
+  `2.46x`; `100 rows / delete 5 rows` moved only within noise (`4.60x` to
+  `4.56x`) while update rows worsened. The profiler did identify
+  `TableLeafDeleteRun::delete_rowid` as a real self-time signal, but this
+  branchier hint path did not improve the matrix.
+- Do not retry current-cell search narrowing as a standalone same-leaf DELETE
+  optimization. Reconsider only with a lower-branch search design that wins the
+  isolated DELETE checks and the same-window focused UPDATE/DELETE gate.
+
+## 2026-05-09 - Same-leaf DELETE no-overflow shape parser
+
+- Target: the current `UPDATE/DELETEThroughput` DELETE tail after the retained
+  same-leaf direct DELETE run and small-delete hybrid, especially
+  `100 rows / delete 5 rows`.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`. The source patch was manually unwound
+  after the focused UPDATE/DELETE gate rejected it; only this ledger entry and
+  artifacts remain.
+- Candidate shape: replace the found-cell `CellRef::parse` in
+  `TableLeafDeleteRun::delete_rowid` with a narrow table-leaf payload-size and
+  bounds check. The hypothesis was that search had already proven the rowid, so
+  the delete run only needed to reject overflow cells before deferring the
+  compact leaf rewrite.
+- Correctness proof before benchmark rejection:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-final-main-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-btree test_table_leaf_delete_run_defragments_multiple_root_leaf_cells -- --nocapture`,
+  `cargo fmt -p fsqlite-btree --check`, and `git diff --check -- crates/fsqlite-btree/src/cursor.rs`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-delete-frontier-profile-20260509T0840Z/`,
+  which captured the baseline isolated/standard DELETE comparisons and perf
+  reports, and
+  `tests/artifacts/perf/codex-delete-nooverflow-candidate-20260509T0851Z/`,
+  which captured the candidate isolated/standard DELETE comparisons plus
+  focused `UPDATE/DELETE` quick matrix.
+- Result: rejected. The isolated 100-row DELETE micro-loop improved from
+  FSQLite `433 ns/delete` versus C SQLite `289 ns/delete` (`1.50x`) to FSQLite
+  `417 ns/delete` versus C SQLite `298 ns/delete` (`1.40x`), but the
+  benchmark-shaped standard delete run worsened from FSQLite `1415 ns/delete`
+  versus C SQLite `430 ns/delete` (`3.29x`) to FSQLite `1635 ns/delete` versus
+  C SQLite `408 ns/delete` (`4.01x`). The focused UPDATE/DELETE gate also
+  worsened: weighted score `1.3497836378 -> 1.3959198820`, average ratio
+  `1.4631128932 -> 1.5300274368`, and `100 rows / delete 5 rows` F median
+  `0.007665 ms -> 0.008536 ms`.
+- Do not retry the no-overflow shape parser as a standalone
+  `TableLeafDeleteRun` optimization. Reconsider only if fused with a broader
+  delete-run admission/materialization rewrite that wins both the isolated
+  DELETE check and the same-window focused UPDATE/DELETE matrix.
+
+## 2026-05-09 - Direct DELETE leaf-run writer flush
+
+- Target: the same-leaf direct DELETE flush boundary after the retained delete
+  run and small-delete hybrid, specifically the fixed cost of constructing a
+  temporary `BtCursor` only to publish an already-owned leaf page image.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` and
+  `crates/fsqlite-btree/src/cursor.rs`. The source patch was manually unwound
+  after the focused UPDATE/DELETE gate rejected it; only this ledger entry and
+  artifacts remain.
+- Candidate shape: expose `TableLeafDeleteRun::into_page` outside the btree
+  cursor module and let `Connection::flush_pending_direct_delete_leaf_run`
+  publish the materialized leaf through `PageWriter` directly. This bypassed
+  `BtCursor::new`, cursor page-size configuration, cache clearing, and the root
+  page validation used by `flush_table_leaf_delete_run`.
+- Correctness proof before benchmark rejection:
+  `cargo fmt -p fsqlite-btree -p fsqlite-core --check`,
+  `git diff --check -- crates/fsqlite-btree/src/cursor.rs crates/fsqlite-core/src/connection.rs docs/progress/perf-negative-results.md`,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-final-main-target CARGO_BUILD_JOBS=8 cargo check -p fsqlite-core --lib`,
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-final-main-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-btree test_table_leaf_delete_run_defragments_multiple_root_leaf_cells -- --nocapture`,
+  and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-final-main-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_prepared_direct_delete_leaf_run -- --nocapture --test-threads=1`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-delete-direct-flush-candidate-20260509T0910Z/`,
+  including isolated and standard `perf-update-delete` DELETE comparisons plus
+  the focused `UPDATE/DELETE` quick matrix. The retained-patch comparison
+  baseline was
+  `tests/artifacts/perf/codex-main-small-delete-hybrid-20260509T1220Z/`.
+- Result: rejected. The isolated 100-row DELETE micro-loop improved slightly
+  from the earlier frontier's FSQLite `433 ns/delete` versus C SQLite
+  `289 ns/delete` (`1.50x`) to FSQLite `423 ns/delete` versus C SQLite
+  `301 ns/delete` (`1.40x`), but the benchmark-shaped standard DELETE run
+  worsened from FSQLite `1415 ns/delete` versus C SQLite `430 ns/delete`
+  (`3.29x`) to FSQLite `1563 ns/delete` versus C SQLite `433 ns/delete`
+  (`3.61x`). The focused UPDATE/DELETE gate also lost against both retained
+  small-delete-hybrid runs: weighted score `1.3477` / `1.3938` became
+  `1.5438`, average ratio `1.4835` / `1.5214` became `1.6968`, and the
+  unrelated `100 rows / update 10 rows` row regressed to ratio `2.3235`.
+- Do not retry direct writer publication for `TableLeafDeleteRun` as a
+  standalone optimization. Reconsider only if root validation and cursor
+  publication are eliminated as part of a broader delete-run operator that
+  improves the benchmark-shaped standard DELETE run and same-window focused
+  UPDATE/DELETE matrix together.
+
+## 2026-05-09 - Non-root DELETE leaf-run rowid bounds
+
+- Target: retained same-leaf direct DELETE admission for multi-page delete
+  loops, especially avoiding a binary search of the previous retained leaf when
+  the next monotone rowid is outside that leaf.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`. The source patch was manually unwound
+  after the benchmark gates rejected it; only this ledger entry and artifacts
+  remain.
+- Candidate shape: add optional `(min_rowid, max_rowid)` bounds to
+  `TableLeafDeleteRun` only for non-root leaves, then let
+  `delete_rowid` return `Ok(false)` before binary search when the requested
+  rowid is outside those bounds. Root-leaf runs intentionally paid no extra
+  rowid-bound parse so the 100-row case would not take new setup overhead.
+- Correctness proof before benchmark rejection:
+  `cargo fmt -p fsqlite-btree --check`,
+  `git diff --check -- crates/fsqlite-btree/src/cursor.rs`, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-final-main-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-btree test_table_leaf_delete_run_defragments_multiple_root_leaf_cells -- --nocapture`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-delete-rowid-bounds-candidate-20260509T0935Z/`,
+  including isolated and standard `perf-update-delete` DELETE comparisons plus
+  the focused `UPDATE/DELETE` quick matrix. The retained-patch comparison
+  baseline was
+  `tests/artifacts/perf/codex-main-small-delete-hybrid-20260509T1220Z/`.
+- Result: rejected. The isolated 100-row DELETE micro-loop regressed to
+  FSQLite `997 ns/delete` versus C SQLite `591 ns/delete` (`1.69x`) compared
+  with the retained frontier's FSQLite `433 ns/delete` versus C SQLite
+  `289 ns/delete` (`1.50x`). The benchmark-shaped standard DELETE run landed
+  at FSQLite `1465 ns/delete` versus C SQLite `446 ns/delete` (`3.29x`), which
+  did not improve the retained frontier's `1415 ns/delete` versus
+  `430 ns/delete`. The focused matrix's weighted score looked better
+  (`1.2428`) only because C SQLite medians were much slower in the same run;
+  FSQLite absolute medians worsened versus the retained baseline on every
+  DELETE row (`0.008165 ms -> 0.017153 ms`, `0.048050 ms -> 0.063018 ms`,
+  and `0.328966 ms -> 0.332873 ms` for 100/1000/10000 rows).
+- Do not retry leaf rowid-bound checks as a standalone same-leaf DELETE
+  admission optimization. Reconsider only with instrumentation proving
+  out-of-leaf misses dominate the delete-run cost and a same-window benchmark
+  that improves FSQLite absolute medians, not just ratios shifted by slower
+  C SQLite measurements.
+
+## 2026-05-09 - Prepared-cache consecutive last-hit template
+
+- Target: repeated prepared `UPDATE`/`DELETE` loops where the same SQL text is
+  prepared on every iteration and the regular prepared-cache LRU lookup mutates
+  cache recency on every hit.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The source patch was manually
+  unwound after the full quick matrix showed no durable improvement; only this
+  ledger entry and artifacts remain.
+- Candidate shape: add a one-entry `prepared_cache_last_hit` next to the
+  existing prepared template LRU. Consecutive same-key/same-SQL hits checked
+  the same schema cookie, schema generation, and function registry generation
+  as the normal prepared cache before returning the cached template without
+  mutating the LRU.
+- Correctness proof before benchmark rejection:
+  `cargo fmt -p fsqlite-core --check`,
+  `git diff --check -- crates/fsqlite-core/src/connection.rs`, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-final-main-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core prepared_cache -- --nocapture --test-threads=1`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-frontier-post-delete-hybrid-20260509T1010Z/`
+  for the pre-candidate frontier and
+  `tests/artifacts/perf/codex-prepared-last-hit-candidate-20260509T1025Z/`
+  for the candidate focused and full quick runs.
+- Result: rejected. The full quick primary weighted score moved only from
+  `0.3721870586` to `0.3719670566`, while geomean worsened from
+  `0.2719371401` to `0.2774929641`, average ratio worsened from
+  `0.4964964000` to `0.5049898958`, and the 93-scenario count moved from
+  `79/2/12` faster/comparable/C-faster to `78/3/12`. The focused
+  UPDATE/DELETE gate also failed to beat the retained small-delete-hybrid
+  artifacts: candidate geomean `1.4194167623` was worse than the retained
+  `1.3476973709` and repeat `1.3938309901`.
+- Do not retry a prepared-cache last-hit template as a standalone optimization.
+  Reconsider only if same-window DML profiling shows prepared-cache LRU
+  mutation as a dominant self-time source and the full quick matrix improves
+  on geomean and primary score together.
+
+## 2026-05-09 - Direct DELETE scratch-reset guard elision
+
+- Target: repeated prepared direct `DELETE FROM bench WHERE id = ?1` inside an
+  explicit transaction, especially the hot same-leaf delete-run path that does
+  not touch the direct INSERT/UPDATE scratch buffers.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The source patch was manually
+  unwound after the focused repeat showed mixed absolute medians; only this
+  ledger entry and artifacts remain.
+- Candidate shape: remove `PreparedDirectInsertScratchResetGuard` from
+  `execute_prepared_direct_simple_delete` so the direct DELETE hot path skips
+  per-row clearing of insert/update scratch buffers that are unused unless the
+  retained count/sum fallback path needs to decode the old row.
+- Correctness proof before benchmark rejection:
+  `cargo fmt -p fsqlite-core --check`,
+  `git diff --check -- crates/fsqlite-core/src/connection.rs`, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-final-main-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_prepared_direct_delete_leaf_run -- --nocapture --test-threads=1`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-direct-delete-scratch-reset-candidate-20260509T1115Z/`,
+  including focused UPDATE/DELETE quick, focused repeat, and full quick matrix
+  runs. The retained comparison artifacts were
+  `tests/artifacts/perf/codex-main-small-delete-hybrid-20260509T1220Z/` and
+  `tests/artifacts/perf/codex-current-frontier-post-delete-hybrid-20260509T1010Z/`.
+- Result: rejected. The full quick write-single geomean improved
+  (`1.1944836817 -> 1.1797993896`) and the focused repeat geomean improved
+  slightly against the retained best (`1.3476973709 -> 1.3428875483`), but the
+  apparent ratio win was not backed by consistent FSQLite absolute medians.
+  The focused repeat kept `100 rows / delete 5 rows` roughly flat
+  (`0.008165 ms` retained best versus `0.008195 ms` candidate), left
+  `1000 rows / delete 50 rows` in the same band (`0.033363 ms` retained repeat
+  versus `0.034004 ms` candidate), and worsened `10000 rows / delete 500 rows`
+  (`0.306073 ms` retained repeat versus `0.340548 ms` candidate). The full
+  quick primary weighted score also worsened from `0.3721870586` to
+  `0.3780985264`.
+- Do not retry direct DELETE scratch-reset elision as a standalone
+  optimization. Reconsider only with direct instrumentation showing scratch
+  clearing as material self-time and a same-window run that improves FSQLite
+  absolute medians on all DELETE rows.
+
+## 2026-05-09 - Pending direct DELETE one-pass defrag threshold retune
+
+- Target: prepared direct `DELETE FROM bench WHERE id = ?1` inside the quick
+  UPDATE/DELETE matrix, where the pending same-leaf delete run flushes compact
+  leaf pages after grouped rowid deletes.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`. The candidate patch changed
+  `SMALL_DELETE_INCREMENTAL_LIMIT` from `8` to `1` and was manually unwound
+  after the focused matrix/profile failed the keep gate.
+- Candidate shape: force the one-pass compact-page materializer whenever a
+  pending leaf run contains more than one delete, instead of using the
+  incremental descending compactor for up to eight deleted cells. The theory
+  was that sparse multi-delete pages would copy fewer total cell bytes.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-delete-leaf-run-profile-20260509T1445Z/`
+  captured the retained threshold profile, and
+  `tests/artifacts/perf/codex-delete-defrag-threshold1-20260509T1455Z/`
+  captured the threshold-1 candidate.
+- Result: rejected. The candidate worsened profiled delete-run flush time on
+  the 500-delete row from about `107 us` to about `158 us`; the focused quick
+  DELETE medians did not improve (`delete 5/100` stayed about `8.7-8.8 us`,
+  `delete 50/1000` stayed about `33 us`, and `delete 500/10000` stayed about
+  `316-320 us`). The focused average ratio also moved the wrong way in the
+  same-window run.
+- Do not retry lowering `SMALL_DELETE_INCREMENTAL_LIMIT` as a standalone
+  optimization. Reconsider only if a new delete workload has much larger
+  per-leaf delete groups and same-window profiling shows the incremental
+  compactor, not page publication or active-run lookup, as the dominant cost.
+
+## 2026-05-09 - Pending direct DELETE cursorless flush
+
+- Target: prepared direct `DELETE FROM bench WHERE id = ?1` pending same-leaf
+  run flushes, especially the quick matrix rows `delete 50/1000` and
+  `delete 500/10000`.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` and
+  `crates/fsqlite-btree/src/cursor.rs`. The candidate made
+  `TableLeafDeleteRun::into_page` public and changed
+  `flush_pending_direct_delete_leaf_run` to materialize/write the page through
+  `TransactionPageIo`/`SharedTxnPageIo` directly, instead of constructing a
+  throwaway `BtCursor` for `flush_table_leaf_delete_run`. The source patch was
+  manually unwound after the full quick matrix failed the keep gate.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-delete-direct-writer-flush-20260509T1510Z/`,
+  `tests/artifacts/perf/codex-delete-direct-writer-flush-noprofile-20260509T1515Z/`,
+  and
+  `tests/artifacts/perf/codex-delete-direct-writer-flush-fullquick-20260509T1520Z/`.
+- Result: rejected. The profiled flush timer moved only slightly on the
+  500-delete row (`~107 us` retained to `~102 us` candidate), while the
+  no-profile focused run did not improve all FSQLite DELETE medians
+  (`delete 5/100` and `delete 500/10000` were worse than the retained current
+  dirty artifact). The full quick matrix also worsened geomean
+  (`0.2721160643 -> 0.2772224020`) and average ratio
+  (`0.4884036044 -> 0.4900305088`).
+- Do not retry cursorless pending direct DELETE flush as a standalone
+  optimization. Reconsider only if a same-window profile shows cursor
+  construction itself, rather than compact-page materialization or write-set
+  publication, dominating the flush path.
+
+## 2026-05-09 - Direct DML no-op pending-write flush pre-gate
+
+- Target: prepared direct INSERT/UPDATE/DELETE entry points in
+  `crates/fsqlite-core/src/connection.rs`, where each DML shape first flushes
+  incompatible pending direct write runs even when the matching pending-run
+  slot is empty.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The candidate wrapped the
+  cross-shape flushes in existing active-flag checks:
+  `pending_direct_update_leaf_patch_run_active`,
+  `pending_direct_delete_leaf_run_active`, and
+  `pending_direct_insert_page_run_active`. The source patch was manually
+  unwound after the full quick matrix failed the primary keep gate.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-delete-perf-20260509T152128/` showed a
+  small `flush_pending_direct_update_leaf_patch_run` sample in the standard
+  DELETE proxy profile; the candidate A/B runs are
+  `tests/artifacts/perf/codex-flush-pregate-candidate-20260509T153111/`,
+  `tests/artifacts/perf/codex-flush-pregate-candidate-repeat-20260509T153346Z/`,
+  and
+  `tests/artifacts/perf/codex-flush-pregate-fullquick-20260509T153400Z/`.
+- Result: rejected. The focused UPDATE/DELETE repeat showed only a tiny
+  improvement in geomean (`1.3833281272 -> 1.3770720964`) and average ratio
+  (`1.5151524964 -> 1.5037535979`). The full quick matrix improved average
+  ratio (`0.5009796353 -> 0.4849641313`), geomean
+  (`0.2782529045 -> 0.2773960637`), and FSQLite-faster count (`80 -> 81`),
+  but the primary weighted score regressed slightly
+  (`0.3687948143 -> 0.3694982710`). The earlier focused INSERT slice also
+  worsened the weighted score (`0.7750871369 -> 0.8239573353`) and increased
+  C-faster rows (`7 -> 8`).
+- Do not retry this active-flag pre-gate as a standalone optimization.
+  Reconsider only if instrumentation shows these no-op flush calls as material
+  self-time and a same-window full quick run improves the primary weighted
+  score, not just individual write rows.
+
+## 2026-05-09 - Prebuilt-record rowid alias eval fast path
+
+- Target: `INSERTThroughput --quick --filter insert`, especially the
+  `tiny_1col` rows where `INSERT INTO bench VALUES (?1)` already uses a
+  prebuilt constant storage record and only needs the explicit rowid from the
+  INTEGER PRIMARY KEY alias expression.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The candidate changed
+  `eval_prepared_direct_simple_insert_explicit_rowid_only` to find the rowid
+  alias column once and bypass the scratch-string borrow plus generic
+  expression evaluator for non-strict placeholder/literal rowid aliases. The
+  source patch was manually unwound after the repeated focused INSERT gate
+  rejected it.
+- Correctness proof before measurement:
+  `cargo fmt -p fsqlite-core --check` passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-rowid-fastpath-test CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core prepared_direct_simple_insert -- --nocapture --test-threads=1`
+  passed all 28 matching direct INSERT tests.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-insert-profile-20260509T153702Z/`
+  captured the current insert profile, and
+  `tests/artifacts/perf/codex-rowid-alias-fastpath-20260509T155238Z/` plus
+  `tests/artifacts/perf/codex-rowid-alias-fastpath-repeat-20260509T155302Z/`
+  captured the same-window candidate A/B runs.
+- Result: rejected. The first focused INSERT run looked promising, moving the
+  primary weighted score `0.8299001271 -> 0.7416901923`, average ratio
+  `0.8284220545 -> 0.8264198395`, and geomean
+  `0.8014118114 -> 0.7985739196`, but p99 worsened
+  `1.2097723273 -> 1.3360817775`. The reverse-order repeat rejected the
+  candidate: weighted score worsened `0.7871566993 -> 0.8257678331`,
+  average/geomean worsened `0.8038534731 / 0.7853756250` to
+  `0.8213945030 / 0.7865259342`, and p99 worsened
+  `1.0993403196 -> 1.5571413248`.
+- Do not retry rowid-alias placeholder/literal specialization as a standalone
+  prebuilt-record optimization. Reconsider only if it is folded into a broader
+  prebuilt-record or transaction setup redesign that wins repeated focused
+  INSERT gates and the full quick primary score.
+
+## 2026-05-09 - MVCC finalize witness-summary reuse
+
+- Target: concurrent writer commit preparation in
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs`, where
+  `hydrate_finalize_witness_state` already sorts read/write witness keys and
+  returns compact key summaries before
+  `prepare_concurrent_commit_with_ssi` builds candidate conflict edges.
+- Touched during rejected candidate:
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs`. The candidate reused the
+  summaries returned by `hydrate_finalize_witness_state` instead of recomputing
+  `summarize_witness_keys` for the sorted read/write key vectors in the
+  non-uncontended SSI path. The source patch was manually unwound after the
+  focused concurrent gate regressed.
+- Correctness proof before measurement:
+  `cargo fmt -p fsqlite-mvcc --check` passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-mvcc-summary-test CARGO_BUILD_JOBS=4 cargo test -p fsqlite-mvcc prepare_concurrent_commit_with_ssi -- --nocapture --test-threads=1`
+  passed the matching focused test.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-concurrent-profile-20260509T155620Z/`
+  and
+  `tests/artifacts/perf/codex-current-concurrent-perf-20260509T155713Z/`
+  captured the current concurrent benchmark/profile leads. The same-window A/B
+  candidate run is
+  `tests/artifacts/perf/codex-mvcc-summary-reuse-20260509T160850Z/`.
+- Result: rejected. The focused concurrent primary weighted score worsened
+  `0.8130074220 -> 0.8649486081`, average ratio worsened
+  `0.8496493482 -> 0.9197304649`, geomean worsened
+  `0.8130074220 -> 0.8649486081`, median ratio worsened
+  `0.9927142095 -> 1.0147132379`, and p90/p99 worsened
+  `1.0313745561 -> 1.2230732404`. The 2-writer FSQLite median regressed from
+  `12.765787ms` to `15.073069ms`, while the 8-writer row remained only
+  slightly better due noise.
+- Do not retry witness-summary reuse as a standalone MVCC commit-prep
+  optimization. Reconsider only if a same-window profile shows duplicate
+  summary recomputation as material self-time and the focused concurrent gate
+  improves both 2-writer and 4-writer medians.
+
+## 2026-05-09 - MVCC page read-witness exact dedupe
+
+- Target: concurrent writer commit preparation and witness recording in
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs`, after the concurrent profile
+  showed read-witness cloning/collection and `record_read_witness` on the
+  remaining 2-writer and 4-writer C-faster rows.
+- Touched during rejected candidate:
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs`. The candidate added a
+  `read_page_witnesses` page set to `ConcurrentHandle` and used it to avoid
+  recording duplicate exact `WitnessKey::Page` read witnesses while preserving
+  granular cell/range witness entries. The source patch and its focused unit
+  test were manually unwound after the focused concurrent gate regressed.
+- Correctness proof before measurement:
+  `cargo fmt -p fsqlite-mvcc --check` passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-read-witness-test CARGO_BUILD_JOBS=4 cargo test -p fsqlite-mvcc test_page_read_witness_dedups_exact_page_key_without_dropping_cell_witness -- --nocapture --test-threads=1`
+  passed the new focused test.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-concurrent-profile-20260509T155620Z/`
+  and
+  `tests/artifacts/perf/codex-current-concurrent-perf-20260509T155713Z/`
+  captured the current concurrent benchmark/profile leads. The same-window A/B
+  candidate run is
+  `tests/artifacts/perf/codex-read-witness-page-dedup-20260509T162143Z/`.
+- Result: rejected. The focused concurrent primary weighted score worsened
+  `0.8419669684 -> 0.9165222048`, average ratio worsened
+  `0.8724640681 -> 0.9525179839`, geomean worsened
+  `0.8419669684 -> 0.9165222048`, and p90/p99 worsened
+  `1.0263615714 -> 1.1825152963`. Absolute FSQLite medians regressed on all
+  concurrent rows: 2 writers `12.846976ms -> 14.253099ms`, 4 writers
+  `20.976609ms -> 24.343293ms`, and 8 writers
+  `52.199384ms -> 56.421501ms`.
+- Do not retry exact page read-witness dedupe or an added page-witness set as a
+  standalone concurrent commit optimization. Reconsider only if instrumentation
+  proves duplicate page witnesses dominate the cloned read-key vector and the
+  extra per-read bookkeeping can be avoided on the insert hot path.
+
+## 2026-05-09 - Pending direct DELETE incremental compactor threshold 16
+
+- Target: prepared direct `DELETE FROM bench WHERE id = ?1` pending same-leaf
+  run flushes after current DML profiling still showed `delete_leaf_flush_ns`
+  around 102us on the 500-delete row.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`. The candidate changed
+  `SMALL_DELETE_INCREMENTAL_LIMIT` from `8` to `16` and was manually unwound
+  after the focused matrix failed the keep gate.
+- Candidate shape: extend the incremental descending compactor to same-leaf
+  delete groups up to sixteen cells, the opposite direction from the prior
+  threshold-1 reject, to see whether sparse 9-16 delete groups were paying too
+  much one-pass materialization overhead.
+- Correctness/build proof before rejection:
+  `cargo fmt -p fsqlite-btree --check` passed;
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-delete-threshold16-test CARGO_BUILD_JOBS=4 cargo test -p fsqlite-btree test_table_leaf_delete_run_defragments_multiple_root_leaf_cells -- --nocapture`
+  passed; `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-delete-threshold16-core-test CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core test_prepared_direct_delete_leaf_run -- --nocapture --test-threads=1`
+  passed; and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-delete-threshold16-bench CARGO_BUILD_JOBS=4 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-dml-profile-20260509T162631Z/`
+  captured the current DML profile lead, and
+  `tests/artifacts/perf/codex-delete-defrag-threshold16-20260509T164619Z/`
+  contains same-window baseline/candidate focused UPDATE/DELETE JSON and
+  DML-profile stderr captures.
+- Result: rejected. The candidate slightly reduced the internal flush timer on
+  DELETE rows (`delete 50/1000` `13806ns -> 11361ns`, `delete 500/10000`
+  `106377ns -> 103901ns`) but did not improve benchmark medians. Focused
+  UPDATE/DELETE faster/comparable/C-faster moved `3/0/3 -> 2/0/4`,
+  average/geomean worsened `1.3611619174 / 1.2333521033 ->
+  1.5101101763 / 1.3563579040`, p90/p99 worsened
+  `1.9569845353 -> 2.4341957255`, and FSQLite absolute medians worsened on
+  key rows including `delete 50/1000` `0.032551ms -> 0.034284ms`,
+  `delete 500/10000` `0.308137ms -> 0.320630ms`, and
+  `update 1000/10000` `0.278572ms -> 0.300873ms`.
+- Do not retry raising `SMALL_DELETE_INCREMENTAL_LIMIT` as a standalone
+  optimization. The compactor sub-timer is not a reliable keep signal by
+  itself; revisit only with a new materializer that improves FSQLite absolute
+  medians across the focused UPDATE/DELETE section in the same window.
+
+## 2026-05-09 - Adaptive sorted freed-page lookup
+
+- Target: `TransactionKind::get_page` and freed-page membership checks in
+  `crates/fsqlite-pager/src/pager.rs`, after isolated DELETE profiling showed
+  `TransactionKind::get_page` as the largest self-time symbol.
+- Touched during rejected candidate:
+  `crates/fsqlite-pager/src/pager.rs`. The candidate kept the existing linear
+  `freed_pages` path for small transactions, then lazily built and maintained a
+  sorted side lookup once a transaction had at least 64 freed pages. The source
+  patch was manually unwound after the focused matrix failed the keep gate.
+- Candidate shape: avoid repeating linear `freed_pages.contains()` scans in
+  longer DELETE transactions while preserving the small-transaction path that
+  the earlier sorted-membership attempt regressed.
+- Correctness/build proof before rejection:
+  `cargo fmt -p fsqlite-pager --check` passed; `git diff --check -- crates/fsqlite-pager/src/pager.rs`
+  passed; `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-freed-lookup-check CARGO_BUILD_JOBS=4 cargo check -p fsqlite-pager --lib`
+  passed; `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-freed-lookup-check CARGO_BUILD_JOBS=4 cargo test -p fsqlite-pager freed_pages -- --nocapture --test-threads=1`
+  passed; `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-freed-lookup-check CARGO_BUILD_JOBS=4 cargo test -p fsqlite-pager free_page -- --nocapture --test-threads=1`
+  passed; `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-freed-lookup-check CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core test_prepared_direct_delete_leaf_run -- --nocapture --test-threads=1`
+  passed; and `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-freed-lookup-check CARGO_BUILD_JOBS=4 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-delete-isolated-delayed-perf-20260509T163258Z/`
+  captured the motivating DELETE profile, and
+  `tests/artifacts/perf/codex-freed-lookup-adaptive-20260509T170836Z/`
+  contains same-window focused UPDATE/DELETE baseline and candidate JSON.
+- Result: rejected. The focused UPDATE/DELETE geomean improved
+  `1.4159355958 -> 1.3837148544`, but the target DELETE rows did not improve:
+  `delete 5/100` FSQLite median worsened `0.008416ms -> 0.009177ms`,
+  `delete 50/1000` was essentially flat `0.033212ms -> 0.033242ms`, and
+  `delete 500/10000` worsened `0.311463ms -> 0.315541ms`. Average ratio
+  worsened `1.5415566938 -> 1.5522165565`, median ratio worsened
+  `1.9434855859 -> 1.9505926534`, and p90/p99 worsened
+  `2.4073226545 -> 2.7263814617`.
+- Do not retry a sorted `freed_pages` side lookup as a standalone DELETE
+  optimization. Reconsider only if a workload with hundreds of same-transaction
+  freed pages is the explicit target and the focused UPDATE/DELETE matrix is
+  neutral on the small DELETE rows in the same measurement window.
+
+## 2026-05-09 - Prepared direct INSERT strict-column invariant hoist
+
+- Target: prepared direct INSERT record serialization in
+  `crates/fsqlite-core/src/connection.rs`, after the current INSERT profile
+  still showed `try_serialize_prepared_direct_simple_insert_record` in the
+  FSQLite hot path.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The candidate added a
+  `has_strict_columns` bool to `PreparedDirectSimpleInsert`, computed it once
+  while building the prepared direct INSERT plan, and used it in the per-row
+  serializer instead of scanning `direct.columns` for `strict_type`. The source
+  patch was manually unwound after the focused INSERT matrix failed the keep
+  gate.
+- Candidate shape: hoist a prepare-time invariant out of the row serializer
+  without changing strict-table behavior; strict direct inserts still fall back
+  to the validated value-building path.
+- Correctness/build proof before rejection:
+  `cargo fmt -p fsqlite-core --check` passed; `git diff --check -- crates/fsqlite-core/src/connection.rs`
+  passed; `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-strict-hoist-check CARGO_BUILD_JOBS=4 cargo check -p fsqlite-core --lib`
+  passed; `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-strict-hoist-check CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core test_prepared_direct_simple_insert_autocommit_profile_breakdown -- --nocapture --test-threads=1`
+  passed; `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-strict-hoist-check CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core test_insert_enforces_strict_column_types -- --nocapture --test-threads=1`
+  passed; and `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-strict-hoist-check CARGO_BUILD_JOBS=4 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-insert-perf-20260509T153816Z/`
+  captured the motivating INSERT profile, and
+  `tests/artifacts/perf/codex-strict-column-hoist-20260509T172635Z/`
+  contains same-window focused INSERT baseline and candidate JSON.
+- Result: rejected. The focused INSERT primary weighted score worsened
+  `0.8220778788 -> 0.8490651990`, average ratio worsened
+  `0.8574671865 -> 0.8620055127`, geomean worsened
+  `0.8362773705 -> 0.8402236186`, median worsened
+  `0.8066411737 -> 0.8103707053`, p90 worsened
+  `1.1201481385 -> 1.1280820309`, and p99 worsened
+  `1.1435639017 -> 1.2845704465`. The `large_10col` 10K rows improved, but
+  small-row and weighted-score regressions failed the gate.
+- Do not retry `has_strict_columns` / strict-column-scan hoisting as a
+  standalone prepared direct INSERT optimization. Reconsider only if folded into
+  a broader prepared row-template design that improves the focused INSERT
+  primary score and p99 in the same measurement window.
+
+## 2026-05-09 - Table leaf delete compact-area admission cache
+
+- Target: `TableLeafDeleteRun::delete_rowid` and
+  `TableLeafDeleteRun::materialize_deletions` in
+  `crates/fsqlite-btree/src/cursor.rs`, after isolated DELETE profiling showed
+  `TableLeafDeleteRun::delete_rowid` self-time including repeated compact-cell
+  area checks.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`. The candidate cached the
+  `has_compact_cell_area` result when constructing a same-leaf delete run and
+  reused the bool during delete admission and materialization. The source patch
+  was manually unwound after the full quick matrix failed the keep gate.
+- Candidate shape: avoid repeating the `cell_pointers.iter().min()` compact
+  page-shape scan inside a delete run while still rejecting pages that are not
+  compact enough for the incremental direct DELETE path.
+- Correctness/build proof before rejection:
+  `cargo fmt -p fsqlite-btree --check` passed; `git diff --check -- crates/fsqlite-btree/src/cursor.rs`
+  passed; `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-next-profile-target CARGO_BUILD_JOBS=4 cargo test -p fsqlite-btree test_table_leaf_delete_run -- --nocapture --test-threads=1`
+  passed; and `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-next-profile-target CARGO_BUILD_JOBS=4 cargo build --profile release-perf -p fsqlite-e2e --bin perf-update-delete --bin comprehensive-bench`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-next-current-profile-20260509T215642Z/`
+  contains the motivating `perf-delete-isolated-symbols.data`, focused
+  UPDATE/DELETE baseline and candidate JSON, and the full quick candidate JSON.
+  Compare against the retained baseline
+  `tests/artifacts/perf/codex-current-full-local-20260509T2125Z/full-current.json`.
+- Result: rejected. The focused UPDATE/DELETE repeat improved the geomean from
+  the earlier current profile `1.6335937522 -> 1.4080647879`, but the full quick
+  matrix failed the project keep gate: primary weighted score worsened
+  `0.3804304224 -> 0.3850955200`, geomean worsened
+  `0.2814659031 -> 0.2834412182`, median worsened
+  `0.3003993277 -> 0.3474039569`, and p99 worsened
+  `2.3830634457 -> 2.5146299484`. The target DELETE rows also worsened by
+  ratio in the full matrix: `delete 5/100` `2.3830634457 -> 2.5146299484`,
+  `delete 50/1000` `1.8588990426 -> 2.0133819951`, and `delete 500/10000`
+  `1.8251918809 -> 1.9574558553`.
+- Do not retry a standalone cached compact-area bool for same-leaf direct
+  DELETE. Reconsider only as part of a broader delete-run representation change
+  that improves the full quick primary score and the DELETE rows in the same
+  measurement window.
+
+## 2026-05-10 - Retained table-leaf page move at UPDATE/DELETE flush
+
+- Target: retained same-leaf UPDATE/DELETE run publication in
+  `crates/fsqlite-btree/src/cursor.rs`, after the corrected prepared-DML
+  artifact showed the DELETE tail still dominated by small retained leaf-run
+  flushes.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`. The candidate changed
+  `TableLeafPayloadPatchRun::into_page` and `TableLeafDeleteRun::into_page` to
+  move the owned `PageData` out of the retained `StackEntry` via
+  `std::mem::replace` instead of cloning the page image at publication. The
+  source patch was manually unwound after the focused corrected DML benchmark
+  failed the keep gate.
+- Candidate shape: avoid a 4 KiB page clone on each retained same-leaf UPDATE
+  patch-run or DELETE run flush while preserving the same materialization and
+  page-write boundary.
+- Correctness/build proof before rejection:
+  `cargo fmt --check` passed after formatting the candidate; and
+  `env CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-proceed-check-target cargo test -p fsqlite-btree table_leaf_delete_run -- --nocapture`
+  passed. The first compile attempt correctly rejected a direct field move
+  because `StackEntry` implements `Drop`; the tested candidate used
+  `std::mem::replace`.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-btree-delete-page-move-20260510T0055Z/`
+  contains the focused UPDATE/DELETE candidate JSON, profile stderr, stdout,
+  and summary. Compare against the corrected prepared-DML baseline
+  `tests/artifacts/perf/codex-dml-prepared-fairness-20260510T0118Z/update-delete.json`.
+- Result: rejected. Faster/comparable/C-faster stayed `2 / 0 / 4`, but the
+  focused UPDATE/DELETE geomean worsened `1.5375199626 -> 1.5783435139`,
+  average worsened `1.7579793375 -> 1.8017759058`, and p99 worsened
+  `3.4058927001 -> 3.5438368056`. The largest 500-delete row improved
+  slightly (`1.9526312197 -> 1.9260297054`), but small DELETE and UPDATE rows
+  regressed enough to fail the focused keep gate.
+- Do not retry standalone retained-page move/unclone for same-leaf
+  UPDATE/DELETE flush. Reconsider only if paired with a broader retained-run
+  ownership redesign that improves the corrected focused DML geomean and p99 in
+  the same measurement window.
+
+## 2026-05-10 - Private-memory large commit cache eviction
+
+- Target: private `:memory:` metadata-only commit publication in
+  `crates/fsqlite-pager/src/pager.rs`, after the large INSERT profile showed
+  `StagedPage::into_buf` / cache population copies on the bulk-load commit
+  path.
+- Touched during rejected candidate:
+  `crates/fsqlite-pager/src/pager.rs`. The candidate skipped committed-cache
+  insertion for large private-memory single-connection commits and evicted
+  touched cache entries instead, leaving the backing store as the authoritative
+  read surface. The source patch and focused cache-eviction test were manually
+  unwound after the focused INSERT benchmark failed the keep gate.
+- Candidate shape: avoid copying thousands of just-written private-memory pages
+  into the advisory committed-page cache when the write transaction already
+  updated the backing store.
+- Correctness/build proof before rejection:
+  `cargo fmt -p fsqlite-pager --check` passed;
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-cache-skip-test CARGO_BUILD_JOBS=4 cargo test -p fsqlite-pager test_large_private_memory_metadata_only_commit_evicts_stale_cache_pages -- --nocapture`
+  passed; `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-cache-skip-test CARGO_BUILD_JOBS=4 cargo test -p fsqlite-pager metadata_only -- --nocapture`
+  passed; `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-cache-skip-test CARGO_BUILD_JOBS=4 cargo test -p fsqlite-pager private_memory -- --nocapture`
+  passed; and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-cache-skip-release-perf CARGO_BUILD_JOBS=4 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-insert-bulkload-perf-20260510T0314Z/`
+  captured the motivating baseline/profile, and
+  `tests/artifacts/perf/codex-private-memory-cache-evict-insert-20260510T0330Z/`
+  contains the focused INSERT candidate JSON/stdout/stderr.
+- Result: rejected. The focused INSERT primary weighted score worsened
+  `0.8357599374 -> 0.8626741680`, average ratio worsened
+  `0.9019129316 -> 0.9363402535`, geomean worsened
+  `0.8733771529 -> 0.9052026405`, median worsened
+  `0.8453748129 -> 0.8829828559`, and p99 worsened
+  `1.6269983195 -> 1.8899905638`. The 100K `large_10col` row regressed from
+  `168.65 ms` to `202.43 ms` despite a 10K `large_10col` improvement.
+- Do not retry private-memory commit cache eviction as a standalone INSERT
+  optimization. Reconsider only if a same-window profile proves cache insertion
+  dominates after the 100K large-row path is protected and the focused INSERT
+  primary score plus p99 improve together.

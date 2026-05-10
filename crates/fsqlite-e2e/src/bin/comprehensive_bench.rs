@@ -22,8 +22,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use asupersync::runtime::{BlockingTaskHandle, Runtime, RuntimeBuilder};
 use fsqlite_core::connection::{
-    hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
-    set_hot_path_profile_enabled,
+    HotPathProfileSnapshot, hot_path_profile_enabled, hot_path_profile_snapshot,
+    reset_hot_path_profile, set_hot_path_profile_enabled,
 };
 use serde::Serialize;
 
@@ -257,6 +257,52 @@ fn measure<F: FnMut()>(label: &str, row_count: usize, mut f: F) -> Measurement {
         let start = Instant::now();
         f();
         let elapsed = start.elapsed();
+        durations.push(elapsed);
+        total_elapsed += elapsed;
+
+        if iter >= MIN_ITERS && total_elapsed >= TARGET_DURATION {
+            break;
+        }
+    }
+    eprint!("\r{:80}\r", ""); // Clear progress line.
+
+    Measurement {
+        label: label.to_string(),
+        durations,
+        row_count,
+    }
+}
+
+fn measure_with_teardown<F, T>(
+    label: &str,
+    row_count: usize,
+    mut f: F,
+    mut teardown: T,
+) -> Measurement
+where
+    F: FnMut(),
+    T: FnMut(),
+{
+    // Warmup
+    for w in 0..WARMUP_ITERS {
+        eprint!("\r    [{label}] warmup {}/{WARMUP_ITERS}...", w + 1);
+        f();
+        teardown();
+    }
+
+    let mut durations = Vec::new();
+    let mut total_elapsed = Duration::ZERO;
+
+    for iter in 0..MAX_ITERS {
+        eprint!(
+            "\r    [{label}] iter {}/{MAX_ITERS} (total: {:.1}s)    ",
+            iter + 1,
+            total_elapsed.as_secs_f64()
+        );
+        let start = Instant::now();
+        f();
+        let elapsed = start.elapsed();
+        teardown();
         durations.push(elapsed);
         total_elapsed += elapsed;
 
@@ -2580,6 +2626,106 @@ fn metric_delta(after: u64, before: u64) -> u64 {
     after.saturating_sub(before)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn print_fsqlite_concurrent_profile(
+    n_threads: usize,
+    total_rows: usize,
+    fs_median: Duration,
+    profile: &HotPathProfileSnapshot,
+    wal_frames: u64,
+    wal_bytes: u64,
+    wal_group_commits: u64,
+    wal_group_commit_latency_us: u64,
+) {
+    let mvcc = &profile.vdbe.mvcc_write_path;
+    let page_data = &profile.vdbe.page_data_motion;
+    eprintln!(
+        "    [fs_concurrent_{n_threads}t] concurrent_profile rows={total_rows} fs_median={} direct_insert={} fast={} slow={} begin_ns={} execute_body_ns={} direct_flush_calls={} direct_flush_ns={} page_run_flushes={} page_run_records={} page_run_bytes={} page_run_owned={} page_run_arena={} page_run_repeated={} page_run_depth2={} row_build_ns={} cursor_setup_ns={} serialize_ns={} btree_insert_ns={} schema_validation_ns={} change_tracking_ns={} commit_pre_ns={} commit_roundtrip_ns={} pager_commit_calls={} pager_phase_a_ns={} pager_wal_ns={} pager_mem_flush_ns={} pager_journal_ns={} pager_c_metadata_ns={} pager_file_size_ns={} pager_unlock_ns={} pager_publish_ns={} pager_cache_finish_ns={} commit_finalize_ns={} commit_handle_ns={} post_write_ns={} finalize_post_ns={} parser_multi_calls={} parser_cache_hits={} parser_cache_misses={} parser_parse_ns={} parser_rewrite_ns={} bg_checks={} bg_ns={} op_cx_bg_gates={} dispatch_bg_gates={} pager_pub_refreshes={} commit_refreshes={} prepared_lookup_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} vdbe_opcodes={} vdbe_statements={} vdbe_statement_us={} vdbe_make_record={} mvcc_tier0={} mvcc_tier1={} mvcc_tier2={} mvcc_page_lock_waits={} mvcc_page_lock_wait_ns={} mvcc_busy_retries={} mvcc_busy_timeouts={} mvcc_stale_snapshot={} mvcc_page_one_tracks={} mvcc_page_one_track_ns={} mvcc_pending_clears={} mvcc_pending_clear_ns={} page_data_borrowed_norm={} page_data_borrowed_exact_copies={} page_data_owned_norm={} page_data_owned_passthrough={} page_data_owned_zero_extends={} page_data_owned_resized_copies={} page_data_payload_bytes={} page_data_zero_fill_bytes={} wal_frames={} wal_bytes={} wal_group_commits={} wal_group_commit_latency_us={}",
+        format_duration(fs_median),
+        profile.prepared_direct_insert_executions,
+        profile.parser.fast_path_executions,
+        profile.parser.slow_path_executions,
+        profile.begin_setup_time_ns,
+        profile.execute_body_time_ns,
+        profile.direct_write_flush_calls,
+        profile.direct_write_flush_time_ns,
+        profile.prepared_direct_insert_page_run_flushes,
+        profile.prepared_direct_insert_page_run_records,
+        profile.prepared_direct_insert_page_run_bytes,
+        profile.prepared_direct_insert_page_run_owned_flushes,
+        profile.prepared_direct_insert_page_run_arena_flushes,
+        profile.prepared_direct_insert_page_run_repeated_flushes,
+        profile.prepared_direct_insert_page_run_depth2_bulk_append_hits,
+        profile.prepared_direct_insert_row_build_time_ns,
+        profile.prepared_direct_insert_cursor_setup_time_ns,
+        profile.prepared_direct_insert_serialize_time_ns,
+        profile.prepared_direct_insert_btree_insert_time_ns,
+        profile.prepared_direct_insert_schema_validation_time_ns,
+        profile.prepared_direct_insert_change_tracking_time_ns,
+        profile.commit_pre_txn_time_ns,
+        profile.commit_txn_roundtrip_time_ns,
+        profile.pager_commit.commit_calls,
+        profile.pager_commit.phase_a_time_ns,
+        profile.pager_commit.wal_commit_time_ns,
+        profile.pager_commit.memory_flush_time_ns,
+        profile.pager_commit.journal_commit_time_ns,
+        profile.pager_commit.phase_c_metadata_time_ns,
+        profile.pager_commit.file_size_time_ns,
+        profile.pager_commit.unlock_time_ns,
+        profile.pager_commit.publish_time_ns,
+        profile.pager_commit.cache_finish_time_ns,
+        profile.commit_finalize_seq_time_ns,
+        profile.commit_handle_finalize_time_ns,
+        profile.commit_post_write_maintenance_time_ns,
+        profile.finalize_post_publish_time_ns,
+        profile.parser.parse_multi_calls,
+        profile.parser.parse_cache_hits,
+        profile.parser.parse_cache_misses,
+        profile.parser.parse_time_ns,
+        profile.parser.rewrite_time_ns,
+        profile.background_status_checks,
+        profile.background_status_time_ns,
+        profile.op_cx_background_gates,
+        profile.statement_dispatch_background_gates,
+        profile.pager_publication_refreshes,
+        profile.commit_refresh_count,
+        profile.prepared_lookup_time_ns,
+        profile.memdb_refresh_count,
+        profile.cached_write_txn_reuses,
+        profile.cached_write_txn_parks,
+        profile.page_buffer_pool_hits,
+        profile.page_buffer_pool_misses,
+        profile.vdbe.opcodes_executed_total,
+        profile.vdbe.statements_total,
+        profile.vdbe.statement_duration_us_total,
+        profile.vdbe.make_record_calls_total,
+        mvcc.tier0_already_owned_writes_total,
+        mvcc.tier1_first_touch_writes_total,
+        mvcc.tier2_commit_surface_writes_total,
+        mvcc.page_lock_waits_total,
+        mvcc.page_lock_wait_time_ns_total,
+        mvcc.write_busy_retries_total,
+        mvcc.write_busy_timeouts_total,
+        mvcc.stale_snapshot_rejects_total,
+        mvcc.page_one_conflict_tracks_total,
+        mvcc.page_one_conflict_track_time_ns_total,
+        mvcc.pending_commit_surface_clears_total,
+        mvcc.pending_commit_surface_clear_time_ns_total,
+        page_data.borrowed_write_normalization_calls_total,
+        page_data.borrowed_exact_size_copies_total,
+        page_data.owned_write_normalization_calls_total,
+        page_data.owned_passthrough_total,
+        page_data.owned_in_place_zero_extends_total,
+        page_data.owned_resized_copies_total,
+        page_data.normalized_payload_bytes_total,
+        page_data.normalized_zero_fill_bytes_total,
+        wal_frames,
+        wal_bytes,
+        wal_group_commits,
+        wal_group_commit_latency_us,
+    );
+}
+
 #[derive(Clone, Copy)]
 enum InsertProfileStrategy {
     Autocommit,
@@ -2795,7 +2941,7 @@ fn profile_fsqlite_insert_with_strategy(
     set_hot_path_profile_enabled(previous_hot_path_profile_enabled);
 
     eprintln!(
-        "    [fs_insert_{}_{}_{count}] insert_profile setup_us={setup_us:.1} begin_us={begin_us:.1} prepare_us={prepare_us:.1} insert_us={insert_us:.1} commit_us={commit_us:.1} rows={count} direct_insert={} fast={} slow={} schema_refreshes={} schema_refresh_ns={} begin_ns={} execute_body_ns={} commit_pre_ns={} commit_roundtrip_ns={} commit_finalize_ns={} commit_handle_ns={} post_write_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} row_build_ns={} cursor_setup_ns={} serialize_ns={} btree_insert_ns={} memdb_apply_ns={} schema_validation_ns={} autocommit_begin_ns={} autocommit_resolve_ns={} autocommit_executions={} change_tracking_ns={} record_parse_into={} record_decode_ns={} btree_payload_copy_calls={} btree_payload_copy_bytes={} btree_cell_assembly_calls={} btree_cell_assembly_bytes={} btree_leaf_payload_appends={} btree_leaf_payload_mutate_ns={} btree_leaf_payload_stage_ns={} btree_leaf_full_cell_appends={} btree_leaf_full_cell_mutate_ns={} btree_leaf_full_cell_stage_ns={} btree_quick_balance_attempts={} btree_quick_balance_hits={} btree_quick_balance_ns={} btree_local_split_attempts={} btree_local_split_hits={} btree_local_split_ns={} btree_nonroot_balance_calls={} btree_nonroot_balance_ns={} btree_no_split_reuse_hits={} btree_conservative_reloads={} btree_page_header_rebuilds={} vdbe_opcodes={} vdbe_statements={} vdbe_make_record={} wal_frames={} wal_bytes={} wal_group_commits={} wal_group_commit_size_sum={} wal_group_commit_latency_us={} commit_prepare_us={} commit_batch_build_us={} commit_conflict_snapshot_us={} commit_lane_prepare_us={} commit_consolidator_lock_wait_us={} commit_consolidator_flushing_wait_us={} commit_flusher_arrival_wait_us={} commit_wal_backend_lock_wait_us={} commit_exclusive_lock_us={} commit_wal_append_us={} commit_flush_frame_prep_us={} commit_append_conflict_check_us={} commit_append_frames_us={} commit_wal_sync_us={} commit_waiter_epoch_wait_us={} commit_flusher_commits={} commit_waiter_commits={} commit_phase_a_us={} commit_phase_b_us={} commit_phase_c1_us={} commit_phase_c2_us={} commit_phase_count={} commit_flusher_lock_wait_us={} commit_wal_service_us={}",
+        "    [fs_insert_{}_{}_{count}] insert_profile setup_us={setup_us:.1} begin_us={begin_us:.1} prepare_us={prepare_us:.1} insert_us={insert_us:.1} commit_us={commit_us:.1} rows={count} direct_insert={} fast={} slow={} schema_refreshes={} schema_refresh_ns={} begin_ns={} execute_body_ns={} direct_flush_calls={} direct_flush_ns={} page_run_flushes={} page_run_records={} page_run_bytes={} page_run_owned={} page_run_arena={} page_run_repeated={} page_run_empty_root={} page_run_depth2={} page_run_fallbacks={} page_run_fallback_rows={} commit_pre_ns={} commit_roundtrip_ns={} pager_commit_calls={} pager_phase_a_ns={} pager_wal_ns={} pager_mem_flush_ns={} pager_journal_ns={} pager_c_metadata_ns={} pager_file_size_ns={} pager_unlock_ns={} pager_publish_ns={} pager_cache_finish_ns={} commit_finalize_ns={} commit_handle_ns={} post_write_ns={} finalize_post_ns={} parser_multi_calls={} parser_cache_hits={} parser_cache_misses={} parser_parse_ns={} parser_rewrite_ns={} bg_checks={} bg_ns={} op_cx_bg_gates={} dispatch_bg_gates={} pager_pub_refreshes={} commit_refreshes={} prepared_lookup_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} row_build_ns={} cursor_setup_ns={} serialize_ns={} btree_insert_ns={} memdb_apply_ns={} schema_validation_ns={} autocommit_begin_ns={} autocommit_resolve_ns={} autocommit_executions={} change_tracking_ns={} record_parse_into={} record_decode_ns={} btree_payload_copy_calls={} btree_payload_copy_bytes={} btree_cell_assembly_calls={} btree_cell_assembly_bytes={} btree_leaf_payload_appends={} btree_leaf_payload_mutate_ns={} btree_leaf_payload_stage_ns={} btree_leaf_full_cell_appends={} btree_leaf_full_cell_mutate_ns={} btree_leaf_full_cell_stage_ns={} btree_quick_balance_attempts={} btree_quick_balance_hits={} btree_quick_balance_ns={} btree_local_split_attempts={} btree_local_split_hits={} btree_local_split_ns={} btree_nonroot_balance_calls={} btree_nonroot_balance_ns={} btree_no_split_reuse_hits={} btree_conservative_reloads={} btree_page_header_rebuilds={} vdbe_opcodes={} vdbe_statements={} vdbe_make_record={} wal_frames={} wal_bytes={} wal_group_commits={} wal_group_commit_size_sum={} wal_group_commit_latency_us={} commit_prepare_us={} commit_batch_build_us={} commit_conflict_snapshot_us={} commit_lane_prepare_us={} commit_consolidator_lock_wait_us={} commit_consolidator_flushing_wait_us={} commit_flusher_arrival_wait_us={} commit_wal_backend_lock_wait_us={} commit_exclusive_lock_us={} commit_wal_append_us={} commit_flush_frame_prep_us={} commit_append_conflict_check_us={} commit_append_frames_us={} commit_wal_sync_us={} commit_waiter_epoch_wait_us={} commit_flusher_commits={} commit_waiter_commits={} commit_phase_a_us={} commit_phase_b_us={} commit_phase_c1_us={} commit_phase_c2_us={} commit_phase_count={} commit_flusher_lock_wait_us={} commit_wal_service_us={}",
         label,
         record_size.name(),
         profile.prepared_direct_insert_executions,
@@ -2805,11 +2951,46 @@ fn profile_fsqlite_insert_with_strategy(
         profile.prepared_schema_refresh_time_ns,
         profile.begin_setup_time_ns,
         profile.execute_body_time_ns,
+        profile.direct_write_flush_calls,
+        profile.direct_write_flush_time_ns,
+        profile.prepared_direct_insert_page_run_flushes,
+        profile.prepared_direct_insert_page_run_records,
+        profile.prepared_direct_insert_page_run_bytes,
+        profile.prepared_direct_insert_page_run_owned_flushes,
+        profile.prepared_direct_insert_page_run_arena_flushes,
+        profile.prepared_direct_insert_page_run_repeated_flushes,
+        profile.prepared_direct_insert_page_run_empty_root_bulk_load_hits,
+        profile.prepared_direct_insert_page_run_depth2_bulk_append_hits,
+        profile.prepared_direct_insert_page_run_row_append_fallback_flushes,
+        profile.prepared_direct_insert_page_run_row_append_fallback_rows,
         profile.commit_pre_txn_time_ns,
         profile.commit_txn_roundtrip_time_ns,
+        profile.pager_commit.commit_calls,
+        profile.pager_commit.phase_a_time_ns,
+        profile.pager_commit.wal_commit_time_ns,
+        profile.pager_commit.memory_flush_time_ns,
+        profile.pager_commit.journal_commit_time_ns,
+        profile.pager_commit.phase_c_metadata_time_ns,
+        profile.pager_commit.file_size_time_ns,
+        profile.pager_commit.unlock_time_ns,
+        profile.pager_commit.publish_time_ns,
+        profile.pager_commit.cache_finish_time_ns,
         profile.commit_finalize_seq_time_ns,
         profile.commit_handle_finalize_time_ns,
         profile.commit_post_write_maintenance_time_ns,
+        profile.finalize_post_publish_time_ns,
+        profile.parser.parse_multi_calls,
+        profile.parser.parse_cache_hits,
+        profile.parser.parse_cache_misses,
+        profile.parser.parse_time_ns,
+        profile.parser.rewrite_time_ns,
+        profile.background_status_checks,
+        profile.background_status_time_ns,
+        profile.op_cx_background_gates,
+        profile.statement_dispatch_background_gates,
+        profile.pager_publication_refreshes,
+        profile.commit_refresh_count,
+        profile.prepared_lookup_time_ns,
         profile.memdb_refresh_count,
         profile.cached_write_txn_reuses,
         profile.cached_write_txn_parks,
@@ -2906,6 +3087,7 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
             CONCURRENT_ROWS_PER_THREAD
         ),
     );
+    let profile_concurrent_enabled = bench_env_flag("FSQLITE_BENCH_PROFILE_CONCURRENT");
 
     for &n_threads in CONCURRENT_THREAD_COUNTS {
         let total_rows = n_threads * CONCURRENT_ROWS_PER_THREAD;
@@ -2973,6 +3155,17 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
         // the whole point of FrankenSQLite); falls back to plain BEGIN
         // otherwise. See also crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs
         // for the standalone reference implementation of this pattern.
+        let profile_scope = if profile_concurrent_enabled {
+            let previous_hot_path_profile_enabled = hot_path_profile_enabled();
+            set_hot_path_profile_enabled(true);
+            reset_hot_path_profile();
+            Some((
+                previous_hot_path_profile_enabled,
+                fsqlite_wal::wal_telemetry_snapshot(),
+            ))
+        } else {
+            None
+        };
         let fs = measure(&format!("fs_concurrent_{n_threads}t"), total_rows, || {
             let runtime = RuntimeBuilder::new()
                 .blocking_threads(n_threads, n_threads)
@@ -3073,6 +3266,37 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                 h.wait();
             }
         });
+        if let Some((previous_hot_path_profile_enabled, wal_before)) = profile_scope {
+            let profile = hot_path_profile_snapshot();
+            let wal_after = fsqlite_wal::wal_telemetry_snapshot();
+            set_hot_path_profile_enabled(previous_hot_path_profile_enabled);
+            let wal_frames = metric_delta(
+                wal_after.wal.frames_written_total,
+                wal_before.wal.frames_written_total,
+            );
+            let wal_bytes = metric_delta(
+                wal_after.wal.bytes_written_total,
+                wal_before.wal.bytes_written_total,
+            );
+            let wal_group_commits = metric_delta(
+                wal_after.group_commit.group_commits_total,
+                wal_before.group_commit.group_commits_total,
+            );
+            let wal_group_commit_latency_us = metric_delta(
+                wal_after.group_commit.commit_latency_us_total,
+                wal_before.group_commit.commit_latency_us_total,
+            );
+            print_fsqlite_concurrent_profile(
+                n_threads,
+                total_rows,
+                fs.median(),
+                &profile,
+                wal_frames,
+                wal_bytes,
+                wal_group_commits,
+                wal_group_commit_latency_us,
+            );
+        }
 
         eprintln!(
             "C={} F={}",
@@ -3133,6 +3357,7 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn sample_measurement(label: &str, row_count: usize, durations_ms: &[u64]) -> Measurement {
@@ -3230,6 +3455,25 @@ mod tests {
             message.contains("benchmark worker panic should surface"),
             "panic payload should mention original worker failure: {message}",
         );
+    }
+
+    #[test]
+    fn measure_with_teardown_runs_after_each_sample() {
+        let timed_calls = Cell::new(0usize);
+        let teardown_calls = Cell::new(0usize);
+
+        let measurement = measure_with_teardown(
+            "teardown-test",
+            7,
+            || timed_calls.set(timed_calls.get() + 1),
+            || teardown_calls.set(teardown_calls.get() + 1),
+        );
+
+        let expected_calls = WARMUP_ITERS + MAX_ITERS;
+        assert_eq!(timed_calls.get(), expected_calls);
+        assert_eq!(teardown_calls.get(), expected_calls);
+        assert_eq!(measurement.iter_count(), MAX_ITERS);
+        assert_eq!(measurement.row_count, 7);
     }
 
     #[test]
@@ -3967,8 +4211,15 @@ fn profile_fsqlite_update_delete_dml(
     for i in 0..count as i64 {
         fs_stmt_execute_with_params(&insert, &[fsqlite::SqliteValue::Integer(i)]);
     }
+    drop(insert);
     fs_execute(&conn, "COMMIT");
     let setup_us = setup_start.elapsed().as_secs_f64() * 1_000_000.0;
+
+    let statement_sql = match kind {
+        "update" => "UPDATE bench SET value = ?2 WHERE id = ?1",
+        "delete" => "DELETE FROM bench WHERE id = ?1",
+        _ => unreachable!("known DML profile kind"),
+    };
 
     let previous_hot_path_profile_enabled = hot_path_profile_enabled();
     set_hot_path_profile_enabled(true);
@@ -3979,13 +4230,7 @@ fn profile_fsqlite_update_delete_dml(
     let begin_us = begin_start.elapsed().as_secs_f64() * 1_000_000.0;
 
     let prepare_start = Instant::now();
-    let statement = match kind {
-        "update" => conn
-            .prepare("UPDATE bench SET value = ?2 WHERE id = ?1")
-            .unwrap(),
-        "delete" => conn.prepare("DELETE FROM bench WHERE id = ?1").unwrap(),
-        _ => unreachable!("known DML profile kind"),
-    };
+    let statement = conn.prepare(statement_sql).unwrap();
     let prepare_us = prepare_start.elapsed().as_secs_f64() * 1_000_000.0;
 
     let mutate_start = Instant::now();
@@ -4016,9 +4261,26 @@ fn profile_fsqlite_update_delete_dml(
     set_hot_path_profile_enabled(previous_hot_path_profile_enabled);
 
     eprintln!(
-        "    [fs_{kind}_{count}] dml_profile setup_us={setup_us:.1} begin_us={begin_us:.1} prepare_us={prepare_us:.1} mutate_us={mutate_us:.1} commit_us={commit_us:.1} mutations={mutation_count} direct_update={} direct_delete={} fast={} slow={} ud_fast_lane={} ud_instrumented_lane={} schema_refreshes={} schema_refresh_ns={} begin_ns={} execute_body_ns={} commit_pre_ns={} commit_roundtrip_ns={} commit_finalize_ns={} commit_handle_ns={} post_write_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} record_parse_into={} record_decode_ns={} btree_payload_copy_calls={} btree_payload_copy_bytes={} btree_cell_assembly_calls={} btree_cell_assembly_bytes={} vdbe_opcodes={} vdbe_statements={} vdbe_make_record={}",
+        "    [fs_{kind}_{count}] dml_profile setup_us={setup_us:.1} begin_us={begin_us:.1} prepare_us={prepare_us:.1} mutate_us={mutate_us:.1} commit_us={commit_us:.1} mutations={mutation_count} direct_update={} direct_delete={} delete_leaf_start={}/{} delete_leaf_start_ns={} delete_leaf_active={}/{} delete_leaf_miss={} delete_leaf_miss_shape={} delete_leaf_miss_out_of_leaf={} delete_leaf_miss_duplicate={} delete_leaf_miss_empty_leaf={} delete_leaf_miss_last_cell={} delete_leaf_miss_noncompact={} delete_leaf_miss_cell_shape={} delete_leaf_active_ns={} delete_leaf_flush={}/{} delete_leaf_flush_ns={} fast={} slow={} ud_fast_lane={} ud_instrumented_lane={} schema_refreshes={} schema_refresh_ns={} begin_ns={} execute_body_ns={} direct_flush_calls={} direct_flush_ns={} commit_pre_ns={} commit_roundtrip_ns={} pager_commit_calls={} pager_phase_a_ns={} pager_wal_ns={} pager_mem_flush_ns={} pager_journal_ns={} pager_c_metadata_ns={} pager_file_size_ns={} pager_unlock_ns={} pager_publish_ns={} pager_cache_finish_ns={} commit_finalize_ns={} commit_handle_ns={} post_write_ns={} finalize_post_ns={} parser_multi_calls={} parser_cache_hits={} parser_cache_misses={} parser_parse_ns={} parser_rewrite_ns={} bg_checks={} bg_ns={} op_cx_bg_gates={} dispatch_bg_gates={} pager_pub_refreshes={} commit_refreshes={} prepared_lookup_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} record_parse_into={} record_decode_ns={} btree_payload_copy_calls={} btree_payload_copy_bytes={} btree_cell_assembly_calls={} btree_cell_assembly_bytes={} vdbe_opcodes={} vdbe_statements={} vdbe_make_record={}",
         profile.prepared_direct_update_executions,
         profile.prepared_direct_delete_executions,
+        profile.prepared_direct_delete_leaf_run_start_hits,
+        profile.prepared_direct_delete_leaf_run_start_attempts,
+        profile.prepared_direct_delete_leaf_run_start_time_ns,
+        profile.prepared_direct_delete_leaf_run_active_hits,
+        profile.prepared_direct_delete_leaf_run_active_attempts,
+        profile.prepared_direct_delete_leaf_run_active_misses,
+        profile.prepared_direct_delete_leaf_run_active_miss_shape_mismatches,
+        profile.prepared_direct_delete_leaf_run_active_miss_rowid_not_in_leaf,
+        profile.prepared_direct_delete_leaf_run_active_miss_already_deleted,
+        profile.prepared_direct_delete_leaf_run_active_miss_nonroot_would_empty_leaf,
+        profile.prepared_direct_delete_leaf_run_active_miss_nonroot_last_cell,
+        profile.prepared_direct_delete_leaf_run_active_miss_noncompact_cell_area,
+        profile.prepared_direct_delete_leaf_run_active_miss_cell_shape_or_overflow,
+        profile.prepared_direct_delete_leaf_run_active_time_ns,
+        profile.prepared_direct_delete_leaf_run_dirty_flushes,
+        profile.prepared_direct_delete_leaf_run_flushes,
+        profile.prepared_direct_delete_leaf_run_flush_time_ns,
         profile.parser.fast_path_executions,
         profile.parser.slow_path_executions,
         profile.prepared_update_delete_fast_lane_hits,
@@ -4027,11 +4289,36 @@ fn profile_fsqlite_update_delete_dml(
         profile.prepared_schema_refresh_time_ns,
         profile.begin_setup_time_ns,
         profile.execute_body_time_ns,
+        profile.direct_write_flush_calls,
+        profile.direct_write_flush_time_ns,
         profile.commit_pre_txn_time_ns,
         profile.commit_txn_roundtrip_time_ns,
+        profile.pager_commit.commit_calls,
+        profile.pager_commit.phase_a_time_ns,
+        profile.pager_commit.wal_commit_time_ns,
+        profile.pager_commit.memory_flush_time_ns,
+        profile.pager_commit.journal_commit_time_ns,
+        profile.pager_commit.phase_c_metadata_time_ns,
+        profile.pager_commit.file_size_time_ns,
+        profile.pager_commit.unlock_time_ns,
+        profile.pager_commit.publish_time_ns,
+        profile.pager_commit.cache_finish_time_ns,
         profile.commit_finalize_seq_time_ns,
         profile.commit_handle_finalize_time_ns,
         profile.commit_post_write_maintenance_time_ns,
+        profile.finalize_post_publish_time_ns,
+        profile.parser.parse_multi_calls,
+        profile.parser.parse_cache_hits,
+        profile.parser.parse_cache_misses,
+        profile.parser.parse_time_ns,
+        profile.parser.rewrite_time_ns,
+        profile.background_status_checks,
+        profile.background_status_time_ns,
+        profile.op_cx_background_gates,
+        profile.statement_dispatch_background_gates,
+        profile.pager_publication_refreshes,
+        profile.commit_refresh_count,
+        profile.prepared_lookup_time_ns,
         profile.memdb_refresh_count,
         profile.cached_write_txn_reuses,
         profile.cached_write_txn_parks,
@@ -4072,62 +4359,106 @@ fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
         let cs = {
             let insert_sql = record_size.insert_sql_csqlite();
             let create_sql = record_size.create_table_sql();
-            measure(&format!("cs_update_{count}"), update_count, || {
-                let conn = rusqlite::Connection::open_in_memory().unwrap();
-                apply_pragmas_csqlite(&conn);
-                conn.execute_batch(&format!("{create_sql};")).unwrap();
-                conn.execute_batch("BEGIN").unwrap();
-                let mut ins = conn.prepare(insert_sql).unwrap();
-                #[allow(clippy::cast_possible_wrap)]
-                for i in 0..count as i64 {
-                    ins.execute(rusqlite::params![i]).unwrap();
-                }
-                conn.execute_batch("COMMIT").unwrap();
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            apply_pragmas_csqlite(&conn);
+            conn.execute_batch(&format!("{create_sql};")).unwrap();
+            conn.execute_batch("BEGIN").unwrap();
+            let mut ins = conn.prepare(insert_sql).unwrap();
+            #[allow(clippy::cast_possible_wrap)]
+            for i in 0..count as i64 {
+                ins.execute(rusqlite::params![i]).unwrap();
+            }
+            drop(ins);
+            conn.execute_batch("COMMIT").unwrap();
+            let mut upd = conn
+                .prepare("UPDATE bench SET value = ?2 WHERE id = ?1")
+                .unwrap();
+            let mut reset = conn
+                .prepare("UPDATE bench SET value = ?2 WHERE id = ?1")
+                .unwrap();
 
-                conn.execute_batch("BEGIN").unwrap();
-                let mut upd = conn
-                    .prepare("UPDATE bench SET value = ?2 WHERE id = ?1")
-                    .unwrap();
-                #[allow(clippy::cast_possible_wrap)]
-                for i in 0..update_count as i64 {
-                    let id = i * 10; // Every 10th row.
-                    upd.execute(rusqlite::params![id, 999.99]).unwrap();
-                }
-                conn.execute_batch("COMMIT").unwrap();
-            })
+            measure_with_teardown(
+                &format!("cs_update_{count}"),
+                update_count,
+                || {
+                    conn.execute_batch("BEGIN").unwrap();
+                    #[allow(clippy::cast_possible_wrap)]
+                    for i in 0..update_count as i64 {
+                        let id = i * 10; // Every 10th row.
+                        upd.execute(rusqlite::params![id, 999.99]).unwrap();
+                    }
+                    conn.execute_batch("COMMIT").unwrap();
+                },
+                || {
+                    conn.execute_batch("BEGIN").unwrap();
+                    #[allow(clippy::cast_possible_wrap)]
+                    for i in 0..update_count as i64 {
+                        let id = i * 10;
+                        let original_value = f64::from(i32::try_from(id).unwrap()) * 0.137;
+                        reset
+                            .execute(rusqlite::params![id, original_value])
+                            .unwrap();
+                    }
+                    conn.execute_batch("COMMIT").unwrap();
+                },
+            )
         };
 
         let fs = {
             let create_sql = record_size.create_table_sql();
-            measure(&format!("fs_update_{count}"), update_count, || {
-                let conn = open_fsqlite_memory_connection_for_benchmark();
-                apply_pragmas_fsqlite(&conn);
-                fs_execute(&conn, create_sql);
-                fs_execute(&conn, "BEGIN");
-                #[allow(clippy::cast_possible_wrap)]
-                let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
-                for i in 0..count as i64 {
-                    fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
-                }
-                fs_execute(&conn, "COMMIT");
+            let conn = open_fsqlite_memory_connection_for_benchmark();
+            apply_pragmas_fsqlite(&conn);
+            fs_execute(&conn, create_sql);
+            fs_execute(&conn, "BEGIN");
+            #[allow(clippy::cast_possible_wrap)]
+            let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
+            for i in 0..count as i64 {
+                fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
+            }
+            drop(stmt);
+            fs_execute(&conn, "COMMIT");
+            let update = conn
+                .prepare("UPDATE bench SET value = ?2 WHERE id = ?1")
+                .unwrap();
+            let reset = conn
+                .prepare("UPDATE bench SET value = ?2 WHERE id = ?1")
+                .unwrap();
 
-                fs_execute(&conn, "BEGIN");
-                let update = conn
-                    .prepare("UPDATE bench SET value = ?2 WHERE id = ?1")
-                    .unwrap();
-                #[allow(clippy::cast_possible_wrap)]
-                for i in 0..update_count as i64 {
-                    let id = i * 10;
-                    fs_stmt_execute_with_params(
-                        &update,
-                        &[
-                            fsqlite::SqliteValue::Integer(id),
-                            fsqlite::SqliteValue::Float(999.99),
-                        ],
-                    );
-                }
-                fs_execute(&conn, "COMMIT");
-            })
+            measure_with_teardown(
+                &format!("fs_update_{count}"),
+                update_count,
+                || {
+                    fs_execute(&conn, "BEGIN");
+                    #[allow(clippy::cast_possible_wrap)]
+                    for i in 0..update_count as i64 {
+                        let id = i * 10;
+                        fs_stmt_execute_with_params(
+                            &update,
+                            &[
+                                fsqlite::SqliteValue::Integer(id),
+                                fsqlite::SqliteValue::Float(999.99),
+                            ],
+                        );
+                    }
+                    fs_execute(&conn, "COMMIT");
+                },
+                || {
+                    fs_execute(&conn, "BEGIN");
+                    #[allow(clippy::cast_possible_wrap)]
+                    for i in 0..update_count as i64 {
+                        let id = i * 10;
+                        let original_value = f64::from(i32::try_from(id).unwrap()) * 0.137;
+                        fs_stmt_execute_with_params(
+                            &reset,
+                            &[
+                                fsqlite::SqliteValue::Integer(id),
+                                fsqlite::SqliteValue::Float(original_value),
+                            ],
+                        );
+                    }
+                    fs_execute(&conn, "COMMIT");
+                },
+            )
         };
         if profile_dml_enabled {
             profile_fsqlite_update_delete_dml(record_size, count, update_count, "update");
@@ -4150,52 +4481,82 @@ fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
         let cs = {
             let insert_sql = record_size.insert_sql_csqlite();
             let create_sql = record_size.create_table_sql();
-            measure(&format!("cs_delete_{count}"), delete_count, || {
-                let conn = rusqlite::Connection::open_in_memory().unwrap();
-                apply_pragmas_csqlite(&conn);
-                conn.execute_batch(&format!("{create_sql};")).unwrap();
-                conn.execute_batch("BEGIN").unwrap();
-                let mut ins = conn.prepare(insert_sql).unwrap();
-                #[allow(clippy::cast_possible_wrap)]
-                for i in 0..count as i64 {
-                    ins.execute(rusqlite::params![i]).unwrap();
-                }
-                conn.execute_batch("COMMIT").unwrap();
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            apply_pragmas_csqlite(&conn);
+            conn.execute_batch(&format!("{create_sql};")).unwrap();
+            conn.execute_batch("BEGIN").unwrap();
+            let mut ins = conn.prepare(insert_sql).unwrap();
+            #[allow(clippy::cast_possible_wrap)]
+            for i in 0..count as i64 {
+                ins.execute(rusqlite::params![i]).unwrap();
+            }
+            drop(ins);
+            conn.execute_batch("COMMIT").unwrap();
+            let mut del = conn.prepare("DELETE FROM bench WHERE id = ?1").unwrap();
+            let mut restore = conn.prepare(insert_sql).unwrap();
 
-                conn.execute_batch("BEGIN").unwrap();
-                let mut del = conn.prepare("DELETE FROM bench WHERE id = ?1").unwrap();
-                #[allow(clippy::cast_possible_wrap)]
-                for i in 0..delete_count as i64 {
-                    let id = i * 20; // Every 20th row.
-                    del.execute(rusqlite::params![id]).unwrap();
-                }
-                conn.execute_batch("COMMIT").unwrap();
-            })
+            measure_with_teardown(
+                &format!("cs_delete_{count}"),
+                delete_count,
+                || {
+                    conn.execute_batch("BEGIN").unwrap();
+                    #[allow(clippy::cast_possible_wrap)]
+                    for i in 0..delete_count as i64 {
+                        let id = i * 20; // Every 20th row.
+                        del.execute(rusqlite::params![id]).unwrap();
+                    }
+                    conn.execute_batch("COMMIT").unwrap();
+                },
+                || {
+                    conn.execute_batch("BEGIN").unwrap();
+                    #[allow(clippy::cast_possible_wrap)]
+                    for i in 0..delete_count as i64 {
+                        let id = i * 20;
+                        restore.execute(rusqlite::params![id]).unwrap();
+                    }
+                    conn.execute_batch("COMMIT").unwrap();
+                },
+            )
         };
 
         let fs = {
             let create_sql = record_size.create_table_sql();
-            measure(&format!("fs_delete_{count}"), delete_count, || {
-                let conn = open_fsqlite_memory_connection_for_benchmark();
-                apply_pragmas_fsqlite(&conn);
-                fs_execute(&conn, create_sql);
-                fs_execute(&conn, "BEGIN");
-                #[allow(clippy::cast_possible_wrap)]
-                let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
-                for i in 0..count as i64 {
-                    fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
-                }
-                fs_execute(&conn, "COMMIT");
+            let conn = open_fsqlite_memory_connection_for_benchmark();
+            apply_pragmas_fsqlite(&conn);
+            fs_execute(&conn, create_sql);
+            fs_execute(&conn, "BEGIN");
+            #[allow(clippy::cast_possible_wrap)]
+            let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
+            for i in 0..count as i64 {
+                fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
+            }
+            drop(stmt);
+            fs_execute(&conn, "COMMIT");
+            let delete = conn.prepare("DELETE FROM bench WHERE id = ?1").unwrap();
+            let restore = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
 
-                fs_execute(&conn, "BEGIN");
-                let delete = conn.prepare("DELETE FROM bench WHERE id = ?1").unwrap();
-                #[allow(clippy::cast_possible_wrap)]
-                for i in 0..delete_count as i64 {
-                    let id = i * 20;
-                    fs_stmt_execute_with_params(&delete, &[fsqlite::SqliteValue::Integer(id)]);
-                }
-                fs_execute(&conn, "COMMIT");
-            })
+            measure_with_teardown(
+                &format!("fs_delete_{count}"),
+                delete_count,
+                || {
+                    fs_execute(&conn, "BEGIN");
+                    #[allow(clippy::cast_possible_wrap)]
+                    for i in 0..delete_count as i64 {
+                        let id = i * 20;
+                        fs_stmt_execute_with_params(&delete, &[fsqlite::SqliteValue::Integer(id)]);
+                    }
+                    fs_execute(&conn, "COMMIT");
+                },
+                || {
+                    fs_execute(&conn, "BEGIN");
+                    #[allow(clippy::cast_possible_wrap)]
+                    for i in 0..delete_count as i64 {
+                        let id = i * 20;
+                        fs_stmt_execute_with_params(&restore, &[fsqlite::SqliteValue::Integer(id)]);
+                    }
+                    fs_execute(&conn, "COMMIT");
+                },
+            )
         };
         if profile_dml_enabled {
             profile_fsqlite_update_delete_dml(record_size, count, delete_count, "delete");

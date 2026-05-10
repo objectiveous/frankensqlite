@@ -6149,7 +6149,9 @@ mod tests {
 
     #[test]
     fn test_concurrent_same_page_writers_preserve_all_committed_versions() {
-        // Configure GC to not trigger during this test:
+        // Hold a reader snapshot while the writers run so eager GC cannot
+        // reclaim superseded versions before the assertion. The threshold
+        // settings below keep length-triggered compaction out of the result:
         // - max_chain_length = 128 → upper_bound = 64
         // - ewma = 32×256 → threshold = min(64, max(8, 64)) = 64
         // With 33 total commits (1 seed + 32 workers), chain_len stays below threshold.
@@ -6165,6 +6167,12 @@ mod tests {
         let mut seed = mgr.begin(BeginKind::Concurrent).unwrap();
         mgr.write_page(&mut seed, pgno, test_data(0x00)).unwrap();
         mgr.commit(&mut seed).unwrap();
+
+        let mut pinning_reader = mgr.begin(BeginKind::Deferred).unwrap();
+        assert!(
+            mgr.read_page(&mut pinning_reader, pgno).is_some(),
+            "pinning reader should see the seeded page version"
+        );
 
         let start = Arc::new(std::sync::Barrier::new(workers));
         let mut handles = Vec::with_capacity(workers);
@@ -6223,6 +6231,8 @@ mod tests {
             total_committed + 1,
             "same-page concurrent commits should retain one version per successful commit plus seed"
         );
+
+        mgr.abort(&mut pinning_reader);
     }
 
     #[test]

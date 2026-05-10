@@ -445,7 +445,16 @@ impl ConcurrentHandle {
     /// Returns witness keys for all read pages (for SSI validation).
     #[must_use]
     pub fn read_witness_keys(&self) -> Vec<WitnessKey> {
-        let mut keys: Vec<_> = self.read_index.values().flatten().cloned().collect();
+        let capacity = self.global_read_witnesses.len()
+            + self
+                .read_index
+                .values()
+                .map(smallvec::SmallVec::len)
+                .sum::<usize>();
+        let mut keys = Vec::with_capacity(capacity);
+        for witnesses in self.read_index.values() {
+            keys.extend(witnesses.iter().cloned());
+        }
         keys.extend(self.global_read_witnesses.iter().cloned());
         keys
     }
@@ -453,7 +462,16 @@ impl ConcurrentHandle {
     /// Returns witness keys for all written pages (for SSI validation).
     #[must_use]
     pub fn write_witness_keys(&self) -> Vec<WitnessKey> {
-        let mut keys: Vec<_> = self.write_index.values().flatten().cloned().collect();
+        let capacity = self.global_write_witnesses.len()
+            + self
+                .write_index
+                .values()
+                .map(smallvec::SmallVec::len)
+                .sum::<usize>();
+        let mut keys = Vec::with_capacity(capacity);
+        for witnesses in self.write_index.values() {
+            keys.extend(witnesses.iter().cloned());
+        }
         keys.extend(self.global_write_witnesses.iter().cloned());
         keys
     }

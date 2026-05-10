@@ -1313,6 +1313,375 @@ impl TableLeafPayloadPatchRun {
     }
 }
 
+/// Reason a same-leaf delete run declined an additional rowid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableLeafDeleteRunMissReason {
+    /// The rowid is outside the retained leaf image.
+    RowidNotInLeaf,
+    /// The rowid was already accepted into this pending run.
+    AlreadyDeleted,
+    /// Accepting the delete could leave a non-root leaf empty.
+    NonRootWouldEmptyLeaf,
+    /// Accepting the delete could require parent separator repair.
+    NonRootLastCell,
+    /// The page no longer has the compact shape this fast path can rewrite.
+    NonCompactCellArea,
+    /// The cell did not match the expected on-page, non-overflow rowid shape.
+    CellShapeOrOverflow,
+}
+
+/// Result of attempting to add a rowid to a same-leaf delete run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableLeafDeleteRunDelete {
+    /// The rowid was accepted into the pending run.
+    Deleted,
+    /// The run declined the rowid and reports why.
+    Miss(TableLeafDeleteRunMissReason),
+}
+
+/// Opaque same-leaf delete run for direct table DELETEs.
+///
+/// The run owns one table-leaf image and accepts only deletes that cannot
+/// require parent separator repair, overflow-chain cleanup, or structural
+/// rebalance. Unsupported rowids return `Ok(false)` so callers can flush and
+/// fall back to the ordinary cursor delete path.
+#[derive(Debug, Clone)]
+pub struct TableLeafDeleteRun {
+    entry: StackEntry,
+    tree_depth: usize,
+    deleted_cell_indices: SmallVec<[u16; 16]>,
+}
+
+const SMALL_DELETE_INCREMENTAL_LIMIT: usize = 8;
+
+impl TableLeafDeleteRun {
+    #[must_use]
+    pub const fn leaf_page(&self) -> PageNumber {
+        self.entry.page_no
+    }
+
+    #[must_use]
+    pub fn is_dirty(&self) -> bool {
+        !self.deleted_cell_indices.is_empty()
+    }
+
+    pub fn delete_rowid(&mut self, cx: &Cx, rowid: i64, usable_size: u32) -> Result<bool> {
+        Ok(matches!(
+            self.delete_rowid_with_reason(cx, rowid, usable_size)?,
+            TableLeafDeleteRunDelete::Deleted
+        ))
+    }
+
+    pub fn delete_rowid_with_reason(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        usable_size: u32,
+    ) -> Result<TableLeafDeleteRunDelete> {
+        let Some(cell_idx) = self.search_table_leaf(cx, rowid)? else {
+            return Ok(TableLeafDeleteRunDelete::Miss(
+                TableLeafDeleteRunMissReason::RowidNotInLeaf,
+            ));
+        };
+        if self.deleted_cell_indices.contains(&cell_idx) {
+            return Ok(TableLeafDeleteRunDelete::Miss(
+                TableLeafDeleteRunMissReason::AlreadyDeleted,
+            ));
+        }
+        if self.tree_depth > 1 {
+            if self.live_cell_count() <= 1 {
+                return Ok(TableLeafDeleteRunDelete::Miss(
+                    TableLeafDeleteRunMissReason::NonRootWouldEmptyLeaf,
+                ));
+            }
+            if cell_idx == self.entry.header.cell_count.saturating_sub(1) {
+                return Ok(TableLeafDeleteRunDelete::Miss(
+                    TableLeafDeleteRunMissReason::NonRootLastCell,
+                ));
+            }
+        }
+        if !self.has_compact_cell_area(usable_size) {
+            return Ok(TableLeafDeleteRunDelete::Miss(
+                TableLeafDeleteRunMissReason::NonCompactCellArea,
+            ));
+        }
+        let cell_offset = usize::from(self.entry.cell_pointers[usize::from(cell_idx)]);
+        let cell = CellRef::parse(
+            self.entry.page_data.as_bytes(),
+            cell_offset,
+            self.entry.header.page_type,
+            usable_size,
+        )?;
+        if cell.rowid != Some(rowid) || cell.overflow_page.is_some() {
+            return Ok(TableLeafDeleteRunDelete::Miss(
+                TableLeafDeleteRunMissReason::CellShapeOrOverflow,
+            ));
+        }
+
+        self.deleted_cell_indices.push(cell_idx);
+        self.entry.cell_idx = if cell_idx >= self.entry.header.cell_count.saturating_sub(1) {
+            self.entry.header.cell_count.saturating_sub(1)
+        } else {
+            cell_idx
+        };
+        Ok(TableLeafDeleteRunDelete::Deleted)
+    }
+
+    fn search_table_leaf(&self, cx: &Cx, target: i64) -> Result<Option<u16>> {
+        let mut lo = 0u16;
+        let mut hi = self.entry.header.cell_count;
+        while lo < hi {
+            observe_cursor_cancellation(cx)?;
+            let mid = lo + (hi - lo) / 2;
+            let rowid = TableLeafPayloadPatchRun::table_leaf_rowid_at(&self.entry, mid)?;
+            match rowid.cmp(&target) {
+                std::cmp::Ordering::Equal => return Ok(Some(mid)),
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        Ok(None)
+    }
+
+    fn live_cell_count(&self) -> u16 {
+        self.entry
+            .header
+            .cell_count
+            .saturating_sub(u16::try_from(self.deleted_cell_indices.len()).unwrap_or(u16::MAX))
+    }
+
+    fn has_compact_cell_area(&self, usable_size: u32) -> bool {
+        self.entry.header.first_freeblock == 0
+            && self.entry.header.fragmented_free_bytes == 0
+            && self
+                .entry
+                .cell_pointers
+                .iter()
+                .copied()
+                .min()
+                .is_some_and(|min_ptr| {
+                    usize::from(min_ptr) == self.entry.header.content_offset(usable_size)
+                })
+    }
+
+    fn materialize_deletions_incremental_descending(
+        &mut self,
+        usable_size: u32,
+        header_offset: usize,
+    ) -> Result<()> {
+        let leaf_page_no = self.entry.page_no;
+        let mut header = self.entry.header;
+        let mut ptrs = self.entry.cell_pointers.clone();
+
+        for &cell_idx in self.deleted_cell_indices.iter().rev() {
+            let delete_idx = usize::from(cell_idx);
+            let ptr_array_end =
+                header_offset + usize::from(header.page_type.header_size()) + (ptrs.len() - 1) * 2;
+            let deleted_ptr = usize::from(ptrs[delete_idx]);
+            let deleted_upper = if delete_idx == 0 {
+                usable_size as usize
+            } else {
+                usize::from(ptrs[delete_idx - 1])
+            };
+            if deleted_ptr >= deleted_upper {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "compact table leaf cell offsets are not monotone".to_owned(),
+                });
+            }
+            let deleted_size = deleted_upper - deleted_ptr;
+            let old_content_offset = header.content_offset(usable_size);
+            if old_content_offset > deleted_ptr {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "compact table leaf content offset exceeds deleted cell".to_owned(),
+                });
+            }
+            let new_content_offset =
+                old_content_offset
+                    .checked_add(deleted_size)
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: "table leaf cell size overflow during delete defragmentation"
+                            .to_owned(),
+                    })?;
+            if new_content_offset > usable_size as usize || new_content_offset < ptr_array_end {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "table leaf cell content overlaps pointer array during delete defragmentation"
+                        .to_owned(),
+                });
+            }
+            let page_bytes = self.entry.page_data.as_bytes_mut();
+            if old_content_offset < deleted_ptr {
+                page_bytes.copy_within(old_content_offset..deleted_ptr, new_content_offset);
+            }
+            for ptr_slot in ptrs.iter_mut().skip(delete_idx + 1) {
+                let adjusted = usize::from(*ptr_slot) + deleted_size;
+                *ptr_slot = u16::try_from(adjusted).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table leaf cell offset {} exceeds u16 range on page {}",
+                        adjusted,
+                        leaf_page_no.get()
+                    ),
+                })?;
+            }
+            ptrs.remove(delete_idx);
+            header.cell_content_offset =
+                u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table leaf cell content offset {} exceeds u32 range on page {}",
+                        new_content_offset,
+                        leaf_page_no.get()
+                    ),
+                })?;
+            header.first_freeblock = 0;
+            header.fragmented_free_bytes = 0;
+            header.cell_count =
+                u16::try_from(ptrs.len()).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table leaf page {} cell count exceeds u16 range during delete",
+                        leaf_page_no.get()
+                    ),
+                })?;
+        }
+
+        let page_bytes = self.entry.page_data.as_bytes_mut();
+        header.write(page_bytes, header_offset);
+        cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
+        self.entry.header = header;
+        self.entry.cell_pointers = ptrs;
+        self.entry.cell_idx = if self.entry.header.cell_count == 0 {
+            0
+        } else {
+            self.entry.header.cell_count - 1
+        };
+        self.entry.mutation_counter = self.entry.page_data.image_token();
+        self.deleted_cell_indices.clear();
+        Ok(())
+    }
+
+    fn materialize_deletions(&mut self, usable_size: u32) -> Result<()> {
+        if self.deleted_cell_indices.is_empty() {
+            return Ok(());
+        }
+        let leaf_page_no = self.entry.page_no;
+        let header_offset = cell::header_offset_for_page(leaf_page_no);
+        let original_len = self.entry.cell_pointers.len();
+        self.deleted_cell_indices.sort_unstable();
+        self.deleted_cell_indices.dedup();
+        for &cell_idx in &self.deleted_cell_indices {
+            if usize::from(cell_idx) >= original_len {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "delete_idx {} out of bounds for page {} with {} cells",
+                        cell_idx, leaf_page_no, original_len
+                    ),
+                });
+            }
+        }
+        let mut header = self.entry.header;
+        if !self.has_compact_cell_area(usable_size) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "pending table leaf delete run lost compact page shape".to_owned(),
+            });
+        }
+        if self.deleted_cell_indices.len() <= SMALL_DELETE_INCREMENTAL_LIMIT
+            && cell_ptrs_are_descending(&self.entry.cell_pointers)
+        {
+            return self.materialize_deletions_incremental_descending(usable_size, header_offset);
+        }
+        let mut ptrs = Vec::with_capacity(original_len - self.deleted_cell_indices.len());
+        let mut cells_to_move = Vec::with_capacity(ptrs.capacity());
+        let mut deleted_idx = 0usize;
+        for (original_idx, &off) in self.entry.cell_pointers.iter().enumerate() {
+            if deleted_idx < self.deleted_cell_indices.len()
+                && usize::from(self.deleted_cell_indices[deleted_idx]) == original_idx
+            {
+                deleted_idx += 1;
+                continue;
+            }
+            let post_delete_idx = ptrs.len();
+            let ptr = usize::from(off);
+            let size = cell::cell_on_page_size_fast(
+                self.entry.page_data.as_bytes(),
+                ptr,
+                header.page_type,
+                usable_size,
+            )?;
+            cells_to_move.push((ptr, size, post_delete_idx));
+            ptrs.push(off);
+        }
+        sort_cells_desc_by_ptr(&mut cells_to_move);
+
+        let ptr_array_end =
+            header_offset + usize::from(header.page_type.header_size()) + ptrs.len() * 2;
+        let mut new_content_offset = usable_size as usize;
+        {
+            let page_bytes = self.entry.page_data.as_bytes_mut();
+            for &(ptr, size, post_delete_idx) in &cells_to_move {
+                new_content_offset = new_content_offset.checked_sub(size).ok_or_else(|| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: "table leaf cell size overflow during delete defragmentation"
+                            .to_owned(),
+                    }
+                })?;
+                if new_content_offset < ptr_array_end {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "table leaf cell content overlaps pointer array during delete defragmentation"
+                            .to_owned(),
+                    });
+                }
+                if new_content_offset != ptr {
+                    page_bytes.copy_within(ptr..ptr + size, new_content_offset);
+                }
+                ptrs[post_delete_idx] = u16::try_from(new_content_offset).map_err(|_| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table leaf cell offset {} exceeds u16 range on page {}",
+                            new_content_offset,
+                            leaf_page_no.get()
+                        ),
+                    }
+                })?;
+            }
+        }
+
+        header.cell_content_offset =
+            u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table leaf cell content offset {} exceeds u32 range on page {}",
+                    new_content_offset,
+                    leaf_page_no.get()
+                ),
+            })?;
+        header.first_freeblock = 0;
+        header.fragmented_free_bytes = 0;
+        header.cell_count =
+            u16::try_from(ptrs.len()).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table leaf page {} cell count exceeds u16 range during delete",
+                    leaf_page_no.get()
+                ),
+            })?;
+
+        let page_bytes = self.entry.page_data.as_bytes_mut();
+        header.write(page_bytes, header_offset);
+        cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
+        self.entry.header = header;
+        self.entry.cell_pointers = ptrs;
+        self.entry.cell_idx = if self.entry.header.cell_count == 0 {
+            0
+        } else {
+            self.entry.header.cell_count - 1
+        };
+        self.entry.mutation_counter = self.entry.page_data.image_token();
+        self.deleted_cell_indices.clear();
+        Ok(())
+    }
+
+    fn into_page(mut self, usable_size: u32) -> Result<(PageNumber, PageData)> {
+        self.materialize_deletions(usable_size)?;
+        Ok((self.entry.page_no, self.entry.page_data.clone()))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BulkTableChild {
     page_no: PageNumber,
@@ -8570,6 +8939,42 @@ impl<P: PageWriter> BtCursor<P> {
         }))
     }
 
+    /// Capture the currently positioned table leaf for batched same-leaf deletes.
+    ///
+    /// This only admits cells whose removal cannot force parent separator repair
+    /// or an immediate non-root leaf rebalance. Callers flush the run and fall
+    /// back to the ordinary cursor path when this returns `None`.
+    #[doc(hidden)]
+    pub fn table_leaf_delete_run_current(
+        &mut self,
+        rowid: i64,
+    ) -> Result<Option<TableLeafDeleteRun>> {
+        if self.at_eof {
+            return Ok(None);
+        }
+        let Some(entry) = self.stack.last() else {
+            return Ok(None);
+        };
+        if entry.header.page_type != BtreePageType::LeafTable || entry.header.cell_count == 0 {
+            return Ok(None);
+        }
+        if TableLeafPayloadPatchRun::table_leaf_rowid_at(entry, entry.cell_idx)? != rowid {
+            return Ok(None);
+        }
+        let tree_depth = self.stack.len();
+        if tree_depth > 1
+            && (entry.header.cell_count <= 1
+                || entry.cell_idx == entry.header.cell_count.saturating_sub(1))
+        {
+            return Ok(None);
+        }
+        Ok(Some(TableLeafDeleteRun {
+            entry: entry.clone(),
+            tree_depth,
+            deleted_cell_indices: SmallVec::new(),
+        }))
+    }
+
     /// Publish a same-leaf payload patch run as one page write.
     #[doc(hidden)]
     pub fn flush_table_leaf_payload_patch_run(
@@ -8579,6 +8984,22 @@ impl<P: PageWriter> BtCursor<P> {
     ) -> Result<()> {
         let (leaf_page, page_data) = run.into_page();
         self.pager.write_page_data(cx, leaf_page, page_data)?;
+        self.stack.clear();
+        self.at_eof = true;
+        self.clear_rightmost_leaf_cache();
+        self.clear_seek_cache();
+        self.cell_slot_cache.get_mut().clear();
+        self.bump_row_image_epoch();
+        Ok(())
+    }
+
+    /// Publish a same-leaf delete run as one page write.
+    #[doc(hidden)]
+    pub fn flush_table_leaf_delete_run(&mut self, cx: &Cx, run: TableLeafDeleteRun) -> Result<()> {
+        if run.is_dirty() {
+            let (leaf_page, page_data) = run.into_page(self.usable_size)?;
+            self.pager.write_page_data(cx, leaf_page, page_data)?;
+        }
         self.stack.clear();
         self.at_eof = true;
         self.clear_rightmost_leaf_cache();
@@ -16786,6 +17207,133 @@ mod tests {
         assert!(revived, "Real cursor should revive from EOF");
         assert!(!cursor.eof());
         assert_eq!(cursor.rowid(&cx).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_table_leaf_delete_run_defragments_multiple_root_leaf_cells() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        let payloads: Vec<(i64, Vec<u8>)> = (1_i64..=20_i64)
+            .map(|rowid| {
+                let payload = format!(
+                    "payload-{rowid:02}-{}",
+                    "x".repeat(usize::try_from(rowid % 5 + 1).unwrap())
+                )
+                .into_bytes();
+                (rowid, payload)
+            })
+            .collect();
+
+        for (rowid, payload) in &payloads {
+            cursor.table_insert(&cx, *rowid, payload).unwrap();
+        }
+        assert!(cursor.table_move_to(&cx, 3).unwrap().is_found());
+        let mut run = cursor
+            .table_leaf_delete_run_current(3)
+            .unwrap()
+            .expect("positioned root leaf should admit a delete run");
+        let deleted_rowids = [3_i64, 7, 11];
+        for rowid in deleted_rowids {
+            assert!(
+                run.delete_rowid(&cx, rowid, USABLE).unwrap(),
+                "delete run should accept root-leaf rowid {rowid}"
+            );
+        }
+        cursor.flush_table_leaf_delete_run(&cx, run).unwrap();
+
+        for deleted in deleted_rowids {
+            assert!(
+                !cursor.table_move_to(&cx, deleted).unwrap().is_found(),
+                "deleted rowid {deleted} should be absent"
+            );
+        }
+        for (rowid, payload) in payloads
+            .iter()
+            .filter(|(rowid, _)| !deleted_rowids.contains(rowid))
+        {
+            assert!(
+                cursor.table_move_to(&cx, *rowid).unwrap().is_found(),
+                "surviving rowid {rowid} should remain reachable"
+            );
+            assert_eq!(cursor.payload(&cx).unwrap().as_slice(), payload.as_slice());
+        }
+
+        let entry = cursor.load_page(&cx, root).unwrap();
+        assert_eq!(entry.header.cell_count, 17);
+        assert_eq!(entry.header.first_freeblock, 0);
+        assert_eq!(entry.header.fragmented_free_bytes, 0);
+        let min_ptr = entry.cell_pointers.iter().copied().min().unwrap();
+        assert_eq!(
+            usize::from(min_ptr),
+            entry.header.content_offset(USABLE),
+            "delete-run flush should leave one compact cell area"
+        );
+    }
+
+    #[test]
+    fn test_table_leaf_delete_run_defragments_large_root_leaf_delete_set() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        let payloads: Vec<(i64, Vec<u8>)> = (1_i64..=40_i64)
+            .map(|rowid| (rowid, format!("payload-{rowid:02}").into_bytes()))
+            .collect();
+
+        for (rowid, payload) in &payloads {
+            cursor.table_insert(&cx, *rowid, payload).unwrap();
+        }
+        assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
+        let mut run = cursor
+            .table_leaf_delete_run_current(2)
+            .unwrap()
+            .expect("positioned root leaf should admit a delete run");
+        let deleted_rowids = [2_i64, 4, 6, 8, 10, 12, 14, 16, 18];
+        assert!(
+            deleted_rowids.len() > SMALL_DELETE_INCREMENTAL_LIMIT,
+            "test must exercise the one-pass delete-run materializer"
+        );
+        for rowid in deleted_rowids {
+            assert!(
+                run.delete_rowid(&cx, rowid, USABLE).unwrap(),
+                "delete run should accept root-leaf rowid {rowid}"
+            );
+        }
+        cursor.flush_table_leaf_delete_run(&cx, run).unwrap();
+
+        for (rowid, payload) in &payloads {
+            let found = cursor.table_move_to(&cx, *rowid).unwrap().is_found();
+            if deleted_rowids.contains(rowid) {
+                assert!(!found, "deleted rowid {rowid} should be absent");
+            } else {
+                assert!(found, "surviving rowid {rowid} should remain reachable");
+                assert_eq!(cursor.payload(&cx).unwrap().as_slice(), payload.as_slice());
+            }
+        }
+    }
+
+    #[test]
+    fn test_table_leaf_delete_run_rejects_nonroot_leaf_max_cell() {
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 10)], pn(4)));
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"L1"), (5, b"L5"), (10, b"L10")]));
+        store
+            .pages
+            .insert(4, build_leaf_table(&[(20, b"L20"), (25, b"L25")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+        assert!(cursor.table_move_to(&cx, 10).unwrap().is_found());
+        assert!(
+            cursor.table_leaf_delete_run_current(10).unwrap().is_none(),
+            "non-root leaf maximum deletion must use the ordinary path so the parent separator is repaired"
+        );
     }
 
     #[test]

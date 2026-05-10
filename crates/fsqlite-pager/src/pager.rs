@@ -74,6 +74,93 @@ fn elapsed_profile_us(start: Option<Instant>) -> u64 {
     })
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PagerCommitProfileSnapshot {
+    pub commit_calls: u64,
+    pub phase_a_time_ns: u64,
+    pub wal_commit_time_ns: u64,
+    pub memory_flush_time_ns: u64,
+    pub journal_commit_time_ns: u64,
+    pub phase_c_metadata_time_ns: u64,
+    pub file_size_time_ns: u64,
+    pub unlock_time_ns: u64,
+    pub publish_time_ns: u64,
+    pub cache_finish_time_ns: u64,
+}
+
+static PAGER_COMMIT_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
+static PAGER_COMMIT_CALLS: AtomicU64 = AtomicU64::new(0);
+static PAGER_COMMIT_PHASE_A_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static PAGER_COMMIT_WAL_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static PAGER_COMMIT_MEMORY_FLUSH_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static PAGER_COMMIT_JOURNAL_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static PAGER_COMMIT_PHASE_C_METADATA_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static PAGER_COMMIT_FILE_SIZE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static PAGER_COMMIT_UNLOCK_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static PAGER_COMMIT_PUBLISH_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static PAGER_COMMIT_CACHE_FINISH_TIME_NS: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_pager_commit_profile_enabled(enabled: bool) {
+    PAGER_COMMIT_PROFILE_ENABLED.store(enabled, AtomicOrdering::Relaxed);
+}
+
+pub fn reset_pager_commit_profile() {
+    PAGER_COMMIT_CALLS.store(0, AtomicOrdering::Relaxed);
+    PAGER_COMMIT_PHASE_A_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    PAGER_COMMIT_WAL_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    PAGER_COMMIT_MEMORY_FLUSH_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    PAGER_COMMIT_JOURNAL_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    PAGER_COMMIT_PHASE_C_METADATA_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    PAGER_COMMIT_FILE_SIZE_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    PAGER_COMMIT_UNLOCK_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    PAGER_COMMIT_PUBLISH_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    PAGER_COMMIT_CACHE_FINISH_TIME_NS.store(0, AtomicOrdering::Relaxed);
+}
+
+#[must_use]
+pub fn pager_commit_profile_snapshot() -> PagerCommitProfileSnapshot {
+    PagerCommitProfileSnapshot {
+        commit_calls: PAGER_COMMIT_CALLS.load(AtomicOrdering::Relaxed),
+        phase_a_time_ns: PAGER_COMMIT_PHASE_A_TIME_NS.load(AtomicOrdering::Relaxed),
+        wal_commit_time_ns: PAGER_COMMIT_WAL_TIME_NS.load(AtomicOrdering::Relaxed),
+        memory_flush_time_ns: PAGER_COMMIT_MEMORY_FLUSH_TIME_NS.load(AtomicOrdering::Relaxed),
+        journal_commit_time_ns: PAGER_COMMIT_JOURNAL_TIME_NS.load(AtomicOrdering::Relaxed),
+        phase_c_metadata_time_ns: PAGER_COMMIT_PHASE_C_METADATA_TIME_NS
+            .load(AtomicOrdering::Relaxed),
+        file_size_time_ns: PAGER_COMMIT_FILE_SIZE_TIME_NS.load(AtomicOrdering::Relaxed),
+        unlock_time_ns: PAGER_COMMIT_UNLOCK_TIME_NS.load(AtomicOrdering::Relaxed),
+        publish_time_ns: PAGER_COMMIT_PUBLISH_TIME_NS.load(AtomicOrdering::Relaxed),
+        cache_finish_time_ns: PAGER_COMMIT_CACHE_FINISH_TIME_NS.load(AtomicOrdering::Relaxed),
+    }
+}
+
+#[inline]
+fn pager_commit_profile_enabled() -> bool {
+    PAGER_COMMIT_PROFILE_ENABLED.load(AtomicOrdering::Relaxed)
+}
+
+#[inline]
+fn pager_commit_profile_start(enabled: bool) -> Option<Instant> {
+    enabled.then(Instant::now)
+}
+
+#[inline]
+fn record_pager_commit_duration(metric: &AtomicU64, start: Option<Instant>) {
+    if let Some(start) = start {
+        metric.fetch_add(
+            u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            AtomicOrdering::Relaxed,
+        );
+    }
+}
+
+#[inline]
+fn record_pager_commit_call(enabled: bool) {
+    if enabled {
+        PAGER_COMMIT_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Group Commit Queue (D1: replaces global WAL_APPEND_GATES mutex)
 // ---------------------------------------------------------------------------
@@ -4504,6 +4591,7 @@ where
                 write_set: PagePageMap::default(),
                 write_pages_sorted: Vec::new(),
                 freed_pages: Vec::new(),
+                freed_page_bounds: None,
                 allocated_from_freelist: Vec::new(),
                 allocated_from_eof: Vec::new(),
                 writes_observed: false,
@@ -4701,6 +4789,7 @@ where
             write_set: PagePageMap::default(),
             write_pages_sorted: Vec::new(),
             freed_pages: Vec::new(),
+            freed_page_bounds: None,
             allocated_from_freelist: Vec::new(),
             allocated_from_eof: Vec::new(),
             writes_observed: false,
@@ -4741,6 +4830,9 @@ where
             .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
 
         if inner.journal_mode == mode {
+            if mode == JournalMode::Wal && !has_wal_backend(&self.wal_backend)? {
+                return Err(FrankenError::Unsupported);
+            }
             return Ok(mode);
         }
 
@@ -6136,6 +6228,7 @@ pub struct SimpleTransaction<V: Vfs> {
     write_set: PagePageMap<StagedPage>,
     write_pages_sorted: Vec<PageNumber>,
     freed_pages: Vec<PageNumber>,
+    freed_page_bounds: Option<(PageNumber, PageNumber)>,
     allocated_from_freelist: Vec<PageNumber>,
     allocated_from_eof: Vec<PageNumber>,
     /// #70 BUG-A / ghost-commit guard: set true as soon as any write-staging
@@ -6394,9 +6487,70 @@ impl<V: Vfs> SimpleTransaction<V> {
     }
 
     #[must_use]
-    fn committed_db_size_with_inner(&self, inner: &PagerInner<V::File>) -> u32 {
+    fn max_live_written_page(&self) -> Option<PageNumber> {
         self.write_pages_sorted
-            .last()
+            .iter()
+            .rev()
+            .copied()
+            .find(|page| self.write_set.contains_key(page))
+    }
+
+    fn note_freed_page_bound(&mut self, page_no: PageNumber) {
+        match self.freed_page_bounds {
+            Some((low, high)) => {
+                self.freed_page_bounds = Some((low.min(page_no), high.max(page_no)));
+            }
+            None => self.freed_page_bounds = Some((page_no, page_no)),
+        }
+    }
+
+    fn refresh_freed_page_bounds(&mut self) {
+        let mut pages = self.freed_pages.iter().copied();
+        let Some(first) = pages.next() else {
+            self.freed_page_bounds = None;
+            return;
+        };
+
+        let (low, high) = pages.fold((first, first), |(low, high), page| {
+            (low.min(page), high.max(page))
+        });
+        self.freed_page_bounds = Some((low, high));
+    }
+
+    fn clear_freed_pages(&mut self) {
+        self.freed_pages.clear();
+        self.freed_page_bounds = None;
+    }
+
+    fn restore_pending_freed_pages(&mut self, pending_freed: Vec<PageNumber>) {
+        self.freed_pages.extend(pending_freed);
+        self.refresh_freed_page_bounds();
+    }
+
+    fn might_have_freed_page(&self, page_no: PageNumber) -> bool {
+        self.freed_page_bounds
+            .is_some_and(|(low, high)| low <= page_no && page_no <= high)
+    }
+
+    fn contains_freed_page(&self, page_no: PageNumber) -> bool {
+        self.might_have_freed_page(page_no) && self.freed_pages.contains(&page_no)
+    }
+
+    fn remove_freed_page_if_present(&mut self, page_no: PageNumber) {
+        if !self.might_have_freed_page(page_no) {
+            return;
+        }
+        if let Some(pos) = self.freed_pages.iter().position(|&p| p == page_no) {
+            self.freed_pages.swap_remove(pos);
+            if self.freed_pages.is_empty() {
+                self.freed_page_bounds = None;
+            }
+        }
+    }
+
+    #[must_use]
+    fn committed_db_size_with_inner(&self, inner: &PagerInner<V::File>) -> u32 {
+        self.max_live_written_page()
             .map_or(inner.db_size, |page| inner.db_size.max(page.get()))
     }
 
@@ -6406,7 +6560,7 @@ impl<V: Vfs> SimpleTransaction<V> {
         current_db_size: u32,
         freelist_dirty: bool,
     ) -> WalPageOneWritePlan {
-        let max_written = self.write_pages_sorted.last().map_or(0, |page| page.get());
+        let max_written = self.max_live_written_page().map_or(0, |page| page.get());
         WalPageOneWritePlan {
             max_written,
             page_one_dirty: self.write_set.contains_key(&PageNumber::ONE),
@@ -6757,6 +6911,14 @@ impl<V: Vfs> SimpleTransaction<V> {
         committed_pages
     }
 
+    fn drain_committed_cache_pages_into_cache(&mut self) {
+        for (page_no, staged) in self.write_set.drain() {
+            self.cache
+                .insert_buffer(page_no, staged.into_buf(&self.pool));
+        }
+        self.write_pages_sorted.clear();
+    }
+
     fn discard_committed_pages(&mut self) {
         self.write_set.clear();
         self.write_pages_sorted.clear();
@@ -6767,7 +6929,7 @@ impl<V: Vfs> SimpleTransaction<V> {
             .iter()
             .chain(self.allocated_from_freelist.iter())
             .copied()
-            .filter(|page| !self.write_set.contains_key(page) && !self.freed_pages.contains(page))
+            .filter(|page| !self.write_set.contains_key(page) && !self.contains_freed_page(*page))
             .collect()
     }
 
@@ -6782,16 +6944,21 @@ impl<V: Vfs> SimpleTransaction<V> {
         let mut unstaged = Vec::new();
         let write_set = &self.write_set;
         let freed_pages = &self.freed_pages;
+        let freed_page_bounds = self.freed_page_bounds;
 
         self.allocated_from_eof.retain(|page| {
-            let keep = write_set.contains_key(page) || freed_pages.contains(page);
+            let keep = write_set.contains_key(page)
+                || freed_page_bounds.is_some_and(|(low, high)| low <= *page && *page <= high)
+                    && freed_pages.contains(page);
             if !keep {
                 unstaged.push(*page);
             }
             keep
         });
         self.allocated_from_freelist.retain(|page| {
-            let keep = write_set.contains_key(page) || freed_pages.contains(page);
+            let keep = write_set.contains_key(page)
+                || freed_page_bounds.is_some_and(|(low, high)| low <= *page && *page <= high)
+                    && freed_pages.contains(page);
             if !keep {
                 unstaged.push(*page);
             }
@@ -6876,9 +7043,12 @@ where
 
             let mut jrnl_offset = hdr_bytes.len() as u64;
             for &page_no in write_set.keys() {
-                // Read current on-disk content as the pre-image.
+                // Read current on-disk content as the pre-image. Rollback only
+                // needs images for pages that existed when this transaction
+                // began; pages allocated later may not exist on disk yet even
+                // if in-memory db_size/page-count metadata has already advanced.
                 let mut pre_image = vec![0u8; ps];
-                if page_no.get() <= inner.db_size {
+                if page_no.get() <= original_db_size {
                     let disk_offset = u64::from(page_no.get() - 1) * ps as u64;
                     let bytes_read = inner.db_file.read(cx, &mut pre_image, disk_offset)?;
                     if bytes_read < ps {
@@ -7801,9 +7971,14 @@ where
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             let promoted = consolidator.complete_flush()?;
+                            if promoted && !consolidator.claim_flusher_vacancy() {
+                                return Err(FrankenError::internal(format!(
+                                    "group commit flusher could not reserve promoted epoch after completing epoch {flush_epoch}"
+                                )));
+                            }
                             (consolidator.epoch(), promoted)
                         };
-                        queue.publish_completed_epoch(completed_epoch, has_promoted);
+                        queue.publish_completed_epoch(completed_epoch, false);
 
                         if has_promoted {
                             record_initial_metrics = false;
@@ -8070,7 +8245,7 @@ where
     V::File: Send + Sync,
 {
     fn get_page(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
-        if self.freed_pages.contains(&page_no) {
+        if self.contains_freed_page(page_no) {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
                     "page {} was freed earlier in this transaction",
@@ -8322,9 +8497,7 @@ where
 
         // If we are writing to a page that was previously freed in this transaction,
         // we must "un-free" it.
-        if let Some(pos) = self.freed_pages.iter().position(|&p| p == page_no) {
-            self.freed_pages.swap_remove(pos);
-        }
+        self.remove_freed_page_if_present(page_no);
 
         // Fast path: a second (or Nth) write to the same page within the
         // same transaction reuses the already-allocated StagedPage buffer
@@ -8354,9 +8527,7 @@ where
         // #70 ghost-commit guard: see `write_page` for rationale.
         self.writes_observed = true;
 
-        if let Some(pos) = self.freed_pages.iter().position(|&p| p == page_no) {
-            self.freed_pages.swap_remove(pos);
-        }
+        self.remove_freed_page_if_present(page_no);
 
         // Same-page steal fast path (see `write_page`). If the existing staged
         // image cannot be overwritten because it has been published or is no
@@ -8542,8 +8713,9 @@ where
                 value: page_no.get().to_string(),
             });
         }
-        if !self.freed_pages.contains(&page_no) {
+        if !self.contains_freed_page(page_no) {
             self.freed_pages.push(page_no);
+            self.note_freed_page_bound(page_no);
         }
         if self.write_set.remove(&page_no).is_some() {
             remove_page_sorted(&mut self.write_pages_sorted, page_no);
@@ -8646,6 +8818,9 @@ where
         // ── Full commit path timing instrumentation ──
         let phase_timing = commit_phase_timing_enabled();
         let t_commit_start = phase_timing.then(Instant::now);
+        let pager_commit_profile_active = pager_commit_profile_enabled();
+        record_pager_commit_call(pager_commit_profile_active);
+        let t_pager_phase_a_start = pager_commit_profile_start(pager_commit_profile_active);
 
         // Phase A: Prepare write_set under inner lock (~20us)
         // Snapshot state needed for WAL I/O, then DROP inner.lock() immediately.
@@ -8690,6 +8865,7 @@ where
             // write and become a cross-process first-committer-wins conflict.
             let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
             pending_freed = self.freed_pages.drain(..).collect();
+            self.freed_page_bounds = None;
             if freelist_dirty {
                 if let Err(e) = serialize_freelist_to_write_set(
                     cx,
@@ -8702,7 +8878,7 @@ where
                     committed_db_size,
                     &pending_free_pages,
                 ) {
-                    self.freed_pages.extend(pending_freed);
+                    self.restore_pending_freed_pages(pending_freed);
                     return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
                     return Err(e);
                 }
@@ -8730,7 +8906,7 @@ where
                 ) {
                     Ok(p) => p,
                     Err(e) => {
-                        self.freed_pages.extend(pending_freed);
+                        self.restore_pending_freed_pages(pending_freed);
                         return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
                         return Err(e);
                     }
@@ -8775,6 +8951,7 @@ where
         let wal_sync_policy = inner.wal_commit_sync_policy;
 
         let t_phase_a_done = phase_timing.then(Instant::now);
+        record_pager_commit_duration(&PAGER_COMMIT_PHASE_A_TIME_NS, t_pager_phase_a_start);
 
         // Phase B: Commit via WAL or journal
         // D1-CRITICAL: For WAL mode, we release inner.lock() here so other
@@ -8788,6 +8965,7 @@ where
             // WAL mode: Use group commit for same-process batching.
             // commit_wal_group_commit will acquire consolidator.lock() first,
             // then briefly inner.lock() for the actual WAL I/O.
+            let t_wal_commit_start = pager_commit_profile_start(pager_commit_profile_active);
             let result = Self::commit_wal_group_commit_with_snapshot(
                 cx,
                 &self.wal_backend,
@@ -8799,17 +8977,17 @@ where
                 &cross_process_conflict_pages,
                 &self.group_commit_queue,
             );
+            record_pager_commit_duration(&PAGER_COMMIT_WAL_TIME_NS, t_wal_commit_start);
 
             // Re-acquire inner lock for Phase C (finalize).
-            inner = match self
-                .inner
+            inner = match inner_arc
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))
             {
                 Ok(guard) => guard,
                 Err(e) => {
-                    self.freed_pages.extend(pending_freed);
-                    if let Ok(mut recovery_inner) = self.inner.lock() {
+                    self.restore_pending_freed_pages(pending_freed);
+                    if let Ok(mut recovery_inner) = inner_arc.lock() {
                         return_pages_to_freelist(
                             &mut recovery_inner.freelist,
                             pending_returned_pages,
@@ -8824,28 +9002,35 @@ where
             // Private `:memory:` commits do not need rollback-journal
             // creation/sync. Page 1 has already been staged above, so flush
             // the final committed image directly once at the release boundary.
-            Self::flush_write_set_to_db_file_batch(
+            let t_memory_flush_start = pager_commit_profile_start(pager_commit_profile_active);
+            let result = Self::flush_write_set_to_db_file_batch(
                 cx,
                 &mut inner,
                 &self.write_set,
                 &self.write_pages_sorted,
-            )
+            );
+            record_pager_commit_duration(&PAGER_COMMIT_MEMORY_FLUSH_TIME_NS, t_memory_flush_start);
+            result
         } else {
             // Journal mode: Direct commit (no group commit)
             // Journal mode keeps inner locked throughout - no parallelization.
-            Self::commit_journal(
+            let t_journal_commit_start = pager_commit_profile_start(pager_commit_profile_active);
+            let result = Self::commit_journal(
                 cx,
                 &self.vfs,
                 &self.journal_path,
                 &mut inner,
                 &self.write_set,
                 self.original_db_size,
-            )
+            );
+            record_pager_commit_duration(&PAGER_COMMIT_JOURNAL_TIME_NS, t_journal_commit_start);
+            result
         };
 
         let t_phase_b_done = phase_timing.then(Instant::now);
 
         if commit_result.is_ok() {
+            let t_phase_c_metadata_start = pager_commit_profile_start(pager_commit_profile_active);
             // Phase C1 (FAST, under inner.lock): Update metadata only.
             // Now that WAL I/O has succeeded, promote pages that became free
             // into inner.freelist. This is the deferred half of the Phase A
@@ -8869,9 +9054,11 @@ where
             // permanent in-process holes that later commits can expose as
             // "Page N: never used" once page_count grows past the gap.
             inner.commit_seq = inner.commit_seq.next();
+            let t_file_size_start = pager_commit_profile_start(pager_commit_profile_active);
             if let Ok(file_size) = inner.db_file.file_size(cx) {
                 inner.committed_db_file_size_bytes = file_size;
             }
+            record_pager_commit_duration(&PAGER_COMMIT_FILE_SIZE_TIME_NS, t_file_size_start);
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
             if self.mode != TransactionMode::Concurrent {
                 inner.writer_active = false;
@@ -8895,8 +9082,14 @@ where
             self.publish_committed_snapshot_from_inner(&inner);
             let preserve_level =
                 retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
+            let t_unlock_start = pager_commit_profile_start(pager_commit_profile_active);
             let _ = inner.db_file.unlock(cx, preserve_level);
+            record_pager_commit_duration(&PAGER_COMMIT_UNLOCK_TIME_NS, t_unlock_start);
             drop(inner);
+            record_pager_commit_duration(
+                &PAGER_COMMIT_PHASE_C_METADATA_TIME_NS,
+                t_phase_c_metadata_start,
+            );
 
             let t_phase_c1_done = phase_timing.then(Instant::now);
 
@@ -8914,11 +9107,13 @@ where
             // Phase C2 (outside inner.lock): publish to the shared snapshot
             // plane. In isolated single-connection mode, only metadata needs
             // to advance; page bytes stay authoritative in pager/db_file state.
+            let t_publish_start = pager_commit_profile_start(pager_commit_profile_active);
             if metadata_only_single_connection_fast_path {
                 self.publish_single_connection_metadata_only(cx, publish_update);
             } else {
                 self.publish_committed_state(cx, publish_update);
             }
+            record_pager_commit_duration(&PAGER_COMMIT_PUBLISH_TIME_NS, t_publish_start);
 
             // Keep the transaction-local published snapshot hint aligned with
             // the commit we just published so post-commit callers querying the
@@ -8963,10 +9158,13 @@ where
             // published page plane stale, so keep the just-committed pages in
             // shared cache even under WAL mode to give the next statement a
             // cheap committed read surface.
+            let t_cache_finish_start = pager_commit_profile_start(pager_commit_profile_active);
             if publish_update.journal_mode == JournalMode::Wal
                 && !metadata_only_single_connection_fast_path
             {
                 self.discard_committed_pages();
+            } else if metadata_only_single_connection_fast_path {
+                self.drain_committed_cache_pages_into_cache();
             } else {
                 let committed_cache_pages = self.drain_committed_cache_pages();
                 if !committed_cache_pages.is_empty() {
@@ -8989,6 +9187,7 @@ where
             // is dropped when the transaction drops; this reset is the
             // amortization hook that keeps the txn-committed state compact.
             self.scratch_arena.reset();
+            record_pager_commit_duration(&PAGER_COMMIT_CACHE_FINISH_TIME_NS, t_cache_finish_start);
         } else {
             // Keep the writer lock held on commit failure so no other writer
             // can interleave while the caller decides to retry or roll back.
@@ -8997,7 +9196,7 @@ where
             // a retry or rollback can still observe them. In the old code
             // they leaked into inner.freelist regardless of commit outcome;
             // now we only promote on success and restore on failure.
-            self.freed_pages.extend(pending_freed);
+            self.restore_pending_freed_pages(pending_freed);
             return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
             drop(inner);
         }
@@ -9073,6 +9272,7 @@ where
         let mut pending_free_pages = pending_returned_pages.clone();
         pending_free_pages.extend(self.freed_pages.iter().copied());
         let pending_freed: Vec<PageNumber> = self.freed_pages.drain(..).collect();
+        self.freed_page_bounds = None;
         let commit_result = {
             let freelist_dirty = freelist_dirty_for_retain;
             // Match the normal commit path: capture semantic Page 1 intent
@@ -9090,7 +9290,7 @@ where
                     committed_db_size,
                     &pending_free_pages,
                 ) {
-                    self.freed_pages.extend(pending_freed);
+                    self.restore_pending_freed_pages(pending_freed);
                     return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
                     return Err(e);
                 }
@@ -9123,7 +9323,7 @@ where
                 ) {
                     Ok(p) => p,
                     Err(e) => {
-                        self.freed_pages.extend(pending_freed);
+                        self.restore_pending_freed_pages(pending_freed);
                         return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
                         return Err(e);
                     }
@@ -9175,15 +9375,14 @@ where
                     &cross_process_conflict_pages,
                     &self.group_commit_queue,
                 );
-                inner = match self
-                    .inner
+                inner = match inner_arc
                     .lock()
                     .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))
                 {
                     Ok(guard) => guard,
                     Err(e) => {
-                        self.freed_pages.extend(pending_freed);
-                        if let Ok(mut recovery_inner) = self.inner.lock() {
+                        self.restore_pending_freed_pages(pending_freed);
+                        if let Ok(mut recovery_inner) = inner_arc.lock() {
                             return_pages_to_freelist(
                                 &mut recovery_inner.freelist,
                                 pending_returned_pages,
@@ -9214,7 +9413,7 @@ where
                         &self.write_set,
                         &self.write_pages_sorted,
                     ) {
-                        self.freed_pages.extend(pending_freed);
+                        self.restore_pending_freed_pages(pending_freed);
                         return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
                         return Err(e);
                     }
@@ -9264,9 +9463,7 @@ where
             // held — MUST happen before publish_committed_state (same order as
             // `commit()`), so concurrent readers see the immutable snapshot
             // before the seqlock commit_seq advances.
-            if !metadata_only_single_connection_fast_path {
-                self.publish_committed_snapshot_from_inner(&inner);
-            }
+            self.publish_committed_snapshot_from_inner(&inner);
             drop(inner);
             if metadata_only_single_connection_fast_path {
                 if defer_private_memory_flush {
@@ -9283,7 +9480,7 @@ where
 
             // Clear retained transaction state for reuse.
             self.write_pages_sorted.clear();
-            self.freed_pages.clear();
+            self.clear_freed_pages();
             self.allocated_from_freelist.clear();
             self.allocated_from_eof.clear();
             self.savepoint_stack.clear();
@@ -9306,7 +9503,7 @@ where
         } else {
             // CRITICAL FIX (beads_rust#138): Restore pending freed pages on
             // commit failure so rollback can still see them.
-            self.freed_pages.extend(pending_freed);
+            self.restore_pending_freed_pages(pending_freed);
             return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
             drop(inner);
             commit_result?;
@@ -9416,7 +9613,7 @@ where
         }
         self.write_set.clear();
         self.write_pages_sorted.clear();
-        self.freed_pages.clear();
+        self.clear_freed_pages();
         self.savepoint_stack.clear();
         self.rolled_back_pages.clear();
         // #70 ghost-commit guard: after rollback, staged writes were
@@ -9628,17 +9825,23 @@ where
             }
         }
 
-        self.allocated_from_freelist = entry.allocated_from_freelist_snapshot.clone();
-        self.allocated_from_eof = entry.allocated_from_eof_snapshot.clone();
-        self.freed_pages = entry.freed_pages_snapshot.clone();
+        let allocated_from_freelist_snapshot = entry.allocated_from_freelist_snapshot.clone();
+        let allocated_from_eof_snapshot = entry.allocated_from_eof_snapshot.clone();
+        let freed_pages_snapshot = entry.freed_pages_snapshot.clone();
+        let write_pages_sorted_snapshot = entry.write_pages_sorted_snapshot.clone();
+        let snapshot_was_empty = entry.write_set_snapshot.is_empty();
+
+        self.allocated_from_freelist = allocated_from_freelist_snapshot;
+        self.allocated_from_eof = allocated_from_eof_snapshot;
+        self.freed_pages = freed_pages_snapshot;
+        self.refresh_freed_page_bounds();
         // #70 ghost-commit guard: rollback-to-savepoint replaces write_set
         // with the snapshot. If the snapshot is empty, no writes are pending
         // — commit will be a legitimate no-op and the guard should not flag
         // it. If the snapshot is non-empty, writes are still pending and
         // writes_observed should stay consistent with that.
-        let snapshot_was_empty = entry.write_set_snapshot.is_empty();
         self.write_set = new_write_set;
-        self.write_pages_sorted = entry.write_pages_sorted_snapshot.clone();
+        self.write_pages_sorted = write_pages_sorted_snapshot;
         if snapshot_was_empty {
             self.writes_observed = false;
         }
@@ -11759,6 +11962,81 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_commit_journal_skips_preimage_for_pages_allocated_after_transaction_start() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let page_size = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let new_page = txn.allocate_page(&cx).unwrap();
+        assert!(
+            new_page.get() > txn.original_db_size,
+            "bead_id={BEAD_ID} case=new_page_is_after_transaction_start"
+        );
+        txn.write_page(&cx, new_page, &vec![0x77; page_size])
+            .unwrap();
+
+        {
+            let mut inner = txn.inner.lock().unwrap();
+            // Simulate upper-layer page-count metadata advancing before the
+            // database file has been extended by the rollback-journal commit.
+            inner.db_size = new_page.get();
+        }
+
+        txn.commit(&cx).unwrap();
+
+        let txn2 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let data = txn2.get_page(&cx, new_page).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            0x77,
+            "bead_id={BEAD_ID} case=post_start_page_commits_without_preimage_read"
+        );
+    }
+
+    #[test]
+    fn test_commit_journal_page_count_ignores_stale_sorted_pages_missing_from_write_set() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let page_size = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let durable_page = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, durable_page, &vec![0x11; page_size])
+            .unwrap();
+        let stale_page = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, stale_page, &vec![0x22; page_size])
+            .unwrap();
+
+        let removed = txn.write_set.remove(&stale_page);
+        assert!(
+            removed.is_some() && txn.write_pages_sorted.contains(&stale_page),
+            "bead_id={BEAD_ID} case=test_setup_left_stale_sorted_page"
+        );
+
+        txn.commit(&cx).unwrap();
+
+        let inner = pager.inner.lock().unwrap();
+        let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
+        let bytes_read = inner.db_file.read(&cx, &mut header_bytes, 0).unwrap();
+        assert_eq!(
+            bytes_read, DATABASE_HEADER_SIZE,
+            "bead_id={BEAD_ID} case=page_one_header_read"
+        );
+        let header = DatabaseHeader::from_bytes(&header_bytes).unwrap();
+        assert_eq!(
+            header.page_count,
+            durable_page.get(),
+            "bead_id={BEAD_ID} case=page_count_uses_authoritative_write_set"
+        );
+        assert_eq!(
+            inner.db_file.file_size(&cx).unwrap(),
+            u64::from(durable_page.get()) * u64::from(PageSize::DEFAULT.get()),
+            "bead_id={BEAD_ID} case=file_size_matches_page_count"
+        );
+    }
+
     // ── Journal crash recovery tests ────────────────────────────────────
 
     #[test]
@@ -13520,8 +13798,18 @@ mod tests {
             page_data: &[u8],
             db_size_if_commit: u32,
         ) -> fsqlite_error::Result<()> {
-            self.wal
-                .append_frame(cx, page_number, page_data, db_size_if_commit)
+            self.wal.file_mut().lock(cx, LockLevel::Exclusive)?;
+            let append_result =
+                self.wal
+                    .append_frame(cx, page_number, page_data, db_size_if_commit);
+            let unlock_result = self.wal.file_mut().unlock(cx, LockLevel::None);
+            match (append_result, unlock_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                (Err(append_error), Err(unlock_error)) => Err(FrankenError::internal(format!(
+                    "publish-window WAL append failed and unlock failed: append={append_error}; unlock={unlock_error}"
+                ))),
+            }
         }
 
         fn append_frames(
@@ -13537,7 +13825,16 @@ mod tests {
                     db_size_if_commit: frame.db_size_if_commit,
                 })
                 .collect();
-            self.wal.append_frames(cx, &wal_frames)
+            self.wal.file_mut().lock(cx, LockLevel::Exclusive)?;
+            let append_result = self.wal.append_frames(cx, &wal_frames);
+            let unlock_result = self.wal.file_mut().unlock(cx, LockLevel::None);
+            match (append_result, unlock_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                (Err(append_error), Err(unlock_error)) => Err(FrankenError::internal(format!(
+                    "publish-window WAL append failed and unlock failed: append={append_error}; unlock={unlock_error}"
+                ))),
+            }
         }
 
         fn prepare_append_frames(
@@ -13622,11 +13919,20 @@ mod tests {
                     c2: transform.c2,
                 })
                 .collect();
-            self.wal.append_prepared_frame_bytes(
+            self.wal.file_mut().lock(cx, LockLevel::Exclusive)?;
+            let append_result = self.wal.append_prepared_frame_bytes(
                 cx,
                 &mut prepared.frame_bytes,
                 &checksum_transforms,
-            )
+            );
+            let unlock_result = self.wal.file_mut().unlock(cx, LockLevel::None);
+            match (append_result, unlock_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                (Err(append_error), Err(unlock_error)) => Err(FrankenError::internal(format!(
+                    "publish-window prepared WAL append failed and unlock failed: append={append_error}; unlock={unlock_error}"
+                ))),
+            }
         }
 
         fn read_page(
@@ -17583,6 +17889,99 @@ mod tests {
 
         target_handle.join().unwrap();
         next_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_group_commit_queue_claimed_promoted_epoch_blocks_parallel_takeover() {
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+
+        {
+            let mut consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let batch1 = TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 1,
+                page_data: sample_page(0x51),
+                db_size_if_commit: 1,
+            }]);
+            assert_eq!(
+                consolidator.submit_batch(batch1).unwrap(),
+                SubmitOutcome::Flusher
+            );
+            let _ = consolidator.begin_flush().unwrap();
+            let pipelined_batch = TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 2,
+                page_data: sample_page(0x52),
+                db_size_if_commit: 2,
+            }]);
+            assert_eq!(
+                consolidator.submit_batch(pipelined_batch).unwrap(),
+                SubmitOutcome::Waiter
+            );
+        }
+
+        let waiter_queue = Arc::clone(&queue);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let guard = waiter_queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _registered_slot = waiter_queue.epoch_waiters.slot(2);
+            ready_tx.send(()).expect("waiter should signal readiness");
+            let outcome = waiter_queue.wait_for_epoch_outcome(guard, 2);
+            done_tx.send(outcome).expect("waiter should report outcome");
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("next-epoch waiter should start");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "bead_id={BEAD_ID} case=group_commit_claimed_promoted_epoch_waiter_stays_parked_before_publish"
+        );
+
+        {
+            let mut consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(consolidator.complete_flush().unwrap());
+            assert!(
+                consolidator.claim_flusher_vacancy(),
+                "bead_id={BEAD_ID} case=group_commit_claimed_promoted_epoch_original_flusher_claims"
+            );
+        }
+        queue.publish_completed_epoch(1, true);
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "bead_id={BEAD_ID} case=group_commit_claimed_promoted_epoch_waiter_must_not_take_over"
+        );
+
+        {
+            let mut consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let batches = consolidator.begin_flush().unwrap();
+            assert_eq!(batches.len(), 1);
+            assert_eq!(consolidator.epoch(), 2);
+            assert!(!consolidator.complete_flush().unwrap());
+        }
+        queue.publish_completed_epoch(2, false);
+
+        let outcome = done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("next-epoch waiter should wake after its epoch completes")
+            .expect("next-epoch waiter should succeed");
+        assert!(
+            matches!(outcome, WaitForEpochOutcome::Completed),
+            "bead_id={BEAD_ID} case=group_commit_claimed_promoted_epoch_waiter_observes_completion outcome={outcome:?}"
+        );
+        waiter.join().unwrap();
     }
 
     #[test]
@@ -22053,6 +22452,17 @@ mod tests {
             txn.txn_read_cache.borrow().contains_key(&p),
             "bead_id={BEAD_ID} case=single_connection_commit_and_retain_keeps_authoritative_txn_read_cache"
         );
+        shared_connection_count.store(2, AtomicOrdering::Release);
+        let retained_snapshot = pager.committed_snapshot();
+        assert_eq!(
+            retained_snapshot.commit_seq, published_after_retain.visible_commit_seq,
+            "bead_id={BEAD_ID} case=single_connection_commit_and_retain_refreshes_committed_snapshot_seq"
+        );
+        assert_eq!(
+            retained_snapshot.db_size, published_after_retain.db_size,
+            "bead_id={BEAD_ID} case=single_connection_commit_and_retain_refreshes_committed_snapshot_db_size"
+        );
+        shared_connection_count.store(1, AtomicOrdering::Release);
         let mut stale_buf = PageBuf::new(PageSize::DEFAULT);
         stale_buf.fill(0x7F);
         pager.cache.insert_buffer(p, stale_buf);
@@ -24145,6 +24555,46 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             "caller should own backend cleanup after a rejected install"
         );
+    }
+
+    #[test]
+    fn test_set_journal_mode_wal_requires_backend_even_when_inner_mode_is_wal() {
+        let cx = Cx::new();
+        let (pager, _) = test_pager();
+        {
+            let mut inner = pager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.journal_mode = JournalMode::Wal;
+        }
+
+        let err = pager
+            .set_journal_mode(&cx, JournalMode::Wal)
+            .expect_err("WAL mode must require an installed WAL backend");
+        assert!(
+            matches!(err, FrankenError::Unsupported),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            !has_wal_backend(&pager.wal_backend).unwrap(),
+            "failed WAL mode confirmation must not publish a backend"
+        );
+    }
+
+    #[test]
+    fn test_set_journal_mode_same_rollback_mode_allowed_during_active_transaction() {
+        let cx = Cx::new();
+        let (pager, _) = test_pager();
+        let mut txn = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+
+        assert_eq!(
+            pager.set_journal_mode(&cx, JournalMode::Delete).unwrap(),
+            JournalMode::Delete,
+            "idempotent rollback journal-mode confirmation should not require a mode switch"
+        );
+
+        txn.rollback(&cx).unwrap();
     }
 
     fn read_all_vfs_bytes<V: Vfs>(vfs: &V, cx: &Cx, path: &Path) -> Vec<u8> {

@@ -2,13 +2,13 @@
 //!
 //! Proves:
 //! 1. Parse/compiled/prepared caches produce hits on repeated identical SQL.
-//! 2. DDL (schema_cookie change) invalidates all three caches.
-//! 3. Results remain correct after invalidation + re-prepare.
+//! 2. DDL (schema_cookie change) invalidates schema-bound prepared state.
+//! 3. Results remain correct after invalidation or transparent re-prepare.
 //! 4. Rollback to savepoint does NOT spuriously invalidate caches when
 //!    schema_cookie is unchanged.
 //! 5. Schema generation bump (connection-local DDL) invalidates prepared
 //!    statements via SchemaChanged error.
-//! 6. File-backed databases share the same cache/invalidation behavior.
+//! 6. File-backed databases share the same correctness/recovery behavior.
 //! 7. Warm-loop churn measurement scorecard with structured output.
 //!
 //! NOTE: Tests T1–T3 and T5–T9 use global hot-path counters. This file
@@ -107,15 +107,16 @@ fn test_parse_cache_hits_on_repeated_select() {
     );
 }
 
-/// T2: DDL invalidates caches; subsequent query still correct.
+/// T2: DDL invalidates schema-bound prepared state; subsequent query still correct.
 #[test]
-fn test_ddl_invalidates_all_caches() {
+fn test_ddl_invalidates_schema_bound_reuse_and_recovers() {
     let _profile_guard = HotPathProfileTestGuard::new();
 
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
     conn.execute("INSERT INTO t VALUES(1, 'before')").unwrap();
+    let stmt = conn.prepare("SELECT val FROM t WHERE id = ?1").unwrap();
 
     // Warm the cache with two identical queries.
     let _ = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
@@ -131,22 +132,44 @@ fn test_ddl_invalidates_all_caches() {
     conn.execute("ALTER TABLE t ADD COLUMN extra INTEGER DEFAULT 0")
         .unwrap();
 
-    // Snapshot AFTER DDL, BEFORE next query.
-    let (_, pm_pre_query, _, _, _, _) = cache_snapshot();
+    let result = stmt.query_with_params(&[fsqlite_types::SqliteValue::Integer(1)]);
+    match result {
+        Err(fsqlite_error::FrankenError::SchemaChanged) => {}
+        Ok(rows) => {
+            assert_eq!(rows.len(), 1, "transparent re-prepare should return 1 row");
+            assert_eq!(
+                rows[0].get(0),
+                Some(&fsqlite_types::SqliteValue::Text("before".into())),
+                "transparent re-prepare should preserve the original column"
+            );
+        }
+        Err(other) => panic!("unexpected prepared-statement error after DDL: {other:?}"),
+    }
 
-    // Next query — should trigger a cache miss (invalidated by DDL).
-    let rows = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
-    let (_, pm_post_query, _, _, _, _) = cache_snapshot();
-
-    assert!(
-        pm_post_query > pm_pre_query,
-        "after DDL, first query should produce a parse cache miss: pre={pm_pre_query}, post={pm_post_query}"
+    // Query through the new schema and prove the connection-local caches recover.
+    let rows = conn.query("SELECT val, extra FROM t WHERE id = 1").unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "query should return the row after ALTER TABLE"
+    );
+    assert_eq!(
+        rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Text("before".into())),
+        "existing column should remain readable after ALTER TABLE"
+    );
+    assert_eq!(
+        rows[0].get(1),
+        Some(&fsqlite_types::SqliteValue::Integer(0)),
+        "new column should expose its DEFAULT value"
     );
 
-    // Result correctness.
+    let (ph_before_reuse, _, _, _, _, _) = cache_snapshot();
+    let _ = conn.query("SELECT val, extra FROM t WHERE id = 1").unwrap();
+    let (ph_after_reuse, _, _, _, _, _) = cache_snapshot();
     assert!(
-        !rows.is_empty(),
-        "query should still return the row after ALTER TABLE"
+        ph_after_reuse > ph_before_reuse,
+        "cache should recover after DDL: {ph_before_reuse} -> {ph_after_reuse}"
     );
 }
 
@@ -227,9 +250,9 @@ fn test_schema_generation_invalidates_prepared() {
     }
 }
 
-/// T5: Repeated identical INSERT uses compiled cache.
+/// T5: Repeated identical INSERT uses prepared cache.
 #[test]
-fn test_compiled_cache_hits_on_repeated_insert() {
+fn test_prepared_cache_hits_on_repeated_insert() {
     let _profile_guard = HotPathProfileTestGuard::new();
 
     let conn = Connection::open(":memory:").unwrap();
@@ -238,16 +261,16 @@ fn test_compiled_cache_hits_on_repeated_insert() {
 
     // Two identical INSERTs.
     conn.execute("INSERT INTO t VALUES(1, 'a')").unwrap();
-    let (_, _, ch1, _, _, _) = cache_snapshot();
+    let (_, _, _, _, ph1, _) = cache_snapshot();
     conn.execute("INSERT INTO t VALUES(1, 'a')")
         .unwrap_or_default(); // PK conflict OK
-    let (_, _, ch2, _, _, _) = cache_snapshot();
+    let (_, _, _, _, ph2, _) = cache_snapshot();
 
-    eprintln!("[T5] compiled_cache hits: {ch1} -> {ch2}");
-    // At least one compiled cache hit should appear for the repeated identical SQL.
+    // The prepared-template cache now owns identical ad-hoc DML reuse; a hit here
+    // bypasses the compiled-program cache entirely.
     assert!(
-        ch2 > ch1,
-        "identical SQL should produce a compiled cache hit: before={ch1}, after={ch2}"
+        ph2 > ph1,
+        "identical SQL should produce a prepared cache hit: before={ph1}, after={ph2}"
     );
 }
 
@@ -265,6 +288,7 @@ fn test_file_backed_cache_invalidation() {
         .unwrap();
     conn.execute("INSERT INTO t VALUES(1, 'file-backed')")
         .unwrap();
+    let stmt = conn.prepare("SELECT val FROM t WHERE id = ?1").unwrap();
 
     // Warm cache.
     let _ = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
@@ -280,16 +304,44 @@ fn test_file_backed_cache_invalidation() {
 
     // DDL invalidation.
     conn.execute("CREATE TABLE t2(x INTEGER)").unwrap();
-    let (_, pm_pre, _, _, _, _) = cache_snapshot();
+    let result = stmt.query_with_params(&[fsqlite_types::SqliteValue::Integer(1)]);
+    match result {
+        Err(fsqlite_error::FrankenError::SchemaChanged) => {}
+        Ok(rows) => {
+            assert_eq!(
+                rows.len(),
+                1,
+                "file-backed: transparent re-prepare should return 1 row"
+            );
+            assert_eq!(
+                rows[0].get(0),
+                Some(&fsqlite_types::SqliteValue::Text("file-backed".into())),
+                "file-backed: transparent re-prepare should preserve row data"
+            );
+        }
+        Err(other) => {
+            panic!("file-backed: unexpected prepared-statement error after DDL: {other:?}")
+        }
+    }
+
     let rows = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
-    let (_, pm_post, _, _, _, _) = cache_snapshot();
-    assert!(
-        pm_post > pm_pre,
-        "file-backed: DDL should cause a cache miss: {pm_pre} -> {pm_post}"
+    assert_eq!(
+        rows.len(),
+        1,
+        "file-backed: result must be correct after DDL"
     );
+    assert_eq!(
+        rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Text("file-backed".into())),
+        "file-backed: row data must survive DDL"
+    );
+
+    let (ph_pre_reuse, _, _, _, _, _) = cache_snapshot();
+    let _ = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
+    let (ph_post_reuse, _, _, _, _, _) = cache_snapshot();
     assert!(
-        !rows.is_empty(),
-        "file-backed: result must be correct after invalidation"
+        ph_post_reuse > ph_pre_reuse,
+        "file-backed: cache should recover after DDL: {ph_pre_reuse} -> {ph_post_reuse}"
     );
 }
 

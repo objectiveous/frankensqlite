@@ -633,6 +633,37 @@ impl FunctionRegistry {
         self.windows.keys().any(|k| k.name == canon)
     }
 
+    /// Return whether a known window function accepts the SQL-visible arity.
+    ///
+    /// `None` means the name is not registered as a window function at all.
+    /// This is useful for callers that may execute optimized window paths
+    /// without invoking the returned function's `step()` method, where the
+    /// wrong-arity sentinel from `find_window` would otherwise be bypassed.
+    #[must_use]
+    pub fn window_accepts_arg_count(&self, name: &str, num_args: i32) -> Option<bool> {
+        let canon = canonical_name(name);
+        let exact = FunctionKey {
+            name: canon.clone(),
+            num_args,
+        };
+        if let Some(function) = self.windows.get(&exact) {
+            return Some(function.accepts_arg_count(num_args));
+        }
+
+        let variadic = FunctionKey {
+            name: canon.clone(),
+            num_args: -1,
+        };
+        if let Some(function) = self.windows.get(&variadic) {
+            return Some(function.accepts_arg_count(num_args));
+        }
+
+        self.windows
+            .keys()
+            .any(|key| key.name == canon)
+            .then_some(false)
+    }
+
     /// Return deduplicated lowercase names of all registered aggregate functions.
     ///
     /// Used by the codegen thread-local to recognize custom aggregate UDFs.
@@ -1289,6 +1320,22 @@ mod tests {
             .find_window("moving_sum", 0)
             .expect("known window with wrong arity returns erroring window");
         assert_wrong_arg_count_window(f.as_ref(), &[], "moving_sum");
+    }
+
+    #[test]
+    fn test_registry_window_accepts_arg_count_reports_known_bad_arity() {
+        let mut registry = FunctionRegistry::new();
+        registry.register_window(MovingSum);
+
+        assert_eq!(
+            registry.window_accepts_arg_count("moving_sum", 1),
+            Some(true)
+        );
+        assert_eq!(
+            registry.window_accepts_arg_count("moving_sum", 0),
+            Some(false)
+        );
+        assert_eq!(registry.window_accepts_arg_count("missing_window", 1), None);
     }
 
     #[test]

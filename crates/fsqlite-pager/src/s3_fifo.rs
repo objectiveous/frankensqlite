@@ -449,7 +449,12 @@ impl S3Fifo {
     #[inline]
     #[must_use]
     pub fn ghost_len(&self) -> usize {
-        self.ghost.len()
+        self.ghost
+            .iter()
+            .filter(|(page_id, epoch)| {
+                matches!(self.index.get(page_id), Some(EntryState::Ghost(current)) if current == epoch)
+            })
+            .count()
     }
 
     #[inline]
@@ -467,7 +472,13 @@ impl S3Fifo {
     #[inline]
     #[must_use]
     pub fn ghost_pages(&self) -> Vec<PageNumber> {
-        self.ghost.iter().map(|(p, _)| *p).collect()
+        self.ghost
+            .iter()
+            .filter_map(|(page_id, epoch)| {
+                matches!(self.index.get(page_id), Some(EntryState::Ghost(current)) if current == epoch)
+                    .then_some(*page_id)
+            })
+            .collect()
     }
 
     /// O(1) queue-location lookup.
@@ -666,9 +677,9 @@ impl S3Fifo {
             if let Some(EntryState::Ghost(current_epoch)) = self.index.get(&page_id) {
                 if *current_epoch == epoch {
                     self.index.remove(&page_id);
+                    events.push(S3FifoEvent::GhostTrimmed(page_id));
                 }
             }
-            events.push(S3FifoEvent::GhostTrimmed(page_id));
         }
     }
 

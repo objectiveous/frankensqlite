@@ -41,11 +41,12 @@ pub use page_cache::{
     resolve_page_buffer_max,
 };
 pub use pager::{
-    PAGER_METADATA_PUBLICATION_CONTRACTS, PagerMetadataPublicationClass,
-    PagerMetadataPublicationContract, PagerPublishedSnapshot, ParallelWalPublicationIntent,
-    SimplePager, SimplePagerCheckpointWriter, SimpleTransaction, WalCommitSyncPolicy,
-    remove_group_commit_queue, reset_staged_page_overwrite_steals_total,
-    staged_page_overwrite_steals_total,
+    PAGER_METADATA_PUBLICATION_CONTRACTS, PagerCommitProfileSnapshot,
+    PagerMetadataPublicationClass, PagerMetadataPublicationContract, PagerPublishedSnapshot,
+    ParallelWalPublicationIntent, SimplePager, SimplePagerCheckpointWriter, SimpleTransaction,
+    WalCommitSyncPolicy, pager_commit_profile_snapshot, remove_group_commit_queue,
+    reset_pager_commit_profile, reset_staged_page_overwrite_steals_total,
+    set_pager_commit_profile_enabled, staged_page_overwrite_steals_total,
 };
 pub use s3_fifo::{
     QueueKind, QueueLocation, RolloutDecision, RolloutMetrics, RolloutPolicy, S3Fifo, S3FifoConfig,

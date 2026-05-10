@@ -803,28 +803,15 @@ mod tests {
         source_indexes: &[usize],
     ) {
         for &source_index in source_indexes {
-            let row = base_rows + source_index;
-            let mut columns = Vec::new();
-            let mut coefficients = Vec::new();
-            for col in 0..constraints.cols {
-                let coeff = constraints.get(row, col);
-                if !coeff.is_zero() {
-                    columns.push(col);
-                    coefficients.push(coeff);
-                }
-            }
-
-            received.push(ReceivedSymbol {
-                esi: u32::try_from(source_index).expect("source index fits u32"),
-                is_source: true,
-                columns,
-                coefficients,
-                data: source[source_index].clone(),
-            });
+            received.push(ReceivedSymbol::source(
+                u32::try_from(source_index).expect("source index fits u32"),
+                source[source_index].clone(),
+            ));
         }
 
         // RFC 6330 decode domain uses K' source-domain rows, not just K.
-        // The K'−K PI rows correspond to zero-padded source symbols.
+        // The K' - K PI rows are internal zero-padding equations, not public
+        // source symbols. Public source ESIs remain restricted to [0, K).
         for source_index in source.len()..k_prime {
             let row = base_rows + source_index;
             let mut columns = Vec::new();
@@ -839,7 +826,7 @@ mod tests {
 
             received.push(ReceivedSymbol {
                 esi: u32::try_from(source_index).expect("source index fits u32"),
-                is_source: true,
+                is_source: false,
                 columns,
                 coefficients,
                 data: vec![0_u8; symbol_size],

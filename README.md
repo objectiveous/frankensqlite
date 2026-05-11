@@ -1147,14 +1147,17 @@ The human-readable scope lock for that contract lives in
 ### Workloads That Benefit Most from MVCC
 
 Current full-quick benchmark source of truth: `comprehensive-bench --quick` in
-`tests/artifacts/perf/codex-free-page-dispatch-candidate-20260511T1108Z/full-quick.json`.
+`tests/artifacts/perf/codex-memory-direct-pageio-candidate-20260511T1255Z/full-quick-noprofile.json`.
 This 2026-05-11 run keeps UPDATE/DELETE population and teardown outside the
 timed interval, prepares the DML statements once for both engines before timed
 samples, skips dormant quotient-filter map borrows on direct DML, drains
 single-connection committed cache pages directly after metadata-only pager
 commits, batches eligible monotone multi-leaf direct DELETE leaf runs, and
 dispatches `TransactionKind::free_page` through concrete transaction variants
-instead of the dynamic transaction-handle helper. Time ratios report
+instead of the dynamic transaction-handle helper. It also skips shared
+concurrent page-I/O wrapping for private `:memory:` direct DML while preserving
+the concurrent transaction/session semantics and file-backed mediation path.
+Time ratios report
 FrankenSQLite time divided by C SQLite time, so values **below `1.0x` are
 faster for FrankenSQLite**.
 
@@ -1168,24 +1171,24 @@ so values **above `1.0x` are faster for FrankenSQLite**.
 
 | Aggregate | Value | Reading |
 |-----------|------:|---------|
-| FrankenSQLite faster / comparable / C SQLite faster | `79 / 0 / 14` | 85 % of scenarios are faster |
-| Geomean F/C time ratio | `0.273x` | ≈ 3.66× faster overall |
-| Median F/C time ratio | `0.287x` | ≈ 3.48× faster at the median |
-| Average F/C time ratio | `0.512x` | ≈ 1.95× faster on the arithmetic mean |
-| p90 F/C time ratio | `1.105x` | The 90th-percentile scenario is still close to parity |
-| p99 F/C time ratio | `3.343x` | Corrected 100-row DELETE tail with prepared DML on both engines |
-| Per-category weighted score | `0.377` | Lower is better; weights favour single-row reads/writes |
+| FrankenSQLite faster / comparable / C SQLite faster | `79 / 4 / 10` | 85 % of scenarios are faster |
+| Geomean F/C time ratio | `0.274x` | ≈ 3.65× faster overall |
+| Median F/C time ratio | `0.310x` | ≈ 3.22× faster at the median |
+| Average F/C time ratio | `0.497x` | ≈ 2.01× faster on the arithmetic mean |
+| p90 F/C time ratio | `1.061x` | The 90th-percentile scenario is still close to parity |
+| p99 F/C time ratio | `3.164x` | Corrected 100-row DELETE tail with prepared DML on both engines |
+| Per-category weighted score | `0.368` | Lower is better; weights favour single-row reads/writes |
 
 Per-category geomean F/C time ratio:
 
 | Category | n | Geomean F/C | Reading |
 |---|---:|---:|---|
-| read_aggregate | 25 | `0.073x` | ≈ 13.7× faster |
-| mixed | 1 | `0.201x` | ≈ 4.99× faster |
-| read_single | 33 | `0.211x` | ≈ 4.75× faster |
-| concurrent_writers | 3 | `0.803x` | ≈ 1.25× faster in the full-quick file-backed mix |
-| write_bulk | 22 | `0.850x` | ≈ 1.18× faster |
-| **write_single** | **9** | **`1.259x`** | **The remaining gap (corrected prepared-DML DELETE tail)** |
+| read_aggregate | 25 | `0.077x` | ≈ 13.0× faster |
+| mixed | 1 | `0.184x` | ≈ 5.45× faster |
+| read_single | 33 | `0.211x` | ≈ 4.73× faster |
+| concurrent_writers | 3 | `0.765x` | ≈ 1.31× faster in the full-quick file-backed mix |
+| write_bulk | 22 | `0.836x` | ≈ 1.20× faster |
+| **write_single** | **9** | **`1.160x`** | **The remaining gap (corrected prepared-DML DELETE tail)** |
 
 #### Concurrent writers (the headline MVCC win)
 
@@ -1213,7 +1216,7 @@ same table, non-overlapping rowid ranges):
 
 | Workload | C ms | F ms | F/C |
 |----------|-----:|-----:|----:|
-| 5 000 ops on a 5 000-row table, 80 % reads / 20 % writes | `202.72` | `40.66` | `0.201x` (≈ 4.99× faster) |
+| 5 000 ops on a 5 000-row table, 80 % reads / 20 % writes | `221.62` | `40.68` | `0.184x` (≈ 5.45× faster) |
 
 #### Where the remaining gap lives
 
@@ -1226,20 +1229,20 @@ same-leaf DELETE runs once at flush. The current correction also avoids timing
 repeated uncached C SQLite prepares against FSQLite prepared-cache hits.
 
 With those benchmark semantics, the current full-quick artifact reports the
-worst row as `100 rows / delete 5 rows` at `3.343x` F/C, with
-`1000 rows / delete 50 rows` at `2.061x`, `10000 rows / delete 500 rows` at
-`1.866x`, `100 rows / update 10 rows` at `1.505x`, and
-`10000 rows / update 1000 rows` faster at `0.776x`.
+worst row as `100 rows / delete 5 rows` at `3.164x` F/C, with
+`1000 rows / delete 50 rows` at `1.876x`, `10000 rows / delete 500 rows` at
+`1.644x`, `100 rows / update 10 rows` at `1.440x`, and
+`10000 rows / update 1000 rows` faster at `0.651x`.
 
 The current focused DML diagnostic artifact is
-`tests/artifacts/perf/codex-free-page-dispatch-candidate-20260511T1108Z/summary.md`.
-That May 11, 2026 screen keeps the static `free_page` dispatch patch because
-the full quick primary weighted score improved from `0.3846803250` to
-`0.3765660231`, p99 improved from `3.6542783060` to `3.3426258993`, and
-write-single geomean improved from `1.2845404564` to `1.2586610602`. Rejected
-predecessor attempts are recorded in `docs/progress/perf-negative-results.md`;
-the prepared-DML DELETE tail still needs a broader transaction-level
-direct/bulk mutation primitive.
+`tests/artifacts/perf/codex-memory-direct-pageio-candidate-20260511T1255Z/summary.md`.
+That May 11, 2026 screen keeps the private-memory direct page-I/O skip because
+the conservative no-profile full quick primary weighted score improved from
+`0.3765660231` to `0.3679685474`, p99 improved from `3.3426258993` to
+`3.1636675236`, and write-single geomean improved from `1.2586610602` to
+`1.1603632366`. Rejected predecessor attempts are recorded in
+`docs/progress/perf-negative-results.md`; the prepared-DML DELETE tail still
+needs a broader transaction-level direct/bulk mutation primitive.
 
 ### Memory Overhead
 
@@ -1249,13 +1252,13 @@ MVCC adds memory overhead proportional to the number of concurrent active versio
 
 | Metric | Current measurement |
 |--------|---------------------|
-| Full-quick matrix headline | `79 / 0 / 14` faster/comparable/slower across 93 scenarios; geomean `0.273x` F/C (`codex-free-page-dispatch-candidate-20260511T1108Z/full-quick.json`) |
-| Small-N write throughput (1 writer) | Corrected matrix shows the gap is dominated by prepared-DML DELETE rows; worst row `3.343x` F/C |
+| Full-quick matrix headline | `79 / 4 / 10` faster/comparable/slower across 93 scenarios; geomean `0.274x` F/C (`codex-memory-direct-pageio-candidate-20260511T1255Z/full-quick-noprofile.json`) |
+| Small-N write throughput (1 writer) | Corrected matrix shows the gap is dominated by prepared-DML DELETE rows; worst row `3.164x` F/C |
 | Single-row INSERT throughput (8 writers, separate tables) | `mt-mvcc-bench --separate-tables`: `40.99x` F/C throughput at 250 rows/thread |
 | Single-row INSERT throughput (8 writers, shared table) | `mt-mvcc-bench` shared-table: `3.42x` F/C throughput at 1 000 rows/thread |
-| Point SELECT by rowid | `read_single` geomean `0.211x` F/C across 33 scenarios (≈ 4.75× faster) |
-| Aggregate / scan reads | `read_aggregate` geomean `0.073x` F/C across 25 scenarios (≈ 13.7× faster) |
-| Mixed OLTP (80 % reads / 20 % writes) | `0.201x` F/C on the 5 000-op / 5 000-row scenario (≈ 4.99× faster) |
+| Point SELECT by rowid | `read_single` geomean `0.211x` F/C across 33 scenarios (≈ 4.73× faster) |
+| Aggregate / scan reads | `read_aggregate` geomean `0.077x` F/C across 25 scenarios (≈ 13.0× faster) |
+| Mixed OLTP (80 % reads / 20 % writes) | `0.184x` F/C on the 5 000-op / 5 000-row scenario (≈ 5.45× faster) |
 | WAL checkpoint latency | Slightly higher (must check active snapshots) |
 | Reader throughput under write load | The mixed 80/20 row above is faster overall; a p99-specific read-latency claim still needs a dedicated harness |
 

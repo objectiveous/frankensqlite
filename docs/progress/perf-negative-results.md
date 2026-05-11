@@ -12,6 +12,32 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-11 - Current DELETE CPU profile no-source boundary
+
+- Target: remaining `UPDATE/DELETEThroughput` DELETE rows after the retained
+  delete-run borrowed-flush win and small UPDATE frontier repeat.
+- Touched during this pass: no source files. Measurement artifact only:
+  `tests/artifacts/perf/codex-current-delete-cpu-profile-20260511T1745Z/`.
+- Evidence: current `HEAD` (`396e055b`) release-perf `perf-update-delete`
+  build plus `perf record -F 999 --call-graph fp`. The long isolated run
+  reported `1506 ms` total DELETE time for 2.5M deletes (`603 ns/delete`) and
+  highlighted the already-known families: `TransactionKind::get_page`
+  (`17.39%`), `TableLeafDeleteRun::delete_rowid_with_reason` (`3.71%`),
+  `TransactionKind::write_page_data` (`3.67%`),
+  `TableLeafPayloadPatchRun::table_leaf_rowid_at` (`2.20%`),
+  `TransactionKind::free_page` (`1.91%`), and
+  `TableLeafDeleteRun::materialize_deletions` (`0.33%`). The
+  rollback-isolated profile was dominated by rollback MemDB reload and record
+  parsing, so it is not direct evidence for the standard full-quick DELETE row.
+- Result: no source patch attempted. The CPU profile does not expose a fresh
+  narrow lever beyond already-rejected `TransactionKind` force-inlining,
+  delete-run admission/materialization/search-hint tweaks, or direct flush
+  wrapper/publication changes.
+- Do not retry another standalone DELETE CPU micro-patch from this profile.
+  Reconsider only as part of a broader transaction-local DML mutation operator
+  or pager/MVCC representation change that improves focused DELETE and the full
+  quick primary score in the same A/B window.
+
 ## 2026-05-11 - Focused small UPDATE frontier repeat no-source boundary
 
 - Target: remaining `UPDATE/DELETEThroughput` `100 rows / update 10 rows`

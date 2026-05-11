@@ -10430,3 +10430,41 @@ set: sessions found by
   optimization. Reconsider only as part of a broader retained direct-DML entry
   redesign that removes enough fixed ceremony to improve the focused DML
   geomean and tail rows in the same measurement window.
+
+## 2026-05-11 - Prepared direct DELETE logical rowid/keyspace buffer
+
+- Target: prepared direct DELETE in `crates/fsqlite-core/src/connection.rs`,
+  after the retained direct DELETE leaf-run path still left the focused
+  UPDATE/DELETE quick matrix behind C SQLite on all DELETE rows.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The first version queued logical
+  DELETE rowids from the exact private `:memory:` MemDatabase mirror; the second
+  version seeded a prepared-statement rowid keyspace before the measured loop
+  and maintained it through direct INSERT restore/delete operations. Both source
+  patches and the focused logical-buffer test were manually unwound after the
+  target benchmark failed the keep gate.
+- Candidate shape: return point-DELETE affected counts from a transaction-local
+  logical view, defer physical B-tree DELETE publication until the normal
+  pending direct-write flush boundary, and avoid per-row B-tree seeks in the
+  benchmark's prepared `BEGIN; DELETE ...; COMMIT` loop.
+- Correctness proof before rejection:
+  `cargo fmt --check` passed, and
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-codex-logical-delete-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_prepared_direct_delete_logical_buffer_flushes_at_read_boundary -- --nocapture`
+  passed for the candidate test before the patch was unwound.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-logical-delete-candidate-20260511T1019Z/`
+  contains the MemDatabase-only candidate, and
+  `tests/artifacts/perf/codex-logical-delete-keyspace-candidate-20260511T1028Z/`
+  contains the keyspace candidate quick DML run.
+- Result: rejected. The MemDatabase-only candidate did not activate in the
+  target benchmark after populate/restore teardown. The rowid-keyspace version
+  also failed to produce a meaningful FSQLite DELETE improvement: quick medians
+  were 100-row DELETE `0.008195 ms`, 1000-row DELETE `0.032871 ms`, and
+  10000-row DELETE `0.300753 ms`, versus the current full quick baseline
+  `0.008456 ms`, `0.033914 ms`, and `0.301384 ms`. Those deltas are within the
+  same noise band as recent profile reruns and did not move the section outcome.
+- Do not retry a prepared direct DELETE logical rowid buffer or prepared-time
+  rowid keyspace as a standalone optimization. Reconsider only if a fresh DML
+  profile proves physical DELETE seeks dominate after commit/flush costs are
+  controlled, and only if the focused quick matrix improves the absolute
+  FSQLite medians for all DELETE rows in the same run.

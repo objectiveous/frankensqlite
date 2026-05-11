@@ -12,6 +12,32 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-11 - Exact-MemDB logical DELETE buffer screen
+
+- Target: remaining `UPDATE/DELETEThroughput` DELETE rows after the DML mutation
+  frontier recertification, especially the 5-row, 50-row, and 500-row prepared
+  DELETE cases.
+- Touched during this pass: no source files. Evidence artifact only:
+  `tests/artifacts/perf/codex-logical-delete-buffer-20260511T1907Z/`.
+- Evidence: current source commit `20a096808b6e` plus the benchmark/code audit in
+  `tests/artifacts/perf/codex-logical-delete-buffer-20260511T1907Z/summary.md`.
+  The comprehensive benchmark disables `fsqlite_capture_time_travel_snapshots`,
+  explicit `:memory:` BEGIN only hydrates row images when that capture path is
+  enabled, and private `:memory:` prepared direct INSERT deliberately abandons
+  the exact MemDatabase mirror in write-only loops. The current DML profile still
+  shows `direct_delete == mutations`, `slow=0`, and `memdb_refresh=0` for the
+  DELETE rows.
+- Result: no source patch attempted. An exact-MemDB-assisted logical DELETE
+  buffer would not open in the measured benchmark shape unless it first paid an
+  O(existing rows) row-image hydration cost, which is the overhead the current
+  direct-DML path intentionally avoids.
+- Do not retry a standalone DELETE tombstone/logical buffer that depends on a
+  hydrated `MemDatabase` row mirror. Reconsider only with a separate exact rowid
+  membership manifest maintained by storage mutations, or with the broader
+  transaction-local DML mutation operator that proves duplicate/missing rowid,
+  read-boundary, rollback/savepoint, and MVCC publication semantics without
+  rehydrating row values.
+
 ## 2026-05-11 - DML mutation frontier recertification
 
 - Target: remaining `UPDATE/DELETEThroughput` DELETE rows at measured source

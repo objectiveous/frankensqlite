@@ -1349,6 +1349,7 @@ pub enum TableLeafDeleteRunDelete {
 pub struct TableLeafDeleteRun {
     entry: StackEntry,
     tree_depth: usize,
+    dirty: bool,
     deleted_cell_indices: SmallVec<[u16; 16]>,
 }
 
@@ -1372,7 +1373,7 @@ impl TableLeafDeleteRun {
 
     #[must_use]
     pub fn is_dirty(&self) -> bool {
-        !self.deleted_cell_indices.is_empty()
+        self.dirty || !self.deleted_cell_indices.is_empty()
     }
 
     pub fn delete_rowid(&mut self, cx: &Cx, rowid: i64, usable_size: u32) -> Result<bool> {
@@ -1429,6 +1430,7 @@ impl TableLeafDeleteRun {
         }
 
         self.deleted_cell_indices.push(cell_idx);
+        self.dirty = true;
         self.entry.cell_idx = if cell_idx >= self.entry.header.cell_count.saturating_sub(1) {
             self.entry.header.cell_count.saturating_sub(1)
         } else {
@@ -1684,11 +1686,6 @@ impl TableLeafDeleteRun {
         self.entry.mutation_counter = self.entry.page_data.image_token();
         self.deleted_cell_indices.clear();
         Ok(())
-    }
-
-    fn into_page(mut self, usable_size: u32) -> Result<(PageNumber, PageData)> {
-        self.materialize_deletions(usable_size)?;
-        Ok((self.entry.page_no, self.entry.page_data.clone()))
     }
 }
 
@@ -9018,6 +9015,7 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(Some(TableLeafDeleteRun {
             entry: entry.clone(),
             tree_depth,
+            dirty: false,
             deleted_cell_indices: SmallVec::new(),
         }))
     }
@@ -9042,14 +9040,32 @@ impl<P: PageWriter> BtCursor<P> {
 
     /// Publish a same-leaf delete run as one page write.
     #[doc(hidden)]
-    pub fn flush_table_leaf_delete_run(&mut self, cx: &Cx, run: TableLeafDeleteRun) -> Result<()> {
+    pub fn flush_table_leaf_delete_run(
+        &mut self,
+        cx: &Cx,
+        mut run: TableLeafDeleteRun,
+    ) -> Result<()> {
+        self.flush_table_leaf_delete_run_in_place(cx, &mut run)
+    }
+
+    /// Publish a same-leaf delete run without consuming it.
+    #[doc(hidden)]
+    pub fn flush_table_leaf_delete_run_in_place(
+        &mut self,
+        cx: &Cx,
+        run: &mut TableLeafDeleteRun,
+    ) -> Result<()> {
+        observe_cursor_cancellation(cx)?;
         if run.is_dirty() {
             let materialize_start = instrumentation::profile_start();
-            let (leaf_page, page_data) = run.into_page(self.usable_size)?;
+            let leaf_page = run.leaf_page();
+            run.materialize_deletions(self.usable_size)?;
             instrumentation::record_delete_leaf_run_materialize(materialize_start);
             let write_start = instrumentation::profile_start();
-            self.pager.write_page_data(cx, leaf_page, page_data)?;
+            self.pager
+                .write_page_data(cx, leaf_page, run.entry.page_data.clone())?;
             instrumentation::record_delete_leaf_run_write(write_start);
+            run.dirty = false;
         }
         self.stack.clear();
         self.at_eof = true;

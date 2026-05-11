@@ -12,6 +12,49 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-11 - Current INSERT refresh after memory page-I/O skip
+
+- Target: remaining `INSERTThroughput` red rows after the memory-direct
+  page-I/O skip and current DML/concurrent-frontier refreshes, especially the
+  100-row fixed-cost tails and `large_10col` 10K single-transaction rows.
+- Touched during this pass: no source files. Measurement/artifact only:
+  `tests/artifacts/perf/codex-current-insert-profile-after-memory-pageio-20260511Tnext/`.
+- Evidence: current `HEAD`
+  (`e4aa479374d01efb079a4e9388bc1893510290d8`) with
+  `FSQLITE_BENCH_PROFILE_INSERT=1 --quick --filter insert` reported `25`
+  scenarios: `18` FSQLite-faster, `2` comparable, and `5` C-SQLite-faster.
+  Average ratio was `0.8377801794`, geomean `0.8170096908`, median
+  `0.8091892416`, p90 `1.1306435102`, p99 `1.1411721601`, and focused
+  primary weighted score `0.8191484915`.
+- Remaining red rows: `small_3col` 100 rows at `1.12487x`, `medium_6col`
+  100 rows at `1.06507x`, `large_10col` 100 rows at `1.13064x`,
+  `large_10col` 10000 rows at `1.04768x`, small 100-row batched/single-txn at
+  `1.13442x` and `1.14117x`, and record-size `large_10col` 10K at
+  `1.01376x`.
+- Profile attribution: all profiled INSERT rows stayed on the prepared direct
+  path (`direct_insert == fast`, `slow=0`). The 100-row red rows are fixed-cost
+  dominated (`small_3col` 100 row-build `28083 ns`, direct flush `3557 ns`;
+  `medium_6col` 100 row-build `36023 ns`, direct flush `7414 ns`; `large_10col`
+  100 row-build `56676 ns`, direct flush `17663 ns`). The large 10K red row
+  still points at record construction plus owned page-run publication:
+  single-txn `large_10col` 10K had row-build `5665487 ns`,
+  preserialize `5081633 ns`, direct flush `2202683 ns`, and one owned empty-root
+  page-run; record-size `large_10col` 10K had row-build `5506717 ns`,
+  preserialize `4888437 ns`, direct flush `1892302 ns`, and one owned
+  empty-root page-run.
+- Result: no source patch attempted. This confirms the current INSERT boundary
+  after the kept memory-direct page-I/O change: the visible rows remain the
+  already-fenced fixed-cost and record/page-run construction families, and the
+  previously attempted fused empty-root page-image builder regressed the focused
+  INSERT matrix.
+- Do not retry standalone INSERT serializer tweaks, concat/param-one/template
+  row-build variants, page-run threshold/arena changes, prebuilt empty-root leaf
+  builders, owned-record borrowed flushes, or direct page-image building from
+  this evidence. Reconsider only with a broader design that moves fused
+  row/body/page construction off the per-row execution path and proves focused
+  INSERT primary score, large-record rows, transaction-strategy rows, and the
+  full-quick primary score in the same measurement window.
+
 ## 2026-05-11 - Current DML frontier refresh no-source boundary
 
 - Target: remaining `UPDATE/DELETEThroughput` DELETE red rows after the

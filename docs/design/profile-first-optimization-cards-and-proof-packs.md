@@ -411,7 +411,7 @@ tracing::info!(
   `tests/artifacts/perf/codex-current-delete-cpu-profile-20260511T1745Z/summary.md`,
   and this recertification summary
   `tests/artifacts/perf/codex-dml-mutation-frontier-recert-20260511T1905Z/summary.md`.
-  Current `HEAD` is `94ebb38c33508d374c157c47f1af0df2f3bec3ff`. The latest
+  The measured source commit is `94ebb38c33508d374c157c47f1af0df2f3bec3ff`. The latest
   full quick matrix still reports the corrected prepared-DML DELETE tail at
   `2.838x` slower for 5 rows, `1.829x` slower for 50 rows, and `1.595x`
   slower for 500 rows. The focused current-source profile with profiling

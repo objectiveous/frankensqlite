@@ -12,9 +12,10 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
-## 2026-05-11 - Current DML mutation frontier recertification
+## 2026-05-11 - DML mutation frontier recertification
 
-- Target: remaining `UPDATE/DELETEThroughput` DELETE rows on current `HEAD`
+- Target: remaining `UPDATE/DELETEThroughput` DELETE rows at measured source
+  commit
   (`94ebb38c33508d374c157c47f1af0df2f3bec3ff`) after the retained delete-run
   borrowed-flush win, small UPDATE repeat, current DELETE CPU profile, and
   concurrent-profile JSON instrumentation.
@@ -352,7 +353,7 @@ Each entry should include:
   full-quick weighted score and does not create additional INSERT or write-bulk
   red rows.
 
-## 2026-05-11 - Current HEAD DML profile artifact refresh
+## 2026-05-11 - DML profile artifact refresh
 
 - Target: current `UPDATE/DELETEThroughput` red rows after publishing the
   current full-quick baseline artifact and backfilled INSERT profile raw files.

@@ -2,13 +2,14 @@
 
 Date: 2026-05-11
 
-Current `HEAD`: `94ebb38c33508d374c157c47f1af0df2f3bec3ff`
+Measured source commit: `94ebb38c33508d374c157c47f1af0df2f3bec3ff`
 
 ## Purpose
 
-Re-read the current DML DELETE frontier after the latest profile/artifact
-commits and decide whether a source patch is justified. This pass intentionally
-screened for an unfenced one-lever optimization before editing source.
+Re-read the DML DELETE frontier at the measured source commit after the latest
+profile/artifact commits and decide whether a source patch is justified. This
+pass intentionally screened for an unfenced one-lever optimization before
+editing source.
 
 ## Evidence Read
 

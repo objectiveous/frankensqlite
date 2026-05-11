@@ -12,6 +12,36 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-11 - TransactionKind hot-method force-inline retry
+
+- Target: post-`free_page` `UPDATE/DELETEThroughput` DELETE tail after the
+  sampled isolated DELETE profile still showed self-time in
+  `TransactionKind::get_page`, `write_page_data`, and `free_page`.
+- Touched during rejected candidate: `crates/fsqlite-pager/src/traits.rs`
+  only. The candidate added `#[inline(always)]` to the three already-specialized
+  hot `TransactionKind` `TransactionHandle` methods, then the source patch was
+  manually unwound after the focused matrix rejected it.
+- Baseline evidence: kept `HEAD`
+  (`d49f5ed64325d4a5ee78014d03bed4d64a9f956c`) artifact
+  `tests/artifacts/perf/codex-free-page-dispatch-candidate-20260511T1108Z/full-quick.json`
+  reported DELETE ratios of `3.34263x` for `100 rows / delete 5 rows`,
+  `2.06124x` for `1000 rows / delete 50 rows`, and `1.86586x` for
+  `10000 rows / delete 500 rows`.
+- Candidate evidence:
+  `tests/artifacts/perf/codex-inline-dispatch-candidate-20260511T1204Z/`
+  contains two `FSQLITE_BENCH_PROFILE_DML=1 --quick --filter update` runs. The
+  repeat candidate run reported DELETE ratios of `3.64178x`, `2.08231x`, and
+  `1.88647x` for the same 5/50/500-row DELETE rows, and the first candidate
+  run also worsened FSQLite's absolute 100-row UPDATE/DELETE medians.
+- Result: reject. Force-inlining the specialized enum-dispatch methods did not
+  produce a stable focused DML win and worsened the 50-row and 500-row DELETE
+  target rows versus the kept full-quick baseline.
+- Do not retry `#[inline(always)]` attributes on the specialized
+  `TransactionKind` hot methods as a standalone optimization. Reconsider only
+  if a later pager representation change removes the `TransactionKind` profile
+  symbol entirely and improves the focused DELETE rows plus full-quick primary
+  score in the same A/B window.
+
 ## 2026-05-11 - Current INSERT and DELETE CPU screen no-source boundary
 
 - Target: pick the next source lever after the exact transaction-control

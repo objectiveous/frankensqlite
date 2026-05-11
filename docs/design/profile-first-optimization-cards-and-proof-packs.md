@@ -403,17 +403,18 @@ tracing::info!(
 
 - **Hotspot:** Current `UPDATE/DELETEThroughput` DELETE tail remains the
   highest measured C SQLite-faster frontier. Evidence:
-  `tests/artifacts/perf/codex-dml-profile-head-20260510T224630Z/` and
-  `tests/artifacts/perf/codex-current-delete-cpu-screen-20260511T083607Z/`,
-  read alongside
-  `tests/artifacts/perf/codex-delete-multileaf-full-20260511T025146Z/full-quick.json`.
-  The focused current-source profile reports DELETE ratios of `3.49891x`
-  slower for 5 rows, `2.15802x` slower for 50 rows, and `1.92630x`
-  slower for 500 rows while the prepared direct fast path is already active.
-  The May 11 CPU screen narrows the remaining delete-body frame to
-  transaction/page-state work (`TransactionKind::get_page`,
-  `TransactionKind::write_page_data`, `TransactionKind::free_page`), retained
-  same-leaf delete-run work, and freelist serialization/return helpers.
+  `tests/artifacts/perf/codex-delete-run-borrow-flush-20260511T1609Z/full-quick-final-local.json`
+  and
+  `tests/artifacts/perf/codex-next-dml-profile-20260511T1701Z/summary.md`,
+  both after `786adc9469fac0e299dfd16b24a776174da4de44`. The current full
+  quick matrix reports the corrected prepared-DML DELETE tail at `2.838x`
+  slower for 5 rows, `1.829x` slower for 50 rows, and `1.595x` slower for
+  500 rows. The focused current-source profile with profiling enabled reports
+  `3.19x`, `1.83x`, and `1.63x` for those rows while every DELETE stays on the
+  prepared direct path (`slow=0`). The latest profile narrows the 10K/500 row
+  to 433 retained same-leaf active hits across 496 attempts, 63 leaf-boundary
+  misses, 64 dirty flushes, about `73.5 us` of delete-run materialization, and
+  about `7.5 us` of page writes.
 - **Rejected smaller cards:** retained `TableLeafDeleteRun` materializer
   tweaks, tombstone-only DELETE overlays, dense-rowid queued overlays,
   standalone freed-page lookup changes, and direct flush wrappers are fenced in

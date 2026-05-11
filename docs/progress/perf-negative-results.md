@@ -12,6 +12,32 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-11 - Focused small UPDATE frontier repeat no-source boundary
+
+- Target: remaining `UPDATE/DELETEThroughput` `100 rows / update 10 rows`
+  red row after the current retained DELETE and DML evidence refresh.
+- Touched during this pass: no source files. Measurement artifact only:
+  `tests/artifacts/perf/codex-dml-update-repeat-20260511T1735Z/`.
+- Evidence: current `HEAD` (`a7afd44a`) with a fresh release-perf
+  `perf-update-delete` build showed the 100-row standard UPDATE body remains
+  slower than C SQLite across three focused repeats: `706 ns` vs `434 ns`
+  (`1.63x`), `707 ns` vs `421 ns` (`1.68x`), and `742 ns` vs `426 ns`
+  (`1.74x`) per updated row. Larger UPDATE rows stayed green in the same
+  focused screen: `1000 rows / update 100 rows` was `0.85x` F/C and
+  `10000 rows / update 1000 rows` was `0.78x` F/C.
+- Result: no source patch attempted. This confirms the small UPDATE tail is
+  real in the focused standard harness, but the shape is fixed
+  transaction/statement ceremony amortized over only 10 row mutations. The
+  prior standalone exact transaction-control bypass already failed the full
+  quick gate, and standalone fixed-width update patch-run tweaks are already
+  fenced below.
+- Do not retry another standalone fixed-width UPDATE leaf-patch,
+  `hot_path_profile_enabled`/lookaside, cached usable-size, or exact
+  transaction-control bypass from this evidence. Reconsider only as part of a
+  broader transaction lifecycle redesign that improves this focused UPDATE row
+  and the full quick primary score without creating new INSERT, DELETE, or
+  write-bulk red rows.
+
 ## 2026-05-11 - Rejected private-memory explicit COMMIT retain deferral
 
 - Target: remaining `UPDATE/DELETEThroughput` explicit-transaction DELETE red

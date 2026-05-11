@@ -132,6 +132,26 @@ pub struct BtreeLeafReuseSnapshot {
     pub delete_leaf_run_write_calls: u64,
     /// Time spent handing retained same-leaf DELETE page images to the pager.
     pub delete_leaf_run_write_time_ns: u64,
+    /// Bulk table INSERT page-run grouping calls.
+    pub bulk_table_grouping_calls: u64,
+    /// Time spent grouping bulk table INSERT records into page ranges.
+    pub bulk_table_grouping_time_ns: u64,
+    /// Bulk table INSERT leaf page builds.
+    pub bulk_table_leaf_page_build_calls: u64,
+    /// Time spent building bulk table INSERT leaf page images.
+    pub bulk_table_leaf_page_build_time_ns: u64,
+    /// Bulk table INSERT leaf page writes.
+    pub bulk_table_leaf_page_write_calls: u64,
+    /// Time spent handing bulk table INSERT leaf pages to the pager.
+    pub bulk_table_leaf_page_write_time_ns: u64,
+    /// Bulk table INSERT interior/root page builds.
+    pub bulk_table_interior_page_build_calls: u64,
+    /// Time spent building bulk table INSERT interior/root page images.
+    pub bulk_table_interior_page_build_time_ns: u64,
+    /// Bulk table INSERT interior/root page writes.
+    pub bulk_table_interior_page_write_calls: u64,
+    /// Time spent handing bulk table INSERT interior/root pages to the pager.
+    pub bulk_table_interior_page_write_time_ns: u64,
 }
 
 /// Per-operation mutable stats while a `btree_op` span is active.
@@ -230,6 +250,16 @@ static BTREE_DELETE_LEAF_RUN_MATERIALIZE_CALLS: AtomicU64 = AtomicU64::new(0);
 static BTREE_DELETE_LEAF_RUN_MATERIALIZE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static BTREE_DELETE_LEAF_RUN_WRITE_CALLS: AtomicU64 = AtomicU64::new(0);
 static BTREE_DELETE_LEAF_RUN_WRITE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static BTREE_BULK_TABLE_GROUPING_CALLS: AtomicU64 = AtomicU64::new(0);
+static BTREE_BULK_TABLE_GROUPING_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static BTREE_BULK_TABLE_LEAF_PAGE_BUILD_CALLS: AtomicU64 = AtomicU64::new(0);
+static BTREE_BULK_TABLE_LEAF_PAGE_BUILD_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static BTREE_BULK_TABLE_LEAF_PAGE_WRITE_CALLS: AtomicU64 = AtomicU64::new(0);
+static BTREE_BULK_TABLE_LEAF_PAGE_WRITE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static BTREE_BULK_TABLE_INTERIOR_PAGE_BUILD_CALLS: AtomicU64 = AtomicU64::new(0);
+static BTREE_BULK_TABLE_INTERIOR_PAGE_BUILD_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static BTREE_BULK_TABLE_INTERIOR_PAGE_WRITE_CALLS: AtomicU64 = AtomicU64::new(0);
+static BTREE_BULK_TABLE_INTERIOR_PAGE_WRITE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 pub(crate) fn copy_profile_enabled() -> bool {
@@ -460,6 +490,46 @@ pub(crate) fn record_delete_leaf_run_write(start: Option<std::time::Instant>) {
     BTREE_DELETE_LEAF_RUN_WRITE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
+pub(crate) fn record_bulk_table_grouping(start: Option<std::time::Instant>) {
+    let Some(duration_ns) = profile_elapsed_ns(start) else {
+        return;
+    };
+    BTREE_BULK_TABLE_GROUPING_CALLS.fetch_add(1, Ordering::Relaxed);
+    BTREE_BULK_TABLE_GROUPING_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
+}
+
+pub(crate) fn record_bulk_table_leaf_page_build(start: Option<std::time::Instant>) {
+    let Some(duration_ns) = profile_elapsed_ns(start) else {
+        return;
+    };
+    BTREE_BULK_TABLE_LEAF_PAGE_BUILD_CALLS.fetch_add(1, Ordering::Relaxed);
+    BTREE_BULK_TABLE_LEAF_PAGE_BUILD_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
+}
+
+pub(crate) fn record_bulk_table_leaf_page_write(start: Option<std::time::Instant>) {
+    let Some(duration_ns) = profile_elapsed_ns(start) else {
+        return;
+    };
+    BTREE_BULK_TABLE_LEAF_PAGE_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
+    BTREE_BULK_TABLE_LEAF_PAGE_WRITE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
+}
+
+pub(crate) fn record_bulk_table_interior_page_build(start: Option<std::time::Instant>) {
+    let Some(duration_ns) = profile_elapsed_ns(start) else {
+        return;
+    };
+    BTREE_BULK_TABLE_INTERIOR_PAGE_BUILD_CALLS.fetch_add(1, Ordering::Relaxed);
+    BTREE_BULK_TABLE_INTERIOR_PAGE_BUILD_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
+}
+
+pub(crate) fn record_bulk_table_interior_page_write(start: Option<std::time::Instant>) {
+    let Some(duration_ns) = profile_elapsed_ns(start) else {
+        return;
+    };
+    BTREE_BULK_TABLE_INTERIOR_PAGE_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
+    BTREE_BULK_TABLE_INTERIOR_PAGE_WRITE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
+}
+
 #[inline]
 pub(crate) fn record_split_event() {
     if !btree_metrics_enabled() {
@@ -599,6 +669,24 @@ pub fn btree_leaf_reuse_snapshot() -> BtreeLeafReuseSnapshot {
             .load(Ordering::Relaxed),
         delete_leaf_run_write_calls: BTREE_DELETE_LEAF_RUN_WRITE_CALLS.load(Ordering::Relaxed),
         delete_leaf_run_write_time_ns: BTREE_DELETE_LEAF_RUN_WRITE_TIME_NS.load(Ordering::Relaxed),
+        bulk_table_grouping_calls: BTREE_BULK_TABLE_GROUPING_CALLS.load(Ordering::Relaxed),
+        bulk_table_grouping_time_ns: BTREE_BULK_TABLE_GROUPING_TIME_NS.load(Ordering::Relaxed),
+        bulk_table_leaf_page_build_calls: BTREE_BULK_TABLE_LEAF_PAGE_BUILD_CALLS
+            .load(Ordering::Relaxed),
+        bulk_table_leaf_page_build_time_ns: BTREE_BULK_TABLE_LEAF_PAGE_BUILD_TIME_NS
+            .load(Ordering::Relaxed),
+        bulk_table_leaf_page_write_calls: BTREE_BULK_TABLE_LEAF_PAGE_WRITE_CALLS
+            .load(Ordering::Relaxed),
+        bulk_table_leaf_page_write_time_ns: BTREE_BULK_TABLE_LEAF_PAGE_WRITE_TIME_NS
+            .load(Ordering::Relaxed),
+        bulk_table_interior_page_build_calls: BTREE_BULK_TABLE_INTERIOR_PAGE_BUILD_CALLS
+            .load(Ordering::Relaxed),
+        bulk_table_interior_page_build_time_ns: BTREE_BULK_TABLE_INTERIOR_PAGE_BUILD_TIME_NS
+            .load(Ordering::Relaxed),
+        bulk_table_interior_page_write_calls: BTREE_BULK_TABLE_INTERIOR_PAGE_WRITE_CALLS
+            .load(Ordering::Relaxed),
+        bulk_table_interior_page_write_time_ns: BTREE_BULK_TABLE_INTERIOR_PAGE_WRITE_TIME_NS
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -656,6 +744,16 @@ pub fn reset_btree_leaf_reuse_profile() {
     BTREE_DELETE_LEAF_RUN_MATERIALIZE_TIME_NS.store(0, Ordering::Relaxed);
     BTREE_DELETE_LEAF_RUN_WRITE_CALLS.store(0, Ordering::Relaxed);
     BTREE_DELETE_LEAF_RUN_WRITE_TIME_NS.store(0, Ordering::Relaxed);
+    BTREE_BULK_TABLE_GROUPING_CALLS.store(0, Ordering::Relaxed);
+    BTREE_BULK_TABLE_GROUPING_TIME_NS.store(0, Ordering::Relaxed);
+    BTREE_BULK_TABLE_LEAF_PAGE_BUILD_CALLS.store(0, Ordering::Relaxed);
+    BTREE_BULK_TABLE_LEAF_PAGE_BUILD_TIME_NS.store(0, Ordering::Relaxed);
+    BTREE_BULK_TABLE_LEAF_PAGE_WRITE_CALLS.store(0, Ordering::Relaxed);
+    BTREE_BULK_TABLE_LEAF_PAGE_WRITE_TIME_NS.store(0, Ordering::Relaxed);
+    BTREE_BULK_TABLE_INTERIOR_PAGE_BUILD_CALLS.store(0, Ordering::Relaxed);
+    BTREE_BULK_TABLE_INTERIOR_PAGE_BUILD_TIME_NS.store(0, Ordering::Relaxed);
+    BTREE_BULK_TABLE_INTERIOR_PAGE_WRITE_CALLS.store(0, Ordering::Relaxed);
+    BTREE_BULK_TABLE_INTERIOR_PAGE_WRITE_TIME_NS.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]

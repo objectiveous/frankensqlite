@@ -4676,15 +4676,22 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         let root_header_offset = cell::header_offset_for_page(self.root_page);
+        let root_grouping_start = instrumentation::profile_start();
         let Some(root_leaf_groups) = self.bulk_table_leaf_groups(records, root_header_offset)?
         else {
+            instrumentation::record_bulk_table_grouping(root_grouping_start);
             return Ok(false);
         };
+        instrumentation::record_bulk_table_grouping(root_grouping_start);
         let root_prefix = root_data.as_bytes().get(..root_header_offset);
         if root_leaf_groups.len() == 1 {
+            let leaf_build_start = instrumentation::profile_start();
             let root_page =
                 self.build_bulk_table_leaf_page(self.root_page, root_prefix, records)?;
+            instrumentation::record_bulk_table_leaf_page_build(leaf_build_start);
+            let leaf_write_start = instrumentation::profile_start();
             self.pager.write_page_data(cx, self.root_page, root_page)?;
+            instrumentation::record_bulk_table_leaf_page_write(leaf_write_start);
             self.stack.clear();
             self.at_eof = true;
             self.last_insert_rowid = records.last().map(|record| record.0);
@@ -4696,15 +4703,22 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(true);
         }
 
+        let leaf_grouping_start = instrumentation::profile_start();
         let Some(leaf_groups) = self.bulk_table_leaf_groups(records, 0)? else {
+            instrumentation::record_bulk_table_grouping(leaf_grouping_start);
             return Ok(false);
         };
+        instrumentation::record_bulk_table_grouping(leaf_grouping_start);
         let mut current_level = Vec::with_capacity(leaf_groups.len());
         for group in leaf_groups {
             let page_no = self.pager.allocate_page(cx)?;
+            let leaf_build_start = instrumentation::profile_start();
             let page =
                 self.build_bulk_table_leaf_page(page_no, None, &records[group.start..group.end])?;
+            instrumentation::record_bulk_table_leaf_page_build(leaf_build_start);
+            let leaf_write_start = instrumentation::profile_start();
             self.pager.write_page_data(cx, page_no, page)?;
+            instrumentation::record_bulk_table_leaf_page_write(leaf_write_start);
             current_level.push(BulkTableChild {
                 page_no,
                 max_rowid: records[group.end - 1].0,
@@ -4713,16 +4727,22 @@ impl<P: PageWriter> BtCursor<P> {
 
         let mut depth = 2usize;
         loop {
+            let root_grouping_start = instrumentation::profile_start();
             let root_groups = self
                 .bulk_table_interior_groups(&current_level, root_header_offset)
                 .ok_or(FrankenError::TooBig)?;
+            instrumentation::record_bulk_table_grouping(root_grouping_start);
             if root_groups.len() == 1 {
+                let interior_build_start = instrumentation::profile_start();
                 let root_page = self.build_bulk_table_interior_page(
                     self.root_page,
                     root_prefix,
                     &current_level,
                 )?;
+                instrumentation::record_bulk_table_interior_page_build(interior_build_start);
+                let interior_write_start = instrumentation::profile_start();
                 self.pager.write_page_data(cx, self.root_page, root_page)?;
+                instrumentation::record_bulk_table_interior_page_write(interior_write_start);
                 self.stack.clear();
                 self.at_eof = true;
                 self.last_insert_rowid = records.last().map(|record| record.0);
@@ -4734,15 +4754,21 @@ impl<P: PageWriter> BtCursor<P> {
                 return Ok(true);
             }
 
+            let interior_grouping_start = instrumentation::profile_start();
             let interior_groups = self
                 .bulk_table_interior_groups(&current_level, 0)
                 .ok_or(FrankenError::TooBig)?;
+            instrumentation::record_bulk_table_grouping(interior_grouping_start);
             let mut next_level = Vec::with_capacity(interior_groups.len());
             for group in interior_groups {
                 let page_no = self.pager.allocate_page(cx)?;
                 let group_children = &current_level[group.start..group.end];
+                let interior_build_start = instrumentation::profile_start();
                 let page = self.build_bulk_table_interior_page(page_no, None, group_children)?;
+                instrumentation::record_bulk_table_interior_page_build(interior_build_start);
+                let interior_write_start = instrumentation::profile_start();
                 self.pager.write_page_data(cx, page_no, page)?;
+                instrumentation::record_bulk_table_interior_page_write(interior_write_start);
                 next_level.push(BulkTableChild {
                     page_no,
                     max_rowid: group_children.last().ok_or(FrankenError::TooBig)?.max_rowid,
@@ -4877,9 +4903,12 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         }
 
+        let leaf_grouping_start = instrumentation::profile_start();
         let Some(leaf_groups) = self.bulk_table_leaf_groups(records, 0)? else {
+            instrumentation::record_bulk_table_grouping(leaf_grouping_start);
             return Ok(false);
         };
+        instrumentation::record_bulk_table_grouping(leaf_grouping_start);
 
         let root_header_offset = cell::header_offset_for_page(self.root_page);
         let initial_root_cell_count = usize::from(root_header.cell_count);
@@ -4913,15 +4942,20 @@ impl<P: PageWriter> BtCursor<P> {
         let mut new_children = Vec::with_capacity(leaf_groups.len());
         for group in &leaf_groups {
             let page_no = self.pager.allocate_page(cx)?;
+            let leaf_build_start = instrumentation::profile_start();
             let page =
                 self.build_bulk_table_leaf_page(page_no, None, &records[group.start..group.end])?;
+            instrumentation::record_bulk_table_leaf_page_build(leaf_build_start);
+            let leaf_write_start = instrumentation::profile_start();
             self.pager.write_page_data(cx, page_no, page)?;
+            instrumentation::record_bulk_table_leaf_page_write(leaf_write_start);
             new_children.push(BulkTableChild {
                 page_no,
                 max_rowid: records[group.end - 1].0,
             });
         }
 
+        let interior_build_start = instrumentation::profile_start();
         let mut root_page = root_data.into_vec();
         let mut root_ptrs = cell::read_cell_pointers(&root_page, &root_header, root_header_offset)?;
         let mut write_offset =
@@ -4973,8 +5007,11 @@ impl<P: PageWriter> BtCursor<P> {
         };
         new_header.write(&mut root_page, root_header_offset);
         cell::write_cell_pointers(&mut root_page, root_header_offset, &new_header, &root_ptrs);
+        instrumentation::record_bulk_table_interior_page_build(interior_build_start);
+        let interior_write_start = instrumentation::profile_start();
         self.pager
             .write_page_data(cx, self.root_page, PageData::from_vec(root_page))?;
+        instrumentation::record_bulk_table_interior_page_write(interior_write_start);
 
         self.stack.clear();
         self.at_eof = true;

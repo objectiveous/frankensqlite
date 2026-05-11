@@ -10774,3 +10774,90 @@ set: sessions found by
   profile proves physical DELETE seeks dominate after commit/flush costs are
   controlled, and only if the focused quick matrix improves the absolute
   FSQLite medians for all DELETE rows in the same run.
+
+## 2026-05-11 - Prepared direct DELETE materialization threshold
+
+- Target: `TableLeafDeleteRun::materialize_deletions` in
+  `crates/fsqlite-btree/src/cursor.rs`, after the focused DML profile showed
+  10k-row DELETE spending most of the direct-delete leaf-run time inside
+  materialization and flush.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`. The candidate changed
+  `SMALL_DELETE_INCREMENTAL_LIMIT` from `8` to `2` so the benchmark's
+  approximately 5-8 deletes per leaf would take the one-pass materializer
+  instead of the repeated incremental compactor. The source patch was manually
+  unwound after the focused benchmark failed the keep gate.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-dml-profile-20260511T205339Z/`
+  contains the current-source focused DML baseline, and
+  `tests/artifacts/perf/codex-delete-threshold2-profile-20260511T210322Z/`
+  contains the rejected threshold candidate run.
+- Result: rejected. The candidate worsened the measured flush/materialize
+  counters: 10k-row DELETE `delete_leaf_materialize` moved from
+  `64/73639 ns` to `64/134592 ns`, and `delete_leaf_flush_ns` moved from
+  `86854 ns` to `148018 ns`. The focused matrix did not improve either:
+  100-row DELETE moved from `0.006863 ms` to `0.007073 ms`, and 10k-row
+  DELETE moved from `0.262732 ms` to `0.258625 ms` while the C baseline
+  changed enough that the ratio worsened from `1.51391` to `1.60369`.
+- Do not retry lowering the incremental materialization threshold as a
+  standalone optimization. Reconsider only with a different one-pass
+  materializer that demonstrably beats the existing incremental path on the
+  same per-leaf delete counts and improves the focused DELETE medians in one
+  A/B window.
+
+## 2026-05-11 - Prepared direct DELETE direct writer flush
+
+- Target: pending prepared direct DELETE leaf-run flush in
+  `crates/fsqlite-core/src/connection.rs` and
+  `crates/fsqlite-btree/src/cursor.rs`, after the focused DML profile showed
+  64 staged leaf runs for the 10k-row DELETE workload.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs` and
+  `crates/fsqlite-core/src/connection.rs`. The candidate factored
+  `TableLeafDeleteRun` publication so `Connection` could write each staged
+  delete leaf directly through `SharedTxnPageIo` / `TransactionPageIo`,
+  skipping construction of a temporary `BtCursor` per staged leaf. The source
+  patch was manually unwound after the focused benchmark failed the keep gate.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-dml-profile-20260511T205339Z/`
+  contains the current-source focused DML baseline, and
+  `tests/artifacts/perf/codex-delete-direct-writer-20260511T211346Z/`
+  contains the rejected direct-writer candidate run.
+- Result: rejected. The candidate did not improve the focused DELETE medians:
+  100-row DELETE moved from `0.006863 ms` to `0.007064 ms`, 1000-row DELETE
+  moved from `0.044454 ms` to `0.029024 ms`, and 10k-row DELETE moved from
+  `0.262732 ms` to `0.267832 ms`. The important 10k row regressed while its
+  `delete_leaf_flush_ns` counter moved from `86854 ns` to `95087 ns`, so the
+  apparent 1000-row win is not a stable keep signal.
+- Do not retry direct leaf-run writer publication as a standalone
+  optimization. Reconsider only if a same-window A/B with lower benchmark
+  variance shows improved absolute FSQLite medians for all DELETE rows and a
+  lower 10k-row `delete_leaf_flush_ns`.
+
+## 2026-05-11 - Prepared direct DELETE retained-leaf search hint
+
+- Target: `TableLeafDeleteRun::search_table_leaf` in
+  `crates/fsqlite-btree/src/cursor.rs`, after the focused DML profile showed
+  the retained-leaf active path consuming about 50 us in the 10k-row DELETE
+  workload.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`. The candidate used the retained
+  `StackEntry.cell_idx` as a monotonic search bound before falling back to the
+  existing binary search. The source patch was manually unwound after repeat
+  focused runs failed the keep gate.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-dml-profile-20260511T205339Z/`
+  contains the current-source focused DML baseline,
+  `tests/artifacts/perf/codex-delete-search-hint-20260511T212300Z/`
+  contains the first candidate run, and
+  `tests/artifacts/perf/codex-delete-search-hint-repeat-20260511T212420Z/`
+  contains the repeat candidate run.
+- Result: rejected. The candidate reduced the intended counters in both runs:
+  10k-row `delete_leaf_active_ns` moved from `50217 ns` to `44054 ns` and then
+  `43269 ns`. However, the focused matrix did not hold the improvement:
+  100-row DELETE moved from `0.006863 ms` to `0.006953 ms` / `0.007243 ms`,
+  and 10k-row DELETE moved from `0.262732 ms` to `0.258635 ms` / `0.267151 ms`.
+  The repeat run failed the absolute-FSQLite median keep gate.
+- Do not retry this cell-index search hint as a standalone optimization.
+  Reconsider only if paired with a broader same-leaf delete-run representation
+  that improves all focused DELETE medians in the same A/B window.

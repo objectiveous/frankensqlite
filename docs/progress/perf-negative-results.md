@@ -40,6 +40,43 @@ Each entry should include:
   changes the per-run allocation/copy cost enough to justify a fresh
   same-window threshold sweep.
 
+## 2026-05-11 - DML frontier repeat after retained delete-run commit
+
+- Target: remaining `UPDATE/DELETEThroughput` DELETE rows after retained
+  commit `88dcadc9` and the documented `COMPACT_DELETE_SINGLE_PASS_MIN`
+  threshold rejection, especially `100 rows / delete 5 rows`,
+  `1000 rows / delete 50 rows`, and `10000 rows / delete 500 rows`.
+- Touched during this pass: no source files. Measurement/artifact only:
+  `tests/artifacts/perf/codex-dml-frontier-repeat-20260511Tnext/`.
+- Evidence: current `HEAD` (`2d47211078847260f63adc496eb9e44e262a850c`)
+  with a fresh local release-perf build and
+  `FSQLITE_BENCH_PROFILE_DML=1 --quick --filter update` reported DELETE
+  ratios of `3.10070x`, `1.78605x`, and `1.59670x` for the 5-row, 50-row,
+  and 500-row DELETE cases. The larger UPDATE rows remained green
+  (`0.77855x` and `0.69630x`), while the 10-row UPDATE fixed-cost tail stayed
+  red at `1.50593x`.
+- Profile attribution: every DELETE row stayed on the prepared direct path
+  (`slow=0`). The 500-row DELETE case still paid
+  `delete_leaf_active=433/496`, `delete_leaf_miss=63`,
+  `delete_leaf_flush=64/64`, `delete_leaf_flush_ns=114393`,
+  `delete_leaf_materialize=64/97923`, and `delete_leaf_write=64/8977`.
+  The 5-row DELETE case used one same-leaf run and one dirty flush
+  (`delete_leaf_flush=1/1`, `delete_leaf_flush_ns=1673`).
+- Result: no source patch attempted. This repeat does not invalidate the
+  existing negative ledger. The remaining DELETE gap is still the known
+  transaction/page-state representation boundary, not a fresh standalone
+  `TableLeafDeleteRun`, direct-flush, transaction-control, or parser wrapper
+  hotspot.
+- Do not retry another retained DELETE leaf-run materializer/admission tweak,
+  direct-flush wrapper, parent-separator/last-cell admission, next-cell hint,
+  tombstone-only overlay, dense-rowid queue, microbatch carry, or exact
+  transaction-control bypass from this evidence. Reconsider only as the
+  broader transaction-local DML mutation operator that removes per-leaf
+  mutation/publication ceremony while proving read-your-writes,
+  rollback/savepoints, duplicate and missing rowid semantics, schema drift,
+  QF/cache invalidation, and MVCC publication in the same focused/full-quick
+  A/B window.
+
 ## 2026-05-11 - Storage-rowid logical DELETE buffer prototype
 
 - Target: remaining `UPDATE/DELETEThroughput` DELETE rows, especially the

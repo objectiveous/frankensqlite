@@ -12,6 +12,32 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-11 - Storage-rowid logical DELETE buffer prototype
+
+- Target: remaining `UPDATE/DELETEThroughput` DELETE rows, especially the
+  prepared direct DELETE shapes with 5, 50, and 500 rowid deletes.
+- Touched during this pass: `crates/fsqlite-core/src/connection.rs` prototype
+  only, fully reverted after measurement. Evidence artifact:
+  `tests/artifacts/perf/codex-storage-rowid-delete-buffer-20260511T1938Z/`.
+- Evidence: focused correctness filters passed while the prototype was present:
+  `pending_direct_delete` via `rch exec -- env
+  CARGO_TARGET_DIR=/data/tmp/frankensqlite-rowid-target CARGO_BUILD_JOBS=8
+  cargo test -p fsqlite-core pending_direct_delete -- --nocapture
+  --test-threads=1`, and local `prepared_direct_delete` via
+  `CARGO_TARGET_DIR=/data/tmp/frankensqlite-rowid-local`. Focused benchmark
+  results are captured in
+  `tests/artifacts/perf/codex-storage-rowid-delete-buffer-20260511T1938Z/summary.md`.
+- Result: rejected and reverted. `perf-update-delete <rows> 20 delete compare
+  standard` reported DELETE ratios of `4.58x`, `3.50x`, and `2.83x` for
+  100/1,000/10,000 rows respectively. The first-consult exact membership build
+  scans the B-tree, and the deferred flush still pays physical delete work, so
+  the measured DELETE rows move in the wrong direction.
+- Do not retry a build-on-first-DELETE exact rowid membership buffer. Reconsider
+  only if a manifest is created essentially for free during a proven-empty table
+  population path, or as part of the broader transaction-local DML mutation
+  operator that covers INSERT/UPDATE publication, duplicate/missing rowids,
+  read-boundary flush, rollback/savepoint, and MVCC semantics together.
+
 ## 2026-05-11 - Exact-MemDB logical DELETE buffer screen
 
 - Target: remaining `UPDATE/DELETEThroughput` DELETE rows after the DML mutation

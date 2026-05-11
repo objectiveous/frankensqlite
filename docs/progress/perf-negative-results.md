@@ -12,6 +12,36 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-11 - Rejected private-memory explicit COMMIT retain deferral
+
+- Target: remaining `UPDATE/DELETEThroughput` explicit-transaction DELETE red
+  rows for private `:memory:` workloads, especially the fixed commit/pager tail
+  visible in standard DELETE timings.
+- Touched during this pass: prototyped and reverted
+  `crates/fsqlite-core/src/connection.rs`. The prototype let explicit
+  private-memory commits with time-travel, differential subscribers, and live
+  vtabs disabled call `commit_and_retain()`, park the retained writer in
+  `cached_write_txn`, then release it at the next statement boundary while
+  preserving concurrent-session finalization.
+- Evidence:
+  `tests/artifacts/perf/codex-dml-delete-standard-isolated-20260511T1507Z/`.
+  Baseline focused standard DELETE was `1409 ns`, `575 ns`, and `503 ns` per row
+  for the 100/1000/10000 row cases. Candidate focused DELETE was `1405 ns`,
+  `578 ns`, and `475 ns` per row: mixed and within/noisy except the 10000-row
+  improvement. Baseline full quick `--filter update` average ratio was `1.55x`
+  with DELETE rows `3.20x`, `1.84x`, and `1.66x`; candidate average ratio
+  worsened to `1.58x`, with DELETE rows `3.89x`, `1.19x`, and `1.71x`.
+- Result: rejected and reverted. The candidate moved pager commit counters out
+  of the measured COMMIT path and made the 1000-row DELETE row green, but it
+  regressed the 100-row DELETE row, slightly regressed the 10000-row DELETE row,
+  and worsened the section average. It is a benchmark-shape transfer, not a
+  durable DML win.
+- Do not retry explicit private-memory `commit_and_retain()` deferral as a
+  standalone commit-side lever. Reconsider only as part of a broader
+  transaction-local DML mutation operator or release-boundary redesign that
+  improves focused DELETE and the full quick `UPDATE/DELETEThroughput` primary
+  score in the same A/B window with no 100-row regression.
+
 ## 2026-05-11 - Current INSERT refresh after memory page-I/O skip
 
 - Target: remaining `INSERTThroughput` red rows after the memory-direct

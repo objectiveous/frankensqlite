@@ -12,6 +12,34 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-11 - Rejected 5-row compact DELETE single-pass threshold
+
+- Target: current retained compact same-leaf DELETE materializer, especially
+  the `UPDATE/DELETEThroughput` `100 rows / delete 5 rows`,
+  `1000 rows / delete 50 rows`, and `10000 rows / delete 500 rows` red rows
+  after `88dcadc9`.
+- Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs`
+  only. The candidate lowered `COMPACT_DELETE_SINGLE_PASS_MIN` from `6` to
+  `5` so the 5-row DELETE case would use the new one-pass compact descending
+  materializer. The source patch was manually unwound after measurement.
+- Baseline evidence:
+  `tests/artifacts/perf/codex-delete-threshold6-baseline-repeat-20260511T2240Z/`
+  reported FSQLite DELETE medians of `0.007063 ms`, `0.028724 ms`, and
+  `0.260167 ms` for the 5/50/500-row cases.
+- Candidate evidence:
+  `tests/artifacts/perf/codex-delete-threshold5-probe-20260511T2239Z/` and
+  `tests/artifacts/perf/codex-delete-threshold5-repeat-20260511T2242Z/`.
+  The first candidate run improved 5-row and 500-row medians but regressed the
+  50-row median (`0.029295 ms` vs baseline `0.028724 ms`). The repeat still
+  failed the all-DELETE-row keep gate, with the 500-row median regressing to
+  `0.270587 ms`.
+- Result: rejected and reverted. The threshold boundary is noise-sensitive and
+  does not improve the 5-row, 50-row, and 500-row DELETE medians together.
+- Do not retry lowering `COMPACT_DELETE_SINGLE_PASS_MIN` to `5` as a
+  standalone tuning patch. Reconsider only if a future materializer rewrite
+  changes the per-run allocation/copy cost enough to justify a fresh
+  same-window threshold sweep.
+
 ## 2026-05-11 - Storage-rowid logical DELETE buffer prototype
 
 - Target: remaining `UPDATE/DELETEThroughput` DELETE rows, especially the

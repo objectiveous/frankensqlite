@@ -1353,7 +1353,7 @@ pub struct TableLeafDeleteRun {
     deleted_cell_indices: SmallVec<[u16; 16]>,
 }
 
-const SMALL_DELETE_INCREMENTAL_LIMIT: usize = 8;
+const COMPACT_DELETE_SINGLE_PASS_MIN: usize = 6;
 
 impl TableLeafDeleteRun {
     #[must_use]
@@ -1569,6 +1569,104 @@ impl TableLeafDeleteRun {
         Ok(())
     }
 
+    fn materialize_deletions_compact_descending_single_pass(
+        &mut self,
+        usable_size: u32,
+        header_offset: usize,
+        original_len: usize,
+    ) -> Result<()> {
+        let leaf_page_no = self.entry.page_no;
+        let mut header = self.entry.header;
+        let live_len = original_len - self.deleted_cell_indices.len();
+        let ptr_array_end =
+            header_offset + usize::from(header.page_type.header_size()) + live_len * 2;
+        let original_ptrs = &self.entry.cell_pointers;
+        let mut ptrs = Vec::with_capacity(live_len);
+        let mut deleted_idx = 0usize;
+        let mut new_content_offset = usable_size as usize;
+
+        {
+            let page_bytes = self.entry.page_data.as_bytes_mut();
+            for (original_idx, &off) in original_ptrs.iter().enumerate() {
+                if deleted_idx < self.deleted_cell_indices.len()
+                    && usize::from(self.deleted_cell_indices[deleted_idx]) == original_idx
+                {
+                    deleted_idx += 1;
+                    continue;
+                }
+
+                let ptr = usize::from(off);
+                let upper = if original_idx == 0 {
+                    usable_size as usize
+                } else {
+                    usize::from(original_ptrs[original_idx - 1])
+                };
+                if ptr >= upper {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "compact table leaf cell offsets are not monotone".to_owned(),
+                    });
+                }
+                let size = upper - ptr;
+                new_content_offset = new_content_offset.checked_sub(size).ok_or_else(|| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: "table leaf cell size overflow during delete defragmentation"
+                            .to_owned(),
+                    }
+                })?;
+                if new_content_offset < ptr_array_end {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "table leaf cell content overlaps pointer array during delete defragmentation"
+                            .to_owned(),
+                    });
+                }
+                if new_content_offset != ptr {
+                    page_bytes.copy_within(ptr..upper, new_content_offset);
+                }
+                ptrs.push(u16::try_from(new_content_offset).map_err(|_| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table leaf cell offset {} exceeds u16 range on page {}",
+                            new_content_offset,
+                            leaf_page_no.get()
+                        ),
+                    }
+                })?);
+            }
+        }
+
+        header.cell_content_offset =
+            u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table leaf cell content offset {} exceeds u32 range on page {}",
+                    new_content_offset,
+                    leaf_page_no.get()
+                ),
+            })?;
+        header.first_freeblock = 0;
+        header.fragmented_free_bytes = 0;
+        header.cell_count =
+            u16::try_from(ptrs.len()).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table leaf page {} cell count exceeds u16 range during delete",
+                    leaf_page_no.get()
+                ),
+            })?;
+
+        let page_bytes = self.entry.page_data.as_bytes_mut();
+        header.write(page_bytes, header_offset);
+        cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
+        self.entry.header = header;
+        self.entry.cell_pointers = ptrs;
+        self.entry.cell_idx = if self.entry.header.cell_count == 0 {
+            0
+        } else {
+            self.entry.header.cell_count - 1
+        };
+        self.entry.mutation_counter = self.entry.page_data.image_token();
+        self.deleted_cell_indices.clear();
+        Ok(())
+    }
+
     fn materialize_deletions(&mut self, usable_size: u32) -> Result<()> {
         if self.deleted_cell_indices.is_empty() {
             return Ok(());
@@ -1594,9 +1692,14 @@ impl TableLeafDeleteRun {
                 detail: "pending table leaf delete run lost compact page shape".to_owned(),
             });
         }
-        if self.deleted_cell_indices.len() <= SMALL_DELETE_INCREMENTAL_LIMIT
-            && cell_ptrs_are_descending(&self.entry.cell_pointers)
-        {
+        if cell_ptrs_are_descending(&self.entry.cell_pointers) {
+            if self.deleted_cell_indices.len() >= COMPACT_DELETE_SINGLE_PASS_MIN {
+                return self.materialize_deletions_compact_descending_single_pass(
+                    usable_size,
+                    header_offset,
+                    original_len,
+                );
+            }
             return self.materialize_deletions_incremental_descending(usable_size, header_offset);
         }
         let mut ptrs = Vec::with_capacity(original_len - self.deleted_cell_indices.len());
@@ -17359,7 +17462,7 @@ mod tests {
             .expect("positioned root leaf should admit a delete run");
         let deleted_rowids = [2_i64, 4, 6, 8, 10, 12, 14, 16, 18];
         assert!(
-            deleted_rowids.len() > SMALL_DELETE_INCREMENTAL_LIMIT,
+            deleted_rowids.len() >= COMPACT_DELETE_SINGLE_PASS_MIN,
             "test must exercise the one-pass delete-run materializer"
         );
         for rowid in deleted_rowids {

@@ -1231,20 +1231,18 @@ worst row as `100 rows / delete 5 rows` at `3.654x` F/C, with
 `10000 rows / update 1000 rows` faster at `0.778x`.
 
 The current focused DML diagnostic artifact is
-`tests/artifacts/perf/codex-delete-multileaf-batch-20260511T025059Z/summary.md`.
-It records the retained DML profile after monotone multi-leaf DELETE batching
-and still shows that the remaining prepared-DML DELETE tail needs a broader
-transaction-level multi-leaf mutation primitive rather than another one-lever
-source patch. The current
-rollback-isolated DELETE comparison is
-`tests/artifacts/perf/codex-current-delete-isolation-20260510T041932Z/`.
-Those artifacts record the FSQLite DML profile separately; the benchmark rows
-themselves prepare the target statements before measurement for both engines.
-Rejected predecessor attempts are recorded in
-`docs/progress/perf-negative-results.md`; the retained direct-DELETE design
-stays behind conservative gates, and the retained pager cache direct-drain
-change only trims isolated single-connection commit ceremony. The prepared-DML
-DELETE tail still needs a broader direct/bulk mutation primitive.
+`tests/artifacts/perf/codex-current-delete-cpu-screen-20260511T083607Z/summary.md`.
+That May 11, 2026 screen reports `10000 rows / delete 500 rows` at
+`1.31x` F/C in isolated body timing and `1.85x` F/C in standard
+mode, with top self-time in `TransactionKind::get_page`,
+`TransactionKind::write_page_data`, `TableLeafDeleteRun::delete_rowid_with_reason`,
+`TransactionKind::free_page`, and freelist serialization/return helpers. It
+supersedes the older monotone multi-leaf DELETE diagnostic as the current
+source-frontier note and still points away from another one-lever retained-run,
+flush-wrapper, freed-page lookup, or transaction-control patch. Rejected
+predecessor attempts are recorded in
+`docs/progress/perf-negative-results.md`; the prepared-DML DELETE tail still
+needs a broader transaction-level direct/bulk mutation primitive.
 
 ### Memory Overhead
 

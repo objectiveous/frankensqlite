@@ -404,10 +404,16 @@ tracing::info!(
 - **Hotspot:** Current `UPDATE/DELETEThroughput` DELETE tail remains the
   highest measured C SQLite-faster frontier. Evidence:
   `tests/artifacts/perf/codex-dml-profile-head-20260510T224630Z/` and
-  `tests/artifacts/perf/codex-current-full-quick-20260510T182554Z/`.
+  `tests/artifacts/perf/codex-current-delete-cpu-screen-20260511T083607Z/`,
+  read alongside
+  `tests/artifacts/perf/codex-delete-multileaf-full-20260511T025146Z/full-quick.json`.
   The focused current-source profile reports DELETE ratios of `3.49891x`
   slower for 5 rows, `2.15802x` slower for 50 rows, and `1.92630x`
   slower for 500 rows while the prepared direct fast path is already active.
+  The May 11 CPU screen narrows the remaining delete-body frame to
+  transaction/page-state work (`TransactionKind::get_page`,
+  `TransactionKind::write_page_data`, `TransactionKind::free_page`), retained
+  same-leaf delete-run work, and freelist serialization/return helpers.
 - **Rejected smaller cards:** retained `TableLeafDeleteRun` materializer
   tweaks, tombstone-only DELETE overlays, dense-rowid queued overlays,
   standalone freed-page lookup changes, and direct flush wrappers are fenced in

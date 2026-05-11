@@ -12,6 +12,31 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-11 - DML frontier refresh after INSERT profile split
+
+- Target: `bd-db300.11.1` focused `UPDATE/DELETEThroughput` rows after the
+  direct INSERT row-build profile split landed.
+- Touched during this pass: no source files. Documentation/artifact only:
+  `tests/artifacts/perf/codex-dml-frontier-refresh-20260511T020200Z/`.
+- Evidence: `FSQLITE_BENCH_PROFILE_DML=1` with `--quick --filter update` on
+  `HEAD` (`1567cae3c83eaf300e50faf5ca2ee02b156f81c4`). FSQLite remains faster
+  for the 1K and 10K UPDATE rows (`0.87774x` and `0.74926x`), but DELETE is
+  still red at 5 rows (`3.62084x`), 50 rows (`2.11388x`), and 500 rows
+  (`2.05328x`). All DELETE rows use the prepared direct path (`slow=0`).
+  The 500-row DELETE profile reports `delete_leaf_start=64/67`,
+  `delete_leaf_active=433/496`, `delete_leaf_miss=63`,
+  `delete_leaf_flush=64/64`, `delete_leaf_flush_ns=110481`,
+  `delete_leaf_materialize=64/73555`, and `delete_leaf_write=64/25601`.
+- Result: no source patch attempted. This refresh confirms that another
+  standalone retained `TableLeafDeleteRun` tweak, direct-flush wrapper,
+  page-boundary admission change, tombstone-only overlay, or dense-rowid queue
+  is still the wrong next move.
+- Worth retrying only as the broader transaction-local DML mutation operator
+  with logical rowid/key-space semantics and proof coverage for
+  read-your-writes, rollback/savepoints, duplicate and missing rowids, schema
+  drift, QF/cache invalidation, and MVCC publication before requiring focused
+  DELETE wins plus full-quick primary-score neutrality or better.
+
 ## 2026-05-10 - Current INSERT repeat after DML frontier profile
 
 - Target: current non-DML red rows after the DML DELETE frontier was fenced,

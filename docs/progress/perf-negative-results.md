@@ -12,6 +12,38 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-11 - Current DML frontier refresh no-source boundary
+
+- Target: remaining `UPDATE/DELETEThroughput` DELETE red rows after the
+  memory-direct page-I/O skip and README artifact refresh, especially
+  `100 rows / delete 5 rows`, `1000 rows / delete 50 rows`, and
+  `10000 rows / delete 500 rows`.
+- Touched during this pass: no source files. Measurement/artifact only:
+  `tests/artifacts/perf/codex-dml-frontier-profile-20260511T-next/`.
+- Evidence: current `HEAD`
+  (`35a51b26a10846a96e25825043d565eff2e3c80c`) with
+  `FSQLITE_BENCH_PROFILE_DML=1 --quick --filter update` reported DELETE ratios
+  of `2.97240x`, `1.78589x`, and `1.67475x` for the 5-row, 50-row, and
+  500-row DELETE cases. UPDATE remained green at larger sizes
+  (`0.74711x` for 1000 rows and `0.67788x` for 10000 rows) while the tiny
+  update row stayed red at `1.34117x`.
+- Profile attribution: every profiled DELETE row stayed on the prepared direct
+  path (`slow=0`). The 500-row DELETE still paid `delete_leaf_active=433/496`,
+  `delete_leaf_miss=63`, `delete_leaf_flush=64/64`,
+  `delete_leaf_flush_ns=92884`, `delete_leaf_materialize=64/78827`, and
+  `delete_leaf_write=64/7434`.
+- Result: no source patch attempted. This repeats the current retained
+  `TableLeafDeleteRun` boundary and does not expose a fresh standalone lever.
+- Do not retry standalone retained DELETE leaf-run admission, materialization,
+  direct-writer publication, direct-flush wrappers, next-cell/page-boundary
+  hints, root-leaf policy changes, tombstone-only overlays, dense-rowid queues,
+  or exact transaction-control bypasses from this evidence. Reconsider only as
+  the broader transaction-local DML mutation operator that removes per-leaf
+  mutation/publication ceremony while proving read-your-writes,
+  rollback/savepoints, duplicate and missing rowid semantics, schema drift,
+  QF/cache invalidation, and MVCC publication, then improves focused DELETE
+  plus full-quick primary score in the same A/B window.
+
 ## 2026-05-11 - Current concurrent writer refresh no-source boundary
 
 - Target: remaining low-thread rows in

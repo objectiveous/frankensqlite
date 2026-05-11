@@ -1304,14 +1304,13 @@ impl From<MemoryMockTransaction> for TransactionKind {
 impl sealed::Sealed for TransactionKind {}
 
 impl TransactionHandle for TransactionKind {
-    // `get_page` and `write_page_data` are the two TransactionKind dispatch
-    // sites that show up in MT8 self-time profiles (mt-mvcc-bench, 2026-04-24:
-    // 0.36% and 0.29% respectively). Routing them through `with_handle` /
-    // `with_handle_mut` coerces the concrete `&SimpleTransaction<V>` into
-    // `&dyn TransactionHandle` inside the closure — every call paid a vtable
-    // lookup. Inlining the match here lets LLVM see the concrete type and
-    // dispatch statically, which the rest of `with_handle`'s callers (cold or
-    // shape-uniform sites) don't need.
+    // These TransactionKind dispatch sites show up in self-time profiles.
+    // Routing them through `with_handle` / `with_handle_mut` coerces the
+    // concrete `&SimpleTransaction<V>` into `&dyn TransactionHandle` inside the
+    // closure, so every call pays a vtable lookup. Inlining the match here lets
+    // LLVM see the concrete type and dispatch statically; the rest of
+    // `with_handle`'s callers are cold or shape-uniform enough to keep sharing
+    // the smaller helper.
     fn get_page(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
         match self {
             Self::Memory(txn) => txn.get_page(cx, page_no),
@@ -1380,7 +1379,10 @@ impl TransactionHandle for TransactionKind {
             Self::Windows(txn) => txn.free_page(cx, page_no),
             Self::Mock(txn) => txn.free_page(cx, page_no),
             Self::MemoryMock(txn) => txn.free_page(cx, page_no),
-            Self::Drained => self.with_handle_mut(|txn| txn.free_page(cx, page_no)),
+            Self::Drained => panic!(
+                "BUG: TransactionKind::Drained accessed in free_page — a retained \
+                 cursor tried to free pages while the transaction was extracted."
+            ),
         }
     }
 

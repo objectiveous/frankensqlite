@@ -1,0 +1,7 @@
+run-context.txt
+stdout.txt
+stderr.txt
+update-delete.json
+summary.md
+manifest.txt
+SHA256SUMS

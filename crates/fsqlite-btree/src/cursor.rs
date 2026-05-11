@@ -1360,6 +1360,16 @@ impl TableLeafDeleteRun {
         self.entry.page_no
     }
 
+    pub fn max_rowid(&self) -> Result<i64> {
+        let max_cell_idx = self
+            .entry
+            .header
+            .cell_count
+            .checked_sub(1)
+            .ok_or_else(|| FrankenError::internal("empty table leaf delete run"))?;
+        TableLeafPayloadPatchRun::table_leaf_rowid_at(&self.entry, max_cell_idx)
+    }
+
     #[must_use]
     pub fn is_dirty(&self) -> bool {
         !self.deleted_cell_indices.is_empty()

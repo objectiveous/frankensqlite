@@ -402,23 +402,32 @@ tracing::info!(
 ### 8.4 bd-db300.11.1 (Transaction-Local DML Mutation Operator)
 
 - **Hotspot:** Current `UPDATE/DELETEThroughput` DELETE tail remains the
-  highest measured C SQLite-faster frontier. Evidence:
-  `tests/artifacts/perf/codex-delete-run-borrow-flush-20260511T1609Z/full-quick-final-local.json`
-  and
+  highest measured C SQLite-faster frontier. Evidence: the current full quick
+  artifact
+  `tests/artifacts/perf/codex-delete-run-borrow-flush-20260511T1609Z/full-quick-final-local.json`,
+  the DML profile
   `tests/artifacts/perf/codex-next-dml-profile-20260511T1701Z/summary.md`,
-  both after `786adc9469fac0e299dfd16b24a776174da4de44`. The current full
-  quick matrix reports the corrected prepared-DML DELETE tail at `2.838x`
-  slower for 5 rows, `1.829x` slower for 50 rows, and `1.595x` slower for
-  500 rows. The focused current-source profile with profiling enabled reports
-  `3.19x`, `1.83x`, and `1.63x` for those rows while every DELETE stays on the
-  prepared direct path (`slow=0`). The latest profile narrows the 10K/500 row
-  to 433 retained same-leaf active hits across 496 attempts, 63 leaf-boundary
-  misses, 64 dirty flushes, about `73.5 us` of delete-run materialization, and
-  about `7.5 us` of page writes.
+  the current DELETE CPU profile
+  `tests/artifacts/perf/codex-current-delete-cpu-profile-20260511T1745Z/summary.md`,
+  and this recertification summary
+  `tests/artifacts/perf/codex-dml-mutation-frontier-recert-20260511T1905Z/summary.md`.
+  Current `HEAD` is `94ebb38c33508d374c157c47f1af0df2f3bec3ff`. The latest
+  full quick matrix still reports the corrected prepared-DML DELETE tail at
+  `2.838x` slower for 5 rows, `1.829x` slower for 50 rows, and `1.595x`
+  slower for 500 rows. The focused current-source profile with profiling
+  enabled reports `3.19x`, `1.83x`, and `1.63x` for those rows while every
+  DELETE stays on the prepared direct path (`slow=0`). The latest profile
+  narrows the 10K/500 row to 433 retained same-leaf active hits across 496
+  attempts, 63 leaf-boundary misses, 64 dirty flushes, about `73.5 us` of
+  delete-run materialization, and about `7.5 us` of page writes. The fresh CPU
+  profile also shows the top remaining frames are still
+  `TransactionKind::get_page`, `TableLeafDeleteRun::delete_rowid_with_reason`,
+  `TransactionKind::write_page_data`, and `TransactionKind::free_page`.
 - **Rejected smaller cards:** retained `TableLeafDeleteRun` materializer
   tweaks, tombstone-only DELETE overlays, dense-rowid queued overlays,
-  standalone freed-page lookup changes, and direct flush wrappers are fenced in
-  `docs/progress/perf-negative-results.md`.
+  standalone freed-page lookup changes, private-memory page-1/commit shortcuts,
+  cursorless/direct flush wrappers, and no-op direct-write pre-gates are fenced
+  in `docs/progress/perf-negative-results.md`.
 - **Lever:** one transaction-local DML mutation operator that buffers
   page-local rowid delete/update messages in logical key space, merges them at
   a proven first-read or commit boundary, and publishes the same MVCC conflict

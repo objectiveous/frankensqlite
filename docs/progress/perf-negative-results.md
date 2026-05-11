@@ -12,6 +12,41 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-11 - Current DML mutation frontier recertification
+
+- Target: remaining `UPDATE/DELETEThroughput` DELETE rows on current `HEAD`
+  (`94ebb38c33508d374c157c47f1af0df2f3bec3ff`) after the retained delete-run
+  borrowed-flush win, small UPDATE repeat, current DELETE CPU profile, and
+  concurrent-profile JSON instrumentation.
+- Touched during this pass: no source files. Documentation/evidence only:
+  `docs/design/profile-first-optimization-cards-and-proof-packs.md` and
+  `tests/artifacts/perf/codex-dml-mutation-frontier-recert-20260511T1905Z/`.
+- Evidence: the current full quick matrix from
+  `tests/artifacts/perf/codex-delete-run-borrow-flush-20260511T1609Z/full-quick-final-local.json`
+  still has DELETE ratios `2.838x`, `1.829x`, and `1.595x` for the 5-row,
+  50-row, and 500-row DELETE cases. The DML profile at
+  `tests/artifacts/perf/codex-next-dml-profile-20260511T1701Z/summary.md`
+  attributes the 10K/500 row to 433 retained same-leaf active hits across 496
+  attempts, 63 leaf-boundary misses, 64 dirty flushes, about `73.5 us`
+  materialization, and about `7.5 us` page-write time. The current CPU profile
+  at
+  `tests/artifacts/perf/codex-current-delete-cpu-profile-20260511T1745Z/summary.md`
+  still points at the already-known page access/publication and delete-run
+  families. A bounded alien-graveyard pass mapped the live symptom to the
+  already-open B-epsilon/message-buffer card, not to a fresh standalone
+  micro-lever.
+- Result: no source patch attempted. The fresh read did not find an unfenced
+  one-lever source edit. Private-memory page-1/commit shortcuts, cursorless
+  direct flush, no-op direct-write pre-gates, freed-page lookup variants,
+  retained leaf-run admission/search/materialization tweaks, and tombstone-only
+  overlays are all already measured rejects for this benchmark matrix.
+- Do not retry another standalone DELETE pager, page-1, direct-flush, or
+  retained-leaf-run micro-patch from these artifacts. Reconsider only with the
+  broader transaction-local DML mutation operator described in
+  `docs/design/profile-first-optimization-cards-and-proof-packs.md#84-bd-db300111-transaction-local-dml-mutation-operator`,
+  or with a new same-window profile that materially changes the top hotspot
+  table and invalidates the listed rejects.
+
 ## 2026-05-11 - Current DELETE CPU profile no-source boundary
 
 - Target: remaining `UPDATE/DELETEThroughput` DELETE rows after the retained

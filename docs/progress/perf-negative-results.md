@@ -12,6 +12,37 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-11 - Current concurrent writer refresh no-source boundary
+
+- Target: remaining low-thread rows in
+  `comprehensive-bench --quick --filter concurrent`, especially
+  `2 writers x 1000 rows` and `4 writers x 1000 rows`.
+- Touched during this pass: no source files. Measurement artifact only:
+  `tests/artifacts/perf/codex-current-concurrent-screen-20260511T123119Z/`.
+- Evidence: current `HEAD`
+  (`3872676fccbf5d7a9beb1e82741d33f61ba50788`) with
+  `FSQLITE_BENCH_PROFILE_CONCURRENT=1 --quick --filter concurrent` reported
+  2-writer ratio `1.18160x`, 4-writer ratio `1.18547x`, and 8-writer ratio
+  `0.49754x`. The profile stayed entirely on prepared direct INSERT
+  (`slow=0`) but file-backed pending page-runs remained inactive
+  (`page_run_flushes=0`). The low-thread rows still paid stale-snapshot/page
+  lock retry cost: 2 writers had `mvcc_page_lock_waits=12`,
+  `mvcc_busy_retries=12`, `mvcc_stale_snapshot=12`, and
+  `mvcc_page_lock_wait_ns=18088806`; 4 writers had
+  `mvcc_page_lock_waits=80`, `mvcc_busy_retries=80`,
+  `mvcc_stale_snapshot=69`, and `mvcc_page_lock_wait_ns=140776414`.
+- Result: no source patch attempted. This repeats the same boundary as the
+  2026-05-10 low-thread concurrent and file-backed page-run screens: the gap is
+  transaction-level stale-snapshot replay and MVCC publication shape, not parser
+  dispatch, row serialization, or a small commit-prep collection hotspot.
+- Do not retry low-thread concurrent wait-slice tuning, retry-loop reshaping,
+  standalone file-backed page-run admission, lazy MemDB mirror admission, WAL
+  checksum precompute, or MVCC commit page-set container tweaks from this
+  evidence. Reconsider only with a representation change that batches
+  file-backed page construction and MVCC publication together while preserving
+  first-committer-wins, and require a same-window focused concurrent win plus
+  no 8-writer or full-quick primary-score regression.
+
 ## 2026-05-11 - TransactionKind hot-method force-inline retry
 
 - Target: post-`free_page` `UPDATE/DELETEThroughput` DELETE tail after the

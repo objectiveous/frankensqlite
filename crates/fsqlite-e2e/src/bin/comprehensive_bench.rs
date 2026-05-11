@@ -2774,6 +2774,46 @@ fn build_fsqlite_concurrent_profile(
         profile.commit_post_write_maintenance_time_ns
     );
     counter!("finalize_post_ns", profile.finalize_post_publish_time_ns);
+    counter!(
+        "concurrent_plan_attempts",
+        profile.concurrent_commit_plan_attempts
+    );
+    counter!(
+        "concurrent_plan_successes",
+        profile.concurrent_commit_plan_successes
+    );
+    counter!(
+        "concurrent_plan_errors",
+        profile.concurrent_commit_plan_errors
+    );
+    counter!(
+        "concurrent_plan_busy_snapshot_errors",
+        profile.concurrent_commit_plan_busy_snapshot_errors
+    );
+    counter!(
+        "concurrent_plan_pending_pages",
+        profile.concurrent_commit_plan_pending_pages
+    );
+    counter!(
+        "concurrent_plan_write_pages",
+        profile.concurrent_commit_plan_write_pages
+    );
+    counter!(
+        "concurrent_plan_held_lock_pages",
+        profile.concurrent_commit_plan_held_lock_pages
+    );
+    counter!(
+        "concurrent_plan_uncontended_fast_paths",
+        profile.concurrent_commit_plan_uncontended_fast_paths
+    );
+    counter!(
+        "concurrent_plan_candidate_free_fast_paths",
+        profile.concurrent_commit_plan_candidate_free_fast_paths
+    );
+    counter!(
+        "concurrent_plan_full_validations",
+        profile.concurrent_commit_plan_full_validations
+    );
     counter!("parser_multi_calls", profile.parser.parse_multi_calls);
     counter!("parser_cache_hits", profile.parser.parse_cache_hits);
     counter!("parser_cache_misses", profile.parser.parse_cache_misses);
@@ -2881,7 +2921,7 @@ fn print_fsqlite_concurrent_profile(
     let mvcc = &profile.vdbe.mvcc_write_path;
     let page_data = &profile.vdbe.page_data_motion;
     eprintln!(
-        "    [fs_concurrent_{n_threads}t] concurrent_profile rows={total_rows} fs_median={} direct_insert={} fast={} slow={} begin_ns={} execute_body_ns={} direct_flush_calls={} direct_flush_ns={} page_run_flushes={} page_run_records={} page_run_bytes={} page_run_owned={} page_run_arena={} page_run_repeated={} page_run_depth2={} row_build_ns={} cursor_setup_ns={} serialize_ns={} btree_insert_ns={} schema_validation_ns={} change_tracking_ns={} commit_pre_ns={} commit_roundtrip_ns={} pager_commit_calls={} pager_phase_a_ns={} pager_wal_ns={} pager_mem_flush_ns={} pager_journal_ns={} pager_c_metadata_ns={} pager_file_size_ns={} pager_unlock_ns={} pager_publish_ns={} pager_cache_finish_ns={} commit_finalize_ns={} commit_handle_ns={} post_write_ns={} finalize_post_ns={} parser_multi_calls={} parser_cache_hits={} parser_cache_misses={} parser_parse_ns={} parser_rewrite_ns={} bg_checks={} bg_ns={} op_cx_bg_gates={} dispatch_bg_gates={} pager_pub_refreshes={} commit_refreshes={} prepared_lookup_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} vdbe_opcodes={} vdbe_statements={} vdbe_statement_us={} vdbe_make_record={} mvcc_tier0={} mvcc_tier1={} mvcc_tier2={} mvcc_page_lock_waits={} mvcc_page_lock_wait_ns={} mvcc_busy_retries={} mvcc_busy_timeouts={} mvcc_stale_snapshot={} mvcc_page_one_tracks={} mvcc_page_one_track_ns={} mvcc_pending_clears={} mvcc_pending_clear_ns={} page_data_borrowed_norm={} page_data_borrowed_exact_copies={} page_data_owned_norm={} page_data_owned_passthrough={} page_data_owned_zero_extends={} page_data_owned_resized_copies={} page_data_payload_bytes={} page_data_zero_fill_bytes={} wal_frames={} wal_bytes={} wal_group_commits={} wal_group_commit_latency_us={}",
+        "    [fs_concurrent_{n_threads}t] concurrent_profile rows={total_rows} fs_median={} direct_insert={} fast={} slow={} begin_ns={} execute_body_ns={} direct_flush_calls={} direct_flush_ns={} page_run_flushes={} page_run_records={} page_run_bytes={} page_run_owned={} page_run_arena={} page_run_repeated={} page_run_depth2={} row_build_ns={} cursor_setup_ns={} serialize_ns={} btree_insert_ns={} schema_validation_ns={} change_tracking_ns={} commit_pre_ns={} commit_roundtrip_ns={} pager_commit_calls={} pager_phase_a_ns={} pager_wal_ns={} pager_mem_flush_ns={} pager_journal_ns={} pager_c_metadata_ns={} pager_file_size_ns={} pager_unlock_ns={} pager_publish_ns={} pager_cache_finish_ns={} commit_finalize_ns={} commit_handle_ns={} post_write_ns={} finalize_post_ns={} concurrent_plan_attempts={} concurrent_plan_successes={} concurrent_plan_errors={} concurrent_plan_busy_snapshot_errors={} concurrent_plan_pending_pages={} concurrent_plan_write_pages={} concurrent_plan_held_lock_pages={} concurrent_plan_uncontended_fast_paths={} concurrent_plan_candidate_free_fast_paths={} concurrent_plan_full_validations={} parser_multi_calls={} parser_cache_hits={} parser_cache_misses={} parser_parse_ns={} parser_rewrite_ns={} bg_checks={} bg_ns={} op_cx_bg_gates={} dispatch_bg_gates={} pager_pub_refreshes={} commit_refreshes={} prepared_lookup_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} vdbe_opcodes={} vdbe_statements={} vdbe_statement_us={} vdbe_make_record={} mvcc_tier0={} mvcc_tier1={} mvcc_tier2={} mvcc_page_lock_waits={} mvcc_page_lock_wait_ns={} mvcc_busy_retries={} mvcc_busy_timeouts={} mvcc_stale_snapshot={} mvcc_page_one_tracks={} mvcc_page_one_track_ns={} mvcc_pending_clears={} mvcc_pending_clear_ns={} page_data_borrowed_norm={} page_data_borrowed_exact_copies={} page_data_owned_norm={} page_data_owned_passthrough={} page_data_owned_zero_extends={} page_data_owned_resized_copies={} page_data_payload_bytes={} page_data_zero_fill_bytes={} wal_frames={} wal_bytes={} wal_group_commits={} wal_group_commit_latency_us={}",
         format_duration(fs_median),
         profile.prepared_direct_insert_executions,
         profile.parser.fast_path_executions,
@@ -2919,6 +2959,16 @@ fn print_fsqlite_concurrent_profile(
         profile.commit_handle_finalize_time_ns,
         profile.commit_post_write_maintenance_time_ns,
         profile.finalize_post_publish_time_ns,
+        profile.concurrent_commit_plan_attempts,
+        profile.concurrent_commit_plan_successes,
+        profile.concurrent_commit_plan_errors,
+        profile.concurrent_commit_plan_busy_snapshot_errors,
+        profile.concurrent_commit_plan_pending_pages,
+        profile.concurrent_commit_plan_write_pages,
+        profile.concurrent_commit_plan_held_lock_pages,
+        profile.concurrent_commit_plan_uncontended_fast_paths,
+        profile.concurrent_commit_plan_candidate_free_fast_paths,
+        profile.concurrent_commit_plan_full_validations,
         profile.parser.parse_multi_calls,
         profile.parser.parse_cache_hits,
         profile.parser.parse_cache_misses,

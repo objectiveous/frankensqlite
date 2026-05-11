@@ -12,6 +12,54 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-11 - Repeat exact transaction-control execute fast path after scratch reset
+
+- Target: remaining fixed-cost `UPDATE/DELETEThroughput` gaps after
+  `56b73f08` narrowed direct DELETE scratch reset, especially
+  `100 rows / delete 5 rows`, `1000 rows / delete 50 rows`, and
+  `100 rows / update 10 rows`.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`; the candidate source patch and its
+  targeted regression test were manually unwound after the full-quick matrix
+  rejected it, leaving no retained source diff.
+- Candidate shape: repeat the already-rejected exact transaction-control SQL
+  bypass against the newer frontier. Exact `BEGIN`, `COMMIT`, and `ROLLBACK`
+  strings were detected in `Connection::execute` after `background_status()`
+  and routed directly to the transaction helpers when trace observability was
+  inactive. The focused DML profile confirmed the micro-effect by moving
+  `parser_multi_calls` from `2` to `0` and `execute_body_ns` to `0` on the
+  explicit transaction-control ceremony.
+- Correctness proof before rejection:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-head-profile-target CARGO_BUILD_JOBS=8 cargo test -p fsqlite-core test_lifecycle_exact_transaction_control_execute_bypasses_parser_when_untraced -- --nocapture`
+  passed before the test and source patch were removed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-head-dml-hotpath-20260511T0652Z/`
+  contains the same-HEAD DML baseline, and
+  `tests/artifacts/perf/codex-txn-control-fastpath-probe-20260511T0700Z/`
+  contains two focused candidate DML runs plus two full-quick candidate runs.
+- Focused DML result: the first candidate run improved the target ratios
+  (`100`-row UPDATE `1.5173 -> 1.3878`, `100`-row DELETE
+  `3.5056 -> 3.1694`, `1000`-row DELETE `2.0304 -> 1.9573`, and
+  `10000`-row DELETE `1.8302 -> 1.7851`), but the repeat DML run showed the
+  smallest UPDATE row was noise (`1.5173 -> 1.5169`) and larger UPDATE rows
+  regressed in absolute FSQLite time.
+- Full-matrix rejection: against the kept scratch-reset full-quick artifact
+  `tests/artifacts/perf/codex-delete-scratch-guard-probe-20260511T051951Z/fullquick2/full-quick.json`,
+  candidate `fullquick1` worsened weighted score
+  `0.3737218607 -> 0.3796332426`, geomean
+  `0.2728731125 -> 0.2794292909`, median
+  `0.2938174301 -> 0.3030926291`, p90
+  `1.0392045236 -> 1.0869783941`, and counts
+  `80/4/9 -> 80/2/11`. Candidate `fullquick2` still worsened weighted score
+  to `0.3767633146`, geomean to `0.2773252427`, p90 to
+  `1.0777721249`, and counts to `79/4/10`. The p99 improved, but not enough
+  to compensate for the broader matrix loss.
+- Do not retry an exact SQL transaction-control bypass as a standalone lever.
+  This repeats and strengthens the 2026-05-09 rejection. Reconsider only as
+  part of a broader transaction lifecycle redesign that improves the primary
+  full-quick weighted score and does not create additional INSERT or write-bulk
+  red rows.
+
 ## 2026-05-11 - Current HEAD DML profile artifact refresh
 
 - Target: current `UPDATE/DELETEThroughput` red rows after publishing the

@@ -1,0 +1,6 @@
+summary.md
+manifest.txt
+SHA256SUMS
+update-delete.json
+stdout.txt
+stderr.txt

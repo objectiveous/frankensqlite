@@ -12,6 +12,45 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-11 - Current INSERT and DELETE CPU screen no-source boundary
+
+- Target: pick the next source lever after the exact transaction-control
+  fast-path retry was rejected, focusing on current INSERT red rows and the
+  remaining `UPDATE/DELETEThroughput` DELETE tail.
+- Touched during this pass: no source files. Measurement/artifact only:
+  `tests/artifacts/perf/codex-current-insert-screen-20260511T083607Z/` and
+  `tests/artifacts/perf/codex-current-delete-cpu-screen-20260511T083607Z/`.
+- INSERT evidence: current `HEAD`
+  (`2f8d3b75af4daedbdcd3522c4e599f2694182749`) with
+  `FSQLITE_BENCH_PROFILE_INSERT=1 --quick --filter insert` reported
+  `17` FSQLite-faster rows, `1` comparable row, `7` C-faster rows, average
+  ratio `0.8817942536`, geomean ratio `0.8540783298`, and primary weighted
+  score `0.8348973035`. Remaining red rows are tiny fixed-cost INSERT cases
+  (`tiny_1col` 100 rows at `1.48997x`, small 100-row variants around
+  `1.13x-1.17x`) and a near-tie large record-size row (`1.00742x`).
+- DELETE evidence: current `perf-update-delete` compare probes reported
+  isolated `10000 rows / delete 500 rows` at `357 ns/delete` for FSQLite vs
+  `273 ns/delete` for C SQLite (`1.31x`), and standard mode at
+  `604 ns/delete` vs `326 ns/delete` (`1.85x`). A delayed delete-only perf
+  capture in the artifact shows top self-time in
+  `TransactionKind::get_page` (`14.11%`),
+  `TransactionKind::write_page_data` (`6.47%`),
+  `TableLeafDeleteRun::delete_rowid_with_reason` (`6.03%`),
+  `TransactionKind::free_page` (`3.99%`), and freelist serialization/return
+  helpers (about `5.29%` combined).
+- Result: no source patch attempted. The current evidence does not expose a
+  fresh standalone lever. INSERT is mostly green and the visible record/page-run
+  construction families are already fenced; DELETE points back to the known
+  transaction/page-state representation boundary rather than a new isolated
+  function-level hotspot.
+- Do not restart from another standalone INSERT record/page-run tweak,
+  freed-pages lookup change, direct flush wrapper, retained-cursor shell,
+  next-cell hint, or `TableLeafDeleteRun` materializer change from this
+  evidence. Reconsider only as part of the broader `bd-db300.11.1`
+  transaction-local DML mutation operator that improves the focused DELETE rows
+  and keeps the full-quick primary score neutral or better in the same A/B
+  window.
+
 ## 2026-05-11 - Repeat exact transaction-control execute fast path after scratch reset
 
 - Target: remaining fixed-cost `UPDATE/DELETEThroughput` gaps after

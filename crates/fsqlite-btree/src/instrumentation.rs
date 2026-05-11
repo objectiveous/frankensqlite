@@ -124,6 +124,14 @@ pub struct BtreeLeafReuseSnapshot {
     pub nonroot_balance_calls: u64,
     /// Time spent in the generic nonroot rebalance path.
     pub nonroot_balance_time_ns: u64,
+    /// Retained same-leaf DELETE run materializations.
+    pub delete_leaf_run_materialize_calls: u64,
+    /// Time spent materializing retained same-leaf DELETE runs into page images.
+    pub delete_leaf_run_materialize_time_ns: u64,
+    /// Retained same-leaf DELETE run page writes.
+    pub delete_leaf_run_write_calls: u64,
+    /// Time spent handing retained same-leaf DELETE page images to the pager.
+    pub delete_leaf_run_write_time_ns: u64,
 }
 
 /// Per-operation mutable stats while a `btree_op` span is active.
@@ -218,6 +226,10 @@ static BTREE_LOCAL_SPLIT_HITS: AtomicU64 = AtomicU64::new(0);
 static BTREE_LOCAL_SPLIT_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static BTREE_NONROOT_BALANCE_CALLS: AtomicU64 = AtomicU64::new(0);
 static BTREE_NONROOT_BALANCE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static BTREE_DELETE_LEAF_RUN_MATERIALIZE_CALLS: AtomicU64 = AtomicU64::new(0);
+static BTREE_DELETE_LEAF_RUN_MATERIALIZE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static BTREE_DELETE_LEAF_RUN_WRITE_CALLS: AtomicU64 = AtomicU64::new(0);
+static BTREE_DELETE_LEAF_RUN_WRITE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 pub(crate) fn copy_profile_enabled() -> bool {
@@ -432,6 +444,22 @@ pub(crate) fn record_nonroot_balance(start: Option<std::time::Instant>) {
     BTREE_NONROOT_BALANCE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
+pub(crate) fn record_delete_leaf_run_materialize(start: Option<std::time::Instant>) {
+    let Some(duration_ns) = profile_elapsed_ns(start) else {
+        return;
+    };
+    BTREE_DELETE_LEAF_RUN_MATERIALIZE_CALLS.fetch_add(1, Ordering::Relaxed);
+    BTREE_DELETE_LEAF_RUN_MATERIALIZE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
+}
+
+pub(crate) fn record_delete_leaf_run_write(start: Option<std::time::Instant>) {
+    let Some(duration_ns) = profile_elapsed_ns(start) else {
+        return;
+    };
+    BTREE_DELETE_LEAF_RUN_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
+    BTREE_DELETE_LEAF_RUN_WRITE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
+}
+
 #[inline]
 pub(crate) fn record_split_event() {
     if !btree_metrics_enabled() {
@@ -565,6 +593,12 @@ pub fn btree_leaf_reuse_snapshot() -> BtreeLeafReuseSnapshot {
         local_split_time_ns: BTREE_LOCAL_SPLIT_TIME_NS.load(Ordering::Relaxed),
         nonroot_balance_calls: BTREE_NONROOT_BALANCE_CALLS.load(Ordering::Relaxed),
         nonroot_balance_time_ns: BTREE_NONROOT_BALANCE_TIME_NS.load(Ordering::Relaxed),
+        delete_leaf_run_materialize_calls: BTREE_DELETE_LEAF_RUN_MATERIALIZE_CALLS
+            .load(Ordering::Relaxed),
+        delete_leaf_run_materialize_time_ns: BTREE_DELETE_LEAF_RUN_MATERIALIZE_TIME_NS
+            .load(Ordering::Relaxed),
+        delete_leaf_run_write_calls: BTREE_DELETE_LEAF_RUN_WRITE_CALLS.load(Ordering::Relaxed),
+        delete_leaf_run_write_time_ns: BTREE_DELETE_LEAF_RUN_WRITE_TIME_NS.load(Ordering::Relaxed),
     }
 }
 
@@ -618,6 +652,10 @@ pub fn reset_btree_leaf_reuse_profile() {
     BTREE_LOCAL_SPLIT_TIME_NS.store(0, Ordering::Relaxed);
     BTREE_NONROOT_BALANCE_CALLS.store(0, Ordering::Relaxed);
     BTREE_NONROOT_BALANCE_TIME_NS.store(0, Ordering::Relaxed);
+    BTREE_DELETE_LEAF_RUN_MATERIALIZE_CALLS.store(0, Ordering::Relaxed);
+    BTREE_DELETE_LEAF_RUN_MATERIALIZE_TIME_NS.store(0, Ordering::Relaxed);
+    BTREE_DELETE_LEAF_RUN_WRITE_CALLS.store(0, Ordering::Relaxed);
+    BTREE_DELETE_LEAF_RUN_WRITE_TIME_NS.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]

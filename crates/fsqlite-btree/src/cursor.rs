@@ -8997,8 +8997,12 @@ impl<P: PageWriter> BtCursor<P> {
     #[doc(hidden)]
     pub fn flush_table_leaf_delete_run(&mut self, cx: &Cx, run: TableLeafDeleteRun) -> Result<()> {
         if run.is_dirty() {
+            let materialize_start = instrumentation::profile_start();
             let (leaf_page, page_data) = run.into_page(self.usable_size)?;
+            instrumentation::record_delete_leaf_run_materialize(materialize_start);
+            let write_start = instrumentation::profile_start();
             self.pager.write_page_data(cx, leaf_page, page_data)?;
+            instrumentation::record_delete_leaf_run_write(write_start);
         }
         self.stack.clear();
         self.at_eof = true;

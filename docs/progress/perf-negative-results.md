@@ -12,6 +12,36 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-11 - Current HEAD DML profile artifact refresh
+
+- Target: current `UPDATE/DELETEThroughput` red rows after publishing the
+  current full-quick baseline artifact and backfilled INSERT profile raw files.
+- Touched during this pass: no source files. Measurement/artifact only:
+  `tests/artifacts/perf/codex-current-head-dml-profile-20260511T043335Z/`.
+- Evidence: `FSQLITE_BENCH_PROFILE_DML=1` with `--quick --filter update` on
+  `HEAD` (`fa0f3073da5866f409ff3053263043e5e58e3b97`). The focused DML slice
+  reported `1` FSQLite-faster row and `5` C-faster rows, with geomean
+  `1.8774822982380694`. UPDATE at 10K rows was faster than C SQLite
+  (`0.7667993122876123x`), but DELETE remained red at 5 rows
+  (`6.161331086773378x`, high variance), 50 rows (`2.057601977750309x`), and
+  500 rows (`1.8675914886100544x`).
+- Profile attribution: all target rows stayed on the prepared direct DML path.
+  The 500-row DELETE case still paid `delete_leaf_active=433/496`,
+  `delete_leaf_miss=63`, `delete_leaf_flush=64/64`,
+  `delete_leaf_flush_ns=109516`, `delete_leaf_materialize=64/78149`, and
+  `delete_leaf_write=64/24061`.
+- Result: no source patch attempted. This profile keeps the same conclusion as
+  the earlier DML frontier refresh: standalone retained DELETE leaf-run tweaks,
+  direct-flush wrappers, parent-separator/last-cell admission, next-cell hints,
+  page-boundary admission, tombstone-only overlays, dense-rowid queues,
+  prepared-cache last-hit changes, and root-`Cx` reuse are not credible next
+  standalone patches.
+- Worth retrying only as a broader transaction-local DML mutation operator
+  that proves read-your-writes, rollback/savepoint behavior, failed-flush
+  preservation, duplicate and missing rowid semantics, schema drift, quotient
+  filter/cache invalidation, and MVCC publication before requiring focused
+  DELETE wins plus full-quick primary-score neutrality or better.
+
 ## 2026-05-11 - DML frontier refresh after INSERT profile split
 
 - Target: `bd-db300.11.1` focused `UPDATE/DELETEThroughput` rows after the

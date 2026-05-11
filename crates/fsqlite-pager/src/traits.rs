@@ -1370,7 +1370,18 @@ impl TransactionHandle for TransactionKind {
     }
 
     fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-        self.with_handle_mut(|txn| txn.free_page(cx, page_no))
+        match self {
+            Self::Memory(txn) => txn.free_page(cx, page_no),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(txn) => txn.free_page(cx, page_no),
+            #[cfg(unix)]
+            Self::Unix(txn) => txn.free_page(cx, page_no),
+            #[cfg(target_os = "windows")]
+            Self::Windows(txn) => txn.free_page(cx, page_no),
+            Self::Mock(txn) => txn.free_page(cx, page_no),
+            Self::MemoryMock(txn) => txn.free_page(cx, page_no),
+            Self::Drained => self.with_handle_mut(|txn| txn.free_page(cx, page_no)),
+        }
     }
 
     fn commit(&mut self, cx: &Cx) -> Result<()> {

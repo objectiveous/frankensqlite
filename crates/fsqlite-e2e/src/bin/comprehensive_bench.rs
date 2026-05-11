@@ -556,6 +556,7 @@ struct ReportRow {
     scenario: String,
     csqlite: Option<Measurement>,
     fsqlite: Option<Measurement>,
+    fsqlite_concurrent_profile: Option<JsonFsqliteConcurrentProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -679,6 +680,14 @@ struct JsonMeasurement {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
+struct JsonFsqliteConcurrentProfile {
+    total_rows: usize,
+    fsqlite_median_ms: f64,
+    capture_scope: String,
+    counters: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
 struct JsonRow {
     scenario_id: String,
     scenario: String,
@@ -686,6 +695,8 @@ struct JsonRow {
     csqlite: Option<JsonMeasurement>,
     fsqlite: Option<JsonMeasurement>,
     ratio_fsqlite_over_csqlite: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fsqlite_concurrent_profile: Option<JsonFsqliteConcurrentProfile>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -1259,6 +1270,7 @@ fn build_json_report(
                     csqlite: row.csqlite.as_ref().map(JsonMeasurement::from_measurement),
                     fsqlite: row.fsqlite.as_ref().map(JsonMeasurement::from_measurement),
                     ratio_fsqlite_over_csqlite: row_ratio(row),
+                    fsqlite_concurrent_profile: row.fsqlite_concurrent_profile.clone(),
                 })
                 .collect();
             JsonSection {
@@ -1455,7 +1467,8 @@ fn benchmark_json_schema() -> serde_json::Value {
                                     "category": {"$ref": "#/$defs/scenario_category"},
                                     "csqlite": {"anyOf": [{"$ref": "#/$defs/measurement"}, {"type": "null"}]},
                                     "fsqlite": {"anyOf": [{"$ref": "#/$defs/measurement"}, {"type": "null"}]},
-                                    "ratio_fsqlite_over_csqlite": {"type": ["number", "null"]}
+                                    "ratio_fsqlite_over_csqlite": {"type": ["number", "null"]},
+                                    "fsqlite_concurrent_profile": {"$ref": "#/$defs/fsqlite_concurrent_profile"}
                                 }
                             }
                         }
@@ -1523,6 +1536,21 @@ fn benchmark_json_schema() -> serde_json::Value {
                     "rows_per_sec": {"type": "number", "minimum": 0},
                     "us_per_row": {"type": "number", "minimum": 0},
                     "iterations": {"type": "integer", "minimum": 1}
+                }
+            },
+            "fsqlite_concurrent_profile": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["total_rows", "fsqlite_median_ms", "capture_scope", "counters"],
+                "properties": {
+                    "total_rows": {"type": "integer", "minimum": 0},
+                    "fsqlite_median_ms": {"type": "number", "minimum": 0},
+                    "capture_scope": {"type": "string"},
+                    "counters": {
+                        "type": "object",
+                        "description": "Stable counter names match the human concurrent_profile line when FSQLITE_BENCH_PROFILE_CONCURRENT=1.",
+                        "additionalProperties": {"type": "integer", "minimum": 0}
+                    }
                 }
             }
         }
@@ -2083,10 +2111,21 @@ impl ReportSection {
         csqlite: Option<Measurement>,
         fsqlite: Option<Measurement>,
     ) {
+        self.add_row_with_fsqlite_concurrent_profile(scenario, csqlite, fsqlite, None);
+    }
+
+    fn add_row_with_fsqlite_concurrent_profile(
+        &mut self,
+        scenario: &str,
+        csqlite: Option<Measurement>,
+        fsqlite: Option<Measurement>,
+        fsqlite_concurrent_profile: Option<JsonFsqliteConcurrentProfile>,
+    ) {
         self.rows.push(ReportRow {
             scenario: scenario.to_string(),
             csqlite,
             fsqlite,
+            fsqlite_concurrent_profile,
         });
     }
 }
@@ -2624,6 +2663,208 @@ fn bench_insert_by_record_size(report: &mut BenchReport) {
 
 fn metric_delta(after: u64, before: u64) -> u64 {
     after.saturating_sub(before)
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_fsqlite_concurrent_profile(
+    total_rows: usize,
+    fs_median: Duration,
+    profile: &HotPathProfileSnapshot,
+    wal_frames: u64,
+    wal_bytes: u64,
+    wal_group_commits: u64,
+    wal_group_commit_latency_us: u64,
+) -> JsonFsqliteConcurrentProfile {
+    let mvcc = &profile.vdbe.mvcc_write_path;
+    let page_data = &profile.vdbe.page_data_motion;
+    let mut counters = BTreeMap::new();
+    macro_rules! counter {
+        ($name:literal, $value:expr) => {
+            counters.insert($name.to_owned(), $value);
+        };
+    }
+
+    counter!("direct_insert", profile.prepared_direct_insert_executions);
+    counter!("fast", profile.parser.fast_path_executions);
+    counter!("slow", profile.parser.slow_path_executions);
+    counter!("begin_ns", profile.begin_setup_time_ns);
+    counter!("execute_body_ns", profile.execute_body_time_ns);
+    counter!("direct_flush_calls", profile.direct_write_flush_calls);
+    counter!("direct_flush_ns", profile.direct_write_flush_time_ns);
+    counter!(
+        "page_run_flushes",
+        profile.prepared_direct_insert_page_run_flushes
+    );
+    counter!(
+        "page_run_records",
+        profile.prepared_direct_insert_page_run_records
+    );
+    counter!(
+        "page_run_bytes",
+        profile.prepared_direct_insert_page_run_bytes
+    );
+    counter!(
+        "page_run_owned",
+        profile.prepared_direct_insert_page_run_owned_flushes
+    );
+    counter!(
+        "page_run_arena",
+        profile.prepared_direct_insert_page_run_arena_flushes
+    );
+    counter!(
+        "page_run_repeated",
+        profile.prepared_direct_insert_page_run_repeated_flushes
+    );
+    counter!(
+        "page_run_depth2",
+        profile.prepared_direct_insert_page_run_depth2_bulk_append_hits
+    );
+    counter!(
+        "row_build_ns",
+        profile.prepared_direct_insert_row_build_time_ns
+    );
+    counter!(
+        "cursor_setup_ns",
+        profile.prepared_direct_insert_cursor_setup_time_ns
+    );
+    counter!(
+        "serialize_ns",
+        profile.prepared_direct_insert_serialize_time_ns
+    );
+    counter!(
+        "btree_insert_ns",
+        profile.prepared_direct_insert_btree_insert_time_ns
+    );
+    counter!(
+        "schema_validation_ns",
+        profile.prepared_direct_insert_schema_validation_time_ns
+    );
+    counter!(
+        "change_tracking_ns",
+        profile.prepared_direct_insert_change_tracking_time_ns
+    );
+    counter!("commit_pre_ns", profile.commit_pre_txn_time_ns);
+    counter!("commit_roundtrip_ns", profile.commit_txn_roundtrip_time_ns);
+    counter!("pager_commit_calls", profile.pager_commit.commit_calls);
+    counter!("pager_phase_a_ns", profile.pager_commit.phase_a_time_ns);
+    counter!("pager_wal_ns", profile.pager_commit.wal_commit_time_ns);
+    counter!(
+        "pager_mem_flush_ns",
+        profile.pager_commit.memory_flush_time_ns
+    );
+    counter!(
+        "pager_journal_ns",
+        profile.pager_commit.journal_commit_time_ns
+    );
+    counter!(
+        "pager_c_metadata_ns",
+        profile.pager_commit.phase_c_metadata_time_ns
+    );
+    counter!("pager_file_size_ns", profile.pager_commit.file_size_time_ns);
+    counter!("pager_unlock_ns", profile.pager_commit.unlock_time_ns);
+    counter!("pager_publish_ns", profile.pager_commit.publish_time_ns);
+    counter!(
+        "pager_cache_finish_ns",
+        profile.pager_commit.cache_finish_time_ns
+    );
+    counter!("commit_finalize_ns", profile.commit_finalize_seq_time_ns);
+    counter!("commit_handle_ns", profile.commit_handle_finalize_time_ns);
+    counter!(
+        "post_write_ns",
+        profile.commit_post_write_maintenance_time_ns
+    );
+    counter!("finalize_post_ns", profile.finalize_post_publish_time_ns);
+    counter!("parser_multi_calls", profile.parser.parse_multi_calls);
+    counter!("parser_cache_hits", profile.parser.parse_cache_hits);
+    counter!("parser_cache_misses", profile.parser.parse_cache_misses);
+    counter!("parser_parse_ns", profile.parser.parse_time_ns);
+    counter!("parser_rewrite_ns", profile.parser.rewrite_time_ns);
+    counter!("bg_checks", profile.background_status_checks);
+    counter!("bg_ns", profile.background_status_time_ns);
+    counter!("op_cx_bg_gates", profile.op_cx_background_gates);
+    counter!(
+        "dispatch_bg_gates",
+        profile.statement_dispatch_background_gates
+    );
+    counter!("pager_pub_refreshes", profile.pager_publication_refreshes);
+    counter!("commit_refreshes", profile.commit_refresh_count);
+    counter!("prepared_lookup_ns", profile.prepared_lookup_time_ns);
+    counter!("memdb_refresh", profile.memdb_refresh_count);
+    counter!("cached_write_reuses", profile.cached_write_txn_reuses);
+    counter!("cached_write_parks", profile.cached_write_txn_parks);
+    counter!("page_pool_hits", profile.page_buffer_pool_hits);
+    counter!("page_pool_misses", profile.page_buffer_pool_misses);
+    counter!("vdbe_opcodes", profile.vdbe.opcodes_executed_total);
+    counter!("vdbe_statements", profile.vdbe.statements_total);
+    counter!(
+        "vdbe_statement_us",
+        profile.vdbe.statement_duration_us_total
+    );
+    counter!("vdbe_make_record", profile.vdbe.make_record_calls_total);
+    counter!("mvcc_tier0", mvcc.tier0_already_owned_writes_total);
+    counter!("mvcc_tier1", mvcc.tier1_first_touch_writes_total);
+    counter!("mvcc_tier2", mvcc.tier2_commit_surface_writes_total);
+    counter!("mvcc_page_lock_waits", mvcc.page_lock_waits_total);
+    counter!("mvcc_page_lock_wait_ns", mvcc.page_lock_wait_time_ns_total);
+    counter!("mvcc_busy_retries", mvcc.write_busy_retries_total);
+    counter!("mvcc_busy_timeouts", mvcc.write_busy_timeouts_total);
+    counter!("mvcc_stale_snapshot", mvcc.stale_snapshot_rejects_total);
+    counter!("mvcc_page_one_tracks", mvcc.page_one_conflict_tracks_total);
+    counter!(
+        "mvcc_page_one_track_ns",
+        mvcc.page_one_conflict_track_time_ns_total
+    );
+    counter!(
+        "mvcc_pending_clears",
+        mvcc.pending_commit_surface_clears_total
+    );
+    counter!(
+        "mvcc_pending_clear_ns",
+        mvcc.pending_commit_surface_clear_time_ns_total
+    );
+    counter!(
+        "page_data_borrowed_norm",
+        page_data.borrowed_write_normalization_calls_total
+    );
+    counter!(
+        "page_data_borrowed_exact_copies",
+        page_data.borrowed_exact_size_copies_total
+    );
+    counter!(
+        "page_data_owned_norm",
+        page_data.owned_write_normalization_calls_total
+    );
+    counter!(
+        "page_data_owned_passthrough",
+        page_data.owned_passthrough_total
+    );
+    counter!(
+        "page_data_owned_zero_extends",
+        page_data.owned_in_place_zero_extends_total
+    );
+    counter!(
+        "page_data_owned_resized_copies",
+        page_data.owned_resized_copies_total
+    );
+    counter!(
+        "page_data_payload_bytes",
+        page_data.normalized_payload_bytes_total
+    );
+    counter!(
+        "page_data_zero_fill_bytes",
+        page_data.normalized_zero_fill_bytes_total
+    );
+    counter!("wal_frames", wal_frames);
+    counter!("wal_bytes", wal_bytes);
+    counter!("wal_group_commits", wal_group_commits);
+    counter!("wal_group_commit_latency_us", wal_group_commit_latency_us);
+
+    JsonFsqliteConcurrentProfile {
+        total_rows,
+        fsqlite_median_ms: duration_ms(fs_median),
+        capture_scope: "fsqlite arm aggregate across warmups and measured iterations".to_owned(),
+        counters,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3288,47 +3529,61 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                 h.wait();
             }
         });
-        if let Some((previous_hot_path_profile_enabled, wal_before)) = profile_scope {
-            let profile = hot_path_profile_snapshot();
-            let wal_after = fsqlite_wal::wal_telemetry_snapshot();
-            set_hot_path_profile_enabled(previous_hot_path_profile_enabled);
-            let wal_frames = metric_delta(
-                wal_after.wal.frames_written_total,
-                wal_before.wal.frames_written_total,
-            );
-            let wal_bytes = metric_delta(
-                wal_after.wal.bytes_written_total,
-                wal_before.wal.bytes_written_total,
-            );
-            let wal_group_commits = metric_delta(
-                wal_after.group_commit.group_commits_total,
-                wal_before.group_commit.group_commits_total,
-            );
-            let wal_group_commit_latency_us = metric_delta(
-                wal_after.group_commit.commit_latency_us_total,
-                wal_before.group_commit.commit_latency_us_total,
-            );
-            print_fsqlite_concurrent_profile(
-                n_threads,
-                total_rows,
-                fs.median(),
-                &profile,
-                wal_frames,
-                wal_bytes,
-                wal_group_commits,
-                wal_group_commit_latency_us,
-            );
-        }
+        let fsqlite_concurrent_profile =
+            if let Some((previous_hot_path_profile_enabled, wal_before)) = profile_scope {
+                let profile = hot_path_profile_snapshot();
+                let wal_after = fsqlite_wal::wal_telemetry_snapshot();
+                set_hot_path_profile_enabled(previous_hot_path_profile_enabled);
+                let wal_frames = metric_delta(
+                    wal_after.wal.frames_written_total,
+                    wal_before.wal.frames_written_total,
+                );
+                let wal_bytes = metric_delta(
+                    wal_after.wal.bytes_written_total,
+                    wal_before.wal.bytes_written_total,
+                );
+                let wal_group_commits = metric_delta(
+                    wal_after.group_commit.group_commits_total,
+                    wal_before.group_commit.group_commits_total,
+                );
+                let wal_group_commit_latency_us = metric_delta(
+                    wal_after.group_commit.commit_latency_us_total,
+                    wal_before.group_commit.commit_latency_us_total,
+                );
+                let json_profile = build_fsqlite_concurrent_profile(
+                    total_rows,
+                    fs.median(),
+                    &profile,
+                    wal_frames,
+                    wal_bytes,
+                    wal_group_commits,
+                    wal_group_commit_latency_us,
+                );
+                print_fsqlite_concurrent_profile(
+                    n_threads,
+                    total_rows,
+                    fs.median(),
+                    &profile,
+                    wal_frames,
+                    wal_bytes,
+                    wal_group_commits,
+                    wal_group_commit_latency_us,
+                );
+                Some(json_profile)
+            } else {
+                None
+            };
 
         eprintln!(
             "C={} F={}",
             format_duration(cs.median()),
             format_duration(fs.median())
         );
-        section.add_row(
+        section.add_row_with_fsqlite_concurrent_profile(
             &format!("{n_threads} writers x {CONCURRENT_ROWS_PER_THREAD} rows"),
             Some(cs),
             Some(fs),
+            fsqlite_concurrent_profile,
         );
     }
 
@@ -3390,6 +3645,20 @@ mod tests {
                 .map(|ms| Duration::from_millis(*ms))
                 .collect(),
             row_count,
+        }
+    }
+
+    fn sample_fsqlite_concurrent_profile() -> JsonFsqliteConcurrentProfile {
+        let mut counters = BTreeMap::new();
+        counters.insert("mvcc_busy_retries".to_owned(), 7);
+        counters.insert("mvcc_page_lock_waits".to_owned(), 3);
+        counters.insert("mvcc_stale_snapshot".to_owned(), 2);
+        counters.insert("wal_frames".to_owned(), 11);
+        JsonFsqliteConcurrentProfile {
+            total_rows: 2_000,
+            fsqlite_median_ms: 12.5,
+            capture_scope: "test aggregate".to_owned(),
+            counters,
         }
     }
 
@@ -3751,6 +4020,72 @@ mod tests {
                 .expect("average ratio should exist for comparable row")
                 > 1.0
         );
+        assert!(
+            json.sections[0].rows[0]
+                .fsqlite_concurrent_profile
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn build_json_report_preserves_concurrent_profile_counters() {
+        let mut report = BenchReport::new();
+        let section = report.add_section(CONCURRENT_WRITERS_SECTION_TITLE, "test");
+        section.add_row_with_fsqlite_concurrent_profile(
+            "2 writers x 1000 rows",
+            Some(sample_measurement("csqlite", 2_000, &[10, 10, 10])),
+            Some(sample_measurement("frankensqlite", 2_000, &[12, 13, 14])),
+            Some(sample_fsqlite_concurrent_profile()),
+        );
+
+        let json = build_json_report(
+            &report,
+            Duration::from_secs(1),
+            JsonRunConfig {
+                quick: true,
+                filter: Some("concurrent".to_owned()),
+                warmup_iterations: WARMUP_ITERS,
+                min_iterations: MIN_ITERS,
+                max_iterations: MAX_ITERS,
+                target_duration_secs: TARGET_DURATION.as_secs(),
+                row_counts: vec![100],
+                html_output_path: None,
+                json_output_path: Some("report.json".to_owned()),
+                json_stdout: false,
+            },
+            DetectedEnvironment {
+                os: None,
+                arch: "x86_64".to_owned(),
+                kernel_release: None,
+                cpu_model: None,
+                cpu_cores: Some(8),
+                ram_gb: None,
+                active_toolchain: None,
+                rust_version: None,
+                cargo_version: None,
+                git_commit_sha: None,
+                git_branch: Some("main".to_owned()),
+                git_head_unix_ts: None,
+                git_dirty: Some(false),
+                benchmark_binary_modified_unix_ts: None,
+                benchmark_binary_older_than_git_head: None,
+                build_profile: "release-perf".to_owned(),
+            },
+        );
+
+        let profile = json.sections[0].rows[0]
+            .fsqlite_concurrent_profile
+            .as_ref()
+            .expect("concurrent profile should be attached to the row");
+        assert_eq!(profile.total_rows, 2_000);
+        assert_eq!(profile.counters["mvcc_busy_retries"], 7);
+        assert_eq!(profile.counters["mvcc_page_lock_waits"], 3);
+
+        let serialized = serde_json::to_value(&json).expect("report should serialize");
+        assert_eq!(
+            serialized["sections"][0]["rows"][0]["fsqlite_concurrent_profile"]["counters"]["mvcc_stale_snapshot"],
+            2
+        );
     }
 
     #[test]
@@ -3895,6 +4230,16 @@ mod tests {
             schema["properties"]["sections"]["items"]["properties"]["rows"]["items"]["properties"]
                 ["category"]["$ref"],
             "#/$defs/scenario_category"
+        );
+        assert_eq!(
+            schema["properties"]["sections"]["items"]["properties"]["rows"]["items"]["properties"]
+                ["fsqlite_concurrent_profile"]["$ref"],
+            "#/$defs/fsqlite_concurrent_profile"
+        );
+        assert_eq!(
+            schema["$defs"]["fsqlite_concurrent_profile"]["properties"]["counters"]["additionalProperties"]
+                ["type"],
+            "integer"
         );
         assert_eq!(schema["$defs"]["scenario_category"]["enum"][5], "mixed");
         assert_eq!(

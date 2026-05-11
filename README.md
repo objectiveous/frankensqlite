@@ -1213,7 +1213,7 @@ same table, non-overlapping rowid ranges):
 
 | Workload | C ms | F ms | F/C |
 |----------|-----:|-----:|----:|
-| 5 000 ops on a 5 000-row table, 80 % reads / 20 % writes | `221.62` | `40.68` | `0.184x` (≈ 5.45× faster) |
+| 5 000 ops on a 5 000-row table, 80 % reads / 20 % writes | `225.61` | `40.98` | `0.182x` (≈ 5.51× faster) |
 
 #### Where the remaining gap lives
 

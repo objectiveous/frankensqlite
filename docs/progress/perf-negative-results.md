@@ -12,6 +12,44 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - ce2309a2 post-fix frontier refresh
+
+- Target: current `comprehensive-bench --quick` and focused
+  `UPDATE/DELETEThroughput` frontier after
+  `ce2309a2d7c3bbfcfd82340276933d53725051df`
+  (`fix(mvcc): align physical merge rowid digests`).
+- Files/subsystems inspected: no source patch. Re-read the README performance
+  contract, current `bd-db300.11.1` JSONL card, recent commits, stale CASS
+  results, the B-epsilon/message-buffer and latch-free MVCC graveyard entries,
+  and the current MVCC cell-delta scaffolding in `crates/fsqlite-mvcc/src`.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-ce2309a2-current-fullquick-20260512T2240Z/`
+  and
+  `tests/artifacts/perf/codex-ce2309a2-current-dml-profile-20260512T2245Z/`.
+  The full quick run reported `93` scenarios with FrankenSQLite faster /
+  comparable / C-SQLite-faster at `79 / 2 / 12`, average F/C
+  `0.4940249739`, geomean F/C `0.2743918095`, p99 `2.9695560254`,
+  and primary `per_category_weighted.score=0.3684659618`. This improves the
+  previous README source artifact's primary score, geomean, average, and p99.
+- Result: no source patch attempted. The focused DML profile still confirms all
+  DELETE rows use the prepared direct path (`slow=0`). The 500-delete row still
+  spends visible time across the known retained same-leaf path:
+  `delete_leaf_active=433/496`, `delete_leaf_miss=63`,
+  `delete_leaf_flush=64/64`, `delete_leaf_flush_ns=52538`,
+  `delete_leaf_materialize=64/39847`, and `delete_leaf_write=64/7245`.
+  CASS was stale/noisy and did not invalidate the local ledger. The open JSONL
+  card and graveyard mapping still point at the broader B-epsilon-style
+  transaction-local DML mutation/read-view operator, not at a new one-lever
+  micro-patch.
+- Do not restart from another standalone retained DELETE, direct writer,
+  borrowed publication, active UPDATE, fixed INSERT, low-thread concurrent
+  retry, commit-side cell-log hook, or MemDB-assisted tombstone buffer from
+  this evidence. Reconsider only with a transaction-local rowid/key-space DML
+  mutation operator that supplies point-read and scan overlays, rollback and
+  savepoint ownership, duplicate/missing rowid semantics, schema/cache/QF
+  invalidation, and MVCC publication together before passing focused DML and
+  full-quick keep gates in the same measurement window.
+
 ## 2026-05-12 - Retained DELETE dense-rowid exact-slot search
 
 - Target: `UPDATE/DELETEThroughput` DELETE rows after the current focused DML

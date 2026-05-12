@@ -11235,3 +11235,30 @@ set: sessions found by
 - Do not retry this cell-index search hint as a standalone optimization.
   Reconsider only if paired with a broader same-leaf delete-run representation
   that improves all focused DELETE medians in the same A/B window.
+
+## 2026-05-12 - Prepared direct DELETE monotone floor variant
+
+- Target: `TableLeafDeleteRun::search_table_leaf` in
+  `crates/fsqlite-btree/src/cursor.rs`, after the kept compact-range
+  materializer still left the 10k-row DELETE workload slower than C SQLite.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`. The candidate added retained
+  `last_deleted_cell_idx` / `last_deleted_rowid` fields and used them as a
+  monotone search floor for increasing same-leaf DELETE streams. The source
+  patch was abandoned uncommitted after the focused profile failed the keep
+  gate.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-delete-monotone-floor-reject-20260512T0635Z/`
+  records the commands and measured baseline/candidate counters.
+- Result: rejected. The narrow 10k-row DELETE compare moved only slightly
+  (`1.35x` to `1.32x` versus C SQLite), while the profiled quick row regressed
+  in absolute FSQLite median from about `336.9 us` after `fb9e79e1` to
+  `381.9 us`. The intended 10k-row `delete_leaf_active_ns` counter improved
+  from about `49485 ns` to `42170 ns`, but `delete_leaf_materialize` worsened
+  from about `40346 ns` to `51479 ns` and `delete_leaf_flush_ns` worsened from
+  about `53519 ns` to `64992 ns`.
+- Do not retry a standalone monotone retained-leaf search floor. Reconsider
+  only as part of a broader same-leaf delete-run representation that lowers
+  active search without increasing flush/materialization cost and improves the
+  absolute FSQLite median for the 10k-row DELETE workload in the same A/B
+  window.

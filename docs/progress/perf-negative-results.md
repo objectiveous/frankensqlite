@@ -12,6 +12,33 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Current INSERT profile boundary refresh
+
+- Target: remaining `INSERTThroughput` red rows from the current fullquick
+  matrix, especially 100-row fixed-cost INSERT rows, `small_3col` transaction
+  strategy rows, and the prior `large_10col` 10K concern.
+- Files/subsystems inspected: prepared direct INSERT row construction,
+  preserialized record building, reusable scratch buffers, and page-run
+  deferral in `crates/fsqlite-core/src/connection.rs`.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-head-insert-profile-20260512T0218/`.
+- Result: no source patch attempted. The focused current-HEAD INSERT profile
+  reported 25 scenarios with FSQLite faster / comparable / C-SQLite-faster at
+  `14 / 7 / 4`, average F/C `0.8367223988`, geomean F/C `0.7919573646`,
+  median F/C `0.8687901212`, p90/p99 `1.1095440495 / 1.3783689373`, and
+  focused weighted score `0.8665744989`. Rows with raw F/C ratio above `1.0`
+  were the 100-row fixed-cost rows, small transaction-strategy tails, 10K
+  `small_3col` autocommit/single-txn, and record-size `small_3col` 10K. The
+  prior `large_10col` 10K concern flipped green in this focused repeat
+  (`14.32 ms` C vs `14.14 ms` F for single-txn, `17.79 ms` C vs `17.29 ms` F
+  for record-size).
+- Do not retry standalone INSERT serializer tweaks, concat/param-one/template
+  row-build variants, row-scratch borrow deferral, page-run threshold/arena
+  changes, prebuilt empty-root page image builders, owned-record borrowed
+  flushes, or direct page-image building from this evidence. Reconsider only
+  with a broader fused row/body/page construction design that proves focused
+  INSERT wins and fullquick primary-score neutrality or better.
+
 ## 2026-05-12 - Direct DELETE cell-log hook boundary
 
 - Target: remaining `UPDATE/DELETEThroughput` DELETE red rows, specifically

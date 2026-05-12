@@ -404,22 +404,23 @@ tracing::info!(
 - **Hotspot:** Current `UPDATE/DELETEThroughput` DELETE tail remains the
   highest measured C SQLite-faster frontier. Evidence: the current full quick
   recertification
-  `tests/artifacts/perf/codex-fd3a1f48-frontier-recert-20260512T2135Z/summary.md`,
-  the prior focused current-HEAD DML refresh
-  `tests/artifacts/perf/codex-head-dml-refresh-20260512T0340Z/summary.md`,
-  the DELETE CPU profile
+  `tests/artifacts/perf/codex-ce2309a2-current-fullquick-20260512T2240Z/summary.md`,
+  the matching focused DML profile
+  `tests/artifacts/perf/codex-ce2309a2-current-dml-profile-20260512T2245Z/summary.md`,
+  the prior DELETE CPU profile
   `tests/artifacts/perf/codex-current-delete-cpu-profile-20260511T1745Z/summary.md`,
-  and the recertification summary
+  and the earlier recertification summary
   `tests/artifacts/perf/codex-dml-mutation-frontier-recert-20260511T1905Z/summary.md`.
   The latest rebuilt source commit is
-  `fd3a1f48dce044bd91f870724fdbd873b695d8bf`. The current full quick matrix
-  reports the prepared-DML DELETE tail at `3.0998x` slower for 5 rows,
-  `1.8221x` slower for 50 rows, and `1.6350x` slower for 500 rows. The focused
+  `ce2309a2d7c3bbfcfd82340276933d53725051df`. The current full quick matrix
+  reports the prepared-DML DELETE tail at `2.9696x` slower for 5 rows,
+  `1.8888x` slower for 50 rows, and `1.6347x` slower for 500 rows. The focused
   DML profile keeps every DELETE on the prepared direct path (`slow=0`) and
-  narrows the 10K/500 row to 433 retained same-leaf active hits across 496
-  attempts, 63 leaf-boundary misses, 64 dirty flushes, about `107.0 us` of
-  delete-run materialization, and about `13.4 us` of page writes. The fresh CPU
-  profile also shows the top remaining frames are still
+  measures the 10K/500 row with 433 retained same-leaf active hits across 496
+  attempts, 63 leaf-boundary misses, 64 dirty flushes, `52.5 us` of dirty-flush
+  work, `39.8 us` of delete-run materialization, `7.2 us` of page writes, and
+  `40.2 us` of retained-leaf search. The fresh CPU profile also shows the top
+  remaining frames are still
   `TransactionKind::get_page`, `TableLeafDeleteRun::delete_rowid_with_reason`,
   `TransactionKind::write_page_data`, and `TransactionKind::free_page`.
 - **Rejected smaller cards:** retained `TableLeafDeleteRun` materializer

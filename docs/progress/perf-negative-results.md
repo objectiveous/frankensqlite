@@ -12,6 +12,40 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Current concurrent writer boundary refresh
+
+- Target: remaining low-thread rows in
+  `comprehensive-bench --quick --filter concurrent` after the current
+  fullquick and INSERT/DML boundary refreshes, especially `2 writers x 1000
+  rows` and the noise-sensitive `4 writers x 1000 rows` row.
+- Files/subsystems inspected: concurrent write first-touch waits in
+  `crates/fsqlite-vdbe/src/engine.rs`, commit planning/finalization and
+  fast-path counters in `crates/fsqlite-mvcc/src/begin_concurrent.rs`, and
+  connection-side concurrent commit planning in
+  `crates/fsqlite-core/src/connection.rs`.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-head-concurrent-profile-20260512T0212/`.
+- Result: no source patch attempted. A clean focused repeat reported 2 writers
+  at C `13.250728 ms`, F `14.208683 ms`, ratio `1.072x`; 4 writers at C
+  `19.741346 ms`, F `20.892271 ms`, ratio `1.058x`; and 8 writers at C
+  `91.496393 ms`, F `48.676111 ms`, ratio `0.532x`. The profiled repeat kept
+  direct INSERT entirely on the fast path (`direct_insert == fast`, `slow=0`)
+  and file-backed page-runs inactive (`page_run_flushes=0`), while 2/4/8
+  writers paid `12 / 78 / 423` MVCC page-lock waits and `12 / 72 / 328`
+  stale-snapshot rejects. The `candidate_free_fast_paths=0` counter is not a
+  missed one-line fast path: the source read confirmed candidate-free planning
+  is intentionally gated by hydrated SSI read/write witnesses and active /
+  committed candidate sets, and adjacent witness-summary / exact-read-witness
+  dedupe probes are already measured regressions.
+- Do not retry low-thread concurrent wait-slice tuning, active-holder
+  preemption, retry-loop reshaping, standalone file-backed page-run admission,
+  preserialized-record widening, witness-summary reuse, exact read-witness
+  dedupe, or MVCC commit page-set container tweaks from this evidence.
+  Reconsider only with a broader representation change that batches file-backed
+  page construction and MVCC publication together while preserving
+  first-committer-wins and SSI, and require same-window focused concurrent
+  wins plus no 8-writer or fullquick primary-score regression.
+
 ## 2026-05-12 - Current INSERT profile boundary refresh
 
 - Target: remaining `INSERTThroughput` red rows from the current fullquick

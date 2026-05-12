@@ -12,6 +12,30 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Private memory prefetch skip
+
+- Target: `TransactionHandle::prefetch_page_hint` cost from the sparse isolated
+  DELETE profile and the remaining `UPDATE/DELETEThroughput` DELETE rows.
+- Touched during rejected candidate: `crates/fsqlite-pager/src/pager.rs`.
+  The candidate made `SimpleTransaction::prefetch_page_hint()` return early for
+  private `:memory:` transactions using `memory_db_bump_alloc`. The source
+  change was unwound.
+- Correctness smoke before benchmarking passed:
+  `cargo test -p fsqlite-pager prefetch -- --nocapture`.
+- Baseline evidence:
+  `tests/artifacts/perf/codex-memory-prefetch-skip-baseline-20260512T1100Z/`.
+  Candidate evidence:
+  `tests/artifacts/perf/codex-memory-prefetch-skip-candidate-20260512T1100Z/`.
+- Result: rejected. The focused update-filter geomean worsened from
+  `1.4012x` to `1.4881x` F/C, and average ratio worsened from `1.5790x` to
+  `1.8665x` F/C. The small DELETE row regressed from `6.9us` FSQLite
+  (`3.01x` F/C) to `10.9us` FSQLite (`4.81x` F/C). Larger DELETE rows moved
+  only within tiny/noisy margins (`29.8us` to `29.4us`, `263.5us` to
+  `260.1us`), so the candidate did not pay for the small-row regression.
+- Do not retry private-memory prefetch skipping as a standalone DML
+  optimization. Reconsider only as part of a broader read-path/prefetch policy
+  redesign that wins the same focused matrix and preserves full-quick score.
+
 ## 2026-05-12 - Transaction-local DML mutation boundary
 
 - Target: remaining `UPDATE/DELETEThroughput` red rows after the current

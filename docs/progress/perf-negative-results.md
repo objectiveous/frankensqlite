@@ -12,6 +12,42 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Current fullquick frontier after rowid fix
+
+- Target: current `comprehensive-bench --quick` frontier after the exact rowid
+  coercion fix and the focused DML refresh, to decide whether another narrow
+  source patch is justified.
+- Files/subsystems inspected: no source patch. Re-read the current fullquick
+  output, the current DML/INSERT/concurrent focused artifacts, the active
+  negative-result boundaries for the remaining red rows, and the existing
+  cell-delta source surface in `crates/fsqlite-mvcc/src/cell_visibility.rs`,
+  `crates/fsqlite-mvcc/src/lifecycle.rs`,
+  `crates/fsqlite-mvcc/src/materialize.rs`, and
+  `crates/fsqlite-mvcc/src/cell_routing.rs`.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-head-fullquick-20260512T0345Z/`.
+- Result: no source patch attempted. The run reported 93 scenarios with
+  FrankenSQLite faster / comparable / C-SQLite-faster at `79 / 3 / 11`,
+  geomean F/C `0.2645495519`, primary
+  `per_category_weighted.score=0.3608218364`, and category geomeans
+  `write_single=1.1604018572`, `write_bulk=0.8011727614`,
+  `concurrent_writers=0.8181208600`. Rows above `1.05x` F/C were still the
+  DML DELETE rows (`2.987x`, `1.825x`, `1.522x`), the 100-row UPDATE row
+  (`1.364x`), fixed-cost 100-row INSERT tails (`1.125x`, `1.111x`, `1.084x`,
+  `1.074x`, `1.056x`, `1.052x`), and the 2-writer concurrent row (`1.095x`).
+  The benchmark warned that the binary predates HEAD because the intervening
+  HEAD was the artifact-only `fc14dbb5`; no Rust source changed after the
+  rebuilt `0c016144` binary.
+- Do not retry another narrow patch against the small INSERT tails, low-thread
+  concurrent retry shape, or standalone DELETE retained-run/cell-log hook from
+  this evidence. Reconsider only the broader transaction-local DML mutation
+  operator, or a similarly broad representation change with focused wins and
+  fullquick primary-score neutrality or better. The current cell-delta
+  scaffolding can record, commit, abort, and explicitly materialize deltas, but
+  it does not yet provide a general uncommitted transaction read view,
+  savepoint-owned delta rollback, or live B-tree read/write integration, so a
+  commit-side-only or record-delete-only patch would be incomplete.
+
 ## 2026-05-12 - Current HEAD DML boundary refresh after rowid fix
 
 - Target: current `UPDATE/DELETEThroughput` focused rows after

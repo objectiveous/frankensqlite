@@ -12,6 +12,39 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Current fullquick frontier after shared-table retry fix
+
+- Target: current `comprehensive-bench --quick` frontier after
+  `70994b63` fixed the 16-thread shared-table retry storm and prevented stale
+  historical pass-over-pass comparisons.
+- Files/subsystems inspected: no source patch. Re-read the rebuilt fullquick
+  output, compared it with
+  `tests/artifacts/perf/codex-current-frontier-fullquick-20260512T0810Z/full.json`,
+  and checked the existing DML, INSERT, and low-thread concurrent negative
+  boundaries.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-current-frontier-after-mtfix-20260512T1200Z/`.
+  Use `full-current.json`, `stdout-current.txt`, `stderr-current.txt`, and
+  `summary-current.md`; ignore the stale direct-binary probe files in that
+  directory because their JSON records `benchmark_binary_older_than_git_head`.
+- Result: no source patch attempted. The rebuilt current matrix at
+  `70994b63` was valid (`git_dirty=false`,
+  `benchmark_binary_older_than_git_head=false`) and reported 93 scenarios with
+  FrankenSQLite faster / comparable / C-SQLite-faster at `79 / 4 / 10`,
+  geomean F/C `0.2757405134`, and primary weighted score
+  `0.3741665362`. The remaining rows above `1.03x` F/C are still the fenced
+  DML DELETE/UPDATE transaction-envelope family, fixed-cost 100-row INSERT
+  tails, and the low-thread 2-writer concurrent row. The 4-writer concurrent
+  row moved below the threshold (`0.9743x`), and the 2-writer row improved from
+  `1.0880x` to `1.0679x`, so the retry fix solved the catastrophic shared-table
+  failure without opening a new narrow source lever.
+- Do not restart with another standalone retained DELETE leaf-run tweak, small
+  INSERT serializer/page-run tweak, or concurrent retry/backoff/admission tweak
+  from this artifact. Reconsider source work only as a broader
+  transaction-local DML mutation/read-view operator, or an equally broad
+  representation change that proves focused wins and fullquick primary-score
+  neutrality or better in the same benchmark window.
+
 ## 2026-05-12 - Private memory prefetch skip
 
 - Target: `TransactionHandle::prefetch_page_hint` cost from the sparse isolated

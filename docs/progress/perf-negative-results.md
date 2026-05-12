@@ -12,6 +12,32 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Preserialized INSERT row-scratch borrow deferral
+
+- Target: remaining fixed overhead in the 100-row `INSERTThroughput` tails,
+  especially prepared direct preserialized/prebuilt INSERT lanes where record
+  bytes can be produced without materializing the full row value scratch.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. Agent Mail reservation was
+  unavailable because the local MCP HTTP transport at `127.0.0.1:8765/mcp/`
+  failed, so the source patch was kept local and manually unwound immediately
+  after the correctness failure.
+- Candidate: delay borrowing `prepared_direct_insert_row_scratch` until the
+  fallback row-materialization branch, and pass a local empty scratch through
+  preserialized/prebuilt finish paths.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-insert-scratch-deferral-reject-20260512T0114/`.
+- Result: rejected before benchmarking. The focused correctness proof
+  `env CARGO_TARGET_DIR=/tmp/frankensqlite-codex-insert-scratch-target CARGO_BUILD_JOBS=2 cargo test -p fsqlite-core prepared_direct_simple_insert -- --nocapture --test-threads=1`
+  failed 1/28:
+  `connection::pager_routing_tests::test_prepared_direct_simple_insert_executes_inside_explicit_transaction`
+  panicked because prepared direct inserts inside `BEGIN` did not populate the
+  concurrent write set.
+- Do not retry row-scratch borrow deferral as a standalone INSERT optimization.
+  Reconsider only if the direct-insert page-run/write-set coupling is
+  redesigned and proven by the explicit-transaction prepared direct insert
+  tests before any benchmark run.
+
 ## 2026-05-12 - Compact DELETE live-span materializer
 
 - Target: retained compact same-leaf DELETE materialization in

@@ -12,6 +12,33 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Current DELETE standard/isolated/sparse rescreen
+
+- Target: remaining `UPDATE/DELETEThroughput` DELETE rows after the current
+  DML profile, especially whether the gap is just transaction-envelope
+  overhead or persists inside one large transaction.
+- Files/subsystems inspected: no DELETE source patch. Re-read
+  `crates/fsqlite-e2e/src/bin/perf_update_delete.rs`,
+  `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`,
+  `crates/fsqlite-core/src/connection.rs`,
+  `crates/fsqlite-btree/src/cursor.rs`, and C SQLite's `OP_SeekRowid`,
+  `OP_Delete`, and `sqlite3BtreeDelete` path from `libsqlite3-sys`.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-dml-delete-mode-rescreen-dd8dd2bd-20260512T1500Z/`.
+  The valid runs used a current-source explicit-target build at
+  `dd8dd2bd`; `rch` could not normalize the `/data/tmp` worktree and fell
+  back to a local build.
+- Result: no DELETE source patch attempted. `perf-update-delete 10000 200
+  delete compare` reported F/C delete ratios of `1.43x` in `standard`,
+  `1.31x` in `isolated`, and `2.43x` in `sparse-isolated`. Keeping all
+  deletes in one transaction does not remove the gap, and preserving the
+  every-20th-row sparse shape makes the gap larger.
+- Do not retry a standalone transaction-envelope trim, retained same-leaf
+  delete-run tweak, or sparse-delete cursor wrapper from this rescreen.
+  Reconsider only as the broader transaction-local DML mutation/read-view
+  operator, or with a new profile that materially changes the attribution and
+  proves focused/fullquick benchmark wins.
+
 ## 2026-05-12 - Current concurrent profile after shared-table retry fix
 
 - Target: current low-thread `Concurrent Writers - C SQLite WAL vs

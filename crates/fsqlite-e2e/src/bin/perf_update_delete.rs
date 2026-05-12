@@ -25,6 +25,21 @@ use std::time::Instant;
 
 const DEFAULT_ROWS: usize = 10_000;
 const DEFAULT_ITERS: usize = 10;
+const USAGE: &str = "\
+Usage:
+  perf-update-delete                         # default: 10_000 rows, 10 iters, update+delete, fsqlite only
+  perf-update-delete 100000 3 update
+  perf-update-delete 1000   5 delete compare
+  perf-update-delete 10000 250 delete fsqlite isolated
+  perf-update-delete 10000 250 delete fsqlite rollback-isolated
+  perf-update-delete 10000 250 delete fsqlite sparse-isolated
+
+Arguments:
+  [rows]   Number of rows to pre-populate (default 10_000)
+  [iters]  Number of outer iterations for profiling (default 10)
+  [which]  \"update\" | \"delete\" | \"both\" (default \"both\")
+  [engine] \"fsqlite\" | \"sqlite\" | \"compare\" (default \"fsqlite\")
+  [mode]   \"standard\" | \"isolated\" | \"rollback-isolated\" | \"sparse-isolated\" (default \"standard\")";
 const BENCH_CREATE_SQL: &str =
     "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT NOT NULL, value REAL NOT NULL)";
 const BENCH_INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, ('user_' || ?1), (?1 * 0.137))";
@@ -188,8 +203,18 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), RunError> {
-    let args = parse_args(std::env::args().skip(1))?;
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if is_help_request(&raw_args) {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    let args = parse_args(raw_args)?;
     run_benchmark(&args)
+}
+
+fn is_help_request(args: &[String]) -> bool {
+    args.first()
+        .is_some_and(|arg| arg == "-h" || arg == "--help")
 }
 
 fn parse_args<I>(args: I) -> Result<BenchArgs, RunError>
@@ -939,6 +964,13 @@ mod tests {
                 profile_mode: ProfileMode::Standard,
             }
         );
+    }
+
+    #[test]
+    fn help_request_is_detected_before_positional_parsing() {
+        assert!(super::is_help_request(&["--help".to_string()]));
+        assert!(super::is_help_request(&["-h".to_string()]));
+        assert!(!super::is_help_request(&["100".to_string()]));
     }
 
     #[test]

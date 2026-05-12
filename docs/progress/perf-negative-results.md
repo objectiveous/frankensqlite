@@ -12,6 +12,40 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - fd3a1f48 frontier recertification
+
+- Target: current `comprehensive-bench --quick` frontier after
+  `fd3a1f48dce044bd91f870724fdbd873b695d8bf`
+  (`fix(mvcc): bound index materialization keys`) and the latest DML/INSERT
+  profile refresh.
+- Files/subsystems inspected: no source patch. Re-read the direct
+  UPDATE/DELETE leaf-run path in `crates/fsqlite-core/src/connection.rs`, the
+  retained leaf-run materializer in `crates/fsqlite-btree/src/cursor.rs`, the
+  active MVCC cell-delta scaffolding in `crates/fsqlite-mvcc/src`, and the
+  current fullquick/DML/INSERT artifacts.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-fd3a1f48-frontier-recert-20260512T2135Z/`.
+- Result: no source patch attempted. The full quick run reported `93`
+  scenarios with FrankenSQLite faster / comparable / C-SQLite-faster at
+  `81 / 3 / 9`, average F/C `0.4886618611`, geomean F/C `0.2714660338`, and
+  primary `per_category_weighted.score=0.3676859704`. Remaining red rows are
+  still the already-fenced families: small 100-row INSERT tails, 2/4-writer
+  low-thread concurrent rows, the 100-row UPDATE fixed-cost row, and the
+  DML DELETE rows (`3.0998x`, `1.8221x`, `1.6350x`). The focused DML profile
+  confirms every DELETE is already on the prepared direct path (`slow=0`), with
+  the 500-delete row spending time across retained leaf active checks
+  (`433/496` hits), `64` dirty flushes, `107007ns` materialization, and
+  `13433ns` page writes.
+- Do not restart from another standalone retained DELETE, direct writer,
+  borrowed publication, active UPDATE, fixed INSERT, low-thread concurrent
+  retry, or commit-side cell-log hook. The next source attempt should be the
+  broader transaction-local DML mutation operator: logical rowid DML messages,
+  a core B-tree read overlay for point reads and scans, rollback/savepoint
+  ownership, and MVCC publication together. A narrower hook is incomplete even
+  though `fsqlite-mvcc` now has cell-delta materialization/read-view primitives,
+  because the current core execution path still observes physical pager/B-tree
+  page images.
+
 ## 2026-05-12 - Direct UPDATE active patch-run early continuation
 
 - Target: `UPDATE/DELETEThroughput`, especially the remaining red

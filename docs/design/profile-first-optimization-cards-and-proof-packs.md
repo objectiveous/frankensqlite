@@ -404,23 +404,25 @@ tracing::info!(
 - **Hotspot:** Current `UPDATE/DELETEThroughput` DELETE tail remains the
   highest measured C SQLite-faster frontier. Evidence: the current full quick
   artifact
-  `tests/artifacts/perf/codex-delete-run-borrow-flush-20260511T1609Z/full-quick-final-local.json`,
-  the DML profile
-  `tests/artifacts/perf/codex-next-dml-profile-20260511T1701Z/summary.md`,
+  `tests/artifacts/perf/codex-current-head-fullquick-20260512T0345Z/summary.md`,
+  the focused current-HEAD DML refresh
+  `tests/artifacts/perf/codex-head-dml-refresh-20260512T0340Z/summary.md`,
   the current DELETE CPU profile
   `tests/artifacts/perf/codex-current-delete-cpu-profile-20260511T1745Z/summary.md`,
-  and this recertification summary
+  and the recertification summary
   `tests/artifacts/perf/codex-dml-mutation-frontier-recert-20260511T1905Z/summary.md`.
-  The measured source commit is `94ebb38c33508d374c157c47f1af0df2f3bec3ff`. The latest
-  full quick matrix still reports the corrected prepared-DML DELETE tail at
-  `2.838x` slower for 5 rows, `1.829x` slower for 50 rows, and `1.595x`
-  slower for 500 rows. The focused current-source profile with profiling
-  enabled reports `3.19x`, `1.83x`, and `1.63x` for those rows while every
-  DELETE stays on the prepared direct path (`slow=0`). The latest profile
-  narrows the 10K/500 row to 433 retained same-leaf active hits across 496
-  attempts, 63 leaf-boundary misses, 64 dirty flushes, about `73.5 us` of
-  delete-run materialization, and about `7.5 us` of page writes. The fresh CPU
-  profile also shows the top remaining frames are still
+  The latest rebuilt source commit is
+  `0c0161449aeb91bc4c93de3568045295482b74b3`; the fullquick artifact was
+  published in docs commit `97e26cf9` with no later Rust source changes. The
+  current full quick matrix reports the corrected prepared-DML DELETE tail at
+  `2.987x` slower for 5 rows, `1.825x` slower for 50 rows, and `1.522x`
+  slower for 500 rows. The focused current-HEAD DML repeat reports `2.828x`,
+  `1.794x`, and `1.640x` for those rows while every DELETE stays on the
+  prepared direct path (`slow=0`). The latest profile narrows the 10K/500 row
+  to 433 retained same-leaf active hits across 496 attempts, 63 leaf-boundary
+  misses, 64 dirty flushes, about `69.3 us` of delete-run materialization, and
+  about `7.7 us` of page writes. The fresh CPU profile also shows the top
+  remaining frames are still
   `TransactionKind::get_page`, `TableLeafDeleteRun::delete_rowid_with_reason`,
   `TransactionKind::write_page_data`, and `TransactionKind::free_page`.
 - **Rejected smaller cards:** retained `TableLeafDeleteRun` materializer

@@ -12,6 +12,32 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Normal private-memory page-1 commit skip
+
+- Target: transaction/release-boundary overhead in the remaining
+  `UPDATE/DELETEThroughput` rows, especially small UPDATE/DELETE cases.
+- Touched during rejected candidate: `crates/fsqlite-pager/src/pager.rs`.
+  The candidate changed normal `SimpleTransaction::commit()` so private
+  in-memory databases skipped page-1 staging unless the freelist was dirty or
+  page 1 was explicitly dirty, mirroring the retained `commit_and_retain()`
+  condition. The source change was unwound.
+- Correctness smoke before benchmarking passed:
+  `cargo fmt -p fsqlite-pager --check` and
+  `cargo test -p fsqlite-pager memory -- --nocapture --test-threads=1`.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-memory-page1-skip-candidate-20260512T0930Z/`.
+  Same-window baseline:
+  `tests/artifacts/perf/codex-update-fixed-overhead-20260512T091030Z/baseline-update.json`.
+- Result: rejected. The update-filter geomean worsened from `1.2075x` to
+  `1.7033x` F/C. The 100-row UPDATE row worsened from `1.378x` to `1.911x`,
+  the 100-row DELETE row from `1.512x` to `3.927x`, the 1000-row DELETE row
+  from `1.862x` to `2.113x`, and the 10000-row DELETE row from `1.642x` to
+  `1.915x`.
+- Do not retry normal private-memory page-1 commit skipping as a standalone
+  DML transaction-envelope optimization. Reconsider only as part of a broader
+  release-boundary redesign that wins the focused matrix and preserves the
+  full-quick primary score.
+
 ## 2026-05-12 - Current small UPDATE transaction-envelope rescreen
 
 - Target: remaining `UPDATE/DELETEThroughput`

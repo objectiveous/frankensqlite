@@ -588,9 +588,7 @@ fn compute_cell_key_and_sort_key(
                     detail: "invalid varint in cell (rowid)".to_owned(),
                 }
             })?;
-        let rowid = i64::try_from(rowid).map_err(|_| FrankenError::DatabaseCorrupt {
-            detail: "cell rowid exceeds i64 range".to_owned(),
-        })?;
+        let rowid = rowid as i64;
 
         // Hash the rowid for key_digest
         let mut key_bytes = [0u8; 10];
@@ -702,9 +700,7 @@ fn compute_cell_key_and_sort_key_from_delta(
                 detail: "invalid varint in delta cell (rowid)".to_owned(),
             }
         })?;
-        let rowid = i64::try_from(rowid).map_err(|_| FrankenError::DatabaseCorrupt {
-            detail: "delta cell rowid exceeds i64 range".to_owned(),
-        })?;
+        let rowid = rowid as i64;
         Ok((key_digest, SortKey::Rowid(rowid)))
     } else if page_type == BtreePageType::LeafIndex {
         use fsqlite_btree::local_payload_size;
@@ -967,10 +963,7 @@ mod tests {
                     detail: "materialized payload out of bounds".to_owned(),
                 }
             })?;
-            let rowid = i64::try_from(rowid).map_err(|_| FrankenError::DatabaseCorrupt {
-                detail: "materialized rowid exceeds i64".to_owned(),
-            })?;
-            payloads.push((rowid, payload.to_vec()));
+            payloads.push((rowid as i64, payload.to_vec()));
         }
 
         Ok(payloads)
@@ -1166,6 +1159,38 @@ mod tests {
         assert_eq!(
             materialized_table_payloads(&result.page).unwrap(),
             vec![(4242, updated_payload)]
+        );
+    }
+
+    #[test]
+    fn test_materialize_preserves_negative_rowid_base_cell() {
+        let base = create_empty_leaf_table_page();
+        let page_no = PageNumber::new(2).unwrap();
+
+        let initial = materialize_page(
+            &base,
+            page_no,
+            &[create_delta_insert(-7, b"original", 5)],
+            &test_snapshot(5),
+            USABLE_SIZE,
+            MaterializationTrigger::Explicit,
+        )
+        .expect("initial negative-rowid materialization should succeed");
+
+        let result = materialize_page(
+            &initial.page,
+            page_no,
+            &[create_delta_update(-7, b"updated", 10)],
+            &test_snapshot(10),
+            USABLE_SIZE,
+            MaterializationTrigger::Explicit,
+        )
+        .expect("negative-rowid update materialization should succeed");
+
+        assert_eq!(result.deltas_applied, 1);
+        assert_eq!(
+            materialized_table_payloads(&result.page).unwrap(),
+            vec![(-7, b"updated".to_vec())]
         );
     }
 

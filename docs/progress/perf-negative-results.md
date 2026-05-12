@@ -12,6 +12,31 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Compact DELETE live-span materializer
+
+- Target: retained compact same-leaf DELETE materialization in
+  `UPDATE/DELETEThroughput`, especially the remaining 5/50/500-row DELETE
+  cases after the current multi-leaf retained run.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`. The candidate changed the compact
+  descending `TableLeafDeleteRun` one-pass materializer to copy contiguous live
+  byte spans between deleted cells instead of copying each surviving cell. A
+  first probe also lowered `COMPACT_DELETE_SINGLE_PASS_MIN` from `6` to `2`;
+  a second probe restored the existing threshold. The source patch was manually
+  unwound after measurement.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-delete-span-materializer-20260512T0045/`.
+- Result: rejected. The span materializer reduced the intended large-row
+  counter (`delete_leaf_materialize` for 500-row DELETE dropped to about
+  `40-42 us`), but focused medians did not clear the keep gate. The threshold-2
+  probe worsened the 100-row DELETE absolute median (`0.009498 ms`), while the
+  restored-threshold probe left 1000/10000-row DELETE flat to slightly worse
+  (`0.030497 ms` and `0.260628 ms`) versus the current frontier repeat.
+- Do not retry live-span compact DELETE materialization as a standalone
+  `TableLeafDeleteRun` optimization. Reconsider only as part of the broader
+  transaction-local DML mutation operator if it removes more of the page-local
+  publication path and wins all focused DELETE medians in a same-window A/B.
+
 ## 2026-05-12 - Direct UPDATE/DELETE microbatch carry
 
 - Target: `UPDATE/DELETEThroughput` direct-simple prepared UPDATE/DELETE rows,

@@ -18,13 +18,23 @@
 //!   [which]  "update" | "delete" | "both" (default "both")
 //!   [engine] "fsqlite" | "sqlite" | "compare" (default "fsqlite")
 //!   [mode]   "standard" | "isolated" | "rollback-isolated" | "sparse-isolated" (default "standard")
+//!
+//! Environment:
+//!   FSQLITE_BENCH_PROFILE_DML=1       Print fsqlite hot-path counters for each measured DML window.
 
 use std::fmt;
 use std::process::ExitCode;
+use std::sync::OnceLock;
 use std::time::Instant;
+
+use fsqlite_core::connection::{
+    HotPathProfileSnapshot, hot_path_profile_enabled, hot_path_profile_snapshot,
+    reset_hot_path_profile, set_hot_path_profile_enabled,
+};
 
 const DEFAULT_ROWS: usize = 10_000;
 const DEFAULT_ITERS: usize = 10;
+const PROFILE_DML_ENV: &str = "FSQLITE_BENCH_PROFILE_DML";
 const USAGE: &str = "\
 Usage:
   perf-update-delete                         # default: 10_000 rows, 10 iters, update+delete, fsqlite only
@@ -39,7 +49,10 @@ Arguments:
   [iters]  Number of outer iterations for profiling (default 10)
   [which]  \"update\" | \"delete\" | \"both\" (default \"both\")
   [engine] \"fsqlite\" | \"sqlite\" | \"compare\" (default \"fsqlite\")
-  [mode]   \"standard\" | \"isolated\" | \"rollback-isolated\" | \"sparse-isolated\" (default \"standard\")";
+  [mode]   \"standard\" | \"isolated\" | \"rollback-isolated\" | \"sparse-isolated\" (default \"standard\")
+
+Environment:
+  FSQLITE_BENCH_PROFILE_DML=1       Print fsqlite hot-path counters for each measured DML window.";
 const BENCH_CREATE_SQL: &str =
     "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT NOT NULL, value REAL NOT NULL)";
 const BENCH_INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, ('user_' || ?1), (?1 * 0.137))";
@@ -404,6 +417,198 @@ struct TimingTotals {
     delete: u128,
 }
 
+struct DmlProfileScope {
+    state: Option<DmlProfileState>,
+}
+
+struct DmlProfileState {
+    previous_enabled: bool,
+    label: DmlProfileLabel,
+    started_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DmlProfileOperation {
+    Update,
+    Delete,
+}
+
+impl fmt::Display for DmlProfileOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Update => f.write_str("update"),
+            Self::Delete => f.write_str("delete"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DmlProfileLabel {
+    mode: ProfileMode,
+    operation: DmlProfileOperation,
+    iter: Option<usize>,
+    rows: usize,
+    iters: Option<usize>,
+}
+
+impl DmlProfileLabel {
+    fn iter(mode: ProfileMode, operation: DmlProfileOperation, iter: usize, rows: usize) -> Self {
+        Self {
+            mode,
+            operation,
+            iter: Some(iter),
+            rows,
+            iters: None,
+        }
+    }
+
+    fn aggregate(
+        mode: ProfileMode,
+        operation: DmlProfileOperation,
+        rows: usize,
+        iters: usize,
+    ) -> Self {
+        Self {
+            mode,
+            operation,
+            iter: None,
+            rows,
+            iters: Some(iters),
+        }
+    }
+}
+
+impl fmt::Display for DmlProfileLabel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "fsqlite {} {}", self.mode, self.operation)?;
+        if let Some(iter) = self.iter {
+            write!(f, " iter={iter} rows={}", self.rows)
+        } else if let Some(iters) = self.iters {
+            write!(f, " rows={} iters={iters}", self.rows)
+        } else {
+            write!(f, " rows={}", self.rows)
+        }
+    }
+}
+
+impl DmlProfileScope {
+    fn start(label: DmlProfileLabel) -> Self {
+        if !dml_profile_enabled() {
+            return Self { state: None };
+        }
+
+        let previous_enabled = hot_path_profile_enabled();
+        set_hot_path_profile_enabled(true);
+        reset_hot_path_profile();
+
+        Self {
+            state: Some(DmlProfileState {
+                previous_enabled,
+                label,
+                started_at: Instant::now(),
+            }),
+        }
+    }
+
+    fn finish(mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+
+        let elapsed_us = state.started_at.elapsed().as_secs_f64() * 1_000_000.0;
+        let profile = hot_path_profile_snapshot();
+        set_hot_path_profile_enabled(state.previous_enabled);
+        print_dml_profile(state.label, elapsed_us, &profile);
+    }
+
+    fn restore(&mut self) {
+        if let Some(state) = self.state.take() {
+            set_hot_path_profile_enabled(state.previous_enabled);
+        }
+    }
+}
+
+impl Drop for DmlProfileScope {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn dml_profile_enabled() -> bool {
+    static PROFILE_DML_ENABLED: OnceLock<bool> = OnceLock::new();
+    *PROFILE_DML_ENABLED.get_or_init(|| env_flag(PROFILE_DML_ENV))
+}
+
+fn print_dml_profile(label: DmlProfileLabel, elapsed_us: f64, profile: &HotPathProfileSnapshot) {
+    eprintln!(
+        "    [{label}] dml_profile elapsed_us={elapsed_us:.1} direct_update={} direct_delete={} delete_qf_ns={} delete_seek_ns={} delete_physical_ns={} delete_leaf_start={}/{} delete_leaf_start_ns={} delete_leaf_active={}/{} delete_leaf_miss={} delete_leaf_miss_shape={} delete_leaf_miss_out_of_leaf={} delete_leaf_miss_duplicate={} delete_leaf_miss_empty_leaf={} delete_leaf_miss_last_cell={} delete_leaf_miss_noncompact={} delete_leaf_miss_cell_shape={} delete_leaf_active_ns={} delete_leaf_flush={}/{} delete_leaf_flush_ns={} delete_leaf_materialize={}/{} delete_leaf_write={}/{} fast={} slow={} ud_fast_lane={} ud_instrumented_lane={} begin_ns={} execute_body_ns={} commit_roundtrip_ns={} pager_commit_calls={} pager_phase_a_ns={} pager_wal_ns={} pager_mem_flush_ns={} pager_cache_finish_ns={} parser_cache_hits={} parser_cache_misses={} parser_parse_ns={} bg_checks={} bg_ns={} prepared_lookup_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} record_parse_into={} record_decode_ns={} btree_payload_copy_calls={} btree_payload_copy_bytes={} btree_cell_assembly_calls={} btree_cell_assembly_bytes={} vdbe_opcodes={} vdbe_statements={} vdbe_make_record={}",
+        profile.prepared_direct_update_executions,
+        profile.prepared_direct_delete_executions,
+        profile.prepared_direct_delete_qf_time_ns,
+        profile.prepared_direct_delete_seek_time_ns,
+        profile.prepared_direct_delete_physical_delete_time_ns,
+        profile.prepared_direct_delete_leaf_run_start_hits,
+        profile.prepared_direct_delete_leaf_run_start_attempts,
+        profile.prepared_direct_delete_leaf_run_start_time_ns,
+        profile.prepared_direct_delete_leaf_run_active_hits,
+        profile.prepared_direct_delete_leaf_run_active_attempts,
+        profile.prepared_direct_delete_leaf_run_active_misses,
+        profile.prepared_direct_delete_leaf_run_active_miss_shape_mismatches,
+        profile.prepared_direct_delete_leaf_run_active_miss_rowid_not_in_leaf,
+        profile.prepared_direct_delete_leaf_run_active_miss_already_deleted,
+        profile.prepared_direct_delete_leaf_run_active_miss_nonroot_would_empty_leaf,
+        profile.prepared_direct_delete_leaf_run_active_miss_nonroot_last_cell,
+        profile.prepared_direct_delete_leaf_run_active_miss_noncompact_cell_area,
+        profile.prepared_direct_delete_leaf_run_active_miss_cell_shape_or_overflow,
+        profile.prepared_direct_delete_leaf_run_active_time_ns,
+        profile.prepared_direct_delete_leaf_run_dirty_flushes,
+        profile.prepared_direct_delete_leaf_run_flushes,
+        profile.prepared_direct_delete_leaf_run_flush_time_ns,
+        profile.btree_leaf_reuse.delete_leaf_run_materialize_calls,
+        profile.btree_leaf_reuse.delete_leaf_run_materialize_time_ns,
+        profile.btree_leaf_reuse.delete_leaf_run_write_calls,
+        profile.btree_leaf_reuse.delete_leaf_run_write_time_ns,
+        profile.parser.fast_path_executions,
+        profile.parser.slow_path_executions,
+        profile.prepared_update_delete_fast_lane_hits,
+        profile.prepared_update_delete_instrumented_lane_hits,
+        profile.begin_setup_time_ns,
+        profile.execute_body_time_ns,
+        profile.commit_txn_roundtrip_time_ns,
+        profile.pager_commit.commit_calls,
+        profile.pager_commit.phase_a_time_ns,
+        profile.pager_commit.wal_commit_time_ns,
+        profile.pager_commit.memory_flush_time_ns,
+        profile.pager_commit.cache_finish_time_ns,
+        profile.parser.parse_cache_hits,
+        profile.parser.parse_cache_misses,
+        profile.parser.parse_time_ns,
+        profile.background_status_checks,
+        profile.background_status_time_ns,
+        profile.prepared_lookup_time_ns,
+        profile.memdb_refresh_count,
+        profile.cached_write_txn_reuses,
+        profile.cached_write_txn_parks,
+        profile.page_buffer_pool_hits,
+        profile.page_buffer_pool_misses,
+        profile.record_decode.parse_record_into_calls,
+        profile.record_decode.decode_time_ns,
+        profile.btree_copy_kernels.local_payload_copy_calls,
+        profile.btree_copy_kernels.local_payload_copy_bytes,
+        profile.btree_copy_kernels.table_leaf_cell_assembly_calls,
+        profile.btree_copy_kernels.table_leaf_cell_assembly_bytes,
+        profile.vdbe.opcodes_executed_total,
+        profile.vdbe.statements_total,
+        profile.vdbe.make_record_calls_total,
+    );
+}
+
 fn run_benchmark(args: &BenchArgs) -> Result<(), RunError> {
     let rows_i64 = i64::try_from(args.rows)
         .map_err(|_| RunError::Usage("rows must fit within i64".to_string()))?;
@@ -496,6 +701,12 @@ fn run_fsqlite_benchmark(
             let update = conn
                 .prepare("UPDATE bench SET value = ?2 WHERE id = ?1")
                 .map_err(|err| RunError::Runtime(format!("prepare update statement: {err}")))?;
+            let profile = DmlProfileScope::start(DmlProfileLabel::iter(
+                args.profile_mode,
+                DmlProfileOperation::Update,
+                iter,
+                args.rows,
+            ));
             let t0 = Instant::now();
             for i in 0..update_count {
                 let id = i64::try_from(i).map_err(|_| {
@@ -511,6 +722,7 @@ fn run_fsqlite_benchmark(
             conn.execute("COMMIT")
                 .map_err(|err| RunError::Runtime(format!("commit update transaction: {err}")))?;
             total_update_ns += t0.elapsed().as_nanos();
+            profile.finish();
         }
 
         if args.workload.do_delete() {
@@ -519,6 +731,12 @@ fn run_fsqlite_benchmark(
             let delete = conn
                 .prepare("DELETE FROM bench WHERE id = ?1")
                 .map_err(|err| RunError::Runtime(format!("prepare delete statement: {err}")))?;
+            let profile = DmlProfileScope::start(DmlProfileLabel::iter(
+                args.profile_mode,
+                DmlProfileOperation::Delete,
+                iter,
+                args.rows,
+            ));
             let t0 = Instant::now();
             for i in 0..delete_count {
                 let id = i64::try_from(i).map_err(|_| {
@@ -531,6 +749,7 @@ fn run_fsqlite_benchmark(
             conn.execute("COMMIT")
                 .map_err(|err| RunError::Runtime(format!("commit delete transaction: {err}")))?;
             total_delete_ns += t0.elapsed().as_nanos();
+            profile.finish();
         }
 
         if iter == 0 {
@@ -583,6 +802,12 @@ fn run_fsqlite_isolated_benchmark(
         conn.execute("BEGIN").map_err(|err| {
             RunError::Runtime(format!("begin isolated update transaction: {err}"))
         })?;
+        let profile = DmlProfileScope::start(DmlProfileLabel::aggregate(
+            args.profile_mode,
+            DmlProfileOperation::Update,
+            args.rows,
+            args.iters,
+        ));
         let t0 = Instant::now();
         for iter in 0..args.iters {
             let next_value = (iter as f64).mul_add(0.001, 999.99);
@@ -599,6 +824,7 @@ fn run_fsqlite_isolated_benchmark(
             }
         }
         total_update_ns = t0.elapsed().as_nanos();
+        profile.finish();
         conn.execute("ROLLBACK").map_err(|err| {
             RunError::Runtime(format!("rollback isolated update transaction: {err}"))
         })?;
@@ -615,6 +841,12 @@ fn run_fsqlite_isolated_benchmark(
                         "begin rollback-isolated delete transaction {iter}: {err}"
                     ))
                 })?;
+                let profile = DmlProfileScope::start(DmlProfileLabel::iter(
+                    args.profile_mode,
+                    DmlProfileOperation::Delete,
+                    iter,
+                    args.rows,
+                ));
                 let t0 = Instant::now();
                 for i in 0..delete_count {
                     let id = i64::try_from(i).map_err(|_| {
@@ -625,6 +857,7 @@ fn run_fsqlite_isolated_benchmark(
                         .map_err(|err| RunError::Runtime(format!("delete row {id}: {err}")))?;
                 }
                 total_delete_ns += t0.elapsed().as_nanos();
+                profile.finish();
                 conn.execute("ROLLBACK").map_err(|err| {
                     RunError::Runtime(format!(
                         "rollback rollback-isolated delete transaction {iter}: {err}"
@@ -638,6 +871,12 @@ fn run_fsqlite_isolated_benchmark(
             conn.execute("BEGIN").map_err(|err| {
                 RunError::Runtime(format!("begin isolated delete transaction: {err}"))
             })?;
+            let profile = DmlProfileScope::start(DmlProfileLabel::aggregate(
+                args.profile_mode,
+                DmlProfileOperation::Delete,
+                args.rows,
+                args.iters,
+            ));
             let t0 = Instant::now();
             for iter in 0..args.iters {
                 for i in 0..delete_count {
@@ -655,6 +894,7 @@ fn run_fsqlite_isolated_benchmark(
                 }
             }
             total_delete_ns = t0.elapsed().as_nanos();
+            profile.finish();
             conn.execute("COMMIT").map_err(|err| {
                 RunError::Runtime(format!("commit isolated delete transaction: {err}"))
             })?;

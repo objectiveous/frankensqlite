@@ -500,6 +500,40 @@ impl TxnDeltaTracker {
         *self.txn_bytes.entry(txn).or_insert(0) += bytes;
     }
 
+    fn delta_count(&self, txn: TxnToken) -> usize {
+        self.txn_deltas.get(&txn).map_or(0, smallvec::SmallVec::len)
+    }
+
+    fn split_off_after(
+        &mut self,
+        txn: TxnToken,
+        retained_len: usize,
+    ) -> Option<SmallVec<[CellDeltaIdx; 16]>> {
+        let became_empty;
+        let removed = {
+            let deltas = self.txn_deltas.get_mut(&txn)?;
+            if retained_len >= deltas.len() {
+                return None;
+            }
+            let removed = deltas.drain(retained_len..).collect();
+            became_empty = deltas.is_empty();
+            removed
+        };
+
+        if became_empty {
+            self.txn_deltas.remove(&txn);
+            self.txn_bytes.remove(&txn);
+        }
+
+        Some(removed)
+    }
+
+    fn subtract_bytes(&mut self, txn: TxnToken, bytes: u64) {
+        if let Some(txn_bytes) = self.txn_bytes.get_mut(&txn) {
+            *txn_bytes = txn_bytes.saturating_sub(bytes);
+        }
+    }
+
     /// Get all delta indices for a transaction (used during abort/rollback).
     #[allow(dead_code)]
     fn get_deltas(&self, txn: TxnToken) -> Option<&SmallVec<[CellDeltaIdx; 16]>> {
@@ -1066,6 +1100,58 @@ impl CellVisibilityLog {
             }
         };
 
+        let (removed_count, bytes_freed) = self.remove_delta_indices(&delta_indices);
+
+        debug!(
+            txn_id = txn.id.get(),
+            delta_count = removed_count,
+            bytes_freed,
+            "cell_txn_rolled_back"
+        );
+
+        removed_count
+    }
+
+    /// Count deltas currently tracked for a transaction.
+    #[must_use]
+    pub fn txn_delta_count(&self, txn: TxnToken) -> usize {
+        let tracker = self.txn_tracker.lock();
+        tracker.delta_count(txn)
+    }
+
+    /// Roll back deltas created after a transaction-local savepoint.
+    ///
+    /// `retained_delta_count` must be the value returned by [`Self::txn_delta_count`]
+    /// when the savepoint was created. Older deltas stay tracked so a later
+    /// transaction commit can publish them normally.
+    pub fn rollback_txn_to_delta_count(&self, txn: TxnToken, retained_delta_count: usize) -> u64 {
+        let mut tracker = self.txn_tracker.lock();
+        let delta_indices = match tracker.split_off_after(txn, retained_delta_count) {
+            Some(indices) => indices,
+            None => {
+                trace!(
+                    txn_id = txn.id.get(),
+                    retained_delta_count, "cell_txn_rollback_to_delta_count_no_deltas"
+                );
+                return 0;
+            }
+        };
+
+        let (removed_count, bytes_freed) = self.remove_delta_indices(&delta_indices);
+        tracker.subtract_bytes(txn, bytes_freed);
+
+        debug!(
+            txn_id = txn.id.get(),
+            retained_delta_count,
+            delta_count = removed_count,
+            bytes_freed,
+            "cell_txn_rolled_back_to_delta_count"
+        );
+
+        removed_count
+    }
+
+    fn remove_delta_indices(&self, delta_indices: &[CellDeltaIdx]) -> (u64, u64) {
         let mut arena = self.arena.lock();
         let mut removed_count = 0u64;
         let mut bytes_freed = 0u64;
@@ -1120,14 +1206,7 @@ impl CellVisibilityLog {
 
         self.delta_count.fetch_sub(removed_count, Ordering::Relaxed);
 
-        debug!(
-            txn_id = txn.id.get(),
-            delta_count = removed_count,
-            bytes_freed,
-            "cell_txn_rolled_back"
-        );
-
-        removed_count
+        (removed_count, bytes_freed)
     }
 
     /// Check for cell-level conflict between two transactions.
@@ -2157,6 +2236,41 @@ mod tests {
                 Some(vec![i as u8])
             );
         }
+    }
+
+    #[test]
+    fn test_rollback_txn_to_delta_count_keeps_pre_savepoint_delta() -> Result<(), String> {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).ok_or_else(|| "valid test page".to_owned())?;
+        let token = txn_token_n(1);
+
+        log.record_insert(cell_key, page_number, vec![1], token)
+            .ok_or_else(|| "first insert should fit test budget".to_owned())?;
+        let retained_delta_count = log.txn_delta_count(token);
+
+        log.record_update(cell_key, page_number, vec![2], token)
+            .ok_or_else(|| "post-savepoint update should fit test budget".to_owned())?;
+        assert_eq!(log.txn_delta_count(token), 2);
+        assert_eq!(log.delta_count(), 2);
+
+        assert_eq!(
+            log.rollback_txn_to_delta_count(token, retained_delta_count),
+            1
+        );
+        assert_eq!(log.txn_delta_count(token), 1);
+        assert_eq!(log.delta_count(), 1);
+        assert_eq!(log.page_delta_count(page_number), 1);
+
+        log.commit_txn(token, CommitSeq::new(10));
+        assert_eq!(
+            log.resolve(page_number, &cell_key, CommitSeq::new(10)),
+            Some(vec![1]),
+            "rollback to savepoint must discard newer cell deltas before commit"
+        );
+
+        Ok(())
     }
 
     #[test]

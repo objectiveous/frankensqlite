@@ -5,7 +5,7 @@
 //!
 //! - [`BeginKind`]: The four modes (Deferred, Immediate, Exclusive, Concurrent).
 //! - [`TransactionManager`]: Orchestrates begin/read/write/commit/abort.
-//! - [`Savepoint`]: B-tree-level page state snapshots within a transaction.
+//! - [`Savepoint`]: Transaction-local write snapshots for page and cell deltas.
 //! - [`CommitResponse`]: Result type for the commit sequencer.
 
 use std::collections::{BTreeMap, HashMap, btree_map::Entry as BTreeEntry};
@@ -394,9 +394,8 @@ impl std::error::Error for MvccError {}
 /// A savepoint records the state of a transaction's write set so it can be
 /// partially rolled back.
 ///
-/// Per spec §5.4: savepoints are a B-tree-level mechanism, NOT MVCC-level.
-/// Page locks are NOT released on `ROLLBACK TO`. SSI witnesses are NOT
-/// rolled back (safe overapproximation).
+/// Per spec §5.4: page locks are NOT released on `ROLLBACK TO`. SSI witnesses
+/// are NOT rolled back (safe overapproximation).
 #[derive(Debug)]
 pub struct Savepoint {
     /// Name of the savepoint.
@@ -408,6 +407,8 @@ pub struct Savepoint {
         Arc<HashMap<PageNumber, PageData, fsqlite_types::PageNumberBuildHasher>>,
     /// Number of pages in write_set when savepoint was created.
     pub write_set_len: usize,
+    /// Number of cell-level deltas tracked for this transaction at savepoint creation.
+    pub cell_delta_len: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -1114,10 +1115,10 @@ impl TransactionManager {
 
     /// Create a savepoint within a transaction.
     ///
-    /// Records the current write_set state so it can be restored on
-    /// `ROLLBACK TO`.
+    /// Records the current write_set and cell-delta state so it can be
+    /// restored on `ROLLBACK TO`.
     #[must_use]
-    pub fn savepoint(txn: &Transaction, name: &str) -> Savepoint {
+    pub fn savepoint(&self, txn: &Transaction, name: &str) -> Savepoint {
         assert_eq!(
             txn.state,
             TransactionState::Active,
@@ -1127,6 +1128,7 @@ impl TransactionManager {
             name: name.to_owned(),
             write_set_snapshot: txn.write_set_data.clone(),
             write_set_len: txn.write_set.len(),
+            cell_delta_len: self.cell_log.txn_delta_count(txn.token()),
         }
     }
 
@@ -1134,14 +1136,18 @@ impl TransactionManager {
     ///
     /// Per spec §5.4:
     /// - Restores write_set page states to the savepoint.
+    /// - Removes cell-level deltas created after the savepoint.
     /// - Page locks are NOT released.
     /// - SSI witnesses are NOT rolled back.
-    pub fn rollback_to_savepoint(txn: &mut Transaction, savepoint: &Savepoint) {
+    pub fn rollback_to_savepoint(&self, txn: &mut Transaction, savepoint: &Savepoint) {
         assert_eq!(
             txn.state,
             TransactionState::Active,
             "can only rollback to savepoint in active transactions"
         );
+
+        self.cell_log
+            .rollback_txn_to_delta_count(txn.token(), savepoint.cell_delta_len);
 
         // Restore write_set_data to the savepoint state.
         txn.write_set_data = savepoint.write_set_snapshot.clone();
@@ -3242,9 +3248,10 @@ mod tests {
 
         m.write_page(&mut txn, p1, test_data(0x01)).unwrap();
 
-        let sp = TransactionManager::savepoint(&txn, "sp1");
+        let sp = m.savepoint(&txn, "sp1");
         assert_eq!(sp.name, "sp1");
         assert_eq!(sp.write_set_len, 1);
+        assert_eq!(sp.cell_delta_len, 0);
         assert!(sp.write_set_snapshot.contains_key(&p1));
     }
 
@@ -3259,14 +3266,14 @@ mod tests {
         m.write_page(&mut txn, p1, test_data(0x01)).unwrap();
 
         // Create savepoint.
-        let sp = TransactionManager::savepoint(&txn, "sp1");
+        let sp = m.savepoint(&txn, "sp1");
 
         // Write page 2 after savepoint.
         m.write_page(&mut txn, p2, test_data(0x02)).unwrap();
         assert_eq!(txn.write_set.len(), 2);
 
         // Rollback to savepoint — should undo page 2 write.
-        TransactionManager::rollback_to_savepoint(&mut txn, &sp);
+        m.rollback_to_savepoint(&mut txn, &sp);
 
         assert_eq!(
             txn.write_set.len(),
@@ -3291,19 +3298,59 @@ mod tests {
         let p2 = PageNumber::new(2).unwrap();
 
         m.write_page(&mut txn, p1, test_data(0x01)).unwrap();
-        let sp = TransactionManager::savepoint(&txn, "sp_tracking");
+        let sp = m.savepoint(&txn, "sp_tracking");
         m.write_page(&mut txn, p2, test_data(0x02)).unwrap();
 
         assert!(txn.write_version_for_page(p1).is_some());
         assert!(txn.write_version_for_page(p2).is_some());
 
-        TransactionManager::rollback_to_savepoint(&mut txn, &sp);
+        m.rollback_to_savepoint(&mut txn, &sp);
 
         assert!(txn.write_version_for_page(p1).is_some());
         assert!(
             txn.write_version_for_page(p2).is_none(),
             "savepoint rollback must prune write-version entries for removed pages"
         );
+    }
+
+    #[test]
+    fn test_rollback_to_savepoint_prunes_cell_deltas() -> Result<(), String> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let m = mgr();
+        let mut txn = m
+            .begin(BeginKind::Concurrent)
+            .map_err(|err| format!("begin failed: {err}"))?;
+        let pgno = PageNumber::new(42).ok_or_else(|| "valid test page".to_owned())?;
+        let cell_key = CellKey::table_row(BtreeRef::Table(TableId::new(1)), 100);
+
+        m.cell_log()
+            .record_insert(cell_key, pgno, vec![1], txn.token())
+            .ok_or_else(|| "pre-savepoint insert should fit test budget".to_owned())?;
+        txn.write_set.push(pgno);
+
+        let sp = m.savepoint(&txn, "cell_sp");
+        assert_eq!(sp.cell_delta_len, 1);
+
+        m.cell_log()
+            .record_update(cell_key, pgno, vec![2], txn.token())
+            .ok_or_else(|| "post-savepoint update should fit test budget".to_owned())?;
+        assert_eq!(m.cell_log().delta_count(), 2);
+
+        m.rollback_to_savepoint(&mut txn, &sp);
+        assert_eq!(m.cell_log().delta_count(), 1);
+
+        let commit_seq = m
+            .commit(&mut txn)
+            .map_err(|err| format!("commit failed: {err}"))?;
+        assert_eq!(
+            m.cell_log().resolve(pgno, &cell_key, commit_seq),
+            Some(vec![1]),
+            "ROLLBACK TO must discard post-savepoint cell deltas before commit"
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -3314,12 +3361,12 @@ mod tests {
         let p2 = PageNumber::new(2).unwrap();
 
         m.write_page(&mut txn, p1, test_data(0x01)).unwrap();
-        let sp = TransactionManager::savepoint(&txn, "sp1");
+        let sp = m.savepoint(&txn, "sp1");
 
         m.write_page(&mut txn, p2, test_data(0x02)).unwrap();
         assert_eq!(txn.page_locks.len(), 2);
 
-        TransactionManager::rollback_to_savepoint(&mut txn, &sp);
+        m.rollback_to_savepoint(&mut txn, &sp);
 
         // Page locks must NOT be released on ROLLBACK TO (spec requirement).
         assert_eq!(
@@ -3340,13 +3387,13 @@ mod tests {
         m.write_page(&mut txn, p1, test_data(0x01)).unwrap();
 
         // Add SSI witnesses after the savepoint.
-        let sp = TransactionManager::savepoint(&txn, "sp1");
+        let sp = m.savepoint(&txn, "sp1");
         txn.read_keys
             .insert(fsqlite_types::WitnessKey::Page(PageNumber::new(2).unwrap()));
         txn.write_keys
             .insert(fsqlite_types::WitnessKey::Page(PageNumber::new(3).unwrap()));
 
-        TransactionManager::rollback_to_savepoint(&mut txn, &sp);
+        m.rollback_to_savepoint(&mut txn, &sp);
 
         // SSI witnesses must NOT be rolled back (spec requirement).
         assert!(
@@ -3368,23 +3415,23 @@ mod tests {
         let p3 = PageNumber::new(3).unwrap();
 
         m.write_page(&mut txn, p1, test_data(0x01)).unwrap();
-        let sp1 = TransactionManager::savepoint(&txn, "sp1");
+        let sp1 = m.savepoint(&txn, "sp1");
 
         m.write_page(&mut txn, p2, test_data(0x02)).unwrap();
-        let sp2 = TransactionManager::savepoint(&txn, "sp2");
+        let sp2 = m.savepoint(&txn, "sp2");
 
         m.write_page(&mut txn, p3, test_data(0x03)).unwrap();
         assert_eq!(txn.write_set.len(), 3);
 
         // Rollback to sp2 — should undo p3 only.
-        TransactionManager::rollback_to_savepoint(&mut txn, &sp2);
+        m.rollback_to_savepoint(&mut txn, &sp2);
         assert_eq!(txn.write_set.len(), 2);
         assert!(txn.write_set_data.contains_key(&p1));
         assert!(txn.write_set_data.contains_key(&p2));
         assert!(!txn.write_set_data.contains_key(&p3));
 
         // Rollback to sp1 — should undo p2 as well.
-        TransactionManager::rollback_to_savepoint(&mut txn, &sp1);
+        m.rollback_to_savepoint(&mut txn, &sp1);
         assert_eq!(txn.write_set.len(), 1);
         assert!(txn.write_set_data.contains_key(&p1));
         assert!(!txn.write_set_data.contains_key(&p2));
@@ -5003,23 +5050,23 @@ mod tests {
         let p3 = PageNumber::new(3).unwrap();
 
         m.write_page(&mut txn, p1, test_data(0x01)).unwrap();
-        let sp1 = TransactionManager::savepoint(&txn, "sp1");
+        let sp1 = m.savepoint(&txn, "sp1");
 
         m.write_page(&mut txn, p2, test_data(0x02)).unwrap();
-        let sp2 = TransactionManager::savepoint(&txn, "sp2");
+        let sp2 = m.savepoint(&txn, "sp2");
 
         m.write_page(&mut txn, p3, test_data(0x03)).unwrap();
         assert_eq!(txn.write_set.len(), 3);
 
         // ROLLBACK TO sp2 — undoes p3 only.
-        TransactionManager::rollback_to_savepoint(&mut txn, &sp2);
+        m.rollback_to_savepoint(&mut txn, &sp2);
         assert_eq!(txn.write_set.len(), 2);
         assert!(txn.write_set_data.contains_key(&p1));
         assert!(txn.write_set_data.contains_key(&p2));
         assert!(!txn.write_set_data.contains_key(&p3));
 
         // ROLLBACK TO sp1 — undoes p2 as well.
-        TransactionManager::rollback_to_savepoint(&mut txn, &sp1);
+        m.rollback_to_savepoint(&mut txn, &sp1);
         assert_eq!(txn.write_set.len(), 1);
         assert!(txn.write_set_data.contains_key(&p1));
         assert!(!txn.write_set_data.contains_key(&p2));

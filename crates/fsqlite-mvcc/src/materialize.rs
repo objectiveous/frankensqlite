@@ -215,7 +215,12 @@ pub fn materialize_page(
     }
 
     // Build working state from base page
-    let btree_ref = visible_deltas[0].cell_key.btree;
+    let btree_ref = visible_deltas
+        .first()
+        .map(|delta| delta.cell_key.btree)
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "materialize_page: no visible deltas after non-empty check".to_owned(),
+        })?;
     let mut state = WorkingPageState::from_base_page(
         base,
         page_number,
@@ -331,7 +336,12 @@ impl WorkingPageState {
             // Extract cell content - we need to compute the cell size
             let cell_end =
                 compute_cell_end(page_bytes, cell_offset, header.page_type, usable_size)?;
-            let cell_content = page_bytes[cell_offset..cell_end].to_vec();
+            let cell_content = page_bytes
+                .get(cell_offset..cell_end)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "materialize_page: computed cell range out of bounds".to_owned(),
+                })?
+                .to_vec();
 
             // Compute key digest and sort key for this cell
             let (key_digest, sort_key) = compute_cell_key_and_sort_key(
@@ -370,44 +380,50 @@ impl WorkingPageState {
         match delta.kind {
             CellDeltaKind::Insert => {
                 // Insert: add new cell (should not exist)
-                if self.cells_by_key.contains_key(&key_digest) {
+                if let Some(&idx) = self.cells_by_key.get(&key_digest) {
                     // Cell already exists - this could be a re-insert after delete
                     // which is valid (the delta chain handles this)
                     // Just update the content
-                    let idx = self.cells_by_key[&key_digest];
-                    self.cells[idx].content.clone_from(&delta.cell_data);
-                    self.cells[idx].sort_key = sort_key;
-                } else {
-                    let idx = self.cells.len();
-                    self.cells.push(WorkingCell {
-                        content: delta.cell_data.clone(),
-                        sort_key,
-                    });
-                    self.cells_by_key.insert(key_digest, idx);
+                    if let Some(cell) = self.cells.get_mut(idx) {
+                        cell.content.clone_from(&delta.cell_data);
+                        cell.sort_key = sort_key;
+                        return;
+                    }
+                    self.cells_by_key.remove(&key_digest);
                 }
+                let idx = self.cells.len();
+                self.cells.push(WorkingCell {
+                    content: delta.cell_data.clone(),
+                    sort_key,
+                });
+                self.cells_by_key.insert(key_digest, idx);
             }
             CellDeltaKind::Update => {
                 // Update: replace existing cell content
                 if let Some(&idx) = self.cells_by_key.get(&key_digest) {
-                    self.cells[idx].content.clone_from(&delta.cell_data);
-                    self.cells[idx].sort_key = sort_key;
-                } else {
-                    // Update on non-existent cell - treat as insert
-                    let idx = self.cells.len();
-                    self.cells.push(WorkingCell {
-                        content: delta.cell_data.clone(),
-                        sort_key,
-                    });
-                    self.cells_by_key.insert(key_digest, idx);
+                    if let Some(cell) = self.cells.get_mut(idx) {
+                        cell.content.clone_from(&delta.cell_data);
+                        cell.sort_key = sort_key;
+                        return;
+                    }
+                    self.cells_by_key.remove(&key_digest);
                 }
+                // Update on non-existent cell - treat as insert.
+                let idx = self.cells.len();
+                self.cells.push(WorkingCell {
+                    content: delta.cell_data.clone(),
+                    sort_key,
+                });
+                self.cells_by_key.insert(key_digest, idx);
             }
             CellDeltaKind::Delete => {
                 // Delete: remove cell
-                if let Some(&idx) = self.cells_by_key.get(&key_digest) {
+                if let Some(idx) = self.cells_by_key.remove(&key_digest) {
                     // Mark as deleted by clearing content
                     // We'll filter these out during page reconstruction
-                    self.cells[idx].content.clear();
-                    self.cells_by_key.remove(&key_digest);
+                    if let Some(cell) = self.cells.get_mut(idx) {
+                        cell.content.clear();
+                    }
                 }
                 // Delete on non-existent is a no-op (idempotent)
             }
@@ -455,7 +471,17 @@ impl WorkingPageState {
 
         // Copy database file header if page 1
         if header_offset > 0 {
-            page[..header_offset].copy_from_slice(&base.as_bytes()[..header_offset]);
+            let dst =
+                page.get_mut(..header_offset)
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: "materialize_page: page header offset out of bounds".to_owned(),
+                    })?;
+            let src = base.as_bytes().get(..header_offset).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: "materialize_page: base header offset out of bounds".to_owned(),
+                }
+            })?;
+            dst.copy_from_slice(src);
         }
 
         // Write cell content area (grows down from end of usable space)
@@ -463,8 +489,15 @@ impl WorkingPageState {
         let mut cell_pointers = Vec::with_capacity(sorted_cells.len());
 
         for cell in &sorted_cells {
-            content_offset -= cell.content.len();
-            page[content_offset..content_offset + cell.content.len()]
+            content_offset = content_offset
+                .checked_sub(cell.content.len())
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "materialize_page: cell content offset underflow".to_owned(),
+                })?;
+            page.get_mut(content_offset..content_offset + cell.content.len())
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "materialize_page: cell content range out of bounds".to_owned(),
+                })?
                 .copy_from_slice(&cell.content);
             cell_pointers.push(content_offset as u16);
         }
@@ -509,15 +542,33 @@ fn compute_cell_key_and_sort_key(
 
     if page_type == BtreePageType::LeafTable {
         // Table leaf cell: payload_size varint, rowid varint, payload
-        let (_, ps_len) = fsqlite_types::serial_type::read_varint(&page[cell_offset..])
+        let cell = page
+            .get(cell_offset..)
             .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                detail: "invalid varint in cell (payload size)".to_owned(),
+                detail: "cell offset out of bounds".to_owned(),
             })?;
+        let (_, ps_len) = fsqlite_types::serial_type::read_varint(cell).ok_or_else(|| {
+            FrankenError::DatabaseCorrupt {
+                detail: "invalid varint in cell (payload size)".to_owned(),
+            }
+        })?;
 
-        let rowid_start = cell_offset + ps_len;
-        let (rowid, _rowid_len) = fsqlite_types::serial_type::read_varint(&page[rowid_start..])
+        let rowid_start =
+            cell_offset
+                .checked_add(ps_len)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "cell rowid offset overflow".to_owned(),
+                })?;
+        let rowid_cell = page
+            .get(rowid_start..)
             .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                detail: "invalid varint in cell (rowid)".to_owned(),
+                detail: "cell rowid offset out of bounds".to_owned(),
+            })?;
+        let (rowid, _rowid_len) =
+            fsqlite_types::serial_type::read_varint(rowid_cell).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: "invalid varint in cell (rowid)".to_owned(),
+                }
             })?;
 
         // Hash the rowid for key_digest
@@ -534,21 +585,43 @@ fn compute_cell_key_and_sort_key(
         // Index leaf cell: payload_size varint, key bytes
         // Note: For large keys with overflow, only local portion is on-page.
         // We use local_payload_size to determine how much is actually here.
-        let (payload_size, ps_len) = fsqlite_types::serial_type::read_varint(&page[cell_offset..])
+        let cell = page
+            .get(cell_offset..)
             .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                detail: "invalid varint in cell (payload size)".to_owned(),
+                detail: "cell offset out of bounds".to_owned(),
+            })?;
+        let (payload_size, ps_len) =
+            fsqlite_types::serial_type::read_varint(cell).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: "invalid varint in cell (payload size)".to_owned(),
+                }
             })?;
 
-        let key_start = cell_offset + ps_len;
+        let key_start =
+            cell_offset
+                .checked_add(ps_len)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "index cell key offset overflow".to_owned(),
+                })?;
 
         // For index cells, the comparison key is the full payload.
         // If payload exceeds local storage, we only have partial key on-page.
         // For now, use what's available (overflow handling is rare for index keys).
         let available = page.len().saturating_sub(key_start);
         let key_len = (payload_size as usize).min(available);
-        let key_end = key_start + key_len;
+        let key_end =
+            key_start
+                .checked_add(key_len)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "index cell key end offset overflow".to_owned(),
+                })?;
 
-        let key_bytes = page[key_start..key_end].to_vec();
+        let key_bytes = page
+            .get(key_start..key_end)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "index cell key range out of bounds".to_owned(),
+            })?
+            .to_vec();
         let key_digest = fsqlite_types::SemanticKeyRef::compute_digest(
             fsqlite_types::SemanticKeyKind::IndexEntry,
             btree_ref,
@@ -623,31 +696,62 @@ fn compute_cell_end(
     use fsqlite_btree::local_payload_size;
 
     // Read varints to determine cell structure
-    let (payload_size, ps_len) = fsqlite_types::serial_type::read_varint(&page[cell_offset..])
+    let cell = page
+        .get(cell_offset..)
         .ok_or_else(|| FrankenError::DatabaseCorrupt {
-            detail: "invalid varint in cell (payload size)".to_owned(),
+            detail: "cell offset out of bounds".to_owned(),
+        })?;
+    let (payload_size, ps_len) =
+        fsqlite_types::serial_type::read_varint(cell).ok_or_else(|| {
+            FrankenError::DatabaseCorrupt {
+                detail: "invalid varint in cell (payload size)".to_owned(),
+            }
         })?;
 
-    let mut pos = cell_offset + ps_len;
+    let mut pos = cell_offset
+        .checked_add(ps_len)
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "cell payload offset overflow".to_owned(),
+        })?;
 
     // Table cells have a rowid varint
     if page_type.is_table() && page_type.is_leaf() {
+        let rowid_cell = page
+            .get(pos..)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "cell rowid offset out of bounds".to_owned(),
+            })?;
         let (_, rowid_len) =
-            fsqlite_types::serial_type::read_varint(&page[pos..]).ok_or_else(|| {
+            fsqlite_types::serial_type::read_varint(rowid_cell).ok_or_else(|| {
                 FrankenError::DatabaseCorrupt {
                     detail: "invalid varint in cell (rowid)".to_owned(),
                 }
             })?;
-        pos += rowid_len;
+        pos = pos
+            .checked_add(rowid_len)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "cell rowid end offset overflow".to_owned(),
+            })?;
     }
 
     // Payload (potentially with overflow pointer)
-    let local_size = local_payload_size(payload_size as u32, usable_size, page_type);
-    pos += local_size as usize;
+    let payload_size = u32::try_from(payload_size).map_err(|_| FrankenError::DatabaseCorrupt {
+        detail: "cell payload size exceeds supported page size".to_owned(),
+    })?;
+    let local_size = local_payload_size(payload_size, usable_size, page_type);
+    pos = pos
+        .checked_add(local_size as usize)
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "cell payload end offset overflow".to_owned(),
+        })?;
 
     // If overflow, add 4 bytes for overflow page pointer
-    if local_size < payload_size as u32 {
-        pos += 4;
+    if local_size < payload_size {
+        pos = pos
+            .checked_add(4)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "cell overflow pointer offset overflow".to_owned(),
+            })?;
     }
 
     Ok(pos)

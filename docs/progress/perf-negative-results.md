@@ -12,6 +12,36 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Prepared direct DELETE monotone search hint retrial
+
+- Target: focused `perf-update-delete 10000 20 delete compare standard`, after
+  `tests/artifacts/perf/codex-delete-active-subprofile-6abc9f00-20260512T1834Z/`
+  split the retained DELETE active bucket and showed `delete_leaf_search`
+  averaging `43709.8ns`.
+- Files/subsystems touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`. The abandoned patch added a
+  lower-bound hint to `TableLeafDeleteRun::search_table_leaf`, trying to reuse
+  monotone same-leaf DELETE rowid order and continue from the prior insertion
+  point. The source patch was manually unwound before commit.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-delete-monotone-search-hint-2fece396-20260512T1848Z/`
+  records the profile-enabled candidate run; its summary records the
+  profile-off candidate observation before the source patch was unwound.
+- Result: rejected. The no-profile focused row did not improve: candidate
+  FSQLite was `551ns` per deleted row versus the prior profile-off guard row
+  of `528ns` in
+  `tests/artifacts/perf/codex-delete-active-subprofile-6abc9f00-20260512T1834Z/`.
+  The intended profile counter regressed: `delete_leaf_search` moved from
+  `560/43709.8ns` to `560/58736.6ns`, and `delete_leaf_active_ns` moved from
+  `147940.0ns` to `164208.0ns`.
+- Do not retry a standalone monotone retained-leaf search hint or floor. The
+  earlier `codex-delete-monotone-floor-reject-20260512T0635Z` entry already
+  rejected this family; this retrial confirms the existing binary search is
+  better for the current 10k-row DELETE shape. Reconsider only inside a broader
+  retained DELETE representation that removes repeated rowid lookup without a
+  per-row sequential scan branch and wins the exact no-profile row in a
+  same-window A/B.
+
 ## 2026-05-12 - DELETE materializer `as_bytes_mut` borrow hoist
 
 - Target: `UPDATE/DELETEThroughput` DELETE rows, especially

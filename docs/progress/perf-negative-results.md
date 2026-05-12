@@ -12,6 +12,33 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Current concurrent profile after shared-table retry fix
+
+- Target: current low-thread `Concurrent Writers - C SQLite WAL vs
+  FrankenSQLite MVCC` rows after the shared-table retry fix and current INSERT
+  boundary artifact, with profiling enabled to refresh the low-thread
+  attribution.
+- Files/subsystems inspected: no source patch. Re-read the current concurrent
+  profile counters and the prior low-thread concurrent boundary entries.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-concurrent-current-profile-after-mtfix-20260512T1250Z/`.
+  This run used a fresh target directory at `7ce06a0e`, so
+  `benchmark_binary_older_than_git_head=false`.
+- Result: no source patch attempted. The profiled run reported F/C ratios of
+  `1.1850x`, `1.2238x`, and `0.6811x` for 2/4/8 writers respectively; treat
+  those ratios as profiled attribution evidence rather than a replacement for
+  the unprofiled fullquick frontier. All rows stayed on prepared direct INSERT
+  (`slow=0`) with no page-run flushes. The 2/4/8 writer counters showed
+  `12 / 85 / 493` page-lock waits, `12 / 72 / 311` stale-snapshot rejects,
+  `18.3ms / 157.3ms / 1054.6ms` page-lock wait time, and
+  `candidate_free_fast_paths=0` throughout.
+- Do not retry low-thread concurrent wait-slice tuning, transaction retry
+  reshaping, active-holder preemption, standalone page-run admission, witness
+  container tweaks, or candidate-free shortcutting from this profile. Reconsider
+  only with a broader MVCC publication design that preserves first-committer
+  wins and SSI, proves focused concurrent wins, and does not regress the
+  8-writer or fullquick primary score.
+
 ## 2026-05-12 - Current INSERT profile after shared-table retry fix
 
 - Target: current `INSERTThroughput` focused rows after the shared-table retry

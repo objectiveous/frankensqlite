@@ -12,6 +12,37 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Sparse DELETE delayed CPU profile
+
+- Target: `perf-update-delete 10000 1000 delete fsqlite sparse-isolated`, to
+  isolate the DELETE-side CPU profile after the current DML refresh showed the
+  sparse isolated mode at `2.26x` slower than C SQLite.
+- Files/subsystems inspected: no source patch. Re-read
+  `TableLeafDeleteRun::materialize_deletions`,
+  `TableLeafDeleteRun::delete_rowid_with_reason`, `PageData::as_bytes_mut`,
+  and `CachedPageEntry::shared_page`.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-sparse-delete-cpu-profile-20260512T1434Z/`.
+  The checkout head was `002e884e`, with unchanged Rust source since the
+  source-equivalent build target used for the current DML refresh. The delayed
+  capture armed after the first isolated delete iteration and recorded `835`
+  samples.
+- Result: no source patch attempted. The delayed window reported
+  `total=4101ms`, `populate=3293ms`, `delete=714ms`, and
+  `per-row-delete=1428ns`. User-space attribution shows the same fenced
+  physical DELETE materialization boundary: `_int_malloc` at `38.08%`
+  children, `PageData::as_bytes_mut` at `18.43%`, `CachedPageEntry::shared_page`
+  at `17.96%`, `TransactionKind::get_page` at `10.99%`,
+  `TransactionKind::prefetch_page_hint` at `9.65%`,
+  `TableLeafDeleteRun::materialize_deletions` at `6.36%`, and
+  `TableLeafDeleteRun::delete_rowid_with_reason` at `4.92%`.
+- Do not retry a standalone DELETE page-materialization, PageData publication,
+  direct-writer, borrowed-write, threshold, compactness-precheck, or retained
+  leaf search tweak from this profile. Reconsider only as the broader
+  transaction-local DML mutation/read-view operator, or with a new profile that
+  materially changes the attribution and proves same-window focused/fullquick
+  benchmark wins.
+
 ## 2026-05-12 - Current DML refresh after INSERT frontier
 
 - Target: current `UPDATE/DELETEThroughput` rows after the INSERT frontier

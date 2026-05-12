@@ -228,6 +228,17 @@ impl CellDelta {
     pub fn is_visible_to(&self, snapshot_high: CommitSeq) -> bool {
         self.commit_seq.get().wrapping_sub(1) < snapshot_high.get()
     }
+
+    /// Visibility for a transaction-local read view.
+    ///
+    /// Committed deltas obey snapshot visibility. Uncommitted deltas are visible
+    /// only to the transaction that created them, which is the read-your-writes
+    /// rule needed by the transaction-local DML mutation path.
+    #[inline]
+    #[must_use]
+    pub fn is_visible_to_txn(&self, snapshot_high: CommitSeq, txn: TxnToken) -> bool {
+        self.is_visible_to(snapshot_high) || (self.commit_seq.get() == 0 && self.created_by == txn)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,6 +1028,48 @@ impl CellVisibilityLog {
         None
     }
 
+    /// Resolve a cell for a transaction-local read view.
+    ///
+    /// This preserves ordinary snapshot visibility while allowing a transaction
+    /// to see its own uncommitted cell deltas. Uncommitted deltas from other
+    /// transactions are skipped.
+    #[must_use]
+    pub fn resolve_for_txn(
+        &self,
+        page_number: PageNumber,
+        cell_key: &CellKey,
+        snapshot_high: CommitSeq,
+        txn: TxnToken,
+    ) -> Option<Vec<u8>> {
+        let shard_idx = Self::shard_index(page_number);
+        let shard = &self.shards[shard_idx];
+        let lookup_key = (page_number, cell_key.key_digest);
+
+        let head_idx = {
+            let heads = shard.heads.read();
+            heads.get(&lookup_key)?.head_idx
+        };
+
+        let arena = self.arena.lock();
+        let mut current_idx = Some(head_idx);
+
+        while let Some(idx) = current_idx {
+            let Some(delta) = arena.get(idx) else {
+                break;
+            };
+
+            if delta.is_visible_to_txn(snapshot_high, txn) {
+                return match delta.kind {
+                    CellDeltaKind::Delete => None,
+                    CellDeltaKind::Insert | CellDeltaKind::Update => Some(delta.cell_data.clone()),
+                };
+            }
+            current_idx = delta.prev_idx;
+        }
+
+        None
+    }
+
     /// Check if the memory budget is exceeded.
     #[must_use]
     pub fn is_over_budget(&self) -> bool {
@@ -1362,28 +1415,38 @@ impl CellVisibilityLog {
         let arena = self.arena.lock();
         let heads = shard.heads.read();
 
-        // Collect all deltas for cells on this page
+        // Collect all deltas for cells on this page. Each head chain is stored
+        // newest-to-oldest, but materialization needs same-cell deltas in
+        // chronological order. That matters when one transaction creates
+        // multiple deltas for the same cell and `commit_txn` assigns them the
+        // same commit_seq.
         for ((pgno, _key_digest), entry) in heads.iter() {
             if !pgno.eq(&page_number) {
                 continue;
             }
 
             let mut current_idx = Some(entry.head_idx);
+            let mut chain_deltas = Vec::new();
 
             // Walk the chain and collect visible deltas
             while let Some(idx) = current_idx {
                 if let Some(delta) = arena.get(idx) {
                     if delta.is_visible_to(snapshot_high) {
-                        deltas.push(delta.clone());
+                        chain_deltas.push(delta.clone());
                     }
                     current_idx = delta.prev_idx;
                 } else {
                     break;
                 }
             }
+
+            chain_deltas.reverse();
+            deltas.extend(chain_deltas);
         }
 
-        // Sort by commit_seq (ascending) so deltas are applied in order
+        // Sort by commit_seq (ascending) so deltas are applied in order.
+        // `sort_by_key` is stable, preserving the per-cell chain order restored
+        // above for equal commit sequences.
         deltas.sort_by_key(|d| d.commit_seq);
 
         trace!(
@@ -2236,6 +2299,96 @@ mod tests {
                 Some(vec![i as u8])
             );
         }
+    }
+
+    #[test]
+    fn test_resolve_for_txn_sees_own_uncommitted_chain() -> Result<(), String> {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).ok_or_else(|| "valid test page".to_owned())?;
+        let token = txn_token_n(1);
+
+        log.record_insert(cell_key, page_number, vec![1], token)
+            .ok_or_else(|| "insert should fit test budget".to_owned())?;
+        assert_eq!(
+            log.resolve(page_number, &cell_key, CommitSeq::new(10)),
+            None
+        );
+        assert_eq!(
+            log.resolve_for_txn(page_number, &cell_key, CommitSeq::new(10), token),
+            Some(vec![1])
+        );
+
+        log.record_update(cell_key, page_number, vec![2], token)
+            .ok_or_else(|| "update should fit test budget".to_owned())?;
+        assert_eq!(
+            log.resolve_for_txn(page_number, &cell_key, CommitSeq::new(10), token),
+            Some(vec![2])
+        );
+
+        log.record_delete(cell_key, page_number, token)
+            .ok_or_else(|| "delete should fit test budget".to_owned())?;
+        assert_eq!(
+            log.resolve_for_txn(page_number, &cell_key, CommitSeq::new(10), token),
+            None
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_for_txn_skips_other_uncommitted_delta() -> Result<(), String> {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).ok_or_else(|| "valid test page".to_owned())?;
+        let committed_txn = txn_token_n(1);
+        let other_txn = txn_token_n(2);
+        let reader_txn = txn_token_n(3);
+
+        log.record_insert(cell_key, page_number, vec![1], committed_txn)
+            .ok_or_else(|| "base insert should fit test budget".to_owned())?;
+        log.commit_txn(committed_txn, CommitSeq::new(10));
+        log.record_update(cell_key, page_number, vec![2], other_txn)
+            .ok_or_else(|| "other update should fit test budget".to_owned())?;
+
+        assert_eq!(
+            log.resolve_for_txn(page_number, &cell_key, CommitSeq::new(20), reader_txn),
+            Some(vec![1]),
+            "transaction-local reads must ignore another transaction's uncommitted delta"
+        );
+        assert_eq!(
+            log.resolve_for_txn(page_number, &cell_key, CommitSeq::new(20), other_txn),
+            Some(vec![2]),
+            "the writer still sees its own uncommitted delta"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_collect_visible_deltas_preserves_same_txn_cell_order() -> Result<(), String> {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).ok_or_else(|| "valid test page".to_owned())?;
+        let token = txn_token_n(1);
+
+        log.record_insert(cell_key, page_number, vec![1], token)
+            .ok_or_else(|| "insert should fit test budget".to_owned())?;
+        log.record_update(cell_key, page_number, vec![2], token)
+            .ok_or_else(|| "update should fit test budget".to_owned())?;
+        log.commit_txn(token, CommitSeq::new(10));
+
+        let deltas = log.collect_visible_deltas(page_number, CommitSeq::new(10));
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].kind, CellDeltaKind::Insert);
+        assert_eq!(deltas[0].cell_data, vec![1]);
+        assert_eq!(deltas[1].kind, CellDeltaKind::Update);
+        assert_eq!(deltas[1].cell_data, vec![2]);
+
+        Ok(())
     }
 
     #[test]

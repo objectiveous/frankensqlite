@@ -735,6 +735,56 @@ mod tests {
         cell
     }
 
+    fn materialized_table_payloads(page: &PageData) -> Result<Vec<(i64, Vec<u8>)>> {
+        let header = BtreePageHeader::parse(page.as_bytes(), 0)?;
+        let pointers = read_cell_pointers(page.as_bytes(), &header, 0)?;
+        let mut payloads = Vec::with_capacity(pointers.len());
+
+        for ptr in pointers {
+            let cell = page.as_bytes().get(ptr as usize..).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: "materialized cell pointer out of bounds".to_owned(),
+                }
+            })?;
+            let (payload_size, ps_len) =
+                fsqlite_types::serial_type::read_varint(cell).ok_or_else(|| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: "materialized cell missing payload varint".to_owned(),
+                    }
+                })?;
+            let rowid_cell = cell
+                .get(ps_len..)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "materialized cell missing rowid varint".to_owned(),
+                })?;
+            let (rowid, rowid_len) = fsqlite_types::serial_type::read_varint(rowid_cell)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "materialized cell invalid rowid varint".to_owned(),
+                })?;
+            let payload_start = ps_len + rowid_len;
+            let payload_len =
+                usize::try_from(payload_size).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: "materialized payload length exceeds usize".to_owned(),
+                })?;
+            let payload_end = payload_start.checked_add(payload_len).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: "materialized payload length overflow".to_owned(),
+                }
+            })?;
+            let payload = cell.get(payload_start..payload_end).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: "materialized payload out of bounds".to_owned(),
+                }
+            })?;
+            let rowid = i64::try_from(rowid).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: "materialized rowid exceeds i64".to_owned(),
+            })?;
+            payloads.push((rowid, payload.to_vec()));
+        }
+
+        Ok(payloads)
+    }
+
     fn encode_varint_u64(value: u64, buf: &mut [u8]) -> usize {
         encode_varint_i64(value as i64, buf)
     }
@@ -865,6 +915,59 @@ mod tests {
         // Verify the cell content is updated
         let header = BtreePageHeader::parse(result.page.as_bytes(), 0).unwrap();
         assert_eq!(header.cell_count, 1);
+    }
+
+    #[test]
+    fn test_materialize_preserves_collected_same_txn_order_for_one_cell() -> Result<()> {
+        let base = create_empty_leaf_table_page();
+        let page_no = PageNumber::new(2).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "valid test page number".to_owned(),
+        })?;
+        let log = crate::cell_visibility::CellVisibilityLog::new(1024 * 1024);
+        let btree = fsqlite_types::BtreeRef::Table(fsqlite_types::TableId::new(1));
+        let cell_key = crate::cell_visibility::CellKey::table_row(btree, 100);
+        let token = test_txn();
+
+        log.record_insert(
+            cell_key,
+            page_no,
+            create_leaf_table_cell(100, b"original"),
+            token,
+        )
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "insert should fit test budget".to_owned(),
+        })?;
+        log.record_update(
+            cell_key,
+            page_no,
+            create_leaf_table_cell(100, b"updated"),
+            token,
+        )
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "update should fit test budget".to_owned(),
+        })?;
+        log.commit_txn(token, CommitSeq::new(10));
+
+        let deltas = log.collect_visible_deltas(page_no, CommitSeq::new(10));
+        let snapshot = test_snapshot(10);
+
+        let result = materialize_page(
+            &base,
+            page_no,
+            &deltas,
+            &snapshot,
+            USABLE_SIZE,
+            MaterializationTrigger::Explicit,
+        )?;
+
+        assert_eq!(result.deltas_applied, 2);
+        assert_eq!(result.cell_count, 1);
+        assert_eq!(
+            materialized_table_payloads(&result.page)?,
+            vec![(100, b"updated".to_vec())]
+        );
+
+        Ok(())
     }
 
     #[test]

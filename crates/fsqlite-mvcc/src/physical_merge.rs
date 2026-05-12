@@ -347,9 +347,7 @@ fn parse_leaf_table_cell(
 
     let cell_bytes = &data[..cell_end];
 
-    // Compute digest using rowid as canonical key bytes (LE i64)
-    let digest =
-        SemanticKeyRef::compute_digest(SemanticKeyKind::TableRow, btree_ref, &rowid.to_le_bytes());
+    let digest = table_rowid_digest(btree_ref, rowid);
 
     Ok((cell_bytes, Some(rowid), digest))
 }
@@ -399,10 +397,19 @@ fn parse_interior_table_cell(
     let cell_end = (4 + n).min(data.len());
     let cell_bytes = &data[..cell_end];
 
-    let digest =
-        SemanticKeyRef::compute_digest(SemanticKeyKind::TableRow, btree_ref, &rowid.to_le_bytes());
+    let digest = table_rowid_digest(btree_ref, rowid);
 
     Ok((cell_bytes, Some(rowid), digest))
+}
+
+fn table_rowid_digest(btree_ref: BtreeRef, rowid: i64) -> [u8; 16] {
+    let mut key_bytes = [0u8; 10];
+    let key_len = encode_table_rowid_key(rowid, &mut key_bytes);
+    SemanticKeyRef::compute_digest(SemanticKeyKind::TableRow, btree_ref, &key_bytes[..key_len])
+}
+
+fn encode_table_rowid_key(rowid: i64, buf: &mut [u8; 10]) -> usize {
+    fsqlite_types::serial_type::write_varint(buf, rowid as u64)
 }
 
 /// Parse an interior index cell: `[4-byte left_child][varint payload_size][payload...][overflow?]`
@@ -1169,6 +1176,12 @@ mod tests {
         wi
     }
 
+    fn table_rowid_key_bytes(rowid: i64) -> Vec<u8> {
+        let mut buf = [0u8; 10];
+        let len = encode_table_rowid_key(rowid, &mut buf);
+        buf[..len].to_vec()
+    }
+
     fn table_id_1() -> TableId {
         TableId::new(1)
     }
@@ -1351,7 +1364,7 @@ mod tests {
                 writes: vec![SemanticKeyRef::new(
                     BtreeRef::Table(tid),
                     SemanticKeyKind::TableRow,
-                    &10_i64.to_le_bytes(),
+                    table_rowid_key_bytes(10).as_slice(),
                 )],
                 structural: StructuralEffects::NONE,
             },
@@ -1526,7 +1539,7 @@ mod tests {
         let expected_digest = SemanticKeyRef::compute_digest(
             SemanticKeyKind::TableRow,
             BtreeRef::Table(tid),
-            &rowid.to_le_bytes(),
+            table_rowid_key_bytes(rowid).as_slice(),
         );
 
         assert_eq!(
@@ -1538,11 +1551,35 @@ mod tests {
         let skr = SemanticKeyRef::new(
             BtreeRef::Table(tid),
             SemanticKeyKind::TableRow,
-            &rowid.to_le_bytes(),
+            table_rowid_key_bytes(rowid).as_slice(),
         );
         assert_eq!(
             parsed.cells[0].cell_key_digest, skr.key_digest,
             "parsed cell digest must match SemanticKeyRef.key_digest"
+        );
+
+        let cell_key = crate::cell_visibility::CellKey::table_row(BtreeRef::Table(tid), rowid);
+        assert_eq!(
+            parsed.cells[0].cell_key_digest, cell_key.key_digest,
+            "physical merge must use the same table-row digest as CellKey::table_row"
+        );
+    }
+
+    #[test]
+    fn test_negative_cell_key_digest_alignment_with_cell_key_table_row() {
+        let ps = default_page_size();
+        let tid = table_id_1();
+        let rowid: i64 = -42;
+
+        let page = build_leaf_table_page(&[(rowid, b"negative")], ps);
+        let parsed =
+            parse_btree_page(&page, ps, 0, false, fsqlite_types::BtreeRef::Table(tid)).unwrap();
+        let cell_key = crate::cell_visibility::CellKey::table_row(BtreeRef::Table(tid), rowid);
+
+        assert_eq!(parsed.cells.len(), 1);
+        assert_eq!(
+            parsed.cells[0].cell_key_digest, cell_key.key_digest,
+            "negative rowid digests must stay canonical across merge and cell MVCC"
         );
     }
 

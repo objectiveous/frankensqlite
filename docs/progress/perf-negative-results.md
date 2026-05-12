@@ -11262,3 +11262,33 @@ set: sessions found by
   active search without increasing flush/materialization cost and improves the
   absolute FSQLite median for the 10k-row DELETE workload in the same A/B
   window.
+
+## 2026-05-12 - Prepared direct DELETE compactness precheck
+
+- Target: `TableLeafDeleteRun::delete_rowid_with_reason` and
+  `BtCursor::table_leaf_delete_run_current` in
+  `crates/fsqlite-btree/src/cursor.rs`, after the focused DML profile showed
+  the 10k-row DELETE retained leaf active path still taking about 50 us.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`. The candidate moved the compact
+  cell-area validation from every accepted row to retained-run creation, while
+  preserving the existing flush-time materialization validation. The source
+  patch was manually unwound after the same-target focused compare failed the
+  keep gate.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-delete-compact-check-reject-20260512T0703Z/`
+  records the commands and measured baseline/candidate counters.
+- Result: rejected. The quick profile initially looked promising: 10k-row
+  DELETE FSQLite moved from `410.8 us` to `329.3 us`, and
+  `delete_leaf_active_ns` moved from `49854 ns` to `46502 ns`. However,
+  materialization/flush worsened slightly (`delete_leaf_materialize` from
+  `64/54643 ns` to `64/57550 ns`, `delete_leaf_flush_ns` from `69190 ns` to
+  `71645 ns`), and the narrow same-target compare did not confirm a reliable
+  keep: candidate FSQLite was `506 ns` per deleted row versus `529 ns` after
+  unwinding, only about a 4% absolute shift, while the delete ratio moved from
+  `1.43x` baseline to `1.46x` candidate because the C SQLite side also moved.
+- Do not retry compactness precheck hoisting as a standalone optimization.
+  Reconsider only if a future profile shows compactness rescans dominating a
+  larger fraction of the retained DELETE path and a same-window A/B improves
+  the absolute FSQLite 10k-row DELETE median by more than 10% without worsening
+  the focused compare ratio.

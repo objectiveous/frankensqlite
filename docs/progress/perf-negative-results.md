@@ -12,6 +12,34 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Current small UPDATE transaction-envelope rescreen
+
+- Target: remaining `UPDATE/DELETEThroughput`
+  `100 rows / update 10 rows` red row after the live materialized-cell count
+  fix at `a19571f8`.
+- Files/subsystems inspected: prepared direct UPDATE dispatch and same-leaf
+  fixed-width REAL patch buffering in
+  `crates/fsqlite-core/src/connection.rs`, the page-local patch run in
+  `crates/fsqlite-btree/src/cursor.rs`, and the current direct-DML negative
+  boundaries. No source patch attempted.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-update-fixed-overhead-20260512T091030Z/`.
+  The focused profiled `comprehensive-bench --quick --filter update` run
+  reported the 100-row UPDATE at `1.378x` F/C (`4.107us` C SQLite,
+  `5.661us` FrankenSQLite), with larger UPDATE rows still green
+  (`0.758x` for 1000 rows and `0.642x` for 10000 rows). The narrow
+  `perf-update-delete 100 20000 update compare` split confirmed the physical
+  mutation is not the remaining problem: standard mode stayed slower
+  (`719ns/update` FSQLite versus `424ns/update` C SQLite), while isolated mode
+  was already faster (`119ns/update` FSQLite versus `285ns/update` C SQLite).
+- Do not retry another standalone prepared direct UPDATE payload patch,
+  fixed-width REAL assignment specialization, retained direct-DML cursor,
+  prepared-lookup/background wrapper trim, or other per-mutation tweak from
+  this evidence. Reconsider only a transaction-envelope or release-boundary
+  redesign that improves the standard focused UPDATE row while preserving the
+  isolated mutation win and the full-quick primary score in the same A/B
+  window.
+
 ## 2026-05-12 - Sharded cache clean-mark elision for DML cache finish
 
 - Target: pager cache-finish tail in the remaining DML DELETE rows, especially

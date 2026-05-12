@@ -378,6 +378,44 @@ Each entry should include:
   first-committer-wins, and require a same-window focused concurrent win plus
   no 8-writer or full-quick primary-score regression.
 
+## 2026-05-12 - Active-holder early BusySnapshot probe
+
+- Target: remaining low-thread concurrent writer rows in
+  `comprehensive-bench --quick --filter concurrent`, specifically the
+  write-body page-lock wait that often precedes a stale-snapshot restart.
+- Touched during rejected candidate: `crates/fsqlite-vdbe/src/engine.rs`;
+  source was manually restored after measurement. Artifact bundle:
+  `tests/artifacts/perf/codex-concurrent-early-held-page-abort-20260512T0026/`.
+- Candidate shape: when `write_page_tier1_first_touch` or the rare tier-2
+  page-one lane saw `MvccError::Busy` from an active page-lock holder, return
+  `BusySnapshot` immediately instead of parking in
+  `wait_for_page_lock_holder_change` and retrying the same acquisition path.
+  The hypothesis was that the holder would usually commit and make the waiting
+  transaction FCW-invalid anyway.
+- Correctness/build proof before measurement:
+  - `cargo fmt --check` passed.
+  - `env CARGO_TARGET_DIR=/tmp/frankensqlite-codex-next-target CARGO_BUILD_JOBS=1 cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`
+    passed.
+- Evidence: baseline versus candidate focused concurrent profile:
+  - 2 writers: F median `14.722367 ms -> 13.673415 ms`, ratio
+    `1.209351 -> 1.195545`, page-lock waits `12 -> 0`, stale snapshots
+    `12 -> 39`, plan errors stayed `0 -> 0`.
+  - 4 writers: F median `23.577873 ms -> 42.872050 ms`, ratio
+    `1.225243 -> 2.198877`, stale snapshots `72 -> 210`, plan errors
+    `7 -> 72`.
+  - 8 writers: F median `45.963463 ms -> 125.994202 ms`, ratio
+    `0.506065 -> 1.392770`, stale snapshots `322 -> 693`, plan errors
+    `21 -> 116`.
+- Result: rejected and reverted. The holder wait is not just wasted latency; it
+  acts as admission control that prevents a storm of whole-transaction restarts
+  at 4+ writers. Preempting active holders gives a small 2-writer local win but
+  destroys the 4/8-writer rows.
+- Do not retry active-holder early `BusySnapshot`, immediate page-lock
+  preemption, or a no-wait first-touch MVCC write policy as standalone
+  optimizations. Reconsider only as part of a broader page-builder plus MVCC
+  publication representation change that avoids rebuilding the whole logical
+  transaction after preemption.
+
 ## 2026-05-11 - TransactionKind hot-method force-inline retry
 
 - Target: post-`free_page` `UPDATE/DELETEThroughput` DELETE tail after the

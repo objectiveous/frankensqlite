@@ -1208,6 +1208,12 @@ same table, non-overlapping rowid ranges):
 | 4 | `345 783` | `406 326` | `0.85x` |
 | 8 | `337 917` | `98 915` | **`3.42x`** |
 
+A May 12, 2026 follow-up `mt-mvcc-bench --rows-per-thread=1000 --threads=16
+--iters=3` shared-table recheck at commit `27d5f71d` is recorded in
+`tests/artifacts/perf/codex-mt-shared-16-recheck-27d5f71d-20260512T2032Z-iters3/mt-shared-16.json`.
+It reported `226 150` FrankenSQLite writes/sec, `29 997` C SQLite writes/sec,
+`7.54x` throughput F/C, and `0` failed rows for both engines.
+
 #### Mixed OLTP
 
 | Workload | C ms | F ms | F/C |

@@ -12,6 +12,34 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Transaction-local DML mutation boundary
+
+- Target: remaining `UPDATE/DELETEThroughput` red rows after the current
+  physical direct-DML frontier:
+  `100 rows / delete 5 rows`, `1000 rows / delete 50 rows`,
+  `10000 rows / delete 500 rows`, and `100 rows / update 10 rows`.
+- Files/subsystems inspected: no source patch. Re-read
+  `crates/fsqlite-core/src/connection.rs` direct UPDATE/DELETE and pending
+  leaf-run flush paths, `crates/fsqlite-btree/src/cursor.rs` retained delete
+  run materialization/publication, and the MVCC cell-delta support in
+  `crates/fsqlite-mvcc/src/cell_visibility.rs`,
+  `crates/fsqlite-mvcc/src/lifecycle.rs`, and
+  `crates/fsqlite-mvcc/src/materialize.rs`.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-dml-logical-mutation-boundary-20260512T100623Z/`.
+- Result: no source patch attempted. The current cell-delta scaffold can record,
+  resolve, commit, abort, and roll back transaction-local cell deltas, but the
+  core B-tree read path still observes physical page images. A commit-side-only
+  `cell_log.record_delete()` or `record_update()` hook would therefore be a
+  correctness bug: it could claim a row was changed while read-your-writes still
+  sees the old physical row until a flush/materialization boundary.
+- Do not retry another standalone physical leaf-run, page-1, direct-flush,
+  cursor-wrapper, or fixed transaction-envelope patch from this evidence.
+  Reconsider DML source work only as the broader transaction-local rowid
+  mutation operator that includes a logical read-view overlay, savepoint/abort
+  ownership, structural fallback boundaries, focused `--quick --filter update`
+  wins, and full-quick primary-score neutrality or better.
+
 ## 2026-05-12 - Normal private-memory page-1 commit skip
 
 - Target: transaction/release-boundary overhead in the remaining

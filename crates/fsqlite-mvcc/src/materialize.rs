@@ -231,6 +231,7 @@ pub fn materialize_page(
     }
 
     // Reconstruct page from working state
+    let result_cell_count = state.live_cell_count()?;
     let page = state.build_page(base, &header, header_offset, usable_size)?;
     let duration_us = start.elapsed().as_micros() as u64;
 
@@ -238,7 +239,7 @@ pub fn materialize_page(
         pgno = page_number.get(),
         base_commit_seq = 0, // base doesn't have a commit_seq
         applied_deltas = visible_deltas.len(),
-        result_cell_count = state.cells.len(),
+        result_cell_count,
         "materialization_detail"
     );
 
@@ -257,7 +258,7 @@ pub fn materialize_page(
     Ok(MaterializationResult {
         page,
         deltas_applied: visible_deltas.len(),
-        cell_count: state.cells.len() as u16,
+        cell_count: result_cell_count,
         duration_us,
     })
 }
@@ -298,6 +299,17 @@ struct WorkingPageState {
 }
 
 impl WorkingPageState {
+    fn live_cell_count(&self) -> Result<u16> {
+        let count = self
+            .cells
+            .iter()
+            .filter(|cell| !cell.content.is_empty())
+            .count();
+        u16::try_from(count).map_err(|_| FrankenError::DatabaseCorrupt {
+            detail: "materialize_page: too many live cells for b-tree page".to_owned(),
+        })
+    }
+
     /// Initialize working state from a base page.
     fn from_base_page(
         base: &PageData,
@@ -458,10 +470,14 @@ impl WorkingPageState {
         }
 
         // Build new header
+        let cell_count =
+            u16::try_from(sorted_cells.len()).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: "materialize_page: too many cells for b-tree page".to_owned(),
+            })?;
         let new_header = BtreePageHeader {
             page_type: original_header.page_type,
             first_freeblock: 0, // No freeblocks in freshly packed page
-            cell_count: sorted_cells.len() as u16,
+            cell_count,
             cell_content_offset: content_offset as u32,
             fragmented_free_bytes: 0, // No fragmentation in freshly packed page
             right_child: original_header.right_child,
@@ -550,14 +566,8 @@ fn compute_cell_key_and_sort_key(
 
 /// Compute key digest and sort key from a cell delta.
 ///
-/// # Known Limitation
-///
-/// For DELETE deltas with empty `cell_data`, this returns `([0u8; 16], SortKey::Rowid(0))`
-/// which will NOT match any actual cell. This is a design flaw in `CellDelta` which
-/// should store the `key_digest` field from the original `CellKey`.
-///
-/// Cell deltas now carry the originating `CellKey`, so DELETE operations can
-/// target the correct cell without reverse-engineering the key from cell bytes.
+/// DELETE deltas carry no cell bytes, so their sort key is only a placeholder.
+/// They still target the correct cell through the originating `CellKey` digest.
 fn compute_cell_key_and_sort_key_from_delta(
     delta: &CellDelta,
     page_type: BtreePageType,
@@ -990,9 +1000,12 @@ mod tests {
         )
         .expect("materialization should succeed");
 
-        // Delete delta has empty cell_data, so key matching won't work
-        // This tests the idempotent delete behavior
         assert_eq!(result.deltas_applied, 2);
+        assert_eq!(result.cell_count, 0);
+        assert_eq!(
+            materialized_table_payloads(&result.page).unwrap(),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -1017,7 +1030,8 @@ mod tests {
                 25 + i as u64,
             ));
         }
-        // 3 deletes (these will be no-op due to key matching issue)
+        // Three deletes against the same row: the first removes it, the rest
+        // are idempotent.
         for _ in 0..3 {
             deltas.push(create_delta_delete(35));
         }
@@ -1035,8 +1049,9 @@ mod tests {
         .expect("materialization should succeed");
 
         assert_eq!(result.deltas_applied, 28);
-        // All 20 cells should still exist (deletes don't match without proper key)
-        assert_eq!(result.cell_count, 20);
+        assert_eq!(result.cell_count, 19);
+        let payloads = materialized_table_payloads(&result.page).unwrap();
+        assert!(!payloads.iter().any(|(rowid, _)| *rowid == 100));
     }
 
     #[test]

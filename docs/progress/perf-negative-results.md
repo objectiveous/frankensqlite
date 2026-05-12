@@ -12,6 +12,39 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Current DML/Vendored SQLite DELETE boundary refresh
+
+- Target: remaining `UPDATE/DELETEThroughput` DELETE red rows after
+  `bacda261`, plus a fresh check against the vendored C SQLite delete path.
+- Files/subsystems inspected: FrankenSQLite prepared direct DELETE and retained
+  leaf-run code in `crates/fsqlite-core/src/connection.rs` and
+  `crates/fsqlite-btree/src/cursor.rs`; C SQLite `OP_Delete` and
+  `sqlite3BtreeDelete` in `legacy_sqlite_code/sqlite/src/vdbe.c` and
+  `legacy_sqlite_code/sqlite/src/btree.c`. Agent Mail reservation could not be
+  obtained because both `macro_start_session` and `health_check` timed out
+  under database contention, so this docs/artifact edit was kept narrow.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-dml-profile-20260512T0125/` and
+  `tests/artifacts/perf/codex-current-dml-boundary-20260512T0128/`.
+- Result: no source patch attempted. The current profile reports DELETE ratios
+  of `3.01x`, `1.81x`, and `1.41x` slower for the 5/50/500-row DELETE cases,
+  all on the prepared direct path (`slow=0`). The 500-row case still spends
+  time across same-leaf active deletion, per-leaf flush/materialization, and
+  commit publication (`delete_leaf_active=433/496`,
+  `delete_leaf_flush=64/64`, `delete_leaf_materialize=64/62093`). Vendored C
+  SQLite's delete path preserves positioned cursor state through
+  `BTREE_SAVEPOSITION` / `CURSOR_SKIPNEXT` when balancing permits, but the
+  comparable FrankenSQLite retained-cursor / `BtCursor::advance_to` family is
+  already rejected by the `2026-05-08 - Retained direct-DML cursor shell` entry
+  and its descendants.
+- Do not retry another standalone cursor-preservation, retained leaf-run,
+  flush-materializer, direct-writer, rowid-bound, or next-cell DELETE tweak from
+  this boundary. Reconsider only as the broader transaction-local DML mutation
+  operator that removes the per-leaf mutation/publication ceremony while
+  proving read-your-writes, rollback/savepoint, duplicate/missing rowid, schema
+  drift, quotient-filter/cache invalidation, MVCC publication, focused DELETE
+  wins, and full-quick primary-score neutrality or better.
+
 ## 2026-05-12 - Preserialized INSERT row-scratch borrow deferral
 
 - Target: remaining fixed overhead in the 100-row `INSERTThroughput` tails,

@@ -1468,6 +1468,61 @@ impl CellVisibilityLog {
         page_number: PageNumber,
         snapshot_high: CommitSeq,
     ) -> Vec<CellDelta> {
+        let deltas =
+            self.collect_page_deltas(page_number, |delta| delta.is_visible_to(snapshot_high));
+
+        trace!(
+            pgno = page_number.get(),
+            snapshot_high = snapshot_high.get(),
+            delta_count = deltas.len(),
+            "collected_visible_deltas"
+        );
+
+        deltas
+    }
+
+    /// Collect all deltas visible to a transaction-local read view.
+    ///
+    /// Committed deltas obey `snapshot_high`; uncommitted deltas are included
+    /// only when they were created by `txn`. Own uncommitted deltas are assigned
+    /// synthetic commit sequence numbers after the snapshot so callers can feed
+    /// the returned list directly to `materialize_page()`.
+    #[must_use]
+    pub fn collect_visible_deltas_for_txn(
+        &self,
+        page_number: PageNumber,
+        snapshot_high: CommitSeq,
+        txn: TxnToken,
+    ) -> Vec<CellDelta> {
+        let mut deltas = self.collect_page_deltas(page_number, |delta| {
+            delta.is_visible_to_txn(snapshot_high, txn)
+        });
+
+        let mut synthetic_seq = snapshot_high.get().saturating_add(1);
+        for delta in &mut deltas {
+            if delta.commit_seq.get() == 0 && delta.created_by.eq(&txn) {
+                delta.commit_seq = CommitSeq::new(synthetic_seq);
+                synthetic_seq = synthetic_seq.saturating_add(1);
+            }
+        }
+        deltas.sort_by_key(|d| d.commit_seq);
+
+        trace!(
+            pgno = page_number.get(),
+            snapshot_high = snapshot_high.get(),
+            txn_id = txn.id.get(),
+            delta_count = deltas.len(),
+            "collected_visible_deltas_for_txn"
+        );
+
+        deltas
+    }
+
+    fn collect_page_deltas(
+        &self,
+        page_number: PageNumber,
+        mut include_delta: impl FnMut(&CellDelta) -> bool,
+    ) -> Vec<CellDelta> {
         let shard_idx = Self::shard_index(page_number);
         let shard = &self.shards[shard_idx];
 
@@ -1492,7 +1547,7 @@ impl CellVisibilityLog {
             // Walk the chain and collect visible deltas
             while let Some(idx) = current_idx {
                 if let Some(delta) = arena.get(idx) {
-                    if delta.is_visible_to(snapshot_high) {
+                    if include_delta(delta) {
                         chain_deltas.push(delta.clone());
                     }
                     current_idx = delta.prev_idx;
@@ -1509,13 +1564,6 @@ impl CellVisibilityLog {
         // `sort_by_key` is stable, preserving the per-cell chain order restored
         // above for equal commit sequences.
         deltas.sort_by_key(|d| d.commit_seq);
-
-        trace!(
-            pgno = page_number.get(),
-            snapshot_high = snapshot_high.get(),
-            delta_count = deltas.len(),
-            "collected_visible_deltas"
-        );
 
         deltas
     }
@@ -1821,23 +1869,7 @@ pub const fn will_be_logical_delete(current_cell_count: u16) -> bool {
 ///
 /// Returns the number of bytes written.
 fn encode_varint_i64(value: i64, buf: &mut [u8; 10]) -> usize {
-    // SQLite uses unsigned varints, so cast to u64
-    let uval = value as u64;
-    encode_varint_u64(uval, buf)
-}
-
-/// Encode a u64 as a SQLite-style varint.
-fn encode_varint_u64(mut value: u64, buf: &mut [u8; 10]) -> usize {
-    let mut i = 0;
-    loop {
-        if value <= 0x7f {
-            buf[i] = value as u8;
-            return i + 1;
-        }
-        buf[i] = ((value & 0x7f) | 0x80) as u8;
-        value >>= 7;
-        i += 1;
-    }
+    fsqlite_types::serial_type::write_varint(buf, value as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -1864,6 +1896,19 @@ mod tests {
         assert_ne!(
             key1.key_digest, key3.key_digest,
             "Different rowid = different digest"
+        );
+
+        let mut canonical = [0_u8; 10];
+        let canonical_len = fsqlite_types::serial_type::write_varint(&mut canonical, 4242);
+        let expected = CellKey::from_semantic_ref(&SemanticKeyRef::new(
+            btree,
+            SemanticKeyKind::TableRow,
+            &canonical[..canonical_len],
+        ));
+        assert_eq!(
+            CellKey::table_row(btree, 4242).key_digest,
+            expected.key_digest,
+            "table row keys must use SQLite varint canonical bytes"
         );
     }
 
@@ -2469,6 +2514,42 @@ mod tests {
         assert_eq!(deltas[0].cell_data, vec![1]);
         assert_eq!(deltas[1].kind, CellDeltaKind::Update);
         assert_eq!(deltas[1].cell_data, vec![2]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_collect_visible_deltas_for_txn_replays_own_delta_after_snapshot() -> Result<(), String>
+    {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).ok_or_else(|| "valid test page".to_owned())?;
+        let committed_txn = txn_token_n(1);
+        let writer_txn = txn_token_n(2);
+        let other_txn = txn_token_n(3);
+
+        log.record_insert(cell_key, page_number, vec![1], committed_txn)
+            .ok_or_else(|| "committed insert should fit test budget".to_owned())?;
+        log.commit_txn(committed_txn, CommitSeq::new(10));
+        log.record_update(cell_key, page_number, vec![2], other_txn)
+            .ok_or_else(|| "other update should fit test budget".to_owned())?;
+        log.record_update(cell_key, page_number, vec![3], writer_txn)
+            .ok_or_else(|| "own update should fit test budget".to_owned())?;
+
+        let deltas =
+            log.collect_visible_deltas_for_txn(page_number, CommitSeq::new(10), writer_txn);
+
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].kind, CellDeltaKind::Insert);
+        assert_eq!(deltas[0].commit_seq, CommitSeq::new(10));
+        assert_eq!(deltas[0].cell_data, vec![1]);
+        assert_eq!(deltas[1].kind, CellDeltaKind::Update);
+        assert!(
+            deltas[1].commit_seq > CommitSeq::new(10),
+            "own uncommitted delta must replay after the snapshot"
+        );
+        assert_eq!(deltas[1].cell_data, vec![3]);
 
         Ok(())
     }

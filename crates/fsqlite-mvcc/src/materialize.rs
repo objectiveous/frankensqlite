@@ -655,23 +655,7 @@ fn compute_cell_end(
 
 /// Encode an i64 as a SQLite varint.
 fn encode_varint_i64(value: i64, buf: &mut [u8]) -> usize {
-    let mut v = value as u64;
-    let mut i = 0;
-
-    // SQLite varint encoding
-    if v <= 0x7F {
-        buf[0] = v as u8;
-        return 1;
-    }
-
-    // Multi-byte encoding
-    while v > 0x7F {
-        buf[i] = (v & 0x7F) as u8 | 0x80;
-        v >>= 7;
-        i += 1;
-    }
-    buf[i] = v as u8;
-    i + 1
+    fsqlite_types::serial_type::write_varint(buf, value as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -925,6 +909,41 @@ mod tests {
         // Verify the cell content is updated
         let header = BtreePageHeader::parse(result.page.as_bytes(), 0).unwrap();
         assert_eq!(header.cell_count, 1);
+    }
+
+    #[test]
+    fn test_materialize_updates_existing_multi_byte_rowid_base_cell() {
+        let base = create_empty_leaf_table_page();
+        let page_no = PageNumber::new(2).unwrap();
+        let original_payload = vec![b'a'; 130];
+        let updated_payload = vec![b'b'; 131];
+
+        let initial = materialize_page(
+            &base,
+            page_no,
+            &[create_delta_insert(4242, &original_payload, 5)],
+            &test_snapshot(5),
+            USABLE_SIZE,
+            MaterializationTrigger::Explicit,
+        )
+        .expect("initial materialization should succeed");
+
+        let result = materialize_page(
+            &initial.page,
+            page_no,
+            &[create_delta_update(4242, &updated_payload, 10)],
+            &test_snapshot(10),
+            USABLE_SIZE,
+            MaterializationTrigger::Explicit,
+        )
+        .expect("update materialization should succeed");
+
+        assert_eq!(result.deltas_applied, 1);
+        assert_eq!(result.cell_count, 1);
+        assert_eq!(
+            materialized_table_payloads(&result.page).unwrap(),
+            vec![(4242, updated_payload)]
+        );
     }
 
     #[test]

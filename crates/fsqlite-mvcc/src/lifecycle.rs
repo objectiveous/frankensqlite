@@ -30,6 +30,7 @@ use crate::core_types::{
 };
 use crate::ebr::{GLOBAL_EBR_METRICS, VersionGuardRegistry, VersionGuardTicket};
 use crate::invariants::{SerializedWriteMutex, TxnManager, VersionStore};
+use crate::materialize::{MaterializationTrigger, materialize_page};
 use crate::observability::{mvcc_snapshot_established, mvcc_snapshot_released};
 use crate::shm::SharedMemoryLayout;
 
@@ -134,7 +135,7 @@ fn read_proc_start_time_ticks(pid: u32) -> Option<u64> {
     tail.split_whitespace().nth(19)?.parse::<u64>().ok()
 }
 
-fn current_process_birth_token(now_fallback: u64) -> u64 {
+fn current_process_birth_marker(now_fallback: u64) -> u64 {
     #[cfg(unix)]
     {
         if !std::path::Path::new("/proc").exists() {
@@ -795,6 +796,52 @@ impl TransactionManager {
             .resolve_visible_version(pgno, &txn.snapshot)?;
         txn.record_page_read(pgno, version.commit_seq);
         Some(version.data)
+    }
+
+    /// Read a page and apply visible cell-level deltas before returning it.
+    ///
+    /// This is the read-view primitive needed by logical DML: committed cell
+    /// deltas obey the transaction snapshot, while this transaction's own
+    /// uncommitted cell deltas replay after that snapshot. A staged full-page
+    /// write-set image remains authoritative and is returned unchanged.
+    pub fn read_page_with_cell_deltas(
+        &self,
+        txn: &mut Transaction,
+        pgno: PageNumber,
+        usable_size: u32,
+    ) -> fsqlite_error::Result<Option<PageData>> {
+        let staged_full_page = txn.write_set_data.contains_key(&pgno);
+        let Some(base_page) = self.read_page(txn, pgno) else {
+            return Ok(None);
+        };
+
+        if staged_full_page || !self.cell_log.page_has_deltas(pgno) {
+            return Ok(Some(base_page));
+        }
+
+        let deltas =
+            self.cell_log
+                .collect_visible_deltas_for_txn(pgno, txn.snapshot.high, txn.token());
+        if deltas.is_empty() {
+            return Ok(Some(base_page));
+        }
+
+        let materialized_high = deltas
+            .iter()
+            .map(|delta| delta.commit_seq)
+            .max()
+            .unwrap_or(txn.snapshot.high);
+        let materialized_snapshot = Snapshot::new(materialized_high, txn.snapshot.schema_epoch);
+        let result = materialize_page(
+            &base_page,
+            pgno,
+            &deltas,
+            &materialized_snapshot,
+            usable_size,
+            MaterializationTrigger::Explicit,
+        )?;
+
+        Ok(Some(result.page))
     }
 
     /// Record a range scan witness/read-set footprint for a transaction.
@@ -1802,7 +1849,7 @@ impl TransactionManager {
         // Step 2: Clear stale indicator if needed, then publish indicator.
         let now = logical_now_epoch_secs();
         let pid = std::process::id();
-        let pid_birth = current_process_birth_token(now);
+        let pid_birth = current_process_birth_marker(now);
         let lease_expiry = now.saturating_add(self.serialized_writer_lease_secs);
 
         // If a serialized-writer token is present and not stale, treat as BUSY.
@@ -2008,6 +2055,79 @@ mod tests {
         let mut data = PageData::zeroed(PageSize::DEFAULT);
         data.as_bytes_mut()[0] = byte;
         data
+    }
+
+    fn empty_leaf_table_page() -> PageData {
+        let mut page = vec![0_u8; PageSize::DEFAULT.as_usize()];
+        page[0] = fsqlite_btree::BtreePageType::LeafTable as u8;
+        page[5..7].copy_from_slice(
+            &u16::try_from(PageSize::DEFAULT.get())
+                .expect("default page size fits u16")
+                .to_be_bytes(),
+        );
+        PageData::from_vec(page)
+    }
+
+    fn leaf_table_cell(rowid: i64, payload: &[u8]) -> Vec<u8> {
+        let mut cell = Vec::with_capacity(payload.len() + 20);
+        let mut varint = [0_u8; 10];
+        let payload_len = fsqlite_types::serial_type::write_varint(
+            &mut varint,
+            u64::try_from(payload.len()).expect("test payload length fits u64"),
+        );
+        cell.extend_from_slice(&varint[..payload_len]);
+        let rowid_len = fsqlite_types::serial_type::write_varint(&mut varint, rowid as u64);
+        cell.extend_from_slice(&varint[..rowid_len]);
+        cell.extend_from_slice(payload);
+        cell
+    }
+
+    fn materialized_table_payloads(page: &PageData) -> fsqlite_error::Result<Vec<(i64, Vec<u8>)>> {
+        let header = fsqlite_btree::BtreePageHeader::parse(page.as_bytes(), 0)?;
+        let pointers = fsqlite_btree::read_cell_pointers(page.as_bytes(), &header, 0)?;
+        let mut payloads = Vec::with_capacity(pointers.len());
+
+        for ptr in pointers {
+            let cell = page.as_bytes().get(ptr as usize..).ok_or_else(|| {
+                fsqlite_error::FrankenError::DatabaseCorrupt {
+                    detail: "materialized cell pointer out of bounds".to_owned(),
+                }
+            })?;
+            let (payload_size, payload_size_len) = fsqlite_types::serial_type::read_varint(cell)
+                .ok_or_else(|| fsqlite_error::FrankenError::DatabaseCorrupt {
+                    detail: "materialized cell missing payload varint".to_owned(),
+                })?;
+            let (rowid, rowid_len) = fsqlite_types::serial_type::read_varint(
+                &cell[payload_size_len..],
+            )
+            .ok_or_else(|| fsqlite_error::FrankenError::DatabaseCorrupt {
+                detail: "materialized cell missing rowid varint".to_owned(),
+            })?;
+            let payload_start = payload_size_len + rowid_len;
+            let payload_len = usize::try_from(payload_size).map_err(|_| {
+                fsqlite_error::FrankenError::DatabaseCorrupt {
+                    detail: "materialized payload length exceeds usize".to_owned(),
+                }
+            })?;
+            let payload_end = payload_start.checked_add(payload_len).ok_or_else(|| {
+                fsqlite_error::FrankenError::DatabaseCorrupt {
+                    detail: "materialized payload length overflow".to_owned(),
+                }
+            })?;
+            let payload = cell.get(payload_start..payload_end).ok_or_else(|| {
+                fsqlite_error::FrankenError::DatabaseCorrupt {
+                    detail: "materialized payload out of bounds".to_owned(),
+                }
+            })?;
+            payloads.push((
+                i64::try_from(rowid).map_err(|_| fsqlite_error::FrankenError::DatabaseCorrupt {
+                    detail: "materialized rowid exceeds i64".to_owned(),
+                })?,
+                payload.to_vec(),
+            ));
+        }
+
+        Ok(payloads)
     }
 
     fn test_i64(v: i64) -> PageData {
@@ -2767,7 +2887,7 @@ mod tests {
     #[test]
     fn test_process_alive_os_rejects_tagged_birth_mismatch() {
         let pid = std::process::id();
-        let birth = current_process_birth_token(logical_now_epoch_secs());
+        let birth = current_process_birth_marker(logical_now_epoch_secs());
         if birth & PID_BIRTH_PROCFS_TAG == 0 {
             return;
         }
@@ -6246,13 +6366,21 @@ mod tests {
                                 Err(MvccError::BusySnapshot) => {
                                     std::thread::yield_now();
                                 }
-                                Err(err) => panic!("unexpected commit error: {err:?}"),
+                                Err(err) => {
+                                    assert_eq!(
+                                        err,
+                                        MvccError::BusySnapshot,
+                                        "unexpected commit error"
+                                    );
+                                }
                             },
                             Err(MvccError::Busy) => {
                                 mgr_clone.abort(&mut txn);
                                 std::thread::yield_now();
                             }
-                            Err(err) => panic!("unexpected write error: {err:?}"),
+                            Err(err) => {
+                                assert_eq!(err, MvccError::Busy, "unexpected write error");
+                            }
                         }
                     }
                 }
@@ -6347,7 +6475,9 @@ mod tests {
             match mgr.commit(&mut writer) {
                 Ok(_) => commits_in_soft_range += 1,
                 Err(MvccError::Busy) => break,
-                Err(other) => panic!("unexpected commit error: {other:?}"),
+                Err(other) => {
+                    assert_eq!(other, MvccError::Busy, "unexpected commit error");
+                }
             }
         }
 
@@ -6393,7 +6523,9 @@ mod tests {
                     saw_busy = true;
                     break;
                 }
-                Err(other) => panic!("unexpected commit error: {other:?}"),
+                Err(other) => {
+                    assert_eq!(other, MvccError::Busy, "unexpected commit error");
+                }
             }
         }
 
@@ -6770,6 +6902,86 @@ mod tests {
             indexed_seq, commit_seq,
             "commit_index should have correct commit_seq"
         );
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_materializes_committed_delta() -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4242;
+        let payload = vec![b'c'; 130];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).expect("writer begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                writer.token(),
+            )
+            .expect("logical insert should fit budget");
+        writer.write_set.push(pgno);
+        mgr.commit(&mut writer).expect("logical commit");
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("page should be visible");
+
+        assert_eq!(materialized_table_payloads(&page)?, vec![(rowid, payload)]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_materializes_own_uncommitted_delta()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4243;
+        let payload = vec![b'l'; 131];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                txn.token(),
+            )
+            .expect("logical insert should fit budget");
+
+        let page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("page should be visible");
+
+        assert_eq!(
+            materialized_table_payloads(&page)?,
+            vec![(rowid, payload)],
+            "transaction-local read view must replay this txn's own uncommitted delta"
+        );
+
+        Ok(())
     }
 
     #[test]

@@ -12,6 +12,39 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Current DML profile after shared-table retry fix
+
+- Target: current `UPDATE/DELETEThroughput` rows after the shared-table retry
+  fix and current frontier artifact, with profiling enabled to decide whether
+  any pure-DELETE-only logical staging shortcut was safe to attempt.
+- Files/subsystems inspected: no source patch. Re-read direct UPDATE/DELETE
+  execution and pending write-run flush boundaries in
+  `crates/fsqlite-core/src/connection.rs`, retained table leaf delete runs in
+  `crates/fsqlite-btree/src/cursor.rs`, and the benchmark DML statement shape
+  in `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-dml-current-profile-after-mtfix-20260512T1230Z/`.
+  This run used a fresh target directory after the docs-only `78728d45` commit,
+  so `benchmark_binary_older_than_git_head=false`. Ignore the earlier
+  `tests/artifacts/perf/codex-dml-current-profile-after-mtfix-20260512T1220Z/`
+  scratch run because it intentionally used a stale binary and was not staged.
+- Result: no source patch attempted. The valid profile reported DML ratios of
+  `3.1208x`, `2.3493x`, and `1.6737x` F/C for the 5/50/500 DELETE rows and
+  `1.3738x`, `0.7559x`, and `0.6195x` for the 10/100/1000 UPDATE rows. The
+  500-delete row stayed fully direct (`fast=500`, `slow=0`) and still paid
+  `delete_seek_ns=33931`, `delete_leaf_active_ns=49953`,
+  `delete_leaf_flush_ns=52448`, `delete_leaf_materialize=64/39044`, and
+  `delete_leaf_write=64/7902`.
+- Do not retry a pure logical-delete staging shortcut as a standalone patch.
+  `execute()` must return each statement's affected-row count immediately, so a
+  staging-only DELETE still needs row-existence/duplicate handling unless it
+  also supplies the broader transaction-local read-view and affected-row
+  overlay. Any deferred representation would also need to flush before reads,
+  inserts, updates, savepoints, and incompatible writes. Reconsider only as the
+  broader transaction-local DML mutation/read-view operator with correctness
+  tests for affected rows, read-your-writes, rollback/savepoints, duplicate
+  rowids, and focused/fullquick benchmark wins.
+
 ## 2026-05-12 - Current fullquick frontier after shared-table retry fix
 
 - Target: current `comprehensive-bench --quick` frontier after

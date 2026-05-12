@@ -6985,6 +6985,54 @@ mod tests {
     }
 
     #[test]
+    fn test_read_page_with_cell_deltas_materializes_own_uncommitted_delete()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4244;
+        let payload = vec![b'd'; 132];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).expect("writer begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                writer.token(),
+            )
+            .expect("logical insert should fit budget");
+        writer.write_set.push(pgno);
+        mgr.commit(&mut writer).expect("logical commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        mgr.cell_log()
+            .record_delete(cell_key, pgno, txn.token())
+            .expect("logical delete should fit budget");
+
+        let page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("page should be visible");
+
+        assert_eq!(
+            materialized_table_payloads(&page)?,
+            Vec::<(i64, Vec<u8>)>::new(),
+            "transaction-local read view must replay this txn's own uncommitted delete"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_commit_mixed_structural_and_logical_pages() {
         // C4 test: Transaction with both structural and logical pages routes correctly
         use crate::cell_visibility::CellKey;

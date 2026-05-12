@@ -12,6 +12,37 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - DELETE materializer `as_bytes_mut` borrow hoist
+
+- Target: `UPDATE/DELETEThroughput` DELETE rows, especially
+  `1000 rows / delete 50 rows` and `10000 rows / delete 500 rows`, after the
+  sparse DELETE CPU profile showed `PageData::as_bytes_mut` in the hot region.
+- Files/subsystems touched: temporary one-line source candidate in
+  `crates/fsqlite-btree/src/cursor.rs`,
+  `TableLeafDeleteRun::materialize_deletions_incremental_descending`, hoisting
+  `self.entry.page_data.as_bytes_mut()` out of the deleted-cell loop and reusing
+  it for final header/pointer writes. The source patch was reverted.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-delete-as-bytes-mut-hoist-candidate-20260512T1500Z/`.
+  Targeted proof passed:
+  `cargo test -p fsqlite-btree test_table_leaf_delete_run -- --nocapture --test-threads=1`.
+  The release-perf candidate build used dirty head `ed0c7913`, where the only
+  Rust source change was this candidate.
+- Result: rejected. Compared with the committed repeat baseline
+  `tests/artifacts/perf/codex-current-dml-refresh-after-insert-frontier-20260512T1615Z/dml-repeat.json`,
+  the candidate repeat improved the tiny `100 rows / delete 5 rows` F median
+  from `0.008967ms` to `0.006993ms`, but that row had `132.9%` F CV and did not
+  represent a stable matrix win. The key larger DELETE rows did not improve:
+  `1000 rows / delete 50 rows` was flat at `0.028724ms` versus `0.028714ms`,
+  and `10000 rows / delete 500 rows` regressed to `0.276948ms` versus
+  `0.258423ms`. Overall repeat geomean F/C worsened from `1.3229800457` to
+  `1.3974486211`.
+- Do not retry this exact borrow-hoist micro-patch. Reconsider only if a new
+  profile isolates `PageData::as_bytes_mut` entry overhead as dominant by
+  itself; current evidence still points at the broader physical DELETE
+  materialization/page-allocation boundary or the larger transaction-local DML
+  mutation operator.
+
 ## 2026-05-12 - Sparse DELETE delayed CPU profile
 
 - Target: `perf-update-delete 10000 1000 delete fsqlite sparse-isolated`, to

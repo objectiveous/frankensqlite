@@ -12,6 +12,31 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Direct UPDATE/DELETE microbatch carry
+
+- Target: `UPDATE/DELETEThroughput` direct-simple prepared UPDATE/DELETE rows,
+  especially the remaining 5/50/500-row DELETE tail after the retained
+  same-leaf delete-run work.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The candidate let the prepared-DML
+  microbatch carry ignore the conservative `may_observe_change_tracking` flag
+  for direct-simple UPDATE/DELETE, then used that carry in the programless
+  direct UPDATE/DELETE path. The source patch was manually unwound after the
+  exact DML section failed the keep gate.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-dml-direct-ud-microbatch-carry-20260512T0009/`.
+  The baseline reference is
+  `tests/artifacts/perf/codex-dml-frontier-repeat-20260511Tnext/summary.md`.
+- Result: rejected. The candidate reduced the intended ceremony
+  (`schema_refreshes=1` in the DML profile), but the exact quick DML section did
+  not improve reliably. Versus the baseline, run 1 improved the 100-row UPDATE
+  and DELETE ratios but regressed 1000/10000 UPDATE and 10000 DELETE; run 2
+  regressed 1000 DELETE to `2.30021x` and 10000 DELETE to `1.76931x`.
+- Do not retry direct-simple UPDATE/DELETE microbatch carry as a standalone
+  patch. Reconsider only inside the broader transaction-local DML mutation
+  operator if a same-window A/B improves all focused DML medians and the full
+  quick matrix stays neutral or better.
+
 ## 2026-05-11 - Rejected 5-row compact DELETE single-pass threshold
 
 - Target: current retained compact same-leaf DELETE materializer, especially

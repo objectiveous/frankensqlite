@@ -12,6 +12,35 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Direct UPDATE active patch-run early continuation
+
+- Target: `UPDATE/DELETEThroughput`, especially the remaining red
+  `100 rows / update 10 rows` shape after
+  `tests/artifacts/perf/codex-current-dml-profile-a7635094-20260512T2005Z/`
+  showed direct fixed-width REAL UPDATE already bypassing VDBE and record
+  decode.
+- Files/subsystems touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The abandoned patch tried to
+  continue an active pending fixed-width REAL update leaf patch run before
+  constructing per-statement lookaside/scratch guards and before checking
+  unrelated pending insert/delete runs, gated on no pending insert/delete run
+  being active. The source patch was manually unwound before commit.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-update-active-patch-early-continuation-20260512T2045Z/`.
+  Targeted proof passed:
+  `cargo test -p fsqlite-core direct_simple_update -- --nocapture`.
+- Result: rejected. The candidate failed the same-window focused DML keep gate.
+  Candidate FSQLite medians worsened against the current baseline: `100 rows /
+  update 10 rows` moved from `6.322us` to `10.941us`, `1000 rows / update 100
+  rows` moved from `29.204us` to `32.230us`, and `10000 rows / update 1000
+  rows` moved from `254.166us` to `310.942us`. DELETE rows also worsened in the
+  same run. The candidate output had high CV on several rows, but the direct F
+  medians are enough to reject it.
+- Do not retry moving active update patch-run continuation ahead of the normal
+  guard/flush prelude as a standalone micro-patch. Reconsider only as part of a
+  broader direct DML batch/mutation operator with same-window focused UPDATE
+  wins and fullquick neutrality or better.
+
 ## 2026-05-12 - Retained DELETE local-payload validation fast path
 
 - Target: `UPDATE/DELETEThroughput` DELETE rows after

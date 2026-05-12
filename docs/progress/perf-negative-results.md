@@ -12,6 +12,33 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Current INSERT rescreen after DELETE mode pass
+
+- Target: current `INSERTThroughput` rows after the DELETE mode rescreen, to
+  check whether the 100-row INSERT tail opened a new unfenced source lever at
+  the current head.
+- Files/subsystems inspected: no source patch. Re-read the current focused
+  INSERT profile, representative direct INSERT counters, and the prior INSERT
+  rejects in this ledger.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-insert-current-profile-after-delete-rescreen-20260512T1545Z/`.
+  The valid run used current head `54c3e5b3` with
+  `git_dirty=false` and `benchmark_binary_older_than_git_head=false`.
+- Result: no source patch attempted. The focused matrix reported 25 scenarios
+  with FrankenSQLite faster / comparable / C-SQLite-faster at `17 / 2 / 6`,
+  geomean F/C `0.8221663401`, and focused weighted score `0.8078101733`.
+  Rows above `1.0x` F/C stayed in the 100-row fixed-cost INSERT family:
+  `tiny_1col` `1.6178x`, `small_3col` strategy single-txn `1.1250x`,
+  `large_10col` `1.1200x`, `small_3col` single-txn `1.1086x`,
+  `small_3col` batched `1.1020x`, and `medium_6col` `1.0565x`.
+  The `tiny_1col` spike had `25.40%` FrankenSQLite CV and conflicts with the
+  prior focused/fullquick runs where the same row was near parity, so it is not
+  a standalone source target.
+- Do not retry another narrow 100-row INSERT trim from this rescreen. Reconsider
+  only with a broader fused row/body/page construction design that proves
+  same-window focused INSERT wins and fullquick primary-score neutrality or
+  better.
+
 ## 2026-05-12 - Current DELETE standard/isolated/sparse rescreen
 
 - Target: remaining `UPDATE/DELETEThroughput` DELETE rows after the current

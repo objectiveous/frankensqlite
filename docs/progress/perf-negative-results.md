@@ -12,6 +12,41 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Direct DELETE cell-log hook boundary
+
+- Target: remaining `UPDATE/DELETEThroughput` DELETE red rows, specifically
+  whether the existing cell-level MVCC scaffolding could be used as the first
+  narrow slice of the broader transaction-local DML mutation operator.
+- Files/subsystems inspected: prepared direct DELETE and pending leaf-run
+  flushing in `crates/fsqlite-core/src/connection.rs`; retained same-leaf
+  DELETE materialization in `crates/fsqlite-btree/src/cursor.rs`;
+  `SharedTxnPageIo` in `crates/fsqlite-vdbe/src/engine.rs`;
+  `TransactionPageIo` in `crates/fsqlite-btree/src/cursor.rs`; and the
+  cell-level MVCC scaffolding in `crates/fsqlite-mvcc/src/cell_visibility.rs`,
+  `crates/fsqlite-mvcc/src/lifecycle.rs`,
+  `crates/fsqlite-mvcc/src/materialize.rs`, and
+  `crates/fsqlite-mvcc/src/cell_routing.rs`.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-head-dml-profile-20260512T0208/` and
+  `tests/artifacts/perf/codex-current-head-dml-celllog-boundary-20260512T0208/`.
+- Result: no source patch attempted. The refreshed focused profile still keeps
+  every DELETE on the prepared direct path (`slow=0`) and reports 5/50/500-row
+  DELETE ratios of `4.489x`, `1.726x`, and `1.603x` slower. The 500-row row
+  still has the retained leaf-run signature
+  (`delete_leaf_active=433/496`, `delete_leaf_flush=64/64`,
+  `delete_leaf_materialize=64/71452`). The existing `CellVisibilityLog` can
+  record deltas and lifecycle tests can manually publish logical pages to
+  `commit_index`, but live B-tree page reads do not resolve cell deltas and the
+  page I/O traits do not expose a safe logical-delete operation. A direct
+  `cell_log.record_delete()` hook would therefore report affected rows while
+  leaving read-your-writes, savepoint/rollback, later scans, and materialized
+  commit surfaces incomplete.
+- Do not retry a standalone prepared direct DELETE cell-log hook. Reconsider
+  only as the full transaction-local DML mutation operator with an integrated
+  materialized read view, rollback/savepoint delta ownership, quotient-filter
+  and count-cache invalidation, logical-page `commit_index` publication, focused
+  DELETE wins, and full-quick primary-score neutrality or better.
+
 ## 2026-05-12 - Current DML/Vendored SQLite DELETE boundary refresh
 
 - Target: remaining `UPDATE/DELETEThroughput` DELETE red rows after

@@ -12,6 +12,35 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Current INSERT profile after shared-table retry fix
+
+- Target: current `INSERTThroughput` focused rows after the shared-table retry
+  fix and current DML boundary artifact, with profiling enabled to decide
+  whether the remaining 100-row fixed-cost rows exposed a new unfenced source
+  lever.
+- Files/subsystems inspected: no source patch. Re-read the current focused
+  INSERT output, representative profile counters, and prior INSERT rejects in
+  this ledger.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-insert-current-profile-after-mtfix-20260512T1240Z/`.
+  This run used a fresh target directory at `88bfb5bc`, so
+  `benchmark_binary_older_than_git_head=false`.
+- Result: no source patch attempted. The valid focused matrix reported 25
+  scenarios with FrankenSQLite faster / comparable / C-SQLite-faster at
+  `18 / 2 / 5`, geomean F/C `0.8001131959`, and focused weighted score
+  `0.8051996787`. Rows above `1.0x` F/C were all 100-row fixed-cost INSERT
+  cases: `small_3col` single-txn `1.1085x`, `medium_6col` single-txn
+  `1.0982x`, `small_3col` batched `1.0970x`, `small_3col` strategy single-txn
+  `1.0916x`, `large_10col` single-txn `1.0910x`, and `tiny_1col` single-txn
+  `1.0215x`.
+- Do not retry standalone INSERT serializer tweaks, concat/param-one/template
+  row-build variants, row-scratch borrow deferral, page-run threshold/arena
+  changes, prebuilt empty-root page builders, owned-record borrowed flushes,
+  direct page-image building, parser/background wrapper trimming, or
+  setup-only PRAGMA/schema shortcuts from this profile. Reconsider only with a
+  broader fused row/body/page construction design that proves focused INSERT
+  wins and fullquick primary-score neutrality or better in the same window.
+
 ## 2026-05-12 - Current DML profile after shared-table retry fix
 
 - Target: current `UPDATE/DELETEThroughput` rows after the shared-table retry

@@ -11292,3 +11292,32 @@ set: sessions found by
   larger fraction of the retained DELETE path and a same-window A/B improves
   the absolute FSQLite 10k-row DELETE median by more than 10% without worsening
   the focused compare ratio.
+
+## 2026-05-12 - Prepared direct DELETE borrowed write publication
+
+- Target: `BtCursor::flush_table_leaf_delete_run_in_place` in
+  `crates/fsqlite-btree/src/cursor.rs`, after the focused DML profile showed
+  64 retained DELETE leaf-run page writes in the 10k-row DELETE workload.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`. The candidate replaced
+  `write_page_data(cx, leaf_page, run.entry.page_data.clone())` with
+  `write_page(cx, leaf_page, run.entry.page_data.as_bytes())`, trying to avoid
+  cloning one 4 KiB `PageData` per retained DELETE leaf-run flush. The source
+  patch was manually unwound after the focused DML profile disproved the
+  intended counter movement.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-delete-borrowed-write-reject-20260512T0716Z/`
+  records the commands and measured candidate counters.
+- Result: rejected. The narrow compare looked positive in isolation
+  (`451 ns` per deleted row, `1.33x` versus C SQLite, compared with the prior
+  same-target baseline of `529 ns` and `1.43x`), but the candidate profile
+  showed the intended write path got substantially worse: 10k-row DELETE
+  FSQLite was `424.3 us`, `delete_leaf_write` moved to `64/23945 ns`,
+  `delete_leaf_flush_ns` moved to `81933 ns`, and `page_pool_misses` rose to
+  `62`. The earlier same-worktree baseline profile was `410.8 us`,
+  `delete_leaf_write=64/8484 ns`, `delete_leaf_flush_ns=69190 ns`, and
+  `page_pool_misses=1`.
+- Do not retry borrowed-slice publication for retained DELETE leaf runs as a
+  standalone optimization. Reconsider only if `write_page` grows an
+  owned-buffer adoption equivalent, or if a same-window DML profile proves
+  the write counter and page-pool misses improve together.

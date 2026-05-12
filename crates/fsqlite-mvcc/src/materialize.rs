@@ -232,7 +232,7 @@ pub fn materialize_page(
 
     // Apply each visible delta
     for delta in &visible_deltas {
-        state.apply_delta(delta);
+        state.apply_delta(delta)?;
     }
 
     // Reconstruct page from working state
@@ -349,6 +349,7 @@ impl WorkingPageState {
                 cell_offset,
                 header.page_type,
                 btree_ref,
+                usable_size,
             )?;
 
             cells.push(WorkingCell {
@@ -373,12 +374,14 @@ impl WorkingPageState {
     }
 
     /// Apply a single delta to the working state.
-    fn apply_delta(&mut self, delta: &CellDelta) {
-        let (key_digest, sort_key) =
-            compute_cell_key_and_sort_key_from_delta(delta, self.page_type);
-
+    fn apply_delta(&mut self, delta: &CellDelta) -> Result<()> {
         match delta.kind {
             CellDeltaKind::Insert => {
+                let (key_digest, sort_key) = compute_cell_key_and_sort_key_from_delta(
+                    delta,
+                    self.page_type,
+                    self.usable_size,
+                )?;
                 // Insert: add new cell (should not exist)
                 if let Some(&idx) = self.cells_by_key.get(&key_digest) {
                     // Cell already exists - this could be a re-insert after delete
@@ -387,7 +390,7 @@ impl WorkingPageState {
                     if let Some(cell) = self.cells.get_mut(idx) {
                         cell.content.clone_from(&delta.cell_data);
                         cell.sort_key = sort_key;
-                        return;
+                        return Ok(());
                     }
                     self.cells_by_key.remove(&key_digest);
                 }
@@ -397,14 +400,20 @@ impl WorkingPageState {
                     sort_key,
                 });
                 self.cells_by_key.insert(key_digest, idx);
+                Ok(())
             }
             CellDeltaKind::Update => {
+                let (key_digest, sort_key) = compute_cell_key_and_sort_key_from_delta(
+                    delta,
+                    self.page_type,
+                    self.usable_size,
+                )?;
                 // Update: replace existing cell content
                 if let Some(&idx) = self.cells_by_key.get(&key_digest) {
                     if let Some(cell) = self.cells.get_mut(idx) {
                         cell.content.clone_from(&delta.cell_data);
                         cell.sort_key = sort_key;
-                        return;
+                        return Ok(());
                     }
                     self.cells_by_key.remove(&key_digest);
                 }
@@ -415,9 +424,16 @@ impl WorkingPageState {
                     sort_key,
                 });
                 self.cells_by_key.insert(key_digest, idx);
+                Ok(())
             }
             CellDeltaKind::Delete => {
+                if !delta.cell_data.is_empty() {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "delete delta unexpectedly contains cell bytes".to_owned(),
+                    });
+                }
                 // Delete: remove cell
+                let key_digest = delta.cell_key.key_digest;
                 if let Some(idx) = self.cells_by_key.remove(&key_digest) {
                     // Mark as deleted by clearing content
                     // We'll filter these out during page reconstruction
@@ -426,6 +442,7 @@ impl WorkingPageState {
                     }
                 }
                 // Delete on non-existent is a no-op (idempotent)
+                Ok(())
             }
         }
     }
@@ -536,6 +553,7 @@ fn compute_cell_key_and_sort_key(
     cell_offset: usize,
     page_type: BtreePageType,
     btree_ref: fsqlite_types::BtreeRef,
+    usable_size: u32,
 ) -> Result<([u8; 16], SortKey)> {
     // For table leaf pages, extract the rowid
     // For index leaf pages, extract the key bytes
@@ -570,21 +588,24 @@ fn compute_cell_key_and_sort_key(
                     detail: "invalid varint in cell (rowid)".to_owned(),
                 }
             })?;
+        let rowid = i64::try_from(rowid).map_err(|_| FrankenError::DatabaseCorrupt {
+            detail: "cell rowid exceeds i64 range".to_owned(),
+        })?;
 
         // Hash the rowid for key_digest
         let mut key_bytes = [0u8; 10];
-        let len = encode_varint_i64(rowid as i64, &mut key_bytes);
+        let len = encode_varint_i64(rowid, &mut key_bytes);
         let key_digest = fsqlite_types::SemanticKeyRef::compute_digest(
             fsqlite_types::SemanticKeyKind::TableRow,
             btree_ref,
             &key_bytes[..len],
         );
 
-        Ok((key_digest, SortKey::Rowid(rowid as i64)))
+        Ok((key_digest, SortKey::Rowid(rowid)))
     } else if page_type == BtreePageType::LeafIndex {
-        // Index leaf cell: payload_size varint, key bytes
-        // Note: For large keys with overflow, only local portion is on-page.
-        // We use local_payload_size to determine how much is actually here.
+        use fsqlite_btree::local_payload_size;
+
+        // Index leaf cell: payload_size varint, key bytes.
         let cell = page
             .get(cell_offset..)
             .ok_or_else(|| FrankenError::DatabaseCorrupt {
@@ -604,11 +625,18 @@ fn compute_cell_key_and_sort_key(
                     detail: "index cell key offset overflow".to_owned(),
                 })?;
 
-        // For index cells, the comparison key is the full payload.
-        // If payload exceeds local storage, we only have partial key on-page.
-        // For now, use what's available (overflow handling is rare for index keys).
-        let available = page.len().saturating_sub(key_start);
-        let key_len = (payload_size as usize).min(available);
+        let payload_size =
+            u32::try_from(payload_size).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: "index cell payload size exceeds supported page size".to_owned(),
+            })?;
+        let key_len = usize::try_from(payload_size.min(local_payload_size(
+            payload_size,
+            usable_size,
+            page_type,
+        )))
+        .map_err(|_| FrankenError::DatabaseCorrupt {
+            detail: "index cell local key length exceeds addressable size".to_owned(),
+        })?;
         let key_end =
             key_start
                 .checked_add(key_len)
@@ -644,43 +672,82 @@ fn compute_cell_key_and_sort_key(
 fn compute_cell_key_and_sort_key_from_delta(
     delta: &CellDelta,
     page_type: BtreePageType,
-) -> ([u8; 16], SortKey) {
+    usable_size: u32,
+) -> Result<([u8; 16], SortKey)> {
     let key_digest = delta.cell_key.key_digest;
 
     if delta.cell_data.is_empty() {
-        let sort_key = if page_type == BtreePageType::LeafIndex {
-            SortKey::IndexKey(Vec::new())
-        } else {
-            SortKey::Rowid(0)
-        };
-        return (key_digest, sort_key);
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: "insert/update delta missing cell bytes".to_owned(),
+        });
     }
 
     if page_type == BtreePageType::LeafTable {
         // Table cell: payload_size varint, rowid varint, payload
-        if let Some((_, ps_len)) = fsqlite_types::serial_type::read_varint(&delta.cell_data) {
-            if ps_len < delta.cell_data.len() {
-                if let Some((rowid, _)) =
-                    fsqlite_types::serial_type::read_varint(&delta.cell_data[ps_len..])
-                {
-                    return (key_digest, SortKey::Rowid(rowid as i64));
+        let (_, ps_len) =
+            fsqlite_types::serial_type::read_varint(&delta.cell_data).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: "invalid varint in delta cell (payload size)".to_owned(),
                 }
+            })?;
+        let rowid_cell =
+            delta
+                .cell_data
+                .get(ps_len..)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "delta cell rowid offset out of bounds".to_owned(),
+                })?;
+        let (rowid, _) = fsqlite_types::serial_type::read_varint(rowid_cell).ok_or_else(|| {
+            FrankenError::DatabaseCorrupt {
+                detail: "invalid varint in delta cell (rowid)".to_owned(),
             }
-        }
-        (key_digest, SortKey::Rowid(0))
+        })?;
+        let rowid = i64::try_from(rowid).map_err(|_| FrankenError::DatabaseCorrupt {
+            detail: "delta cell rowid exceeds i64 range".to_owned(),
+        })?;
+        Ok((key_digest, SortKey::Rowid(rowid)))
     } else if page_type == BtreePageType::LeafIndex {
+        use fsqlite_btree::local_payload_size;
+
         // Index cell: payload_size varint, key bytes
         if let Some((payload_size, ps_len)) =
             fsqlite_types::serial_type::read_varint(&delta.cell_data)
         {
             let key_start = ps_len;
-            let key_len = (payload_size as usize).min(delta.cell_data.len() - key_start);
-            let key_bytes = delta.cell_data[key_start..key_start + key_len].to_vec();
-            return (key_digest, SortKey::IndexKey(key_bytes));
+            let payload_size =
+                u32::try_from(payload_size).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: "delta index cell payload size exceeds supported page size".to_owned(),
+                })?;
+            let key_len = usize::try_from(payload_size.min(local_payload_size(
+                payload_size,
+                usable_size,
+                page_type,
+            )))
+            .map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: "delta index cell local key length exceeds addressable size".to_owned(),
+            })?;
+            let key_end =
+                key_start
+                    .checked_add(key_len)
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: "delta index cell key end offset overflow".to_owned(),
+                    })?;
+            let key_bytes = delta
+                .cell_data
+                .get(key_start..key_end)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "delta index cell key range out of bounds".to_owned(),
+                })?
+                .to_vec();
+            return Ok((key_digest, SortKey::IndexKey(key_bytes)));
         }
-        (key_digest, SortKey::IndexKey(delta.cell_data.clone()))
+        Err(FrankenError::DatabaseCorrupt {
+            detail: "invalid varint in delta index cell (payload size)".to_owned(),
+        })
     } else {
-        (key_digest, SortKey::Rowid(0))
+        Err(FrankenError::DatabaseCorrupt {
+            detail: "cannot compute key digest for interior delta cell".to_owned(),
+        })
     }
 }
 
@@ -814,6 +881,21 @@ mod tests {
         PageData::from_vec(page)
     }
 
+    fn create_empty_leaf_index_page() -> PageData {
+        let mut page = vec![0u8; PAGE_SIZE as usize];
+
+        page[0] = BtreePageType::LeafIndex as u8;
+        page[1] = 0;
+        page[2] = 0;
+        page[3] = 0;
+        page[4] = 0;
+        page[5] = 0x10;
+        page[6] = 0x00;
+        page[7] = 0;
+
+        PageData::from_vec(page)
+    }
+
     fn create_leaf_table_cell(rowid: i64, payload: &[u8]) -> Vec<u8> {
         let mut cell = Vec::new();
 
@@ -829,6 +911,17 @@ mod tests {
 
         // Payload
         cell.extend_from_slice(payload);
+
+        cell
+    }
+
+    fn create_leaf_index_cell(key: &[u8]) -> Vec<u8> {
+        let mut cell = Vec::new();
+
+        let mut buf = [0u8; 10];
+        let ps_len = encode_varint_u64(key.len() as u64, &mut buf);
+        cell.extend_from_slice(&buf[..ps_len]);
+        cell.extend_from_slice(key);
 
         cell
     }
@@ -928,6 +1021,32 @@ mod tests {
             kind: CellDeltaKind::Update,
             page_number: PageNumber::new(2).unwrap(),
             cell_data: create_leaf_table_cell(rowid, payload),
+            prev_idx: None,
+        }
+    }
+
+    fn create_delta_index_insert(key: &[u8], commit_seq: u64) -> CellDelta {
+        let btree = fsqlite_types::BtreeRef::Index(fsqlite_types::IndexId::new(1));
+        CellDelta {
+            commit_seq: CommitSeq::new(commit_seq),
+            created_by: test_txn(),
+            cell_key: crate::cell_visibility::CellKey::index_entry(btree, key),
+            kind: CellDeltaKind::Insert,
+            page_number: PageNumber::new(2).unwrap(),
+            cell_data: create_leaf_index_cell(key),
+            prev_idx: None,
+        }
+    }
+
+    fn create_delta_index_delete(key: &[u8], commit_seq: u64) -> CellDelta {
+        let btree = fsqlite_types::BtreeRef::Index(fsqlite_types::IndexId::new(1));
+        CellDelta {
+            commit_seq: CommitSeq::new(commit_seq),
+            created_by: test_txn(),
+            cell_key: crate::cell_visibility::CellKey::index_entry(btree, key),
+            kind: CellDeltaKind::Delete,
+            page_number: PageNumber::new(2).unwrap(),
+            cell_data: Vec::new(),
             prev_idx: None,
         }
     }
@@ -1047,6 +1166,58 @@ mod tests {
         assert_eq!(
             materialized_table_payloads(&result.page).unwrap(),
             vec![(4242, updated_payload)]
+        );
+    }
+
+    #[test]
+    fn test_materialize_deletes_existing_index_base_cell_without_trailing_page_bytes() {
+        let base = create_empty_leaf_index_page();
+        let page_no = PageNumber::new(2).unwrap();
+        let key = b"abc";
+
+        let initial = materialize_page(
+            &base,
+            page_no,
+            &[create_delta_index_insert(key, 5)],
+            &test_snapshot(5),
+            USABLE_SIZE,
+            MaterializationTrigger::Explicit,
+        )
+        .expect("initial index materialization should succeed");
+        assert_eq!(initial.cell_count, 1);
+
+        let result = materialize_page(
+            &initial.page,
+            page_no,
+            &[create_delta_index_delete(key, 10)],
+            &test_snapshot(10),
+            USABLE_SIZE,
+            MaterializationTrigger::Explicit,
+        )
+        .expect("index delete materialization should match the existing base cell");
+
+        assert_eq!(result.cell_count, 0);
+        let header = BtreePageHeader::parse(result.page.as_bytes(), 0).unwrap();
+        assert_eq!(header.cell_count, 0);
+    }
+
+    #[test]
+    fn test_materialize_rejects_insert_delta_without_cell_bytes() {
+        let base = create_empty_leaf_table_page();
+        let page_no = PageNumber::new(2).unwrap();
+        let mut delta = create_delta_insert(100, b"value", 5);
+        delta.cell_data.clear();
+
+        assert!(
+            materialize_page(
+                &base,
+                page_no,
+                &[delta],
+                &test_snapshot(5),
+                USABLE_SIZE,
+                MaterializationTrigger::Explicit,
+            )
+            .is_err()
         );
     }
 

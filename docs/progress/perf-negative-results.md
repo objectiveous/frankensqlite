@@ -12,6 +12,38 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Retained DELETE dense-rowid exact-slot search
+
+- Target: `UPDATE/DELETEThroughput` DELETE rows after the current focused DML
+  profile showed retained same-leaf DELETE still spending time in
+  `delete_leaf_search`.
+- Files/subsystems touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`. The abandoned patch added first/last
+  rowid range checks and a dense-rowid exact-slot probe to
+  `TableLeafDeleteRun::search_table_leaf`, reusing the proof shape already used
+  by ordinary table-leaf integer-key seeks. The source patch was manually
+  unwound before commit.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-6789e50b-current-dml-screen-20260512T2245Z/`,
+  `tests/artifacts/perf/codex-delete-run-dense-search-20260512T2255Z/`, and
+  `tests/artifacts/perf/codex-delete-run-dense-search-fullquick-20260512T2300Z/`.
+  Targeted proof passed:
+  `cargo test -p fsqlite-btree table_leaf_delete_run -- --nocapture`.
+- Result: rejected. The focused candidate did reduce the profiled
+  `fs_delete_10000` search bucket from `560/39571ns` to `560/17444ns`, with
+  the 500-row DELETE FSQLite median moving from `0.282699ms` to `0.236423ms`.
+  The full quick keep gate still failed: current recorded frontier score was
+  `per_category_weighted.score=0.3676859704` with `81 / 3 / 9`
+  faster/comparable/C-faster rows, while the candidate full quick reported
+  `score=0.3732603712` with `78 / 5 / 10`. The candidate also left the
+  100-row UPDATE row worse in the same full run (`1.4569x` slower), so the
+  matrix-level result does not justify keeping the micro-patch.
+- Do not retry a standalone dense-rowid exact-slot search in retained DELETE
+  runs. Reconsider only if a same-window fullquick rerun shows a neutral or
+  better primary score and C-faster count, or as part of the broader
+  transaction-local DML mutation operator that removes repeated physical
+  retained-leaf probes rather than reshaping the probe.
+
 ## 2026-05-12 - fd3a1f48 frontier recertification
 
 - Target: current `comprehensive-bench --quick` frontier after

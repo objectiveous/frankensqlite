@@ -165,6 +165,34 @@ pub enum CellDeltaKind {
     Update,
 }
 
+/// Result of resolving a cell-level MVCC chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CellResolve {
+    /// The cell has no delta chain in the log.
+    Untracked,
+    /// The log has deltas for this cell, but none are visible to this read view.
+    NoVisibleVersion,
+    /// The visible delta is a delete tombstone.
+    Deleted,
+    /// The visible delta carries cell bytes.
+    Visible(Vec<u8>),
+}
+
+impl CellResolve {
+    /// Convert to the legacy optional payload shape.
+    ///
+    /// Callers that overlay cell MVCC on top of a base page must inspect the
+    /// full state so they do not confuse [`Self::Deleted`] with
+    /// [`Self::Untracked`].
+    #[must_use]
+    pub fn into_visible_data(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Visible(cell_data) => Some(cell_data),
+            Self::Untracked | Self::NoVisibleVersion | Self::Deleted => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CellDelta — A single versioned change to a cell (§C1.3)
 // ---------------------------------------------------------------------------
@@ -959,6 +987,18 @@ impl CellVisibilityLog {
         cell_key: &CellKey,
         snapshot_high: CommitSeq,
     ) -> Option<Vec<u8>> {
+        self.resolve_state(page_number, cell_key, snapshot_high)
+            .into_visible_data()
+    }
+
+    /// Resolve the visible cell state for a snapshot.
+    #[must_use]
+    pub fn resolve_state(
+        &self,
+        page_number: PageNumber,
+        cell_key: &CellKey,
+        snapshot_high: CommitSeq,
+    ) -> CellResolve {
         let shard_idx = Self::shard_index(page_number);
         let shard = &self.shards[shard_idx];
         let lookup_key = (page_number, cell_key.key_digest);
@@ -975,7 +1015,7 @@ impl CellVisibilityLog {
                         result = "not_tracked",
                         "cell_resolved"
                     );
-                    return None;
+                    return CellResolve::Untracked;
                 }
             }
         };
@@ -987,7 +1027,7 @@ impl CellVisibilityLog {
         while let Some(idx) = current_idx {
             if let Some(delta) = arena.get(idx) {
                 if delta.is_visible_to(snapshot_high) {
-                    let result = match delta.kind {
+                    return match delta.kind {
                         CellDeltaKind::Delete => {
                             trace!(
                                 pgno = page_number.get(),
@@ -996,7 +1036,7 @@ impl CellVisibilityLog {
                                 result = "deleted",
                                 "cell_resolved"
                             );
-                            None
+                            CellResolve::Deleted
                         }
                         CellDeltaKind::Insert | CellDeltaKind::Update => {
                             trace!(
@@ -1007,10 +1047,9 @@ impl CellVisibilityLog {
                                 data_len = delta.cell_data.len(),
                                 "cell_resolved"
                             );
-                            Some(delta.cell_data.clone())
+                            CellResolve::Visible(delta.cell_data.clone())
                         }
                     };
-                    return result;
                 }
                 current_idx = delta.prev_idx;
             } else {
@@ -1025,7 +1064,7 @@ impl CellVisibilityLog {
             result = "no_visible_version",
             "cell_resolved"
         );
-        None
+        CellResolve::NoVisibleVersion
     }
 
     /// Resolve a cell for a transaction-local read view.
@@ -1041,13 +1080,33 @@ impl CellVisibilityLog {
         snapshot_high: CommitSeq,
         txn: TxnToken,
     ) -> Option<Vec<u8>> {
+        self.resolve_state_for_txn(page_number, cell_key, snapshot_high, txn)
+            .into_visible_data()
+    }
+
+    /// Resolve a cell state for a transaction-local read view.
+    ///
+    /// Unlike [`Self::resolve_for_txn`], this preserves delete tombstones and
+    /// untracked cells as distinct outcomes so overlay readers can decide
+    /// whether to hide the base-page cell or fall back to it.
+    #[must_use]
+    pub fn resolve_state_for_txn(
+        &self,
+        page_number: PageNumber,
+        cell_key: &CellKey,
+        snapshot_high: CommitSeq,
+        txn: TxnToken,
+    ) -> CellResolve {
         let shard_idx = Self::shard_index(page_number);
         let shard = &self.shards[shard_idx];
         let lookup_key = (page_number, cell_key.key_digest);
 
         let head_idx = {
             let heads = shard.heads.read();
-            heads.get(&lookup_key)?.head_idx
+            match heads.get(&lookup_key) {
+                Some(entry) => entry.head_idx,
+                None => return CellResolve::Untracked,
+            }
         };
 
         let arena = self.arena.lock();
@@ -1060,14 +1119,16 @@ impl CellVisibilityLog {
 
             if delta.is_visible_to_txn(snapshot_high, txn) {
                 return match delta.kind {
-                    CellDeltaKind::Delete => None,
-                    CellDeltaKind::Insert | CellDeltaKind::Update => Some(delta.cell_data.clone()),
+                    CellDeltaKind::Delete => CellResolve::Deleted,
+                    CellDeltaKind::Insert | CellDeltaKind::Update => {
+                        CellResolve::Visible(delta.cell_data.clone())
+                    }
                 };
             }
             current_idx = delta.prev_idx;
         }
 
-        None
+        CellResolve::NoVisibleVersion
     }
 
     /// Check if the memory budget is exceeded.
@@ -1265,7 +1326,7 @@ impl CellVisibilityLog {
     /// Check for cell-level conflict between two transactions.
     #[must_use]
     pub fn check_conflict(&self, txn: TxnToken, other_txn: TxnToken) -> CellConflict {
-        if txn == other_txn {
+        if txn.eq(&other_txn) {
             return CellConflict::None;
         }
 
@@ -1846,6 +1907,10 @@ mod tests {
         // Should not be visible yet (commit_seq = 0)
         let snapshot = CommitSeq::new(10);
         assert!(log.resolve(page_number, &cell_key, snapshot).is_none());
+        assert_eq!(
+            log.resolve_state(page_number, &cell_key, snapshot),
+            CellResolve::NoVisibleVersion
+        );
 
         // Commit the delta
         log.commit_delta(idx, CommitSeq::new(5));
@@ -1853,6 +1918,10 @@ mod tests {
         // Now should be visible
         let result = log.resolve(page_number, &cell_key, snapshot);
         assert_eq!(result, Some(vec![1, 2, 3, 4]));
+        assert_eq!(
+            log.resolve_state(page_number, &cell_key, snapshot),
+            CellResolve::Visible(vec![1, 2, 3, 4])
+        );
 
         // Older snapshot should not see it
         let old_snapshot = CommitSeq::new(4);
@@ -1882,6 +1951,10 @@ mod tests {
         assert!(
             log.resolve(page_number, &cell_key, CommitSeq::new(15))
                 .is_none()
+        );
+        assert_eq!(
+            log.resolve_state(page_number, &cell_key, CommitSeq::new(15)),
+            CellResolve::Deleted
         );
 
         // Snapshot before delete: cell visible
@@ -2319,6 +2392,10 @@ mod tests {
             log.resolve_for_txn(page_number, &cell_key, CommitSeq::new(10), token),
             Some(vec![1])
         );
+        assert_eq!(
+            log.resolve_state_for_txn(page_number, &cell_key, CommitSeq::new(10), token),
+            CellResolve::Visible(vec![1])
+        );
 
         log.record_update(cell_key, page_number, vec![2], token)
             .ok_or_else(|| "update should fit test budget".to_owned())?;
@@ -2332,6 +2409,11 @@ mod tests {
         assert_eq!(
             log.resolve_for_txn(page_number, &cell_key, CommitSeq::new(10), token),
             None
+        );
+        assert_eq!(
+            log.resolve_state_for_txn(page_number, &cell_key, CommitSeq::new(10), token),
+            CellResolve::Deleted,
+            "transaction-local overlays must distinguish deletes from untracked cells"
         );
 
         Ok(())
@@ -2695,6 +2777,11 @@ mod tests {
                 .is_none(),
             "snapshot=3 should not see cell (before insert)"
         );
+        assert_eq!(
+            log.resolve_state(page_number, &cell_key, CommitSeq::new(3)),
+            CellResolve::NoVisibleVersion,
+            "a tracked cell with no visible version is distinct from an untracked cell"
+        );
 
         // Snapshot at 7: sees insert version
         assert_eq!(
@@ -2715,6 +2802,11 @@ mod tests {
             log.resolve(page_number, &cell_key, CommitSeq::new(20))
                 .is_none(),
             "snapshot=20 should not see cell (deleted)"
+        );
+        assert_eq!(
+            log.resolve_state(page_number, &cell_key, CommitSeq::new(20)),
+            CellResolve::Deleted,
+            "a deleted visible version must not look like an untracked cell"
         );
     }
 

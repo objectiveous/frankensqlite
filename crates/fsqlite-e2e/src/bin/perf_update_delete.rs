@@ -10,13 +10,14 @@
 //!   perf-update-delete 1000   5 delete compare
 //!   perf-update-delete 10000 250 delete fsqlite isolated
 //!   perf-update-delete 10000 250 delete fsqlite rollback-isolated
+//!   perf-update-delete 10000 250 delete fsqlite sparse-isolated
 //!
 //! Arguments:
 //!   [rows]   Number of rows to pre-populate (default 10_000)
 //!   [iters]  Number of outer iterations for profiling (default 10)
 //!   [which]  "update" | "delete" | "both" (default "both")
 //!   [engine] "fsqlite" | "sqlite" | "compare" (default "fsqlite")
-//!   [mode]   "standard" | "isolated" | "rollback-isolated" (default "standard")
+//!   [mode]   "standard" | "isolated" | "rollback-isolated" | "sparse-isolated" (default "standard")
 
 use std::fmt;
 use std::process::ExitCode;
@@ -125,6 +126,7 @@ enum ProfileMode {
     Standard,
     Isolated,
     RollbackIsolated,
+    SparseIsolated,
 }
 
 impl ProfileMode {
@@ -133,8 +135,9 @@ impl ProfileMode {
             "standard" => Ok(Self::Standard),
             "isolated" => Ok(Self::Isolated),
             "rollback-isolated" => Ok(Self::RollbackIsolated),
+            "sparse-isolated" => Ok(Self::SparseIsolated),
             other => Err(RunError::Usage(format!(
-                "invalid mode '{other}'; expected standard, isolated, or rollback-isolated"
+                "invalid mode '{other}'; expected standard, isolated, rollback-isolated, or sparse-isolated"
             ))),
         }
     }
@@ -146,6 +149,7 @@ impl fmt::Display for ProfileMode {
             Self::Standard => f.write_str("standard"),
             Self::Isolated => f.write_str("isolated"),
             Self::RollbackIsolated => f.write_str("rollback-isolated"),
+            Self::SparseIsolated => f.write_str("sparse-isolated"),
         }
     }
 }
@@ -224,7 +228,7 @@ where
     };
     if let Some(extra) = args.next() {
         return Err(RunError::Usage(format!(
-            "unexpected extra argument '{extra}'; usage: perf-update-delete [rows] [iters] [update|delete|both] [fsqlite|sqlite|compare] [standard|isolated|rollback-isolated]"
+            "unexpected extra argument '{extra}'; usage: perf-update-delete [rows] [iters] [update|delete|both] [fsqlite|sqlite|compare] [standard|isolated|rollback-isolated|sparse-isolated]"
         )));
     }
     if iters == 0 {
@@ -256,8 +260,37 @@ fn isolated_populate_rows_i64(
     rows_i64: i64,
     delete_count: usize,
 ) -> Result<i64, RunError> {
-    if !args.workload.do_delete() || args.profile_mode == ProfileMode::RollbackIsolated {
+    if !args.workload.do_delete()
+        || args.profile_mode == ProfileMode::RollbackIsolated
+        || delete_count == 0
+    {
         return Ok(rows_i64);
+    }
+
+    if args.profile_mode == ProfileMode::SparseIsolated {
+        let last_iter_base = args
+            .iters
+            .checked_sub(1)
+            .and_then(|last_iter| last_iter.checked_mul(args.rows))
+            .ok_or_else(|| {
+                RunError::Usage("sparse isolated delete row count overflowed usize".to_string())
+            })?;
+        let last_delete_offset = delete_count
+            .checked_sub(1)
+            .and_then(|last_idx| last_idx.checked_mul(20))
+            .ok_or_else(|| {
+                RunError::Usage("sparse isolated delete row id overflowed usize".to_string())
+            })?;
+        let required_rows = last_iter_base
+            .checked_add(last_delete_offset)
+            .and_then(|last_rowid| last_rowid.checked_add(1))
+            .ok_or_else(|| {
+                RunError::Usage("sparse isolated delete row count overflowed usize".to_string())
+            })?;
+        let required_rows_i64 = i64::try_from(required_rows).map_err(|_| {
+            RunError::Usage("sparse isolated delete row count must fit within i64".to_string())
+        })?;
+        return Ok(rows_i64.max(required_rows_i64));
     }
 
     let required_delete_rows = args
@@ -277,6 +310,22 @@ fn isolated_delete_id(iter: usize, index: usize, delete_count: usize) -> Result<
         .ok_or_else(|| RunError::Usage("isolated delete row id overflowed usize".to_string()))?;
     i64::try_from(row_offset)
         .map_err(|_| RunError::Usage("isolated delete row id must fit within i64".to_string()))
+}
+
+fn sparse_isolated_delete_id(iter: usize, index: usize, rows: usize) -> Result<i64, RunError> {
+    let row_offset = iter
+        .checked_mul(rows)
+        .and_then(|base| {
+            index
+                .checked_mul(20)
+                .and_then(|offset| base.checked_add(offset))
+        })
+        .ok_or_else(|| {
+            RunError::Usage("sparse isolated delete row id overflowed usize".to_string())
+        })?;
+    i64::try_from(row_offset).map_err(|_| {
+        RunError::Usage("sparse isolated delete row id must fit within i64".to_string())
+    })
 }
 
 fn apply_benchmark_pragmas(conn: &fsqlite::Connection) -> Result<(), RunError> {
@@ -357,7 +406,7 @@ fn run_benchmark(args: &BenchArgs) -> Result<(), RunError> {
             ProfileMode::Standard => {
                 run_fsqlite_benchmark(args, rows_i64, update_count, delete_count)?
             }
-            ProfileMode::Isolated | ProfileMode::RollbackIsolated => {
+            ProfileMode::Isolated | ProfileMode::RollbackIsolated | ProfileMode::SparseIsolated => {
                 run_fsqlite_isolated_benchmark(args, rows_i64, update_count, delete_count)?
             }
         };
@@ -370,7 +419,7 @@ fn run_benchmark(args: &BenchArgs) -> Result<(), RunError> {
             ProfileMode::Standard => {
                 run_sqlite_benchmark(args, rows_i64, update_count, delete_count)?
             }
-            ProfileMode::Isolated | ProfileMode::RollbackIsolated => {
+            ProfileMode::Isolated | ProfileMode::RollbackIsolated | ProfileMode::SparseIsolated => {
                 run_sqlite_isolated_benchmark(args, rows_i64, update_count, delete_count)?
             }
         };
@@ -567,7 +616,11 @@ fn run_fsqlite_isolated_benchmark(
             let t0 = Instant::now();
             for iter in 0..args.iters {
                 for i in 0..delete_count {
-                    let id = isolated_delete_id(iter, i, delete_count)?;
+                    let id = if args.profile_mode == ProfileMode::SparseIsolated {
+                        sparse_isolated_delete_id(iter, i, args.rows)?
+                    } else {
+                        isolated_delete_id(iter, i, delete_count)?
+                    };
                     delete
                         .execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
                         .map_err(|err| RunError::Runtime(format!("delete row {id}: {err}")))?;
@@ -783,7 +836,11 @@ fn run_sqlite_isolated_benchmark(
             let t0 = Instant::now();
             for iter in 0..args.iters {
                 for i in 0..delete_count {
-                    let id = isolated_delete_id(iter, i, delete_count)?;
+                    let id = if args.profile_mode == ProfileMode::SparseIsolated {
+                        sparse_isolated_delete_id(iter, i, args.rows)?
+                    } else {
+                        isolated_delete_id(iter, i, delete_count)?
+                    };
                     delete.execute(rusqlite::params![id]).map_err(|err| {
                         RunError::Runtime(format!("delete C SQLite row {id}: {err}"))
                     })?;
@@ -866,8 +923,8 @@ fn print_comparison_summary(args: &BenchArgs, fsqlite: TimingTotals, sqlite: Tim
 mod tests {
     use super::{
         BENCH_CREATE_SQL, BENCH_INSERT_SQL, BENCHMARK_PRAGMAS, BenchArgs, DEFAULT_ITERS,
-        DEFAULT_ROWS, EngineKind, ProfileMode, RunError, WorkloadKind, parse_args, per_row_ns,
-        run_benchmark,
+        DEFAULT_ROWS, EngineKind, ProfileMode, RunError, WorkloadKind, isolated_populate_rows_i64,
+        parse_args, per_row_ns, run_benchmark, sparse_isolated_delete_id,
     };
 
     #[test]
@@ -989,6 +1046,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_accepts_sparse_isolated_mode() {
+        assert_eq!(
+            parse_args([
+                "10000".to_string(),
+                "3".to_string(),
+                "delete".to_string(),
+                "fsqlite".to_string(),
+                "sparse-isolated".to_string(),
+            ])
+            .unwrap(),
+            BenchArgs {
+                rows: 10000,
+                iters: 3,
+                workload: WorkloadKind::Delete,
+                engine: EngineKind::Fsqlite,
+                profile_mode: ProfileMode::SparseIsolated,
+            }
+        );
+    }
+
+    #[test]
     fn parse_args_rejects_invalid_engine() {
         let err = parse_args([
             "100".to_string(),
@@ -1018,9 +1096,31 @@ mod tests {
         assert_eq!(
             err,
             RunError::Usage(
-                "invalid mode 'bogus'; expected standard, isolated, or rollback-isolated"
-                    .to_string()
+                "invalid mode 'bogus'; expected standard, isolated, rollback-isolated, or sparse-isolated".to_string()
             )
+        );
+    }
+
+    #[test]
+    fn sparse_isolated_delete_ids_keep_standard_sparse_shape_per_block() {
+        assert_eq!(sparse_isolated_delete_id(0, 0, 10_000).unwrap(), 0);
+        assert_eq!(sparse_isolated_delete_id(0, 1, 10_000).unwrap(), 20);
+        assert_eq!(sparse_isolated_delete_id(1, 0, 10_000).unwrap(), 10_000);
+        assert_eq!(sparse_isolated_delete_id(1, 499, 10_000).unwrap(), 19_980);
+    }
+
+    #[test]
+    fn sparse_isolated_populates_enough_rows_for_last_sparse_delete() {
+        let args = BenchArgs {
+            rows: 10_000,
+            iters: 3,
+            workload: WorkloadKind::Delete,
+            engine: EngineKind::Fsqlite,
+            profile_mode: ProfileMode::SparseIsolated,
+        };
+        assert_eq!(
+            isolated_populate_rows_i64(&args, 10_000, 500).unwrap(),
+            29_981
         );
     }
 
@@ -1054,7 +1154,8 @@ mod tests {
             engine: EngineKind::Compare,
             profile_mode: ProfileMode::Standard,
         };
-        run_benchmark(&args).expect("small smoke workload should succeed");
+        let result = run_benchmark(&args);
+        assert!(result.is_ok(), "small smoke workload failed: {result:?}");
     }
 
     #[test]
@@ -1066,6 +1167,26 @@ mod tests {
             engine: EngineKind::Compare,
             profile_mode: ProfileMode::RollbackIsolated,
         };
-        run_benchmark(&args).expect("rollback-isolated delete workload should succeed");
+        let result = run_benchmark(&args);
+        assert!(
+            result.is_ok(),
+            "rollback-isolated delete workload failed: {result:?}"
+        );
+    }
+
+    #[test]
+    fn run_benchmark_smoke_sparse_isolated_delete() {
+        let args = BenchArgs {
+            rows: 20,
+            iters: 2,
+            workload: WorkloadKind::Delete,
+            engine: EngineKind::Compare,
+            profile_mode: ProfileMode::SparseIsolated,
+        };
+        let result = run_benchmark(&args);
+        assert!(
+            result.is_ok(),
+            "sparse-isolated delete workload failed: {result:?}"
+        );
     }
 }

@@ -12,6 +12,32 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Current DML refresh after INSERT frontier
+
+- Target: current `UPDATE/DELETEThroughput` rows after the INSERT frontier
+  rescreen, plus focused `perf-update-delete` modes for the 10000-row,
+  500-delete workload.
+- Files/subsystems inspected: no source patch. Re-read the current DML JSON,
+  profiler counters, focused delete-mode probes, and the prior DML rejects in
+  this ledger.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-current-dml-refresh-after-insert-frontier-20260512T1615Z/`.
+  Both valid JSON runs used current head `ececff30` with `git_dirty=false`,
+  `benchmark_binary_older_than_git_head=false`, and `build_profile=release-perf`.
+- Result: no source patch attempted. The focused DML repeat reported 6
+  scenarios with FrankenSQLite faster / comparable / C-SQLite-faster at
+  `2 / 0 / 4`, geomean F/C `1.3229800457`, and focused weighted score
+  `1.3229800457`. The large UPDATE row stayed green at `0.6912x`; the
+  `1000 rows / update 100 rows` row flipped green on repeat after a noisy
+  first run. Stable red rows remain DELETE: `1000 rows / delete 50 rows`
+  at `1.7957x` and `10000 rows / delete 500 rows` at `1.6173x`.
+  Focused delete-mode probes reported DELETE F/C ratios of `1.50x` standard,
+  `1.22x` isolated, `1.09x` rollback-isolated, and `2.26x` sparse-isolated.
+- Do not retry another narrow DELETE micro-patch from this refresh. Reconsider
+  only as the broader transaction-local DML mutation operator with proof of
+  focused DELETE wins, preserved read/rollback/savepoint behavior, and
+  fullquick primary-score neutrality or better.
+
 ## 2026-05-12 - Current INSERT rescreen after DELETE mode pass
 
 - Target: current `INSERTThroughput` rows after the DELETE mode rescreen, to

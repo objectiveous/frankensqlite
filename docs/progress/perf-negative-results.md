@@ -12,6 +12,41 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - `release_set` targeted waiter wakeups
+
+- Target: `Concurrent Writers -- C SQLite WAL vs FrankenSQLite MVCC`, especially
+  the 8-writer shared-table row after the focused concurrent profile showed
+  large `mvcc_page_lock_wait_ns` and stale-snapshot retry churn.
+- Files/subsystems touched during rejected candidate:
+  `crates/fsqlite-mvcc/src/core_types.rs`. The abandoned patch changed
+  `InProcessPageLockTable::release_set` to collect released pages and use
+  page-targeted waiter wakeups for small release batches, with a fallback to
+  `notify_all_waiters()` for large batches. It also added a focused unit test
+  proving that `release_set([page_a])` did not wake a waiter parked on
+  `page_b`. The source patch was manually unwound before commit.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-24355d23-current-concurrent-profile-20260512T2335Z/`,
+  `tests/artifacts/perf/codex-release-set-targeted-24355d23-concurrent-profile-20260513T0000Z/`,
+  `tests/artifacts/perf/codex-release-set-targeted-24355d23-concurrent-profile-rerun-20260513T0004Z/`,
+  and
+  `tests/artifacts/perf/codex-release-set-targeted-24355d23-fullquick-20260513T0007Z/`.
+  Focused proof passed:
+  `cargo test -p fsqlite-mvcc test_release_set_keeps_small_batches_page_targeted -- --nocapture`.
+- Result: rejected. The candidate looked attractive in focused reruns, with
+  8-thread FSQLite medians at `53.60ms` and `44.83ms`, but the current
+  full-quick baseline already had the 8-thread row at `46.399814ms` and F/C
+  `0.5070851611`. The candidate full-quick gate regressed the exact concurrent
+  category from baseline rows `2t=1.1657621132`, `4t=1.0750080613`,
+  `8t=0.5070851611` to `2t=1.2128043846`, `4t=1.2172419273`,
+  `8t=0.6530681449`, worsening concurrent geomean from `0.8597407658` to
+  `0.9879257179`. The overall primary score also worsened from
+  `0.3684659618` (`79 / 2 / 12`) to `0.3743731688` (`77 / 2 / 14`).
+- Do not retry standalone `release_set` targeted wakeups. Reconsider only with
+  a same-window A/B full-quick gate that improves the primary score and does
+  not regress the 2- and 4-writer rows, or after page-specific conflict
+  telemetry shows a wakeup-herd problem independent of the existing
+  stale-snapshot retry topology.
+
 ## 2026-05-12 - ce2309a2 post-fix frontier refresh
 
 - Target: current `comprehensive-bench --quick` and focused

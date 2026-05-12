@@ -627,19 +627,28 @@ fn compute_cell_key_and_sort_key(
             u32::try_from(payload_size).map_err(|_| FrankenError::DatabaseCorrupt {
                 detail: "index cell payload size exceeds supported page size".to_owned(),
             })?;
-        let key_len = usize::try_from(payload_size.min(local_payload_size(
-            payload_size,
-            usable_size,
-            page_type,
-        )))
-        .map_err(|_| FrankenError::DatabaseCorrupt {
-            detail: "index cell local key length exceeds addressable size".to_owned(),
+        let local_payload = local_payload_size(payload_size, usable_size, page_type);
+        let key_len = usize::try_from(payload_size.min(local_payload)).map_err(|_| {
+            FrankenError::DatabaseCorrupt {
+                detail: "index cell local key length exceeds addressable size".to_owned(),
+            }
         })?;
         let key_end =
             key_start
                 .checked_add(key_len)
                 .ok_or_else(|| FrankenError::DatabaseCorrupt {
                     detail: "index cell key end offset overflow".to_owned(),
+                })?;
+        let digest_len = key_len
+            .checked_add(if local_payload < payload_size { 4 } else { 0 })
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "index cell digest length overflow".to_owned(),
+            })?;
+        let digest_end =
+            key_start
+                .checked_add(digest_len)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "index cell digest end offset overflow".to_owned(),
                 })?;
 
         let key_bytes = page
@@ -648,10 +657,15 @@ fn compute_cell_key_and_sort_key(
                 detail: "index cell key range out of bounds".to_owned(),
             })?
             .to_vec();
+        let digest_bytes =
+            page.get(key_start..digest_end)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "index cell digest range out of bounds".to_owned(),
+                })?;
         let key_digest = fsqlite_types::SemanticKeyRef::compute_digest(
             fsqlite_types::SemanticKeyKind::IndexEntry,
             btree_ref,
-            &key_bytes,
+            digest_bytes,
         );
 
         Ok((key_digest, SortKey::IndexKey(key_bytes)))
@@ -1224,6 +1238,67 @@ mod tests {
         assert_eq!(result.cell_count, 0);
         let header = BtreePageHeader::parse(result.page.as_bytes(), 0).unwrap();
         assert_eq!(header.cell_count, 0);
+    }
+
+    #[test]
+    fn test_index_overflow_cell_digest_includes_overflow_pointer() {
+        let payload_size = 1_500_u32;
+        let local_payload =
+            fsqlite_btree::local_payload_size(payload_size, USABLE_SIZE, BtreePageType::LeafIndex);
+        assert!(local_payload < payload_size);
+
+        let cell_offset = 32_usize;
+        let mut page = vec![0_u8; PAGE_SIZE as usize];
+        let mut buf = [0_u8; 10];
+        let ps_len = encode_varint_u64(u64::from(payload_size), &mut buf);
+        page[cell_offset..cell_offset + ps_len].copy_from_slice(&buf[..ps_len]);
+
+        let key_start = cell_offset + ps_len;
+        let local_len = local_payload as usize;
+        for (idx, byte) in page[key_start..key_start + local_len]
+            .iter_mut()
+            .enumerate()
+        {
+            *byte = (idx % 251) as u8;
+        }
+        let overflow_ptr = 0x0102_0304_u32.to_be_bytes();
+        page[key_start + local_len..key_start + local_len + 4].copy_from_slice(&overflow_ptr);
+
+        let btree = fsqlite_types::BtreeRef::Index(fsqlite_types::IndexId::new(7));
+        let (digest, sort_key) = compute_cell_key_and_sort_key(
+            &page,
+            cell_offset,
+            BtreePageType::LeafIndex,
+            btree,
+            USABLE_SIZE,
+        )
+        .expect("overflow index cell key should parse");
+
+        let digest_bytes = &page[key_start..key_start + local_len + 4];
+        let expected = fsqlite_types::SemanticKeyRef::compute_digest(
+            fsqlite_types::SemanticKeyKind::IndexEntry,
+            btree,
+            digest_bytes,
+        );
+        let local_only = fsqlite_types::SemanticKeyRef::compute_digest(
+            fsqlite_types::SemanticKeyKind::IndexEntry,
+            btree,
+            &page[key_start..key_start + local_len],
+        );
+
+        assert_eq!(digest, expected);
+        assert_ne!(
+            digest, local_only,
+            "overflow index cell identity must include the overflow pointer"
+        );
+        assert!(
+            matches!(&sort_key, SortKey::IndexKey(_)),
+            "index cells must sort by index key bytes"
+        );
+        let SortKey::IndexKey(key) = sort_key else {
+            return;
+        };
+        assert_eq!(key, page[key_start..key_start + local_len]);
     }
 
     #[test]

@@ -1587,50 +1587,69 @@ impl TableLeafDeleteRun {
 
         {
             let page_bytes = self.entry.page_data.as_bytes_mut();
-            for (original_idx, &off) in original_ptrs.iter().enumerate() {
-                if deleted_idx < self.deleted_cell_indices.len()
-                    && usize::from(self.deleted_cell_indices[deleted_idx]) == original_idx
+            let mut live_start = 0usize;
+            while live_start < original_len {
+                while deleted_idx < self.deleted_cell_indices.len()
+                    && usize::from(self.deleted_cell_indices[deleted_idx]) == live_start
                 {
                     deleted_idx += 1;
-                    continue;
+                    live_start += 1;
+                }
+                if live_start >= original_len {
+                    break;
                 }
 
-                let ptr = usize::from(off);
-                let upper = if original_idx == 0 {
+                let mut live_end = live_start + 1;
+                while live_end < original_len
+                    && (deleted_idx >= self.deleted_cell_indices.len()
+                        || usize::from(self.deleted_cell_indices[deleted_idx]) != live_end)
+                {
+                    live_end += 1;
+                }
+
+                let upper = if live_start == 0 {
                     usable_size as usize
                 } else {
-                    usize::from(original_ptrs[original_idx - 1])
+                    usize::from(original_ptrs[live_start - 1])
                 };
-                if ptr >= upper {
+                let lower = usize::from(original_ptrs[live_end - 1]);
+                if lower >= upper {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: "compact table leaf cell offsets are not monotone".to_owned(),
                     });
                 }
-                let size = upper - ptr;
-                new_content_offset = new_content_offset.checked_sub(size).ok_or_else(|| {
-                    FrankenError::DatabaseCorrupt {
-                        detail: "table leaf cell size overflow during delete defragmentation"
-                            .to_owned(),
-                    }
-                })?;
+                let range_size = upper - lower;
+                new_content_offset =
+                    new_content_offset.checked_sub(range_size).ok_or_else(|| {
+                        FrankenError::DatabaseCorrupt {
+                            detail: "table leaf cell size overflow during delete defragmentation"
+                                .to_owned(),
+                        }
+                    })?;
                 if new_content_offset < ptr_array_end {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: "table leaf cell content overlaps pointer array during delete defragmentation"
                             .to_owned(),
                     });
                 }
-                if new_content_offset != ptr {
-                    page_bytes.copy_within(ptr..upper, new_content_offset);
+                if new_content_offset != lower {
+                    page_bytes.copy_within(lower..upper, new_content_offset);
                 }
-                ptrs.push(u16::try_from(new_content_offset).map_err(|_| {
-                    FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "table leaf cell offset {} exceeds u16 range on page {}",
-                            new_content_offset,
-                            leaf_page_no.get()
-                        ),
-                    }
-                })?);
+
+                for &original_ptr in original_ptrs.iter().take(live_end).skip(live_start) {
+                    let adjusted_ptr = new_content_offset + (usize::from(original_ptr) - lower);
+                    ptrs.push(u16::try_from(adjusted_ptr).map_err(|_| {
+                        FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "table leaf cell offset {} exceeds u16 range on page {}",
+                                adjusted_ptr,
+                                leaf_page_no.get()
+                            ),
+                        }
+                    })?);
+                }
+
+                live_start = live_end;
             }
         }
 

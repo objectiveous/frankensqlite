@@ -12,6 +12,33 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Sharded cache clean-mark elision for DML cache finish
+
+- Target: pager cache-finish tail in the remaining DML DELETE rows, especially
+  `UPDATE/DELETEThroughput` 50-row and 500-row DELETE where
+  `pager_cache_finish_ns` reflects draining staged committed pages into
+  `ShardedPageCache`.
+- Touched during rejected candidate:
+  `crates/fsqlite-pager/src/page_cache.rs`. The patch removed the redundant
+  `mark_page_clean()` probe after `ShardedPageCache::insert_buffer()` because
+  every replacement path already installs a fresh clean `CachedPageEntry`, and
+  added focused tests for replacing dirty sharded/fast-array entries with clean
+  inserted buffers.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-cache-insert-clean-elision-reject-20260512T0800Z/summary.md`.
+- Result: rejected and unwound. Focused tests passed, and the 500-row DELETE
+  profile counter moved only slightly (`pager_cache_finish_ns` from `12193ns`
+  baseline to `11822ns` and `11902ns` candidate repeats). The focused matrix
+  did not validate the change: 50-row DELETE regressed from baseline
+  `28.2us` to `58.0us` / `56.3us`, and 500-row DELETE moved from `269.3us`
+  to `339.5us` / `437.0us` in the candidate repeats. The intended counter was
+  too small relative to retained leaf-run materialization/write noise and did
+  not translate to a workload win.
+- Do not retry `insert_buffer()` clean-mark elision as a standalone DML-tail
+  optimization. Reconsider only as part of a broader cache-admission/cache-finish
+  redesign that proves focused DELETE wins in same-window A/B and protects the
+  full quick primary score.
+
 ## 2026-05-12 - Current fullquick frontier after rowid fix
 
 - Target: current `comprehensive-bench --quick` frontier after the exact rowid

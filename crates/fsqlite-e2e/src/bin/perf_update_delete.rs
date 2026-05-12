@@ -547,7 +547,7 @@ fn dml_profile_enabled() -> bool {
 
 fn print_dml_profile(label: DmlProfileLabel, elapsed_us: f64, profile: &HotPathProfileSnapshot) {
     eprintln!(
-        "    [{label}] dml_profile elapsed_us={elapsed_us:.1} direct_update={} direct_delete={} delete_qf_ns={} delete_seek_ns={} delete_physical_ns={} delete_leaf_start={}/{} delete_leaf_start_ns={} delete_leaf_active={}/{} delete_leaf_miss={} delete_leaf_miss_shape={} delete_leaf_miss_out_of_leaf={} delete_leaf_miss_duplicate={} delete_leaf_miss_empty_leaf={} delete_leaf_miss_last_cell={} delete_leaf_miss_noncompact={} delete_leaf_miss_cell_shape={} delete_leaf_active_ns={} delete_leaf_flush={}/{} delete_leaf_flush_ns={} delete_leaf_materialize={}/{} delete_leaf_write={}/{} fast={} slow={} ud_fast_lane={} ud_instrumented_lane={} begin_ns={} execute_body_ns={} commit_roundtrip_ns={} pager_commit_calls={} pager_phase_a_ns={} pager_wal_ns={} pager_mem_flush_ns={} pager_cache_finish_ns={} parser_cache_hits={} parser_cache_misses={} parser_parse_ns={} bg_checks={} bg_ns={} prepared_lookup_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} record_parse_into={} record_decode_ns={} btree_payload_copy_calls={} btree_payload_copy_bytes={} btree_cell_assembly_calls={} btree_cell_assembly_bytes={} vdbe_opcodes={} vdbe_statements={} vdbe_make_record={}",
+        "    [{label}] dml_profile elapsed_us={elapsed_us:.1} direct_update={} direct_delete={} delete_qf_ns={} delete_seek_ns={} delete_physical_ns={} delete_leaf_start={}/{} delete_leaf_start_ns={} delete_leaf_active={}/{} delete_leaf_miss={} delete_leaf_miss_shape={} delete_leaf_miss_out_of_leaf={} delete_leaf_miss_duplicate={} delete_leaf_miss_empty_leaf={} delete_leaf_miss_last_cell={} delete_leaf_miss_noncompact={} delete_leaf_miss_cell_shape={} delete_leaf_active_ns={} delete_leaf_flush={}/{} delete_leaf_flush_ns={} delete_leaf_materialize={}/{} delete_leaf_write={}/{} delete_leaf_search={}/{} delete_leaf_dupcheck={}/{} delete_leaf_compact={}/{} delete_leaf_cellparse={}/{} fast={} slow={} ud_fast_lane={} ud_instrumented_lane={} begin_ns={} execute_body_ns={} commit_roundtrip_ns={} pager_commit_calls={} pager_phase_a_ns={} pager_wal_ns={} pager_mem_flush_ns={} pager_cache_finish_ns={} parser_cache_hits={} parser_cache_misses={} parser_parse_ns={} bg_checks={} bg_ns={} prepared_lookup_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} record_parse_into={} record_decode_ns={} btree_payload_copy_calls={} btree_payload_copy_bytes={} btree_cell_assembly_calls={} btree_cell_assembly_bytes={} vdbe_opcodes={} vdbe_statements={} vdbe_make_record={}",
         profile.prepared_direct_update_executions,
         profile.prepared_direct_delete_executions,
         profile.prepared_direct_delete_qf_time_ns,
@@ -574,6 +574,20 @@ fn print_dml_profile(label: DmlProfileLabel, elapsed_us: f64, profile: &HotPathP
         profile.btree_leaf_reuse.delete_leaf_run_materialize_time_ns,
         profile.btree_leaf_reuse.delete_leaf_run_write_calls,
         profile.btree_leaf_reuse.delete_leaf_run_write_time_ns,
+        profile.btree_leaf_reuse.delete_leaf_run_search_calls,
+        profile.btree_leaf_reuse.delete_leaf_run_search_time_ns,
+        profile
+            .btree_leaf_reuse
+            .delete_leaf_run_duplicate_check_calls,
+        profile
+            .btree_leaf_reuse
+            .delete_leaf_run_duplicate_check_time_ns,
+        profile.btree_leaf_reuse.delete_leaf_run_compact_check_calls,
+        profile
+            .btree_leaf_reuse
+            .delete_leaf_run_compact_check_time_ns,
+        profile.btree_leaf_reuse.delete_leaf_run_cell_parse_calls,
+        profile.btree_leaf_reuse.delete_leaf_run_cell_parse_time_ns,
         profile.parser.fast_path_executions,
         profile.parser.slow_path_executions,
         profile.prepared_update_delete_fast_lane_hits,

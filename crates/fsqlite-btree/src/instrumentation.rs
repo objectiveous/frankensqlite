@@ -132,6 +132,22 @@ pub struct BtreeLeafReuseSnapshot {
     pub delete_leaf_run_write_calls: u64,
     /// Time spent handing retained same-leaf DELETE page images to the pager.
     pub delete_leaf_run_write_time_ns: u64,
+    /// Rowid searches inside retained same-leaf DELETE runs.
+    pub delete_leaf_run_search_calls: u64,
+    /// Time spent searching retained same-leaf DELETE run rowids.
+    pub delete_leaf_run_search_time_ns: u64,
+    /// Duplicate-index checks inside retained same-leaf DELETE runs.
+    pub delete_leaf_run_duplicate_check_calls: u64,
+    /// Time spent checking duplicate indexes in retained same-leaf DELETE runs.
+    pub delete_leaf_run_duplicate_check_time_ns: u64,
+    /// Compact-page-shape checks inside retained same-leaf DELETE runs.
+    pub delete_leaf_run_compact_check_calls: u64,
+    /// Time spent checking compact page shape in retained same-leaf DELETE runs.
+    pub delete_leaf_run_compact_check_time_ns: u64,
+    /// Cell parse/shape checks inside retained same-leaf DELETE runs.
+    pub delete_leaf_run_cell_parse_calls: u64,
+    /// Time spent parsing cells in retained same-leaf DELETE runs.
+    pub delete_leaf_run_cell_parse_time_ns: u64,
     /// Bulk table INSERT page-run grouping calls.
     pub bulk_table_grouping_calls: u64,
     /// Time spent grouping bulk table INSERT records into page ranges.
@@ -250,6 +266,14 @@ static BTREE_DELETE_LEAF_RUN_MATERIALIZE_CALLS: AtomicU64 = AtomicU64::new(0);
 static BTREE_DELETE_LEAF_RUN_MATERIALIZE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static BTREE_DELETE_LEAF_RUN_WRITE_CALLS: AtomicU64 = AtomicU64::new(0);
 static BTREE_DELETE_LEAF_RUN_WRITE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static BTREE_DELETE_LEAF_RUN_SEARCH_CALLS: AtomicU64 = AtomicU64::new(0);
+static BTREE_DELETE_LEAF_RUN_SEARCH_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static BTREE_DELETE_LEAF_RUN_DUPLICATE_CHECK_CALLS: AtomicU64 = AtomicU64::new(0);
+static BTREE_DELETE_LEAF_RUN_DUPLICATE_CHECK_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static BTREE_DELETE_LEAF_RUN_COMPACT_CHECK_CALLS: AtomicU64 = AtomicU64::new(0);
+static BTREE_DELETE_LEAF_RUN_COMPACT_CHECK_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static BTREE_DELETE_LEAF_RUN_CELL_PARSE_CALLS: AtomicU64 = AtomicU64::new(0);
+static BTREE_DELETE_LEAF_RUN_CELL_PARSE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static BTREE_BULK_TABLE_GROUPING_CALLS: AtomicU64 = AtomicU64::new(0);
 static BTREE_BULK_TABLE_GROUPING_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static BTREE_BULK_TABLE_LEAF_PAGE_BUILD_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -490,6 +514,38 @@ pub(crate) fn record_delete_leaf_run_write(start: Option<std::time::Instant>) {
     BTREE_DELETE_LEAF_RUN_WRITE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
+pub(crate) fn record_delete_leaf_run_search(start: Option<std::time::Instant>) {
+    let Some(duration_ns) = profile_elapsed_ns(start) else {
+        return;
+    };
+    BTREE_DELETE_LEAF_RUN_SEARCH_CALLS.fetch_add(1, Ordering::Relaxed);
+    BTREE_DELETE_LEAF_RUN_SEARCH_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
+}
+
+pub(crate) fn record_delete_leaf_run_duplicate_check(start: Option<std::time::Instant>) {
+    let Some(duration_ns) = profile_elapsed_ns(start) else {
+        return;
+    };
+    BTREE_DELETE_LEAF_RUN_DUPLICATE_CHECK_CALLS.fetch_add(1, Ordering::Relaxed);
+    BTREE_DELETE_LEAF_RUN_DUPLICATE_CHECK_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
+}
+
+pub(crate) fn record_delete_leaf_run_compact_check(start: Option<std::time::Instant>) {
+    let Some(duration_ns) = profile_elapsed_ns(start) else {
+        return;
+    };
+    BTREE_DELETE_LEAF_RUN_COMPACT_CHECK_CALLS.fetch_add(1, Ordering::Relaxed);
+    BTREE_DELETE_LEAF_RUN_COMPACT_CHECK_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
+}
+
+pub(crate) fn record_delete_leaf_run_cell_parse(start: Option<std::time::Instant>) {
+    let Some(duration_ns) = profile_elapsed_ns(start) else {
+        return;
+    };
+    BTREE_DELETE_LEAF_RUN_CELL_PARSE_CALLS.fetch_add(1, Ordering::Relaxed);
+    BTREE_DELETE_LEAF_RUN_CELL_PARSE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
+}
+
 pub(crate) fn record_bulk_table_grouping(start: Option<std::time::Instant>) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
@@ -669,6 +725,21 @@ pub fn btree_leaf_reuse_snapshot() -> BtreeLeafReuseSnapshot {
             .load(Ordering::Relaxed),
         delete_leaf_run_write_calls: BTREE_DELETE_LEAF_RUN_WRITE_CALLS.load(Ordering::Relaxed),
         delete_leaf_run_write_time_ns: BTREE_DELETE_LEAF_RUN_WRITE_TIME_NS.load(Ordering::Relaxed),
+        delete_leaf_run_search_calls: BTREE_DELETE_LEAF_RUN_SEARCH_CALLS.load(Ordering::Relaxed),
+        delete_leaf_run_search_time_ns: BTREE_DELETE_LEAF_RUN_SEARCH_TIME_NS
+            .load(Ordering::Relaxed),
+        delete_leaf_run_duplicate_check_calls: BTREE_DELETE_LEAF_RUN_DUPLICATE_CHECK_CALLS
+            .load(Ordering::Relaxed),
+        delete_leaf_run_duplicate_check_time_ns: BTREE_DELETE_LEAF_RUN_DUPLICATE_CHECK_TIME_NS
+            .load(Ordering::Relaxed),
+        delete_leaf_run_compact_check_calls: BTREE_DELETE_LEAF_RUN_COMPACT_CHECK_CALLS
+            .load(Ordering::Relaxed),
+        delete_leaf_run_compact_check_time_ns: BTREE_DELETE_LEAF_RUN_COMPACT_CHECK_TIME_NS
+            .load(Ordering::Relaxed),
+        delete_leaf_run_cell_parse_calls: BTREE_DELETE_LEAF_RUN_CELL_PARSE_CALLS
+            .load(Ordering::Relaxed),
+        delete_leaf_run_cell_parse_time_ns: BTREE_DELETE_LEAF_RUN_CELL_PARSE_TIME_NS
+            .load(Ordering::Relaxed),
         bulk_table_grouping_calls: BTREE_BULK_TABLE_GROUPING_CALLS.load(Ordering::Relaxed),
         bulk_table_grouping_time_ns: BTREE_BULK_TABLE_GROUPING_TIME_NS.load(Ordering::Relaxed),
         bulk_table_leaf_page_build_calls: BTREE_BULK_TABLE_LEAF_PAGE_BUILD_CALLS
@@ -744,6 +815,14 @@ pub fn reset_btree_leaf_reuse_profile() {
     BTREE_DELETE_LEAF_RUN_MATERIALIZE_TIME_NS.store(0, Ordering::Relaxed);
     BTREE_DELETE_LEAF_RUN_WRITE_CALLS.store(0, Ordering::Relaxed);
     BTREE_DELETE_LEAF_RUN_WRITE_TIME_NS.store(0, Ordering::Relaxed);
+    BTREE_DELETE_LEAF_RUN_SEARCH_CALLS.store(0, Ordering::Relaxed);
+    BTREE_DELETE_LEAF_RUN_SEARCH_TIME_NS.store(0, Ordering::Relaxed);
+    BTREE_DELETE_LEAF_RUN_DUPLICATE_CHECK_CALLS.store(0, Ordering::Relaxed);
+    BTREE_DELETE_LEAF_RUN_DUPLICATE_CHECK_TIME_NS.store(0, Ordering::Relaxed);
+    BTREE_DELETE_LEAF_RUN_COMPACT_CHECK_CALLS.store(0, Ordering::Relaxed);
+    BTREE_DELETE_LEAF_RUN_COMPACT_CHECK_TIME_NS.store(0, Ordering::Relaxed);
+    BTREE_DELETE_LEAF_RUN_CELL_PARSE_CALLS.store(0, Ordering::Relaxed);
+    BTREE_DELETE_LEAF_RUN_CELL_PARSE_TIME_NS.store(0, Ordering::Relaxed);
     BTREE_BULK_TABLE_GROUPING_CALLS.store(0, Ordering::Relaxed);
     BTREE_BULK_TABLE_GROUPING_TIME_NS.store(0, Ordering::Relaxed);
     BTREE_BULK_TABLE_LEAF_PAGE_BUILD_CALLS.store(0, Ordering::Relaxed);

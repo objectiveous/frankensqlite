@@ -1350,6 +1350,7 @@ pub struct TableLeafDeleteRun {
     entry: StackEntry,
     tree_depth: usize,
     dirty: bool,
+    profile_delete_leaf_run: bool,
     deleted_cell_indices: SmallVec<[u16; 16]>,
 }
 
@@ -1389,12 +1390,28 @@ impl TableLeafDeleteRun {
         rowid: i64,
         usable_size: u32,
     ) -> Result<TableLeafDeleteRunDelete> {
-        let Some(cell_idx) = self.search_table_leaf(cx, rowid)? else {
+        let cell_idx = if self.profile_delete_leaf_run {
+            let search_start = Some(std::time::Instant::now());
+            let search_result = self.search_table_leaf(cx, rowid);
+            instrumentation::record_delete_leaf_run_search(search_start);
+            search_result?
+        } else {
+            self.search_table_leaf(cx, rowid)?
+        };
+        let Some(cell_idx) = cell_idx else {
             return Ok(TableLeafDeleteRunDelete::Miss(
                 TableLeafDeleteRunMissReason::RowidNotInLeaf,
             ));
         };
-        if self.deleted_cell_indices.contains(&cell_idx) {
+        let already_deleted = if self.profile_delete_leaf_run {
+            let duplicate_check_start = Some(std::time::Instant::now());
+            let already_deleted = self.deleted_cell_indices.contains(&cell_idx);
+            instrumentation::record_delete_leaf_run_duplicate_check(duplicate_check_start);
+            already_deleted
+        } else {
+            self.deleted_cell_indices.contains(&cell_idx)
+        };
+        if already_deleted {
             return Ok(TableLeafDeleteRunDelete::Miss(
                 TableLeafDeleteRunMissReason::AlreadyDeleted,
             ));
@@ -1411,18 +1428,38 @@ impl TableLeafDeleteRun {
                 ));
             }
         }
-        if !self.has_compact_cell_area(usable_size) {
+        let has_compact_cell_area = if self.profile_delete_leaf_run {
+            let compact_check_start = Some(std::time::Instant::now());
+            let has_compact_cell_area = self.has_compact_cell_area(usable_size);
+            instrumentation::record_delete_leaf_run_compact_check(compact_check_start);
+            has_compact_cell_area
+        } else {
+            self.has_compact_cell_area(usable_size)
+        };
+        if !has_compact_cell_area {
             return Ok(TableLeafDeleteRunDelete::Miss(
                 TableLeafDeleteRunMissReason::NonCompactCellArea,
             ));
         }
         let cell_offset = usize::from(self.entry.cell_pointers[usize::from(cell_idx)]);
-        let cell = CellRef::parse(
-            self.entry.page_data.as_bytes(),
-            cell_offset,
-            self.entry.header.page_type,
-            usable_size,
-        )?;
+        let cell = if self.profile_delete_leaf_run {
+            let cell_parse_start = Some(std::time::Instant::now());
+            let cell = CellRef::parse(
+                self.entry.page_data.as_bytes(),
+                cell_offset,
+                self.entry.header.page_type,
+                usable_size,
+            );
+            instrumentation::record_delete_leaf_run_cell_parse(cell_parse_start);
+            cell?
+        } else {
+            CellRef::parse(
+                self.entry.page_data.as_bytes(),
+                cell_offset,
+                self.entry.header.page_type,
+                usable_size,
+            )?
+        };
         if cell.rowid != Some(rowid) || cell.overflow_page.is_some() {
             return Ok(TableLeafDeleteRunDelete::Miss(
                 TableLeafDeleteRunMissReason::CellShapeOrOverflow,
@@ -9138,6 +9175,7 @@ impl<P: PageWriter> BtCursor<P> {
             entry: entry.clone(),
             tree_depth,
             dirty: false,
+            profile_delete_leaf_run: instrumentation::copy_profile_enabled(),
             deleted_cell_indices: SmallVec::new(),
         }))
     }

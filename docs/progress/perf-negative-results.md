@@ -12,6 +12,36 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Current HEAD DML boundary refresh after rowid fix
+
+- Target: current `UPDATE/DELETEThroughput` focused rows after
+  `0c016144` to confirm whether the remaining write-single frontier changed
+  enough to justify another source patch.
+- Files/subsystems inspected: no source patch. Re-read the prepared direct
+  UPDATE/DELETE path in `crates/fsqlite-core/src/connection.rs`, the current
+  fullquick artifact, the current INSERT/DML boundary artifacts, and the
+  rejected DML/INSERT/concurrent families above.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-head-dml-refresh-20260512T0340Z/`.
+- Result: no source patch attempted. A fresh current-HEAD release-perf
+  benchmark rebuilt at `0c016144` reported first-run DELETE ratios of
+  `1.492x`, `1.822x`, and `1.616x` for the 5/50/500-row DELETE cases; the
+  repeat reported `2.828x`, `1.794x`, and `1.640x`. The 10K/500 repeat still
+  used the prepared direct path (`slow=0`) and retained leaf-run shape
+  (`delete_leaf_active=433/496`, `delete_leaf_flush=64/64`,
+  `delete_leaf_materialize=64/69271`). The 100-row UPDATE tail remained
+  fixed-cost/noise-sensitive (`1.094x` first run, `1.389x` repeat), while the
+  larger UPDATE rows stayed green.
+- Do not retry another standalone DELETE retained-run search/admission/
+  materializer, direct writer/flush, scratch reset, exact transaction-control
+  bypass, logical rowid buffer, or cell-log hook from this current-HEAD
+  evidence. Reconsider only as the broader transaction-local DML mutation
+  operator that removes per-leaf mutation/publication ceremony and proves
+  read-your-writes, rollback/savepoint behavior, duplicate/missing rowid
+  semantics, schema drift handling, quotient-filter/cache invalidation, MVCC
+  publication, focused DELETE wins, and full-quick primary-score neutrality or
+  better.
+
 ## 2026-05-12 - Current concurrent writer boundary refresh
 
 - Target: remaining low-thread rows in

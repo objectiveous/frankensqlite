@@ -59,7 +59,12 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::{fmt::Write as _, fs, path::Path, path::PathBuf};
+use std::{
+    fmt::{Display, Write as _},
+    fs,
+    path::Path,
+    path::PathBuf,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -72,8 +77,10 @@ const DEFAULT_HISTORY_JSON: &str = ".bench-history/mt-mvcc-bench.latest.json";
 const DEFAULT_SEPARATE_TABLES_HISTORY_JSON: &str =
     ".bench-history/mt-mvcc-bench.separate-tables.latest.json";
 const ROWID_BASE_STRIDE: i64 = 1_000_000;
-const MAX_RETRIES: usize = 32;
+const MAX_RETRIES: usize = 512;
 const RETRY_SLEEP_MS: u64 = 1;
+const MAX_RETRY_SLEEP_MS: u64 = 25;
+const FSQLITE_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 const SHARED_INSERT_SQL: &str = "INSERT INTO bench (id, payload) VALUES (?1, ?2)";
 const STARTUP_COORDINATION_TIMEOUT: Duration = Duration::from_secs(5);
 const PASS_OVER_PASS_SCHEMA_V1: &str = "fsqlite-e2e.mt_mvcc_bench.pass_over_pass.v1";
@@ -125,6 +132,11 @@ fn print_usage_and_exit(code: i32) -> ! {
     std::process::exit(code);
 }
 
+fn print_usage_error(message: impl Display) -> ! {
+    eprintln!("{message}");
+    print_usage_and_exit(2);
+}
+
 fn parse_args() -> Options {
     let mut opts = Options::default();
     let mut args = std::env::args().skip(1);
@@ -143,36 +155,36 @@ fn parse_args() -> Options {
             print_usage_and_exit(0);
         } else {
             // Support space-separated form.
-            let v = args
-                .next()
-                .unwrap_or_else(|| panic!("missing value for argument `{arg}`"));
+            let v = args.next().unwrap_or_else(|| {
+                print_usage_error(format!("missing value for argument `{arg}`"))
+            });
             (arg, v)
         };
         match key.as_str() {
             "--rows-per-thread" => {
-                opts.rows_per_thread = val
-                    .parse()
-                    .unwrap_or_else(|_| panic!("invalid --rows-per-thread: {val}"));
+                opts.rows_per_thread = val.parse().unwrap_or_else(|_| {
+                    print_usage_error(format!("invalid --rows-per-thread: {val}"))
+                });
             }
             "--threads" => {
                 opts.threads = val
                     .split(',')
                     .map(|s| {
-                        s.trim()
-                            .parse::<usize>()
-                            .unwrap_or_else(|_| panic!("invalid thread count in --threads: {s}"))
+                        s.trim().parse::<usize>().unwrap_or_else(|_| {
+                            print_usage_error(format!("invalid thread count in --threads: {s}"))
+                        })
                     })
                     .collect();
                 if opts.threads.is_empty() {
-                    panic!("--threads must contain at least one value");
+                    print_usage_error("--threads must contain at least one value");
                 }
             }
             "--iters" => {
                 opts.iters = val
                     .parse()
-                    .unwrap_or_else(|_| panic!("invalid --iters: {val}"));
+                    .unwrap_or_else(|_| print_usage_error(format!("invalid --iters: {val}")));
                 if opts.iters == 0 {
-                    panic!("--iters must be >= 1");
+                    print_usage_error("--iters must be >= 1");
                 }
             }
             "--json-output" => {
@@ -321,7 +333,41 @@ struct RatioRegression {
 
 #[derive(Debug, Clone, Deserialize)]
 struct HistoricalMtMvccBenchReport {
+    workload_shape: Option<String>,
+    rows_per_thread: Option<usize>,
     thread_results: Vec<ThreadComparisonReport>,
+}
+
+#[derive(Debug, Clone)]
+struct FsqliteRetryBudget {
+    attempts: usize,
+    started: Instant,
+}
+
+impl FsqliteRetryBudget {
+    fn new() -> Self {
+        Self {
+            attempts: 0,
+            started: Instant::now(),
+        }
+    }
+
+    const fn attempts(&self) -> usize {
+        self.attempts
+    }
+
+    fn next_wait(&mut self, tid: usize) -> Option<Duration> {
+        if self.attempts >= MAX_RETRIES || self.started.elapsed() >= FSQLITE_RETRY_TIMEOUT {
+            return None;
+        }
+        self.attempts += 1;
+        let exp_shift = (self.attempts / 8).min(5);
+        let base_ms = RETRY_SLEEP_MS
+            .saturating_mul(1_u64 << exp_shift)
+            .min(MAX_RETRY_SLEEP_MS);
+        let jitter_ms = ((tid as u64).wrapping_mul(7) + (self.attempts as u64).wrapping_mul(3)) % 5;
+        Some(Duration::from_millis(base_ms.saturating_add(jitter_ms)))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -479,7 +525,16 @@ fn build_pass_over_pass_gate(
     history_json: &Path,
     previous: Option<&HistoricalMtMvccBenchReport>,
     current_rows: &[ThreadComparisonReport],
+    current_workload_shape: &str,
+    current_rows_per_thread: usize,
 ) -> PassOverPassGateReport {
+    let previous = previous.filter(|previous| {
+        previous
+            .workload_shape
+            .as_deref()
+            .is_some_and(|shape| shape == current_workload_shape)
+            && previous.rows_per_thread == Some(current_rows_per_thread)
+    });
     let regressions = previous
         .map(|previous| {
             let previous_by_threads: BTreeMap<usize, f64> = previous
@@ -715,7 +770,7 @@ fn run_fsqlite(
 
             // Single transaction spanning all rows; retry on transient
             // conflicts by rolling back and reopening the transaction.
-            let mut retry_count = 0usize;
+            let mut retry_budget = FsqliteRetryBudget::new();
             'outer: loop {
                 let begin_sql = if concurrent_ok {
                     "BEGIN CONCURRENT"
@@ -723,12 +778,16 @@ fn run_fsqlite(
                     "BEGIN"
                 };
                 if let Err(e) = conn.execute(begin_sql) {
-                    if e.is_transient() && retry_count < MAX_RETRIES {
-                        retry_count += 1;
-                        thread::sleep(Duration::from_millis(RETRY_SLEEP_MS));
+                    if e.is_transient()
+                        && let Some(wait) = retry_budget.next_wait(tid)
+                    {
+                        thread::sleep(wait);
                         continue;
                     }
-                    return Err(format!("[fsqlite t{tid}] BEGIN failed: {e}"));
+                    return Err(format!(
+                        "[fsqlite t{tid}] BEGIN failed after {} retries: {e}",
+                        retry_budget.attempts()
+                    ));
                 }
 
                 let stmt = match conn.prepare(&insert_sql) {
@@ -749,11 +808,16 @@ fn run_fsqlite(
                     ];
                     match stmt.execute_with_params(&params) {
                         Ok(_) => {}
-                        Err(e) if e.is_transient() && retry_count < MAX_RETRIES => {
+                        Err(e) if e.is_transient() => {
                             let _ = conn.execute("ROLLBACK");
-                            retry_count += 1;
-                            thread::sleep(Duration::from_millis(RETRY_SLEEP_MS));
-                            continue 'outer;
+                            if let Some(wait) = retry_budget.next_wait(tid) {
+                                thread::sleep(wait);
+                                continue 'outer;
+                            }
+                            return Err(format!(
+                                "[fsqlite t{tid}] INSERT {id} exhausted retry budget after {} retries: {e}",
+                                retry_budget.attempts()
+                            ));
                         }
                         Err(e) => {
                             eprintln!("[fsqlite t{tid}] INSERT {id} failed: {e}");
@@ -764,10 +828,16 @@ fn run_fsqlite(
 
                 match conn.execute("COMMIT") {
                     Ok(_) => break 'outer,
-                    Err(e) if e.is_transient() && retry_count < MAX_RETRIES => {
+                    Err(e) if e.is_transient() => {
                         let _ = conn.execute("ROLLBACK");
-                        retry_count += 1;
-                        thread::sleep(Duration::from_millis(RETRY_SLEEP_MS));
+                        if let Some(wait) = retry_budget.next_wait(tid) {
+                            thread::sleep(wait);
+                            continue;
+                        }
+                        return Err(format!(
+                            "[fsqlite t{tid}] COMMIT exhausted retry budget after {} retries: {e}",
+                            retry_budget.attempts()
+                        ));
                     }
                     Err(e) => {
                         let _ = conn.execute("ROLLBACK");
@@ -1037,15 +1107,18 @@ fn run() -> Result<(), String> {
     }
 
     let previous_report = load_previous_report(&opts.history_json)?;
+    let workload_shape = workload_shape(opts.separate_tables);
     let pass_over_pass_gate = build_pass_over_pass_gate(
         &opts.history_json,
         previous_report.as_ref(),
         &thread_results,
+        workload_shape,
+        opts.rows_per_thread,
     );
 
     let full_report = MtMvccBenchReport {
         schema_version: REPORT_SCHEMA_V3,
-        workload_shape: workload_shape(opts.separate_tables),
+        workload_shape,
         rows_per_thread: opts.rows_per_thread,
         iterations: opts.iters,
         thread_results,
@@ -1205,6 +1278,8 @@ mod tests {
     #[test]
     fn pass_over_pass_gate_flags_ratio_drop_over_five_percent() {
         let previous = HistoricalMtMvccBenchReport {
+            workload_shape: Some("shared_table".to_owned()),
+            rows_per_thread: Some(1000),
             thread_results: vec![ThreadComparisonReport {
                 threads: 8,
                 fsqlite_wps_p50: 0.0,
@@ -1245,8 +1320,13 @@ mod tests {
             sqlite_failed_rows: 0,
         }];
 
-        let gate =
-            build_pass_over_pass_gate(Path::new(DEFAULT_HISTORY_JSON), Some(&previous), &current);
+        let gate = build_pass_over_pass_gate(
+            Path::new(DEFAULT_HISTORY_JSON),
+            Some(&previous),
+            &current,
+            "shared_table",
+            1000,
+        );
 
         assert_eq!(gate.status, "failed");
         assert_eq!(gate.regressions.len(), 1);
@@ -1256,9 +1336,93 @@ mod tests {
 
     #[test]
     fn pass_over_pass_gate_skips_without_prior_report() {
-        let gate = build_pass_over_pass_gate(Path::new(DEFAULT_HISTORY_JSON), None, &[]);
+        let gate = build_pass_over_pass_gate(
+            Path::new(DEFAULT_HISTORY_JSON),
+            None,
+            &[],
+            "shared_table",
+            1000,
+        );
 
         assert_eq!(gate.status, "no_prior_report");
         assert!(gate.regressions.is_empty());
+    }
+
+    #[test]
+    fn pass_over_pass_gate_skips_incompatible_history_shape() {
+        let previous = HistoricalMtMvccBenchReport {
+            workload_shape: Some("shared_table".to_owned()),
+            rows_per_thread: Some(100),
+            thread_results: vec![ThreadComparisonReport {
+                threads: 16,
+                fsqlite_wps_p50: 0.0,
+                fsqlite_wps_p95: 0.0,
+                fsqlite_wps_p99: 0.0,
+                sqlite_wps_p50: 0.0,
+                sqlite_wps_p95: 0.0,
+                sqlite_wps_p99: 0.0,
+                throughput_ratio: 30.0,
+                fsqlite_ms_p50: 0.0,
+                fsqlite_ms_p95: 0.0,
+                fsqlite_ms_p99: 0.0,
+                sqlite_ms_p50: 0.0,
+                sqlite_ms_p95: 0.0,
+                sqlite_ms_p99: 0.0,
+                time_ratio: 0.0,
+                fsqlite_failed_rows: 0,
+                sqlite_failed_rows: 0,
+            }],
+        };
+        let current = vec![ThreadComparisonReport {
+            threads: 16,
+            fsqlite_wps_p50: 0.0,
+            fsqlite_wps_p95: 0.0,
+            fsqlite_wps_p99: 0.0,
+            sqlite_wps_p50: 0.0,
+            sqlite_wps_p95: 0.0,
+            sqlite_wps_p99: 0.0,
+            throughput_ratio: 20.0,
+            fsqlite_ms_p50: 0.0,
+            fsqlite_ms_p95: 0.0,
+            fsqlite_ms_p99: 0.0,
+            sqlite_ms_p50: 0.0,
+            sqlite_ms_p95: 0.0,
+            sqlite_ms_p99: 0.0,
+            time_ratio: 0.0,
+            fsqlite_failed_rows: 0,
+            sqlite_failed_rows: 0,
+        }];
+
+        let gate = build_pass_over_pass_gate(
+            Path::new(DEFAULT_HISTORY_JSON),
+            Some(&previous),
+            &current,
+            "shared_table",
+            1000,
+        );
+
+        assert_eq!(gate.status, "no_prior_report");
+        assert!(gate.regressions.is_empty());
+    }
+
+    #[test]
+    fn retry_budget_allows_busy_timeout_scaled_retries() {
+        let mut budget = FsqliteRetryBudget::new();
+        let mut waits = Vec::new();
+        for _ in 0..MAX_RETRIES {
+            waits.push(
+                budget
+                    .next_wait(8)
+                    .expect("budget should allow configured retry count"),
+            );
+        }
+
+        assert_eq!(budget.attempts(), MAX_RETRIES);
+        assert!(budget.next_wait(8).is_none());
+        assert!(
+            waits
+                .iter()
+                .all(|wait| wait.as_millis() <= u128::from(MAX_RETRY_SLEEP_MS + 4))
+        );
     }
 }

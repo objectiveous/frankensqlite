@@ -346,7 +346,7 @@ impl CellDeltaArena {
             .get_mut(idx.chunk as usize)?
             .get_mut(idx.offset as usize)?;
 
-        if slot.generation != idx.generation {
+        if !slot.generation.eq(&idx.generation) {
             return None; // Stale pointer
         }
 
@@ -375,10 +375,25 @@ impl CellDeltaArena {
             .get(idx.chunk as usize)?
             .get(idx.offset as usize)?;
 
-        if slot.generation != idx.generation {
+        if !slot.generation.eq(&idx.generation) {
             return None;
         }
         slot.delta.as_ref()
+    }
+
+    /// Mutably look up a delta by index.
+    ///
+    /// Returns `None` if the index is stale or the slot is empty.
+    pub fn get_mut(&mut self, idx: CellDeltaIdx) -> Option<&mut CellDelta> {
+        let slot = self
+            .chunks
+            .get_mut(idx.chunk as usize)?
+            .get_mut(idx.offset as usize)?;
+
+        if !slot.generation.eq(&idx.generation) {
+            return None;
+        }
+        slot.delta.as_mut()
     }
 
     /// Total cell data bytes currently in the arena.
@@ -878,7 +893,7 @@ impl CellVisibilityLog {
             .get_mut(idx.chunk as usize)
             .and_then(|c| c.get_mut(idx.offset as usize))
         {
-            if slot.generation == idx.generation {
+            if slot.generation.eq(&idx.generation) {
                 if let Some(ref mut delta) = slot.delta {
                     delta.commit_seq = commit_seq;
                 }
@@ -1020,7 +1035,7 @@ impl CellVisibilityLog {
                 .get_mut(idx.chunk as usize)
                 .and_then(|c| c.get_mut(idx.offset as usize))
             {
-                if slot.generation == idx.generation {
+                if slot.generation.eq(&idx.generation) {
                     if let Some(ref mut delta) = slot.delta {
                         delta.commit_seq = commit_seq;
                         committed_count += 1;
@@ -1056,35 +1071,49 @@ impl CellVisibilityLog {
         let mut bytes_freed = 0u64;
 
         for idx in delta_indices.iter().rev() {
+            let Some(delta_before_free) = arena.get(*idx).cloned() else {
+                continue;
+            };
+            let shard_idx = Self::shard_index(delta_before_free.page_number);
+            let shard = &self.shards[shard_idx];
+            let lookup_key = (
+                delta_before_free.page_number,
+                delta_before_free.cell_key.key_digest,
+            );
+            let next_head = delta_before_free
+                .prev_idx
+                .filter(|prev| arena.get(*prev).is_some());
+
+            {
+                let mut heads = shard.heads.write();
+                if let Some(entry) = heads.get_mut(&lookup_key) {
+                    if entry.head_idx.eq(idx) {
+                        if let Some(prev) = next_head {
+                            entry.head_idx = prev;
+                        } else {
+                            heads.remove(&lookup_key);
+                        }
+                    } else {
+                        let mut current_idx = Some(entry.head_idx);
+                        while let Some(current) = current_idx {
+                            let current_prev = arena.get(current).and_then(|delta| delta.prev_idx);
+                            if current_prev.is_some_and(|prev| prev.eq(idx)) {
+                                if let Some(delta) = arena.get_mut(current) {
+                                    delta.prev_idx = next_head;
+                                }
+                                break;
+                            }
+                            current_idx = current_prev;
+                        }
+                    }
+                }
+            }
+
             if let Some(delta) = arena.free(*idx) {
                 bytes_freed += delta.memory_size() as u64;
                 removed_count += 1;
 
-                let shard_idx = Self::shard_index(delta.page_number);
-                let shard = &self.shards[shard_idx];
-                let mut heads = shard.heads.write();
-
-                let lookup_key = (delta.page_number, delta.cell_key.key_digest);
-                let next_head = delta.prev_idx.filter(|prev| arena.get(*prev).is_some());
-                let should_remove = heads
-                    .get(&lookup_key)
-                    .is_some_and(|entry| entry.head_idx == *idx)
-                    && next_head.is_none();
-
-                if let Some(entry) = heads.get_mut(&lookup_key) {
-                    if entry.head_idx == *idx {
-                        if let Some(prev) = next_head {
-                            entry.head_idx = prev;
-                        }
-                    }
-                }
-
-                if should_remove {
-                    heads.remove(&lookup_key);
-                }
-
                 // C7 (bd-l9k8e.7): Decrement per-page delta count.
-                drop(heads); // Release write lock before calling decrement
                 shard.decrement_page_count(delta.page_number);
             }
         }
@@ -1256,7 +1285,7 @@ impl CellVisibilityLog {
 
         // Collect all deltas for cells on this page
         for ((pgno, _key_digest), entry) in heads.iter() {
-            if *pgno != page_number {
+            if !pgno.eq(&page_number) {
                 continue;
             }
 
@@ -1306,7 +1335,7 @@ impl CellVisibilityLog {
         let mut count = 0usize;
 
         for ((pgno, _), entry) in heads.iter() {
-            if *pgno != page_number {
+            if !pgno.eq(&page_number) {
                 continue;
             }
 
@@ -1368,7 +1397,7 @@ impl CellVisibilityLog {
             let heads = shard.heads.read();
 
             for ((pgno, key_digest), entry) in heads.iter() {
-                if *pgno != page_number {
+                if !pgno.eq(&page_number) {
                     continue;
                 }
 
@@ -1831,6 +1860,41 @@ mod tests {
         assert_eq!(
             log.resolve(page_number, &cell_key, CommitSeq::new(20)),
             Some(vec![1])
+        );
+    }
+
+    #[test]
+    fn test_rollback_middle_delta_relinks_newer_delta_to_committed_base() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).unwrap();
+
+        let committed = log
+            .record_insert(cell_key, page_number, vec![1], txn_token_n(1))
+            .expect("committed insert should succeed");
+        log.commit_delta(committed, CommitSeq::new(10));
+
+        let rolled_back_txn = txn_token_n(2);
+        log.record_update(cell_key, page_number, vec![2], rolled_back_txn)
+            .expect("middle update should succeed");
+
+        let newer_txn = txn_token_n(3);
+        log.record_update(cell_key, page_number, vec![3], newer_txn)
+            .expect("newer update should succeed");
+
+        assert_eq!(log.rollback_txn(rolled_back_txn), 1);
+        log.commit_txn(newer_txn, CommitSeq::new(30));
+
+        assert_eq!(
+            log.resolve(page_number, &cell_key, CommitSeq::new(10)),
+            Some(vec![1]),
+            "rolling back an interior delta must preserve the older visible version"
+        );
+        assert_eq!(
+            log.resolve(page_number, &cell_key, CommitSeq::new(30)),
+            Some(vec![3]),
+            "the newer delta should stay linked as the current version"
         );
     }
 

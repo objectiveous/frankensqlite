@@ -137,6 +137,17 @@ fn print_usage_error(message: impl Display) -> ! {
     print_usage_and_exit(2);
 }
 
+fn parse_thread_count(raw: &str) -> Result<usize, String> {
+    let threads = raw
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| format!("invalid thread count in --threads: {raw}"))?;
+    if threads == 0 {
+        return Err("--threads values must be >= 1".to_owned());
+    }
+    Ok(threads)
+}
+
 fn parse_args() -> Options {
     let mut opts = Options::default();
     let mut args = std::env::args().skip(1);
@@ -170,9 +181,7 @@ fn parse_args() -> Options {
                 opts.threads = val
                     .split(',')
                     .map(|s| {
-                        s.trim().parse::<usize>().unwrap_or_else(|_| {
-                            print_usage_error(format!("invalid thread count in --threads: {s}"))
-                        })
+                        parse_thread_count(s).unwrap_or_else(|message| print_usage_error(message))
                     })
                     .collect();
                 if opts.threads.is_empty() {
@@ -1273,6 +1282,14 @@ mod tests {
             worker_insert_sql(7, true),
             "INSERT INTO bench_7 (id, payload) VALUES (?1, ?2)"
         );
+    }
+
+    #[test]
+    fn parse_thread_count_rejects_zero_worker_runs() {
+        assert_eq!(parse_thread_count("16").unwrap(), 16);
+        assert_eq!(parse_thread_count(" 4 ").unwrap(), 4);
+        assert!(parse_thread_count("0").is_err());
+        assert!(parse_thread_count("not-a-number").is_err());
     }
 
     #[test]

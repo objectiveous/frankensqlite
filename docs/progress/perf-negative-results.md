@@ -12,6 +12,35 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-12 - Retained DELETE local-payload validation fast path
+
+- Target: `UPDATE/DELETEThroughput` DELETE rows after
+  `tests/artifacts/perf/codex-current-dml-profile-a7635094-20260512T2005Z/`
+  showed retained same-leaf DELETE still spending time in the per-row
+  successful-cell shape check.
+- Files/subsystems touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`. The abandoned patch replaced the
+  successful-delete `CellRef::parse` call in `TableLeafDeleteRun` with a
+  narrower helper that read the payload-size and rowid varints, rejected cells
+  whose payload must overflow, and reused the retained page-image proof from
+  the binary search. The source patch was manually unwound before commit.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-delete-local-payload-candidate-20260512T2020Z/`.
+  Targeted proof passed:
+  `cargo test -p fsqlite-btree table_leaf_delete_run -- --nocapture`.
+- Result: rejected. The intended micro-counter did not move enough to matter:
+  on the 10000-row DELETE profile, `delete_leaf_cellparse` was
+  `497/12725ns` versus the baseline `497/13074ns`; on the 1000-row DELETE row
+  it worsened to `50/1754ns` versus baseline `50/1374ns`. The matrix did not
+  improve: candidate FSQLite DELETE medians were `6.5us`, `102.3us`, and
+  `335.1us` for the 100/1000/10000-row rows, versus baseline `7.2us`,
+  `29.5us`, and `259.3us`. The larger rows are the keep gate, so the patch is
+  out of tree.
+- Do not retry a standalone successful-cell `CellRef::parse` replacement for
+  retained DELETE runs. Reconsider only if a new no-profile profile shows this
+  exact shape check dominating after the broader DELETE materialization/write
+  costs have been removed.
+
 ## 2026-05-12 - Prepared direct DELETE monotone search hint retrial
 
 - Target: focused `perf-update-delete 10000 20 delete compare standard`, after

@@ -814,12 +814,7 @@ impl CellVisibilityLog {
         let shard_idx = Self::shard_index(page_number);
         let shard = &self.shards[shard_idx];
 
-        // Look up existing head (can release this lock early)
         let lookup_key = (page_number, cell_key.key_digest);
-        let prev_idx = {
-            let heads = shard.heads.read();
-            heads.get(&lookup_key).map(|e| e.head_idx)
-        };
 
         // Create new delta
         let delta = CellDelta {
@@ -829,7 +824,7 @@ impl CellVisibilityLog {
             kind: kind.clone(),
             page_number,
             cell_data,
-            prev_idx,
+            prev_idx: None,
         };
 
         let delta_memory = delta.memory_size() as u64;
@@ -851,28 +846,35 @@ impl CellVisibilityLog {
                 return None;
             }
 
-            // Allocate in arena while holding tracker lock
+            // Allocate in arena while holding tracker lock.  The head link is
+            // filled under the shard head write lock below; reading the old
+            // head before allocation can orphan a concurrent same-cell delta.
             let idx = {
                 let mut arena = self.arena.lock();
-                arena.alloc(delta)
+                let idx = arena.alloc(delta);
+
+                let mut heads = shard.heads.write();
+                let prev_idx = heads.get(&lookup_key).map(|entry| entry.head_idx);
+                let Some(delta) = arena.get_mut(idx) else {
+                    let _ = arena.free(idx);
+                    return None;
+                };
+                delta.prev_idx = prev_idx;
+                heads.insert(
+                    lookup_key,
+                    CellHeadEntry {
+                        cell_key,
+                        head_idx: idx,
+                    },
+                );
+
+                idx
             };
 
             // Record atomically with budget check
             tracker.record(created_by, idx, delta_memory);
             idx
         };
-
-        // Update head
-        {
-            let mut heads = shard.heads.write();
-            heads.insert(
-                lookup_key,
-                CellHeadEntry {
-                    cell_key,
-                    head_idx: new_idx,
-                },
-            );
-        }
 
         // C7 (bd-l9k8e.7): Increment per-page delta count for batch visibility.
         shard.increment_page_count(page_number);
@@ -3336,6 +3338,58 @@ mod tests {
 
         // All inserts should be present
         assert_eq!(log.delta_count(), 16 * 100);
+    }
+
+    #[test]
+    fn c3_test_concurrent_same_cell_deltas_remain_reachable() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const WRITERS: usize = 24;
+
+        let log = Arc::new(CellVisibilityLog::new(10 * 1024 * 1024));
+        let btree = BtreeRef::Table(TableId::new(1));
+        let page_number = PageNumber::new(42).unwrap();
+        let cell_key = CellKey::table_row(btree, 7);
+        let start = Arc::new(Barrier::new(WRITERS));
+
+        let mut handles = Vec::with_capacity(WRITERS);
+        for writer in 0..WRITERS {
+            let log_clone = Arc::clone(&log);
+            let start_clone = Arc::clone(&start);
+            handles.push(thread::spawn(move || {
+                let token = txn_token_n((writer + 1) as u32);
+                let cell_data = vec![writer as u8; 8];
+                start_clone.wait();
+                log_clone
+                    .record_update(cell_key, page_number, cell_data.clone(), token)
+                    .expect("same-cell update should fit budget");
+                (token, cell_data)
+            }));
+        }
+
+        let observed: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("writer thread should complete"))
+            .collect();
+
+        for (token, cell_data) in observed {
+            assert_eq!(
+                log.txn_delta_count(token),
+                1,
+                "transaction tracker should retain its same-cell delta"
+            );
+            let visible = log.collect_visible_deltas_for_txn(page_number, CommitSeq::ZERO, token);
+            assert_eq!(
+                visible.len(),
+                1,
+                "transaction-local read view should expose only this writer's uncommitted delta"
+            );
+            assert_eq!(
+                visible[0].cell_data, cell_data,
+                "transaction-local read view lost its same-cell uncommitted delta"
+            );
+        }
     }
 
     /// Test: 64-thread stress test: each thread inserts unique cells, all commit

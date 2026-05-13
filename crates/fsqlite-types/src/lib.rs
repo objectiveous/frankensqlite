@@ -48,9 +48,7 @@ use std::sync::{Arc, OnceLock};
 ///
 /// Page numbers are 1-based (page 0 does not exist). Page 1 is the database
 /// header page. The maximum page count is `u32::MAX - 1` (4,294,967,294).
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct PageNumber(NonZeroU32);
 
@@ -61,12 +59,17 @@ impl PageNumber {
 
     /// Create a new page number from a raw u32.
     ///
-    /// Returns `None` if `n` is 0 (page 0 does not exist in SQLite).
+    /// Returns `None` if `n` is 0 (page 0 does not exist in SQLite) or
+    /// `u32::MAX` (outside SQLite's maximum page count).
     #[inline]
     pub const fn new(n: u32) -> Option<Self> {
-        match NonZeroU32::new(n) {
-            Some(v) => Some(Self(v)),
-            None => None,
+        if n == u32::MAX {
+            None
+        } else {
+            match NonZeroU32::new(n) {
+                Some(v) => Some(Self(v)),
+                None => None,
+            }
         }
     }
 
@@ -80,6 +83,30 @@ impl PageNumber {
 impl fmt::Display for PageNumber {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl serde::Serialize for PageNumber {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u32(self.get())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PageNumber {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = <u32 as serde::Deserialize>::deserialize(deserializer)?;
+        Self::new(raw).ok_or_else(|| {
+            serde::de::Error::invalid_value(
+                serde::de::Unexpected::Unsigned(u64::from(raw)),
+                &"a SQLite page number in 1..=4294967294",
+            )
+        })
     }
 }
 
@@ -203,13 +230,13 @@ impl MergePageKind {
     }
 }
 
-/// Error returned when attempting to create a `PageNumber` from 0.
+/// Error returned when attempting to create an out-of-range `PageNumber`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidPageNumber;
 
 impl fmt::Display for InvalidPageNumber {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("page number cannot be zero")
+        f.write_str("page number must be in 1..=4294967294")
     }
 }
 
@@ -1634,6 +1661,38 @@ mod tests {
     fn test_page_number_zero_rejected() {
         assert!(PageNumber::new(0).is_none());
         assert!(PageNumber::try_from(0u32).is_err());
+    }
+
+    #[test]
+    fn page_number_max_u32_is_invalid() {
+        assert!(PageNumber::new(u32::MAX).is_none());
+        assert!(PageNumber::try_from(u32::MAX).is_err());
+        assert_eq!(
+            PageNumber::new(u32::MAX - 1)
+                .expect("SQLite maximum page number should be valid")
+                .get(),
+            u32::MAX - 1
+        );
+    }
+
+    #[test]
+    fn page_number_serde_preserves_constructor_invariant() {
+        let max =
+            PageNumber::new(u32::MAX - 1).expect("SQLite maximum page number should be valid");
+        let encoded = serde_json::to_string(&max).expect("PageNumber should serialize as a u32");
+        assert_eq!(encoded, (u32::MAX - 1).to_string());
+        assert_eq!(
+            serde_json::from_str::<PageNumber>(&encoded)
+                .expect("valid serialized PageNumber should decode"),
+            max
+        );
+
+        let err = serde_json::from_str::<PageNumber>(&u32::MAX.to_string())
+            .expect_err("serde must reject page numbers outside SQLite's valid range");
+        assert!(
+            err.to_string().contains("SQLite page number"),
+            "unexpected serde error: {err}"
+        );
     }
 
     #[test]

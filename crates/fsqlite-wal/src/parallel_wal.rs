@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::hash::BuildHasher;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -766,8 +766,36 @@ pub fn read_segment(path: &Path) -> io::Result<(SegmentHeader, Vec<WalRecord>)> 
     let header = SegmentHeader::from_bytes(&header_buf)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+    let file_len = reader.get_ref().metadata()?.len();
+    let body_len = file_len.saturating_sub(SEGMENT_HEADER_SIZE as u64);
+    let min_record_on_disk_len = u64::try_from(4 + SEGMENT_RECORD_MIN_SIZE).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "minimum segment record length exceeds u64",
+        )
+    })?;
+    let max_possible_records = body_len / min_record_on_disk_len;
+    if u64::from(header.record_count) > max_possible_records {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "segment record count {} exceeds maximum possible {} for file length {}",
+                header.record_count, max_possible_records, file_len
+            ),
+        ));
+    }
+
     // Read records
-    let mut records = Vec::with_capacity(header.record_count as usize);
+    let record_capacity = usize::try_from(header.record_count).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "segment record count {} exceeds addressable size",
+                header.record_count
+            ),
+        )
+    })?;
+    let mut records = Vec::with_capacity(record_capacity);
     for _ in 0..header.record_count {
         let mut len_buf = [0u8; 4];
         reader.read_exact(&mut len_buf)?;
@@ -784,6 +812,16 @@ pub fn read_segment(path: &Path) -> io::Result<(SegmentHeader, Vec<WalRecord>)> 
         let record = deserialize_record(&record_buf)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         records.push(record);
+    }
+    let consumed_len = reader.stream_position()?;
+    if consumed_len != file_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "segment has {} trailing bytes after declared records",
+                file_len.saturating_sub(consumed_len)
+            ),
+        ));
     }
 
     Ok((header, ordered_segment_records(header.epoch, &records)?))
@@ -1097,6 +1135,12 @@ fn deserialize_record(buf: &[u8]) -> Result<WalRecord, String> {
     let after_len = read_record_u32(buf, &mut offset, "after_image length")? as usize;
     validate_segment_image_len("after_image", after_len)?;
     let after_image = read_record_bytes(buf, &mut offset, after_len, "after_image")?.to_vec();
+    if offset != buf.len() {
+        return Err(format!(
+            "trailing bytes after WAL record: {}",
+            buf.len().saturating_sub(offset)
+        ));
+    }
 
     let txn_id = fsqlite_types::TxnId::new(txn_id).ok_or("invalid txn_id (zero)")?;
     let page_id = PageNumber::new(page_id).ok_or("invalid page_id (zero)")?;
@@ -2229,6 +2273,114 @@ mod tests {
             .expect_err("invalid end_seq flag must reject corrupt record bytes");
         assert!(
             error.contains("invalid end_seq flag"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_record_rejects_trailing_bytes() {
+        let record = WalRecord {
+            txn_token: TxnToken::new(
+                fsqlite_types::TxnId::new(1).expect("txn id should be non-zero"),
+                fsqlite_types::TxnEpoch::new(0),
+            ),
+            epoch: 5,
+            page_id: PageNumber::new(1).expect("page should be non-zero"),
+            begin_seq: CommitSeq::new(100),
+            end_seq: None,
+            before_image: Vec::new(),
+            after_image: vec![0xAA; 8],
+        };
+        let mut bytes = serialize_record(&record).expect("sample record should serialize");
+        bytes.extend_from_slice(b"junk");
+
+        let error =
+            deserialize_record(&bytes).expect_err("record decoder must reject trailing bytes");
+        assert!(
+            error.contains("trailing bytes"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_read_segment_rejects_impossible_record_count_before_allocation() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("impossible-count.db");
+        let seg_path = segment_path(&db_path, 1);
+        std::fs::write(&seg_path, SegmentHeader::new(1, u32::MAX).to_bytes())
+            .expect("write corrupt segment header");
+
+        let error =
+            read_segment(&seg_path).expect_err("impossible record count must fail before alloc");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("exceeds maximum possible"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_read_segment_rejects_record_count_without_min_payload_space() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("short-records.db");
+        let seg_path = segment_path(&db_path, 1);
+        let mut bytes = SegmentHeader::new(1, 2).to_bytes().to_vec();
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        std::fs::write(&seg_path, bytes).expect("write corrupt segment");
+
+        let error = read_segment(&seg_path)
+            .expect_err("record count must account for minimum record payload bytes");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("exceeds maximum possible"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_read_segment_rejects_trailing_bytes_after_declared_records() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("trailing-bytes.db");
+        let batch = EpochFlushBatch {
+            epoch: 1,
+            records: vec![WalRecord {
+                txn_token: TxnToken::new(
+                    fsqlite_types::TxnId::new(1).expect("txn id should be non-zero"),
+                    fsqlite_types::TxnEpoch::new(0),
+                ),
+                epoch: 1,
+                page_id: PageNumber::new(1).expect("page should be non-zero"),
+                begin_seq: CommitSeq::new(1),
+                end_seq: Some(CommitSeq::new(1)),
+                before_image: Vec::new(),
+                after_image: vec![0xCC; 16],
+            }],
+            records_per_core: vec![1],
+        };
+        write_segment(&db_path, &batch, FsyncPolicy::Off).expect("write should succeed");
+
+        let seg_path = segment_path(&db_path, 1);
+        {
+            use std::io::Write as _;
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&seg_path)
+                .expect("open segment for append");
+            file.write_all(b"junk").expect("append trailing bytes");
+        }
+
+        let error =
+            read_segment(&seg_path).expect_err("segment decoder must reject trailing bytes");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("trailing bytes"),
             "unexpected error: {error}"
         );
     }

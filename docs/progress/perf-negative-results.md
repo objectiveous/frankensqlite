@@ -32,9 +32,10 @@ Each entry should include:
   ratios of `3.0859x`, `1.8157x`, and `1.7505x`.
 - Result: no source patch attempted. The current direct DELETE path already
   tries the retained leaf image first and stages monotone cross-leaf runs.
-  Prior first/last probes, dense-rowid slot detection, interpolation probes,
-  and related binary-search reshapes were measured as standalone rejects, so
-  the obvious micro-patches map to existing rejection fences. The MVCC
+  Prior attempts to add first/last probes, dense-rowid slot detection,
+  interpolation hints, and related search reshapes to the retained
+  `TableLeafDeleteRun` active-rowid path were measured as standalone rejects,
+  so the obvious micro-patches map to existing rejection fences. The MVCC
   `CellVisibilityLog`/`read_page_with_cell_deltas` primitive exists, but the
   live core/VDBE/pager path still exposes page-oriented `SharedTxnPageIo` and
   `TransactionHandle` APIs with no transaction-local logical row/cell mutation

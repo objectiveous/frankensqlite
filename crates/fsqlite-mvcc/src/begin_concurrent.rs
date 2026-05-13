@@ -51,6 +51,23 @@ use crate::ssi_validation::{
 /// unbounded resource consumption.
 pub const MAX_CONCURRENT_WRITERS: usize = 128;
 
+#[inline]
+fn same_txn_identity(left: TxnToken, right: TxnToken) -> bool {
+    left.id.get() == right.id.get() && left.epoch.get() == right.epoch.get()
+}
+
+#[inline]
+#[cfg(test)]
+fn witness_is_page(witness: &WitnessKey, page: PageNumber) -> bool {
+    match witness {
+        WitnessKey::Page(candidate) => candidate.get().cmp(&page.get()).is_eq(),
+        WitnessKey::Cell { .. }
+        | WitnessKey::ByteRange { .. }
+        | WitnessKey::KeyRange { .. }
+        | WitnessKey::Custom { .. } => false,
+    }
+}
+
 /// Stable shared handle for one active concurrent transaction.
 pub type SharedConcurrentHandle = Arc<Mutex<ConcurrentHandle>>;
 
@@ -1128,7 +1145,7 @@ impl ConcurrentRegistry {
             .into_iter()
             .filter_map(|idx| self.committed_readers.get(idx))
             .filter(|reader| {
-                reader.token != committing_txn
+                !same_txn_identity(reader.token, committing_txn)
                     && committing_begin < reader.commit_seq.get()
                     && reader.begin_seq.get() < committing_end
             })
@@ -1162,7 +1179,8 @@ impl ConcurrentRegistry {
             .into_iter()
             .filter_map(|idx| self.committed_writers.get(idx))
             .filter(|writer| {
-                writer.token != committing_txn && committing_begin < writer.commit_seq.get()
+                !same_txn_identity(writer.token, committing_txn)
+                    && committing_begin < writer.commit_seq.get()
             })
             .cloned()
             .collect()
@@ -2283,7 +2301,7 @@ impl ActiveEdgeDiscoveryIndex {
             .into_iter()
             .filter_map(|idx| views.get(idx))
             .filter(|view| {
-                view.token != committing_txn
+                !same_txn_identity(view.token, committing_txn)
                     && view.is_currently_active()
                     && view.begin_seq.get() < committing_end
             })
@@ -2334,7 +2352,7 @@ impl ActiveEdgeDiscoveryIndex {
             .into_iter()
             .filter_map(|idx| views.get(idx))
             .filter(|view| {
-                view.token != committing_txn
+                !same_txn_identity(view.token, committing_txn)
                     && view.is_currently_active()
                     && view.begin_seq.get() < committing_end
             })
@@ -3320,7 +3338,7 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         }
         for reader in registry.active.values() {
             let reader = reader.lock();
-            if !reader.is_active() || reader.token() != edge.from {
+            if !reader.is_active() || !same_txn_identity(reader.token(), edge.from) {
                 continue;
             }
             reader.set_has_out_rw(true);
@@ -3353,7 +3371,7 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         }
         for writer in registry.active.values() {
             let writer = writer.lock();
-            if !writer.is_active() || writer.token() != edge.to {
+            if !writer.is_active() || !same_txn_identity(writer.token(), edge.to) {
                 continue;
             }
             writer.set_has_in_rw(true);
@@ -3607,7 +3625,8 @@ mod tests {
         concurrent_savepoint, concurrent_stage_prepared_write_marker,
         concurrent_track_write_conflict_page, concurrent_write_metadata_page,
         concurrent_write_page, finalize_prepared_concurrent_commit_with_ssi,
-        prepare_concurrent_commit_with_ssi, summarize_witness_keys, validate_first_committer_wins,
+        prepare_concurrent_commit_with_ssi, same_txn_identity, summarize_witness_keys,
+        validate_first_committer_wins, witness_is_page,
     };
 
     fn test_snapshot(high: u64) -> Snapshot {
@@ -4210,9 +4229,7 @@ mod tests {
             handle
                 .write_witness_keys()
                 .iter()
-                .filter(
-                    |key| matches!(key, WitnessKey::Page(witness_page) if *witness_page == page)
-                )
+                .filter(|witness| witness_is_page(witness, page))
                 .count(),
             1,
             "rewriting an already-owned page should not duplicate page witnesses"
@@ -4237,9 +4254,7 @@ mod tests {
             handle
                 .write_witness_keys()
                 .iter()
-                .filter(
-                    |key| matches!(key, WitnessKey::Page(witness_page) if *witness_page == page)
-                )
+                .filter(|witness| witness_is_page(witness, page))
                 .count(),
             1,
             "retracking an already-owned conflict-only page should not duplicate page witnesses"
@@ -4278,9 +4293,7 @@ mod tests {
             handle
                 .write_witness_keys()
                 .iter()
-                .filter(
-                    |key| matches!(key, WitnessKey::Page(witness_page) if *witness_page == test_page(12))
-                )
+                .filter(|witness| witness_is_page(witness, test_page(12)))
                 .count(),
             1,
             "reusing a savepoint-preserved lock should not duplicate page witnesses"
@@ -4309,9 +4322,7 @@ mod tests {
             handle
                 .write_witness_keys()
                 .iter()
-                .filter(
-                    |key| matches!(key, WitnessKey::Page(witness_page) if *witness_page == page)
-                )
+                .filter(|witness| witness_is_page(witness, page))
                 .count(),
             1,
             "promoting a conflict-only page into the write set should not duplicate page witnesses"
@@ -4337,9 +4348,7 @@ mod tests {
             handle
                 .write_witness_keys()
                 .iter()
-                .filter(
-                    |key| matches!(key, WitnessKey::Page(witness_page) if *witness_page == page)
-                )
+                .filter(|witness| witness_is_page(witness, page))
                 .count(),
             1,
             "rewriting a previously freed page should not duplicate page witnesses"
@@ -4490,8 +4499,10 @@ mod tests {
                 assert_eq!(conflicting_pages, vec![test_page(5)]);
                 assert_eq!(conflicting_commit_seq, CommitSeq::new(15));
             }
-            FcwResult::Clean => panic!("expected conflict"),
-            FcwResult::Abort { .. } => panic!("expected conflict, got abort"),
+            other => assert!(
+                matches!(other, FcwResult::Conflict { .. }),
+                "expected conflict, got {other:?}"
+            ),
         }
     }
 
@@ -5622,14 +5633,6 @@ mod tests {
 
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
         let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
-        {
-            let mut h1 = registry.get_mut(s1).unwrap();
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data()).unwrap();
-        }
-        {
-            let mut h2 = registry.get_mut(s2).unwrap();
-            concurrent_write_page(&mut h2, &lock_table, s2, test_page(6), test_data()).unwrap();
-        }
 
         let prepared = prepare_concurrent_commit_with_ssi(
             &mut registry,
@@ -6586,7 +6589,7 @@ mod tests {
         let committed = registry
             .committed_writers
             .iter()
-            .find(|entry| entry.token.id.get() == winner_session)
+            .find(|entry| same_txn_identity(entry.token, winner_token))
             .map(|entry| entry.token)
             .expect("winning writer should be recorded");
         assert_eq!(committed, winner_token);
@@ -6613,6 +6616,7 @@ mod tests {
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
         let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
         let s3 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let t1_token = registry.get(s1).unwrap().txn_token();
 
         // T1: reads B (20), writes A (10)
         {
@@ -6643,7 +6647,7 @@ mod tests {
         let t1_writer = registry
             .committed_writers
             .iter()
-            .find(|entry| entry.token.id.get() == s1)
+            .find(|entry| same_txn_identity(entry.token, t1_token))
             .expect("T1 writer history should be present");
         assert!(
             t1_writer.had_out_rw,

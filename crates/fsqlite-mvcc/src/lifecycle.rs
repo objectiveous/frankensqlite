@@ -1306,13 +1306,9 @@ impl TransactionManager {
         )
     }
 
-    /// Serialized write path.
-    fn write_page_serialized(
-        &self,
-        txn: &mut Transaction,
-        pgno: PageNumber,
-        data: PageData,
-    ) -> Result<(), MvccError> {
+    /// Ensure a serialized transaction holds writer exclusion before publishing
+    /// either full-page writes or logical cell deltas.
+    fn ensure_serialized_write_exclusion(&self, txn: &mut Transaction) -> Result<(), MvccError> {
         if !txn.serialized_write_lock_held {
             // DEFERRED upgrade: acquire global mutex on first write.
             self.acquire_serialized_writer_exclusion(txn.txn_id)?;
@@ -1346,6 +1342,17 @@ impl TransactionManager {
                 "serialized deferred upgrade: mutex acquired"
             );
         }
+
+        Ok(())
+    }
+
+    fn write_page_serialized(
+        &self,
+        txn: &mut Transaction,
+        pgno: PageNumber,
+        data: PageData,
+    ) -> Result<(), MvccError> {
+        self.ensure_serialized_write_exclusion(txn)?;
 
         txn.record_page_write(pgno, self.resolve_visible_commit_seq(txn, pgno));
 
@@ -1414,8 +1421,57 @@ impl TransactionManager {
         Ok(())
     }
 
+    /// Cell-delta-only transactions bypass `write_page`, so commit must acquire
+    /// the same exclusion and witness metadata before FCW validation/publish.
+    fn prepare_cell_delta_commit_exclusion(&self, txn: &mut Transaction) -> Result<(), MvccError> {
+        let pages = self.cell_log.txn_pages(txn.token());
+        if pages.is_empty() {
+            return Ok(());
+        }
+
+        if txn.mode == TransactionMode::Serialized {
+            self.ensure_serialized_write_exclusion(txn)?;
+            for pgno in pages {
+                txn.record_page_write(pgno, self.resolve_visible_commit_seq(txn, pgno));
+            }
+            return Ok(());
+        }
+
+        if self
+            .shm
+            .check_serialized_writer_exclusion(logical_now_epoch_secs(), process_alive_os)
+            .is_err()
+        {
+            return Err(MvccError::Busy);
+        }
+
+        for pgno in pages {
+            self.lock_table
+                .try_acquire(pgno, txn.txn_id)
+                .map_err(|_| MvccError::Busy)?;
+
+            let newly_locked = txn.page_locks.insert(pgno);
+            if newly_locked {
+                tracing::debug!(
+                    txn_id = %txn.txn_id,
+                    pgno = pgno.get(),
+                    "concurrent: cell-delta commit page lock acquired"
+                );
+            }
+
+            txn.record_page_write(pgno, self.resolve_visible_commit_seq(txn, pgno));
+        }
+
+        Ok(())
+    }
+
     /// Serialized commit path.
     fn commit_serialized(&self, txn: &mut Transaction) -> Result<CommitSeq, MvccError> {
+        if let Err(err) = self.prepare_cell_delta_commit_exclusion(txn) {
+            self.abort(txn);
+            return Err(err);
+        }
+
         let pages = self.pending_commit_pages(txn);
         let snapshot_high = txn.snapshot.high;
 
@@ -1458,6 +1514,11 @@ impl TransactionManager {
     /// Pipeline: (1) SSI validation, (2) FCW CommitIndex check with rebase
     /// attempt on conflict, (3) SSI re-validation after rebase, (4) publish.
     fn commit_concurrent(&self, txn: &mut Transaction) -> Result<CommitSeq, MvccError> {
+        if let Err(err) = self.prepare_cell_delta_commit_exclusion(txn) {
+            self.abort(txn);
+            return Err(err);
+        }
+
         let pages = self.pending_commit_pages(txn);
         let snapshot_high = txn.snapshot.high;
 
@@ -6190,8 +6251,10 @@ mod tests {
         mgr.write_page(&mut txn1, pgno, first_data.clone()).unwrap();
         let first_commit = mgr.commit(&mut txn1).unwrap();
 
+        let mut reader = mgr.begin(BeginKind::Concurrent).unwrap();
+        let snapshot_before_second_commit = reader.snapshot;
+
         let mut txn2 = mgr.begin(BeginKind::Concurrent).unwrap();
-        let snapshot_before_second_commit = txn2.snapshot;
         let second_data = test_data(0x22);
         mgr.write_page(&mut txn2, pgno, second_data.clone())
             .unwrap();
@@ -6228,6 +6291,7 @@ mod tests {
                 .data,
             second_data
         );
+        mgr.abort(&mut reader);
         assert_eq!(mgr.version_guard_registry().active_guard_count(), 0);
     }
 
@@ -7027,6 +7091,95 @@ mod tests {
             Some(first_seq),
             "aborted second writer must not advance the page commit index"
         );
+    }
+
+    #[test]
+    fn test_cell_delta_only_commit_takes_page_lock_before_publish() {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+
+        let mut first = mgr.begin(BeginKind::Concurrent).expect("first begin");
+        let mut second = mgr.begin(BeginKind::Concurrent).expect("second begin");
+        mgr.cell_log()
+            .record_insert(
+                CellKey::table_row(btree, 10),
+                pgno,
+                leaf_table_cell(10, &[b'a'; 8]),
+                first.token(),
+            )
+            .expect("first logical insert should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                CellKey::table_row(btree, 11),
+                pgno,
+                leaf_table_cell(11, &[b'b'; 8]),
+                second.token(),
+            )
+            .expect("second logical insert should fit budget");
+
+        mgr.prepare_cell_delta_commit_exclusion(&mut first)
+            .expect("first logical writer should acquire the page lock");
+        assert_eq!(mgr.lock_table().holder(pgno), Some(first.txn_id));
+        assert!(
+            first.write_version_for_page(pgno).is_some(),
+            "logical page writes need SSI/FCW witness metadata"
+        );
+
+        let err = mgr
+            .prepare_cell_delta_commit_exclusion(&mut second)
+            .expect_err("same-page logical writer must not pass the commit race window");
+        assert_eq!(err, MvccError::Busy);
+        assert_eq!(
+            mgr.lock_table().holder(pgno),
+            Some(first.txn_id),
+            "failed logical writer must not steal the page lock"
+        );
+
+        mgr.abort(&mut first);
+        mgr.abort(&mut second);
+    }
+
+    #[test]
+    fn test_serialized_cell_delta_only_commit_requires_writer_exclusion() {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+
+        let mut holder = mgr
+            .begin(BeginKind::Immediate)
+            .expect("immediate serialized writer should acquire exclusion");
+        let mut logical = mgr
+            .begin(BeginKind::Deferred)
+            .expect("deferred serialized transaction should begin");
+        let logical_token = logical.token();
+        mgr.cell_log()
+            .record_insert(
+                CellKey::table_row(btree, 12),
+                pgno,
+                leaf_table_cell(12, &[b'c'; 8]),
+                logical_token,
+            )
+            .expect("logical insert should fit budget");
+
+        let err = mgr
+            .commit(&mut logical)
+            .expect_err("cell-delta-only serialized commit must not bypass writer exclusion");
+        assert_eq!(err, MvccError::Busy);
+        assert_eq!(logical.state, TransactionState::Aborted);
+        assert_eq!(
+            mgr.cell_log().txn_delta_count(logical_token),
+            0,
+            "failed serialized logical commit should roll back its cell deltas"
+        );
+
+        mgr.abort(&mut holder);
     }
 
     #[test]

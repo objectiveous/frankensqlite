@@ -562,19 +562,23 @@ fn emit_upsert_assignments(
                 ));
             }
         };
-        if let Some(col_idx) = table.column_index(col_name) {
-            let dest_reg = target_regs + col_idx as i32;
-            emit_upsert_expr(
-                b,
-                &assign.value,
-                dest_reg,
-                existing_ctx,
-                excluded_ctx,
-                table,
-                existing_hidden_rowid_reg,
-                excluded_hidden_rowid_reg,
-            );
-        }
+        let col_idx = table
+            .column_index(col_name)
+            .ok_or_else(|| CodegenError::ColumnNotFound {
+                table: table.name.clone(),
+                column: col_name.to_owned(),
+            })?;
+        let dest_reg = target_regs + col_idx as i32;
+        emit_upsert_expr(
+            b,
+            &assign.value,
+            dest_reg,
+            existing_ctx,
+            excluded_ctx,
+            table,
+            existing_hidden_rowid_reg,
+            excluded_hidden_rowid_reg,
+        );
     }
     Ok(())
 }
@@ -10083,6 +10087,7 @@ pub fn codegen_insert(
     }) = upsert_clause
     {
         for assign in assignments {
+            validate_assignment_target(table, &assign.target)?;
             validate_upsert_expr_columns(&assign.value, table, target_alias)?;
         }
         if let Some(where_expr) = where_clause {
@@ -13918,6 +13923,27 @@ fn validate_upsert_expr_columns(
     validate_expr_columns_with(expr, &|col_ref| {
         validate_upsert_column_ref(col_ref, table, table_alias)
     })
+}
+
+fn validate_assignment_target(
+    table: &TableSchema,
+    target: &AssignmentTarget,
+) -> Result<(), CodegenError> {
+    match target {
+        AssignmentTarget::Column(name) => {
+            if table.column_index(name).is_some() {
+                Ok(())
+            } else {
+                Err(CodegenError::ColumnNotFound {
+                    table: table.name.clone(),
+                    column: name.clone(),
+                })
+            }
+        }
+        AssignmentTarget::ColumnList(_) => Err(CodegenError::Unsupported(
+            "multi-column SET (a, b) = (...) assignment is not yet supported".to_owned(),
+        )),
+    }
 }
 
 fn validate_expr_columns_with<F>(expr: &Expr, validate_column: &F) -> Result<(), CodegenError>
@@ -30864,6 +30890,43 @@ mod tests {
 
         assert!(
             matches!(err, CodegenError::TableNotFound(ref name) if name == "t"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_codegen_upsert_update_unknown_assignment_target_errors() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![UpsertClause {
+                target: None,
+                action: UpsertAction::Update {
+                    assignments: vec![Assignment {
+                        target: AssignmentTarget::Column("missing".to_owned()),
+                        value: Expr::Column(ColumnRef::qualified("excluded", "score"), Span::ZERO),
+                    }],
+                    where_clause: None,
+                },
+            }],
+            returning: vec![],
+        };
+        let schema = schema_with_ipk_and_strict_real_notnull();
+        let ctx = CodegenContext {
+            concurrent_mode: false,
+            rowid_alias_col_idx: Some(0),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        let err = codegen_insert(&mut b, &stmt, &schema, &ctx)
+            .expect_err("UPSERT DO UPDATE should reject unknown SET targets");
+
+        assert!(
+            matches!(err, CodegenError::ColumnNotFound { ref table, ref column } if table == "t" && column == "missing"),
             "unexpected error: {err:?}"
         );
     }

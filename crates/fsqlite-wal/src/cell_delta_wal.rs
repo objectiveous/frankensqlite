@@ -6,10 +6,11 @@
 //! # Design Overview
 //!
 //! Cell-delta frames are distinguished from full-page frames by a dedicated
-//! marker word in the first 4 bytes. Older encodings also packed the page
-//! number into the lower 31 bits of that word; deserialization still accepts
-//! those legacy frames, but new frames write only the marker so the real page
-//! number can use the full `u32` range supported by [`PageNumber`].
+//! marker word in the first 4 bytes. Older experimental encodings also packed
+//! the page number into the lower 31 bits of that word. Current recovery
+//! intentionally rejects those legacy frames so high-bit page numbers remain
+//! unambiguously valid full-page frames; only the marker helper below decodes
+//! the old word shape for diagnostics.
 //!
 //! ## Frame Format
 //!

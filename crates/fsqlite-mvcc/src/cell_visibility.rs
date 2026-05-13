@@ -1233,6 +1233,32 @@ impl CellVisibilityLog {
         tracker.delta_count(txn)
     }
 
+    /// Return the unique page numbers touched by deltas for `txn`.
+    ///
+    /// Commit planning uses this to treat a cell-delta-only transaction as a
+    /// real write even when no full page image is staged in the page write set.
+    #[must_use]
+    pub fn txn_pages(&self, txn: TxnToken) -> Vec<PageNumber> {
+        let delta_indices = {
+            let tracker = self.txn_tracker.lock();
+            match tracker.get_deltas(txn) {
+                Some(indices) => indices.clone(),
+                None => return Vec::new(),
+            }
+        };
+
+        let arena = self.arena.lock();
+        let mut pages = Vec::with_capacity(delta_indices.len());
+        for idx in delta_indices {
+            if let Some(delta) = arena.get(idx) {
+                pages.push(delta.page_number);
+            }
+        }
+        pages.sort_unstable();
+        pages.dedup();
+        pages
+    }
+
     /// Roll back deltas created after a transaction-local savepoint.
     ///
     /// `retained_delta_count` must be the value returned by [`Self::txn_delta_count`]

@@ -1119,8 +1119,11 @@ impl TransactionManager {
             return Err(MvccError::Schema);
         }
 
-        // If no writes, just commit (read-only transaction).
-        if txn.write_set.is_empty() && txn.write_set_data.is_empty() {
+        let has_cell_deltas = self.cell_log.txn_delta_count(txn.token()) != 0;
+
+        // If no writes, just commit (read-only transaction). Cell-level
+        // deltas are writes too, even when no full page image is staged.
+        if txn.write_set.is_empty() && txn.write_set_data.is_empty() && !has_cell_deltas {
             txn.commit();
             self.release_all_resources(txn);
             return Ok(CommitSeq::ZERO);
@@ -1413,12 +1416,12 @@ impl TransactionManager {
 
     /// Serialized commit path.
     fn commit_serialized(&self, txn: &mut Transaction) -> Result<CommitSeq, MvccError> {
-        let pages = txn.write_set.clone();
+        let pages = self.pending_commit_pages(txn);
         let snapshot_high = txn.snapshot.high;
 
-        // FCW freshness validation: check that no page in write_set has been
+        // FCW freshness validation: check that no pending write page has been
         // committed since our snapshot.
-        for &pgno in &txn.write_set {
+        for &pgno in &pages {
             if let Some(latest) = self.commit_index.latest(pgno) {
                 if latest > txn.snapshot.high {
                     self.abort(txn);
@@ -1455,7 +1458,7 @@ impl TransactionManager {
     /// Pipeline: (1) SSI validation, (2) FCW CommitIndex check with rebase
     /// attempt on conflict, (3) SSI re-validation after rebase, (4) publish.
     fn commit_concurrent(&self, txn: &mut Transaction) -> Result<CommitSeq, MvccError> {
-        let pages = txn.write_set.clone();
+        let pages = self.pending_commit_pages(txn);
         let snapshot_high = txn.snapshot.high;
 
         // Step 1: SSI validation — if dangerous structure, abort immediately.
@@ -1476,7 +1479,7 @@ impl TransactionManager {
         // First pass: collect conflicting pages.
         // SmallVec avoids heap allocation for typical transactions (≤8 conflicts).
         let mut conflicts = smallvec::SmallVec::<[PageNumber; 8]>::new();
-        for &pgno in &txn.write_set {
+        for &pgno in &pages {
             if let Some(latest) = self.commit_index.latest(pgno) {
                 if latest > txn.snapshot.high {
                     conflicts.push(pgno);
@@ -1581,6 +1584,18 @@ impl TransactionManager {
         );
 
         Ok(commit_seq)
+    }
+
+    /// Return full-page writes plus logical cell-delta pages that must publish
+    /// under this transaction's commit sequence.
+    fn pending_commit_pages(&self, txn: &Transaction) -> smallvec::SmallVec<[PageNumber; 8]> {
+        let mut pages = txn.write_set.clone();
+        for page in self.cell_log.txn_pages(txn.token()) {
+            if !pages.contains(&page) {
+                pages.push(page);
+            }
+        }
+        pages
     }
 
     /// Attempt to rebase a conflicting page via GF(256) disjoint merge (§5.10).
@@ -6901,6 +6916,116 @@ mod tests {
         assert_eq!(
             indexed_seq, commit_seq,
             "commit_index should have correct commit_seq"
+        );
+    }
+
+    #[test]
+    fn test_cell_delta_only_commit_assigns_commit_seq_without_write_set()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 5252;
+        let payload = vec![b'x'; 96];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).expect("writer begin");
+        let writer_token = writer.token();
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                writer_token,
+            )
+            .expect("logical insert should fit budget");
+        assert!(
+            writer.write_set.is_empty() && writer.write_set_data.is_empty(),
+            "this regression must exercise the cell-delta-only commit path"
+        );
+
+        let commit_seq = mgr.commit(&mut writer).expect("logical commit");
+        assert!(
+            commit_seq.get() > 0,
+            "cell-delta-only commit must allocate a real commit sequence"
+        );
+        assert_eq!(
+            mgr.cell_log().txn_delta_count(writer_token),
+            0,
+            "committed cell deltas should leave transaction tracking"
+        );
+        assert_eq!(
+            mgr.cell_log().resolve(pgno, &cell_key, commit_seq),
+            Some(leaf_table_cell(rowid, &payload)),
+            "committed cell delta should be visible at its commit sequence"
+        );
+        assert_eq!(
+            mgr.commit_index.latest(pgno),
+            Some(commit_seq),
+            "cell-delta-only commit should advance the page conflict index"
+        );
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("page should be visible");
+        assert_eq!(materialized_table_payloads(&page)?, vec![(rowid, payload)]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cell_delta_only_commit_checks_pending_page_fcw() {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut first = mgr.begin(BeginKind::Concurrent).expect("first begin");
+        let mut second = mgr.begin(BeginKind::Concurrent).expect("second begin");
+        mgr.cell_log()
+            .record_insert(
+                CellKey::table_row(btree, 1),
+                pgno,
+                leaf_table_cell(1, &[b'a'; 8]),
+                first.token(),
+            )
+            .expect("first logical insert should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                CellKey::table_row(btree, 2),
+                pgno,
+                leaf_table_cell(2, &[b'b'; 8]),
+                second.token(),
+            )
+            .expect("second logical insert should fit budget");
+        assert!(first.write_set.is_empty());
+        assert!(second.write_set.is_empty());
+
+        let first_seq = mgr.commit(&mut first).expect("first commit");
+        let second_err = mgr
+            .commit(&mut second)
+            .expect_err("second commit must respect page-level FCW");
+        assert_eq!(second_err, MvccError::BusySnapshot);
+        assert_eq!(
+            mgr.commit_index.latest(pgno),
+            Some(first_seq),
+            "aborted second writer must not advance the page commit index"
         );
     }
 

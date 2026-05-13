@@ -1683,9 +1683,11 @@ pub fn codegen_select(
     }
 
     let table = find_table(schema, table_name)?;
+    validate_single_table_result_columns(columns, table, table_alias)?;
     if let Some(where_expr) = where_clause.as_deref() {
         validate_single_table_expr_columns(where_expr, table, table_alias)?;
     }
+    validate_single_table_order_by_terms(&stmt.order_by, columns, table, table_alias)?;
     let cursor = 0_i32;
 
     // Labels for control flow.
@@ -10020,6 +10022,7 @@ pub fn codegen_insert(
     ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
     let table = find_table(schema, &stmt.table.name)?;
+    let target_alias = stmt.alias.as_deref();
     let table_cursor = 0_i32;
 
     let end_label = b.emit_label();
@@ -10071,6 +10074,21 @@ pub fn codegen_insert(
     } else {
         (conflict_action_to_oe(stmt.or_conflict.as_ref()), None)
     };
+    if let Some(UpsertClause {
+        action: UpsertAction::Update {
+            assignments,
+            where_clause,
+        },
+        ..
+    }) = upsert_clause
+    {
+        for assign in assignments {
+            validate_upsert_expr_columns(&assign.value, table, target_alias)?;
+        }
+        if let Some(where_expr) = where_clause {
+            validate_upsert_expr_columns(where_expr, table, target_alias)?;
+        }
+    }
 
     match &stmt.source {
         InsertSource::Values(rows) => {
@@ -10088,6 +10106,7 @@ pub fn codegen_insert(
                     table_cursor,
                     table,
                     &stmt.returning,
+                    target_alias,
                     ctx,
                     oe_flag,
                     upsert_clause,
@@ -10102,6 +10121,7 @@ pub fn codegen_insert(
                     table_cursor,
                     table,
                     &stmt.returning,
+                    target_alias,
                     ctx,
                     oe_flag,
                     upsert_clause,
@@ -10124,6 +10144,7 @@ pub fn codegen_insert(
                 table,
                 schema,
                 &stmt.returning,
+                target_alias,
                 ctx,
                 oe_flag,
                 expected_cols,
@@ -10220,7 +10241,14 @@ pub fn codegen_insert(
             emit_index_inserts(b, table, table_cursor, col_regs, rowid_reg, oe_flag);
 
             if !stmt.returning.is_empty() {
-                emit_returning(b, table_cursor, table, &stmt.returning, rowid_reg)?;
+                emit_returning(
+                    b,
+                    table_cursor,
+                    table,
+                    &stmt.returning,
+                    target_alias,
+                    rowid_reg,
+                )?;
             }
         }
     }
@@ -10314,6 +10342,7 @@ fn codegen_insert_values(
     cursor: i32,
     table: &TableSchema,
     returning: &[ResultColumn],
+    table_alias: Option<&str>,
     ctx: &CodegenContext,
     oe_flag: u16,
     upsert: Option<&UpsertClause>,
@@ -10624,7 +10653,7 @@ fn codegen_insert_values(
                 let existing_ctx = ScanCtx {
                     cursor,
                     table,
-                    table_alias: None,
+                    table_alias,
                     schema: None,
                     register_base: Some(existing_regs),
                     secondary: None,
@@ -10704,7 +10733,7 @@ fn codegen_insert_values(
                         OE_REPLACE,
                     );
                     if !returning.is_empty() {
-                        emit_returning(b, cursor, table, returning, update_rowid_reg)?;
+                        emit_returning(b, cursor, table, returning, table_alias, update_rowid_reg)?;
                     }
                     b.resolve_label(skip_update_label);
                 } else {
@@ -10752,7 +10781,7 @@ fn codegen_insert_values(
                         OE_REPLACE,
                     );
                     if !returning.is_empty() {
-                        emit_returning(b, cursor, table, returning, update_rowid_reg)?;
+                        emit_returning(b, cursor, table, returning, table_alias, update_rowid_reg)?;
                     }
                 }
 
@@ -10780,7 +10809,7 @@ fn codegen_insert_values(
                 emit_index_inserts(b, table, cursor, val_regs, rowid_reg, oe_flag);
 
                 if !returning.is_empty() {
-                    emit_returning(b, cursor, table, returning, rowid_reg)?;
+                    emit_returning(b, cursor, table, returning, table_alias, rowid_reg)?;
                 }
 
                 b.resolve_label(done_label);
@@ -10805,7 +10834,7 @@ fn codegen_insert_values(
                 );
                 emit_index_inserts(b, table, cursor, val_regs, rowid_reg, oe_flag);
                 if !returning.is_empty() {
-                    emit_returning(b, cursor, table, returning, rowid_reg)?;
+                    emit_returning(b, cursor, table, returning, table_alias, rowid_reg)?;
                 }
             }
         } else {
@@ -10829,7 +10858,7 @@ fn codegen_insert_values(
             );
             emit_index_inserts(b, table, cursor, val_regs, rowid_reg, oe_flag);
             if !returning.is_empty() {
-                emit_returning(b, cursor, table, returning, rowid_reg)?;
+                emit_returning(b, cursor, table, returning, table_alias, rowid_reg)?;
             }
         }
 
@@ -10985,6 +11014,7 @@ fn codegen_insert_select(
     target_table: &TableSchema,
     schema: &[TableSchema],
     returning: &[ResultColumn],
+    target_alias: Option<&str>,
     ctx: &CodegenContext,
     oe_flag: u16,
     expected_cols: Option<usize>,
@@ -11014,6 +11044,7 @@ fn codegen_insert_select(
             write_cursor,
             target_table,
             returning,
+            target_alias,
             ctx,
             oe_flag,
             expected_cols,
@@ -11248,7 +11279,14 @@ fn codegen_insert_select(
 
     // RETURNING clause: position cursor on inserted row and read columns.
     if !returning.is_empty() {
-        emit_returning(b, write_cursor, target_table, returning, rowid_reg)?;
+        emit_returning(
+            b,
+            write_cursor,
+            target_table,
+            returning,
+            target_alias,
+            rowid_reg,
+        )?;
     }
 
     // Skip label for WHERE-filtered rows.
@@ -11277,6 +11315,7 @@ fn codegen_insert_select_without_from(
     write_cursor: i32,
     target_table: &TableSchema,
     returning: &[ResultColumn],
+    target_alias: Option<&str>,
     ctx: &CodegenContext,
     oe_flag: u16,
     expected_cols: Option<usize>,
@@ -11451,7 +11490,14 @@ fn codegen_insert_select_without_from(
     );
 
     if !returning.is_empty() {
-        emit_returning(b, write_cursor, target_table, returning, rowid_reg)?;
+        emit_returning(
+            b,
+            write_cursor,
+            target_table,
+            returning,
+            target_alias,
+            rowid_reg,
+        )?;
     }
 
     b.resolve_label(done_label);
@@ -11491,6 +11537,13 @@ pub fn codegen_update(
             "UPDATE ORDER BY/LIMIT/OFFSET must be materialized before codegen".to_owned(),
         ));
     }
+    for assign in &stmt.assignments {
+        validate_single_table_expr_columns(&assign.value, table, stmt.table.alias.as_deref())?;
+    }
+    if let Some(where_expr) = &stmt.where_clause {
+        validate_single_table_expr_columns(where_expr, table, stmt.table.alias.as_deref())?;
+    }
+    validate_single_table_result_columns(&stmt.returning, table, stmt.table.alias.as_deref())?;
 
     // Init.
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
@@ -11809,7 +11862,14 @@ pub fn codegen_update(
         // post-WHERE placeholder index so RETURNING placeholders don't collide
         // with SET placeholder numbering.
         b.set_next_anon_placeholder(set_placeholder_count + where_placeholder_count + 1);
-        emit_returning(b, table_cursor, table, &stmt.returning, rowid_reg)?;
+        emit_returning(
+            b,
+            table_cursor,
+            table,
+            &stmt.returning,
+            stmt.table.alias.as_deref(),
+            rowid_reg,
+        )?;
     }
 
     if let (Some(apply_seek_miss_label), Some(apply_loop)) = (apply_seek_miss_label, apply_loop) {
@@ -11969,6 +12029,25 @@ fn codegen_update_from(
     let target_cursor = 0_i32;
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let from_cursor = (1 + target.indexes.len()) as i32;
+    let validation_scan = ScanCtx {
+        cursor: target_cursor,
+        table: target,
+        table_alias: stmt.table.alias.as_deref(),
+        schema: Some(schema),
+        register_base: None,
+        secondary: Some(SecondaryScan {
+            cursor: from_cursor,
+            table: from_table,
+            table_alias: from_alias,
+        }),
+    };
+    for assign in &stmt.assignments {
+        validate_scan_expr_columns(&assign.value, &validation_scan)?;
+    }
+    if let Some(where_expr) = &stmt.where_clause {
+        validate_scan_expr_columns(where_expr, &validation_scan)?;
+    }
+    validate_single_table_result_columns(&stmt.returning, target, stmt.table.alias.as_deref())?;
 
     // OpenWrite for target table.
     b.emit_op(
@@ -12193,7 +12272,14 @@ fn codegen_update_from(
     // RETURNING clause.
     if !stmt.returning.is_empty() {
         b.set_next_anon_placeholder(set_placeholder_count + where_placeholder_count + 1);
-        emit_returning(b, target_cursor, target, &stmt.returning, rowid_reg)?;
+        emit_returning(
+            b,
+            target_cursor,
+            target,
+            &stmt.returning,
+            stmt.table.alias.as_deref(),
+            rowid_reg,
+        )?;
     }
 
     // Skip label for WHERE-filtered rows.
@@ -12258,6 +12344,10 @@ pub fn codegen_delete(
             "DELETE ORDER BY/LIMIT/OFFSET must be materialized before codegen".to_owned(),
         ));
     }
+    if let Some(where_expr) = &stmt.where_clause {
+        validate_single_table_expr_columns(where_expr, table, stmt.table.alias.as_deref())?;
+    }
+    validate_single_table_result_columns(&stmt.returning, table, stmt.table.alias.as_deref())?;
 
     // Init.
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
@@ -13108,7 +13198,7 @@ fn emit_projection_without_from(
     Ok(())
 }
 
-/// Emit RETURNING clause opcodes after an INSERT.
+/// Emit RETURNING clause opcodes for a row-producing DML statement.
 ///
 /// Positions the cursor on the just-inserted row via `SeekRowid`, reads the
 /// requested columns, and emits a `ResultRow`.
@@ -13118,8 +13208,11 @@ fn emit_returning(
     cursor: i32,
     table: &TableSchema,
     returning: &[ResultColumn],
+    table_alias: Option<&str>,
     rowid_reg: i32,
 ) -> Result<(), CodegenError> {
+    validate_single_table_result_columns(returning, table, table_alias)?;
+
     let skip_returning = b.emit_label();
     b.emit_jump_to_label(
         Opcode::SeekRowid,
@@ -13131,7 +13224,7 @@ fn emit_returning(
     );
     let ret_count = result_column_count(returning, table);
     let ret_regs = b.alloc_regs(ret_count);
-    emit_column_reads(b, cursor, returning, table, None, &[], ret_regs)?;
+    emit_column_reads(b, cursor, returning, table, table_alias, &[], ret_regs)?;
     b.emit_op(Opcode::ResultRow, ret_regs, ret_count, 0, P4::None, 0);
     b.resolve_label(skip_returning);
     Ok(())
@@ -13808,28 +13901,51 @@ fn validate_single_table_expr_columns(
     table: &TableSchema,
     table_alias: Option<&str>,
 ) -> Result<(), CodegenError> {
+    validate_expr_columns_with(expr, &|col_ref| {
+        validate_single_table_column_ref(col_ref, table, table_alias)
+    })
+}
+
+fn validate_scan_expr_columns(expr: &Expr, scan: &ScanCtx<'_>) -> Result<(), CodegenError> {
+    validate_expr_columns_with(expr, &|col_ref| validate_scan_column_ref(col_ref, scan))
+}
+
+fn validate_upsert_expr_columns(
+    expr: &Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Result<(), CodegenError> {
+    validate_expr_columns_with(expr, &|col_ref| {
+        validate_upsert_column_ref(col_ref, table, table_alias)
+    })
+}
+
+fn validate_expr_columns_with<F>(expr: &Expr, validate_column: &F) -> Result<(), CodegenError>
+where
+    F: Fn(&ColumnRef) -> Result<(), CodegenError>,
+{
     match expr {
-        Expr::Column(col_ref, _) => validate_single_table_column_ref(col_ref, table, table_alias),
+        Expr::Column(col_ref, _) => validate_column(col_ref),
         Expr::BinaryOp { left, right, .. } => {
-            validate_single_table_expr_columns(left, table, table_alias)?;
-            validate_single_table_expr_columns(right, table, table_alias)
+            validate_expr_columns_with(left, validate_column)?;
+            validate_expr_columns_with(right, validate_column)
         }
         Expr::UnaryOp { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::Collate { expr, .. }
-        | Expr::IsNull { expr, .. } => validate_single_table_expr_columns(expr, table, table_alias),
+        | Expr::IsNull { expr, .. } => validate_expr_columns_with(expr, validate_column),
         Expr::Between {
             expr, low, high, ..
         } => {
-            validate_single_table_expr_columns(expr, table, table_alias)?;
-            validate_single_table_expr_columns(low, table, table_alias)?;
-            validate_single_table_expr_columns(high, table, table_alias)
+            validate_expr_columns_with(expr, validate_column)?;
+            validate_expr_columns_with(low, validate_column)?;
+            validate_expr_columns_with(high, validate_column)
         }
         Expr::In { expr, set, .. } => {
-            validate_single_table_expr_columns(expr, table, table_alias)?;
+            validate_expr_columns_with(expr, validate_column)?;
             if let InSet::List(values) = set {
                 for value in values {
-                    validate_single_table_expr_columns(value, table, table_alias)?;
+                    validate_expr_columns_with(value, validate_column)?;
                 }
             }
             Ok(())
@@ -13840,10 +13956,10 @@ fn validate_single_table_expr_columns(
             escape,
             ..
         } => {
-            validate_single_table_expr_columns(expr, table, table_alias)?;
-            validate_single_table_expr_columns(pattern, table, table_alias)?;
+            validate_expr_columns_with(expr, validate_column)?;
+            validate_expr_columns_with(pattern, validate_column)?;
             if let Some(escape) = escape {
-                validate_single_table_expr_columns(escape, table, table_alias)?;
+                validate_expr_columns_with(escape, validate_column)?;
             }
             Ok(())
         }
@@ -13854,14 +13970,14 @@ fn validate_single_table_expr_columns(
             ..
         } => {
             if let Some(operand) = operand {
-                validate_single_table_expr_columns(operand, table, table_alias)?;
+                validate_expr_columns_with(operand, validate_column)?;
             }
             for (when_expr, then_expr) in whens {
-                validate_single_table_expr_columns(when_expr, table, table_alias)?;
-                validate_single_table_expr_columns(then_expr, table, table_alias)?;
+                validate_expr_columns_with(when_expr, validate_column)?;
+                validate_expr_columns_with(then_expr, validate_column)?;
             }
             if let Some(else_expr) = else_expr {
-                validate_single_table_expr_columns(else_expr, table, table_alias)?;
+                validate_expr_columns_with(else_expr, validate_column)?;
             }
             Ok(())
         }
@@ -13873,24 +13989,24 @@ fn validate_single_table_expr_columns(
         } => {
             if let FunctionArgs::List(arg_exprs) = args {
                 for arg_expr in arg_exprs {
-                    validate_single_table_expr_columns(arg_expr, table, table_alias)?;
+                    validate_expr_columns_with(arg_expr, validate_column)?;
                 }
             }
             for term in order_by {
-                validate_single_table_expr_columns(&term.expr, table, table_alias)?;
+                validate_expr_columns_with(&term.expr, validate_column)?;
             }
             if let Some(filter) = filter {
-                validate_single_table_expr_columns(filter, table, table_alias)?;
+                validate_expr_columns_with(filter, validate_column)?;
             }
             Ok(())
         }
         Expr::JsonAccess { expr, path, .. } => {
-            validate_single_table_expr_columns(expr, table, table_alias)?;
-            validate_single_table_expr_columns(path, table, table_alias)
+            validate_expr_columns_with(expr, validate_column)?;
+            validate_expr_columns_with(path, validate_column)
         }
         Expr::RowValue(exprs, _) => {
             for expr in exprs {
-                validate_single_table_expr_columns(expr, table, table_alias)?;
+                validate_expr_columns_with(expr, validate_column)?;
             }
             Ok(())
         }
@@ -13900,6 +14016,40 @@ fn validate_single_table_expr_columns(
         | Expr::Placeholder(_, _)
         | Expr::Raise { .. } => Ok(()),
     }
+}
+
+fn validate_single_table_result_columns(
+    columns: &[ResultColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Result<(), CodegenError> {
+    for column in columns {
+        match column {
+            ResultColumn::Star => {}
+            ResultColumn::TableStar(qualifier) => {
+                if !matches_table_or_alias(&qualifier.name, table, table_alias) {
+                    return Err(CodegenError::TableNotFound(qualifier.to_string()));
+                }
+            }
+            ResultColumn::Expr { expr, .. } => {
+                validate_single_table_expr_columns(expr, table, table_alias)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_single_table_order_by_terms(
+    order_by: &[OrderingTerm],
+    columns: &[ResultColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Result<(), CodegenError> {
+    for term in order_by {
+        let expr = resolve_order_by_output_expr(&term.expr, columns).unwrap_or(&term.expr);
+        validate_single_table_expr_columns(expr, table, table_alias)?;
+    }
+    Ok(())
 }
 
 fn validate_single_table_column_ref(
@@ -13921,6 +14071,64 @@ fn validate_single_table_column_ref(
         table: table.name.clone(),
         column: col_ref.column.to_string(),
     })
+}
+
+fn validate_scan_column_ref(col_ref: &ColumnRef, scan: &ScanCtx<'_>) -> Result<(), CodegenError> {
+    if let Some(qualifier) = col_ref.table.as_deref() {
+        if matches_table_or_alias(qualifier, scan.table, scan.table_alias) {
+            return validate_table_column_ref(scan.table, &col_ref.column);
+        }
+        if let Some(secondary) = &scan.secondary
+            && matches_table_or_alias(qualifier, secondary.table, secondary.table_alias)
+        {
+            return validate_table_column_ref(secondary.table, &col_ref.column);
+        }
+        return Err(CodegenError::TableNotFound(qualifier.to_owned()));
+    }
+
+    let primary_has_column = table_has_column_or_rowid(scan.table, &col_ref.column);
+    let secondary_has_column = scan
+        .secondary
+        .as_ref()
+        .is_some_and(|secondary| table_has_column_or_rowid(secondary.table, &col_ref.column));
+
+    match (primary_has_column, secondary_has_column) {
+        (true, true) => Err(CodegenError::AmbiguousColumn(col_ref.column.to_string())),
+        (true, false) | (false, true) => Ok(()),
+        (false, false) => Err(CodegenError::ColumnNotFound {
+            table: scan.table.name.clone(),
+            column: col_ref.column.to_string(),
+        }),
+    }
+}
+
+fn validate_upsert_column_ref(
+    col_ref: &ColumnRef,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Result<(), CodegenError> {
+    if col_ref
+        .table
+        .as_deref()
+        .is_some_and(|qualifier| qualifier.eq_ignore_ascii_case("excluded"))
+    {
+        return validate_table_column_ref(table, &col_ref.column);
+    }
+    validate_single_table_column_ref(col_ref, table, table_alias)
+}
+
+fn validate_table_column_ref(table: &TableSchema, column: &str) -> Result<(), CodegenError> {
+    if table_has_column_or_rowid(table, column) {
+        return Ok(());
+    }
+    Err(CodegenError::ColumnNotFound {
+        table: table.name.clone(),
+        column: column.to_owned(),
+    })
+}
+
+fn table_has_column_or_rowid(table: &TableSchema, column: &str) -> bool {
+    table.column_index(column).is_some() || table.resolves_to_hidden_rowid(column)
 }
 
 /// Compute comparison p5 flags for a column reference.
@@ -20401,6 +20609,7 @@ mod tests {
         let expr = Expr::Literal(Literal::Integer(big), Span::ZERO);
 
         emit_limit_expr(&mut b, &expr, reg);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
         let prog = b.finish().unwrap();
         assert!(
@@ -20444,6 +20653,7 @@ mod tests {
         let two = Expr::Literal(Literal::Integer(2), Span::ZERO);
 
         emit_comparison(&mut b, &one, AstBinaryOp::Add, &two, reg, None);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
         let prog = b.finish().unwrap();
         assert!(
@@ -20462,6 +20672,7 @@ mod tests {
         let two = Expr::Literal(Literal::Integer(2), Span::ZERO);
 
         emit_is_comparison(&mut b, &one, AstBinaryOp::Eq, &two, reg, None);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
         let prog = b.finish().unwrap();
         assert!(
@@ -23337,6 +23548,60 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_codegen_insert_returning_expression_wrong_qualifier_errors() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![],
+            returning: vec![ResultColumn::Expr {
+                expr: Expr::BinaryOp {
+                    left: Box::new(Expr::Column(ColumnRef::qualified("u", "a"), Span::ZERO)),
+                    op: AstBinaryOp::Add,
+                    right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                    span: Span::ZERO,
+                },
+                alias: None,
+            }],
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_insert(&mut b, &stmt, &schema, &ctx)
+            .expect_err("RETURNING expression should reject wrong qualifier");
+        assert!(
+            matches!(err, CodegenError::TableNotFound(ref name) if name == "u"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_codegen_insert_returning_respects_target_alias() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: Some("u".to_owned()),
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![],
+            returning: vec![ResultColumn::Expr {
+                expr: Expr::Column(ColumnRef::qualified("u", "a"), Span::ZERO),
+                alias: None,
+            }],
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+
+        codegen_insert(&mut b, &stmt, &schema, &ctx)
+            .expect("INSERT RETURNING should resolve the target alias");
+    }
+
     // === Test 11: SELECT with LIMIT ===
     #[test]
     fn test_codegen_select_with_limit() {
@@ -23851,6 +24116,47 @@ mod tests {
                 )
             }),
             "aliased-column index ORDER BY should bypass the sorter"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_order_by_wrong_qualifier_errors() {
+        let mut stmt = simple_select(&["a"], "t", None);
+        stmt.order_by = vec![OrderingTerm {
+            expr: Expr::Column(ColumnRef::qualified("u", "b"), Span::ZERO),
+            direction: None,
+            nulls: None,
+        }];
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_select(&mut b, &stmt, &schema, &ctx)
+            .expect_err("mismatched ORDER BY qualifier should be a semantic error");
+        assert!(
+            matches!(err, CodegenError::TableNotFound(ref name) if name == "u"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_order_by_alias_hides_base_table_qualifier() {
+        let mut stmt = simple_select(&["a"], "t", None);
+        if let SelectCore::Select { from, .. } = &mut stmt.body.select {
+            *from = Some(from_table_as("t", "x"));
+        }
+        stmt.order_by = vec![OrderingTerm {
+            expr: Expr::Column(ColumnRef::qualified("t", "b"), Span::ZERO),
+            direction: None,
+            nulls: None,
+        }];
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_select(&mut b, &stmt, &schema, &ctx)
+            .expect_err("base-table qualifier should not resolve after FROM aliasing");
+        assert!(
+            matches!(err, CodegenError::TableNotFound(ref name) if name == "t"),
+            "unexpected error: {err:?}"
         );
     }
 
@@ -29022,6 +29328,151 @@ mod tests {
     }
 
     #[test]
+    fn test_codegen_select_projection_expression_wrong_qualifier_errors() {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::BinaryOp {
+                            left: Box::new(Expr::Column(
+                                ColumnRef::qualified("u", "a"),
+                                Span::ZERO,
+                            )),
+                            op: AstBinaryOp::Add,
+                            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                            span: Span::ZERO,
+                        },
+                        alias: None,
+                    }],
+                    from: Some(from_table("t")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_select(&mut b, &stmt, &schema, &ctx)
+            .expect_err("projection expression should reject wrong qualifier");
+        assert!(
+            matches!(err, CodegenError::TableNotFound(ref name) if name == "u"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_codegen_update_where_wrong_qualifier_errors() {
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: Some("u".to_owned()),
+                index_hint: None,
+                time_travel: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("b".to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::qualified("t", "a"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(2)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_update(&mut b, &stmt, &schema, &ctx)
+            .expect_err("base table qualifier should be hidden by UPDATE alias");
+        assert!(
+            matches!(err, CodegenError::TableNotFound(ref name) if name == "t"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_codegen_update_set_unknown_column_errors() {
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+                time_travel: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("b".to_owned()),
+                value: Expr::Column(ColumnRef::bare("missing"), Span::ZERO),
+            }],
+            from: None,
+            where_clause: None,
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_update(&mut b, &stmt, &schema, &ctx)
+            .expect_err("SET expression should reject unknown source column");
+        assert!(
+            matches!(err, CodegenError::ColumnNotFound { ref table, ref column } if table == "t" && column == "missing"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_codegen_update_returning_qualified_alias() {
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: Some("u".to_owned()),
+                index_hint: None,
+                time_travel: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("b".to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::qualified("u", "a"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(2)),
+                span: Span::ZERO,
+            }),
+            returning: vec![ResultColumn::Expr {
+                expr: Expr::Column(ColumnRef::qualified("u", "a"), Span::ZERO),
+                alias: None,
+            }],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
+    }
+
+    #[test]
     fn test_codegen_update_where_uses_resolved_collation_and_affinity() {
         let stmt = UpdateStatement {
             with: None,
@@ -29443,6 +29894,37 @@ mod tests {
     }
 
     #[test]
+    fn test_codegen_delete_where_wrong_qualifier_errors() {
+        let stmt = DeleteStatement {
+            with: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: Some("u".to_owned()),
+                index_hint: None,
+                time_travel: None,
+            },
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::qualified("t", "a"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(1)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_delete(&mut b, &stmt, &schema, &ctx)
+            .expect_err("base table qualifier should be hidden by DELETE alias");
+        assert!(
+            matches!(err, CodegenError::TableNotFound(ref name) if name == "t"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
     fn test_codegen_update_where_qualified_rowid_alias() {
         // UPDATE t AS u SET b = ?1 WHERE u.rowid = ?2
         let stmt = UpdateStatement {
@@ -29536,6 +30018,43 @@ mod tests {
         assert!(
             opcodes.contains(&Opcode::Insert),
             "expected Insert for updated row"
+        );
+    }
+
+    #[test]
+    fn test_codegen_update_from_unknown_set_column_errors() {
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+                time_travel: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("b".to_owned()),
+                value: Expr::Column(ColumnRef::bare("missing"), Span::ZERO),
+            }],
+            from: Some(from_table("s")),
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::qualified("t", "a"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(Expr::Column(ColumnRef::qualified("s", "b"), Span::ZERO)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema_with_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_update(&mut b, &stmt, &schema, &ctx)
+            .expect_err("UPDATE FROM SET expression should reject unknown columns");
+        assert!(
+            matches!(err, CodegenError::ColumnNotFound { ref table, ref column } if table == "t" && column == "missing"),
+            "unexpected error: {err:?}"
         );
     }
 
@@ -30272,6 +30791,80 @@ mod tests {
         assert_eq!(
             table_record_headers, 2,
             "UPSERT DO UPDATE should use precomputed headers for both conflict-update and insert table records"
+        );
+    }
+
+    #[test]
+    fn test_codegen_upsert_update_respects_insert_target_alias() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: Some("u".to_owned()),
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![UpsertClause {
+                target: None,
+                action: UpsertAction::Update {
+                    assignments: vec![Assignment {
+                        target: AssignmentTarget::Column("score".to_owned()),
+                        value: Expr::Column(ColumnRef::qualified("u", "score"), Span::ZERO),
+                    }],
+                    where_clause: None,
+                },
+            }],
+            returning: vec![],
+        };
+        let schema = schema_with_ipk_and_strict_real_notnull();
+        let ctx = CodegenContext {
+            concurrent_mode: false,
+            rowid_alias_col_idx: Some(0),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            !opcode_sequence(&prog).contains(&Opcode::Null),
+            "target alias in UPSERT DO UPDATE should resolve to the existing row, not emit NULL"
+        );
+    }
+
+    #[test]
+    fn test_codegen_upsert_update_rejects_wrong_target_qualifier() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: Some("u".to_owned()),
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![UpsertClause {
+                target: None,
+                action: UpsertAction::Update {
+                    assignments: vec![Assignment {
+                        target: AssignmentTarget::Column("score".to_owned()),
+                        value: Expr::Column(ColumnRef::qualified("t", "score"), Span::ZERO),
+                    }],
+                    where_clause: None,
+                },
+            }],
+            returning: vec![],
+        };
+        let schema = schema_with_ipk_and_strict_real_notnull();
+        let ctx = CodegenContext {
+            concurrent_mode: false,
+            rowid_alias_col_idx: Some(0),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        let err = codegen_insert(&mut b, &stmt, &schema, &ctx)
+            .expect_err("UPSERT target alias should hide the base table qualifier");
+
+        assert!(
+            matches!(err, CodegenError::TableNotFound(ref name) if name == "t"),
+            "unexpected error: {err:?}"
         );
     }
 

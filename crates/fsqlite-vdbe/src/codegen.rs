@@ -1683,6 +1683,9 @@ pub fn codegen_select(
     }
 
     let table = find_table(schema, table_name)?;
+    if let Some(where_expr) = where_clause.as_deref() {
+        validate_single_table_expr_columns(where_expr, table, table_alias)?;
+    }
     let cursor = 0_i32;
 
     // Labels for control flow.
@@ -13800,6 +13803,126 @@ fn resolve_column_ref(
     None
 }
 
+fn validate_single_table_expr_columns(
+    expr: &Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Result<(), CodegenError> {
+    match expr {
+        Expr::Column(col_ref, _) => validate_single_table_column_ref(col_ref, table, table_alias),
+        Expr::BinaryOp { left, right, .. } => {
+            validate_single_table_expr_columns(left, table, table_alias)?;
+            validate_single_table_expr_columns(right, table, table_alias)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => validate_single_table_expr_columns(expr, table, table_alias),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            validate_single_table_expr_columns(expr, table, table_alias)?;
+            validate_single_table_expr_columns(low, table, table_alias)?;
+            validate_single_table_expr_columns(high, table, table_alias)
+        }
+        Expr::In { expr, set, .. } => {
+            validate_single_table_expr_columns(expr, table, table_alias)?;
+            if let InSet::List(values) = set {
+                for value in values {
+                    validate_single_table_expr_columns(value, table, table_alias)?;
+                }
+            }
+            Ok(())
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            validate_single_table_expr_columns(expr, table, table_alias)?;
+            validate_single_table_expr_columns(pattern, table, table_alias)?;
+            if let Some(escape) = escape {
+                validate_single_table_expr_columns(escape, table, table_alias)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                validate_single_table_expr_columns(operand, table, table_alias)?;
+            }
+            for (when_expr, then_expr) in whens {
+                validate_single_table_expr_columns(when_expr, table, table_alias)?;
+                validate_single_table_expr_columns(then_expr, table, table_alias)?;
+            }
+            if let Some(else_expr) = else_expr {
+                validate_single_table_expr_columns(else_expr, table, table_alias)?;
+            }
+            Ok(())
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            if let FunctionArgs::List(arg_exprs) = args {
+                for arg_expr in arg_exprs {
+                    validate_single_table_expr_columns(arg_expr, table, table_alias)?;
+                }
+            }
+            for term in order_by {
+                validate_single_table_expr_columns(&term.expr, table, table_alias)?;
+            }
+            if let Some(filter) = filter {
+                validate_single_table_expr_columns(filter, table, table_alias)?;
+            }
+            Ok(())
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            validate_single_table_expr_columns(expr, table, table_alias)?;
+            validate_single_table_expr_columns(path, table, table_alias)
+        }
+        Expr::RowValue(exprs, _) => {
+            for expr in exprs {
+                validate_single_table_expr_columns(expr, table, table_alias)?;
+            }
+            Ok(())
+        }
+        Expr::Exists { .. }
+        | Expr::Subquery(_, _)
+        | Expr::Literal(_, _)
+        | Expr::Placeholder(_, _)
+        | Expr::Raise { .. } => Ok(()),
+    }
+}
+
+fn validate_single_table_column_ref(
+    col_ref: &ColumnRef,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Result<(), CodegenError> {
+    if let Some(qualifier) = col_ref.table.as_deref()
+        && !matches_table_or_alias(qualifier, table, table_alias)
+    {
+        return Err(CodegenError::TableNotFound(qualifier.to_owned()));
+    }
+    if table.column_index(&col_ref.column).is_some()
+        || table.resolves_to_hidden_rowid(&col_ref.column)
+    {
+        return Ok(());
+    }
+    Err(CodegenError::ColumnNotFound {
+        table: table.name.clone(),
+        column: col_ref.column.to_string(),
+    })
+}
+
 /// Compute comparison p5 flags for a column reference.
 ///
 /// Encodes NULLEQ (0x80) and the column's type affinity so the VDBE engine
@@ -19780,7 +19903,7 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_select_ipk_range_with_wrong_qualifier_falls_back() {
+    fn test_codegen_select_ipk_range_with_wrong_qualifier_errors() {
         let stmt = simple_select(
             &["a"],
             "t",
@@ -19792,14 +19915,11 @@ mod tests {
         let schema = schema_with_ipk_alias();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
-        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
-        let prog = b.finish().unwrap();
-        let ops = prog.ops();
-
+        let err = codegen_select(&mut b, &stmt, &schema, &ctx)
+            .expect_err("mismatched qualifier should be a semantic error");
         assert!(
-            !ops.iter()
-                .any(|op| matches!(op.opcode, Opcode::SeekGE | Opcode::SeekGT)),
-            "mismatched qualifier must not use the rowid range fast path"
+            matches!(err, CodegenError::TableNotFound(ref name) if name == "u"),
+            "unexpected error: {err:?}"
         );
     }
 
@@ -22565,7 +22685,7 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_select_with_index_wrong_qualifier_falls_back() {
+    fn test_codegen_select_with_index_wrong_qualifier_errors() {
         let stmt = simple_select(
             &["a"],
             "t",
@@ -22579,25 +22699,11 @@ mod tests {
         let schema = test_schema_with_index();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
-        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
-        let prog = b.finish().unwrap();
-        let ops = prog.ops();
-
+        let err = codegen_select(&mut b, &stmt, &schema, &ctx)
+            .expect_err("mismatched qualifier should be a semantic error");
         assert!(
-            ops.iter()
-                .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
-            "mismatched qualifier should fall back to the generic table scan"
-        );
-        assert!(
-            !ops.iter().any(|op| {
-                op.opcode == Opcode::OpenRead
-                    && matches!(&op.p4, P4::Index(name) if name == "idx_t_b")
-            }),
-            "mismatched qualifier must not open the indexed-equality fast path"
-        );
-        assert!(
-            !ops.iter().any(|op| op.opcode == Opcode::SeekRowid),
-            "mismatched qualifier must not use the indexed row lookup fast path"
+            matches!(err, CodegenError::TableNotFound(ref name) if name == "u"),
+            "unexpected error: {err:?}"
         );
     }
 
@@ -23070,7 +23176,7 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_select_index_range_with_wrong_qualifier_falls_back() {
+    fn test_codegen_select_index_range_with_wrong_qualifier_errors() {
         let stmt = simple_select(
             &["a"],
             "t",
@@ -23082,26 +23188,11 @@ mod tests {
         let schema = test_schema_with_index();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
-        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
-        let prog = b.finish().unwrap();
-        let ops = prog.ops();
-
+        let err = codegen_select(&mut b, &stmt, &schema, &ctx)
+            .expect_err("mismatched qualifier should be a semantic error");
         assert!(
-            ops.iter()
-                .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
-            "mismatched qualifier should fall back to the generic table scan"
-        );
-        assert!(
-            !ops.iter().any(|op| {
-                op.opcode == Opcode::OpenRead
-                    && matches!(&op.p4, P4::Index(name) if name == "idx_t_b")
-            }),
-            "mismatched qualifier must not open the index-range fast path"
-        );
-        assert!(
-            !ops.iter()
-                .any(|op| matches!(op.opcode, Opcode::SeekGE | Opcode::SeekGT)),
-            "mismatched qualifier must not use the index-range seek path"
+            matches!(err, CodegenError::TableNotFound(ref name) if name == "u"),
+            "unexpected error: {err:?}"
         );
     }
 

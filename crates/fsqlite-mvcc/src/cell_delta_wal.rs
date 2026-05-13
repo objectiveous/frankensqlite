@@ -275,6 +275,10 @@ impl CellDeltaWalFrame {
             );
             return None;
         }
+        if op == CellDeltaOp::Delete && data_len != 0 {
+            warn!(data_len, "cell_delta_wal_frame_delete_payload");
+            return None;
+        }
 
         let expected_total_size =
             CELL_DELTA_HEADER_SIZE + data_len as usize + CELL_DELTA_CHECKSUM_SIZE;
@@ -283,6 +287,15 @@ impl CellDeltaWalFrame {
                 buf_len = buf.len(),
                 expected_size = expected_total_size,
                 "cell_delta_wal_frame_truncated"
+            );
+            return None;
+        }
+        if buf.len() > expected_total_size {
+            warn!(
+                buf_len = buf.len(),
+                expected_size = expected_total_size,
+                trailing_bytes = buf.len() - expected_total_size,
+                "cell_delta_wal_frame_trailing_bytes"
             );
             return None;
         }
@@ -333,7 +346,42 @@ impl CellDeltaWalFrame {
     #[inline]
     #[must_use]
     pub fn is_cell_delta_frame(buf: &[u8]) -> bool {
-        !buf.is_empty() && buf[0] == CELL_DELTA_FRAME_TYPE
+        if buf.len() < CELL_DELTA_MIN_FRAME_SIZE || buf[0] != CELL_DELTA_FRAME_TYPE {
+            return false;
+        }
+        if PageNumber::new(u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]])).is_none() {
+            return false;
+        }
+        let Some(op) = CellDeltaOp::from_byte(buf[21]) else {
+            return false;
+        };
+        let txn_id = u64::from_be_bytes([
+            buf[30], buf[31], buf[32], buf[33], buf[34], buf[35], buf[36], buf[37],
+        ]);
+        if TxnId::new(txn_id).is_none() {
+            return false;
+        }
+        let data_len = u32::from_be_bytes([buf[38], buf[39], buf[40], buf[41]]);
+        if data_len > CELL_DELTA_MAX_DATA_LEN || (op == CellDeltaOp::Delete && data_len != 0) {
+            return false;
+        }
+        let Some(expected_total_size) = CELL_DELTA_HEADER_SIZE
+            .checked_add(data_len as usize)
+            .and_then(|len| len.checked_add(CELL_DELTA_CHECKSUM_SIZE))
+        else {
+            return false;
+        };
+        if buf.len() != expected_total_size {
+            return false;
+        }
+        let checksum_start = CELL_DELTA_HEADER_SIZE + data_len as usize;
+        let stored_checksum = u32::from_be_bytes([
+            buf[checksum_start],
+            buf[checksum_start + 1],
+            buf[checksum_start + 2],
+            buf[checksum_start + 3],
+        ]);
+        stored_checksum == crc32c_checksum(&buf[..checksum_start])
     }
 }
 
@@ -576,6 +624,13 @@ mod tests {
         // Regular page frame (starts with page number) should return false
         let fake_page_frame = [0x00, 0x00, 0x00, 0x01]; // page 1
         assert!(!CellDeltaWalFrame::is_cell_delta_frame(&fake_page_frame));
+
+        // A full-page frame whose first byte happens to match the marker is
+        // still not a valid cell-delta envelope.
+        let fake_marker_page_frame = [CELL_DELTA_FRAME_TYPE, 0x00, 0x00, 0x01];
+        assert!(!CellDeltaWalFrame::is_cell_delta_frame(
+            &fake_marker_page_frame
+        ));
     }
 
     #[test]
@@ -671,6 +726,43 @@ mod tests {
                 "Should reject frame truncated at {truncate_at}"
             );
         }
+    }
+
+    #[test]
+    fn test_trailing_bytes_rejected() {
+        let frame = CellDeltaWalFrame {
+            page_number: PageNumber::new(42).unwrap(),
+            key_digest: [0; 16],
+            op: CellDeltaOp::Insert,
+            commit_seq: CommitSeq::new(1),
+            txn_id: TxnId::new(1).unwrap(),
+            cell_data: vec![1, 2, 3],
+        };
+
+        let mut serialized = frame.serialize();
+        serialized.extend_from_slice(b"junk");
+
+        assert!(
+            CellDeltaWalFrame::deserialize(&serialized).is_none(),
+            "frame decoder must reject bytes not covered by the frame checksum"
+        );
+    }
+
+    #[test]
+    fn test_delete_payload_rejected() {
+        let frame = CellDeltaWalFrame {
+            page_number: PageNumber::new(42).unwrap(),
+            key_digest: [0; 16],
+            op: CellDeltaOp::Delete,
+            commit_seq: CommitSeq::new(1),
+            txn_id: TxnId::new(1).unwrap(),
+            cell_data: vec![1, 2, 3],
+        };
+
+        assert!(
+            CellDeltaWalFrame::deserialize(&frame.serialize()).is_none(),
+            "delete frame payload bytes cannot be applied consistently during materialization"
+        );
     }
 
     #[test]

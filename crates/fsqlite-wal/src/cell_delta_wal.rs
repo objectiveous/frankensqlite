@@ -50,7 +50,7 @@
 //!
 //! During crash recovery:
 //! 1. Read WAL frames sequentially
-//! 2. Check high bit of page_number to identify frame type
+//! 2. Check the frame envelope for the exact cell-delta marker and checksum
 //! 3. Full-page frames: apply directly to page cache
 //! 4. Cell-delta frames: reconstruct into CellVisibilityLog
 //! 5. Materialize affected pages from CellVisibilityLog
@@ -225,7 +225,11 @@ impl CellDeltaWalFrame {
             });
         }
 
-        // Verify marker
+        // Verify marker. New frames use the first word as a pure type tag.
+        // Legacy frames with an embedded page number are still accepted by
+        // `deserialize`, but the public discriminator below intentionally
+        // matches only the current exact marker to avoid confusing high-bit
+        // full-page frame page numbers for cell-delta records.
         let marker_and_pgno = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         if marker_and_pgno & CELL_DELTA_FRAME_MARKER == 0 {
             return Err(FrankenError::WalCorrupt {
@@ -269,9 +273,30 @@ impl CellDeltaWalFrame {
         })?;
 
         let cell_data_len = u32::from_be_bytes([data[41], data[42], data[43], data[44]]) as usize;
+        if cell_data_len > CELL_DELTA_MAX_DATA_SIZE {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "cell-delta frame data too large: {} bytes, max {}",
+                    cell_data_len, CELL_DELTA_MAX_DATA_SIZE
+                ),
+            });
+        }
+        if op == CellOp::Delete && cell_data_len != 0 {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "cell-delta delete frame has non-empty payload: {} bytes",
+                    cell_data_len
+                ),
+            });
+        }
 
         // Validate total length
-        let expected_len = CELL_DELTA_HEADER_SIZE + cell_data_len + CELL_DELTA_CHECKSUM_SIZE;
+        let expected_len = CELL_DELTA_HEADER_SIZE
+            .checked_add(cell_data_len)
+            .and_then(|len| len.checked_add(CELL_DELTA_CHECKSUM_SIZE))
+            .ok_or_else(|| FrankenError::WalCorrupt {
+                detail: "cell-delta frame length overflow".to_owned(),
+            })?;
         if data.len() < expected_len {
             return Err(FrankenError::WalCorrupt {
                 detail: format!(
@@ -279,6 +304,14 @@ impl CellDeltaWalFrame {
                     data.len(),
                     expected_len,
                     cell_data_len
+                ),
+            });
+        }
+        if data.len() > expected_len {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "cell-delta frame has {} trailing bytes after checksum",
+                    data.len() - expected_len
                 ),
             });
         }
@@ -321,18 +354,56 @@ impl CellDeltaWalFrame {
 // Frame Type Detection (§C4-WAL.3)
 // ---------------------------------------------------------------------------
 
-/// Check if a WAL frame is a cell-delta frame based on the first 4 bytes.
+/// Check if a WAL frame is a structurally valid cell-delta frame.
 ///
-/// This function can be used to quickly identify frame type during recovery
-/// without parsing the entire frame.
+/// Full-page WAL frames also start with a page number, and page number
+/// `0x80000000` is valid. The discriminator therefore verifies the complete
+/// cell-delta envelope instead of trusting the marker word alone.
 #[must_use]
 pub fn is_cell_delta_frame(frame_data: &[u8]) -> bool {
-    if frame_data.len() < 4 {
+    if frame_data.len() < CELL_DELTA_MIN_FRAME_SIZE {
         return false;
     }
     let marker_and_pgno =
         u32::from_be_bytes([frame_data[0], frame_data[1], frame_data[2], frame_data[3]]);
-    marker_and_pgno & CELL_DELTA_FRAME_MARKER != 0
+    if marker_and_pgno != CELL_DELTA_FRAME_MARKER {
+        return false;
+    }
+    let actual_pgno =
+        u32::from_be_bytes([frame_data[4], frame_data[5], frame_data[6], frame_data[7]]);
+    if PageNumber::new(actual_pgno).is_none() {
+        return false;
+    }
+    let Some(op) = CellOp::from_byte(frame_data[24]) else {
+        return false;
+    };
+    let cell_data_len = u32::from_be_bytes([
+        frame_data[41],
+        frame_data[42],
+        frame_data[43],
+        frame_data[44],
+    ]) as usize;
+    if cell_data_len > CELL_DELTA_MAX_DATA_SIZE || (op == CellOp::Delete && cell_data_len != 0) {
+        return false;
+    }
+    let Some(expected_len) = CELL_DELTA_HEADER_SIZE
+        .checked_add(cell_data_len)
+        .and_then(|len| len.checked_add(CELL_DELTA_CHECKSUM_SIZE))
+    else {
+        return false;
+    };
+    if frame_data.len() != expected_len {
+        return false;
+    }
+
+    let checksum_offset = CELL_DELTA_HEADER_SIZE + cell_data_len;
+    let stored_checksum = u32::from_be_bytes([
+        frame_data[checksum_offset],
+        frame_data[checksum_offset + 1],
+        frame_data[checksum_offset + 2],
+        frame_data[checksum_offset + 3],
+    ]);
+    stored_checksum == crc32c::crc32c(&frame_data[..checksum_offset])
 }
 
 /// Extract the legacy embedded page number from a cell-delta frame marker.
@@ -509,13 +580,13 @@ mod tests {
 
         let serialized = frame.serialize();
 
-        // Verify marker bit is set
+        // Verify exact cell-delta marker.
         assert!(is_cell_delta_frame(&serialized));
 
-        // Verify first 4 bytes have marker
+        // Verify first 4 bytes are the pure marker word.
         let marker_and_pgno =
             u32::from_be_bytes([serialized[0], serialized[1], serialized[2], serialized[3]]);
-        assert!(marker_and_pgno & CELL_DELTA_FRAME_MARKER != 0);
+        assert_eq!(marker_and_pgno, CELL_DELTA_FRAME_MARKER);
 
         // New frames use a pure marker word; there is no embedded page number.
         assert_eq!(extract_page_number_from_marker(marker_and_pgno), None);
@@ -558,6 +629,19 @@ mod tests {
         // Simulate full-page frame (page number without marker)
         let fake_page_frame = [0x00, 0x00, 0x00, 0x2A]; // page 42, no marker
         assert!(!is_cell_delta_frame(&fake_page_frame));
+
+        // High-bit page numbers are valid full-page frame page numbers. The
+        // discriminator must not classify them as cell-delta frames just
+        // because they share the legacy marker bit.
+        let high_bit_full_page_frame = 0x8000_0042_u32.to_be_bytes();
+        assert!(!is_cell_delta_frame(&high_bit_full_page_frame));
+
+        let mut exact_marker_full_page_frame = vec![0u8; 24 + 4096];
+        exact_marker_full_page_frame[..4].copy_from_slice(&CELL_DELTA_FRAME_MARKER.to_be_bytes());
+        assert!(
+            !is_cell_delta_frame(&exact_marker_full_page_frame),
+            "valid full-page WAL page number 0x80000000 must not collide with the cell-delta marker"
+        );
 
         // Too short
         assert!(!is_cell_delta_frame(&[0x80]));
@@ -603,6 +687,73 @@ mod tests {
         let truncated = &serialized[..serialized.len() - 3];
         let result = CellDeltaWalFrame::deserialize(truncated);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deserialize_rejects_trailing_bytes() {
+        let frame = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Insert,
+            CommitSeq::new(100),
+            test_txn_id(42),
+            vec![1, 2, 3],
+        );
+
+        let mut serialized = frame.serialize();
+        serialized.extend_from_slice(b"junk");
+
+        let result = CellDeltaWalFrame::deserialize(&serialized);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("trailing bytes"),
+            "decoder should reject bytes not covered by the frame checksum"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_rejects_oversized_cell_data_len() {
+        let mut serialized = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Insert,
+            CommitSeq::new(100),
+            test_txn_id(42),
+            Vec::new(),
+        )
+        .serialize();
+        let too_large = u32::try_from(CELL_DELTA_MAX_DATA_SIZE + 1)
+            .expect("test max cell delta size should fit u32");
+        serialized[41..45].copy_from_slice(&too_large.to_be_bytes());
+
+        let result = CellDeltaWalFrame::deserialize(&serialized);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("data too large"),
+            "decoder should reject impossible allocation sizes before checksum work"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_rejects_delete_payload() {
+        let frame = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Delete,
+            CommitSeq::new(100),
+            test_txn_id(42),
+            vec![1, 2, 3],
+        );
+
+        let result = CellDeltaWalFrame::deserialize(&frame.serialize());
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("delete frame has non-empty payload"),
+            "decoder should reject delete frames with unreachable payload bytes"
+        );
     }
 
     #[test]

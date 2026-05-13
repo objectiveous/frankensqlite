@@ -433,21 +433,53 @@ pub fn deserialize_cell_delta_batch(buf: &[u8]) -> Vec<CellDeltaWalFrame> {
     while offset < buf.len() {
         let remaining = &buf[offset..];
 
-        // Check if this looks like a cell-delta frame
-        if !CellDeltaWalFrame::is_cell_delta_frame(remaining) {
-            break;
-        }
-
         // Need at least header to read data length
         if remaining.len() < CELL_DELTA_HEADER_SIZE {
+            break;
+        }
+        if remaining[0] != CELL_DELTA_FRAME_TYPE {
+            break;
+        }
+        if PageNumber::new(u32::from_be_bytes([
+            remaining[1],
+            remaining[2],
+            remaining[3],
+            remaining[4],
+        ]))
+        .is_none()
+        {
+            break;
+        }
+        let Some(op) = CellDeltaOp::from_byte(remaining[21]) else {
+            break;
+        };
+        let txn_id = u64::from_be_bytes([
+            remaining[30],
+            remaining[31],
+            remaining[32],
+            remaining[33],
+            remaining[34],
+            remaining[35],
+            remaining[36],
+            remaining[37],
+        ]);
+        if TxnId::new(txn_id).is_none() {
             break;
         }
 
         // Read data length to determine frame size
         let data_len =
             u32::from_be_bytes([remaining[38], remaining[39], remaining[40], remaining[41]]);
+        if data_len > CELL_DELTA_MAX_DATA_LEN || (op == CellDeltaOp::Delete && data_len != 0) {
+            break;
+        }
 
-        let frame_size = CELL_DELTA_HEADER_SIZE + data_len as usize + CELL_DELTA_CHECKSUM_SIZE;
+        let Some(frame_size) = CELL_DELTA_HEADER_SIZE
+            .checked_add(data_len as usize)
+            .and_then(|len| len.checked_add(CELL_DELTA_CHECKSUM_SIZE))
+        else {
+            break;
+        };
 
         if remaining.len() < frame_size {
             break;

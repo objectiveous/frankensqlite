@@ -94,6 +94,11 @@ use tracing::{debug, trace};
 
 use crate::cache_aligned::CacheAligned;
 
+#[inline]
+fn same_txn_identity(left: TxnToken, right: TxnToken) -> bool {
+    left.id.get() == right.id.get() && left.epoch.get() == right.epoch.get()
+}
+
 // ---------------------------------------------------------------------------
 // CellKey — Stable cell identity (§C1.1)
 // ---------------------------------------------------------------------------
@@ -272,7 +277,8 @@ impl CellDelta {
     #[inline]
     #[must_use]
     pub fn is_visible_to_txn(&self, snapshot_high: CommitSeq, txn: TxnToken) -> bool {
-        self.is_visible_to(snapshot_high) || (self.commit_seq.get() == 0 && self.created_by == txn)
+        self.is_visible_to(snapshot_high)
+            || (self.commit_seq.get() == 0 && same_txn_identity(self.created_by, txn))
     }
 }
 
@@ -1131,7 +1137,7 @@ impl CellVisibilityLog {
                 break;
             };
 
-            if delta.commit_seq.get() == 0 && delta.created_by == txn {
+            if delta.commit_seq.get() == 0 && same_txn_identity(delta.created_by, txn) {
                 return CellResolve::from_visible_delta(delta);
             }
 
@@ -1841,7 +1847,9 @@ pub fn can_be_logical_insert(
     }
 
     // If cell (with overhead) fits in current free space, it's logical.
-    let total_cell_size = payload_size + cell_overhead;
+    let Some(total_cell_size) = payload_size.checked_add(cell_overhead) else {
+        return false;
+    };
     total_cell_size <= page_free_space
 }
 
@@ -2029,6 +2037,14 @@ mod tests {
 
         // Requires overflow: payload > local max
         assert!(!can_be_logical_insert(250, 200, 1000, 10)); // 250 > 200
+
+        // Pathological inputs must not wrap and pretend the cell fits.
+        assert!(!can_be_logical_insert(
+            usize::MAX - 1,
+            usize::MAX,
+            usize::MAX,
+            2
+        ));
     }
 
     #[test]

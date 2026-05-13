@@ -12,6 +12,41 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-13 - 7ea5da35 DML DELETE compare refresh
+
+- Target: remaining `UPDATE/DELETEThroughput` DELETE rows after
+  `7ea5da35` (`docs(perf): publish f11324ca benchmark refresh`), especially
+  `100 rows / delete 5 rows`, `1000 rows / delete 50 rows`, and
+  `10000 rows / delete 500 rows`.
+- Files/subsystems inspected: no source patch. Re-read the current pending
+  prepared direct DELETE same-leaf and monotone cross-leaf buffering in
+  `crates/fsqlite-core/src/connection.rs`, the retained delete-run
+  materializer in `crates/fsqlite-btree/src/cursor.rs`, and the open
+  transaction-local DML mutation-operator design card in
+  `docs/design/profile-first-optimization-cards-and-proof-packs.md`.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-7ea5da35-dml-compare-20260513T0120Z/`.
+  The narrow compare used
+  `FSQLITE_BENCH_PROFILE_DML=1 perf-update-delete <rows> 100 delete compare standard`
+  after building `perf-update-delete` with `CARGO_TARGET_DIR=/data/tmp/frankensqlite-dml-current-target`.
+- Result: no source patch attempted. All profiled DELETE rows stayed on the
+  prepared direct fast path (`slow=0`). The compare run reported FSQLite/C
+  per-row DELETE ratios of `5.25x` for 5 deletes, `2.93x` for 50 deletes, and
+  `2.63x` for 500 deletes. The 500-delete final iteration still spent the
+  visible work in the existing physical retained-run path:
+  `delete_leaf_active=433/496`, `delete_leaf_flush=64/64`,
+  `delete_leaf_materialize=64/88828ns`, `delete_leaf_write=64/16590ns`,
+  `execute_body_ns=74851`, and `commit_roundtrip_ns=35997`.
+- Do not retry another retained DELETE search, duplicate-check, compactness,
+  materialization, direct-flush, or publication micro-patch from this evidence.
+  The existing buffering already flushes before reads and rolls back without
+  physical publication, but it still mutates page-local delete-run state and
+  materializes dirty leaf pages at the boundary. Reconsider source work only as
+  the broader transaction-local DML mutation operator with logical rowid/key
+  messages, read-boundary flushing or a logical read-view overlay,
+  savepoint/rollback ownership, row-count oracle tests, focused DELETE wins,
+  and full-quick primary-score neutrality or better.
+
 ## 2026-05-12 - `release_set` targeted waiter wakeups
 
 - Target: `Concurrent Writers -- C SQLite WAL vs FrankenSQLite MVCC`, especially

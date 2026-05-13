@@ -191,6 +191,13 @@ impl CellResolve {
             Self::Untracked | Self::NoVisibleVersion | Self::Deleted => None,
         }
     }
+
+    fn from_visible_delta(delta: &CellDelta) -> Self {
+        match &delta.kind {
+            CellDeltaKind::Delete => Self::Deleted,
+            CellDeltaKind::Insert | CellDeltaKind::Update => Self::Visible(delta.cell_data.clone()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,39 +1031,43 @@ impl CellVisibilityLog {
 
         let arena = self.arena.lock();
         let mut current_idx = Some(head_idx);
+        let mut best_visible: Option<(CommitSeq, CellResolve)> = None;
 
-        // Walk chain to find visible delta
+        // The chain is allocation order, not necessarily commit order. A later
+        // allocation can commit before an older same-cell allocation, so choose
+        // the newest visible commit sequence rather than the first visible node.
         while let Some(idx) = current_idx {
             if let Some(delta) = arena.get(idx) {
                 if delta.is_visible_to(snapshot_high) {
-                    return match delta.kind {
-                        CellDeltaKind::Delete => {
-                            trace!(
-                                pgno = page_number.get(),
-                                key_digest = ?&cell_key.key_digest[..4],
-                                snapshot_high = snapshot_high.get(),
-                                result = "deleted",
-                                "cell_resolved"
-                            );
-                            CellResolve::Deleted
-                        }
-                        CellDeltaKind::Insert | CellDeltaKind::Update => {
-                            trace!(
-                                pgno = page_number.get(),
-                                key_digest = ?&cell_key.key_digest[..4],
-                                snapshot_high = snapshot_high.get(),
-                                result = "visible",
-                                data_len = delta.cell_data.len(),
-                                "cell_resolved"
-                            );
-                            CellResolve::Visible(delta.cell_data.clone())
-                        }
-                    };
+                    let should_replace = best_visible
+                        .as_ref()
+                        .is_none_or(|(seq, _)| delta.commit_seq > *seq);
+                    if should_replace {
+                        best_visible =
+                            Some((delta.commit_seq, CellResolve::from_visible_delta(delta)));
+                    }
                 }
                 current_idx = delta.prev_idx;
             } else {
                 break;
             }
+        }
+
+        if let Some((_commit_seq, resolved)) = best_visible {
+            let (result_label, data_len) = match &resolved {
+                CellResolve::Deleted => ("deleted", 0),
+                CellResolve::Visible(cell_data) => ("visible", cell_data.len()),
+                CellResolve::Untracked | CellResolve::NoVisibleVersion => ("unexpected", 0),
+            };
+            trace!(
+                pgno = page_number.get(),
+                key_digest = ?&cell_key.key_digest[..4],
+                snapshot_high = snapshot_high.get(),
+                result = result_label,
+                data_len,
+                "cell_resolved"
+            );
+            return resolved;
         }
 
         trace!(
@@ -1113,24 +1124,30 @@ impl CellVisibilityLog {
 
         let arena = self.arena.lock();
         let mut current_idx = Some(head_idx);
+        let mut best_committed: Option<(CommitSeq, CellResolve)> = None;
 
         while let Some(idx) = current_idx {
             let Some(delta) = arena.get(idx) else {
                 break;
             };
 
-            if delta.is_visible_to_txn(snapshot_high, txn) {
-                return match delta.kind {
-                    CellDeltaKind::Delete => CellResolve::Deleted,
-                    CellDeltaKind::Insert | CellDeltaKind::Update => {
-                        CellResolve::Visible(delta.cell_data.clone())
-                    }
-                };
+            if delta.commit_seq.get() == 0 && delta.created_by == txn {
+                return CellResolve::from_visible_delta(delta);
+            }
+
+            if delta.is_visible_to(snapshot_high) {
+                let should_replace = best_committed
+                    .as_ref()
+                    .is_none_or(|(seq, _)| delta.commit_seq > *seq);
+                if should_replace {
+                    best_committed =
+                        Some((delta.commit_seq, CellResolve::from_visible_delta(delta)));
+                }
             }
             current_idx = delta.prev_idx;
         }
 
-        CellResolve::NoVisibleVersion
+        best_committed.map_or(CellResolve::NoVisibleVersion, |(_, resolved)| resolved)
     }
 
     /// Check if the memory budget is exceeded.
@@ -1413,17 +1430,20 @@ impl CellVisibilityLog {
 
                 for entry in heads.values() {
                     let mut current_idx = Some(entry.head_idx);
-                    let mut found_visible_below_horizon = false;
+                    let mut below_horizon: Vec<(CommitSeq, CellDeltaIdx)> = Vec::new();
+                    let mut newest_below_horizon: Option<(CommitSeq, CellDeltaIdx)> = None;
 
                     while let Some(idx) = current_idx {
                         stats.examined += 1;
 
                         if let Some(delta) = arena.get(idx) {
                             if delta.commit_seq.get() != 0 && delta.commit_seq <= gc_horizon {
-                                if found_visible_below_horizon {
-                                    to_free.push(idx);
-                                } else {
-                                    found_visible_below_horizon = true;
+                                below_horizon.push((delta.commit_seq, idx));
+                                let should_keep = newest_below_horizon
+                                    .as_ref()
+                                    .is_none_or(|(seq, _)| delta.commit_seq > *seq);
+                                if should_keep {
+                                    newest_below_horizon = Some((delta.commit_seq, idx));
                                 }
                             }
                             current_idx = delta.prev_idx;
@@ -1431,27 +1451,23 @@ impl CellVisibilityLog {
                             break;
                         }
                     }
+
+                    if let Some((_seq, keep_idx)) = newest_below_horizon {
+                        to_free.extend(
+                            below_horizon
+                                .into_iter()
+                                .filter_map(|(_seq, idx)| (!idx.eq(&keep_idx)).then_some(idx)),
+                        );
+                    }
                 }
             }
         }
 
         if !to_free.is_empty() {
-            let mut arena = self.arena.lock();
-
-            for idx in to_free {
-                if let Some(delta) = arena.free(idx) {
-                    stats.reclaimed += 1;
-                    stats.bytes_freed += delta.memory_size() as u64;
-
-                    // C7 (bd-l9k8e.7): Decrement per-page delta count.
-                    let shard_idx = Self::shard_index(delta.page_number);
-                    self.shards[shard_idx].decrement_page_count(delta.page_number);
-                }
-            }
+            let (reclaimed, bytes_freed) = self.remove_delta_indices(&to_free);
+            stats.reclaimed = reclaimed;
+            stats.bytes_freed = bytes_freed;
         }
-
-        self.delta_count
-            .fetch_sub(stats.reclaimed, Ordering::Relaxed);
 
         debug!(
             gc_horizon = gc_horizon.get(),
@@ -1666,87 +1682,38 @@ impl CellVisibilityLog {
         let shard_idx = Self::shard_index(page_number);
         let shard = &self.shards[shard_idx];
 
-        // Phase 1: Collect info about what to free and how to update heads.
-        // Lock order: arena first, then heads (matches rollback_txn pattern).
-        // (key_digest, indices_to_free, new_head_idx)
-        let mut updates: Vec<([u8; 16], Vec<CellDeltaIdx>, Option<CellDeltaIdx>)> = Vec::new();
-
-        {
+        let to_free = {
             let arena = self.arena.lock();
             let heads = shard.heads.read();
+            let mut indices = Vec::new();
 
-            for ((pgno, key_digest), entry) in heads.iter() {
+            for ((pgno, _key_digest), entry) in heads.iter() {
                 if !pgno.eq(&page_number) {
                     continue;
                 }
 
-                let mut to_free_for_key: Vec<CellDeltaIdx> = Vec::new();
-                let mut new_head: Option<CellDeltaIdx> = None;
                 let mut current_idx = Some(entry.head_idx);
 
-                // Walk the chain, collecting deltas to free
                 while let Some(idx) = current_idx {
                     if let Some(delta) = arena.get(idx) {
                         if delta.commit_seq.get() != 0 && delta.commit_seq <= below_commit_seq {
-                            to_free_for_key.push(idx);
-                        } else if new_head.is_none() {
-                            // First delta that survives becomes the new head
-                            new_head = Some(idx);
+                            indices.push(idx);
                         }
                         current_idx = delta.prev_idx;
                     } else {
                         break;
                     }
                 }
-
-                if !to_free_for_key.is_empty() {
-                    updates.push((*key_digest, to_free_for_key, new_head));
-                }
             }
-        }
 
-        if updates.is_empty() {
+            indices
+        };
+
+        if to_free.is_empty() {
             return 0;
         }
 
-        // Now perform the actual updates with write locks
-        let mut arena = self.arena.lock();
-        let mut heads = shard.heads.write();
-        let mut freed = 0usize;
-
-        for (key_digest, to_free, new_head) in updates {
-            let lookup_key = (page_number, key_digest);
-
-            // Free the deltas from arena
-            for idx in &to_free {
-                if arena.free(*idx).is_some() {
-                    freed += 1;
-                }
-            }
-
-            // Update or remove the head entry
-            if let Some(new_head_idx) = new_head {
-                // Update head to point to surviving delta
-                if let Some(entry) = heads.get_mut(&lookup_key) {
-                    entry.head_idx = new_head_idx;
-                }
-            } else {
-                // All deltas for this key were freed, remove the entry
-                heads.remove(&lookup_key);
-            }
-        }
-
-        // Drop locks before calling decrement_page_count (avoid deadlock)
-        drop(heads);
-        drop(arena);
-
-        // C7: Decrement page_delta_counts for each freed delta
-        for _ in 0..freed {
-            shard.decrement_page_count(page_number);
-        }
-
-        // Update global delta count
-        self.delta_count.fetch_sub(freed as u64, Ordering::Relaxed);
+        let (freed, _bytes_freed) = self.remove_delta_indices(&to_free);
 
         debug!(
             pgno = page_number.get(),
@@ -1755,7 +1722,7 @@ impl CellVisibilityLog {
             "page_deltas_cleared"
         );
 
-        freed
+        usize::try_from(freed).unwrap_or(usize::MAX)
     }
 }
 
@@ -2260,6 +2227,63 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_uses_newest_visible_commit_seq_not_head_order() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).unwrap();
+
+        let older_alloc = log
+            .record_update(cell_key, page_number, vec![30], txn_token_n(1))
+            .expect("older allocation should succeed");
+        let newer_alloc = log
+            .record_update(cell_key, page_number, vec![20], txn_token_n(2))
+            .expect("newer allocation should succeed");
+
+        log.commit_delta(newer_alloc, CommitSeq::new(20));
+        log.commit_delta(older_alloc, CommitSeq::new(30));
+
+        assert_eq!(
+            log.resolve(page_number, &cell_key, CommitSeq::new(25)),
+            Some(vec![20]),
+            "snapshot before the later commit should see the earlier committed head"
+        );
+        assert_eq!(
+            log.resolve(page_number, &cell_key, CommitSeq::new(30)),
+            Some(vec![30]),
+            "resolver must choose the newest visible commit_seq, not the chain head"
+        );
+    }
+
+    #[test]
+    fn test_resolve_for_txn_own_uncommitted_delta_overlays_visible_head() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).unwrap();
+        let writer_txn = txn_token_n(1);
+        let other_txn = txn_token_n(2);
+
+        log.record_update(cell_key, page_number, vec![99], writer_txn)
+            .expect("writer update should succeed");
+        let visible_head = log
+            .record_update(cell_key, page_number, vec![10], other_txn)
+            .expect("other update should succeed");
+        log.commit_delta(visible_head, CommitSeq::new(10));
+
+        assert_eq!(
+            log.resolve_for_txn(page_number, &cell_key, CommitSeq::new(10), writer_txn),
+            Some(vec![99]),
+            "own uncommitted delta is logically after the snapshot even when a visible committed head was allocated later"
+        );
+        assert_eq!(
+            log.resolve_for_txn(page_number, &cell_key, CommitSeq::new(10), other_txn),
+            Some(vec![10]),
+            "the committed head remains visible to transactions without an own overlay"
+        );
+    }
+
+    #[test]
     fn test_different_cells_no_conflict() {
         let log = CellVisibilityLog::new(1024 * 1024);
         let btree = BtreeRef::Table(TableId::new(1));
@@ -2338,6 +2362,77 @@ mod tests {
         assert_eq!(
             log.resolve(page_number, &cell_key, CommitSeq::new(15)),
             Some(vec![4, 5, 6])
+        );
+    }
+
+    #[test]
+    fn test_gc_keeps_newest_commit_below_horizon_not_first_chain_match() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).unwrap();
+
+        let mid_commit_alloc = log
+            .record_update(cell_key, page_number, vec![20], txn_token_n(1))
+            .expect("middle commit allocation should succeed");
+        let old_commit_alloc = log
+            .record_update(cell_key, page_number, vec![10], txn_token_n(2))
+            .expect("old commit allocation should succeed");
+        let future_commit_alloc = log
+            .record_update(cell_key, page_number, vec![30], txn_token_n(3))
+            .expect("future commit allocation should succeed");
+
+        log.commit_delta(mid_commit_alloc, CommitSeq::new(20));
+        log.commit_delta(old_commit_alloc, CommitSeq::new(10));
+        log.commit_delta(future_commit_alloc, CommitSeq::new(30));
+
+        let stats = log.gc(CommitSeq::new(20));
+        assert_eq!(
+            stats.reclaimed, 1,
+            "GC should reclaim only the superseded below-horizon version"
+        );
+        assert_eq!(
+            log.resolve(page_number, &cell_key, CommitSeq::new(20)),
+            Some(vec![20]),
+            "GC must preserve the newest committed version below the horizon"
+        );
+        assert_eq!(
+            log.resolve(page_number, &cell_key, CommitSeq::new(30)),
+            Some(vec![30]),
+            "newer above-horizon version must remain linked"
+        );
+    }
+
+    #[test]
+    fn test_clear_page_deltas_relinks_survivor_behind_freed_middle_delta() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).unwrap();
+
+        let survivor_behind_freed = log
+            .record_update(cell_key, page_number, vec![20], txn_token_n(1))
+            .expect("survivor allocation should succeed");
+        let freed_middle = log
+            .record_update(cell_key, page_number, vec![10], txn_token_n(2))
+            .expect("freed middle allocation should succeed");
+        let survivor_head = log
+            .record_update(cell_key, page_number, vec![30], txn_token_n(3))
+            .expect("head allocation should succeed");
+
+        log.commit_delta(survivor_behind_freed, CommitSeq::new(20));
+        log.commit_delta(freed_middle, CommitSeq::new(10));
+        log.commit_delta(survivor_head, CommitSeq::new(30));
+
+        assert_eq!(log.clear_page_deltas(page_number, CommitSeq::new(10)), 1);
+        assert_eq!(
+            log.resolve(page_number, &cell_key, CommitSeq::new(20)),
+            Some(vec![20]),
+            "clearing materialized deltas must relink the head past a freed middle node"
+        );
+        assert_eq!(
+            log.resolve(page_number, &cell_key, CommitSeq::new(30)),
+            Some(vec![30])
         );
     }
 

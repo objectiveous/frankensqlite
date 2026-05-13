@@ -26,6 +26,8 @@ Each entry should include:
   `docs/design/profile-first-optimization-cards-and-proof-packs.md`.
 - Evidence artifact:
   `tests/artifacts/perf/codex-7ea5da35-dml-compare-20260513T0120Z/`.
+  The directory name says `T0120Z`, but the run started at `T0020Z`; the
+  existing directory name is preserved to avoid rename/delete churn.
   The narrow compare used
   `FSQLITE_BENCH_PROFILE_DML=1 perf-update-delete <rows> 100 delete compare standard`
   after building `perf-update-delete` with `CARGO_TARGET_DIR=/data/tmp/frankensqlite-dml-current-target`.

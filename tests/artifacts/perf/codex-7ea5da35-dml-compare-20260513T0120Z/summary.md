@@ -1,6 +1,8 @@
 # DML DELETE Compare Profile Refresh
 
-- Date: 2026-05-13T01:20Z
+- Date: 2026-05-13T00:20Z
+- Note: the artifact directory name contains `T0120Z`, but the run started at
+  `T0020Z`; the directory name is left unchanged to avoid rename/delete churn.
 - Source: `7ea5da35` (`docs(perf): publish f11324ca benchmark refresh`)
 - Build command: `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-dml-current-target cargo build --profile release-perf -p fsqlite-e2e --bin perf-update-delete`
 - Profile command shape: `FSQLITE_BENCH_PROFILE_DML=1 /data/tmp/frankensqlite-dml-current-target/release-perf/perf-update-delete <rows> 100 delete compare standard`

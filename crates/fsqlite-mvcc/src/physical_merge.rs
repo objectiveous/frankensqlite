@@ -343,9 +343,11 @@ fn parse_leaf_table_cell(
     let has_overflow = payload_size > u64::from(local_payload);
 
     let total_cell_size = header_len + local_payload as usize + if has_overflow { 4 } else { 0 };
-    let cell_end = total_cell_size.min(data.len());
+    if total_cell_size > data.len() {
+        return Err(MergeError::InvalidPageBuffer);
+    }
 
-    let cell_bytes = &data[..cell_end];
+    let cell_bytes = &data[..total_cell_size];
 
     let digest = table_rowid_digest(btree_ref, rowid);
 
@@ -364,15 +366,16 @@ fn parse_leaf_index_cell(
     let local_payload = compute_local_payload_size(payload_size, usable, false);
     let has_overflow = payload_size > u64::from(local_payload);
     let total_cell_size = n1 + local_payload as usize + if has_overflow { 4 } else { 0 };
-    let cell_end = total_cell_size.min(data.len());
+    if total_cell_size > data.len() {
+        return Err(MergeError::InvalidPageBuffer);
+    }
 
-    let cell_bytes = &data[..cell_end];
+    let cell_bytes = &data[..total_cell_size];
 
     // For index pages, use the payload + overflow pointer as canonical key bytes
     // to ensure uniqueness even when common prefixes overflow (§5.10.3).
     let payload_start = n1;
-    let payload_end =
-        (n1 + local_payload as usize + if has_overflow { 4 } else { 0 }).min(data.len());
+    let payload_end = n1 + local_payload as usize + if has_overflow { 4 } else { 0 };
     let key_bytes = &data[payload_start..payload_end];
 
     let digest = SemanticKeyRef::compute_digest(SemanticKeyKind::IndexEntry, btree_ref, key_bytes);
@@ -394,7 +397,10 @@ fn parse_interior_table_cell(
     #[allow(clippy::cast_possible_wrap)]
     let rowid = rowid_u64 as i64;
 
-    let cell_end = (4 + n).min(data.len());
+    let cell_end = 4 + n;
+    if cell_end > data.len() {
+        return Err(MergeError::InvalidPageBuffer);
+    }
     let cell_bytes = &data[..cell_end];
 
     let digest = table_rowid_digest(btree_ref, rowid);
@@ -427,7 +433,10 @@ fn parse_interior_index_cell(
     let local_payload = compute_local_payload_size(payload_size, usable, false);
     let has_overflow = payload_size > u64::from(local_payload);
     let total = 4 + n1 + local_payload as usize + if has_overflow { 4 } else { 0 };
-    let cell_end = total.min(data.len());
+    if total > data.len() {
+        return Err(MergeError::InvalidPageBuffer);
+    }
+    let cell_end = total;
 
     let cell_bytes = &data[..cell_end];
 
@@ -1190,9 +1199,104 @@ mod tests {
         PageSize::new(4096).expect("4096 is valid")
     }
 
+    fn build_single_leaf_cell_page(page_type: u8, cell_offset: usize, cell: &[u8]) -> Vec<u8> {
+        let mut page = vec![0u8; default_page_size().as_usize()];
+        page[0] = page_type;
+        page[3..5].copy_from_slice(&1_u16.to_be_bytes());
+        page[5..7].copy_from_slice(
+            &u16::try_from(cell_offset)
+                .expect("test cell offset fits u16")
+                .to_be_bytes(),
+        );
+        page[8..10].copy_from_slice(
+            &u16::try_from(cell_offset)
+                .expect("test cell pointer fits u16")
+                .to_be_bytes(),
+        );
+        page[cell_offset..cell_offset + cell.len()].copy_from_slice(cell);
+        page
+    }
+
+    fn build_single_interior_cell_page(page_type: u8, cell_offset: usize, cell: &[u8]) -> Vec<u8> {
+        let mut page = vec![0u8; default_page_size().as_usize()];
+        page[0] = page_type;
+        page[3..5].copy_from_slice(&1_u16.to_be_bytes());
+        page[5..7].copy_from_slice(
+            &u16::try_from(cell_offset)
+                .expect("test cell offset fits u16")
+                .to_be_bytes(),
+        );
+        page[8..12].copy_from_slice(&1_u32.to_be_bytes());
+        page[12..14].copy_from_slice(
+            &u16::try_from(cell_offset)
+                .expect("test cell pointer fits u16")
+                .to_be_bytes(),
+        );
+        page[cell_offset..cell_offset + cell.len()].copy_from_slice(cell);
+        page
+    }
+
     // -----------------------------------------------------------------------
     // Test 1: Structured page merge parse→merge→repack round-trip
     // -----------------------------------------------------------------------
+    #[test]
+    fn test_parse_rejects_truncated_leaf_table_cell() {
+        let ps = default_page_size();
+        let tid = table_id_1();
+        let page = build_single_leaf_cell_page(13, ps.as_usize() - 3, &[10, 1, 0xAA]);
+
+        assert!(matches!(
+            parse_btree_page(&page, ps, 0, false, fsqlite_types::BtreeRef::Table(tid)),
+            Err(MergeError::InvalidPageBuffer)
+        ));
+    }
+
+    #[test]
+    fn test_parse_rejects_truncated_leaf_index_cell() {
+        let ps = default_page_size();
+        let page = build_single_leaf_cell_page(10, ps.as_usize() - 2, &[10, 0xAA]);
+
+        assert!(matches!(
+            parse_btree_page(
+                &page,
+                ps,
+                0,
+                false,
+                fsqlite_types::BtreeRef::Index(fsqlite_types::IndexId::new(1)),
+            ),
+            Err(MergeError::InvalidPageBuffer)
+        ));
+    }
+
+    #[test]
+    fn test_parse_rejects_truncated_interior_index_cell() {
+        let ps = default_page_size();
+        let page = build_single_interior_cell_page(2, ps.as_usize() - 6, &[0, 0, 0, 1, 10, 0xAA]);
+
+        assert!(matches!(
+            parse_btree_page(
+                &page,
+                ps,
+                0,
+                false,
+                fsqlite_types::BtreeRef::Index(fsqlite_types::IndexId::new(1)),
+            ),
+            Err(MergeError::InvalidPageBuffer)
+        ));
+    }
+
+    #[test]
+    fn test_parse_rejects_truncated_interior_table_cell() {
+        let ps = default_page_size();
+        let tid = table_id_1();
+        let page = build_single_interior_cell_page(5, ps.as_usize() - 5, &[0, 0, 0, 1, 0x81]);
+
+        assert!(matches!(
+            parse_btree_page(&page, ps, 0, false, fsqlite_types::BtreeRef::Table(tid)),
+            Err(MergeError::InvalidPageBuffer)
+        ));
+    }
+
     #[test]
     fn test_structured_page_merge_parse_merge_repack() {
         let ps = default_page_size();

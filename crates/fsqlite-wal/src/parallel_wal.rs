@@ -148,6 +148,9 @@ pub const PARALLEL_WAL_COMPATIBILITY_SELECTOR: &str = "wal_invariant,integrity_c
 pub const PARALLEL_WAL_STAGE_SCENARIO_ID: &str = "parallel_wal_lane_stage";
 /// Structured-log scenario id for flush-time lane telemetry.
 pub const PARALLEL_WAL_FLUSH_SCENARIO_ID: &str = "parallel_wal_lane_flush";
+/// Lane ids are stored as `u16`, so the largest representable lane set is
+/// ids 0..=65535.
+const MAX_PARALLEL_WAL_LANE_COUNT: usize = 65_536;
 
 /// Verdict emitted by shadow-compare lane validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -217,13 +220,14 @@ impl<T> ParallelWalLaneStager<T> {
                 .control
                 .lane_count_override
                 .unwrap_or_else(default_parallel_wal_lane_count)
-                .max(1),
+                .clamp(1, MAX_PARALLEL_WAL_LANE_COUNT),
         }
     }
 
     #[must_use]
     pub fn current_lane_id(&self) -> u16 {
-        u16::try_from(thread_buffer_slot(self.lane_count())).unwrap_or(u16::MAX)
+        u16::try_from(thread_buffer_slot(self.lane_count()))
+            .expect("lane_count is clamped to the u16 lane-id range")
     }
 
     #[must_use]
@@ -1811,6 +1815,19 @@ mod tests {
             .map(|handle| handle.join().expect("lane thread should join"))
             .collect::<Vec<_>>();
         assert_eq!(observed, vec![0, 0]);
+    }
+
+    #[test]
+    fn test_lane_stager_clamps_lane_count_to_lane_id_range() {
+        let _guard = lane_test_guard();
+        let stager = ParallelWalLaneStager::<u32>::new(ParallelWalControlSurface {
+            mode: ParallelWalOperatingMode::Auto,
+            lane_count_override: Some(MAX_PARALLEL_WAL_LANE_COUNT + 1),
+            ..ParallelWalControlSurface::default()
+        });
+
+        assert_eq!(stager.lane_count(), MAX_PARALLEL_WAL_LANE_COUNT);
+        assert!(usize::from(stager.current_lane_id()) < stager.lane_count());
     }
 
     #[test]

@@ -15,7 +15,7 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────┐
-//! │ frame_marker = 0x80000000  (4 bytes, BE) — cell-delta indicator │
+//! │ frame_marker = 0x00000000  (4 bytes, BE) — cell-delta indicator │
 //! ├─────────────────────────────────────────────────────────────────┤
 //! │ actual_page_number          (4 bytes, BE)                      │
 //! ├─────────────────────────────────────────────────────────────────┤
@@ -60,7 +60,17 @@ use fsqlite_types::{CommitSeq, PageNumber, TxnId};
 use tracing::debug;
 
 /// Marker word that indicates a cell-delta frame.
-pub const CELL_DELTA_FRAME_MARKER: u32 = 0x8000_0000;
+///
+/// This must stay outside the valid page-number domain because mixed WAL
+/// recovery uses the first word to distinguish cell-delta records from ordinary
+/// full-page frames. Page number 0 is invalid in SQLite, so it is a safe
+/// in-band type word.
+pub const CELL_DELTA_FRAME_MARKER: u32 = 0;
+
+/// Legacy experimental frames used the high bit of the page-number word as a
+/// marker. Keep the helper below able to decode that shape, but never use it as
+/// the current discriminator because high-bit page numbers are valid.
+const LEGACY_CELL_DELTA_FRAME_MARKER: u32 = 0x8000_0000;
 
 /// Fixed header size for cell-delta frames (excluding variable cell_data).
 pub const CELL_DELTA_HEADER_SIZE: usize = 45;
@@ -162,9 +172,22 @@ impl CellDeltaWalFrame {
 
     /// Serialize this frame to bytes.
     ///
-    /// Returns a Vec containing the complete frame with checksum.
-    #[must_use]
-    pub fn serialize(&self) -> Vec<u8> {
+    /// Returns a `Vec` containing the complete frame with checksum.
+    pub fn serialize(&self) -> Result<Vec<u8>> {
+        if self.cell_data.len() > CELL_DELTA_MAX_DATA_SIZE {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "cell-delta payload too large: {} bytes exceeds max {CELL_DELTA_MAX_DATA_SIZE}",
+                    self.cell_data.len()
+                ),
+            });
+        }
+        if self.op == CellOp::Delete && !self.cell_data.is_empty() {
+            return Err(FrankenError::WalCorrupt {
+                detail: "delete cell-delta frame cannot carry cell data".to_owned(),
+            });
+        }
+
         let mut buf = Vec::with_capacity(self.serialized_size());
 
         // Frame marker + actual page number (4 bytes each).
@@ -185,9 +208,15 @@ impl CellDeltaWalFrame {
         // Txn ID (8 bytes)
         buf.extend_from_slice(&self.txn_id.get().to_be_bytes());
 
-        // Cell data length (4 bytes)
-        #[allow(clippy::cast_possible_truncation)]
-        let data_len = self.cell_data.len() as u32;
+        // Cell data length (4 bytes). The payload-size guard above keeps this
+        // conversion infallible without silent narrowing.
+        let data_len =
+            u32::try_from(self.cell_data.len()).map_err(|_| FrankenError::WalCorrupt {
+                detail: format!(
+                    "cell-delta payload length {} does not fit in u32",
+                    self.cell_data.len()
+                ),
+            })?;
         buf.extend_from_slice(&data_len.to_be_bytes());
 
         // Cell data (variable)
@@ -207,7 +236,7 @@ impl CellDeltaWalFrame {
             "wal_frame_written"
         );
 
-        buf
+        Ok(buf)
     }
 
     /// Deserialize a cell-delta frame from bytes.
@@ -225,15 +254,12 @@ impl CellDeltaWalFrame {
             });
         }
 
-        // Verify marker. New frames use the first word as a pure type tag.
-        // Legacy frames with an embedded page number are still accepted by
-        // `deserialize`, but the public discriminator below intentionally
-        // matches only the current exact marker to avoid confusing high-bit
-        // full-page frame page numbers for cell-delta records.
+        // Verify marker. New frames use an invalid page-number word as a pure
+        // type tag, so full-page frames cannot collide with cell-delta frames.
         let marker_and_pgno = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-        if marker_and_pgno & CELL_DELTA_FRAME_MARKER == 0 {
+        if marker_and_pgno != CELL_DELTA_FRAME_MARKER {
             return Err(FrankenError::WalCorrupt {
-                detail: "cell-delta frame missing marker bit".to_owned(),
+                detail: format!("cell-delta frame has invalid marker word: {marker_and_pgno:#x}"),
             });
         }
 
@@ -242,18 +268,6 @@ impl CellDeltaWalFrame {
         let page_number = PageNumber::new(actual_pgno).ok_or_else(|| FrankenError::WalCorrupt {
             detail: "cell-delta frame has invalid page number 0".to_owned(),
         })?;
-        if let Some(marker_page) = extract_page_number_from_marker(marker_and_pgno) {
-            if marker_page != page_number {
-                return Err(FrankenError::WalCorrupt {
-                    detail: format!(
-                        "cell-delta frame marker page {} disagrees with actual page {}",
-                        marker_page.get(),
-                        page_number.get()
-                    ),
-                });
-            }
-        }
-
         let mut cell_key_digest = [0u8; 16];
         cell_key_digest.copy_from_slice(&data[8..24]);
 
@@ -356,9 +370,9 @@ impl CellDeltaWalFrame {
 
 /// Check if a WAL frame is a structurally valid cell-delta frame.
 ///
-/// Full-page WAL frames also start with a page number, and page number
-/// `0x80000000` is valid. The discriminator therefore verifies the complete
-/// cell-delta envelope instead of trusting the marker word alone.
+/// Full-page WAL frames also start with a page number. The marker word is page
+/// 0, which is invalid, and the remaining envelope is still verified before a
+/// frame is accepted.
 #[must_use]
 pub fn is_cell_delta_frame(frame_data: &[u8]) -> bool {
     if frame_data.len() < CELL_DELTA_MIN_FRAME_SIZE {
@@ -408,14 +422,15 @@ pub fn is_cell_delta_frame(frame_data: &[u8]) -> bool {
 
 /// Extract the legacy embedded page number from a cell-delta frame marker.
 ///
-/// New frames use the first word as a pure type marker and store the real page
-/// number in the second word, so this returns `None` for the current encoding.
+/// New frames use an invalid page-number word as a pure type marker and store
+/// the real page number in the second word, so this returns `None` for the
+/// current encoding.
 #[must_use]
 pub fn extract_page_number_from_marker(marker_and_pgno: u32) -> Option<PageNumber> {
-    if marker_and_pgno & CELL_DELTA_FRAME_MARKER == 0 {
+    if marker_and_pgno & LEGACY_CELL_DELTA_FRAME_MARKER == 0 {
         return None; // Not a cell-delta frame
     }
-    let embedded_page = marker_and_pgno & !CELL_DELTA_FRAME_MARKER;
+    let embedded_page = marker_and_pgno & !LEGACY_CELL_DELTA_FRAME_MARKER;
     if embedded_page == 0 {
         return None;
     }
@@ -490,7 +505,7 @@ mod tests {
             vec![1, 2, 3, 4, 5],
         );
 
-        let serialized = frame.serialize();
+        let serialized = frame.serialize().unwrap();
         let deserialized = CellDeltaWalFrame::deserialize(&serialized).unwrap();
 
         assert_eq!(frame, deserialized);
@@ -507,7 +522,7 @@ mod tests {
             vec![10, 20, 30],
         );
 
-        let mut serialized = frame.serialize();
+        let mut serialized = frame.serialize().unwrap();
 
         // Corrupt one byte in the middle
         serialized[20] ^= 0xFF;
@@ -533,7 +548,7 @@ mod tests {
             test_txn_id(1),
             vec![],
         );
-        let serialized = frame_empty.serialize();
+        let serialized = frame_empty.serialize().unwrap();
         let deserialized = CellDeltaWalFrame::deserialize(&serialized).unwrap();
         assert_eq!(frame_empty, deserialized);
         assert!(deserialized.cell_data.is_empty());
@@ -547,7 +562,7 @@ mod tests {
             test_txn_id(2),
             vec![0xAB; 100],
         );
-        let serialized = frame_100.serialize();
+        let serialized = frame_100.serialize().unwrap();
         let deserialized = CellDeltaWalFrame::deserialize(&serialized).unwrap();
         assert_eq!(frame_100, deserialized);
         assert_eq!(deserialized.cell_data.len(), 100);
@@ -561,7 +576,7 @@ mod tests {
             test_txn_id(3),
             vec![0xCD; 4000],
         );
-        let serialized = frame_4000.serialize();
+        let serialized = frame_4000.serialize().unwrap();
         let deserialized = CellDeltaWalFrame::deserialize(&serialized).unwrap();
         assert_eq!(frame_4000, deserialized);
         assert_eq!(deserialized.cell_data.len(), 4000);
@@ -578,7 +593,7 @@ mod tests {
             vec![1, 2, 3],
         );
 
-        let serialized = frame.serialize();
+        let serialized = frame.serialize().unwrap();
 
         // Verify exact cell-delta marker.
         assert!(is_cell_delta_frame(&serialized));
@@ -591,8 +606,9 @@ mod tests {
         // New frames use a pure marker word; there is no embedded page number.
         assert_eq!(extract_page_number_from_marker(marker_and_pgno), None);
 
-        // Legacy markers may still embed the page number in the lower 31 bits.
-        let legacy_marker = CELL_DELTA_FRAME_MARKER | test_page_number().get();
+        // Legacy experimental markers may still embed the page number in the
+        // lower 31 bits.
+        let legacy_marker = LEGACY_CELL_DELTA_FRAME_MARKER | test_page_number().get();
         assert_eq!(
             extract_page_number_from_marker(legacy_marker),
             Some(test_page_number())
@@ -623,11 +639,11 @@ mod tests {
             test_txn_id(42),
             vec![1, 2, 3],
         );
-        let serialized = frame.serialize();
+        let serialized = frame.serialize().unwrap();
         assert!(is_cell_delta_frame(&serialized));
 
-        // Simulate full-page frame (page number without marker)
-        let fake_page_frame = [0x00, 0x00, 0x00, 0x2A]; // page 42, no marker
+        // Too short to be a structurally valid cell-delta frame.
+        let fake_page_frame = [0x00, 0x00, 0x00, 0x2A];
         assert!(!is_cell_delta_frame(&fake_page_frame));
 
         // High-bit page numbers are valid full-page frame page numbers. The
@@ -640,7 +656,7 @@ mod tests {
         exact_marker_full_page_frame[..4].copy_from_slice(&CELL_DELTA_FRAME_MARKER.to_be_bytes());
         assert!(
             !is_cell_delta_frame(&exact_marker_full_page_frame),
-            "valid full-page WAL page number 0x80000000 must not collide with the cell-delta marker"
+            "page-zero marker must not classify a malformed envelope as cell-delta"
         );
 
         // Too short
@@ -661,7 +677,7 @@ mod tests {
 
         // Header (45) + data (50) + checksum (4) = 99
         assert_eq!(frame.serialized_size(), 99);
-        assert_eq!(frame.serialize().len(), 99);
+        assert_eq!(frame.serialize().unwrap().len(), 99);
     }
 
     #[test]
@@ -675,7 +691,7 @@ mod tests {
             vec![1, 2, 3, 4, 5],
         );
 
-        let serialized = frame.serialize();
+        let serialized = frame.serialize().unwrap();
 
         // Truncate to various lengths
         assert!(CellDeltaWalFrame::deserialize(&serialized[..10]).is_err());
@@ -700,7 +716,7 @@ mod tests {
             vec![1, 2, 3],
         );
 
-        let mut serialized = frame.serialize();
+        let mut serialized = frame.serialize().unwrap();
         serialized.extend_from_slice(b"junk");
 
         let result = CellDeltaWalFrame::deserialize(&serialized);
@@ -721,7 +737,8 @@ mod tests {
             test_txn_id(42),
             Vec::new(),
         )
-        .serialize();
+        .serialize()
+        .unwrap();
         let too_large = u32::try_from(CELL_DELTA_MAX_DATA_SIZE + 1)
             .expect("test max cell delta size should fit u32");
         serialized[41..45].copy_from_slice(&too_large.to_be_bytes());
@@ -736,16 +753,19 @@ mod tests {
 
     #[test]
     fn test_deserialize_rejects_delete_payload() {
-        let frame = CellDeltaWalFrame::new(
+        let mut serialized = CellDeltaWalFrame::new(
             test_page_number(),
             test_cell_key_digest(),
-            CellOp::Delete,
+            CellOp::Update,
             CommitSeq::new(100),
             test_txn_id(42),
             vec![1, 2, 3],
-        );
+        )
+        .serialize()
+        .unwrap();
+        serialized[24] = CellOp::Delete.as_byte();
 
-        let result = CellDeltaWalFrame::deserialize(&frame.serialize());
+        let result = CellDeltaWalFrame::deserialize(&serialized);
         assert!(result.is_err());
         assert!(
             result
@@ -753,6 +773,46 @@ mod tests {
                 .to_string()
                 .contains("delete frame has non-empty payload"),
             "decoder should reject delete frames with unreachable payload bytes"
+        );
+    }
+
+    #[test]
+    fn test_serialize_rejects_oversized_cell_data() {
+        let frame = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Insert,
+            CommitSeq::new(100),
+            test_txn_id(42),
+            vec![0; CELL_DELTA_MAX_DATA_SIZE + 1],
+        );
+
+        let err = frame
+            .serialize()
+            .expect_err("serializer should reject payloads larger than the frame limit");
+        assert!(
+            err.to_string().contains("payload too large"),
+            "unexpected serializer error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_serialize_rejects_delete_payload() {
+        let frame = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Delete,
+            CommitSeq::new(100),
+            test_txn_id(42),
+            vec![1],
+        );
+
+        let err = frame
+            .serialize()
+            .expect_err("serializer should reject DELETE frames with a payload");
+        assert!(
+            err.to_string().contains("cannot carry cell data"),
+            "unexpected serializer error: {err}"
         );
     }
 
@@ -788,7 +848,7 @@ mod tests {
                 cell_data,
             );
 
-            let serialized = frame.serialize();
+            let serialized = frame.serialize().unwrap();
             let deserialized = CellDeltaWalFrame::deserialize(&serialized).unwrap();
             assert_eq!(frame, deserialized);
         }
@@ -805,13 +865,13 @@ mod tests {
             vec![1, 2, 3],
         );
 
-        let serialized = frame.serialize();
+        let serialized = frame.serialize().unwrap();
         let deserialized = CellDeltaWalFrame::deserialize(&serialized).unwrap();
         assert_eq!(deserialized.page_number, high_bit_page_number());
     }
 
     #[test]
-    fn test_deserialize_rejects_mismatched_legacy_marker_page_number() {
+    fn test_deserialize_rejects_legacy_marker_word() {
         let frame = CellDeltaWalFrame::new(
             test_page_number(),
             test_cell_key_digest(),
@@ -821,9 +881,9 @@ mod tests {
             vec![1, 2, 3],
         );
 
-        let mut serialized = frame.serialize();
-        let mismatched_marker = CELL_DELTA_FRAME_MARKER | 0x03E7;
-        serialized[..4].copy_from_slice(&mismatched_marker.to_be_bytes());
+        let mut serialized = frame.serialize().unwrap();
+        let legacy_marker = LEGACY_CELL_DELTA_FRAME_MARKER | test_page_number().get();
+        serialized[..4].copy_from_slice(&legacy_marker.to_be_bytes());
 
         let result = CellDeltaWalFrame::deserialize(&serialized);
         assert!(result.is_err());
@@ -831,7 +891,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("disagrees with actual page")
+                .contains("invalid marker word")
         );
     }
 }

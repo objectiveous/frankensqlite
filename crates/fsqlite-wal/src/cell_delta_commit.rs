@@ -54,6 +54,7 @@
 use crate::cell_delta_wal::{
     CELL_DELTA_CHECKSUM_SIZE, CELL_DELTA_HEADER_SIZE, CellDeltaWalFrame, CellOp,
 };
+use fsqlite_error::Result;
 use fsqlite_types::{CommitSeq, PageNumber, TxnId};
 use tracing::{debug, trace};
 
@@ -292,14 +293,17 @@ impl CellDeltaDescriptor {
 ///
 /// This ordering ensures that cell deltas are always followed by the commit
 /// marker, enabling atomic crash recovery semantics.
-#[must_use]
-pub fn serialize_mixed_frames(submission: &MixedFrameSubmission, page_size: usize) -> Vec<u8> {
+pub fn serialize_mixed_frames(
+    submission: &MixedFrameSubmission,
+    page_size: usize,
+) -> Result<Vec<u8>> {
     let estimated_size = submission.estimated_size(page_size);
     let mut buf = Vec::with_capacity(estimated_size);
 
     // 1. Serialize cell-delta frames first
     for frame in &submission.cell_delta_frames {
-        buf.extend_from_slice(&frame.serialize());
+        let serialized = frame.serialize()?;
+        buf.extend_from_slice(&serialized);
     }
 
     // 2. Serialize full-page frames
@@ -318,7 +322,7 @@ pub fn serialize_mixed_frames(submission: &MixedFrameSubmission, page_size: usiz
         "mixed_frames_serialized"
     );
 
-    buf
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -469,7 +473,7 @@ mod tests {
             vec![1, 2, 3, 4, 5],
         ));
 
-        let buf = serialize_mixed_frames(&sub, 4096);
+        let buf = serialize_mixed_frames(&sub, 4096).unwrap();
 
         // Verify the buffer contains a valid cell-delta frame
         assert!(!buf.is_empty());

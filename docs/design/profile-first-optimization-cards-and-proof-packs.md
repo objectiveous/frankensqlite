@@ -453,7 +453,12 @@ tracing::info!(
   or permanent off-by-default mode is acceptable.
 - **Card status:** open only for the broader mutation-operator lever above.
   Any smaller overlay or retained-leaf-run attempt is blocked until a newer
-  profile invalidates the 2026-05-10 rejection artifacts.
+  profile invalidates the 2026-05-10 rejection artifacts. The current source
+  feasibility probe
+  `tests/artifacts/perf/codex-dml-operator-probe-20260513T0303Z/summary.md`
+  confirms that the MVCC cell-delta primitive is not yet wired into the live
+  `SharedTxnPageIo` / `TransactionHandle` path, so the next viable slice is the
+  integration boundary rather than another retained DELETE micro-patch.
 
 ---
 

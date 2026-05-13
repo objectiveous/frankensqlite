@@ -12,6 +12,41 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-13 - DML mutation-operator source feasibility probe
+
+- Target: remaining `UPDATE/DELETEThroughput` DELETE rows after
+  `e644bd64eefea85d67e0eb9a813eacee3b2790de`, especially 5-, 50-, and 500-row
+  prepared direct DELETE cases.
+- Files/subsystems inspected: current direct prepared DELETE buffering in
+  `crates/fsqlite-core/src/connection.rs`, retained table-leaf DELETE mechanics
+  in `crates/fsqlite-btree/src/cursor.rs`, MVCC cell-delta lifecycle support in
+  `crates/fsqlite-mvcc/src/lifecycle.rs`, the live `SharedTxnPageIo` read path
+  in `crates/fsqlite-vdbe/src/engine.rs`, and pager `TransactionHandle` APIs in
+  `crates/fsqlite-pager/src/traits.rs`. No source patch was applied.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-dml-operator-probe-20260513T0303Z/summary.md`.
+  The probe uses the published
+  `tests/artifacts/perf/codex-e644bd64-frontier-refresh-20260513T0248Z/`
+  benchmark frontier: full quick `78 / 6 / 9`, average F/C `0.4964158116`,
+  geomean F/C `0.2752616803`, p99 F/C `3.0527225583`, and focused DELETE F/C
+  ratios of `3.0859x`, `1.8157x`, and `1.7505x`.
+- Result: no source patch attempted. The current direct DELETE path already
+  tries the retained leaf image first and stages monotone cross-leaf runs, while
+  `TableLeafDeleteRun` already includes first/last probes, dense-rowid slot
+  detection, interpolation probes, and binary-search fallback. The obvious
+  micro-patches therefore map to existing rejection fences. The MVCC
+  `CellVisibilityLog`/`read_page_with_cell_deltas` primitive exists, but the
+  live core/VDBE/pager path still exposes page-oriented `SharedTxnPageIo` and
+  `TransactionHandle` APIs with no transaction-local logical row/cell mutation
+  bridge.
+- Do not retry a narrow retained DELETE search, duplicate-check, compactness,
+  materialization, direct-flush, publication, or tombstone-only overlay from
+  this evidence. Reconsider source work only after defining the broader
+  transaction-local DML mutation operator integration boundary: stable rowid/key
+  messages, delta-aware B-tree read view, rollback/savepoint ownership,
+  MVCC/page-cell witness publication, row-count oracle tests, focused DELETE
+  wins, and full-quick primary-score neutrality or better.
+
 ## 2026-05-13 - e644bd64 current frontier refresh
 
 - Target: current `comprehensive-bench --quick` and focused

@@ -3,8 +3,9 @@
 //! This module implements three tightly coupled subsystems:
 //!
 //! 1. **`PageHistory` Objects (§5.10.6):** Compressed version chains where the
-//!    newest committed version is stored as a full page image and older versions
-//!    are stored as patches (intent logs or structured patches). Encoded as ECS
+//!    newest committed version is stored as a full page image. Older versions are
+//!    currently stored as full images too; patch variants remain representable but
+//!    are not generated until their lossless wire decoders exist. Encoded as ECS
 //!    objects for repair and remote fetching.
 //!
 //! 2. **Intent Commutativity (§5.10.7):** Mazurkiewicz trace-monoid formalization
@@ -52,8 +53,11 @@ pub struct CompressedPageVersion {
     pub data: CompressedVersionData,
 }
 
-/// Compressed page history: newest version is always a full image, older
-/// versions are stored as patches (intent logs and/or structured patches).
+/// Compressed page history: newest version is always a full image.
+///
+/// Older versions are full images in the current encoder. Patch variants are
+/// retained in the type so the ECS format can grow into intent/structured
+/// patches without changing the outer object shape.
 ///
 /// This is the ECS-integrated representation from §5.10.6. Hot pages encode
 /// their patch chains as these objects for bounded memory, repairability, and
@@ -89,12 +93,12 @@ impl std::fmt::Display for HistoryCompressionError {
 
 impl std::error::Error for HistoryCompressionError {}
 
-/// Compress a page history by keeping the newest version as a full image
-/// and converting older versions to the specified patch form.
+/// Compress a page history by keeping every retained version as a full image.
 ///
 /// The input `full_images` must be ordered newest-first; each entry is
-/// `(commit_seq, page_bytes)`. Older versions are stored as structured
-/// patches computed by diffing against the next-newer image.
+/// `(commit_seq, page_bytes)`. Patch-shaped variants remain part of the
+/// serialized type, but this encoder does not emit them until their lossless
+/// wire decoders are implemented.
 ///
 /// # Errors
 ///
@@ -213,9 +217,16 @@ impl CompressedPageHistory {
                 .try_into()
                 .map_err(|_| err("version count decode failed"))?,
         );
+        let version_count = usize::try_from(version_count)
+            .map_err(|_| err("version count exceeds addressable size"))?;
+        let remaining = data.len() - 8;
+        let max_possible_versions = remaining / 13;
+        if version_count > max_possible_versions {
+            return Err(err("truncated version entry"));
+        }
 
         let mut offset = 8usize;
-        let mut versions = Vec::with_capacity(version_count as usize);
+        let mut versions = Vec::with_capacity(version_count);
 
         for _ in 0..version_count {
             if offset + 9 > data.len() {
@@ -241,24 +252,32 @@ impl CompressedPageHistory {
             ) as usize;
             offset += 4;
 
-            if offset + payload_len > data.len() {
+            let payload_end = offset
+                .checked_add(payload_len)
+                .ok_or_else(|| err("payload length overflow"))?;
+            if payload_end > data.len() {
                 return Err(err("truncated payload"));
             }
-            let payload = &data[offset..offset + payload_len];
-            offset += payload_len;
+            let payload = &data[offset..payload_end];
+            offset = payload_end;
 
             let version_data = match tag {
                 TAG_FULL_IMAGE => CompressedVersionData::FullImage(payload.to_vec()),
                 TAG_INTENT_LOG_PATCH => {
-                    // Older versions stored as intent log patches. For decode,
-                    // we just store the raw payload length as a marker (the full
-                    // reconstruction requires replaying the intent log against
-                    // the newer version, which is done at query time).
-                    // Empty payload = empty intent log.
-                    let _ = payload; // consumed; actual intent log reconstruction is deferred.
+                    // Intent patch decoding is intentionally limited until the
+                    // canonical wire parser is implemented. Accept only empty
+                    // placeholders; accepting non-empty bytes would silently
+                    // drop mutation ops and make historical reconstruction
+                    // wrong.
+                    if !(payload.is_empty() || payload == 0u32.to_le_bytes().as_slice()) {
+                        return Err(err("intent log patch payload decode not implemented"));
+                    }
                     CompressedVersionData::IntentLogPatch(Vec::new())
                 }
                 TAG_STRUCTURED_PATCH => {
+                    if !payload.is_empty() {
+                        return Err(err("structured patch payload decode not implemented"));
+                    }
                     CompressedVersionData::StructuredPatch(StructuredPagePatch::default())
                 }
                 other => return Err(err(&format!("unknown version data tag: {other}"))),
@@ -268,6 +287,17 @@ impl CompressedPageHistory {
                 commit_seq,
                 data: version_data,
             });
+        }
+
+        if offset != data.len() {
+            return Err(err("trailing bytes after compressed page history"));
+        }
+
+        let Some(newest) = versions.first() else {
+            return Err(HistoryCompressionError::EmptyHistory);
+        };
+        if !matches!(newest.data, CompressedVersionData::FullImage(_)) {
+            return Err(HistoryCompressionError::NewestNotFullImage);
         }
 
         Ok(Self { pgno, versions })
@@ -1373,6 +1403,103 @@ mod tests {
         assert_eq!(orig, dec);
     }
 
+    #[test]
+    fn test_page_history_decode_rejects_empty_history() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&1_u32.to_le_bytes());
+        encoded.extend_from_slice(&0_u32.to_le_bytes());
+
+        assert!(matches!(
+            CompressedPageHistory::from_bytes(&encoded),
+            Err(HistoryCompressionError::EmptyHistory)
+        ));
+    }
+
+    #[test]
+    fn test_page_history_decode_rejects_non_full_newest_version() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&1_u32.to_le_bytes());
+        encoded.extend_from_slice(&1_u32.to_le_bytes());
+        encoded.extend_from_slice(&10_u64.to_le_bytes());
+        encoded.push(TAG_INTENT_LOG_PATCH);
+        encoded.extend_from_slice(&0_u32.to_le_bytes());
+
+        assert!(matches!(
+            CompressedPageHistory::from_bytes(&encoded),
+            Err(HistoryCompressionError::NewestNotFullImage)
+        ));
+    }
+
+    #[test]
+    fn test_page_history_decode_rejects_trailing_bytes() {
+        let pgno = PageNumber::new(42).unwrap();
+        let images = vec![(CommitSeq::new(200), vec![0x11; 512])];
+        let original = compress_page_history(pgno, &images).unwrap();
+        let mut encoded = original.to_bytes();
+        encoded.extend_from_slice(b"extra");
+
+        assert!(matches!(
+            CompressedPageHistory::from_bytes(&encoded),
+            Err(HistoryCompressionError::DecodeError(message))
+                if message.contains("trailing bytes")
+        ));
+    }
+
+    #[test]
+    fn test_page_history_decode_rejects_impossible_version_count_before_allocating() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&1_u32.to_le_bytes());
+        encoded.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        assert!(matches!(
+            CompressedPageHistory::from_bytes(&encoded),
+            Err(HistoryCompressionError::DecodeError(message))
+                if message.contains("truncated version entry")
+        ));
+    }
+
+    #[test]
+    fn test_page_history_decode_rejects_non_empty_intent_patch_payload() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&1_u32.to_le_bytes());
+        encoded.extend_from_slice(&2_u32.to_le_bytes());
+        encoded.extend_from_slice(&20_u64.to_le_bytes());
+        encoded.push(TAG_FULL_IMAGE);
+        encoded.extend_from_slice(&1_u32.to_le_bytes());
+        encoded.push(0xAA);
+        encoded.extend_from_slice(&10_u64.to_le_bytes());
+        encoded.push(TAG_INTENT_LOG_PATCH);
+        encoded.extend_from_slice(&4_u32.to_le_bytes());
+        encoded.extend_from_slice(&1_u32.to_le_bytes());
+
+        assert!(matches!(
+            CompressedPageHistory::from_bytes(&encoded),
+            Err(HistoryCompressionError::DecodeError(message))
+                if message.contains("intent log patch payload decode")
+        ));
+    }
+
+    #[test]
+    fn test_page_history_decode_rejects_non_empty_structured_patch_payload() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&1_u32.to_le_bytes());
+        encoded.extend_from_slice(&2_u32.to_le_bytes());
+        encoded.extend_from_slice(&20_u64.to_le_bytes());
+        encoded.push(TAG_FULL_IMAGE);
+        encoded.extend_from_slice(&1_u32.to_le_bytes());
+        encoded.push(0xAA);
+        encoded.extend_from_slice(&10_u64.to_le_bytes());
+        encoded.push(TAG_STRUCTURED_PATCH);
+        encoded.extend_from_slice(&1_u32.to_le_bytes());
+        encoded.push(0xBB);
+
+        assert!(matches!(
+            CompressedPageHistory::from_bytes(&encoded),
+            Err(HistoryCompressionError::DecodeError(message))
+                if message.contains("structured patch payload decode")
+        ));
+    }
+
     // -- Test 3: §5.10.7 Independence relation --
 
     #[allow(clippy::too_many_lines)]
@@ -1878,10 +2005,13 @@ mod tests {
         let compressed = compress_page_history(pgno, &full_images).unwrap();
         let roundtripped = CompressedPageHistory::from_bytes(&compressed.to_bytes()).unwrap();
 
-        // Current compression keeps the newest version materialized as a full image
-        // while older versions are patch placeholders. Treat only the newest point
-        // as within the retained query window for this E2E.
-        let retention_low = full_images[0].0;
+        // Current compression keeps every retained version materialized as a
+        // full image. The retained query window therefore starts at the oldest
+        // retained commit in this synthetic history.
+        let retention_low = full_images
+            .last()
+            .expect("synthetic history should be non-empty")
+            .0;
 
         let query_uncompressed = |snapshot: CommitSeq| -> Option<Vec<u8>> {
             if snapshot.get() < retention_low.get() {

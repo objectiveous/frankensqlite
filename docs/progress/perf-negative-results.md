@@ -12,6 +12,40 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-13 - e644bd64 current frontier refresh
+
+- Target: current `comprehensive-bench --quick` and focused
+  `UPDATE/DELETEThroughput` frontier after
+  `e644bd64eefea85d67e0eb9a813eacee3b2790de`
+  (`fix(mvcc): lock cell-delta-only commit pages`).
+- Files/subsystems inspected: no source patch. Re-read the current README
+  performance contract, the `bd-db300.11.1` transaction-local DML mutation card,
+  recent negative ledger entries, stale/noisy CASS leads for `frankensqlite`
+  DELETE/DML work, and the focused DML profile counters.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-e644bd64-frontier-refresh-20260513T0248Z/`.
+  The full quick run reported `93` scenarios with FrankenSQLite faster /
+  comparable / C-SQLite-faster at `78 / 6 / 9`, average F/C `0.4964158116`,
+  geomean F/C `0.2752616803`, p99 `3.0527225583`, and primary
+  `per_category_weighted.score=0.3710116820`. The focused DML profile reported
+  `6` scenarios at `2 / 0 / 4`, geomean F/C `1.3423972979`, and p99
+  `3.0859002169`.
+- Result: no source patch attempted. The current DELETE rows still use the
+  prepared direct path (`slow=0`), but remain red at `3.086x`, `1.816x`, and
+  `1.750x` F/C in the focused 5-, 50-, and 500-row cases. The 500-delete row
+  still spends visible work in the existing physical retained-run path:
+  `delete_leaf_active=433/496`, `delete_leaf_miss=63`,
+  `delete_leaf_flush=64/64`, `delete_leaf_materialize=64/39933ns`,
+  `delete_leaf_write=64/7453ns`, `execute_body_ns=41287`, and
+  `commit_roundtrip_ns=20789`.
+- Do not restart from another retained DELETE search, duplicate-check,
+  compaction, materialization, direct-flush, publication, or low-thread
+  concurrent micro-patch from this evidence. Reconsider source work only as the
+  broader transaction-local DML mutation operator with logical rowid/key
+  messages, read-boundary flushing or a logical read-view overlay,
+  savepoint/rollback ownership, row-count oracle tests, focused DELETE wins, and
+  full-quick primary-score neutrality or better in the same measurement window.
+
 ## 2026-05-13 - 7ea5da35 DML DELETE compare refresh
 
 - Target: remaining `UPDATE/DELETEThroughput` DELETE rows after

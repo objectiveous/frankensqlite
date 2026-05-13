@@ -404,7 +404,9 @@ tracing::info!(
 - **Hotspot:** Current `UPDATE/DELETEThroughput` DELETE tail remains the
   highest measured C SQLite-faster frontier. Evidence: the current full quick
   recertification
-  `tests/artifacts/perf/codex-f11324ca-current-fullquick-20260513T0025Z/full-quick.json`,
+  `tests/artifacts/perf/codex-e644bd64-frontier-refresh-20260513T0248Z/full-quick.json`,
+  the matching focused DML profile
+  `tests/artifacts/perf/codex-e644bd64-frontier-refresh-20260513T0248Z/update-delete-profile.json`,
   the matching focused DELETE compare profile
   `tests/artifacts/perf/codex-7ea5da35-dml-compare-20260513T0120Z/summary.md`,
   the prior DELETE CPU profile
@@ -412,18 +414,18 @@ tracing::info!(
   and the earlier recertification summary
   `tests/artifacts/perf/codex-dml-mutation-frontier-recert-20260511T1905Z/summary.md`.
   The latest rebuilt source commit for the full quick matrix is
-  `f11324caf0a4966c4f01f519ba2877f8c88b7cc7`; the current full quick matrix
+  `e644bd64eefea85d67e0eb9a813eacee3b2790de`; the current full quick matrix
   reports `93` scenarios with FrankenSQLite faster / comparable /
-  C-SQLite-faster at `80 / 4 / 9`, primary score `0.3633`, geomean F/C
-  `0.2691`, and p99 F/C `2.7941`. The prepared-DML DELETE tail is still red at
-  `2.7941x` slower for 5 rows, `1.8038x` slower for 50 rows, and `1.6253x`
-  slower for 500 rows in that matrix. The follow-up focused DELETE compare run
-  at `7ea5da35` keeps every DELETE on the prepared direct path (`slow=0`) and
-  measures per-row F/C ratios of `5.25x` for 5 deletes, `2.93x` for 50 deletes,
-  and `2.63x` for 500 deletes. Its representative 10K/500 row has 433 retained
-  same-leaf active hits across 496 attempts, 63 leaf-boundary misses, 64 dirty
-  flushes, `88.8 us` of delete-run materialization, `16.6 us` of page writes,
-  `74.9 us` of execute body time, and `36.0 us` of commit roundtrip. The fresh
+  C-SQLite-faster at `78 / 6 / 9`, primary score `0.3710`, geomean F/C
+  `0.2753`, and p99 F/C `3.0527`. The prepared-DML DELETE tail is still red at
+  `3.0527x` slower for 5 rows, `1.8557x` slower for 50 rows, and `1.6418x`
+  slower for 500 rows in that matrix. The focused DML profile at `e644bd64`
+  keeps every DELETE on the prepared direct path (`slow=0`) and measures F/C
+  ratios of `3.09x` for 5 deletes, `1.82x` for 50 deletes, and `1.75x` for
+  500 deletes. Its representative 10K/500 row has 433 retained same-leaf active
+  hits across 496 attempts, 63 leaf-boundary misses, 64 dirty flushes, `39.9 us`
+  of delete-run materialization, `7.5 us` of page writes, `41.3 us` of execute
+  body time, and `20.8 us` of commit roundtrip. The prior
   CPU profile also shows the top remaining frames are still
   `TransactionKind::get_page`, `TableLeafDeleteRun::delete_rowid_with_reason`,
   `TransactionKind::write_page_data`, and `TransactionKind::free_page`.

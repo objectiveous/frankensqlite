@@ -17,7 +17,8 @@ use std::path::Path;
 
 use fsqlite_ast::{
     ColumnConstraintKind, CreateTableBody, CreateTableStatement, DefaultValue, Expr,
-    GeneratedStorage, IndexedColumn, SortDirection, Statement, TableConstraintKind,
+    GeneratedStorage, IndexedColumn, Literal, SortDirection, Statement, TableConstraintKind,
+    UnaryOp,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_btree::BtreeCursorOps;
@@ -1862,24 +1863,87 @@ fn strip_wrapping_default_parens(mut default_sql: &str) -> &str {
     }
 }
 
+fn parse_wrapped_default_text(default_sql: &str, quote: char) -> Option<SqliteValue> {
+    if !default_sql.starts_with(quote) {
+        return None;
+    }
+    let mut value = String::new();
+    let body = &default_sql[quote.len_utf8()..];
+    let mut chars = body.char_indices().peekable();
+
+    while let Some((offset, ch)) = chars.next() {
+        if ch != quote {
+            value.push(ch);
+            continue;
+        }
+        if let Some((_, next_ch)) = chars.peek()
+            && *next_ch == quote
+        {
+            value.push(quote);
+            let _ = chars.next();
+            continue;
+        }
+        let absolute_end = quote.len_utf8() + offset + ch.len_utf8();
+        return (absolute_end == default_sql.len()).then(|| SqliteValue::Text(value.into()));
+    }
+
+    None
+}
+
+fn loaded_default_literal_value(literal: &Literal) -> Option<SqliteValue> {
+    match literal {
+        Literal::Integer(value) => Some(SqliteValue::Integer(*value)),
+        Literal::Float(value) => Some(SqliteValue::Float(*value)),
+        Literal::String(value) => Some(SqliteValue::Text(value.clone().into())),
+        Literal::Blob(value) => Some(SqliteValue::from(value.clone())),
+        Literal::Null => Some(SqliteValue::Null),
+        Literal::True => Some(SqliteValue::Integer(1)),
+        Literal::False => Some(SqliteValue::Integer(0)),
+        Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp => None,
+    }
+}
+
+fn loaded_constant_default_expr_value(expr: &Expr) -> Option<SqliteValue> {
+    match expr {
+        Expr::Literal(literal, _) => loaded_default_literal_value(literal),
+        Expr::UnaryOp {
+            op: UnaryOp::Plus,
+            expr,
+            ..
+        } => match loaded_constant_default_expr_value(expr)? {
+            value @ (SqliteValue::Integer(_) | SqliteValue::Float(_)) => Some(value),
+            _ => None,
+        },
+        Expr::UnaryOp {
+            op: UnaryOp::Negate,
+            expr,
+            ..
+        } => match loaded_constant_default_expr_value(expr)? {
+            SqliteValue::Integer(value) => Some(
+                value
+                    .checked_neg()
+                    .map_or_else(|| SqliteValue::Float(-(value as f64)), SqliteValue::Integer),
+            ),
+            SqliteValue::Float(value) => Some(SqliteValue::Float(-value)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn parse_loaded_column_default_value(default_sql: &str) -> SqliteValue {
     let default_sql = strip_wrapping_default_parens(default_sql);
-    if default_sql.eq_ignore_ascii_case("NULL") {
-        SqliteValue::Null
-    } else if let Ok(value) = default_sql.parse::<i64>() {
-        SqliteValue::Integer(value)
-    } else if let Ok(value) = default_sql.parse::<f64>() {
-        SqliteValue::Float(value)
-    } else if default_sql.len() >= 2 && default_sql.starts_with('\'') && default_sql.ends_with('\'')
+    if let Some(value) = parse_wrapped_default_text(default_sql, '\'')
+        .or_else(|| parse_wrapped_default_text(default_sql, '"'))
     {
-        SqliteValue::Text(
-            default_sql[1..default_sql.len() - 1]
-                .replace("''", "'")
-                .into(),
-        )
-    } else {
-        SqliteValue::Text(default_sql.into())
+        return value;
     }
+    if let Ok(expr) = fsqlite_parser::expr::parse_expr(default_sql)
+        && let Some(value) = loaded_constant_default_expr_value(&expr)
+    {
+        return value;
+    }
+    SqliteValue::Text(default_sql.into())
 }
 
 fn inflate_loaded_table_row_values(
@@ -2563,6 +2627,22 @@ mod tests {
         load_from_sqlite(&cx, path)
     }
 
+    #[test]
+    fn test_parse_loaded_default_text_requires_complete_quoted_literal() {
+        assert_eq!(
+            parse_loaded_column_default_value("'can''t'"),
+            SqliteValue::Text("can't".into()),
+        );
+        assert_eq!(
+            parse_loaded_column_default_value(r#""a""b""#),
+            SqliteValue::Text("a\"b".into()),
+        );
+        assert_eq!(
+            parse_loaded_column_default_value("'x' || 'y'"),
+            SqliteValue::Text("'x' || 'y'".into()),
+        );
+    }
+
     fn make_test_schema_and_db() -> (Vec<TableSchema>, MemDatabase) {
         let mut db = MemDatabase::new();
         let root = db.create_table(2);
@@ -2852,6 +2932,37 @@ mod tests {
         assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
         assert_eq!(rows[0].1[2], SqliteValue::Integer(9));
         assert_eq!(rows[0].1[3], SqliteValue::Text("fallback".into()));
+    }
+
+    #[test]
+    fn test_load_sqlite3_altered_short_rows_parse_boolean_blob_and_quoted_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_ipk_literal_defaults.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT INTO items(id, name) VALUES (5, 'alpha');
+                 ALTER TABLE items ADD COLUMN active BOOLEAN DEFAULT TRUE;
+                 ALTER TABLE items ADD COLUMN disabled BOOLEAN DEFAULT FALSE;
+                 ALTER TABLE items ADD COLUMN payload BLOB DEFAULT X'6162';
+                 ALTER TABLE items ADD COLUMN tag TEXT DEFAULT "fallback";"#,
+            )
+            .unwrap();
+        }
+
+        let loaded = load_test_db(&db_path).unwrap();
+        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+        let rows: Vec<_> = table.iter_rows().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 5);
+        assert_eq!(rows[0].1[0], SqliteValue::Integer(5));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[0].1[2], SqliteValue::Integer(1));
+        assert_eq!(rows[0].1[3], SqliteValue::Integer(0));
+        assert_eq!(rows[0].1[4], SqliteValue::from(vec![0x61, 0x62]));
+        assert_eq!(rows[0].1[5], SqliteValue::Text("fallback".into()));
     }
 
     #[test]

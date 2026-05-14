@@ -209,7 +209,7 @@ pub use cache_aligned::{
     slot_mode, slot_state,
 };
 pub use cell_delta_wal::{
-    CELL_DELTA_CHECKSUM_SIZE, CELL_DELTA_FRAME_TYPE, CELL_DELTA_HEADER_SIZE,
+    CELL_DELTA_CHECKSUM_SIZE, CELL_DELTA_FRAME_MARKER, CELL_DELTA_HEADER_SIZE,
     CELL_DELTA_MAX_DATA_LEN, CELL_DELTA_MIN_FRAME_SIZE, CellDeltaOp, CellDeltaRecoverySummary,
     CellDeltaWalFrame, deserialize_cell_delta_batch, serialize_cell_delta_batch,
 };

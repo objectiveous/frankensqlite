@@ -14,32 +14,31 @@
 //! ```text
 //! Offset  Size  Field
 //! ------  ----  -----
-//!   0       1   Frame type byte (0x43 = 'C' for cell-delta)
-//!   1       4   Page number (big-endian)
-//!   5      16   Cell key digest (BLAKE3 truncated)
-//!  21       1   Cell operation (1=Insert, 2=Update, 3=Delete)
-//!  22       8   Commit sequence (big-endian)
-//!  30       8   Transaction ID (big-endian)
-//!  38       4   Cell data length (big-endian, 0 for Delete)
-//!  42       N   Cell data bytes
-//!  42+N     4   CRC32C checksum of bytes 0..(42+N)
+//!   0       4   Frame marker word (0 = cell-delta, invalid as a page number)
+//!   4       4   Page number (big-endian)
+//!   8      16   Cell key digest (BLAKE3 truncated)
+//!  24       1   Cell operation (1=Insert, 2=Update, 3=Delete)
+//!  25       8   Commit sequence (big-endian)
+//!  33       8   Transaction ID (big-endian)
+//!  41       4   Cell data length (big-endian, 0 for Delete)
+//!  45       N   Cell data bytes
+//!  45+N     4   CRC32C checksum of bytes 0..(45+N)
 //! ```
 //!
-//! Total overhead: 46 bytes fixed + cell_data
-//! Typical 100-byte INSERT: ~146 bytes vs 4096 bytes full-page = ~28x smaller
+//! Total overhead: 49 bytes fixed + cell_data
+//! Typical 100-byte INSERT: ~149 bytes vs 4096 bytes full-page = ~27x smaller
 //!
 //! # Frame Type Discrimination
 //!
-//! Regular full-page frames start with page_number (4 bytes, always >= 1 for valid pages).
-//! Cell-delta frames start with type byte 0x43 ('C'), which would decode as page_number
-//! 0x43000000 (1124073472) if misinterpreted. This is distinguishable by checking:
-//! - If byte[0] == CELL_DELTA_FRAME_TYPE, it's a cell-delta frame
-//! - Otherwise, interpret as regular full-page frame
+//! Regular full-page frames start with page_number (4 bytes, always >= 1 for
+//! valid pages). Cell-delta frames start with marker word 0, which is outside
+//! the valid page-number domain. The remaining envelope is still validated
+//! before accepting the frame as cell-delta data.
 //!
 //! # Recovery
 //!
 //! During WAL recovery:
-//! 1. Read frame type byte
+//! 1. Read frame marker word
 //! 2. Full-page frames: apply directly to page cache (existing path)
 //! 3. Cell-delta frames: insert into [`CellVisibilityLog`], then materialize affected pages
 //!
@@ -51,6 +50,7 @@
 //! 3. Truncate WAL (clears both frame types)
 //! 4. Clear [`CellVisibilityLog`] for checkpointed pages
 
+use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::{CommitSeq, PageNumber, TxnId};
 use tracing::{debug, trace, warn};
 
@@ -60,12 +60,14 @@ use crate::cell_visibility::{CellDeltaKind, CellKey};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Frame type marker for cell-delta frames.
-/// 'C' = 0x43, chosen to be distinguishable from valid page numbers (>= 1).
-pub const CELL_DELTA_FRAME_TYPE: u8 = 0x43;
+/// Marker word for cell-delta frames.
+///
+/// Page number 0 is invalid in SQLite, so this marker remains disjoint from
+/// ordinary full-page WAL frames while still allowing high-bit page numbers.
+pub const CELL_DELTA_FRAME_MARKER: u32 = 0;
 
 /// Fixed header size before variable-length cell data.
-pub const CELL_DELTA_HEADER_SIZE: usize = 42;
+pub const CELL_DELTA_HEADER_SIZE: usize = 45;
 
 /// CRC32C checksum size.
 pub const CELL_DELTA_CHECKSUM_SIZE: usize = 4;
@@ -73,8 +75,8 @@ pub const CELL_DELTA_CHECKSUM_SIZE: usize = 4;
 /// Minimum frame size (header + checksum, no data).
 pub const CELL_DELTA_MIN_FRAME_SIZE: usize = CELL_DELTA_HEADER_SIZE + CELL_DELTA_CHECKSUM_SIZE;
 
-/// Maximum cell data length (practical limit to prevent pathological frames).
-pub const CELL_DELTA_MAX_DATA_LEN: u32 = 1024 * 1024; // 1MB
+/// Maximum cell data length.
+pub const CELL_DELTA_MAX_DATA_LEN: u32 = 65_536;
 
 // ---------------------------------------------------------------------------
 // CellDeltaOp — Wire format for cell operation kind
@@ -176,15 +178,26 @@ impl CellDeltaWalFrame {
     /// Serialize this frame to bytes.
     ///
     /// Returns the complete frame including CRC32C checksum.
-    #[must_use]
-    pub fn serialize(&self) -> Vec<u8> {
+    pub fn serialize(&self) -> Result<Vec<u8>> {
+        if self.cell_data.len() > CELL_DELTA_MAX_DATA_LEN as usize {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "cell-delta payload too large: {} bytes exceeds max {CELL_DELTA_MAX_DATA_LEN}",
+                    self.cell_data.len()
+                ),
+            });
+        }
+        if self.op == CellDeltaOp::Delete && !self.cell_data.is_empty() {
+            return Err(FrankenError::WalCorrupt {
+                detail: "delete cell-delta frame cannot carry cell data".to_owned(),
+            });
+        }
+
         let total_size = self.serialized_size();
         let mut buf = Vec::with_capacity(total_size);
 
-        // Frame type byte
-        buf.push(CELL_DELTA_FRAME_TYPE);
-
-        // Page number (4 bytes, big-endian)
+        // Marker word + page number (4 bytes each, big-endian).
+        buf.extend_from_slice(&CELL_DELTA_FRAME_MARKER.to_be_bytes());
         buf.extend_from_slice(&self.page_number.get().to_be_bytes());
 
         // Key digest (16 bytes)
@@ -200,7 +213,13 @@ impl CellDeltaWalFrame {
         buf.extend_from_slice(&self.txn_id.get().to_be_bytes());
 
         // Cell data length (4 bytes, big-endian)
-        let data_len = u32::try_from(self.cell_data.len()).unwrap_or(u32::MAX);
+        let data_len =
+            u32::try_from(self.cell_data.len()).map_err(|_| FrankenError::WalCorrupt {
+                detail: format!(
+                    "cell-delta payload length {} does not fit in u32",
+                    self.cell_data.len()
+                ),
+            })?;
         buf.extend_from_slice(&data_len.to_be_bytes());
 
         // Cell data
@@ -219,14 +238,14 @@ impl CellDeltaWalFrame {
             "cell_delta_wal_frame_serialized"
         );
 
-        buf
+        Ok(buf)
     }
 
     /// Deserialize a cell-delta frame from bytes.
     ///
     /// Returns `None` if:
     /// - Frame is too short
-    /// - Frame type byte doesn't match
+    /// - Frame marker word doesn't match
     /// - CRC32C checksum fails
     /// - Cell data length exceeds maximum
     #[must_use]
@@ -240,31 +259,33 @@ impl CellDeltaWalFrame {
             return None;
         }
 
-        // Check frame type
-        if buf[0] != CELL_DELTA_FRAME_TYPE {
+        // Check frame marker. Page number 0 is invalid for ordinary full-page
+        // frames, so this remains disjoint from the page-number domain.
+        let marker = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if marker != CELL_DELTA_FRAME_MARKER {
             return None; // Not a cell-delta frame
         }
 
         // Read header fields
-        let page_number = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+        let page_number = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
         let page_number = PageNumber::new(page_number)?;
 
         let mut key_digest = [0u8; 16];
-        key_digest.copy_from_slice(&buf[5..21]);
+        key_digest.copy_from_slice(&buf[8..24]);
 
-        let op = CellDeltaOp::from_byte(buf[21])?;
+        let op = CellDeltaOp::from_byte(buf[24])?;
 
         let commit_seq = u64::from_be_bytes([
-            buf[22], buf[23], buf[24], buf[25], buf[26], buf[27], buf[28], buf[29],
+            buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31], buf[32],
         ]);
         let commit_seq = CommitSeq::new(commit_seq);
 
         let txn_id = u64::from_be_bytes([
-            buf[30], buf[31], buf[32], buf[33], buf[34], buf[35], buf[36], buf[37],
+            buf[33], buf[34], buf[35], buf[36], buf[37], buf[38], buf[39], buf[40],
         ]);
         let txn_id = TxnId::new(txn_id)?;
 
-        let data_len = u32::from_be_bytes([buf[38], buf[39], buf[40], buf[41]]);
+        let data_len = u32::from_be_bytes([buf[41], buf[42], buf[43], buf[44]]);
 
         // Validate data length
         if data_len > CELL_DELTA_MAX_DATA_LEN {
@@ -342,26 +363,30 @@ impl CellDeltaWalFrame {
         })
     }
 
-    /// Check if a buffer starts with the cell-delta frame type marker.
+    /// Check if a buffer is a structurally valid cell-delta frame.
     #[inline]
     #[must_use]
     pub fn is_cell_delta_frame(buf: &[u8]) -> bool {
-        if buf.len() < CELL_DELTA_MIN_FRAME_SIZE || buf[0] != CELL_DELTA_FRAME_TYPE {
+        if buf.len() < CELL_DELTA_MIN_FRAME_SIZE {
             return false;
         }
-        if PageNumber::new(u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]])).is_none() {
+        let marker = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if marker != CELL_DELTA_FRAME_MARKER {
             return false;
         }
-        let Some(op) = CellDeltaOp::from_byte(buf[21]) else {
+        if PageNumber::new(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]])).is_none() {
+            return false;
+        }
+        let Some(op) = CellDeltaOp::from_byte(buf[24]) else {
             return false;
         };
         let txn_id = u64::from_be_bytes([
-            buf[30], buf[31], buf[32], buf[33], buf[34], buf[35], buf[36], buf[37],
+            buf[33], buf[34], buf[35], buf[36], buf[37], buf[38], buf[39], buf[40],
         ]);
         if TxnId::new(txn_id).is_none() {
             return false;
         }
-        let data_len = u32::from_be_bytes([buf[38], buf[39], buf[40], buf[41]]);
+        let data_len = u32::from_be_bytes([buf[41], buf[42], buf[43], buf[44]]);
         if data_len > CELL_DELTA_MAX_DATA_LEN || (op == CellDeltaOp::Delete && data_len != 0) {
             return false;
         }
@@ -403,13 +428,12 @@ fn crc32c_checksum(data: &[u8]) -> u32 {
 ///
 /// This is used when a transaction commits multiple cell changes atomically.
 /// Each frame is written sequentially with its own checksum.
-#[must_use]
-pub fn serialize_cell_delta_batch(frames: &[CellDeltaWalFrame]) -> Vec<u8> {
+pub fn serialize_cell_delta_batch(frames: &[CellDeltaWalFrame]) -> Result<Vec<u8>> {
     let total_size: usize = frames.iter().map(CellDeltaWalFrame::serialized_size).sum();
     let mut buf = Vec::with_capacity(total_size);
 
     for frame in frames {
-        buf.extend_from_slice(&frame.serialize());
+        buf.extend_from_slice(&frame.serialize()?);
     }
 
     debug!(
@@ -418,7 +442,7 @@ pub fn serialize_cell_delta_batch(frames: &[CellDeltaWalFrame]) -> Vec<u8> {
         "cell_delta_batch_serialized"
     );
 
-    buf
+    Ok(buf)
 }
 
 /// Deserialize cell-delta frames from a buffer.
@@ -437,31 +461,32 @@ pub fn deserialize_cell_delta_batch(buf: &[u8]) -> Vec<CellDeltaWalFrame> {
         if remaining.len() < CELL_DELTA_HEADER_SIZE {
             break;
         }
-        if remaining[0] != CELL_DELTA_FRAME_TYPE {
+        let marker = u32::from_be_bytes([remaining[0], remaining[1], remaining[2], remaining[3]]);
+        if marker != CELL_DELTA_FRAME_MARKER {
             break;
         }
         if PageNumber::new(u32::from_be_bytes([
-            remaining[1],
-            remaining[2],
-            remaining[3],
             remaining[4],
+            remaining[5],
+            remaining[6],
+            remaining[7],
         ]))
         .is_none()
         {
             break;
         }
-        let Some(op) = CellDeltaOp::from_byte(remaining[21]) else {
+        let Some(op) = CellDeltaOp::from_byte(remaining[24]) else {
             break;
         };
         let txn_id = u64::from_be_bytes([
-            remaining[30],
-            remaining[31],
-            remaining[32],
             remaining[33],
             remaining[34],
             remaining[35],
             remaining[36],
             remaining[37],
+            remaining[38],
+            remaining[39],
+            remaining[40],
         ]);
         if TxnId::new(txn_id).is_none() {
             break;
@@ -469,7 +494,7 @@ pub fn deserialize_cell_delta_batch(buf: &[u8]) -> Vec<CellDeltaWalFrame> {
 
         // Read data length to determine frame size
         let data_len =
-            u32::from_be_bytes([remaining[38], remaining[39], remaining[40], remaining[41]]);
+            u32::from_be_bytes([remaining[41], remaining[42], remaining[43], remaining[44]]);
         if data_len > CELL_DELTA_MAX_DATA_LEN || (op == CellDeltaOp::Delete && data_len != 0) {
             break;
         }
@@ -553,6 +578,10 @@ mod tests {
         }
     }
 
+    fn serialize(frame: &CellDeltaWalFrame) -> Vec<u8> {
+        frame.serialize().expect("test cell-delta frame is valid")
+    }
+
     // -----------------------------------------------------------------------
     // Serialization tests (from C4-WAL bead)
     // -----------------------------------------------------------------------
@@ -568,10 +597,36 @@ mod tests {
             cell_data: vec![0xDE, 0xAD, 0xBE, 0xEF],
         };
 
-        let serialized = frame.serialize();
+        let serialized = serialize(&frame);
         let deserialized = CellDeltaWalFrame::deserialize(&serialized);
 
         assert_eq!(deserialized, Some(frame));
+    }
+
+    #[test]
+    fn test_cell_delta_frame_matches_wal_crate_wire_format() {
+        let key_digest = [1, 3, 3, 7, 8, 13, 21, 34, 55, 89, 144, 233, 5, 8, 13, 21];
+        let mvcc_frame = CellDeltaWalFrame {
+            page_number: PageNumber::new(42).unwrap(),
+            key_digest,
+            op: CellDeltaOp::Update,
+            commit_seq: CommitSeq::new(12345),
+            txn_id: TxnId::new(67890).unwrap(),
+            cell_data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let wal_frame = fsqlite_wal::CellDeltaWalFrame::new(
+            mvcc_frame.page_number,
+            key_digest,
+            fsqlite_wal::CellOp::Update,
+            mvcc_frame.commit_seq,
+            mvcc_frame.txn_id,
+            mvcc_frame.cell_data.clone(),
+        );
+
+        assert_eq!(
+            serialize(&mvcc_frame),
+            wal_frame.serialize().expect("WAL frame should serialize")
+        );
     }
 
     #[test]
@@ -585,7 +640,7 @@ mod tests {
             cell_data: vec![1, 2, 3, 4, 5],
         };
 
-        let mut serialized = frame.serialize();
+        let mut serialized = serialize(&frame);
 
         // Corrupt one byte in the middle
         let corrupt_idx = serialized.len() / 2;
@@ -606,7 +661,7 @@ mod tests {
             txn_id: TxnId::new(1).unwrap(),
             cell_data: vec![],
         };
-        let ser = frame_empty.serialize();
+        let ser = serialize(&frame_empty);
         assert_eq!(CellDeltaWalFrame::deserialize(&ser), Some(frame_empty));
 
         // 100 bytes cell data
@@ -618,7 +673,7 @@ mod tests {
             txn_id: TxnId::new(2).unwrap(),
             cell_data: vec![0xAB; 100],
         };
-        let ser = frame_100.serialize();
+        let ser = serialize(&frame_100);
         assert_eq!(CellDeltaWalFrame::deserialize(&ser), Some(frame_100));
 
         // 4000 bytes cell data
@@ -630,12 +685,12 @@ mod tests {
             txn_id: TxnId::new(3).unwrap(),
             cell_data: vec![0xCD; 4000],
         };
-        let ser = frame_4000.serialize();
+        let ser = serialize(&frame_4000);
         assert_eq!(CellDeltaWalFrame::deserialize(&ser), Some(frame_4000));
     }
 
     #[test]
-    fn test_cell_delta_frame_type_byte() {
+    fn test_cell_delta_frame_marker_word() {
         let frame = CellDeltaWalFrame {
             page_number: PageNumber::new(42).unwrap(),
             key_digest: [0; 16],
@@ -645,10 +700,15 @@ mod tests {
             cell_data: vec![1, 2, 3],
         };
 
-        let serialized = frame.serialize();
+        let serialized = serialize(&frame);
 
-        // First byte should be the type marker
-        assert_eq!(serialized[0], CELL_DELTA_FRAME_TYPE);
+        let marker =
+            u32::from_be_bytes([serialized[0], serialized[1], serialized[2], serialized[3]]);
+        let page_number =
+            u32::from_be_bytes([serialized[4], serialized[5], serialized[6], serialized[7]]);
+
+        assert_eq!(marker, CELL_DELTA_FRAME_MARKER);
+        assert_eq!(page_number, 42);
 
         // is_cell_delta_frame should return true
         assert!(CellDeltaWalFrame::is_cell_delta_frame(&serialized));
@@ -657,9 +717,12 @@ mod tests {
         let fake_page_frame = [0x00, 0x00, 0x00, 0x01]; // page 1
         assert!(!CellDeltaWalFrame::is_cell_delta_frame(&fake_page_frame));
 
-        // A full-page frame whose first byte happens to match the marker is
+        // A full-page frame whose first word happens to match the marker is
         // still not a valid cell-delta envelope.
-        let fake_marker_page_frame = [CELL_DELTA_FRAME_TYPE, 0x00, 0x00, 0x01];
+        let fake_marker_page_frame = [
+            0x00, 0x00, 0x00, 0x00, // marker
+            0x00, 0x00, 0x00, 0x01, // page 1
+        ];
         assert!(!CellDeltaWalFrame::is_cell_delta_frame(
             &fake_marker_page_frame
         ));
@@ -704,7 +767,8 @@ mod tests {
             },
         ];
 
-        let serialized = serialize_cell_delta_batch(&frames);
+        let serialized =
+            serialize_cell_delta_batch(&frames).expect("test cell-delta batch is valid");
         let deserialized = deserialize_cell_delta_batch(&serialized);
 
         assert_eq!(deserialized, frames);
@@ -712,7 +776,7 @@ mod tests {
 
     #[test]
     fn test_serialized_size() {
-        // Empty data: 42 header + 0 data + 4 checksum = 46
+        // Empty data: 45 header + 0 data + 4 checksum = 49
         let frame_empty = CellDeltaWalFrame {
             page_number: PageNumber::new(1).unwrap(),
             key_digest: [0; 16],
@@ -721,10 +785,10 @@ mod tests {
             txn_id: TxnId::new(1).unwrap(),
             cell_data: vec![],
         };
-        assert_eq!(frame_empty.serialized_size(), 46);
-        assert_eq!(frame_empty.serialize().len(), 46);
+        assert_eq!(frame_empty.serialized_size(), 49);
+        assert_eq!(serialize(&frame_empty).len(), 49);
 
-        // 100 bytes data: 42 + 100 + 4 = 146
+        // 100 bytes data: 45 + 100 + 4 = 149
         let frame_100 = CellDeltaWalFrame {
             page_number: PageNumber::new(1).unwrap(),
             key_digest: [0; 16],
@@ -733,8 +797,8 @@ mod tests {
             txn_id: TxnId::new(1).unwrap(),
             cell_data: vec![0; 100],
         };
-        assert_eq!(frame_100.serialized_size(), 146);
-        assert_eq!(frame_100.serialize().len(), 146);
+        assert_eq!(frame_100.serialized_size(), 149);
+        assert_eq!(serialize(&frame_100).len(), 149);
     }
 
     #[test]
@@ -748,7 +812,7 @@ mod tests {
             cell_data: vec![1, 2, 3, 4, 5],
         };
 
-        let serialized = frame.serialize();
+        let serialized = serialize(&frame);
 
         // Truncate at various points
         for truncate_at in [0, 10, 20, 40, serialized.len() - 1] {
@@ -771,7 +835,7 @@ mod tests {
             cell_data: vec![1, 2, 3],
         };
 
-        let mut serialized = frame.serialize();
+        let mut serialized = serialize(&frame);
         serialized.extend_from_slice(b"junk");
 
         assert!(
@@ -791,16 +855,27 @@ mod tests {
             cell_data: vec![1, 2, 3],
         };
 
-        assert!(
-            CellDeltaWalFrame::deserialize(&frame.serialize()).is_none(),
-            "delete frame payload bytes cannot be applied consistently during materialization"
-        );
+        assert!(frame.serialize().is_err());
+    }
+
+    #[test]
+    fn test_serialize_oversized_payload_rejected() {
+        let frame = CellDeltaWalFrame {
+            page_number: PageNumber::new(42).unwrap(),
+            key_digest: [0; 16],
+            op: CellDeltaOp::Insert,
+            commit_seq: CommitSeq::new(1),
+            txn_id: TxnId::new(1).unwrap(),
+            cell_data: vec![0; CELL_DELTA_MAX_DATA_LEN as usize + 1],
+        };
+
+        assert!(frame.serialize().is_err());
     }
 
     #[test]
     fn test_invalid_page_number_rejected() {
         // page_number 0 is invalid
-        let mut buf = vec![CELL_DELTA_FRAME_TYPE];
+        let mut buf = CELL_DELTA_FRAME_MARKER.to_be_bytes().to_vec();
         buf.extend_from_slice(&0u32.to_be_bytes()); // page 0
         buf.extend_from_slice(&[0u8; 16]); // key_digest
         buf.push(1); // op
@@ -816,7 +891,7 @@ mod tests {
     #[test]
     fn test_invalid_txn_id_rejected() {
         // txn_id 0 is invalid
-        let mut buf = vec![CELL_DELTA_FRAME_TYPE];
+        let mut buf = CELL_DELTA_FRAME_MARKER.to_be_bytes().to_vec();
         buf.extend_from_slice(&1u32.to_be_bytes()); // page 1
         buf.extend_from_slice(&[0u8; 16]); // key_digest
         buf.push(1); // op
@@ -831,7 +906,7 @@ mod tests {
 
     #[test]
     fn test_invalid_op_rejected() {
-        let mut buf = vec![CELL_DELTA_FRAME_TYPE];
+        let mut buf = CELL_DELTA_FRAME_MARKER.to_be_bytes().to_vec();
         buf.extend_from_slice(&1u32.to_be_bytes()); // page 1
         buf.extend_from_slice(&[0u8; 16]); // key_digest
         buf.push(99); // invalid op

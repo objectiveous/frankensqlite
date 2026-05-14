@@ -16220,6 +16220,11 @@ fn payload_includes_rowid_alias(
                 return true;
             }
         }
+        // Rows can be more than one column short after repeated ALTER TABLE
+        // ADD COLUMN operations while still carrying SQLite's NULL IPK slot.
+        if matches!(payload_values.get(ipk_col_idx), Some(SqliteValue::Null)) {
+            return true;
+        }
         return false;
     }
     if payload_cols <= ipk_col_idx {
@@ -17381,6 +17386,19 @@ mod tests {
             0,
             Some(4),
             Some(2)
+        ));
+    }
+
+    #[test]
+    fn test_payload_includes_rowid_alias_accepts_multi_column_short_null_placeholder() {
+        let payload_values = vec![SqliteValue::Null, SqliteValue::Text("old".into())];
+
+        assert!(payload_includes_rowid_alias(
+            &payload_values,
+            9,
+            0,
+            Some(4),
+            None
         ));
     }
 
@@ -26297,6 +26315,95 @@ mod tests {
                 .unwrap()
                 .is_found(),
             "non-conflicting rowid-alias index entries must remain intact"
+        );
+    }
+
+    #[test]
+    fn test_native_replace_row_deletes_index_entry_after_multi_alter_short_rowid_alias_payload() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let mut db = MemDatabase::new();
+        let table_root = db.create_table(4);
+        let index_root = 256;
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(db);
+        engine.set_transaction(txn);
+        engine.set_rowid_alias_column_by_root_page(HashMap::from([(table_root, 0)]));
+        engine.set_table_column_count_by_root_page(HashMap::from([(table_root, 4)]));
+        engine.table_index_meta = Arc::new(HashMap::from([(
+            0,
+            vec![IndexCursorMeta {
+                cursor_id: 1,
+                column_indices: vec![1],
+            }]
+            .into_boxed_slice(),
+        )]));
+
+        assert!(engine.open_storage_cursor(0, table_root, true));
+        assert!(engine.open_storage_cursor(1, index_root, true));
+        engine.cursor_root_pages.insert(0, table_root);
+        engine.cursor_root_pages.insert(1, index_root);
+
+        let row1 = encode_record(&[SqliteValue::Null, SqliteValue::Text("old".into())]);
+        let row2 = encode_record(&[SqliteValue::Null, SqliteValue::Text("keep".into())]);
+        let idx1 = encode_record(&[SqliteValue::Text("old".into()), SqliteValue::Integer(1)]);
+        let idx2 = encode_record(&[SqliteValue::Text("keep".into()), SqliteValue::Integer(2)]);
+
+        {
+            let table_cursor = engine
+                .storage_cursors
+                .get_mut(&0)
+                .expect("table storage cursor should exist");
+            table_cursor
+                .cursor
+                .table_insert(&table_cursor.cx, 1, &row1)
+                .unwrap();
+            table_cursor
+                .cursor
+                .table_insert(&table_cursor.cx, 2, &row2)
+                .unwrap();
+        }
+        {
+            let index_cursor = engine
+                .storage_cursors
+                .get_mut(&1)
+                .expect("index storage cursor should exist");
+            index_cursor
+                .cursor
+                .index_insert(&index_cursor.cx, &idx1)
+                .unwrap();
+            index_cursor
+                .cursor
+                .index_insert(&index_cursor.cx, &idx2)
+                .unwrap();
+        }
+
+        engine.native_replace_row(0, 1).unwrap();
+
+        let index_cursor = engine
+            .storage_cursors
+            .get_mut(&1)
+            .expect("index storage cursor should still exist");
+        assert!(
+            !index_cursor
+                .cursor
+                .index_move_to(&index_cursor.cx, &idx1)
+                .unwrap()
+                .is_found(),
+            "REPLACE cleanup must not shift columns left when an old row keeps the NULL IPK placeholder"
+        );
+        assert!(
+            index_cursor
+                .cursor
+                .index_move_to(&index_cursor.cx, &idx2)
+                .unwrap()
+                .is_found(),
+            "non-conflicting short rowid-alias payload index entries must remain intact"
         );
     }
 

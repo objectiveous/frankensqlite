@@ -1,10 +1,12 @@
-# Current `UPDATE/DELETE Throughput` Focused Refresh
+# Current UPDATE/DELETE Focused Refresh
 
 ## Run
 
 - Run ID: `codex-41a82af7-update-filter-refresh-20260514T215206Z`
 - Date: 2026-05-14
 - Source commit: `41a82af76ae343058c719859e27d0d2e8851b986`
+- Artifact section title: `UPDATE/DELETEThroughput` (renamed in
+  `ff8f942c9b4db7c563280ab8e1a438d29654edf6` after this run)
 - Host: `threadripperje`, AMD Ryzen Threadripper PRO 5995WX, Linux 6.17.0-19-generic
 - Toolchain: `rustc 1.97.0-nightly (ff9a9ea07 2026-05-13)`
 - Command:

@@ -242,4 +242,3 @@ fsqlite/sqlite time ratio: total=1.16x populate=0.93x update=0.00x delete=2.19x
 
   [2m2026-05-14T21:24:13.984761Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankensqlite/.rch-target on vmi1153651[0m
     [2;3mat[0m rch/src/transfer.rs:1716 [2;3mon[0m ThreadId(1)
-

@@ -597,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cell_delta_frame_type_byte() {
+    fn test_cell_delta_frame_marker_word() {
         let frame = CellDeltaWalFrame::new(
             test_page_number(),
             test_cell_key_digest(),

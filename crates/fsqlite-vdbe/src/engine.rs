@@ -6535,6 +6535,88 @@ impl VdbeEngine {
         }
     }
 
+    fn table_root_page_for_cursor(&self, cursor_id: i32) -> Option<i32> {
+        self.cursor_root_pages.get(&cursor_id).copied().or_else(|| {
+            self.storage_cursors
+                .get(&cursor_id)
+                .map(|cursor| cursor.root_page)
+        })
+    }
+
+    fn logical_table_payload_value(
+        &self,
+        table_root_page: Option<i32>,
+        payload_values: &[SqliteValue],
+        rowid: i64,
+        column_index: usize,
+    ) -> SqliteValue {
+        let rowid_alias_col_idx = table_root_page
+            .and_then(|root_page| self.rowid_alias_col_by_root_page.get(&root_page))
+            .copied();
+        if rowid_alias_col_idx == Some(column_index) {
+            return SqliteValue::Integer(rowid);
+        }
+
+        let payload_includes_rowid_alias = rowid_alias_col_idx.is_some_and(|ipk_idx| {
+            payload_includes_rowid_alias(
+                payload_values,
+                rowid,
+                ipk_idx,
+                table_root_page.and_then(|root_page| {
+                    self.table_column_count_by_root_page
+                        .get(&root_page)
+                        .copied()
+                }),
+                table_root_page.and_then(|root_page| {
+                    self.first_not_null_non_ipk_col_by_root_page
+                        .get(&root_page)
+                        .copied()
+                }),
+            )
+        });
+
+        let payload_index = if let Some(ipk_idx) = rowid_alias_col_idx
+            && column_index > ipk_idx
+            && !payload_includes_rowid_alias
+        {
+            column_index - 1
+        } else {
+            column_index
+        };
+
+        payload_values
+            .get(payload_index)
+            .cloned()
+            .unwrap_or_else(|| {
+                table_root_page
+                    .and_then(|root_page| self.column_defaults_by_root_page.get(&root_page))
+                    .and_then(|defaults| defaults.get(column_index))
+                    .and_then(|default| default.as_ref())
+                    .cloned()
+                    .unwrap_or(SqliteValue::Null)
+            })
+    }
+
+    fn index_key_values_from_table_payload(
+        &self,
+        table_root_page: Option<i32>,
+        payload_values: &[SqliteValue],
+        rowid: i64,
+        column_indices: &[usize],
+    ) -> Vec<SqliteValue> {
+        let mut key_values = Vec::with_capacity(column_indices.len().saturating_add(1));
+        for &col_idx in column_indices {
+            key_values.push(self.logical_table_payload_value(
+                table_root_page,
+                payload_values,
+                rowid,
+                col_idx,
+            ));
+        }
+        key_values.push(SqliteValue::Integer(rowid));
+        key_values
+    }
+
     /// Handles REPLACE conflict resolution natively (bd-2yqp6.x).
     /// Deletes the conflicting row from the table AND from all associated indexes.
     fn native_replace_row(&mut self, tbl_cursor_id: i32, conflict_rowid: i64) -> Result<()> {
@@ -6560,6 +6642,7 @@ impl VdbeEngine {
         let old_row = parse_record(&payload).ok_or_else(|| {
             FrankenError::internal("delete_secondary_index_entries: malformed table record")
         })?;
+        let table_root_page = self.table_root_page_for_cursor(tbl_cursor_id);
 
         // Delete secondary index entries for the old row using the metadata
         // registered by the codegen. For each index cursor, build the index
@@ -6567,14 +6650,12 @@ impl VdbeEngine {
         let table_index_meta = Arc::clone(&self.table_index_meta);
         if let Some(index_metas) = table_index_meta.get(&tbl_cursor_id) {
             for meta in index_metas.iter() {
-                // Build index key: (indexed_col_values..., rowid).
-                let mut key_values: Vec<SqliteValue> =
-                    Vec::with_capacity(meta.column_indices.len() + 1);
-                for &col_idx in &meta.column_indices {
-                    let val = old_row.get(col_idx).cloned().unwrap_or(SqliteValue::Null);
-                    key_values.push(val);
-                }
-                key_values.push(SqliteValue::Integer(conflict_rowid));
+                let key_values = self.index_key_values_from_table_payload(
+                    table_root_page,
+                    &old_row,
+                    conflict_rowid,
+                    &meta.column_indices,
+                );
                 let key_bytes = encode_record(&key_values);
 
                 // Seek to the key in the index cursor and delete it.
@@ -6691,6 +6772,7 @@ impl VdbeEngine {
                 );
 
                 let table_index_meta = Arc::clone(&self.table_index_meta);
+                let table_root_page = self.table_root_page_for_cursor(cursor_id);
                 if let Some(index_metas) = table_index_meta.get(&cursor_id) {
                     let old_row = parse_record(&payload).ok_or_else(|| {
                         FrankenError::internal(
@@ -6698,13 +6780,12 @@ impl VdbeEngine {
                         )
                     })?;
                     for meta in index_metas.iter() {
-                        let mut key_values =
-                            Vec::with_capacity(meta.column_indices.len().saturating_add(1));
-                        for &col_idx in &meta.column_indices {
-                            key_values
-                                .push(old_row.get(col_idx).cloned().unwrap_or(SqliteValue::Null));
-                        }
-                        key_values.push(SqliteValue::Integer(rowid));
+                        let key_values = self.index_key_values_from_table_payload(
+                            table_root_page,
+                            &old_row,
+                            rowid,
+                            &meta.column_indices,
+                        );
                         let key_bytes = encode_record(&key_values);
                         if let Some(sc) = self.storage_cursors.get_mut(&meta.cursor_id)
                             && sc.writable
@@ -26128,6 +26209,94 @@ mod tests {
                 .unwrap()
                 .is_found(),
             "non-conflicting index entries must remain intact"
+        );
+    }
+
+    #[test]
+    fn test_native_replace_row_deletes_index_entry_on_rowid_alias_column() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let mut db = MemDatabase::new();
+        let table_root = db.create_table(2);
+        let index_root = 256;
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(db);
+        engine.set_transaction(txn);
+        engine.set_rowid_alias_column_by_root_page(HashMap::from([(table_root, 0)]));
+        engine.table_index_meta = Arc::new(HashMap::from([(
+            0,
+            vec![IndexCursorMeta {
+                cursor_id: 1,
+                column_indices: vec![0],
+            }]
+            .into_boxed_slice(),
+        )]));
+
+        assert!(engine.open_storage_cursor(0, table_root, true));
+        assert!(engine.open_storage_cursor(1, index_root, true));
+        engine.cursor_root_pages.insert(0, table_root);
+        engine.cursor_root_pages.insert(1, index_root);
+
+        let row1 = encode_record(&[SqliteValue::Null, SqliteValue::Text("old".into())]);
+        let row2 = encode_record(&[SqliteValue::Null, SqliteValue::Text("keep".into())]);
+        let idx1 = encode_record(&[SqliteValue::Integer(1), SqliteValue::Integer(1)]);
+        let idx2 = encode_record(&[SqliteValue::Integer(2), SqliteValue::Integer(2)]);
+
+        {
+            let table_cursor = engine
+                .storage_cursors
+                .get_mut(&0)
+                .expect("table storage cursor should exist");
+            table_cursor
+                .cursor
+                .table_insert(&table_cursor.cx, 1, &row1)
+                .unwrap();
+            table_cursor
+                .cursor
+                .table_insert(&table_cursor.cx, 2, &row2)
+                .unwrap();
+        }
+        {
+            let index_cursor = engine
+                .storage_cursors
+                .get_mut(&1)
+                .expect("index storage cursor should exist");
+            index_cursor
+                .cursor
+                .index_insert(&index_cursor.cx, &idx1)
+                .unwrap();
+            index_cursor
+                .cursor
+                .index_insert(&index_cursor.cx, &idx2)
+                .unwrap();
+        }
+
+        engine.native_replace_row(0, 1).unwrap();
+
+        let index_cursor = engine
+            .storage_cursors
+            .get_mut(&1)
+            .expect("index storage cursor should still exist");
+        assert!(
+            !index_cursor
+                .cursor
+                .index_move_to(&index_cursor.cx, &idx1)
+                .unwrap()
+                .is_found(),
+            "REPLACE cleanup must use the logical rowid alias, not the raw NULL payload slot"
+        );
+        assert!(
+            index_cursor
+                .cursor
+                .index_move_to(&index_cursor.cx, &idx2)
+                .unwrap()
+                .is_found(),
+            "non-conflicting rowid-alias index entries must remain intact"
         );
     }
 

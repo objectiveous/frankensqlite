@@ -355,16 +355,21 @@ impl MixedCommitStats {
     pub fn calculate(submission: &MixedFrameSubmission, page_size: usize) -> Self {
         let full_page_count = submission.full_page_frames.len() as u64;
         let cell_delta_count = submission.cell_delta_frames.len() as u64;
+        let bytes_per_full_page =
+            24u64.saturating_add(u64::try_from(page_size).unwrap_or(u64::MAX));
 
-        let full_page_bytes = full_page_count * (24 + page_size as u64);
-        let cell_delta_bytes: u64 = submission
-            .cell_delta_frames
-            .iter()
-            .map(|f| (CELL_DELTA_HEADER_SIZE + f.cell_data.len() + CELL_DELTA_CHECKSUM_SIZE) as u64)
-            .sum();
+        let full_page_bytes = full_page_count.saturating_mul(bytes_per_full_page);
+        let cell_delta_bytes = submission.cell_delta_frames.iter().fold(0u64, |acc, f| {
+            acc.saturating_add(
+                u64::try_from(CELL_DELTA_HEADER_SIZE)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(u64::try_from(f.cell_data.len()).unwrap_or(u64::MAX))
+                    .saturating_add(u64::try_from(CELL_DELTA_CHECKSUM_SIZE).unwrap_or(u64::MAX)),
+            )
+        });
 
         // Without cell-delta optimization, all would be full-page frames
-        let hypothetical_full_page_bytes = cell_delta_count * (24 + page_size as u64);
+        let hypothetical_full_page_bytes = cell_delta_count.saturating_mul(bytes_per_full_page);
         let bytes_saved = hypothetical_full_page_bytes.saturating_sub(cell_delta_bytes);
 
         Self {
@@ -379,12 +384,16 @@ impl MixedCommitStats {
     /// Compression ratio: actual bytes / hypothetical all-full-page bytes.
     #[must_use]
     pub fn compression_ratio(&self, page_size: usize) -> f64 {
-        let hypothetical =
-            (self.full_page_frames + self.cell_delta_frames) * (24 + page_size as u64);
+        let bytes_per_full_page =
+            24u64.saturating_add(u64::try_from(page_size).unwrap_or(u64::MAX));
+        let hypothetical = self
+            .full_page_frames
+            .saturating_add(self.cell_delta_frames)
+            .saturating_mul(bytes_per_full_page);
         if hypothetical == 0 {
             return 1.0;
         }
-        (self.full_page_bytes + self.cell_delta_bytes) as f64 / hypothetical as f64
+        self.full_page_bytes.saturating_add(self.cell_delta_bytes) as f64 / hypothetical as f64
     }
 }
 
@@ -531,6 +540,28 @@ mod tests {
             ratio < 1.0,
             "compression ratio should be < 1.0, got {ratio}"
         );
+    }
+
+    #[test]
+    fn test_mixed_commit_stats_saturate_for_pathological_page_size() {
+        let mut sub = MixedFrameSubmission::new(test_txn_id(), CommitSeq::new(100));
+        sub.add_full_page(test_page_number(), Vec::new());
+        sub.add_cell_delta(CellDeltaWalFrame::new(
+            test_page_number(),
+            test_key_digest(),
+            CellOp::Insert,
+            CommitSeq::new(100),
+            test_txn_id(),
+            vec![1],
+        ));
+
+        let stats = MixedCommitStats::calculate(&sub, usize::MAX);
+        let bytes_per_full_page =
+            24u64.saturating_add(u64::try_from(usize::MAX).unwrap_or(u64::MAX));
+
+        assert_eq!(stats.full_page_bytes, bytes_per_full_page);
+        assert!(stats.bytes_saved <= bytes_per_full_page);
+        assert!(stats.compression_ratio(usize::MAX).is_finite());
     }
 
     #[test]

@@ -10061,10 +10061,10 @@ impl VdbeEngine {
                                                     }
                                                 }
 
-                                                // Now insert the new index entry
-                                                // (the conflicting one was already
-                                                // deleted by
-                                                // find_conflicting_rowid_in_index).
+                                                // Now insert the new index entry. The binary probe
+                                                // deletes the conflicting index entry directly; the
+                                                // collated probe leaves exact-key cleanup to
+                                                // native_replace_row above.
                                                 let Some(sc2) =
                                                     self.storage_cursors.get_mut(&cursor_id)
                                                 else {
@@ -15999,15 +15999,11 @@ fn find_conflicting_rowid_in_index(
         }
 
         if prefix_match && !has_null {
-            // Extract the rowid (last field in the index entry).
-            let old_rowid = sc
-                .cur_vals_buf
-                .last()
-                .and_then(|value| match value {
-                    SqliteValue::Integer(rid) => Some(*rid),
-                    _ => None,
-                })
-                .unwrap_or_else(|| sc.cursor.rowid(&sc.cx).unwrap_or(0));
+            let old_rowid = index_entry_rowid_at(
+                &sc.cur_vals_buf,
+                n_idx_cols,
+                "find_conflicting_rowid: index entry must end with exactly one integer rowid suffix",
+            )?;
 
             // Delete the conflicting index entry.
             sc.cursor.delete(&sc.cx)?;
@@ -16069,13 +16065,11 @@ fn find_conflicting_rowid_in_index_collated(
                 collation_registry,
             ) == Ordering::Equal
         {
-            let rowid = existing_values
-                .last()
-                .and_then(|value| match value {
-                    SqliteValue::Integer(rowid) => Some(*rowid),
-                    _ => None,
-                })
-                .unwrap_or_else(|| sc.cursor.rowid(&sc.cx).unwrap_or(0));
+            let rowid = index_entry_rowid_at(
+                &existing_values,
+                n_idx_cols,
+                "find_conflicting_rowid_in_index_collated: index entry must end with exactly one integer rowid suffix",
+            )?;
             return Ok(Some(rowid));
         }
 
@@ -16085,6 +16079,28 @@ fn find_conflicting_rowid_in_index_collated(
     }
 
     Ok(None)
+}
+
+fn index_entry_rowid_at(
+    values: &[SqliteValue],
+    n_idx_cols: usize,
+    corrupt_detail: &str,
+) -> Result<i64> {
+    let expected_len = n_idx_cols
+        .checked_add(1)
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: corrupt_detail.to_owned(),
+        })?;
+    if values.len() != expected_len {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: corrupt_detail.to_owned(),
+        });
+    }
+    values[n_idx_cols]
+        .as_integer()
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: corrupt_detail.to_owned(),
+        })
 }
 
 fn encode_record(values: &[SqliteValue]) -> Vec<u8> {
@@ -17425,6 +17441,176 @@ mod tests {
         }
 
         engine
+    }
+
+    #[test]
+    fn test_find_conflicting_rowid_rejects_index_entry_without_rowid_suffix() {
+        let mut engine = VdbeEngine::new(8);
+        let mut db = MemDatabase::new();
+        let index_root = db.allocate_root_page();
+
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        assert!(
+            engine.open_storage_cursor(0, index_root, true),
+            "index storage cursor should open"
+        );
+
+        let sc = engine
+            .storage_cursors
+            .get_mut(&0)
+            .expect("storage cursor should exist");
+        sc.cursor
+            .index_insert(&sc.cx, &encode_record(&[SqliteValue::Integer(7)]))
+            .expect("malformed index fixture should insert for corruption regression");
+
+        let probe_key = encode_record(&[SqliteValue::Integer(7), SqliteValue::Integer(42)]);
+        let err = find_conflicting_rowid_in_index(sc, &probe_key, 1)
+            .expect_err("missing rowid suffix should be reported as corruption");
+
+        assert!(matches!(
+            err,
+            FrankenError::DatabaseCorrupt { detail }
+                if detail.contains("integer rowid suffix")
+        ));
+    }
+
+    #[test]
+    fn test_find_conflicting_rowid_rejects_index_entry_with_extra_suffix_fields() {
+        let mut engine = VdbeEngine::new(8);
+        let mut db = MemDatabase::new();
+        let index_root = db.allocate_root_page();
+
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        assert!(
+            engine.open_storage_cursor(0, index_root, true),
+            "index storage cursor should open"
+        );
+
+        let sc = engine
+            .storage_cursors
+            .get_mut(&0)
+            .expect("storage cursor should exist");
+        sc.cursor
+            .index_insert(
+                &sc.cx,
+                &encode_record(&[
+                    SqliteValue::Integer(7),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("extra".into()),
+                ]),
+            )
+            .expect("malformed index fixture should insert for corruption regression");
+
+        let probe_key = encode_record(&[SqliteValue::Integer(7), SqliteValue::Integer(42)]);
+        let err = find_conflicting_rowid_in_index(sc, &probe_key, 1)
+            .expect_err("extra suffix fields should be reported as corruption");
+
+        assert!(matches!(
+            err,
+            FrankenError::DatabaseCorrupt { detail }
+                if detail.contains("integer rowid suffix")
+        ));
+    }
+
+    #[test]
+    fn test_collated_conflicting_rowid_rejects_index_entry_without_rowid_suffix() {
+        let mut engine = VdbeEngine::new(8);
+        let mut db = MemDatabase::new();
+        let index_root = db.allocate_root_page();
+
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        engine.set_index_collations_by_root_page(HashMap::from([(
+            index_root,
+            vec![Some("NOCASE".to_owned())],
+        )]));
+        assert!(
+            engine.open_storage_cursor(0, index_root, true),
+            "NOCASE index storage cursor should open"
+        );
+
+        let sc = engine
+            .storage_cursors
+            .get_mut(&0)
+            .expect("NOCASE storage cursor should exist");
+        sc.cursor
+            .index_insert(&sc.cx, &encode_record(&[SqliteValue::Text("alpha".into())]))
+            .expect("malformed NOCASE index fixture should insert for corruption regression");
+
+        let probe_key =
+            encode_record(&[SqliteValue::Text("ALPHA".into()), SqliteValue::Integer(42)]);
+        let err = find_conflicting_rowid_in_index_collated(
+            sc,
+            &probe_key,
+            1,
+            &[false],
+            &[Some("NOCASE".to_owned())],
+            &BUILTIN_COLLATION_REGISTRY,
+        )
+        .expect_err("missing rowid suffix should be reported as corruption");
+
+        assert!(matches!(
+            err,
+            FrankenError::DatabaseCorrupt { detail }
+                if detail.contains("integer rowid suffix")
+        ));
+    }
+
+    #[test]
+    fn test_collated_conflicting_rowid_rejects_index_entry_with_extra_suffix_fields() {
+        let mut engine = VdbeEngine::new(8);
+        let mut db = MemDatabase::new();
+        let index_root = db.allocate_root_page();
+
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        engine.set_index_collations_by_root_page(HashMap::from([(
+            index_root,
+            vec![Some("NOCASE".to_owned())],
+        )]));
+        assert!(
+            engine.open_storage_cursor(0, index_root, true),
+            "NOCASE index storage cursor should open"
+        );
+
+        let sc = engine
+            .storage_cursors
+            .get_mut(&0)
+            .expect("NOCASE storage cursor should exist");
+        sc.cursor
+            .index_insert(
+                &sc.cx,
+                &encode_record(&[
+                    SqliteValue::Text("alpha".into()),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("extra".into()),
+                ]),
+            )
+            .expect("malformed NOCASE index fixture should insert for corruption regression");
+
+        let probe_key =
+            encode_record(&[SqliteValue::Text("ALPHA".into()), SqliteValue::Integer(42)]);
+        let err = find_conflicting_rowid_in_index_collated(
+            sc,
+            &probe_key,
+            1,
+            &[false],
+            &[Some("NOCASE".to_owned())],
+            &BUILTIN_COLLATION_REGISTRY,
+        )
+        .expect_err("extra suffix fields should be reported as corruption");
+
+        assert!(matches!(
+            err,
+            FrankenError::DatabaseCorrupt { detail }
+                if detail.contains("integer rowid suffix")
+        ));
     }
 
     #[test]

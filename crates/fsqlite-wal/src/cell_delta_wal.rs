@@ -392,6 +392,19 @@ pub fn is_cell_delta_frame(frame_data: &[u8]) -> bool {
     let Some(op) = CellOp::from_byte(frame_data[24]) else {
         return false;
     };
+    let txn_id_raw = u64::from_be_bytes([
+        frame_data[33],
+        frame_data[34],
+        frame_data[35],
+        frame_data[36],
+        frame_data[37],
+        frame_data[38],
+        frame_data[39],
+        frame_data[40],
+    ]);
+    if TxnId::new(txn_id_raw).is_none() {
+        return false;
+    }
     let cell_data_len = u32::from_be_bytes([
         frame_data[41],
         frame_data[42],
@@ -642,6 +655,17 @@ mod tests {
         );
         let serialized = frame.serialize().unwrap();
         assert!(is_cell_delta_frame(&serialized));
+
+        let mut invalid_txn_id = serialized.clone();
+        invalid_txn_id[33..41].copy_from_slice(&0u64.to_be_bytes());
+        let checksum_offset = invalid_txn_id.len() - CELL_DELTA_CHECKSUM_SIZE;
+        let checksum = crc32c::crc32c(&invalid_txn_id[..checksum_offset]);
+        invalid_txn_id[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
+        assert!(
+            !is_cell_delta_frame(&invalid_txn_id),
+            "frame detector should reject envelopes with invalid transaction ids"
+        );
+        assert!(CellDeltaWalFrame::deserialize(&invalid_txn_id).is_err());
 
         // Too short to be a structurally valid cell-delta frame.
         let fake_page_frame = [0x00, 0x00, 0x00, 0x2A];

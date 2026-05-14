@@ -866,51 +866,36 @@ fn parse_create_index_sql_to_schema(
     sql: &str,
 ) -> Option<IndexSchema> {
     // Simple regex-free parser: look for "ON table_name (col1, col2 COLLATE NOCASE DESC)"
-    let upper = sql.to_ascii_uppercase();
-    let is_unique = upper.contains("CREATE UNIQUE INDEX");
-    // Find the column list between the first '(' and matching ')'.
-    let paren_start = sql.find('(')?;
-    let paren_end = sql[paren_start..].find(')')? + paren_start;
+    // while preserving quoted names and comments inside the indexed term list.
+    let keyword_tokens = unquoted_sql_keyword_tokens(sql);
+    let is_unique = unquoted_tokens_contain_phrase(&keyword_tokens, &["CREATE", "UNIQUE", "INDEX"]);
+    // Find the indexed-term list between the unquoted '(' after ON and its
+    // matching ')'.
+    let on_pos = find_unquoted_sql_keyword(sql, "ON")?;
+    let after_on_pos = on_pos + "ON".len();
+    let paren_start = after_on_pos + find_unquoted_sql_char(&sql[after_on_pos..], '(')?;
+    let paren_end = find_matching_sql_paren(sql, paren_start)?;
     let col_list = &sql[paren_start + 1..paren_end];
 
     let mut columns = Vec::new();
     let mut collations = Vec::new();
     let mut directions = Vec::new();
 
-    for part in col_list.split(',') {
-        let tokens: Vec<&str> = part.split_whitespace().collect();
-        if tokens.is_empty() {
-            continue;
-        }
-        // First token is the column name (possibly quoted).
-        let col_name = tokens[0].trim_matches('"');
-        columns.push(col_name.to_owned());
-
-        let mut coll = None;
-        let mut dir = SortDirection::Asc;
-        let mut i = 1;
-        while i < tokens.len() {
-            if tokens[i].eq_ignore_ascii_case("COLLATE") && i + 1 < tokens.len() {
-                coll = Some(tokens[i + 1].trim_matches('"').to_owned());
-                i += 2;
-            } else if tokens[i].eq_ignore_ascii_case("DESC") {
-                dir = SortDirection::Desc;
-                i += 1;
-            } else if tokens[i].eq_ignore_ascii_case("ASC") {
-                dir = SortDirection::Asc;
-                i += 1;
-            } else {
-                i += 1;
-            }
-        }
-        collations.push(coll);
-        directions.push(dir);
+    for part in split_top_level_csv_items(col_list) {
+        let (col_name, remainder) = parse_column_name_and_remainder(&part)?;
+        columns.push(col_name);
+        collations.push(extract_collation_name(remainder));
+        directions.push(extract_index_term_direction(remainder));
     }
 
     // WHERE clause for partial indexes (everything after the closing paren).
-    let after_paren = sql[paren_end + 1..].trim();
-    let where_clause = if after_paren.to_ascii_uppercase().starts_with("WHERE ") {
-        Some(after_paren["WHERE ".len()..].to_owned())
+    let after_paren = trim_leading_sql_space_and_comments(&sql[paren_end + 1..]);
+    let where_clause = if collect_unquoted_sql_keyword_tokens(after_paren)
+        .first()
+        .is_some_and(|(token, start)| token == "WHERE" && *start == 0)
+    {
+        let expr = trim_leading_sql_space_and_comments(&after_paren["WHERE".len()..]);
+        Some(expr.to_owned())
     } else {
         None
     };
@@ -926,6 +911,17 @@ fn parse_create_index_sql_to_schema(
         is_unique,
         key_collations: collations,
     })
+}
+
+fn extract_index_term_direction(remainder: &str) -> SortDirection {
+    if unquoted_sql_keyword_tokens(remainder)
+        .iter()
+        .any(|keyword| keyword == "DESC")
+    {
+        SortDirection::Desc
+    } else {
+        SortDirection::Asc
+    }
 }
 
 fn quote_identifier(identifier: &str) -> String {
@@ -2471,6 +2467,60 @@ fn find_unquoted_sql_keyword(input: &str, keyword: &str) -> Option<usize> {
     collect_unquoted_sql_keyword_tokens(input)
         .into_iter()
         .find_map(|(token, start)| (token == keyword).then_some(start))
+}
+
+fn find_unquoted_sql_char(input: &str, target: char) -> Option<usize> {
+    let mut chars = input.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '\'' | '"' | '`' => skip_quoted_sql(&mut chars, ch),
+            '[' => skip_bracket_identifier(&mut chars),
+            '-' if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '-') => {
+                let _ = chars.next();
+                skip_line_comment(&mut chars);
+            }
+            '/' if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '*') => {
+                let _ = chars.next();
+                skip_block_comment(&mut chars);
+            }
+            _ if ch == target => return Some(idx),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_matching_sql_paren(input: &str, open_idx: usize) -> Option<usize> {
+    if input.as_bytes().get(open_idx).copied() != Some(b'(') {
+        return None;
+    }
+
+    let mut depth = 0_usize;
+    let mut chars = input[open_idx..].char_indices().peekable();
+    while let Some((rel_idx, ch)) = chars.next() {
+        let idx = open_idx + rel_idx;
+        match ch {
+            '\'' | '"' | '`' => skip_quoted_sql(&mut chars, ch),
+            '[' => skip_bracket_identifier(&mut chars),
+            '-' if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '-') => {
+                let _ = chars.next();
+                skip_line_comment(&mut chars);
+            }
+            '/' if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '*') => {
+                let _ = chars.next();
+                skip_block_comment(&mut chars);
+            }
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn trim_leading_sql_space_and_comments(mut input: &str) -> &str {
@@ -4145,6 +4195,35 @@ PRAGMA integrity_check;
         assert_eq!(type_to_affinity("VARCHAR"), 'B');
         assert_eq!(type_to_affinity("BLOB"), 'A');
         assert_eq!(type_to_affinity("NUMERIC"), 'C');
+    }
+
+    #[test]
+    fn test_parse_create_index_sql_preserves_quoted_collations_and_comments() {
+        let sql = r#"CREATE INDEX "idx(words)" ON "items(table)" (
+            "last, name" COLLATE /* keep comment invisible */ [RTRIM] DESC,
+            code COLLATE 'BINARY',
+            tag COLLATE `NOCASE`
+        ) /* index tail */ WHERE active = 1"#;
+
+        let idx = parse_create_index_sql_to_schema("idx(words)", 7, sql).unwrap();
+
+        assert_eq!(
+            idx.columns,
+            vec!["last, name".to_owned(), "code".to_owned(), "tag".to_owned()]
+        );
+        assert_eq!(
+            idx.key_collations,
+            vec![
+                Some("RTRIM".to_owned()),
+                Some("BINARY".to_owned()),
+                Some("NOCASE".to_owned())
+            ]
+        );
+        assert_eq!(
+            idx.key_sort_directions,
+            vec![SortDirection::Desc, SortDirection::Asc, SortDirection::Asc]
+        );
+        assert_eq!(idx.where_clause.as_deref(), Some("active = 1"));
     }
 
     #[test]

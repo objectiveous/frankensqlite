@@ -3864,6 +3864,7 @@ mod tests {
             "update",
             "delete",
             "update-delete",
+            "update-delete-throughput",
             "update-deletethroughput",
             "update/delete",
             "dml",
@@ -3873,6 +3874,7 @@ mod tests {
             "update",
             "delete",
             "update-delete",
+            "update-delete-throughput",
             "update-deletethroughput",
             "update/delete",
             "dml",
@@ -4776,7 +4778,7 @@ fn profile_fsqlite_update_delete_dml(
 
 fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
     let section = report.add_section(
-        "UPDATE/DELETEThroughput",
+        "UPDATE/DELETE Throughput",
         "Pre-populated table with N rows. Measures batch update (10% of rows) and batch delete (5% of rows).",
     );
 
@@ -5917,6 +5919,7 @@ fn main() {
         "update",
         "delete",
         "update-delete",
+        "update-delete-throughput",
         "update-deletethroughput",
         "update/delete",
         "dml",

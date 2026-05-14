@@ -1,4 +1,4 @@
-# Current `UPDATE/DELETEThroughput` Focused Refresh
+# Current `UPDATE/DELETE Throughput` Focused Refresh
 
 ## Run
 

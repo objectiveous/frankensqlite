@@ -148,9 +148,9 @@ pub const PARALLEL_WAL_COMPATIBILITY_SELECTOR: &str = "wal_invariant,integrity_c
 pub const PARALLEL_WAL_STAGE_SCENARIO_ID: &str = "parallel_wal_lane_stage";
 /// Structured-log scenario id for flush-time lane telemetry.
 pub const PARALLEL_WAL_FLUSH_SCENARIO_ID: &str = "parallel_wal_lane_flush";
-/// Lane ids are stored as `u16`, so the largest representable lane set is
-/// ids 0..=65535.
-const MAX_PARALLEL_WAL_LANE_COUNT: usize = 65_536;
+/// Lane ids and commit-certificate lane counts are stored as `u16`, so keep
+/// both the count and every generated id representable.
+const MAX_PARALLEL_WAL_LANE_COUNT: usize = 65_535;
 
 /// Verdict emitted by shadow-compare lane validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1827,6 +1827,7 @@ mod tests {
         });
 
         assert_eq!(stager.lane_count(), MAX_PARALLEL_WAL_LANE_COUNT);
+        assert_eq!(stager.lane_count(), usize::from(u16::MAX));
         assert!(usize::from(stager.current_lane_id()) < stager.lane_count());
     }
 

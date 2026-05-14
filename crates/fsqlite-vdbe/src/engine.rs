@@ -26301,6 +26301,83 @@ mod tests {
     }
 
     #[test]
+    fn test_update_conflict_restore_reinserts_index_entry_on_rowid_alias_column() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let mut db = MemDatabase::new();
+        let table_root = db.create_table(2);
+        let index_root = 256;
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(db);
+        engine.set_transaction(txn);
+        engine.set_rowid_alias_column_by_root_page(HashMap::from([(table_root, 0)]));
+        engine.table_index_meta = Arc::new(HashMap::from([(
+            0,
+            vec![IndexCursorMeta {
+                cursor_id: 1,
+                column_indices: vec![0],
+            }]
+            .into_boxed_slice(),
+        )]));
+
+        assert!(engine.open_storage_cursor(0, table_root, true));
+        assert!(engine.open_storage_cursor(1, index_root, true));
+        engine.cursor_root_pages.insert(0, table_root);
+        engine.cursor_root_pages.insert(1, index_root);
+
+        let restored_row = encode_record(&[SqliteValue::Null, SqliteValue::Text("old".into())]);
+        let logical_idx = encode_record(&[SqliteValue::Integer(1), SqliteValue::Integer(1)]);
+        let raw_payload_idx = encode_record(&[SqliteValue::Null, SqliteValue::Integer(1)]);
+
+        engine
+            .restore_pending_update_after_conflict(PendingUpdateRestore::Storage {
+                cursor_id: 0,
+                rowid: 1,
+                payload: restored_row,
+            })
+            .unwrap();
+
+        let table_cursor = engine
+            .storage_cursors
+            .get_mut(&0)
+            .expect("table storage cursor should still exist");
+        assert!(
+            table_cursor
+                .cursor
+                .table_move_to(&table_cursor.cx, 1)
+                .unwrap()
+                .is_found(),
+            "UPDATE conflict rollback should restore the original table row"
+        );
+
+        let index_cursor = engine
+            .storage_cursors
+            .get_mut(&1)
+            .expect("index storage cursor should still exist");
+        assert!(
+            index_cursor
+                .cursor
+                .index_move_to(&index_cursor.cx, &logical_idx)
+                .unwrap()
+                .is_found(),
+            "UPDATE conflict restore must use the logical rowid alias in index keys"
+        );
+        assert!(
+            !index_cursor
+                .cursor
+                .index_move_to(&index_cursor.cx, &raw_payload_idx)
+                .unwrap()
+                .is_found(),
+            "UPDATE conflict restore must not index the raw NULL rowid-alias payload slot"
+        );
+    }
+
+    #[test]
     fn test_insert_after_missing_probe_disturbed_by_reposition_stays_sorted() {
         let mut db = MemDatabase::new();
         let root = db.create_table(1);

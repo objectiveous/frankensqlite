@@ -1477,10 +1477,10 @@ impl TableLeafDeleteRun {
     }
 
     fn search_table_leaf(&self, cx: &Cx, target: i64) -> Result<Option<u16>> {
+        observe_cursor_cancellation(cx)?;
         let mut lo = 0u16;
         let mut hi = self.entry.header.cell_count;
         while lo < hi {
-            observe_cursor_cancellation(cx)?;
             let mid = lo + (hi - lo) / 2;
             let rowid = TableLeafPayloadPatchRun::table_leaf_rowid_at(&self.entry, mid)?;
             match rowid.cmp(&target) {
@@ -17560,6 +17560,34 @@ mod tests {
         assert!(
             cursor.table_leaf_delete_run_current(10).unwrap().is_none(),
             "non-root leaf maximum deletion must use the ordinary path so the parent separator is repaired"
+        );
+    }
+
+    #[test]
+    fn test_table_leaf_delete_run_honors_cancelled_context_before_search() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        for rowid in 1_i64..=8 {
+            cursor.table_insert(&cx, rowid, b"payload").unwrap();
+        }
+
+        assert!(cursor.table_move_to(&cx, 3).unwrap().is_found());
+        let mut run = cursor
+            .table_leaf_delete_run_current(3)
+            .unwrap()
+            .expect("positioned root leaf should admit a delete run");
+
+        let cancelled_cx = Cx::new();
+        cancelled_cx.transition_to_running();
+        cancelled_cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
+
+        let err = run.delete_rowid(&cancelled_cx, 3, USABLE).unwrap_err();
+        assert!(matches!(err, FrankenError::Abort));
+        assert!(
+            !run.is_dirty(),
+            "cancelled delete-run search must not stage a deletion"
         );
     }
 

@@ -914,14 +914,22 @@ fn parse_create_index_sql_to_schema(
 }
 
 fn extract_index_term_direction(remainder: &str) -> SortDirection {
-    if unquoted_sql_keyword_tokens(remainder)
-        .iter()
-        .any(|keyword| keyword == "DESC")
-    {
-        SortDirection::Desc
-    } else {
-        SortDirection::Asc
+    let collation_name_range = find_collation_name_range(remainder);
+    let mut direction = SortDirection::Asc;
+    for (token, start) in collect_unquoted_sql_keyword_tokens(remainder) {
+        if collation_name_range
+            .as_ref()
+            .is_some_and(|range| range.contains(&start))
+        {
+            continue;
+        }
+        match token.as_str() {
+            "DESC" => direction = SortDirection::Desc,
+            "ASC" => direction = SortDirection::Asc,
+            _ => {}
+        }
     }
+    direction
 }
 
 fn quote_identifier(identifier: &str) -> String {
@@ -1719,11 +1727,14 @@ fn parse_column_name_and_remainder(def: &str) -> Option<(String, &str)> {
         b'`' => parse_quoted_identifier(trimmed, b'`', b'`')?,
         b'[' => parse_bracket_identifier(trimmed)?,
         _ => {
-            let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+            let end = find_unquoted_name_end(trimmed);
             (&trimmed[..end], &trimmed[end..])
         }
     };
-    Some((strip_identifier_quotes(name_raw), remainder.trim_start()))
+    Some((
+        strip_identifier_quotes(name_raw),
+        trim_leading_sql_space_and_comments(remainder),
+    ))
 }
 
 fn parse_single_statement(sql: &str) -> Option<Statement> {
@@ -2339,7 +2350,7 @@ const COLUMN_CONSTRAINT_KEYWORDS: &[&str] = &[
 ];
 
 /// Split a comma-separated SQL list while respecting parentheses, quotes,
-/// and top-level `-- ...` line comments.
+/// and SQL comments.
 fn split_top_level_csv_items(input: &str) -> Vec<String> {
     let mut chars = input.char_indices().peekable();
     let mut out = Vec::new();
@@ -2402,6 +2413,21 @@ fn split_top_level_csv_items(input: &str) -> Vec<String> {
                     }
                 }
             }
+            '/' if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '*') => {
+                chars.next();
+                let ends_with_whitespace = current.chars().last().is_some_and(char::is_whitespace);
+                if !current.trim_end().is_empty() && !ends_with_whitespace {
+                    current.push(' ');
+                }
+
+                let mut previous = '\0';
+                for (_, next_ch) in chars.by_ref() {
+                    if previous == '*' && next_ch == '/' {
+                        break;
+                    }
+                    previous = next_ch;
+                }
+            }
             '(' => {
                 paren_depth = paren_depth.saturating_add(1);
                 current.push(ch);
@@ -2427,6 +2453,22 @@ fn split_top_level_csv_items(input: &str) -> Vec<String> {
     }
 
     out
+}
+
+fn find_unquoted_name_end(input: &str) -> usize {
+    let mut chars = input.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if ch.is_whitespace() {
+            return idx;
+        }
+        if ch == '-' && chars.peek().is_some_and(|(_, next_ch)| *next_ch == '-') {
+            return idx;
+        }
+        if ch == '/' && chars.peek().is_some_and(|(_, next_ch)| *next_ch == '*') {
+            return idx;
+        }
+    }
+    input.len()
 }
 
 fn starts_with_unquoted_table_constraint(def: &str) -> bool {
@@ -2643,14 +2685,21 @@ fn unquoted_tokens_contain_phrase(tokens: &[String], phrase: &[&str]) -> bool {
 }
 
 fn extract_collation_name(remainder: &str) -> Option<String> {
+    let raw_name = remainder.get(find_collation_name_range(remainder)?)?;
+    let name = strip_sql_name_quotes(raw_name);
+    (!name.is_empty()).then(|| name.to_ascii_uppercase())
+}
+
+fn find_collation_name_range(remainder: &str) -> Option<std::ops::Range<usize>> {
     let pos = find_unquoted_sql_keyword(remainder, "COLLATE")?;
     let after = trim_leading_sql_space_and_comments(&remainder[pos + 7..]);
+    let start = remainder.len().checked_sub(after.len())?;
     let bytes = after.as_bytes();
     if bytes.is_empty() {
         return None;
     }
 
-    let raw_name = match bytes[0] {
+    let raw_len = match bytes[0] {
         b'\'' => parse_quoted_identifier(after, b'\'', b'\'')?.0,
         b'"' => parse_quoted_identifier(after, b'"', b'"')?.0,
         b'`' => parse_quoted_identifier(after, b'`', b'`')?.0,
@@ -2661,9 +2710,9 @@ fn extract_collation_name(remainder: &str) -> Option<String> {
                 .unwrap_or(after.len());
             &after[..end]
         }
-    };
-    let name = strip_sql_name_quotes(raw_name);
-    (!name.is_empty()).then(|| name.to_ascii_uppercase())
+    }
+    .len();
+    (raw_len > 0).then_some(start..start + raw_len)
 }
 
 fn strip_sql_name_quotes(token: &str) -> String {
@@ -3596,7 +3645,7 @@ PRAGMA integrity_check;
             name TEXT COLLATE "NOCASE",
             code TEXT COLLATE [RTRIM],
             note TEXT COLLATE 'BINARY',
-            tag TEXT COLLATE /* comment */ `NOCASE`
+            tag/* name/type comment, comma */TEXT COLLATE/* collation comment, comma */`NOCASE`
         ) trailing"#;
         let cols = parse_columns_from_create_sql(sql);
 
@@ -4201,27 +4250,39 @@ PRAGMA integrity_check;
     fn test_parse_create_index_sql_preserves_quoted_collations_and_comments() {
         let sql = r#"CREATE INDEX "idx(words)" ON "items(table)" (
             "last, name" COLLATE /* keep comment invisible */ [RTRIM] DESC,
-            code COLLATE 'BINARY',
-            tag COLLATE `NOCASE`
+            code/* comma, paren ), and COLLATE text stay in comment */COLLATE 'BINARY',
+            tag COLLATE DESC,
+            ord COLLATE [DESC] DESC
         ) /* index tail */ WHERE active = 1"#;
 
         let idx = parse_create_index_sql_to_schema("idx(words)", 7, sql).unwrap();
 
         assert_eq!(
             idx.columns,
-            vec!["last, name".to_owned(), "code".to_owned(), "tag".to_owned()]
+            vec![
+                "last, name".to_owned(),
+                "code".to_owned(),
+                "tag".to_owned(),
+                "ord".to_owned()
+            ]
         );
         assert_eq!(
             idx.key_collations,
             vec![
                 Some("RTRIM".to_owned()),
                 Some("BINARY".to_owned()),
-                Some("NOCASE".to_owned())
+                Some("DESC".to_owned()),
+                Some("DESC".to_owned())
             ]
         );
         assert_eq!(
             idx.key_sort_directions,
-            vec![SortDirection::Desc, SortDirection::Asc, SortDirection::Asc]
+            vec![
+                SortDirection::Desc,
+                SortDirection::Asc,
+                SortDirection::Asc,
+                SortDirection::Desc
+            ]
         );
         assert_eq!(idx.where_clause.as_deref(), Some("active = 1"));
     }

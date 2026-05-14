@@ -12,6 +12,34 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-14 - Memory concurrent synced-write one-entry cache
+
+- Target: private `:memory:` concurrent direct DML bookkeeping in the
+  `UPDATE/DELETEThroughput` tail, screened with
+  `FSQLITE_BENCH_PROFILE_DML=1 perf-update-delete 10000 20 delete compare standard`.
+- Files/subsystems touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. Commit `c93c3a9b` added a
+  per-`Connection` `Cell<Option<(u64, i32)>>` fast cache for the most recently
+  registered `(session_id, root_page)` in
+  `sync_memory_concurrent_pending_write_pages`; commit `e4767e31` reverted it.
+- Evidence: the same-window focused screen measured the baseline FrankenSQLite
+  500-row DELETE at about `950 ns` per row and the candidate at about `964 ns`
+  per row. The apparent F/C ratio movement (`2.70x` to `2.23x`) was not a keep
+  signal because C SQLite's row in the second run was slower; FrankenSQLite's
+  own row regressed. Focused correctness tests for the candidate passed, but
+  the revert re-read found the deeper lifecycle bug.
+- Result: rejected and reverted. The candidate cache was per-`Connection`, while
+  the canonical `memory_concurrent_synced_write_roots` set is per transaction
+  and is cleared at transaction end. A second transaction writing the same root
+  on the same connection could hit the stale one-entry cache and skip
+  registration into the new transaction's empty canonical set.
+- Do not retry a standalone per-connection one-entry synced-write cache. A
+  retry is only worth considering if the key or invalidation is explicitly tied
+  to transaction lifetime, the lifecycle invariant has regression tests across
+  commit, rollback, and savepoint rollback boundaries, and a same-window DML
+  screen improves FrankenSQLite's own per-row time before any ratio comparison
+  is considered.
+
 ## 2026-05-13 - DML mutation-operator source feasibility probe
 
 - Target: remaining `UPDATE/DELETEThroughput` DELETE rows after

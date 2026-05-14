@@ -604,12 +604,9 @@ fn emit_upsert_expr(
     match expr {
         // ── Leaf: column reference — dispatch to correct context ────────
         Expr::Column(col_ref, _) => {
-            if _table.resolves_to_hidden_rowid(&col_ref.column)
-                && col_ref
-                    .table
-                    .as_deref()
-                    .is_some_and(|t| t.eq_ignore_ascii_case("excluded"))
-            {
+            let is_excluded_pseudo_ref =
+                is_upsert_excluded_pseudo_table(col_ref, _table, existing_ctx.table_alias);
+            if _table.resolves_to_hidden_rowid(&col_ref.column) && is_excluded_pseudo_ref {
                 b.emit_op(Opcode::Copy, excluded_hidden_rowid_reg, reg, 0, P4::None, 0);
             } else if _table.resolves_to_hidden_rowid(&col_ref.column) {
                 if let Some(existing_hidden_rowid_reg) = existing_hidden_rowid_reg {
@@ -617,11 +614,7 @@ fn emit_upsert_expr(
                 } else {
                     b.emit_op(Opcode::Rowid, existing_ctx.cursor, reg, 0, P4::None, 0);
                 }
-            } else if col_ref
-                .table
-                .as_deref()
-                .is_some_and(|t| t.eq_ignore_ascii_case("excluded"))
-            {
+            } else if is_excluded_pseudo_ref {
                 emit_expr(b, expr, reg, Some(excluded_ctx));
             } else {
                 emit_expr(b, expr, reg, Some(existing_ctx));
@@ -14133,14 +14126,21 @@ fn validate_upsert_column_ref(
     table: &TableSchema,
     table_alias: Option<&str>,
 ) -> Result<(), CodegenError> {
-    if col_ref
-        .table
-        .as_deref()
-        .is_some_and(|qualifier| qualifier.eq_ignore_ascii_case("excluded"))
-    {
+    if is_upsert_excluded_pseudo_table(col_ref, table, table_alias) {
         return validate_table_column_ref(table, &col_ref.column);
     }
     validate_single_table_column_ref(col_ref, table, table_alias)
+}
+
+fn is_upsert_excluded_pseudo_table(
+    col_ref: &ColumnRef,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    col_ref.table.as_deref().is_some_and(|qualifier| {
+        qualifier.eq_ignore_ascii_case("excluded")
+            && !matches_table_or_alias(qualifier, table, table_alias)
+    })
 }
 
 fn validate_table_column_ref(table: &TableSchema, column: &str) -> Result<(), CodegenError> {

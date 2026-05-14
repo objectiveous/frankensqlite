@@ -1441,10 +1441,7 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
 
             let default_value = extract_default_value(remainder);
 
-            let collation = keyword_tokens
-                .windows(2)
-                .find(|window| matches!(window[0].as_str(), "COLLATE"))
-                .map(|window| window[1].clone());
+            let collation = extract_collation_name(remainder);
 
             Some(ColumnInfo {
                 name,
@@ -2476,6 +2473,25 @@ fn find_unquoted_sql_keyword(input: &str, keyword: &str) -> Option<usize> {
         .find_map(|(token, start)| (token == keyword).then_some(start))
 }
 
+fn trim_leading_sql_space_and_comments(mut input: &str) -> &str {
+    loop {
+        let trimmed = input.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("--") {
+            let end = rest.find(['\n', '\r']).map_or(rest.len(), |idx| idx + 1);
+            input = &rest[end..];
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("/*") {
+            let Some(end) = rest.find("*/") else {
+                return "";
+            };
+            input = &rest[end + 2..];
+            continue;
+        }
+        return trimmed;
+    }
+}
+
 fn collect_unquoted_sql_keyword_tokens(input: &str) -> Vec<(String, usize)> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -2576,6 +2592,41 @@ fn unquoted_tokens_contain_phrase(tokens: &[String], phrase: &[&str]) -> bool {
         })
 }
 
+fn extract_collation_name(remainder: &str) -> Option<String> {
+    let pos = find_unquoted_sql_keyword(remainder, "COLLATE")?;
+    let after = trim_leading_sql_space_and_comments(&remainder[pos + 7..]);
+    let bytes = after.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let raw_name = match bytes[0] {
+        b'\'' => parse_quoted_identifier(after, b'\'', b'\'')?.0,
+        b'"' => parse_quoted_identifier(after, b'"', b'"')?.0,
+        b'`' => parse_quoted_identifier(after, b'`', b'`')?.0,
+        b'[' => parse_bracket_identifier(after)?.0,
+        _ => {
+            let end = after
+                .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                .unwrap_or(after.len());
+            &after[..end]
+        }
+    };
+    let name = strip_sql_name_quotes(raw_name);
+    (!name.is_empty()).then(|| name.to_ascii_uppercase())
+}
+
+fn strip_sql_name_quotes(token: &str) -> String {
+    let trimmed = token.trim();
+    if trimmed.len() >= 2 {
+        if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+            return trimmed[1..trimmed.len() - 1].replace("''", "'");
+        }
+        return strip_identifier_quotes(trimmed);
+    }
+    trimmed.to_owned()
+}
+
 fn strip_identifier_quotes(token: &str) -> String {
     let trimmed = token.trim();
     if trimmed.len() >= 2 {
@@ -2619,7 +2670,7 @@ fn extract_type_declaration(tokens: &[&str]) -> String {
 /// `DEFAULT 'string'`, `DEFAULT "string"`, and `DEFAULT (expr)`.
 fn extract_default_value(remainder: &str) -> Option<String> {
     let pos = find_unquoted_sql_keyword(remainder, "DEFAULT")?;
-    let after = remainder[pos + 7..].trim_start();
+    let after = trim_leading_sql_space_and_comments(&remainder[pos + 7..]);
     if after.is_empty() {
         return None;
     }
@@ -2778,6 +2829,14 @@ mod tests {
         );
         assert_eq!(
             extract_default_value("TEXT /* DEFAULT 'bad' */ DEFAULT 'ok'").as_deref(),
+            Some("'ok'")
+        );
+        assert_eq!(
+            extract_default_value("TEXT DEFAULT /* comment */ 'ok'").as_deref(),
+            Some("'ok'")
+        );
+        assert_eq!(
+            extract_default_value("TEXT DEFAULT -- comment\n 'ok'").as_deref(),
             Some("'ok'")
         );
     }
@@ -3479,6 +3538,23 @@ PRAGMA integrity_check;
         assert!(!cols[0].notnull);
         assert_eq!(cols[1].default_value, None);
         assert!(!cols[1].unique);
+    }
+
+    #[test]
+    fn test_parse_columns_fallback_keeps_quoted_collation_names() {
+        let sql = r#"CREATE TABLE t (
+            name TEXT COLLATE "NOCASE",
+            code TEXT COLLATE [RTRIM],
+            note TEXT COLLATE 'BINARY',
+            tag TEXT COLLATE /* comment */ `NOCASE`
+        ) trailing"#;
+        let cols = parse_columns_from_create_sql(sql);
+
+        assert_eq!(cols.len(), 4);
+        assert_eq!(cols[0].collation.as_deref(), Some("NOCASE"));
+        assert_eq!(cols[1].collation.as_deref(), Some("RTRIM"));
+        assert_eq!(cols[2].collation.as_deref(), Some("BINARY"));
+        assert_eq!(cols[3].collation.as_deref(), Some("NOCASE"));
     }
 
     #[test]

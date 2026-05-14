@@ -13757,16 +13757,15 @@ impl VdbeEngine {
         let payload_includes = if let Some(ipk) = ipk_col_idx {
             if let Some(cached) = cursor.payload_includes_rowid_alias {
                 cached
-            } else if let Some(includes) = root_page.and_then(|rp| {
-                payload_includes_rowid_alias_without_rowid(
+            } else if let Some(rp) = root_page {
+                let includes = payload_includes_rowid_alias_without_rowid(
                     &cursor.row_decode,
                     ipk,
                     self.table_column_count_by_root_page.get(&rp).copied(),
                     self.first_not_null_non_ipk_col_by_root_page
                         .get(&rp)
                         .copied(),
-                )
-            }) {
+                );
                 cursor.payload_includes_rowid_alias = Some(includes);
                 includes
             } else {
@@ -13892,16 +13891,15 @@ impl VdbeEngine {
         let payload_includes = if let Some(ipk) = ipk_col_idx {
             if let Some(cached) = cursor.payload_includes_rowid_alias {
                 cached
-            } else if let Some(includes) = root_page.and_then(|rp| {
-                payload_includes_rowid_alias_without_rowid(
+            } else if let Some(rp) = root_page {
+                let includes = payload_includes_rowid_alias_without_rowid(
                     &cursor.row_decode,
                     ipk,
                     self.table_column_count_by_root_page.get(&rp).copied(),
                     self.first_not_null_non_ipk_col_by_root_page
                         .get(&rp)
                         .copied(),
-                )
-            }) {
+                );
                 cursor.payload_includes_rowid_alias = Some(includes);
                 includes
             } else {
@@ -14085,8 +14083,8 @@ impl VdbeEngine {
             let payload_includes_rowid_alias = if let Some(ipk_col_idx) = ipk_col_idx {
                 if let Some(cached) = cursor.payload_includes_rowid_alias {
                     cached
-                } else if let Some(includes) = root_page.and_then(|root_page| {
-                    payload_includes_rowid_alias_without_rowid(
+                } else if let Some(root_page) = root_page {
+                    let includes = payload_includes_rowid_alias_without_rowid(
                         &cursor.row_decode,
                         ipk_col_idx,
                         self.table_column_count_by_root_page
@@ -14095,8 +14093,7 @@ impl VdbeEngine {
                         self.first_not_null_non_ipk_col_by_root_page
                             .get(&root_page)
                             .copied(),
-                    )
-                }) {
+                    );
                     cursor.payload_includes_rowid_alias = Some(includes);
                     includes
                 } else {
@@ -16236,79 +16233,11 @@ fn payload_includes_rowid_alias(
 
 /// Resolve the rowid-alias payload shape from record-header metadata alone.
 ///
-/// Returns `None` only for the rare case where an integer stored at the IPK
-/// position must be compared with the physical rowid.
+/// This stays conservative for non-NULL IPK-position values: a shifted user
+/// column can coincidentally equal the physical rowid, so equality is not
+/// evidence that the IPK alias slot is present.
 fn payload_includes_rowid_alias_without_rowid(
     row_decode: &RowDecodeScratch,
-    ipk_col_idx: usize,
-    table_column_count: Option<usize>,
-    first_not_null_non_ipk_col_idx: Option<usize>,
-) -> Option<bool> {
-    use fsqlite_types::serial_type::{SerialTypeClass, classify_serial_type};
-
-    let payload_cols = row_decode.column_count();
-    if let Some(table_cols) = table_column_count {
-        if payload_cols == table_cols {
-            return Some(true);
-        }
-        let one_column_short = payload_cols.checked_add(1) == Some(table_cols);
-        if let Some(not_null_col_idx) =
-            first_not_null_non_ipk_col_idx.filter(|idx| *idx > ipk_col_idx)
-        {
-            let omitted_payload_idx = not_null_col_idx - 1;
-            let present_payload_idx = not_null_col_idx;
-            if omitted_payload_idx < payload_cols
-                && present_payload_idx < payload_cols
-                && let Some(col) = row_decode.column_offset(omitted_payload_idx)
-                && matches!(classify_serial_type(col.serial_type), SerialTypeClass::Null)
-            {
-                return Some(true);
-            }
-        }
-        if one_column_short {
-            let Some(col) = row_decode.column_offset(ipk_col_idx) else {
-                return Some(false);
-            };
-            return Some(matches!(
-                classify_serial_type(col.serial_type),
-                SerialTypeClass::Null
-            ));
-        }
-        if ipk_col_idx >= payload_cols {
-            return Some(false);
-        }
-        let Some(col) = row_decode.column_offset(ipk_col_idx) else {
-            return Some(false);
-        };
-        return match classify_serial_type(col.serial_type) {
-            SerialTypeClass::Null => Some(true),
-            SerialTypeClass::Integer => None,
-            _ => Some(false),
-        };
-    }
-    if ipk_col_idx >= payload_cols {
-        return Some(false);
-    }
-    let Some(col) = row_decode.column_offset(ipk_col_idx) else {
-        return Some(false);
-    };
-    match classify_serial_type(col.serial_type) {
-        SerialTypeClass::Null => Some(true),
-        _ => Some(false),
-    }
-}
-
-/// Lazy-decode variant of [`payload_includes_rowid_alias`] that works
-/// with the header offset table instead of requiring all columns to be
-/// pre-decoded.
-///
-/// For the common `NULL`-at-IPK case, only the serial type is inspected
-/// (zero-decode).  For the integer-match case, a single column is decoded
-/// on demand and cached in the caller-owned scratch buffer.
-fn payload_includes_rowid_alias_lazy(
-    row_decode: &RowDecodeScratch,
-    payload_buf: &[u8],
-    rowid: i64,
     ipk_col_idx: usize,
     table_column_count: Option<usize>,
     first_not_null_non_ipk_col_idx: Option<usize>,
@@ -16321,37 +16250,77 @@ fn payload_includes_rowid_alias_lazy(
             return true;
         }
         let one_column_short = payload_cols.checked_add(1) == Some(table_cols);
+        if let Some(not_null_col_idx) =
+            first_not_null_non_ipk_col_idx.filter(|idx| *idx > ipk_col_idx)
+        {
+            let omitted_payload_idx = not_null_col_idx - 1;
+            let present_payload_idx = not_null_col_idx;
+            if omitted_payload_idx < payload_cols
+                && present_payload_idx < payload_cols
+                && let Some(col) = row_decode.column_offset(omitted_payload_idx)
+                && matches!(classify_serial_type(col.serial_type), SerialTypeClass::Null)
+            {
+                return true;
+            }
+        }
+        if one_column_short {
+            let Some(col) = row_decode.column_offset(ipk_col_idx) else {
+                return false;
+            };
+            return matches!(classify_serial_type(col.serial_type), SerialTypeClass::Null);
+        }
+        if ipk_col_idx >= payload_cols {
+            return false;
+        }
+        let Some(col) = row_decode.column_offset(ipk_col_idx) else {
+            return false;
+        };
+        return matches!(classify_serial_type(col.serial_type), SerialTypeClass::Null);
+    }
+    if ipk_col_idx >= payload_cols {
+        return false;
+    }
+    let Some(col) = row_decode.column_offset(ipk_col_idx) else {
+        return false;
+    };
+    matches!(classify_serial_type(col.serial_type), SerialTypeClass::Null)
+}
+
+/// Lazy-decode variant of [`payload_includes_rowid_alias`] that works
+/// with the header offset table instead of requiring all columns to be
+/// pre-decoded.
+///
+/// Only the serial type is inspected. Integer equality is deliberately
+/// ignored because a shifted first stored user column can coincidentally equal
+/// the physical rowid after `ALTER TABLE ADD COLUMN`.
+fn payload_includes_rowid_alias_lazy(
+    row_decode: &RowDecodeScratch,
+    _payload_buf: &[u8],
+    _rowid: i64,
+    ipk_col_idx: usize,
+    table_column_count: Option<usize>,
+    first_not_null_non_ipk_col_idx: Option<usize>,
+) -> bool {
+    use fsqlite_types::serial_type::{SerialTypeClass, classify_serial_type};
+
+    let payload_cols = row_decode.column_count();
+    if let Some(table_cols) = table_column_count {
+        if payload_cols == table_cols {
+            return true;
+        }
         if ipk_col_idx < payload_cols {
             // The IPK position exists in the payload. Check its serial
-            // type. In one-column-short rows from before ALTER TABLE ADD
-            // COLUMN, SQLite-format INTEGER PRIMARY KEY aliases are still
-            // stored as NULL placeholders. Integer equality is deliberately
-            // ignored for that shape because the first stored user column can
-            // legitimately equal the physical rowid.
+            // type. SQLite-format INTEGER PRIMARY KEY aliases are stored as
+            // NULL placeholders, while a non-NULL value at this position may
+            // be a shifted user column from a shorter payload.
             if let Some(col) = row_decode.column_offset(ipk_col_idx) {
-                match classify_serial_type(col.serial_type) {
-                    SerialTypeClass::Null => {
-                        // NULL placeholder at IPK position → IPK is included.
-                        return true;
-                    }
-                    SerialTypeClass::Integer => {
-                        if one_column_short {
-                            return false;
-                        }
-                        // Decode the integer at the IPK position and compare
-                        // to the rowid.
-                        if let Some(SqliteValue::Integer(v)) =
-                            fsqlite_types::record::decode_column_from_offset(
-                                payload_buf,
-                                col,
-                                false,
-                            )
-                            && v == rowid
-                        {
-                            return true;
-                        }
-                    }
-                    _ => {}
+                let serial_class = classify_serial_type(col.serial_type);
+                if matches!(serial_class, SerialTypeClass::Null) {
+                    // NULL placeholder at IPK position → IPK is included.
+                    return true;
+                }
+                if matches!(serial_class, SerialTypeClass::Integer) {
+                    return false;
                 }
             }
         }
@@ -17271,14 +17240,12 @@ mod tests {
             .prepare_for_record(&record)
             .expect("payload should decode");
 
-        assert_eq!(
+        assert!(
             payload_includes_rowid_alias_without_rowid(&scratch, 0, Some(3), Some(1)),
-            Some(true),
             "matching payload/table width proves the payload already carries the IPK alias"
         );
-        assert_eq!(
-            payload_includes_rowid_alias_without_rowid(&scratch, 0, Some(4), Some(1)),
-            Some(false),
+        assert!(
+            !payload_includes_rowid_alias_without_rowid(&scratch, 0, Some(4), Some(1)),
             "one-column-short integer rows must not compare against rowid because the first stored user column may match by coincidence"
         );
     }
@@ -17295,15 +17262,14 @@ mod tests {
             .prepare_for_record(&record)
             .expect("payload should decode");
 
-        assert_eq!(
+        assert!(
             payload_includes_rowid_alias_without_rowid(&scratch, 0, Some(4), Some(1)),
-            Some(true),
             "SQLite-format rows keep a NULL IPK placeholder when later ALTER TABLE ADD COLUMN makes the payload one column short"
         );
     }
 
     #[test]
-    fn test_payload_includes_rowid_alias_without_rowid_defers_ambiguous_integer_match() {
+    fn test_payload_includes_rowid_alias_without_rowid_rejects_ambiguous_integer_match() {
         let record = serialize_record(&[
             SqliteValue::Integer(2),
             SqliteValue::Text("local".into()),
@@ -17314,15 +17280,31 @@ mod tests {
             .prepare_for_record(&record)
             .expect("payload should decode");
 
-        assert_eq!(
-            payload_includes_rowid_alias_without_rowid(&scratch, 0, Some(5), Some(1)),
-            None,
-            "ambiguous integer-at-IPK rows still need the rowid-aware fallback"
+        assert!(
+            !payload_includes_rowid_alias_without_rowid(&scratch, 0, Some(5), Some(1)),
+            "ambiguous integer-at-IPK rows must not be accepted by rowid equality"
         );
-        assert_eq!(
-            payload_includes_rowid_alias_without_rowid(&scratch, 0, None, Some(1)),
-            Some(false),
+        assert!(
+            !payload_includes_rowid_alias_without_rowid(&scratch, 0, None, Some(1)),
             "the metadata-free fallback remains conservative"
+        );
+    }
+
+    #[test]
+    fn test_payload_includes_rowid_alias_lazy_rejects_multi_column_short_integer_match() {
+        let record = serialize_record(&[
+            SqliteValue::Integer(1),
+            SqliteValue::Text("local".into()),
+            SqliteValue::Text("dup-session".into()),
+        ]);
+        let mut scratch = fsqlite_types::record::RecordDecodeScratch::default();
+        scratch
+            .prepare_for_record(&record)
+            .expect("payload should decode");
+
+        assert!(
+            !payload_includes_rowid_alias_lazy(&scratch, &record, 1, 0, Some(5), Some(1)),
+            "multi-column-short rows must not treat a shifted user integer equal to rowid as an IPK placeholder"
         );
     }
 

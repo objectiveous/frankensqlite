@@ -429,8 +429,7 @@ fn crc32c_checksum(data: &[u8]) -> u32 {
 /// This is used when a transaction commits multiple cell changes atomically.
 /// Each frame is written sequentially with its own checksum.
 pub fn serialize_cell_delta_batch(frames: &[CellDeltaWalFrame]) -> Result<Vec<u8>> {
-    let total_size: usize = frames.iter().map(CellDeltaWalFrame::serialized_size).sum();
-    let mut buf = Vec::with_capacity(total_size);
+    let mut buf = Vec::new();
 
     for frame in frames {
         buf.extend_from_slice(&frame.serialize()?);
@@ -870,6 +869,20 @@ mod tests {
         };
 
         assert!(frame.serialize().is_err());
+    }
+
+    #[test]
+    fn test_serialize_batch_rejects_oversized_payload() {
+        let frame = CellDeltaWalFrame {
+            page_number: PageNumber::new(42).unwrap(),
+            key_digest: [0; 16],
+            op: CellDeltaOp::Insert,
+            commit_seq: CommitSeq::new(1),
+            txn_id: TxnId::new(1).unwrap(),
+            cell_data: vec![0; CELL_DELTA_MAX_DATA_LEN as usize + 1],
+        };
+
+        assert!(serialize_cell_delta_batch(&[frame]).is_err());
     }
 
     #[test]

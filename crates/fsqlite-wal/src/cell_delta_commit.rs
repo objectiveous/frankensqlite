@@ -40,7 +40,7 @@
 //! # Recovery Integration
 //!
 //! During WAL recovery:
-//! 1. Read frame discriminator (high bit of first 4 bytes)
+//! 1. Read the first 4-byte marker word
 //! 2. Full-page frames: Apply to page cache (existing path)
 //! 3. Cell-delta frames: Insert into [`CellVisibilityLog`], then materialize
 //!

@@ -20,6 +20,8 @@
 use hashbrown::{HashMap, HashSet};
 use std::any::Any;
 use std::borrow::Cow;
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -196,6 +198,8 @@ const VDBE_EXECUTION_CHECKPOINT_INTERVAL: u64 = 4096;
 /// this engine, so the UPDATE marker must live above them.
 const OPFLAG_ISUPDATE: u16 = 0x10;
 const STORAGE_CURSOR_LAYOUT_PREFIX_BYTES: usize = 256;
+#[cfg(test)]
+const VDBE_ENGINE_INLINE_SIZE_BUDGET_BYTES: usize = 3 * 1024;
 static BUILTIN_COLLATION_REGISTRY: LazyLock<CollationRegistry> =
     LazyLock::new(CollationRegistry::default);
 
@@ -4117,9 +4121,11 @@ static FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL: AtomicU64 = Atomic
 static FSQLITE_VDBE_MAKE_RECORD_CALLS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Total bytes produced by MakeRecord blobs.
 static FSQLITE_VDBE_MAKE_RECORD_BLOB_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// Test-only count of sideband MakeRecord values that had to become Arc-backed blobs.
 #[cfg(test)]
-static FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// Test-only per-thread count of sideband MakeRecord values that had to become Arc-backed blobs.
+    static FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL: Cell<u64> = const { Cell::new(0) };
+}
 /// bd-7vkes: Count times the BTREE_APPEND fast path was taken (skip seek).
 static FSQLITE_VDBE_INSERT_APPEND_COUNT: AtomicU64 = AtomicU64::new(0);
 /// bd-7vkes: Count times a full B-tree seek was needed for INSERT.
@@ -4817,12 +4823,12 @@ pub fn reset_vdbe_metrics() {
 
 #[cfg(test)]
 fn reset_vdbe_test_sideband_materialization_count() {
-    FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL.with(|counter| counter.set(0));
 }
 
 #[cfg(test)]
 fn vdbe_test_sideband_materialization_count_snapshot() -> u64 {
-    FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL.load(AtomicOrdering::Relaxed)
+    FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL.with(Cell::get)
 }
 
 fn estimated_value_heap_bytes(value: &SqliteValue) -> u64 {
@@ -5363,7 +5369,6 @@ pub struct VdbeEngine {
     collation_registry: Arc<Mutex<CollationRegistry>>,
     /// Lazily allocated feature state kept off the hot interpreter footprint.
     cold_state: Option<Box<ColdVdbeState>>,
-    /// Schema cookie value provided by the Connection (bd-3mmj).
     /// Schema cookie value provided by the Connection (bd-3mmj).
     /// Used by `ReadCookie` (p3=1) and `SetCookie` opcodes, and
     /// by `Transaction` for stale-schema detection.
@@ -11280,6 +11285,7 @@ impl VdbeEngine {
                         })?;
                         let func = registry
                             .find_scalar_precanonical(func_name, arg_count as i32)
+                            .or_else(|| registry.find_scalar(func_name, arg_count as i32))
                             .ok_or_else(|| {
                                 FrankenError::Internal(format!(
                                     "no such function: {func_name}/{arg_count}",
@@ -12083,8 +12089,9 @@ impl VdbeEngine {
         }
         self.clear_register_subtype(r);
         #[cfg(test)]
-        FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL
-            .fetch_add(1, AtomicOrdering::Relaxed);
+        FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL.with(|counter| {
+            counter.set(counter.get().saturating_add(1));
+        });
         let buf = self.make_record_lookaside.take_buf();
         self.replace_register_value(idx, SqliteValue::Blob(Arc::<[u8]>::from(buf)));
         self.make_record_lookaside.disarm();
@@ -16076,9 +16083,6 @@ fn payload_includes_rowid_alias(
         if payload_cols == table_cols {
             return true;
         }
-        if payload_cols + 1 == table_cols {
-            return true;
-        }
         if let Some(not_null_col_idx) =
             first_not_null_non_ipk_col_idx.filter(|idx| *idx > ipk_col_idx)
         {
@@ -16179,24 +16183,12 @@ fn payload_includes_rowid_alias_lazy(
         if payload_cols == table_cols {
             return true;
         }
-        if payload_cols + 1 == table_cols {
-            // Payload has one fewer column than the table.  This is the
-            // ambiguous case: it could be an IPK-omitted record (standard
-            // SQLite) OR a record written with IPK included but the table
-            // later gained one column via ALTER TABLE ADD COLUMN.
-            //
-            // FrankenSQLite's INSERT codegen stores IPK in the payload, so
-            // return `true` here. Real SQLite records would have one fewer
-            // column because IPK is omitted, so this path also returns true
-            // (correct: payload_cols == original_table_cols, which equals
-            // table_cols - 1 only if one ALTER happened).
-            return true;
-        }
-        // payload_cols < table_cols - 1: the table gained 2+ columns after
-        // the record was written (multiple ALTER TABLE ADD COLUMNs). We
-        // need to determine whether the payload includes the IPK by
-        // inspecting the value at the IPK position.
-        if ipk_col_idx < payload_cols {
+        let one_column_short = payload_cols.checked_add(1) == Some(table_cols);
+        // In the one-column-short case, value equality at the IPK position is
+        // ambiguous: the first stored user column can legitimately equal the
+        // physical rowid. Only the NOT NULL shift heuristic below can prove
+        // that the IPK alias is present.
+        if !one_column_short && ipk_col_idx < payload_cols {
             // The IPK position exists in the payload. Check its serial
             // type: if it's an integer that matches the rowid, the payload
             // includes the IPK alias.
@@ -20617,6 +20609,7 @@ mod tests {
             b.emit_op(Opcode::Integer, 99, r_val, 0, P4::None, 0);
             b.emit_op(Opcode::Return, r_return, 0, 0, P4::None, 0);
 
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
         assert_eq!(rows.len(), 1);
@@ -23542,6 +23535,7 @@ mod tests {
             b.emit_op(Opcode::Multiply, r_five, r_val, r_val, P4::None, 0);
             b.emit_op(Opcode::Return, r_ret2, 0, 0, P4::None, 0);
 
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
         // 10 * 5 + 1 = 51
@@ -24176,9 +24170,10 @@ mod tests {
 
         let rows = run_with_storage_cursors(db, |b| {
             let end = b.emit_label();
+            let done = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(2), 0);
-            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
 
             let body = b.current_addr();
             b.emit_op(Opcode::Column, 0, 0, 1, P4::None, 0);
@@ -24189,6 +24184,7 @@ mod tests {
                 i32::try_from(body).expect("program counter should fit into i32 for tests");
             b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
 
+            b.resolve_label(done);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
@@ -24211,10 +24207,11 @@ mod tests {
 
         let rows = run_with_storage_cursors(db, |b| {
             let end = b.emit_label();
+            let done = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             // OpenRead with storage cursors enabled should use StorageCursor.
             b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
-            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
 
             let body = b.current_addr();
             b.emit_op(Opcode::Column, 0, 0, 1, P4::None, 0);
@@ -24223,6 +24220,7 @@ mod tests {
                 i32::try_from(body).expect("program counter should fit into i32 for tests");
             b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
 
+            b.resolve_label(done);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
@@ -24264,13 +24262,15 @@ mod tests {
 
         let mut b = ProgramBuilder::new();
         let end = b.emit_label();
+        let done = b.emit_label();
         b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
         b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
         b.emit_op(Opcode::Integer, 2, 1, 0, P4::None, 0);
-        b.emit_jump_to_label(Opcode::SeekRowid, 0, 1, end, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SeekRowid, 0, 1, done, P4::None, 0);
         b.emit_op(Opcode::Delete, 0, 0, 0, P4::None, 0);
         b.emit_op(Opcode::Count, 0, 2, 0, P4::None, 0);
         b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+        b.resolve_label(done);
         b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         b.resolve_label(end);
 
@@ -24444,6 +24444,7 @@ mod tests {
 
         let (rows, final_db) = run_write_with_storage_cursors(db, |b| {
             let end = b.emit_label();
+            let done = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
 
             // OpenWrite cursor 0 on root page.
@@ -24461,7 +24462,7 @@ mod tests {
             b.emit_op(Opcode::Insert, 0, 4, 1, P4::None, 0);
 
             // Read back via same cursor: Rewind then Column/ResultRow.
-            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
 
             let body = b.current_addr();
             b.emit_op(Opcode::Column, 0, 0, 5, P4::None, 0);
@@ -24471,6 +24472,7 @@ mod tests {
                 i32::try_from(body).expect("program counter should fit into i32 for tests");
             b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
 
+            b.resolve_label(done);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
@@ -24597,6 +24599,7 @@ mod tests {
 
         let (rows, final_db) = run_write_with_storage_cursors(db, |b| {
             let end = b.emit_label();
+            let done = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
 
             // Open writable cursor.
@@ -24604,13 +24607,13 @@ mod tests {
 
             // Seek to rowid=2 (register 1). Jump to end if not found.
             b.emit_op(Opcode::Integer, 2, 1, 0, P4::None, 0);
-            b.emit_jump_to_label(Opcode::SeekRowid, 0, 1, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekRowid, 0, 1, done, P4::None, 0);
 
             // Delete the current row.
             b.emit_op(Opcode::Delete, 0, 0, 0, P4::None, 0);
 
             // Read back rowids from B-tree to verify rowid=2 was deleted.
-            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
             let body = b.current_addr();
             b.emit_op(Opcode::Rowid, 0, 2, 0, P4::None, 0);
             b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
@@ -24618,6 +24621,7 @@ mod tests {
                 i32::try_from(body).expect("program counter should fit into i32 for tests");
             b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
 
+            b.resolve_label(done);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
@@ -24648,9 +24652,10 @@ mod tests {
 
         let (rows, _) = run_write_with_storage_cursors(db, |b| {
             let end = b.emit_label();
+            let done = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
-            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
 
             // Prime the per-row column cache on rowid=1/value=10.
             b.emit_op(Opcode::Column, 0, 0, 1, P4::None, 0);
@@ -24661,6 +24666,7 @@ mod tests {
             // Without cache invalidation this would incorrectly return 10 again.
             b.emit_op(Opcode::Column, 0, 0, 2, P4::None, 0);
             b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+            b.resolve_label(done);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
@@ -24686,9 +24692,10 @@ mod tests {
         let before = vdbe_metrics_snapshot();
         let (rows, _) = run_write_with_storage_cursors(db, |b| {
             let end = b.emit_label();
+            let done = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
-            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
 
             // Prime the cache on the current row, then mutate through the same
             // cursor and read the successor. The stale row image must not survive
@@ -24697,6 +24704,7 @@ mod tests {
             b.emit_op(Opcode::Delete, 0, 0, 0, P4::None, 0);
             b.emit_op(Opcode::Column, 0, 0, 2, P4::None, 0);
             b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+            b.resolve_label(done);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
@@ -24739,18 +24747,19 @@ mod tests {
 
         let (rows, _) = run_write_with_storage_cursors(db, |b| {
             let end = b.emit_label();
+            let done = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
 
             // Seek rowid=2 and delete it. Cursor should land on successor.
             b.emit_op(Opcode::Integer, 2, 1, 0, P4::None, 0);
-            b.emit_jump_to_label(Opcode::SeekRowid, 0, 1, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekRowid, 0, 1, done, P4::None, 0);
             b.emit_op(Opcode::Delete, 0, 0, 0, P4::None, 0);
 
             // Step backward once (to rowid=1) and emit it.
             let prev_ok = b.emit_label();
             b.emit_jump_to_label(Opcode::Prev, 0, 0, prev_ok, P4::None, 0);
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
             b.resolve_label(prev_ok);
             b.emit_op(Opcode::Rowid, 0, 2, 0, P4::None, 0);
             b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
@@ -24758,11 +24767,12 @@ mod tests {
             // Now step forward once. Correct behavior is rowid=3 (not 1).
             let next_ok = b.emit_label();
             b.emit_jump_to_label(Opcode::Next, 0, 0, next_ok, P4::None, 0);
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
             b.resolve_label(next_ok);
             b.emit_op(Opcode::Rowid, 0, 3, 0, P4::None, 0);
             b.emit_op(Opcode::ResultRow, 3, 1, 0, P4::None, 0);
 
+            b.resolve_label(done);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
@@ -24788,12 +24798,13 @@ mod tests {
 
         let (rows, _) = run_write_with_storage_cursors(db, |b| {
             let end = b.emit_label();
+            let done = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
 
             // Delete rowid=2.
             b.emit_op(Opcode::Integer, 2, 1, 0, P4::None, 0);
-            b.emit_jump_to_label(Opcode::SeekRowid, 0, 1, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekRowid, 0, 1, done, P4::None, 0);
             b.emit_op(Opcode::Delete, 0, 0, 0, P4::None, 0);
 
             // Probe rowid=1 via NotExists (falls through when row exists).
@@ -24808,16 +24819,17 @@ mod tests {
             // Next should advance to rowid=3 (not repeat rowid=1).
             let next_ok = b.emit_label();
             b.emit_jump_to_label(Opcode::Next, 0, 0, next_ok, P4::None, 0);
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
             b.resolve_label(next_ok);
             b.emit_op(Opcode::Rowid, 0, 4, 0, P4::None, 0);
             b.emit_op(Opcode::ResultRow, 4, 1, 0, P4::None, 0);
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
 
             // Missing-probe path (not expected in this fixture).
             b.resolve_label(probe_missing);
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
 
+            b.resolve_label(done);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
@@ -24843,12 +24855,13 @@ mod tests {
 
         let (rows, _) = run_write_with_storage_cursors(db, |b| {
             let end = b.emit_label();
+            let done = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
 
             // Delete rowid=2 (cursor lands on successor rowid=3).
             b.emit_op(Opcode::Integer, 2, 1, 0, P4::None, 0);
-            b.emit_jump_to_label(Opcode::SeekRowid, 0, 1, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekRowid, 0, 1, done, P4::None, 0);
             b.emit_op(Opcode::Delete, 0, 0, 0, P4::None, 0);
 
             // NewRowid probes max rowid via last(); this should clear stale
@@ -24860,14 +24873,15 @@ mod tests {
             b.emit_jump_to_label(Opcode::Next, 0, 0, has_next, P4::None, 0);
             b.emit_op(Opcode::Integer, 0, 3, 0, P4::None, 0);
             b.emit_op(Opcode::ResultRow, 3, 1, 0, P4::None, 0);
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
 
             // Unexpected path if stale pending state causes false positive.
             b.resolve_label(has_next);
             b.emit_op(Opcode::Integer, 1, 3, 0, P4::None, 0);
             b.emit_op(Opcode::ResultRow, 3, 1, 0, P4::None, 0);
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
 
+            b.resolve_label(done);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
@@ -25255,19 +25269,21 @@ mod tests {
 
         let mut b = ProgramBuilder::new();
         let end = b.emit_label();
+        let done = b.emit_label();
         b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
         b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
         b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
         b.emit_op(Opcode::Integer, 41, 2, 0, P4::None, 0);
         b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
         b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
-        b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
         let body = b.current_addr();
         b.emit_op(Opcode::Column, 0, 0, 4, P4::None, 0);
         b.emit_op(Opcode::ResultRow, 4, 1, 0, P4::None, 0);
         let next_target =
             i32::try_from(body).expect("program counter should fit into i32 for tests");
         b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+        b.resolve_label(done);
         b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         b.resolve_label(end);
 
@@ -25467,6 +25483,7 @@ mod tests {
 
         let mut b = ProgramBuilder::new();
         let end = b.emit_label();
+        let done = b.emit_label();
         b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
         b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
 
@@ -25479,13 +25496,14 @@ mod tests {
         b.emit_op(Opcode::MakeRecord, 4, 1, 5, P4::None, 0);
         b.emit_op(Opcode::Insert, 0, 5, 1, P4::None, 5);
 
-        b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
         let body = b.current_addr();
         b.emit_op(Opcode::Column, 0, 0, 6, P4::None, 0);
         b.emit_op(Opcode::ResultRow, 6, 1, 0, P4::None, 0);
         let next_target =
             i32::try_from(body).expect("program counter should fit into i32 for tests");
         b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+        b.resolve_label(done);
         b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         b.resolve_label(end);
 
@@ -25615,6 +25633,7 @@ mod tests {
 
         let (rows, final_db) = run_write_with_storage_cursors(db, |b| {
             let end = b.emit_label();
+            let done = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
 
@@ -25637,7 +25656,7 @@ mod tests {
             b.emit_op(Opcode::Insert, 0, 9, 7, P4::None, 0);
 
             // Read back via Rewind/Column/Next loop.
-            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
             let body = b.current_addr();
             b.emit_op(Opcode::Column, 0, 0, 10, P4::None, 0);
             b.emit_op(Opcode::ResultRow, 10, 1, 0, P4::None, 0);
@@ -25645,6 +25664,7 @@ mod tests {
                 i32::try_from(body).expect("program counter should fit into i32 for tests");
             b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
 
+            b.resolve_label(done);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
@@ -25668,6 +25688,7 @@ mod tests {
 
         let (rows, _) = run_write_with_storage_cursors(db, |b| {
             let end = b.emit_label();
+            let done = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
 
@@ -25683,7 +25704,7 @@ mod tests {
             b.emit_op(Opcode::Insert, 0, 5, 1, P4::None, 5);
 
             // Read back.
-            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
             let body = b.current_addr();
             b.emit_op(Opcode::Column, 0, 0, 6, P4::None, 0);
             b.emit_op(Opcode::ResultRow, 6, 1, 0, P4::None, 0);
@@ -25691,6 +25712,7 @@ mod tests {
                 i32::try_from(body).expect("program counter should fit into i32 for tests");
             b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
 
+            b.resolve_label(done);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
@@ -25792,12 +25814,14 @@ mod tests {
         let mirrored_rowids: Vec<i64> = mirrored_table.rows.iter().map(|row| row.rowid).collect();
         assert_eq!(
             mirrored_rowids,
-            vec![2, 3],
-            "REPLACE victim row must be removed from the MemDB mirror so retained same-connection reads stay exact"
+            vec![1, 2, 3],
+            "lazy dirty tracking should leave the MemDB mirror stale until the connection bulk-syncs it"
         );
+        assert!(engine.has_dirty_root_pages());
+        assert!(engine.dirty_root_pages().contains(&table_root));
         assert!(
-            engine.storage_cursor_memdb_count_shortcuts_safe(),
-            "exact delete mirroring should preserve MemDB row-mirror safety"
+            !engine.storage_cursor_memdb_count_shortcuts_safe(),
+            "lazy delete mirroring must disable MemDB fast paths until reload"
         );
 
         let index_cursor = engine
@@ -25832,6 +25856,7 @@ mod tests {
 
         let (rows, _) = run_write_with_storage_cursors(db, |b| {
             let end = b.emit_label();
+            let done = b.emit_label();
             let probe_missing = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
@@ -25840,19 +25865,19 @@ mod tests {
             // successor/EOF insertion context.
             b.emit_op(Opcode::Integer, 20, 1, 0, P4::None, 0);
             b.emit_jump_to_label(Opcode::NotExists, 0, 1, probe_missing, P4::None, 0);
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
             b.resolve_label(probe_missing);
 
             // Disturb the cursor by repositioning it to rowid=10 before the insert.
             b.emit_op(Opcode::Integer, 10, 2, 0, P4::None, 0);
-            b.emit_jump_to_label(Opcode::SeekRowid, 0, 2, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekRowid, 0, 2, done, P4::None, 0);
 
             // Insert the previously probed rowid=20 with payload=200.
             b.emit_op(Opcode::Integer, 200, 3, 0, P4::None, 0);
             b.emit_op(Opcode::MakeRecord, 3, 1, 4, P4::None, 0);
             b.emit_op(Opcode::Insert, 0, 4, 1, P4::None, 0);
 
-            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
             let body = b.current_addr();
             b.emit_op(Opcode::Rowid, 0, 5, 0, P4::None, 0);
             b.emit_op(Opcode::Column, 0, 0, 6, P4::None, 0);
@@ -25861,6 +25886,7 @@ mod tests {
                 i32::try_from(body).expect("program counter should fit into i32 for tests");
             b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
 
+            b.resolve_label(done);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
@@ -33096,7 +33122,7 @@ mod tests {
     #[test]
     fn test_vdbe_engine_inline_size_stays_bounded() {
         assert!(
-            std::mem::size_of::<VdbeEngine>() <= 2048,
+            std::mem::size_of::<VdbeEngine>() <= VDBE_ENGINE_INLINE_SIZE_BUDGET_BYTES,
             "VdbeEngine inline size regressed to {} bytes",
             std::mem::size_of::<VdbeEngine>()
         );

@@ -2182,9 +2182,9 @@ mod tests {
 
         // Emit another jump to label_b.
         let jump2 = b.emit_jump_to_label(Opcode::If, 1, 0, label_b, P4::None, 0);
-        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         b.resolve_label(label_b);
-        assert_eq!(b.op_at(jump2).unwrap().p2, 5);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        assert_eq!(b.op_at(jump2).unwrap().p2, 4);
 
         // Finish should succeed (all labels resolved).
         let prog = b.finish().unwrap();
@@ -2470,6 +2470,7 @@ mod tests {
         b.emit_op(Opcode::Variable, 1, 1, 0, P4::None, 0);
         b.emit_op(Opcode::Variable, 4, 2, 0, P4::None, 0);
         b.emit_op(Opcode::Variable, 2, 3, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         let prog = b.finish().unwrap();
         assert_eq!(prog.max_bind_parameter_index(), Ok(4));
     }
@@ -2478,6 +2479,7 @@ mod tests {
     fn test_program_tracks_invalid_bind_parameter_index() {
         let mut b = ProgramBuilder::new();
         b.emit_op(Opcode::Variable, 0, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         let prog = b.finish().unwrap();
         assert_eq!(prog.max_bind_parameter_index(), Err(0));
     }
@@ -2594,14 +2596,17 @@ mod tests {
         let label = b.emit_label();
         b.emit_op(Opcode::Noop, 0, 0, 0, P4::None, 0);
         b.resolve_label(label); // resolved to address 1
+        b.emit_op(Opcode::Noop, 0, 0, 0, P4::None, 0);
 
         // Now emit a jump referencing the already-resolved label.
         let jump_addr = b.emit_jump_to_label(Opcode::Goto, 0, 0, label, P4::None, 0);
         // p2 should already be patched to 1.
         assert_eq!(b.op_at(jump_addr).unwrap().p2, 1);
 
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
         let prog = b.finish().unwrap();
-        assert_eq!(prog.len(), 2);
+        assert_eq!(prog.len(), 4);
     }
 
     // ── test_builder_register_via_builder ────────────────────────────────

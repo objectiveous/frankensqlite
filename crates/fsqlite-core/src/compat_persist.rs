@@ -755,6 +755,14 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             continue;
         }
 
+        let root_page_u32 = validate_sqlite_master_root_page(&index_name, root_page_num)?;
+        let root_page_i32 =
+            i32::try_from(root_page_u32).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "sqlite_master index `{index_name}` has rootpage {root_page_num} that exceeds supported range"
+                ),
+            })?;
+
         // Find the parent table in the schema.
         let Some(table) = schema
             .iter_mut()
@@ -766,7 +774,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
         // Parse the CREATE INDEX SQL to extract column names, collations,
         // sort directions, and WHERE clause.
         if let Some(idx_schema) =
-            self::parse_create_index_sql_to_schema(&index_name, root_page_num, &create_sql)
+            self::parse_create_index_sql_to_schema(&index_name, root_page_i32, &create_sql)
         {
             // Only add if not already present (avoid duplicates with autoindexes).
             if !table.indexes.iter().any(|i| i.name == index_name) {
@@ -862,7 +870,7 @@ fn init_leaf_index_page(
 /// Returns `None` if the SQL cannot be parsed.
 fn parse_create_index_sql_to_schema(
     index_name: &str,
-    root_page: i64,
+    root_page: i32,
     sql: &str,
 ) -> Option<IndexSchema> {
     // Simple regex-free parser: look for "ON table_name (col1, col2 COLLATE NOCASE DESC)"
@@ -900,10 +908,9 @@ fn parse_create_index_sql_to_schema(
         None
     };
 
-    #[allow(clippy::cast_possible_truncation)]
     Some(IndexSchema {
         name: index_name.to_owned(),
-        root_page: root_page as i32,
+        root_page,
         columns,
         key_expressions: Vec::new(),
         key_sort_directions: directions,
@@ -1478,18 +1485,20 @@ pub fn parse_columns_from_sqlite_master_sql(sql: &str) -> Vec<ColumnInfo> {
 pub(crate) fn validate_sqlite_master_root_page(name: &str, root_page_num: i64) -> Result<u32> {
     if root_page_num <= 0 {
         return Err(FrankenError::DatabaseCorrupt {
-            detail: format!("table `{name}` has invalid rootpage {root_page_num} in sqlite_master"),
+            detail: format!("sqlite_master entry `{name}` has invalid rootpage {root_page_num}"),
         });
     }
 
     let root_page_u32 =
         u32::try_from(root_page_num).map_err(|_| FrankenError::DatabaseCorrupt {
             detail: format!(
-                "table `{name}` has out-of-range rootpage {root_page_num} in sqlite_master"
+                "sqlite_master entry `{name}` has out-of-range rootpage {root_page_num}"
             ),
         })?;
     i32::try_from(root_page_u32).map_err(|_| FrankenError::DatabaseCorrupt {
-        detail: format!("table `{name}` has rootpage {root_page_num} that exceeds supported range"),
+        detail: format!(
+            "sqlite_master entry `{name}` has rootpage {root_page_num} that exceeds supported range"
+        ),
     })?;
     Ok(root_page_u32)
 }
@@ -4481,6 +4490,36 @@ PRAGMA integrity_check;
             message.contains("supported range")
                 || message.contains("out-of-range")
                 || message.contains("2147483648"),
+            "unexpected load error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_load_from_sqlite_rejects_index_rootpage_above_supported_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("compat_corrupt_index_rootpage_large.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r"
+                CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
+                CREATE INDEX docs_title_idx ON docs(title);
+                PRAGMA writable_schema = ON;
+                UPDATE sqlite_master SET rootpage = 2147483648 WHERE name = 'docs_title_idx';
+                PRAGMA writable_schema = OFF;
+                ",
+            )
+            .unwrap();
+        }
+
+        let err = match load_test_db(&db_path) {
+            Ok(_) => panic!("oversized index rootpage should fail load"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("docs_title_idx") && message.contains("2147483648"),
             "unexpected load error: {message}"
         );
     }

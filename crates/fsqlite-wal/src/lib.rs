@@ -20,6 +20,7 @@
 #[cfg(target_arch = "wasm32")]
 use std::path::Path;
 
+pub mod cell_delta_commit;
 pub mod cell_delta_wal;
 pub mod checkpoint;
 pub mod checkpoint_executor;
@@ -41,6 +42,10 @@ pub mod wal;
 pub mod wal_fec;
 pub mod wal_index;
 
+pub use cell_delta_commit::{
+    CellDeltaDescriptor, FullPageFrame, MixedCommitStats, MixedFrameSubmission,
+    build_cell_delta_frames, serialize_mixed_frames,
+};
 pub use cell_delta_wal::{
     CELL_DELTA_CHECKSUM_SIZE, CELL_DELTA_FRAME_MARKER, CELL_DELTA_HEADER_SIZE,
     CELL_DELTA_MAX_DATA_SIZE, CELL_DELTA_MIN_FRAME_SIZE, CellDeltaWalFrame, CellOp,

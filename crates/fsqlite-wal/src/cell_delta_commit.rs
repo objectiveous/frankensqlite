@@ -157,16 +157,21 @@ impl MixedFrameSubmission {
 
     /// Estimate total serialized size in bytes.
     ///
-    /// Used for buffer pre-allocation and I/O planning.
+    /// Used for I/O planning and telemetry.
     #[must_use]
     pub fn estimated_size(&self, page_size: usize) -> usize {
-        let full_page_size = self.full_page_frames.len() * (24 + page_size);
-        let cell_delta_size: usize = self
-            .cell_delta_frames
-            .iter()
-            .map(|f| CELL_DELTA_HEADER_SIZE + f.cell_data.len() + CELL_DELTA_CHECKSUM_SIZE)
-            .sum();
-        full_page_size + cell_delta_size
+        let full_page_size = self
+            .full_page_frames
+            .len()
+            .saturating_mul(24usize.saturating_add(page_size));
+        let cell_delta_size = self.cell_delta_frames.iter().fold(0usize, |acc, f| {
+            acc.saturating_add(
+                CELL_DELTA_HEADER_SIZE
+                    .saturating_add(f.cell_data.len())
+                    .saturating_add(CELL_DELTA_CHECKSUM_SIZE),
+            )
+        });
+        full_page_size.saturating_add(cell_delta_size)
     }
 }
 
@@ -298,7 +303,7 @@ pub fn serialize_mixed_frames(
     page_size: usize,
 ) -> Result<Vec<u8>> {
     let estimated_size = submission.estimated_size(page_size);
-    let mut buf = Vec::with_capacity(estimated_size);
+    let mut buf = Vec::new();
 
     // 1. Serialize cell-delta frames first
     for frame in &submission.cell_delta_frames {
@@ -550,6 +555,21 @@ mod tests {
         // Full page: 24 + 4096 = 4120
         // Total: 4219
         assert_eq!(estimated, 4219);
+    }
+
+    #[test]
+    fn test_serialize_mixed_frames_rejects_oversized_cell_delta_without_preallocation() {
+        let mut sub = MixedFrameSubmission::new(test_txn_id(), CommitSeq::new(100));
+        sub.add_cell_delta(CellDeltaWalFrame::new(
+            test_page_number(),
+            test_key_digest(),
+            CellOp::Insert,
+            CommitSeq::new(100),
+            test_txn_id(),
+            vec![0u8; crate::cell_delta_wal::CELL_DELTA_MAX_DATA_SIZE + 1],
+        ));
+
+        assert!(serialize_mixed_frames(&sub, 4096).is_err());
     }
 
     #[test]

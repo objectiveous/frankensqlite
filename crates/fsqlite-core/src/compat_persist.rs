@@ -278,9 +278,26 @@ pub fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
         // "wrong # of entries in index" and "page N: never used" errors when
         // stock SQLite runs integrity_check (issue #55).
         for index in &table.indexes {
-            if index.columns.is_empty() {
+            let is_expression_index = index.columns.is_empty() && !index.key_expressions.is_empty();
+            if index.columns.is_empty() && !is_expression_index {
                 continue;
             }
+            let key_exprs = if is_expression_index {
+                index
+                    .key_expressions
+                    .iter()
+                    .map(|expr| {
+                        fsqlite_parser::expr::parse_expr(expr).map_err(|err| {
+                            FrankenError::Internal(format!(
+                                "failed to parse expression index term `{expr}` while persisting `{}`: {err}",
+                                index.name
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
             // Allocate and initialize root page as leaf index page (0x0A).
             let idx_root = txn.allocate_page(cx)?;
             init_leaf_index_page(cx, &mut txn, idx_root, page_size_usize, usable_size)?;
@@ -317,18 +334,25 @@ pub fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
                             // If evaluation fails, include the row (safe default).
                         }
 
-                        // Build index key: (indexed_column_values..., rowid).
+                        // Build index key: (indexed_terms..., rowid).
                         let mut key_values: Vec<SqliteValue> = Vec::new();
-                        for col_name in &index.columns {
-                            let col_idx = table
-                                .columns
-                                .iter()
-                                .position(|c| c.name.eq_ignore_ascii_case(col_name));
-                            if let Some(idx) = col_idx {
-                                key_values
-                                    .push(values.get(idx).cloned().unwrap_or(SqliteValue::Null));
-                            } else {
-                                key_values.push(SqliteValue::Null);
+                        if is_expression_index {
+                            for expr in &key_exprs {
+                                key_values.push(eval_join_expr(expr, values, &col_map)?);
+                            }
+                        } else {
+                            for col_name in &index.columns {
+                                let col_idx = table
+                                    .columns
+                                    .iter()
+                                    .position(|c| c.name.eq_ignore_ascii_case(col_name));
+                                if let Some(idx) = col_idx {
+                                    key_values.push(
+                                        values.get(idx).cloned().unwrap_or(SqliteValue::Null),
+                                    );
+                                } else {
+                                    key_values.push(SqliteValue::Null);
+                                }
                             }
                         }
                         key_values.push(SqliteValue::Integer(rowid));
@@ -348,6 +372,16 @@ pub fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
                 // Prefer original DDL for the same reasons as tables: preserves
                 // exact WHERE clause formatting, collation names, etc.
                 Some(orig.clone())
+            } else if is_expression_index {
+                Some(build_create_expression_index_sql(
+                    &index.name,
+                    &table_name,
+                    index.is_unique,
+                    &index.key_expressions,
+                    &index.key_collations,
+                    &index.key_sort_directions,
+                    index.where_clause.as_deref(),
+                ))
             } else {
                 let terms: Vec<CreateIndexSqlTerm<'_>> = index
                     .columns
@@ -873,6 +907,12 @@ fn parse_create_index_sql_to_schema(
     root_page: i32,
     sql: &str,
 ) -> Option<IndexSchema> {
+    if let Some(Statement::CreateIndex(create)) = parse_single_statement(sql) {
+        return Some(create_index_statement_to_index_schema(
+            index_name, root_page, &create,
+        ));
+    }
+
     // Simple regex-free parser: look for "ON table_name (col1, col2 COLLATE NOCASE DESC)"
     // while preserving quoted names and comments inside the indexed term list.
     let keyword_tokens = unquoted_sql_keyword_tokens(sql);
@@ -918,6 +958,70 @@ fn parse_create_index_sql_to_schema(
         is_unique,
         key_collations: collations,
     })
+}
+
+fn create_index_statement_to_index_schema(
+    index_name: &str,
+    root_page: i32,
+    create: &fsqlite_ast::CreateIndexStatement,
+) -> IndexSchema {
+    let normalized_terms = create
+        .columns
+        .iter()
+        .map(|indexed| {
+            Some((
+                indexed_column_name(indexed)?.to_owned(),
+                normalized_indexed_column_collation(indexed),
+            ))
+        })
+        .collect::<Option<Vec<_>>>();
+    let (columns, key_expressions, key_collations) =
+        if let Some(normalized_terms) = normalized_terms {
+            (
+                normalized_terms
+                    .iter()
+                    .map(|(column_name, _)| column_name.clone())
+                    .collect(),
+                Vec::new(),
+                normalized_terms
+                    .into_iter()
+                    .map(|(_, collation)| collation)
+                    .collect(),
+            )
+        } else {
+            (
+                Vec::new(),
+                create
+                    .columns
+                    .iter()
+                    .map(|indexed| indexed.expr.to_string())
+                    .collect(),
+                create
+                    .columns
+                    .iter()
+                    .map(normalized_indexed_column_collation)
+                    .collect(),
+            )
+        };
+
+    IndexSchema {
+        name: index_name.to_owned(),
+        root_page,
+        columns,
+        key_expressions,
+        key_sort_directions: create
+            .columns
+            .iter()
+            .map(|indexed| indexed.direction.unwrap_or(SortDirection::Asc))
+            .collect(),
+        where_clause: create.where_clause.as_ref().map(ToString::to_string),
+        is_unique: create.unique,
+        key_collations,
+    }
+}
+
+fn normalized_indexed_column_collation(indexed: &IndexedColumn) -> Option<String> {
+    indexed_column_collation(indexed).map(|collation| collation.to_ascii_uppercase())
 }
 
 fn extract_index_term_direction(remainder: &str) -> SortDirection {
@@ -1384,6 +1488,55 @@ pub(crate) fn build_create_index_sql(
     sql.push(')');
     if let Some(expr) = where_clause {
         let _ = write!(sql, " WHERE {expr}");
+    }
+    sql
+}
+
+fn build_create_expression_index_sql(
+    index_name: &str,
+    table_name: &str,
+    unique: bool,
+    expressions: &[String],
+    collations: &[Option<String>],
+    directions: &[SortDirection],
+    where_clause: Option<&str>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut sql = if unique {
+        format!(
+            "CREATE UNIQUE INDEX {} ON {} (",
+            quote_identifier(index_name),
+            quote_identifier(table_name)
+        )
+    } else {
+        format!(
+            "CREATE INDEX {} ON {} (",
+            quote_identifier(index_name),
+            quote_identifier(table_name)
+        )
+    };
+    for (i, expr) in expressions.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(expr);
+        let expression_already_declares_collation = unquoted_sql_keyword_tokens(expr)
+            .iter()
+            .any(|token| token == "COLLATE");
+        if !expression_already_declares_collation
+            && let Some(collation) = collations.get(i).and_then(|c| c.as_deref())
+        {
+            let _ = write!(sql, " COLLATE {}", quote_identifier(collation));
+        }
+        match directions.get(i).copied() {
+            Some(SortDirection::Asc) => sql.push_str(" ASC"),
+            Some(SortDirection::Desc) => sql.push_str(" DESC"),
+            None => {}
+        }
+    }
+    sql.push(')');
+    if let Some(predicate) = where_clause {
+        let _ = write!(sql, " WHERE {predicate}");
     }
     sql
 }
@@ -4297,6 +4450,21 @@ PRAGMA integrity_check;
     }
 
     #[test]
+    fn test_parse_create_index_sql_preserves_expression_terms() {
+        let sql =
+            "CREATE UNIQUE INDEX uq_agents_name_ci ON agents(lower(name) DESC) WHERE is_active = 1";
+
+        let idx = parse_create_index_sql_to_schema("uq_agents_name_ci", 7, sql).unwrap();
+
+        assert!(idx.columns.is_empty());
+        assert_eq!(idx.key_expressions.len(), 1);
+        assert_eq!(idx.key_expressions[0].to_ascii_lowercase(), "lower(name)");
+        assert_eq!(idx.key_sort_directions, vec![SortDirection::Desc]);
+        assert_eq!(idx.where_clause.as_deref(), Some("is_active = 1"));
+        assert!(idx.is_unique);
+    }
+
+    #[test]
     fn test_build_create_index_sql_preserves_unique_collation_and_direction() {
         let terms = [
             CreateIndexSqlTerm {
@@ -4338,6 +4506,173 @@ PRAGMA integrity_check;
         assert_eq!(
             sql,
             "CREATE UNIQUE INDEX \"idx\"\"q\" ON \"ta\"\"ble\" (\"na\"\"me\" COLLATE \"NO\"\"CASE\" DESC)"
+        );
+    }
+
+    #[test]
+    fn test_build_create_expression_index_sql_does_not_duplicate_collation() {
+        let expressions = vec!["lower(name) COLLATE NOCASE".to_owned()];
+        let collations = vec![Some("NOCASE".to_owned())];
+        let directions = vec![SortDirection::Desc];
+
+        let sql = build_create_expression_index_sql(
+            "idx_expr",
+            "agents",
+            false,
+            &expressions,
+            &collations,
+            &directions,
+            Some("is_active = 1"),
+        );
+
+        assert_eq!(
+            sql,
+            "CREATE INDEX \"idx_expr\" ON \"agents\" (lower(name) COLLATE NOCASE DESC) WHERE is_active = 1"
+        );
+    }
+
+    #[test]
+    fn test_persist_to_sqlite_keeps_expression_index_btree_and_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("expression-index-persist.db");
+        let cx = Cx::new();
+
+        let mut db = MemDatabase::new();
+        db.create_table_at(2, 3);
+        let table_data = db.get_table_mut(2).unwrap();
+        table_data.insert_row(
+            1,
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("Alpha".into()),
+                SqliteValue::Integer(1),
+            ],
+        );
+        table_data.insert_row(
+            2,
+            vec![
+                SqliteValue::Integer(2),
+                SqliteValue::Text("Dormant".into()),
+                SqliteValue::Integer(0),
+            ],
+        );
+
+        let schema = vec![TableSchema {
+            name: "agents".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo {
+                    name: "id".to_owned(),
+                    affinity: 'D',
+                    is_ipk: true,
+                    type_name: Some("INTEGER".to_owned()),
+                    notnull: false,
+                    unique: false,
+                    default_value: None,
+                    strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                },
+                ColumnInfo {
+                    name: "name".to_owned(),
+                    affinity: 'B',
+                    is_ipk: false,
+                    type_name: Some("TEXT".to_owned()),
+                    notnull: true,
+                    unique: false,
+                    default_value: None,
+                    strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                },
+                ColumnInfo {
+                    name: "is_active".to_owned(),
+                    affinity: 'D',
+                    is_ipk: false,
+                    type_name: Some("INTEGER".to_owned()),
+                    notnull: true,
+                    unique: false,
+                    default_value: Some("1".to_owned()),
+                    strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                },
+            ],
+            indexes: vec![IndexSchema {
+                name: "uq_agents_name_ci".to_owned(),
+                root_page: 3,
+                columns: Vec::new(),
+                key_expressions: vec!["lower(name)".to_owned()],
+                key_sort_directions: vec![SortDirection::Asc],
+                where_clause: Some("is_active = 1".to_owned()),
+                is_unique: true,
+                key_collations: vec![None],
+            }],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: vec![vec!["id".to_owned()]],
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }];
+        let header = DatabaseHeader {
+            page_size: DEFAULT_PAGE_SIZE,
+            schema_cookie: 1,
+            change_counter: 1,
+            version_valid_for: 1,
+            ..DatabaseHeader::default()
+        };
+        let mut original_ddl = HashMap::new();
+        original_ddl.insert(
+            "agents".to_owned(),
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 1)"
+                .to_owned(),
+        );
+        original_ddl.insert(
+            "uq_agents_name_ci".to_owned(),
+            "CREATE UNIQUE INDEX uq_agents_name_ci ON agents(lower(name)) WHERE is_active = 1"
+                .to_owned(),
+        );
+
+        persist_to_sqlite_with_header_and_master_entries(
+            &cx,
+            &db_path,
+            &schema,
+            &db,
+            &header,
+            &[],
+            &original_ddl,
+        )
+        .unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let index_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_agents_name_ci';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            index_sql.to_ascii_lowercase().contains("lower(name)")
+                && index_sql
+                    .to_ascii_lowercase()
+                    .contains("where is_active = 1"),
+            "expression index SQL should be preserved: {index_sql}"
+        );
+        let duplicate = conn.execute(
+            "INSERT INTO agents(name, is_active) VALUES ('ALPHA', 1);",
+            [],
+        );
+        assert!(
+            duplicate.is_err(),
+            "persisted expression index should still enforce active-name uniqueness"
         );
     }
 

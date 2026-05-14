@@ -1413,10 +1413,18 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
             let tokens: Vec<&str> = remainder.split_whitespace().collect();
             let type_decl = extract_type_declaration(&tokens);
             let affinity = type_to_affinity(&type_decl);
-            let upper = col_def.to_ascii_uppercase();
+            let keyword_tokens = unquoted_sql_keyword_tokens(remainder);
+            let has_primary_key =
+                unquoted_tokens_contain_phrase(&keyword_tokens, &["PRIMARY", "KEY"]);
+            let has_primary_key_desc =
+                unquoted_tokens_contain_phrase(&keyword_tokens, &["PRIMARY", "KEY", "DESC"]);
+            let has_unique = keyword_tokens
+                .iter()
+                .any(|keyword| matches!(keyword.as_str(), "UNIQUE"));
+            let has_not_null = unquoted_tokens_contain_phrase(&keyword_tokens, &["NOT", "NULL"]);
             let is_ipk = !is_without_rowid
-                && upper.contains("PRIMARY KEY")
-                && !upper.contains("PRIMARY KEY DESC")
+                && has_primary_key
+                && !has_primary_key_desc
                 && type_decl.eq_ignore_ascii_case("INTEGER");
             let type_name = if type_decl.is_empty() {
                 None
@@ -1433,28 +1441,18 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
 
             let default_value = extract_default_value(remainder);
 
-            // Extract COLLATE name from column definition.
-            let collation = upper
-                .find("COLLATE ")
-                .map(|pos| {
-                    // Read the collation name from the original (non-uppercased) text.
-                    let after = &col_def[pos + 8..];
-                    after
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                        .trim_end_matches(',')
-                        .to_owned()
-                })
-                .filter(|s| !s.is_empty());
+            let collation = keyword_tokens
+                .windows(2)
+                .find(|window| matches!(window[0].as_str(), "COLLATE"))
+                .map(|window| window[1].clone());
 
             Some(ColumnInfo {
                 name,
                 affinity,
                 is_ipk,
                 type_name,
-                notnull: upper.contains("NOT NULL"),
-                unique: upper.contains("UNIQUE") || upper.contains("PRIMARY KEY"),
+                notnull: has_not_null,
+                unique: has_unique || has_primary_key,
                 default_value,
                 strict_type,
                 generated_expr: None,
@@ -1511,21 +1509,7 @@ pub fn is_without_rowid_table_sql(sql: &str) -> bool {
         return false;
     };
     let tail = &sql[close_paren + 1..];
-    let mut tokens = Vec::new();
-    let mut token = String::new();
-    for ch in tail.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            token.push(ch.to_ascii_uppercase());
-        } else if !token.is_empty() {
-            tokens.push(std::mem::take(&mut token));
-        }
-    }
-    if !token.is_empty() {
-        tokens.push(token);
-    }
-    tokens
-        .windows(2)
-        .any(|window| window[0] == "WITHOUT" && window[1] == "ROWID")
+    unquoted_tokens_contain_phrase(&unquoted_sql_keyword_tokens(tail), &["WITHOUT", "ROWID"])
 }
 
 fn parse_virtual_table_columns_from_sql(sql: &str) -> Option<Vec<ColumnInfo>> {
@@ -1608,18 +1592,9 @@ pub fn is_strict_table_sql(sql: &str) -> bool {
         return false;
     };
     let tail = &sql[close_paren + 1..];
-    let mut token = String::new();
-    for ch in tail.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            token.push(ch.to_ascii_uppercase());
-        } else if !token.is_empty() {
-            if token == "STRICT" {
-                return true;
-            }
-            token.clear();
-        }
-    }
-    token == "STRICT"
+    unquoted_sql_keyword_tokens(tail)
+        .iter()
+        .any(|keyword| matches!(keyword.as_str(), "STRICT"))
 }
 
 /// Return true when CREATE TABLE SQL declares AUTOINCREMENT.
@@ -1629,18 +1604,9 @@ pub fn is_autoincrement_table_sql(sql: &str) -> bool {
         return autoincrement_from_create_table_statement(&create);
     }
 
-    let mut token = String::new();
-    for ch in sql.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            token.push(ch.to_ascii_uppercase());
-        } else if !token.is_empty() {
-            if token == "AUTOINCREMENT" {
-                return true;
-            }
-            token.clear();
-        }
-    }
-    token == "AUTOINCREMENT"
+    unquoted_sql_keyword_tokens(sql)
+        .iter()
+        .any(|keyword| matches!(keyword.as_str(), "AUTOINCREMENT"))
 }
 
 pub(crate) fn autoincrement_from_create_table_statement(create: &CreateTableStatement) -> bool {
@@ -1824,11 +1790,11 @@ fn strip_wrapping_default_parens(mut default_sql: &str) -> &str {
         let mut wraps_entire_expr = false;
         while idx < bytes.len() {
             match bytes[idx] {
-                b'\'' => {
+                quote @ (b'\'' | b'"') => {
                     idx += 1;
                     while idx < bytes.len() {
-                        if bytes[idx] == b'\'' {
-                            if idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
+                        if bytes[idx] == quote {
+                            if idx + 1 < bytes.len() && bytes[idx + 1] == quote {
                                 idx += 2;
                             } else {
                                 idx += 1;
@@ -2494,6 +2460,122 @@ fn starts_with_unquoted_table_constraint(def: &str) -> bool {
         || upper == "FOREIGN"
 }
 
+type SqlCharIndices<'a> = std::iter::Peekable<std::str::CharIndices<'a>>;
+
+fn unquoted_sql_keyword_tokens(input: &str) -> Vec<String> {
+    collect_unquoted_sql_keyword_tokens(input)
+        .into_iter()
+        .map(|(token, _)| token)
+        .collect()
+}
+
+fn find_unquoted_sql_keyword(input: &str, keyword: &str) -> Option<usize> {
+    let keyword = keyword.to_ascii_uppercase();
+    collect_unquoted_sql_keyword_tokens(input)
+        .into_iter()
+        .find_map(|(token, start)| (token == keyword).then_some(start))
+}
+
+fn collect_unquoted_sql_keyword_tokens(input: &str) -> Vec<(String, usize)> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut current_start = 0_usize;
+    let mut chars = input.char_indices().peekable();
+
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '\'' | '"' | '`' => {
+                push_keyword_token(&mut tokens, &mut current, current_start);
+                skip_quoted_sql(&mut chars, ch);
+            }
+            '[' => {
+                push_keyword_token(&mut tokens, &mut current, current_start);
+                skip_bracket_identifier(&mut chars);
+            }
+            '-' if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '-') => {
+                let _ = chars.next();
+                push_keyword_token(&mut tokens, &mut current, current_start);
+                skip_line_comment(&mut chars);
+            }
+            '/' if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '*') => {
+                let _ = chars.next();
+                push_keyword_token(&mut tokens, &mut current, current_start);
+                skip_block_comment(&mut chars);
+            }
+            _ if ch.is_ascii_alphanumeric() || matches!(ch, '_') => {
+                if current.is_empty() {
+                    current_start = idx;
+                }
+                current.push(ch.to_ascii_uppercase());
+            }
+            _ => push_keyword_token(&mut tokens, &mut current, current_start),
+        }
+    }
+
+    push_keyword_token(&mut tokens, &mut current, current_start);
+    tokens
+}
+
+fn push_keyword_token(
+    tokens: &mut Vec<(String, usize)>,
+    current: &mut String,
+    current_start: usize,
+) {
+    if !current.is_empty() {
+        tokens.push((std::mem::take(current), current_start));
+    }
+}
+
+fn skip_quoted_sql(chars: &mut SqlCharIndices<'_>, quote: char) {
+    while let Some((_, ch)) = chars.next() {
+        if ch != quote {
+            continue;
+        }
+        if chars.peek().is_some_and(|(_, next_ch)| *next_ch == quote) {
+            let _ = chars.next();
+        } else {
+            break;
+        }
+    }
+}
+
+fn skip_bracket_identifier(chars: &mut SqlCharIndices<'_>) {
+    for (_, ch) in chars.by_ref() {
+        if ch == ']' {
+            break;
+        }
+    }
+}
+
+fn skip_line_comment(chars: &mut SqlCharIndices<'_>) {
+    for (_, ch) in chars.by_ref() {
+        if ch == '\n' || ch == '\r' {
+            break;
+        }
+    }
+}
+
+fn skip_block_comment(chars: &mut SqlCharIndices<'_>) {
+    let mut previous = '\0';
+    for (_, ch) in chars.by_ref() {
+        if previous == '*' && ch == '/' {
+            break;
+        }
+        previous = ch;
+    }
+}
+
+fn unquoted_tokens_contain_phrase(tokens: &[String], phrase: &[&str]) -> bool {
+    !phrase.is_empty()
+        && tokens.len() >= phrase.len()
+        && tokens.windows(phrase.len()).any(|window| {
+            window
+                .iter()
+                .zip(phrase)
+                .all(|(token, expected)| token.as_str() == *expected)
+        })
+}
+
 fn strip_identifier_quotes(token: &str) -> String {
     let trimmed = token.trim();
     if trimmed.len() >= 2 {
@@ -2534,10 +2616,9 @@ fn extract_type_declaration(tokens: &[&str]) -> String {
 
 /// Extract a DEFAULT value from a column definition remainder (the part after
 /// the column name).  Handles `DEFAULT literal`, `DEFAULT -number`,
-/// `DEFAULT 'string'`, and `DEFAULT (expr)`.
+/// `DEFAULT 'string'`, `DEFAULT "string"`, and `DEFAULT (expr)`.
 fn extract_default_value(remainder: &str) -> Option<String> {
-    let upper = remainder.to_ascii_uppercase();
-    let pos = upper.find("DEFAULT")?;
+    let pos = find_unquoted_sql_keyword(remainder, "DEFAULT")?;
     let after = remainder[pos + 7..].trim_start();
     if after.is_empty() {
         return None;
@@ -2545,25 +2626,55 @@ fn extract_default_value(remainder: &str) -> Option<String> {
     // Parenthesized expression: DEFAULT (...)
     if after.starts_with('(') {
         let mut depth = 0i32;
-        for (i, ch) in after.char_indices() {
-            if ch == '(' {
-                depth += 1;
-            } else if ch == ')' {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(after[..=i].to_owned());
+        let bytes = after.as_bytes();
+        let mut idx = 0_usize;
+        while idx < bytes.len() {
+            match bytes[idx] {
+                quote @ (b'\'' | b'"') => {
+                    idx += 1;
+                    while idx < bytes.len() {
+                        if bytes[idx] == quote {
+                            if idx + 1 < bytes.len() && bytes[idx + 1] == quote {
+                                idx += 2;
+                            } else {
+                                idx += 1;
+                                break;
+                            }
+                        } else {
+                            idx += 1;
+                        }
+                    }
+                    continue;
                 }
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(after[..=idx].to_owned());
+                    }
+                    if depth < 0 {
+                        return None;
+                    }
+                }
+                _ => {}
             }
+            idx += 1;
         }
         return None;
     }
-    // Quoted string: DEFAULT '...'
-    if let Some(rest) = after.strip_prefix('\'') {
+    // Quoted string: DEFAULT '...' or DEFAULT "..."
+    if let Some(quote) = after
+        .as_bytes()
+        .first()
+        .copied()
+        .filter(|quote| matches!(*quote, b'\'' | b'"'))
+    {
+        let rest = &after[1..];
         let mut i = 0;
         let bytes = rest.as_bytes();
         while i < bytes.len() {
-            if bytes[i] == b'\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+            if bytes[i] == quote {
+                if i + 1 < bytes.len() && bytes[i + 1] == quote {
                     i += 2;
                     continue;
                 }
@@ -2640,6 +2751,34 @@ mod tests {
         assert_eq!(
             parse_loaded_column_default_value("'x' || 'y'"),
             SqliteValue::Text("'x' || 'y'".into()),
+        );
+        assert_eq!(
+            parse_loaded_column_default_value("('a)b')"),
+            SqliteValue::Text("a)b".into()),
+        );
+        assert_eq!(
+            parse_loaded_column_default_value(r#"("a)b")"#),
+            SqliteValue::Text("a)b".into()),
+        );
+        assert_eq!(
+            extract_default_value("TEXT DEFAULT ('a)b')").as_deref(),
+            Some("('a)b')")
+        );
+        assert_eq!(
+            extract_default_value(r#"TEXT DEFAULT ("a)b")"#).as_deref(),
+            Some(r#"("a)b")"#)
+        );
+        assert_eq!(
+            extract_default_value("TEXT CHECK (note <> 'DEFAULT bad') DEFAULT 'ok'").as_deref(),
+            Some("'ok'")
+        );
+        assert_eq!(
+            extract_default_value("TEXT CHECK (note <> 'DEFAULT bad')").as_deref(),
+            None
+        );
+        assert_eq!(
+            extract_default_value("TEXT /* DEFAULT 'bad' */ DEFAULT 'ok'").as_deref(),
+            Some("'ok'")
         );
     }
 
@@ -3287,9 +3426,12 @@ PRAGMA integrity_check;
 
     #[test]
     fn test_parse_columns_from_create_sql_ignores_constraint_keywords_inside_default_literals() {
-        let sql = "CREATE TABLE t (note TEXT DEFAULT 'NOT NULL UNIQUE PRIMARY KEY')";
+        let sql = r#"CREATE TABLE t (
+            note TEXT DEFAULT 'NOT NULL UNIQUE PRIMARY KEY',
+            tag TEXT DEFAULT "fallback"
+        )"#;
         let cols = parse_columns_from_create_sql(sql);
-        assert_eq!(cols.len(), 1);
+        assert_eq!(cols.len(), 2);
         assert!(!cols[0].notnull);
         assert!(!cols[0].unique);
         assert!(!cols[0].is_ipk);
@@ -3297,6 +3439,46 @@ PRAGMA integrity_check;
             cols[0].default_value.as_deref(),
             Some("'NOT NULL UNIQUE PRIMARY KEY'")
         );
+        assert_eq!(cols[1].default_value.as_deref(), Some("fallback"));
+    }
+
+    #[test]
+    fn test_parse_columns_fallback_ignores_constraint_keywords_inside_default_literals() {
+        let sql = r#"CREATE TABLE t (
+            note TEXT DEFAULT 'NOT NULL UNIQUE PRIMARY KEY COLLATE bogus',
+            actual INTEGER DEFAULT "PRIMARY KEY" PRIMARY KEY,
+            required TEXT DEFAULT "UNIQUE" NOT NULL,
+            uniq TEXT DEFAULT "NOT NULL" UNIQUE COLLATE nocase
+        ) trailing"#;
+        let cols = parse_columns_from_create_sql(sql);
+
+        assert_eq!(cols.len(), 4);
+        assert!(!cols[0].notnull);
+        assert!(!cols[0].unique);
+        assert!(!cols[0].is_ipk);
+        assert_eq!(cols[0].collation, None);
+        assert!(cols[1].is_ipk);
+        assert!(cols[1].unique);
+        assert!(cols[2].notnull);
+        assert!(!cols[2].unique);
+        assert!(!cols[3].notnull);
+        assert!(cols[3].unique);
+        assert_eq!(cols[3].collation.as_deref(), Some("NOCASE"));
+    }
+
+    #[test]
+    fn test_parse_columns_fallback_finds_unquoted_default_keyword() {
+        let sql = r#"CREATE TABLE t (
+            note TEXT CHECK (note <> 'DEFAULT NOT NULL') DEFAULT 'ok',
+            other TEXT CHECK (other <> "DEFAULT UNIQUE")
+        ) trailing"#;
+        let cols = parse_columns_from_create_sql(sql);
+
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].default_value.as_deref(), Some("'ok'"));
+        assert!(!cols[0].notnull);
+        assert_eq!(cols[1].default_value, None);
+        assert!(!cols[1].unique);
     }
 
     #[test]
@@ -3843,6 +4025,9 @@ PRAGMA integrity_check;
     fn test_is_autoincrement_table_sql_ignores_default_literal_keyword() {
         assert!(!is_autoincrement_table_sql(
             "CREATE TABLE t(id INTEGER PRIMARY KEY, note TEXT DEFAULT 'AUTOINCREMENT')"
+        ));
+        assert!(!is_autoincrement_table_sql(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, note TEXT DEFAULT 'AUTOINCREMENT') trailing"
         ));
     }
 

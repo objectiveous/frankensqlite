@@ -623,6 +623,11 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             foreign_keys,
             check_constraints,
         });
+        let current_table_schema = schema.last().ok_or_else(|| {
+            FrankenError::Internal(format!(
+                "compat loader lost table schema after registering `{table_name_for_err}`"
+            ))
+        })?;
 
         // Read all rows from this table's B-tree.
         let file_root =
@@ -638,13 +643,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
 
         if let Some(mem_table) = db.tables.get_mut(&real_root_page) {
             let mut unique_groups = Vec::<(Vec<usize>, Vec<Option<String>>)>::new();
-            for (column_index, column) in schema
-                .last()
-                .expect("current table schema must exist")
-                .columns
-                .iter()
-                .enumerate()
-            {
+            for (column_index, column) in current_table_schema.columns.iter().enumerate() {
                 if column.unique && !column.is_ipk {
                     unique_groups.push((vec![column_index], vec![column.collation.clone()]));
                 }
@@ -658,9 +657,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                     .iter()
                     .enumerate()
                     .filter_map(|(term_idx, column_name)| {
-                        schema
-                            .last()
-                            .expect("current table schema must exist")
+                        current_table_schema
                             .columns
                             .iter()
                             .position(|column| column.name.eq_ignore_ascii_case(column_name))
@@ -673,13 +670,9 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                     })
                     .unzip();
                 if group.is_empty()
-                    || group.iter().all(|&column_index| {
-                        schema
-                            .last()
-                            .expect("current table schema must exist")
-                            .columns[column_index]
-                            .is_ipk
-                    })
+                    || group
+                        .iter()
+                        .all(|&column_index| current_table_schema.columns[column_index].is_ipk)
                     || unique_groups.iter().any(|(existing, _)| existing == &group)
                 {
                     continue;
@@ -709,15 +702,13 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                             ),
                         }
                     })?;
-                    if !without_rowid && let Some(ipk_idx) = ipk_col_idx {
-                        hydrate_rowid_alias_value(
-                            &mut values,
-                            ipk_idx,
-                            rowid,
-                            num_columns,
-                            &table_name_for_err,
-                        )?;
-                    }
+                    inflate_loaded_table_row_values(
+                        &mut values,
+                        rowid,
+                        &current_table_schema.columns,
+                        if without_rowid { None } else { ipk_col_idx },
+                        &table_name_for_err,
+                    )?;
                     mem_table.insert_row(rowid, values);
                     if !cursor.next(cx)? {
                         break;
@@ -1819,56 +1810,278 @@ fn indexed_column_collation(indexed_column: &IndexedColumn) -> Option<String> {
         .or_else(|| extract(&indexed_column.expr).map(str::to_owned))
 }
 
-fn hydrate_rowid_alias_value(
+fn strip_wrapping_default_parens(mut default_sql: &str) -> &str {
+    loop {
+        let trimmed = default_sql.trim();
+        let bytes = trimmed.as_bytes();
+        if bytes.first() != Some(&b'(') || bytes.last() != Some(&b')') {
+            return trimmed;
+        }
+
+        let mut depth = 0_i32;
+        let mut idx = 0_usize;
+        let mut wraps_entire_expr = false;
+        while idx < bytes.len() {
+            match bytes[idx] {
+                b'\'' => {
+                    idx += 1;
+                    while idx < bytes.len() {
+                        if bytes[idx] == b'\'' {
+                            if idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
+                                idx += 2;
+                            } else {
+                                idx += 1;
+                                break;
+                            }
+                        } else {
+                            idx += 1;
+                        }
+                    }
+                    continue;
+                }
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        wraps_entire_expr = idx == bytes.len() - 1;
+                        break;
+                    }
+                    if depth < 0 {
+                        return trimmed;
+                    }
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+
+        if !wraps_entire_expr || depth != 0 {
+            return trimmed;
+        }
+        default_sql = &trimmed[1..trimmed.len() - 1];
+    }
+}
+
+fn parse_loaded_column_default_value(default_sql: &str) -> SqliteValue {
+    let default_sql = strip_wrapping_default_parens(default_sql);
+    if default_sql.eq_ignore_ascii_case("NULL") {
+        SqliteValue::Null
+    } else if let Ok(value) = default_sql.parse::<i64>() {
+        SqliteValue::Integer(value)
+    } else if let Ok(value) = default_sql.parse::<f64>() {
+        SqliteValue::Float(value)
+    } else if default_sql.len() >= 2 && default_sql.starts_with('\'') && default_sql.ends_with('\'')
+    {
+        SqliteValue::Text(
+            default_sql[1..default_sql.len() - 1]
+                .replace("''", "'")
+                .into(),
+        )
+    } else {
+        SqliteValue::Text(default_sql.into())
+    }
+}
+
+fn inflate_loaded_table_row_values(
     values: &mut Vec<SqliteValue>,
-    ipk_idx: usize,
     rowid: i64,
-    num_columns: usize,
+    columns: &[ColumnInfo],
+    rowid_alias_col_idx: Option<usize>,
     table_name: &str,
 ) -> Result<()> {
-    match values.len() {
-        len if len + 1 == num_columns => {
-            values.insert(ipk_idx, SqliteValue::Integer(rowid));
-        }
-        len if len == num_columns => match values.get_mut(ipk_idx) {
-            Some(slot @ SqliteValue::Null) => {
-                *slot = SqliteValue::Integer(rowid);
-            }
-            Some(SqliteValue::Integer(encoded_rowid)) if *encoded_rowid == rowid => {}
-            Some(SqliteValue::Integer(encoded_rowid)) => {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "table `{table_name}` rowid {rowid} stores inconsistent INTEGER PRIMARY KEY alias value {encoded_rowid}"
-                    ),
-                });
-            }
-            Some(other) => {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "table `{table_name}` rowid {rowid} stores non-integer INTEGER PRIMARY KEY alias value {other:?}"
-                    ),
-                });
-            }
-            None => {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "table `{table_name}` rowid {rowid} payload is missing INTEGER PRIMARY KEY alias column"
-                    ),
-                });
-            }
-        },
-        len => {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "table `{table_name}` rowid {rowid} payload has {len} columns; expected {} or {}",
-                    num_columns.saturating_sub(1),
-                    num_columns
-                ),
-            });
-        }
+    let num_columns = columns.len();
+    if values.len() > num_columns {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "table `{table_name}` rowid {rowid} payload has {} columns; expected at most {num_columns}",
+                values.len()
+            ),
+        });
+    }
+    if let Some(ipk_idx) = rowid_alias_col_idx
+        && ipk_idx >= num_columns
+    {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "table `{table_name}` rowid {rowid} has invalid INTEGER PRIMARY KEY alias column index {ipk_idx}"
+            ),
+        });
     }
 
+    let payload_values = std::mem::take(values);
+    let inflated = inflate_loaded_table_row_values_from_payload(
+        &payload_values,
+        rowid,
+        columns,
+        rowid_alias_col_idx,
+        table_name,
+    )?;
+    *values = inflated;
+
     Ok(())
+}
+
+fn inflate_loaded_table_row_values_from_payload(
+    payload_values: &[SqliteValue],
+    rowid: i64,
+    columns: &[ColumnInfo],
+    rowid_alias_col_idx: Option<usize>,
+    table_name: &str,
+) -> Result<Vec<SqliteValue>> {
+    let Some(ipk_idx) = rowid_alias_col_idx else {
+        return inflate_loaded_table_row_values_with_alias_alignment(
+            payload_values,
+            rowid,
+            columns,
+            None,
+            false,
+            table_name,
+        );
+    };
+
+    if payload_values.len() == columns.len() {
+        return inflate_loaded_table_row_values_with_alias_alignment(
+            payload_values,
+            rowid,
+            columns,
+            Some(ipk_idx),
+            true,
+            table_name,
+        );
+    }
+
+    let Some(value_at_alias_position) = payload_values.get(ipk_idx) else {
+        return inflate_loaded_table_row_values_with_alias_alignment(
+            payload_values,
+            rowid,
+            columns,
+            Some(ipk_idx),
+            false,
+            table_name,
+        );
+    };
+
+    let alias_slot_could_be_present = match value_at_alias_position {
+        SqliteValue::Null => true,
+        SqliteValue::Integer(encoded_rowid) => *encoded_rowid == rowid,
+        _ => false,
+    };
+    if !alias_slot_could_be_present {
+        return inflate_loaded_table_row_values_with_alias_alignment(
+            payload_values,
+            rowid,
+            columns,
+            Some(ipk_idx),
+            false,
+            table_name,
+        );
+    }
+
+    let with_alias = inflate_loaded_table_row_values_with_alias_alignment(
+        payload_values,
+        rowid,
+        columns,
+        Some(ipk_idx),
+        true,
+        table_name,
+    )?;
+    let without_alias = inflate_loaded_table_row_values_with_alias_alignment(
+        payload_values,
+        rowid,
+        columns,
+        Some(ipk_idx),
+        false,
+        table_name,
+    )?;
+    let with_alias_valid = loaded_row_values_satisfy_notnull(columns, &with_alias);
+    let without_alias_valid = loaded_row_values_satisfy_notnull(columns, &without_alias);
+
+    if !with_alias_valid && !without_alias_valid {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "table `{table_name}` rowid {rowid} short payload violates NOT NULL constraints under both rowid-alias alignments"
+            ),
+        });
+    }
+    if with_alias_valid
+        && (!without_alias_valid || matches!(value_at_alias_position, SqliteValue::Null))
+    {
+        Ok(with_alias)
+    } else {
+        Ok(without_alias)
+    }
+}
+
+fn inflate_loaded_table_row_values_with_alias_alignment(
+    payload_values: &[SqliteValue],
+    rowid: i64,
+    columns: &[ColumnInfo],
+    rowid_alias_col_idx: Option<usize>,
+    payload_includes_rowid_alias: bool,
+    table_name: &str,
+) -> Result<Vec<SqliteValue>> {
+    let mut inflated = Vec::with_capacity(columns.len());
+    let mut payload_idx = 0_usize;
+
+    for (col_idx, column) in columns.iter().enumerate() {
+        if rowid_alias_col_idx == Some(col_idx) && !payload_includes_rowid_alias {
+            inflated.push(SqliteValue::Integer(rowid));
+            continue;
+        }
+
+        let value = if let Some(value) = payload_values.get(payload_idx) {
+            payload_idx += 1;
+            value.clone()
+        } else if let Some(default_sql) = column.default_value.as_ref() {
+            parse_loaded_column_default_value(default_sql)
+        } else {
+            SqliteValue::Null
+        };
+
+        if rowid_alias_col_idx == Some(col_idx) {
+            match &value {
+                SqliteValue::Null => {
+                    inflated.push(SqliteValue::Integer(rowid));
+                    continue;
+                }
+                SqliteValue::Integer(encoded_rowid) if *encoded_rowid == rowid => {}
+                SqliteValue::Integer(encoded_rowid) => {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table `{table_name}` rowid {rowid} stores inconsistent INTEGER PRIMARY KEY alias value {encoded_rowid}"
+                        ),
+                    });
+                }
+                other => {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table `{table_name}` rowid {rowid} stores non-integer INTEGER PRIMARY KEY alias value {other:?}"
+                        ),
+                    });
+                }
+            }
+        }
+
+        inflated.push(value);
+    }
+
+    if payload_idx != payload_values.len() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "table `{table_name}` rowid {rowid} left {} payload columns unconsumed after rowid-alias inflation",
+                payload_values.len() - payload_idx
+            ),
+        });
+    }
+
+    Ok(inflated)
+}
+
+fn loaded_row_values_satisfy_notnull(columns: &[ColumnInfo], values: &[SqliteValue]) -> bool {
+    values.len() == columns.len()
+        && columns.iter().zip(values.iter()).all(|(column, value)| {
+            !column.notnull || column.is_ipk || !matches!(value, SqliteValue::Null)
+        })
 }
 
 fn table_primary_key_is_rowid_alias(
@@ -2574,6 +2787,116 @@ mod tests {
         assert_eq!(rows[1].0, 20);
         assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
         assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
+    }
+
+    #[test]
+    fn test_load_sqlite3_rowid_alias_multi_alter_short_rows_preserves_alignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_ipk_multi_alter.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (
+                    prefix TEXT,
+                    id INTEGER PRIMARY KEY,
+                    nullable TEXT,
+                    required TEXT NOT NULL
+                 );
+                 INSERT INTO items(prefix, id, nullable, required)
+                 VALUES ('p', 7, NULL, 'keep');
+                 ALTER TABLE items ADD COLUMN extra TEXT DEFAULT 'x';
+                 ALTER TABLE items ADD COLUMN note INTEGER DEFAULT 9;",
+            )
+            .unwrap();
+        }
+
+        let loaded = load_test_db(&db_path).unwrap();
+        assert_eq!(loaded.schema.len(), 1);
+        assert_eq!(loaded.schema[0].name, "items");
+
+        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+        let rows: Vec<_> = table.iter_rows().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 7);
+        assert_eq!(rows[0].1[0], SqliteValue::Text("p".into()));
+        assert_eq!(rows[0].1[1], SqliteValue::Integer(7));
+        assert_eq!(rows[0].1[2], SqliteValue::Null);
+        assert_eq!(rows[0].1[3], SqliteValue::Text("keep".into()));
+        assert_eq!(rows[0].1[4], SqliteValue::Text("x".into()));
+        assert_eq!(rows[0].1[5], SqliteValue::Integer(9));
+    }
+
+    #[test]
+    fn test_load_sqlite3_rowid_alias_parenthesized_added_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_ipk_parenthesized_defaults.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT INTO items(id, name) VALUES (3, 'alpha');
+                 ALTER TABLE items ADD COLUMN score INTEGER DEFAULT (9);
+                 ALTER TABLE items ADD COLUMN tag TEXT DEFAULT ('fallback');",
+            )
+            .unwrap();
+        }
+
+        let loaded = load_test_db(&db_path).unwrap();
+        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+        let rows: Vec<_> = table.iter_rows().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 3);
+        assert_eq!(rows[0].1[0], SqliteValue::Integer(3));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[0].1[2], SqliteValue::Integer(9));
+        assert_eq!(rows[0].1[3], SqliteValue::Text("fallback".into()));
+    }
+
+    #[test]
+    fn test_inflate_loaded_rowid_alias_omitted_slot_keeps_shifted_null_alignment() {
+        let column = |name: &str, affinity: char, is_ipk: bool| ColumnInfo {
+            name: name.to_owned(),
+            affinity,
+            is_ipk,
+            type_name: None,
+            notnull: false,
+            unique: false,
+            default_value: None,
+            strict_type: None,
+            generated_expr: None,
+            generated_stored: None,
+            collation: None,
+        };
+        let mut required = column("required", 'B', false);
+        required.notnull = true;
+        let mut extra = column("extra", 'B', false);
+        extra.default_value = Some("'x'".to_owned());
+        let mut note = column("note", 'D', false);
+        note.default_value = Some("9".to_owned());
+        let columns = vec![
+            column("prefix", 'B', false),
+            column("id", 'D', true),
+            column("nullable", 'B', false),
+            required,
+            extra,
+            note,
+        ];
+        let mut values = vec![
+            SqliteValue::Text("p".into()),
+            SqliteValue::Null,
+            SqliteValue::Text("keep".into()),
+        ];
+
+        inflate_loaded_table_row_values(&mut values, 7, &columns, Some(1), "items").unwrap();
+
+        assert_eq!(values[0], SqliteValue::Text("p".into()));
+        assert_eq!(values[1], SqliteValue::Integer(7));
+        assert_eq!(values[2], SqliteValue::Null);
+        assert_eq!(values[3], SqliteValue::Text("keep".into()));
+        assert_eq!(values[4], SqliteValue::Text("x".into()));
+        assert_eq!(values[5], SqliteValue::Integer(9));
     }
 
     #[test]

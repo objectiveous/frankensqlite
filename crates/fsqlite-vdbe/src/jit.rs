@@ -75,7 +75,7 @@ pub struct ConstantResultRowTemplate {
 /// Template for a compiled simple INSERT program.
 ///
 /// Captures the static properties of the INSERT at compile time:
-/// cursor ID, root page, column count, value sources, and affinity.
+/// cursor ID, root page, column count, value sources, affinity, and MakeRecord metadata.
 #[derive(Debug, Clone)]
 pub struct SimpleInsertTemplate {
     /// Cursor ID for the target table.
@@ -88,6 +88,8 @@ pub struct SimpleInsertTemplate {
     pub value_sources: Vec<InsertValueSource>,
     /// Optional affinity string applied to the bound column values.
     pub affinity: Option<String>,
+    /// Original `MakeRecord` metadata used for row-image semantics.
+    pub record_p4: P4,
     /// Insert flags (P5 from the Insert opcode).
     pub insert_flags: u16,
 }
@@ -383,6 +385,7 @@ pub fn try_compile_insert(ops: &[VdbeOp]) -> Option<SimpleInsertTemplate> {
             num_cols: fused.p3,
             value_sources,
             affinity: find_affinity(ops, fused.p2, fused.p3),
+            record_p4: fused.p4.clone(),
             insert_flags: fused.p5,
         });
     }
@@ -412,6 +415,7 @@ pub fn try_compile_insert(ops: &[VdbeOp]) -> Option<SimpleInsertTemplate> {
         num_cols: make_record.p2,
         value_sources,
         affinity: find_affinity(ops, make_record.p1, make_record.p2),
+        record_p4: make_record.p4.clone(),
         insert_flags: insert.p5,
     })
 }
@@ -699,6 +703,7 @@ mod tests {
             vec![InsertValueSource::Binding(0), InsertValueSource::Binding(1)]
         );
         assert_eq!(template.affinity.as_deref(), Some("DB"));
+        assert_eq!(template.record_p4, P4::Affinity("DB".to_owned()));
         assert_eq!(template.insert_flags, 2);
     }
 

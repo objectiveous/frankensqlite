@@ -12648,6 +12648,26 @@ impl VdbeEngine {
         values
     }
 
+    fn apply_make_record_null_placeholders(values: &mut [SqliteValue], record_p4: &P4) {
+        match record_p4 {
+            P4::PrecomputedHeader(header) if header.column_count() == values.len() => {
+                for (value, slot) in values.iter_mut().zip(&header.slots) {
+                    if slot.kind == PrecomputedSerialTypeKind::NullPlaceholder {
+                        *value = SqliteValue::Null;
+                    }
+                }
+            }
+            P4::Affinity(affinity) => {
+                for (value, affinity) in values.iter_mut().zip(affinity.bytes()) {
+                    if affinity == b'X' {
+                        *value = SqliteValue::Null;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn execute_compiled_constant_result_row(
         &mut self,
         template: &ConstantResultRowTemplate,
@@ -12677,12 +12697,13 @@ impl VdbeEngine {
             )));
         }
 
-        let values = self.compiled_column_values(
+        let mut values = self.compiled_column_values(
             &template.value_sources,
             borrowed_bindings,
             collect_vdbe_metrics,
             template.affinity.as_deref(),
         );
+        Self::apply_make_record_null_placeholders(&mut values, &template.record_p4);
         let concurrent_allocator = self.concurrent_rowid_allocator.clone();
         let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
         let previous_last_insert_rowid = self.last_insert_rowid;
@@ -16083,6 +16104,10 @@ fn payload_includes_rowid_alias(
         if payload_cols == table_cols {
             return true;
         }
+        let one_column_short = payload_cols.checked_add(1) == Some(table_cols);
+        if one_column_short && matches!(payload_values.get(ipk_col_idx), Some(SqliteValue::Null)) {
+            return true;
+        }
         if let Some(not_null_col_idx) =
             first_not_null_non_ipk_col_idx.filter(|idx| *idx > ipk_col_idx)
         {
@@ -16121,9 +16146,10 @@ fn payload_includes_rowid_alias_without_rowid(
 
     let payload_cols = row_decode.column_count();
     if let Some(table_cols) = table_column_count {
-        if payload_cols == table_cols || payload_cols.checked_add(1) == Some(table_cols) {
+        if payload_cols == table_cols {
             return Some(true);
         }
+        let one_column_short = payload_cols.checked_add(1) == Some(table_cols);
         if let Some(not_null_col_idx) =
             first_not_null_non_ipk_col_idx.filter(|idx| *idx > ipk_col_idx)
         {
@@ -16136,6 +16162,15 @@ fn payload_includes_rowid_alias_without_rowid(
             {
                 return Some(true);
             }
+        }
+        if one_column_short {
+            let Some(col) = row_decode.column_offset(ipk_col_idx) else {
+                return Some(false);
+            };
+            return Some(matches!(
+                classify_serial_type(col.serial_type),
+                SerialTypeClass::Null
+            ));
         }
         if ipk_col_idx >= payload_cols {
             return Some(false);
@@ -16184,14 +16219,13 @@ fn payload_includes_rowid_alias_lazy(
             return true;
         }
         let one_column_short = payload_cols.checked_add(1) == Some(table_cols);
-        // In the one-column-short case, value equality at the IPK position is
-        // ambiguous: the first stored user column can legitimately equal the
-        // physical rowid. Only the NOT NULL shift heuristic below can prove
-        // that the IPK alias is present.
-        if !one_column_short && ipk_col_idx < payload_cols {
+        if ipk_col_idx < payload_cols {
             // The IPK position exists in the payload. Check its serial
-            // type: if it's an integer that matches the rowid, the payload
-            // includes the IPK alias.
+            // type. In one-column-short rows from before ALTER TABLE ADD
+            // COLUMN, SQLite-format INTEGER PRIMARY KEY aliases are still
+            // stored as NULL placeholders. Integer equality is deliberately
+            // ignored for that shape because the first stored user column can
+            // legitimately equal the physical rowid.
             if let Some(col) = row_decode.column_offset(ipk_col_idx) {
                 match classify_serial_type(col.serial_type) {
                     SerialTypeClass::Null => {
@@ -16199,6 +16233,9 @@ fn payload_includes_rowid_alias_lazy(
                         return true;
                     }
                     SerialTypeClass::Integer => {
+                        if one_column_short {
+                            return false;
+                        }
                         // Decode the integer at the IPK position and compare
                         // to the rowid.
                         if let Some(SqliteValue::Integer(v)) =
@@ -17110,6 +17147,14 @@ mod tests {
             None,
             Some(1)
         ));
+        assert!(payload_includes_rowid_alias_lazy(
+            &scratch,
+            &record,
+            1,
+            0,
+            Some(4),
+            Some(1)
+        ));
     }
 
     #[test]
@@ -17131,8 +17176,27 @@ mod tests {
         );
         assert_eq!(
             payload_includes_rowid_alias_without_rowid(&scratch, 0, Some(4), Some(1)),
+            Some(false),
+            "one-column-short integer rows must not compare against rowid because the first stored user column may match by coincidence"
+        );
+    }
+
+    #[test]
+    fn test_payload_includes_rowid_alias_without_rowid_accepts_short_null_placeholder() {
+        let record = serialize_record(&[
+            SqliteValue::Null,
+            SqliteValue::Text("local".into()),
+            SqliteValue::Text("dup-session".into()),
+        ]);
+        let mut scratch = fsqlite_types::record::RecordDecodeScratch::default();
+        scratch
+            .prepare_for_record(&record)
+            .expect("payload should decode");
+
+        assert_eq!(
+            payload_includes_rowid_alias_without_rowid(&scratch, 0, Some(4), Some(1)),
             Some(true),
-            "one-column-short rows stay compatible with the existing ALTER TABLE heuristic"
+            "SQLite-format rows keep a NULL IPK placeholder when later ALTER TABLE ADD COLUMN makes the payload one column short"
         );
     }
 
@@ -17207,15 +17271,14 @@ mod tests {
     }
 
     #[test]
-    fn test_payload_includes_rowid_alias_does_not_false_positive_when_first_actual_column_is_null()
-    {
+    fn test_payload_includes_rowid_alias_accepts_short_null_placeholder() {
         let payload_values = vec![
             SqliteValue::Null,
             SqliteValue::Integer(5),
             SqliteValue::Text("tail".into()),
         ];
 
-        assert!(!payload_includes_rowid_alias(
+        assert!(payload_includes_rowid_alias(
             &payload_values,
             9,
             0,
@@ -17225,8 +17288,7 @@ mod tests {
     }
 
     #[test]
-    fn test_payload_includes_rowid_alias_lazy_does_not_false_positive_when_first_actual_column_is_null()
-     {
+    fn test_payload_includes_rowid_alias_lazy_accepts_short_null_placeholder() {
         let record = serialize_record(&[
             SqliteValue::Null,
             SqliteValue::Integer(5),
@@ -17237,7 +17299,7 @@ mod tests {
             .prepare_for_record(&record)
             .expect("payload should decode");
 
-        assert!(!payload_includes_rowid_alias_lazy(
+        assert!(payload_includes_rowid_alias_lazy(
             &scratch,
             &record,
             9,
@@ -23795,6 +23857,43 @@ mod tests {
             long_affinity,
             vec![SqliteValue::Null],
             "a long affinity string must not widen the P2 register range",
+        );
+    }
+
+    #[test]
+    fn test_compiled_simple_insert_applies_make_record_null_placeholders() {
+        let mut affinity_values = vec![
+            SqliteValue::Integer(77),
+            SqliteValue::Text("kept".into()),
+            SqliteValue::Integer(9),
+        ];
+        VdbeEngine::apply_make_record_null_placeholders(
+            &mut affinity_values,
+            &P4::Affinity("XBD".to_owned()),
+        );
+        assert_eq!(
+            affinity_values,
+            vec![
+                SqliteValue::Null,
+                SqliteValue::Text("kept".into()),
+                SqliteValue::Integer(9),
+            ],
+            "compiled INSERT must preserve MakeRecord X-affinity IPK placeholders",
+        );
+
+        let precomputed = fsqlite_types::record::PrecomputedRecordHeader::new(&[
+            fsqlite_types::record::PrecomputedSerialTypeKind::NullPlaceholder,
+            fsqlite_types::record::PrecomputedSerialTypeKind::IntegerOrNull,
+        ]);
+        let mut precomputed_values = vec![SqliteValue::Integer(88), SqliteValue::Integer(5)];
+        VdbeEngine::apply_make_record_null_placeholders(
+            &mut precomputed_values,
+            &P4::PrecomputedHeader(precomputed),
+        );
+        assert_eq!(
+            precomputed_values,
+            vec![SqliteValue::Null, SqliteValue::Integer(5)],
+            "compiled INSERT must preserve MakeRecord precomputed-header IPK placeholders",
         );
     }
 

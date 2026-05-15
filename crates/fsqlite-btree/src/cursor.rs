@@ -1477,10 +1477,10 @@ impl TableLeafDeleteRun {
     }
 
     fn search_table_leaf(&self, cx: &Cx, target: i64) -> Result<Option<u16>> {
-        observe_cursor_cancellation(cx)?;
         let mut lo = 0u16;
         let mut hi = self.entry.header.cell_count;
         while lo < hi {
+            observe_cursor_cancellation(cx)?;
             let mid = lo + (hi - lo) / 2;
             let rowid = TableLeafPayloadPatchRun::table_leaf_rowid_at(&self.entry, mid)?;
             match rowid.cmp(&target) {

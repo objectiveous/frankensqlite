@@ -12,6 +12,36 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-14 - Retained DELETE search cancellation probe weakening
+
+- Target: `TableLeafDeleteRun::search_table_leaf` in
+  `crates/fsqlite-btree/src/cursor.rs`, after the focused DML profile showed
+  delete-run search still visible in the remaining `UPDATE/DELETEThroughput`
+  DELETE tail.
+- Files/subsystems touched during reverted candidate:
+  `crates/fsqlite-btree/src/cursor.rs`. Commit `8b03dfc9` moved
+  `observe_cursor_cancellation(cx)?` out of the retained leaf binary-search
+  loop so each rowid lookup paid one cancellation check instead of one per
+  binary-search iteration. A fresh-eyes follow-up restored the in-loop
+  checkpoint and kept the regression test proving that a pre-cancelled context
+  does not stage a deletion.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-b85cbbb5-dml-refresh-20260514T232746Z/update-filter.json`,
+  `tests/artifacts/perf/codex-delete-search-cancel-candidate-20260514T233445Z/update-filter.json`,
+  and the later full-quick source-equivalent check
+  `tests/artifacts/perf/codex-head-full-quick-8b03dfc9-20260514T235037Z/full-quick.json`.
+- Result: rejected and reverted. The focused DML screen improved from geomean
+  F/C `1.4540560934` to `1.3048321478`, but the later full-quick check for the
+  same source-equivalent state reported primary score `0.3806717205`, worse
+  than the previous published frontier refresh (`0.3710116820`) and with
+  `10` C-faster rows. The change also weakened the documented cancellation
+  invariant that B-tree loops over user data maintain checkpoints at loop
+  boundaries.
+- Do not retry weakening retained DELETE search cancellation polling as a
+  standalone performance patch. Reconsider only if a full-quick same-window A/B
+  proves primary-score neutrality or better while preserving bounded
+  cancellation responsiveness.
+
 ## 2026-05-14 - Memory concurrent synced-write one-entry cache
 
 - Target: private `:memory:` concurrent direct DML bookkeeping in the

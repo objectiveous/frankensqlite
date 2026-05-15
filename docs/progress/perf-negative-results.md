@@ -12,6 +12,44 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-15 - Current DELETE frontier recheck after fresh perf pass
+
+- Target: remaining `UPDATE/DELETE Throughput` prepared direct DELETE rows on
+  current local `HEAD` (`f7cc04ba`), after rereading README performance claims,
+  recent commits, recent beads, CASS leads, and the existing negative ledger.
+- Files/subsystems inspected: prepared direct DELETE and pending retained
+  leaf-run buffering in `crates/fsqlite-core/src/connection.rs`,
+  `TableLeafDeleteRun` materialization/search/flush in
+  `crates/fsqlite-btree/src/cursor.rs`, live `SharedTxnPageIo`/pager
+  transaction APIs, the MVCC `CellVisibilityLog`/`read_page_with_cell_deltas`
+  primitives, the transaction-local DML mutation card, and the vendored
+  SQLite DELETE boundary notes already captured in this ledger. No source patch
+  was applied.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-current-delete-frontier-f7cc04ba-20260515T0715Z/summary.md`.
+  Fresh release-perf focused no-profile compares reported DELETE F/C ratios of
+  `3.51x` for `100 rows / delete 5 rows`, `1.70x` for
+  `1000 rows / delete 50 rows`, and `1.56x` for
+  `10000 rows / delete 500 rows`. The profile-enabled 10K/500 sample again kept
+  every DELETE on the prepared direct path (`slow=0`) with
+  `delete_leaf_active=433/496`, `delete_leaf_miss=63`,
+  `delete_leaf_flush=64/64`, and the known retained-run materialization/write
+  buckets.
+- Result: no source patch attempted. The fresh profile did not invalidate the
+  current hotspot table or open a new one-lever source edit. The existing MVCC
+  cell-delta substrate is still below the live pager/B-tree API boundary: the
+  correct next source attempt remains the full transaction-local DML mutation
+  operator, not a direct `cell_log.record_delete()` hook or another retained-run
+  micro-patch.
+- Do not retry standalone retained DELETE search/admission/materialization,
+  direct-flush/publication, cancellation-polling, per-connection synced-write
+  caches, or tombstone-only/cell-log hooks from this evidence. Reconsider
+  source work only as the broader transaction-local DML mutation operator with
+  logical rowid/key messages, delta-aware read view or proven read-boundary
+  materialization, rollback/savepoint ownership, affected-row oracle tests,
+  QF/count-cache invalidation, MVCC publication, focused DELETE wins, and
+  full-quick primary-score neutrality or better.
+
 ## 2026-05-14 - Retained DELETE search cancellation probe weakening
 
 - Target: `TableLeafDeleteRun::search_table_leaf` in

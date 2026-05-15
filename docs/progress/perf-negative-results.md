@@ -142,7 +142,7 @@ Each entry should include:
 
 ## 2026-05-13 - 7ea5da35 DML DELETE compare refresh
 
-- Target: remaining `UPDATE/DELETEThroughput` DELETE rows after
+- Target: remaining `UPDATE/DELETE Throughput` DELETE rows after
   `7ea5da35` (`docs(perf): publish f11324ca benchmark refresh`), especially
   `100 rows / delete 5 rows`, `1000 rows / delete 50 rows`, and
   `10000 rows / delete 500 rows`.
@@ -215,7 +215,7 @@ Each entry should include:
 ## 2026-05-12 - ce2309a2 post-fix frontier refresh
 
 - Target: current `comprehensive-bench --quick` and focused
-  `UPDATE/DELETEThroughput` frontier after
+  `UPDATE/DELETE Throughput` frontier after
   `ce2309a2d7c3bbfcfd82340276933d53725051df`
   (`fix(mvcc): align physical merge rowid digests`).
 - Files/subsystems inspected: no source patch. Re-read the README performance
@@ -252,7 +252,7 @@ Each entry should include:
 
 ## 2026-05-12 - Retained DELETE dense-rowid exact-slot search
 
-- Target: `UPDATE/DELETEThroughput` DELETE rows after the current focused DML
+- Target: `UPDATE/DELETE Throughput` DELETE rows after the current focused DML
   profile showed retained same-leaf DELETE still spending time in
   `delete_leaf_search`.
 - Files/subsystems touched during rejected candidate:
@@ -318,7 +318,7 @@ Each entry should include:
 
 ## 2026-05-12 - Direct UPDATE active patch-run early continuation
 
-- Target: `UPDATE/DELETEThroughput`, especially the remaining red
+- Target: `UPDATE/DELETE Throughput`, especially the remaining red
   `100 rows / update 10 rows` shape after
   `tests/artifacts/perf/codex-current-dml-profile-a7635094-20260512T2005Z/`
   showed direct fixed-width REAL UPDATE already bypassing VDBE and record
@@ -347,7 +347,7 @@ Each entry should include:
 
 ## 2026-05-12 - Retained DELETE local-payload validation fast path
 
-- Target: `UPDATE/DELETEThroughput` DELETE rows after
+- Target: `UPDATE/DELETE Throughput` DELETE rows after
   `tests/artifacts/perf/codex-current-dml-profile-a7635094-20260512T2005Z/`
   showed retained same-leaf DELETE still spending time in the per-row
   successful-cell shape check.
@@ -406,7 +406,7 @@ Each entry should include:
 
 ## 2026-05-12 - DELETE materializer `as_bytes_mut` borrow hoist
 
-- Target: `UPDATE/DELETEThroughput` DELETE rows, especially
+- Target: `UPDATE/DELETE Throughput` DELETE rows, especially
   `1000 rows / delete 50 rows` and `10000 rows / delete 500 rows`, after the
   sparse DELETE CPU profile showed `PageData::as_bytes_mut` in the hot region.
 - Files/subsystems touched: temporary one-line source candidate in
@@ -468,7 +468,7 @@ Each entry should include:
 
 ## 2026-05-12 - Current DML refresh after INSERT frontier
 
-- Target: current `UPDATE/DELETEThroughput` rows after the INSERT frontier
+- Target: current `UPDATE/DELETE Throughput` rows after the INSERT frontier
   rescreen, plus focused `perf-update-delete` modes for the 10000-row,
   500-delete workload.
 - Files/subsystems inspected: no source patch. Re-read the current DML JSON,
@@ -521,7 +521,7 @@ Each entry should include:
 
 ## 2026-05-12 - Current DELETE standard/isolated/sparse rescreen
 
-- Target: remaining `UPDATE/DELETEThroughput` DELETE rows after the current
+- Target: remaining `UPDATE/DELETE Throughput` DELETE rows after the current
   DML profile, especially whether the gap is just transaction-envelope
   overhead or persists inside one large transaction.
 - Files/subsystems inspected: no DELETE source patch. Re-read
@@ -604,7 +604,7 @@ Each entry should include:
 
 ## 2026-05-12 - Current DML profile after shared-table retry fix
 
-- Target: current `UPDATE/DELETEThroughput` rows after the shared-table retry
+- Target: current `UPDATE/DELETE Throughput` rows after the shared-table retry
   fix and current frontier artifact, with profiling enabled to decide whether
   any pure-DELETE-only logical staging shortcut was safe to attempt.
 - Files/subsystems inspected: no source patch. Re-read direct UPDATE/DELETE
@@ -671,7 +671,7 @@ Each entry should include:
 ## 2026-05-12 - Private memory prefetch skip
 
 - Target: `TransactionHandle::prefetch_page_hint` cost from the sparse isolated
-  DELETE profile and the remaining `UPDATE/DELETEThroughput` DELETE rows.
+  DELETE profile and the remaining `UPDATE/DELETE Throughput` DELETE rows.
 - Touched during rejected candidate: `crates/fsqlite-pager/src/pager.rs`.
   The candidate made `SimpleTransaction::prefetch_page_hint()` return early for
   private `:memory:` transactions using `memory_db_bump_alloc`. The source
@@ -694,7 +694,7 @@ Each entry should include:
 
 ## 2026-05-12 - Transaction-local DML mutation boundary
 
-- Target: remaining `UPDATE/DELETEThroughput` red rows after the current
+- Target: remaining `UPDATE/DELETE Throughput` red rows after the current
   physical direct-DML frontier:
   `100 rows / delete 5 rows`, `1000 rows / delete 50 rows`,
   `10000 rows / delete 500 rows`, and `100 rows / update 10 rows`.
@@ -723,7 +723,7 @@ Each entry should include:
 ## 2026-05-12 - Normal private-memory page-1 commit skip
 
 - Target: transaction/release-boundary overhead in the remaining
-  `UPDATE/DELETEThroughput` rows, especially small UPDATE/DELETE cases.
+  `UPDATE/DELETE Throughput` rows, especially small UPDATE/DELETE cases.
 - Touched during rejected candidate: `crates/fsqlite-pager/src/pager.rs`.
   The candidate changed normal `SimpleTransaction::commit()` so private
   in-memory databases skipped page-1 staging unless the freelist was dirty or
@@ -748,7 +748,7 @@ Each entry should include:
 
 ## 2026-05-12 - Current small UPDATE transaction-envelope rescreen
 
-- Target: remaining `UPDATE/DELETEThroughput`
+- Target: remaining `UPDATE/DELETE Throughput`
   `100 rows / update 10 rows` red row after the live materialized-cell count
   fix at `a19571f8`.
 - Files/subsystems inspected: prepared direct UPDATE dispatch and same-leaf
@@ -777,7 +777,7 @@ Each entry should include:
 ## 2026-05-12 - Sharded cache clean-mark elision for DML cache finish
 
 - Target: pager cache-finish tail in the remaining DML DELETE rows, especially
-  `UPDATE/DELETEThroughput` 50-row and 500-row DELETE where
+  `UPDATE/DELETE Throughput` 50-row and 500-row DELETE where
   `pager_cache_finish_ns` reflects draining staged committed pages into
   `ShardedPageCache`.
 - Touched during rejected candidate:
@@ -839,7 +839,7 @@ Each entry should include:
 
 ## 2026-05-12 - Current HEAD DML boundary refresh after rowid fix
 
-- Target: current `UPDATE/DELETEThroughput` focused rows after
+- Target: current `UPDATE/DELETE Throughput` focused rows after
   `0c016144` to confirm whether the remaining write-single frontier changed
   enough to justify another source patch.
 - Files/subsystems inspected: no source patch. Re-read the prepared direct
@@ -930,7 +930,7 @@ Each entry should include:
 
 ## 2026-05-12 - Direct DELETE cell-log hook boundary
 
-- Target: remaining `UPDATE/DELETEThroughput` DELETE red rows, specifically
+- Target: remaining `UPDATE/DELETE Throughput` DELETE red rows, specifically
   whether the existing cell-level MVCC scaffolding could be used as the first
   narrow slice of the broader transaction-local DML mutation operator.
 - Files/subsystems inspected: prepared direct DELETE and pending leaf-run
@@ -965,7 +965,7 @@ Each entry should include:
 
 ## 2026-05-12 - Current DML/Vendored SQLite DELETE boundary refresh
 
-- Target: remaining `UPDATE/DELETEThroughput` DELETE red rows after
+- Target: remaining `UPDATE/DELETE Throughput` DELETE red rows after
   `bacda261`, plus a fresh check against the vendored C SQLite delete path.
 - Files/subsystems inspected: FrankenSQLite prepared direct DELETE and retained
   leaf-run code in `crates/fsqlite-core/src/connection.rs` and
@@ -1025,7 +1025,7 @@ Each entry should include:
 ## 2026-05-12 - Compact DELETE live-span materializer
 
 - Target: retained compact same-leaf DELETE materialization in
-  `UPDATE/DELETEThroughput`, especially the remaining 5/50/500-row DELETE
+  `UPDATE/DELETE Throughput`, especially the remaining 5/50/500-row DELETE
   cases after the current multi-leaf retained run.
 - Touched during rejected candidate:
   `crates/fsqlite-btree/src/cursor.rs`. The candidate changed the compact
@@ -1049,7 +1049,7 @@ Each entry should include:
 
 ## 2026-05-12 - Direct UPDATE/DELETE microbatch carry
 
-- Target: `UPDATE/DELETEThroughput` direct-simple prepared UPDATE/DELETE rows,
+- Target: `UPDATE/DELETE Throughput` direct-simple prepared UPDATE/DELETE rows,
   especially the remaining 5/50/500-row DELETE tail after the retained
   same-leaf delete-run work.
 - Touched during rejected candidate:
@@ -1075,7 +1075,7 @@ Each entry should include:
 ## 2026-05-11 - Rejected 5-row compact DELETE single-pass threshold
 
 - Target: current retained compact same-leaf DELETE materializer, especially
-  the `UPDATE/DELETEThroughput` `100 rows / delete 5 rows`,
+  the `UPDATE/DELETE Throughput` `100 rows / delete 5 rows`,
   `1000 rows / delete 50 rows`, and `10000 rows / delete 500 rows` red rows
   after `88dcadc9`.
 - Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs`
@@ -1102,7 +1102,7 @@ Each entry should include:
 
 ## 2026-05-11 - DML frontier repeat after retained delete-run commit
 
-- Target: remaining `UPDATE/DELETEThroughput` DELETE rows after retained
+- Target: remaining `UPDATE/DELETE Throughput` DELETE rows after retained
   commit `88dcadc9` and the documented `COMPACT_DELETE_SINGLE_PASS_MIN`
   threshold rejection, especially `100 rows / delete 5 rows`,
   `1000 rows / delete 50 rows`, and `10000 rows / delete 500 rows`.
@@ -1139,7 +1139,7 @@ Each entry should include:
 
 ## 2026-05-11 - Storage-rowid logical DELETE buffer prototype
 
-- Target: remaining `UPDATE/DELETEThroughput` DELETE rows, especially the
+- Target: remaining `UPDATE/DELETE Throughput` DELETE rows, especially the
   prepared direct DELETE shapes with 5, 50, and 500 rowid deletes.
 - Touched during this pass: `crates/fsqlite-core/src/connection.rs` prototype
   only, fully reverted after measurement. Evidence artifact:
@@ -1165,7 +1165,7 @@ Each entry should include:
 
 ## 2026-05-11 - Exact-MemDB logical DELETE buffer screen
 
-- Target: remaining `UPDATE/DELETEThroughput` DELETE rows after the DML mutation
+- Target: remaining `UPDATE/DELETE Throughput` DELETE rows after the DML mutation
   frontier recertification, especially the 5-row, 50-row, and 500-row prepared
   DELETE cases.
 - Touched during this pass: no source files. Evidence artifact only:
@@ -1191,7 +1191,7 @@ Each entry should include:
 
 ## 2026-05-11 - DML mutation frontier recertification
 
-- Target: remaining `UPDATE/DELETEThroughput` DELETE rows at measured source
+- Target: remaining `UPDATE/DELETE Throughput` DELETE rows at measured source
   commit
   (`94ebb38c33508d374c157c47f1af0df2f3bec3ff`) after the retained delete-run
   borrowed-flush win, small UPDATE repeat, current DELETE CPU profile, and
@@ -1227,7 +1227,7 @@ Each entry should include:
 
 ## 2026-05-11 - Current DELETE CPU profile no-source boundary
 
-- Target: remaining `UPDATE/DELETEThroughput` DELETE rows after the retained
+- Target: remaining `UPDATE/DELETE Throughput` DELETE rows after the retained
   delete-run borrowed-flush win and small UPDATE frontier repeat.
 - Touched during this pass: no source files. Measurement artifact only:
   `tests/artifacts/perf/codex-current-delete-cpu-profile-20260511T1745Z/`.
@@ -1253,7 +1253,7 @@ Each entry should include:
 
 ## 2026-05-11 - Focused small UPDATE frontier repeat no-source boundary
 
-- Target: remaining `UPDATE/DELETEThroughput` `100 rows / update 10 rows`
+- Target: remaining `UPDATE/DELETE Throughput` `100 rows / update 10 rows`
   red row after the current retained DELETE and DML evidence refresh.
 - Touched during this pass: no source files. Measurement artifact only:
   `tests/artifacts/perf/codex-dml-update-repeat-20260511T1735Z/`.
@@ -1279,7 +1279,7 @@ Each entry should include:
 
 ## 2026-05-11 - Rejected private-memory explicit COMMIT retain deferral
 
-- Target: remaining `UPDATE/DELETEThroughput` explicit-transaction DELETE red
+- Target: remaining `UPDATE/DELETE Throughput` explicit-transaction DELETE red
   rows for private `:memory:` workloads, especially the fixed commit/pager tail
   visible in standard DELETE timings.
 - Touched during this pass: prototyped and reverted
@@ -1304,7 +1304,7 @@ Each entry should include:
 - Do not retry explicit private-memory `commit_and_retain()` deferral as a
   standalone commit-side lever. Reconsider only as part of a broader
   transaction-local DML mutation operator or release-boundary redesign that
-  improves focused DELETE and the full quick `UPDATE/DELETEThroughput` primary
+  improves focused DELETE and the full quick `UPDATE/DELETE Throughput` primary
   score in the same A/B window with no 100-row regression.
 
 ## 2026-05-11 - Current INSERT refresh after memory page-I/O skip
@@ -1352,7 +1352,7 @@ Each entry should include:
 
 ## 2026-05-11 - Current DML frontier refresh no-source boundary
 
-- Target: remaining `UPDATE/DELETEThroughput` DELETE red rows after the
+- Target: remaining `UPDATE/DELETE Throughput` DELETE red rows after the
   memory-direct page-I/O skip and README artifact refresh, especially
   `100 rows / delete 5 rows`, `1000 rows / delete 50 rows`, and
   `10000 rows / delete 500 rows`.
@@ -1453,7 +1453,7 @@ Each entry should include:
 
 ## 2026-05-11 - TransactionKind hot-method force-inline retry
 
-- Target: post-`free_page` `UPDATE/DELETEThroughput` DELETE tail after the
+- Target: post-`free_page` `UPDATE/DELETE Throughput` DELETE tail after the
   sampled isolated DELETE profile still showed self-time in
   `TransactionKind::get_page`, `write_page_data`, and `free_page`.
 - Touched during rejected candidate: `crates/fsqlite-pager/src/traits.rs`
@@ -1485,7 +1485,7 @@ Each entry should include:
 
 - Target: pick the next source lever after the exact transaction-control
   fast-path retry was rejected, focusing on current INSERT red rows and the
-  remaining `UPDATE/DELETEThroughput` DELETE tail.
+  remaining `UPDATE/DELETE Throughput` DELETE tail.
 - Touched during this pass: no source files. Measurement/artifact only:
   `tests/artifacts/perf/codex-current-insert-screen-20260511T083607Z/` and
   `tests/artifacts/perf/codex-current-delete-cpu-screen-20260511T083607Z/`.
@@ -1522,7 +1522,7 @@ Each entry should include:
 
 ## 2026-05-11 - Repeat exact transaction-control execute fast path after scratch reset
 
-- Target: remaining fixed-cost `UPDATE/DELETEThroughput` gaps after
+- Target: remaining fixed-cost `UPDATE/DELETE Throughput` gaps after
   `56b73f08` narrowed direct DELETE scratch reset, especially
   `100 rows / delete 5 rows`, `1000 rows / delete 50 rows`, and
   `100 rows / update 10 rows`.
@@ -1570,7 +1570,7 @@ Each entry should include:
 
 ## 2026-05-11 - DML profile artifact refresh
 
-- Target: current `UPDATE/DELETEThroughput` red rows after publishing the
+- Target: current `UPDATE/DELETE Throughput` red rows after publishing the
   current full-quick baseline artifact and backfilled INSERT profile raw files.
 - Touched during this pass: no source files. Measurement/artifact only:
   `tests/artifacts/perf/codex-current-head-dml-profile-20260511T043335Z/`.
@@ -1600,7 +1600,7 @@ Each entry should include:
 
 ## 2026-05-11 - DML frontier refresh after INSERT profile split
 
-- Target: `bd-db300.11.1` focused `UPDATE/DELETEThroughput` rows after the
+- Target: `bd-db300.11.1` focused `UPDATE/DELETE Throughput` rows after the
   direct INSERT row-build profile split landed.
 - Touched during this pass: no source files. Documentation/artifact only:
   `tests/artifacts/perf/codex-dml-frontier-refresh-20260511T020200Z/`.
@@ -1655,7 +1655,7 @@ Each entry should include:
 
 ## 2026-05-10 - Current DML DELETE profile frontier no-source decision
 
-- Target: current `UPDATE/DELETEThroughput` DELETE red rows after the overlay
+- Target: current `UPDATE/DELETE Throughput` DELETE red rows after the overlay
   and retained leaf-run micro-optimization families were rejected.
 - Touched during this pass: no source files. Documentation/artifact only:
   `tests/artifacts/perf/codex-dml-profile-head-20260510T224630Z/`.
@@ -1681,7 +1681,7 @@ Each entry should include:
 ## 2026-05-10 - DML DELETE overlay side-worktree rejection sync
 
 - Target: `bd-db300.11.1`, the committed leaf-delta/tombstone DELETE overlay
-  family for focused `UPDATE/DELETEThroughput` DELETE red rows.
+  family for focused `UPDATE/DELETE Throughput` DELETE red rows.
 - Touched during this sync: no source files. Documentation/artifact only:
   `tests/artifacts/perf/codex-logical-tombstone-probe-20260510T0058Z/`,
   `tests/artifacts/perf/codex-dense-rowid-delete-overlay-20260510T0115Z/`,
@@ -1732,7 +1732,7 @@ Each entry should include:
   frontier is a transaction-local DML mutation operator that batches page-local
   mutations while preserving read-your-writes, rollback, savepoints, schema
   drift handling, duplicate/missing rowid semantics, and MVCC publication
-  correctness. Require focused `UPDATE/DELETEThroughput` wins for the 5-row,
+  correctness. Require focused `UPDATE/DELETE Throughput` wins for the 5-row,
   50-row, and 500-row DELETE rows plus full-quick primary-score neutrality or
   better before keeping such a patch.
 - Do not restart with another one-branch INSERT, concurrent backoff/admission,
@@ -1740,7 +1740,7 @@ Each entry should include:
 
 ## 2026-05-10 - Direct DELETE leaf-run stack-entry detach
 
-- Target: focused `UPDATE/DELETEThroughput` DELETE red rows from
+- Target: focused `UPDATE/DELETE Throughput` DELETE red rows from
   `tests/artifacts/perf/codex-current-full-quick-20260510T182554Z/full-quick.json`,
   especially `1000 rows / delete 50 rows` and
   `10000 rows / delete 500 rows`.
@@ -1803,7 +1803,7 @@ Each entry should include:
 
 ## 2026-05-10 - Monotone multi-leaf direct DELETE backlog
 
-- Target: focused `UPDATE/DELETEThroughput` DELETE red rows from
+- Target: focused `UPDATE/DELETE Throughput` DELETE red rows from
   `tests/artifacts/perf/codex-current-full-quick-20260510T182554Z/full-quick.json`,
   especially `1000 rows / delete 50 rows` and
   `10000 rows / delete 500 rows`.
@@ -1839,7 +1839,7 @@ Each entry should include:
 
 - Target: narrow small-delete special case left open by the global retained
   direct DELETE run disable screen, especially
-  `UPDATE/DELETEThroughput` `100 rows / delete 5 rows`.
+  `UPDATE/DELETE Throughput` `100 rows / delete 5 rows`.
 - Touched during rejected candidate, then reverted:
   `crates/fsqlite-btree/src/cursor.rs`. The temporary test expectation edits
   for root-leaf delete-run admission were also reverted.
@@ -1994,7 +1994,7 @@ Each entry should include:
 
 ## 2026-05-10 - DML mutation design blocker after latest microprobe rejects
 
-- Target: remaining `UPDATE/DELETEThroughput` DELETE rows after the retained
+- Target: remaining `UPDATE/DELETE Throughput` DELETE rows after the retained
   same-leaf DELETE run, multi-leaf backlog rejection, disable-run probe, and
   next-cell hint probe.
 - Touched during measurement: no source files. This was a fresh reread of the
@@ -2068,7 +2068,7 @@ Each entry should include:
 
 ## 2026-05-10 - Multi-leaf prepared direct DELETE backlog candidate
 
-- Target: `UPDATE/DELETEThroughput` DELETE tail, especially
+- Target: `UPDATE/DELETE Throughput` DELETE tail, especially
   `1000 rows / delete 50 rows` and `10000 rows / delete 500 rows`.
 - Touched during candidate, then reverted:
   `crates/fsqlite-core/src/connection.rs`.
@@ -2134,7 +2134,7 @@ Each entry should include:
 
 ## 2026-05-10 - DML head refresh and multi-leaf DELETE screen
 
-- Target: current `UPDATE/DELETEThroughput` tail on `HEAD`, especially
+- Target: current `UPDATE/DELETE Throughput` tail on `HEAD`, especially
   explicit-transaction `DELETE FROM bench WHERE id = ?1` after the retained
   same-leaf direct DELETE run and commit-publication fixes.
 - Touched during measurement: no source files. The profile reused the retained
@@ -2204,7 +2204,7 @@ Each entry should include:
 ## 2026-05-10 - Single-connection cache batch insertion
 
 - Target: reduce the residual `pager_cache_finish_ns` component in focused
-  `UPDATE/DELETEThroughput` by holding the single-connection fast-array cache
+  `UPDATE/DELETE Throughput` by holding the single-connection fast-array cache
   lock once while draining committed staged pages, instead of calling
   `ShardedPageCache::insert_buffer` once per page.
 - Touched during rejected candidate:
@@ -2236,7 +2236,7 @@ Each entry should include:
 ## 2026-05-10 - Page-cache insert clean-mark elision
 
 - Target: reduce the residual `pager_cache_finish_ns` component in focused
-  `UPDATE/DELETEThroughput` by avoiding the second lookup/lock in
+  `UPDATE/DELETE Throughput` by avoiding the second lookup/lock in
   `ShardedPageCache::insert_buffer` after a freshly inserted
   `CachedPageEntry` is already clean.
 - Touched during rejected candidate:
@@ -2258,14 +2258,14 @@ Each entry should include:
   enough to fail the keep gate. The candidate trimmed some absolute FSQLite
   medians, but not coherently across the benchmark-shaped rows.
 - Do not retry `insert_buffer` clean-mark elision as a standalone
-  `UPDATE/DELETEThroughput` optimization. Reconsider only as part of a broader
+  `UPDATE/DELETE Throughput` optimization. Reconsider only as part of a broader
   cache-publication rewrite that wins the same-window focused DML geomean and
   does not regress the mid-size rows.
 
 ## 2026-05-10 - Memory VFS write-page-batch no-allocation screen
 
 - Target: reduce the remaining `pager_mem_flush_ns` component in focused
-  `UPDATE/DELETEThroughput` by removing the temporary `Vec` allocation inside
+  `UPDATE/DELETE Throughput` by removing the temporary `Vec` allocation inside
   `MemoryFile::write_page_batch` for multi-page memory commits.
 - Touched during measurement: `crates/fsqlite-vfs/src/memory.rs`. The candidate
   used a two-pass validate/copy loop and was reverted after measurement.
@@ -2282,7 +2282,7 @@ Each entry should include:
 
 ## 2026-05-10 - Pager commit subphase tiny-field screen
 
-- Target: explain the remaining explicit-transaction `UPDATE/DELETEThroughput`
+- Target: explain the remaining explicit-transaction `UPDATE/DELETE Throughput`
   commit envelope after parser/background attribution showed the cost had moved
   into pager transaction roundtrip.
 - Touched during measurement:
@@ -2322,7 +2322,7 @@ Each entry should include:
 
 ## 2026-05-10 - DML commit-envelope parser/background attribution
 
-- Target: explain the remaining `UPDATE/DELETEThroughput` explicit-transaction
+- Target: explain the remaining `UPDATE/DELETE Throughput` explicit-transaction
   `COMMIT` wall-time gap after the tiny DELETE mutation loop itself measured at
   parity in rollback-isolated mode.
 - Touched during measurement:
@@ -2352,7 +2352,7 @@ Each entry should include:
 
 ## 2026-05-10 - Direct DELETE parent-separator admission as next DML lever
 
-- Target: `UPDATE/DELETEThroughput` explicit-transaction DELETE rows after the
+- Target: `UPDATE/DELETE Throughput` explicit-transaction DELETE rows after the
   retained same-leaf delete run still flushed once per leaf and fell back at
   active-run boundaries.
 - Touched during measurement:
@@ -2433,7 +2433,7 @@ Each entry should include:
 
 ## 2026-05-10 - Direct write flush wrapper as DML bottleneck
 
-- Target: `UPDATE/DELETEThroughput` explicit-transaction DML rows after the
+- Target: `UPDATE/DELETE Throughput` explicit-transaction DML rows after the
   profile split showed `commit_us` contained pending direct-write flush work
   that was not visible in `commit_pre_ns` / `commit_roundtrip_ns`.
 - Touched during measurement:
@@ -2467,7 +2467,7 @@ Each entry should include:
 
 ## 2026-05-10 - Direct DELETE forced VDBE fallback screen
 
-- Target: remaining `UPDATE/DELETEThroughput` direct-simple DELETE gap after
+- Target: remaining `UPDATE/DELETE Throughput` direct-simple DELETE gap after
   the same-leaf direct DELETE run and rollback-isolated timing harness showed
   the direct path still around `1.3x-1.5x` slower than C SQLite on isolated
   DELETE loops.
@@ -2496,7 +2496,7 @@ Each entry should include:
 - Do not retry routing direct-simple DELETE through forced VDBE fallback as a
   standalone optimization. Reconsider VDBE only if a prepared-program design
   explicitly enables safe retained storage cursors and proves same-window
-  `UPDATE/DELETEThroughput` improvements; otherwise the remaining gap needs a
+  `UPDATE/DELETE Throughput` improvements; otherwise the remaining gap needs a
   better direct/bulk mutation primitive.
 
 ## 2026-05-09 - Pending direct DELETE freeblock-run materializer
@@ -2577,7 +2577,7 @@ Each entry should include:
 ## 2026-05-09 - Explicit write-commit duplicate lookaside reset removal
 
 - Target: fixed explicit-transaction commit cleanup in
-  `UPDATE/DELETEThroughput`, especially tiny direct DML rows where commit
+  `UPDATE/DELETE Throughput`, especially tiny direct DML rows where commit
   ceremony is a material part of the measured envelope.
 - Touched during rejected candidate:
   `crates/fsqlite-core/src/connection.rs`; the source patch was backed out
@@ -2659,7 +2659,7 @@ Each entry should include:
 ## 2026-05-09 - Retained leaf-run PageData move before publish
 
 - Target: same-leaf retained direct UPDATE/DELETE page publication in
-  `UPDATE/DELETEThroughput`, after current profiling still showed
+  `UPDATE/DELETE Throughput`, after current profiling still showed
   `delete_leaf_flush_ns` near `106 us` on the `delete 500/10000` row.
 - Touched during rejected candidate:
   `crates/fsqlite-btree/src/cursor.rs`; the source patch was backed out after
@@ -3656,7 +3656,7 @@ Each entry should include:
 ## 2026-05-09 - DML leaf-patch interpolation admission
 
 - Target: direct-simple fixed-width REAL UPDATE rows inside
-  `UPDATE/DELETEThroughput`, especially the active
+  `UPDATE/DELETE Throughput`, especially the active
   `TableLeafPayloadPatchRun` path that still performed a plain binary search
   inside the retained leaf image.
 - Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs`; the
@@ -3693,7 +3693,7 @@ Each entry should include:
 ## 2026-05-09 - DML patch-run local payload target parser
 
 - Target: the fixed-width REAL direct UPDATE tail in
-  `UPDATE/DELETEThroughput`, specifically the retained
+  `UPDATE/DELETE Throughput`, specifically the retained
   `TableLeafPayloadPatchRun` path's found-cell `CellRef::parse` overhead after
   binary leaf admission.
 - Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs`; the
@@ -3778,7 +3778,7 @@ Each entry should include:
 
 ## 2026-05-08 - Retained direct-DML cursor shell
 
-- Target: remaining `UPDATE/DELETEThroughput` direct-simple UPDATE/DELETE rows,
+- Target: remaining `UPDATE/DELETE Throughput` direct-simple UPDATE/DELETE rows,
   especially the isolated 100-row prepared statement loops where the current
   frontier still loses to C SQLite despite bypassing VDBE dispatch.
 - Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`
@@ -3862,7 +3862,7 @@ Each entry should include:
 
 ## 2026-05-08 - Fixed-width REAL update page-local payload patch
 
-- Target: `UPDATE/DELETEThroughput` direct-simple UPDATE rows, especially
+- Target: `UPDATE/DELETE Throughput` direct-simple UPDATE rows, especially
   `UPDATE bench SET value = ?2 WHERE id = ?1`, after the current profile still
   showed payload copying, `parse_record_projected_column_offsets`, and
   same-size payload overwrite work in the fixed-width REAL update path.
@@ -3901,7 +3901,7 @@ Each entry should include:
 
 ## 2026-05-08 - Deferred UPDATE/DELETE microbatch carry
 
-- Target: `UPDATE/DELETEThroughput` 100-row direct UPDATE/DELETE tails and the
+- Target: `UPDATE/DELETE Throughput` 100-row direct UPDATE/DELETE tails and the
   isolated `perf-update-delete 100 ... compare isolated` mutation loop, after
   profiling showed repeated direct DML mutation remained slower than C SQLite.
 - Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
@@ -4014,7 +4014,7 @@ Each entry should include:
 
 ## 2026-05-08 - Direct REAL UPDATE numeric assignment shortcut
 
-- Target: focused `UPDATE/DELETEThroughput` fixed-width REAL direct UPDATE
+- Target: focused `UPDATE/DELETE Throughput` fixed-width REAL direct UPDATE
   rows, especially `UPDATE bench SET value = ?2 WHERE id = ?1` in the
   100-row tail.
 - Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
@@ -4052,7 +4052,7 @@ Each entry should include:
 
 ## 2026-05-08 - Direct UPDATE lazy row-scratch borrow
 
-- Target: remaining focused `UPDATE/DELETEThroughput` tail, especially the
+- Target: remaining focused `UPDATE/DELETE Throughput` tail, especially the
   fixed-width REAL direct UPDATE rows in
   `UPDATE bench SET value = ?2 WHERE id = ?1`.
 - Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
@@ -4089,7 +4089,7 @@ Each entry should include:
 
 ## 2026-05-08 - Private-memory direct UPDATE/DELETE `SharedTxnPageIo` bypass
 
-- Target: remaining setup-heavy `UPDATE/DELETEThroughput` rows for private
+- Target: remaining setup-heavy `UPDATE/DELETE Throughput` rows for private
   `:memory:` benchmark databases, especially the 100-row update/delete tail.
 - Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`.
   The diff was already present in the shared worktree before measurement and
@@ -4162,7 +4162,7 @@ Each entry should include:
 
 - Target: prepared direct DML fixed ceremony in the remaining INSERT and
   UPDATE/DELETE rows, especially small direct INSERT rows and the
-  `UPDATE/DELETEThroughput` 100-row setup-heavy rows.
+  `UPDATE/DELETE Throughput` 100-row setup-heavy rows.
 - Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
   source was restored by the reservation holder after measurement.
 - Candidate shape: keep the legacy `root_page: i32` in prepared direct INSERT,
@@ -4715,7 +4715,7 @@ Each entry should include:
 
 ## 2026-05-07 - SharedTxnPageIo borrowed concurrent-context clean retry
 
-- Target: `UPDATE/DELETEThroughput`, after fresh isolated `perf record`
+- Target: `UPDATE/DELETE Throughput`, after fresh isolated `perf record`
   samples for direct-simple DML showed repeated page I/O through
   `SharedTxnPageIo::{read_page_data,write_page_internal}` and per-access
   `ConcurrentContext` cloning on top of the newer direct-INSERT-layout
@@ -4751,7 +4751,7 @@ Each entry should include:
 
 ## 2026-05-07 - Lazy fallback page-lock shard allocation clean retry
 
-- Target: `UPDATE/DELETEThroughput`, after a clean retry of a prior MVCC
+- Target: `UPDATE/DELETE Throughput`, after a clean retry of a prior MVCC
   page-lock allocation idea.
 - Touched during rejected candidate: `crates/fsqlite-mvcc/src/core_types.rs`;
   the candidate was reverted before this ledger entry was added.
@@ -4777,7 +4777,7 @@ Each entry should include:
 
 ## 2026-05-07 - SharedTxnPageIo synthetic page-one cleanup negative cache
 
-- Target: `UPDATE/DELETEThroughput`, after an isolated `perf record` sample
+- Target: `UPDATE/DELETE Throughput`, after an isolated `perf record` sample
   showed `SharedTxnPageIo::clear_stale_synthetic_pending_commit_surface` in the
   top hot symbols during repeated direct-simple UPDATE.
 - Touched during rejected candidate: `crates/fsqlite-vdbe/src/engine.rs`; the
@@ -4812,7 +4812,7 @@ Each entry should include:
 
 ## 2026-05-07 - Same-size UPDATE staged-page overwrite probe
 
-- Target: `UPDATE/DELETEThroughput`, especially fixed-width REAL direct UPDATE
+- Target: `UPDATE/DELETE Throughput`, especially fixed-width REAL direct UPDATE
   rows where an isolated `perf record` sample showed self-time in
   `PageData::as_bytes_mut`, `write_page_internal`, and staged write-surface
   maintenance under `table_overwrite_current_payload_same_size_no_overflow`.
@@ -4861,7 +4861,7 @@ Each entry should include:
 
 ## 2026-05-07 - Hard-disable dormant QF consultation in direct UPDATE/DELETE
 
-- Target: `UPDATE/DELETEThroughput`, especially the per-row direct-simple
+- Target: `UPDATE/DELETE Throughput`, especially the per-row direct-simple
   UPDATE/DELETE path that still calls `qf_maybe_short_circuit_for_rowid` even
   though build-on-first-consult was disabled by `4ea55010` after a severe
   full-table scan regression.
@@ -4899,7 +4899,7 @@ Each entry should include:
 
 ## 2026-05-07 - Lazy VDBE fallback compilation for direct UPDATE/DELETE
 
-- Target: `UPDATE/DELETEThroughput`, especially the small prepared direct
+- Target: `UPDATE/DELETE Throughput`, especially the small prepared direct
   UPDATE/DELETE rows where `prepare_us` is a visible part of total time.
 - Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
   the source was restored with manual reverse patches after the focused
@@ -4943,7 +4943,7 @@ Each entry should include:
 
 ## 2026-05-07 - Retained direct UPDATE/DELETE cursor shell
 
-- Target: `UPDATE/DELETEThroughput`, especially repeated prepared rowid
+- Target: `UPDATE/DELETE Throughput`, especially repeated prepared rowid
   UPDATE/DELETE loops inside one explicit concurrent transaction.
 - Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`
   and `crates/fsqlite-vdbe/src/engine.rs`; the source was restored with a
@@ -4984,7 +4984,7 @@ Each entry should include:
 
 ## 2026-05-07 - Direct UPDATE/DELETE microbatch schema-proof carry
 
-- Target: `UPDATE/DELETEThroughput`, especially repeated prepared rowid
+- Target: `UPDATE/DELETE Throughput`, especially repeated prepared rowid
   UPDATE/DELETE loops inside one explicit transaction.
 - Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
   the source was manually restored after the repeat A/B benchmark lost.
@@ -5034,7 +5034,7 @@ Each entry should include:
 
 ## 2026-05-07 - Direct UPDATE/DELETE per-row scratch reset removal
 
-- Target: `UPDATE/DELETEThroughput`, especially direct UPDATE/DELETE per-row
+- Target: `UPDATE/DELETE Throughput`, especially direct UPDATE/DELETE per-row
   ceremony in prepared statement loops.
 - Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
   the source was manually restored after the focused benchmark lost.
@@ -5064,11 +5064,11 @@ Each entry should include:
   the broader regression.
 - Do not retry removing the direct UPDATE/DELETE scratch reset as a standalone
   ceremony trim. Reconsider only if paired with a larger retained-cursor design
-  and revalidated on the full `UPDATE/DELETEThroughput` section.
+  and revalidated on the full `UPDATE/DELETE Throughput` section.
 
 ## 2026-05-07 - Direct UPDATE fixed-width REAL leaf-payload patch
 
-- Target: `UPDATE/DELETEThroughput`, especially the top full-matrix gap
+- Target: `UPDATE/DELETE Throughput`, especially the top full-matrix gap
   `100 rows / update 10 rows`, and the isolated direct UPDATE mutation loop.
 - Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs` and
   `crates/fsqlite-core/src/connection.rs`; the source was manually removed
@@ -5548,7 +5548,7 @@ Each entry should include:
 
 ## 2026-05-06 - Single-freeblock compact table-leaf DELETE
 
-- Target: `UPDATE/DELETEThroughput`, especially small direct DELETE rows where
+- Target: `UPDATE/DELETE Throughput`, especially small direct DELETE rows where
   profiles showed table-leaf DELETE paying page-copy/defrag costs after every
   point rowid deletion.
 - Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs`; the
@@ -7569,7 +7569,7 @@ the exact `/data/projects/frankensqlite` workspace filter.
 ## 2026-05-06 - Direct UPDATE lazy decoded-row scratch borrow
 
 - Target: isolated prepared direct UPDATE on the fixed-width REAL fast path
-  used by `UPDATE/DELETEThroughput`, after the current profile showed VDBE
+  used by `UPDATE/DELETE Throughput`, after the current profile showed VDBE
   bypass was active and the remaining mutation cost was sub-microsecond
   ceremony plus B-tree page work.
 - Candidate shape: in
@@ -7644,7 +7644,7 @@ as `rejected`, `reverted`, `abandoned`, `slower`, `didn't help`,
 
 ## 2026-05-06 - Direct DELETE tier0 already-staged MVCC marker skip
 
-Scope: `UPDATE/DELETEThroughput`, especially the current worst full-matrix row
+Scope: `UPDATE/DELETE Throughput`, especially the current worst full-matrix row
 `100 rows / delete 5 rows` after `7d6117e1`, where FrankenSQLite measured
 `0.425427 ms` vs C SQLite `0.092583 ms` (`4.595x`).
 
@@ -7678,7 +7678,7 @@ Scope: `UPDATE/DELETEThroughput`, especially the current worst full-matrix row
 
 ## 2026-05-06 - Direct UPDATE/DELETE reusable SharedTxnPageIo shell
 
-Scope: `UPDATE/DELETEThroughput`, especially the current worst full-matrix row
+Scope: `UPDATE/DELETE Throughput`, especially the current worst full-matrix row
 `100 rows / delete 5 rows` after `7d6117e1`, where FrankenSQLite measured
 `0.425427 ms` vs C SQLite `0.092583 ms` (`4.595x`).
 
@@ -8430,7 +8430,7 @@ again showed time in `memmove`, `read_cell_pointers_into`,
   `baseline-update-section-report.json`.
 - Result: rejected. The narrow isolated harness improved by about `5%`
   (`880/886 ns` baseline per update in same-window reverse builds versus
-  `838/839 ns` candidate), but the quick `UPDATE/DELETEThroughput` section was
+  `838/839 ns` candidate), but the quick `UPDATE/DELETE Throughput` section was
   mixed: 10K update improved `10.34 ms -> 9.70 ms` and 10K delete improved
   `9.21 ms -> 8.63 ms`, while 100-row update regressed
   `451.7 us -> 468.5 us`, 1000-row update regressed `1.26 ms -> 1.32 ms`, and
@@ -8911,7 +8911,7 @@ Primary CASS evidence:
 
 ## 2026-05-05 - Direct single-rowid DELETE lowering
 
-- Target: `UPDATE/DELETEThroughput`, especially prepared
+- Target: `UPDATE/DELETE Throughput`, especially prepared
   `DELETE FROM bench WHERE id = ?1`.
 - Touched: `crates/fsqlite-vdbe/src/codegen.rs`.
 - Candidate shape: when DELETE has a simple rowid equality predicate, skip the
@@ -10438,7 +10438,7 @@ set: sessions found by
 
 ## 2026-05-06 - Direct UPDATE/DELETE retained table-seek hint
 
-- Scope: direct-simple UPDATE/DELETE rowid probes in `UPDATE/DELETEThroughput`,
+- Scope: direct-simple UPDATE/DELETE rowid probes in `UPDATE/DELETE Throughput`,
   after profiles showed repeated B-tree seek/page work and legacy SQLite keeps
   VDBE cursor position across repeated rowid probes.
 - Touched during rejected candidate in a clean worktree only:
@@ -10720,7 +10720,7 @@ set: sessions found by
 
 ## 2026-05-07 - Direct DELETE no-rebalance leaf primitive
 
-- Target: `UPDATE/DELETEThroughput`, especially direct-simple DELETE rows where
+- Target: `UPDATE/DELETE Throughput`, especially direct-simple DELETE rows where
   generic `BtCursor::delete` pays separator/anchor ceremony even when the
   current leaf will remain non-empty and the deleted cell is not the leaf max.
 - Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs` and
@@ -10746,7 +10746,7 @@ set: sessions found by
 
 ## 2026-05-07 - Same-leaf fixed-width REAL UPDATE batch run
 
-- Target: `UPDATE/DELETEThroughput`, especially monotone explicit-transaction
+- Target: `UPDATE/DELETE Throughput`, especially monotone explicit-transaction
   fixed-width REAL direct UPDATE rows that seemed eligible for one-write-per-leaf
   batching.
 - Touched during rejected shared-worktree candidate:
@@ -10824,7 +10824,7 @@ set: sessions found by
 
 ## 2026-05-08 - Pending direct DELETE leaf-run buffer via repeated seeks
 
-- Target: the remaining `UPDATE/DELETEThroughput` 100-row DELETE tail, after
+- Target: the remaining `UPDATE/DELETE Throughput` 100-row DELETE tail, after
   the clean frontier showed the gap is a real direct-DML mutation-kernel cost
   rather than population/setup time.
 - Touched during rejected shared-worktree candidate:
@@ -10851,11 +10851,11 @@ set: sessions found by
 - Do not land or retry this specific pending direct DELETE leaf-run shape as a
   standalone optimization. Reconsider DELETE leaf-run batching only if it avoids
   the per-row root-to-leaf admission cost or otherwise proves an isolated
-  DELETE-kernel win before running the focused `UPDATE/DELETEThroughput` matrix.
+  DELETE-kernel win before running the focused `UPDATE/DELETE Throughput` matrix.
 
 ## 2026-05-08 - Fixed-width REAL UPDATE payload-range page patch
 
-- Target: the remaining `UPDATE/DELETEThroughput` 100-row UPDATE tail, after
+- Target: the remaining `UPDATE/DELETE Throughput` 100-row UPDATE tail, after
   profiling showed `BtCursor::load_page`, staged-page writes, and payload copy
   work inside the direct fixed-width REAL update lane.
 - Touched during rejected candidate:
@@ -10896,7 +10896,7 @@ set: sessions found by
 
 ## 2026-05-08 - Fixed-width REAL UPDATE leaf-local field patch
 
-- Target: the remaining `UPDATE/DELETEThroughput` UPDATE rows after the prior
+- Target: the remaining `UPDATE/DELETE Throughput` UPDATE rows after the prior
   payload-range page patch rejection showed full-payload copying still visible
   in the direct fixed-width REAL update counter path.
 - Touched during rejected candidate:
@@ -11028,7 +11028,7 @@ set: sessions found by
 ## 2026-05-08 - Direct DELETE scratch/lookaside guard trim
 
 - Target: the 100-row DELETE tail in the current full quick frontier, where
-  `UPDATE/DELETEThroughput` showed `100 rows / delete 5 rows` at ratio `1.381`
+  `UPDATE/DELETE Throughput` showed `100 rows / delete 5 rows` at ratio `1.381`
   and DML profiling showed the direct DELETE mutate phase was only `8.3 us`
   inside a much larger fixed-cost envelope.
 - Touched during rejected candidate:
@@ -11067,7 +11067,7 @@ set: sessions found by
 
 ## 2026-05-09 - Same-leaf DELETE run search-hint narrowing
 
-- Target: the corrected `UPDATE/DELETEThroughput` tail after the retained
+- Target: the corrected `UPDATE/DELETE Throughput` tail after the retained
   same-leaf direct DELETE run, especially `100 rows / delete 5 rows` and the
   isolated `perf-update-delete 100 ... delete compare isolated` row.
 - Touched during rejected candidate:
@@ -11100,7 +11100,7 @@ set: sessions found by
 
 ## 2026-05-09 - Same-leaf DELETE no-overflow shape parser
 
-- Target: the current `UPDATE/DELETEThroughput` DELETE tail after the retained
+- Target: the current `UPDATE/DELETE Throughput` DELETE tail after the retained
   same-leaf direct DELETE run and small-delete hybrid, especially
   `100 rows / delete 5 rows`.
 - Touched during rejected candidate:

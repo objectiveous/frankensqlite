@@ -16,7 +16,7 @@ Each entry should include:
 
 - Target: `TableLeafDeleteRun::search_table_leaf` in
   `crates/fsqlite-btree/src/cursor.rs`, after the focused DML profile showed
-  delete-run search still visible in the remaining `UPDATE/DELETEThroughput`
+  delete-run search still visible in the remaining `UPDATE/DELETE Throughput`
   DELETE tail.
 - Files/subsystems touched during reverted candidate:
   `crates/fsqlite-btree/src/cursor.rs`. Commit `8b03dfc9` moved
@@ -45,7 +45,7 @@ Each entry should include:
 ## 2026-05-14 - Memory concurrent synced-write one-entry cache
 
 - Target: private `:memory:` concurrent direct DML bookkeeping in the
-  `UPDATE/DELETEThroughput` tail, screened with
+  `UPDATE/DELETE Throughput` tail, screened with
   `FSQLITE_BENCH_PROFILE_DML=1 perf-update-delete 10000 20 delete compare standard`.
 - Files/subsystems touched during rejected candidate:
   `crates/fsqlite-core/src/connection.rs`. Commit `c93c3a9b` added a
@@ -72,7 +72,7 @@ Each entry should include:
 
 ## 2026-05-13 - DML mutation-operator source feasibility probe
 
-- Target: remaining `UPDATE/DELETEThroughput` DELETE rows after
+- Target: remaining `UPDATE/DELETE Throughput` DELETE rows after
   `e644bd64eefea85d67e0eb9a813eacee3b2790de`, especially 5-, 50-, and 500-row
   prepared direct DELETE cases.
 - Files/subsystems inspected: current direct prepared DELETE buffering in
@@ -109,7 +109,7 @@ Each entry should include:
 ## 2026-05-13 - e644bd64 current frontier refresh
 
 - Target: current `comprehensive-bench --quick` and focused
-  `UPDATE/DELETEThroughput` frontier after
+  `UPDATE/DELETE Throughput` frontier after
   `e644bd64eefea85d67e0eb9a813eacee3b2790de`
   (`fix(mvcc): lock cell-delta-only commit pages`).
 - Files/subsystems inspected: no source patch. Re-read the current README

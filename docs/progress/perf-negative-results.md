@@ -15,7 +15,7 @@ Each entry should include:
 ## 2026-05-15 - Current DELETE frontier recheck after fresh perf pass
 
 - Target: remaining `UPDATE/DELETE Throughput` prepared direct DELETE rows on
-  current local `HEAD` (`f7cc04ba`), after rereading README performance claims,
+  source checkout `f7cc04ba`, after rereading README performance claims,
   recent commits, recent beads, CASS leads, and the existing negative ledger.
 - Files/subsystems inspected: prepared direct DELETE and pending retained
   leaf-run buffering in `crates/fsqlite-core/src/connection.rs`,

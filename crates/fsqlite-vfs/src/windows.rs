@@ -70,6 +70,28 @@ fn sqlite_pending_lock_path(path: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
+// The three advisory-lock sidecars `WindowsOsLockFiles::open` writes next to
+// every DB it touches. Returned as an array so callers can iterate uniformly.
+fn windows_lock_sidecar_paths(path: &Path) -> [PathBuf; 3] {
+    [
+        sqlite_shared_lock_path(path),
+        sqlite_reserved_lock_path(path),
+        sqlite_pending_lock_path(path),
+    ]
+}
+
+// Best-effort removal of the three advisory-lock sidecars alongside `path`.
+// Errors are intentionally swallowed: sidecars are advisory and may be missing,
+// in use by a racing handle, or already cleaned up. Without this, every
+// transient DB file (e.g. VACUUM INTO backups) leaks three zero-byte files,
+// and a downstream caller that re-enumerates the dir can mistake an orphan
+// sidecar for a backup root and chain a fresh set on top.
+fn try_remove_windows_lock_sidecars(path: &Path) {
+    for sidecar in windows_lock_sidecar_paths(path) {
+        let _ = fs::remove_file(sidecar);
+    }
+}
+
 fn ensure_shm_file_len(path: &Path, min_len: u64) -> Result<()> {
     let file = OpenOptions::new()
         .read(true)
@@ -488,6 +510,7 @@ impl Vfs for WindowsVfs {
         if shm_path.exists() {
             fs::remove_file(shm_path)?;
         }
+        try_remove_windows_lock_sidecars(&resolved);
         Ok(())
     }
 

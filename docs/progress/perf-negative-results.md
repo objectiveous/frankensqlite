@@ -24,12 +24,13 @@ Each entry should include:
   was a repeat of the rejected 2026-05-07 and 2026-05-12 microbatch-carry lever,
   not a materially new optimization.
 - Evidence artifacts:
-  baseline profile
-  `tests/artifacts/perf/codex-current-dml-profile-d42c0061-20260516T072957Z/run.log`
-  and candidate profile
-  `tests/artifacts/perf/codex-direct-dml-microbatch-candidate-20260516T121218Z/run.log`.
-  The remote run reported writing `update-delete.json`, but only `run.log` was
-  present in the local artifact directory after retrieval.
+  current baseline profile
+  `tests/artifacts/perf/codex-current-dml-profiled-20260515T224517Z/summary.md`
+  plus the durable candidate rejection summary
+  `tests/artifacts/perf/codex-direct-dml-microbatch-candidate-20260516T121218Z/summary.md`.
+  The candidate's raw remote `run.log`/`update-delete.json` were not retained
+  locally, so the summary preserves the session-captured counters and matrix
+  rows that drove the rejection.
 - Result: rejected and unwound uncommitted. A focused proof test showed the
   direct-simple UPDATE/DELETE statements could hit the microbatch carry, but the
   measured benchmark already had `schema_refreshes=1` per batch before this
@@ -55,10 +56,13 @@ Each entry should include:
   MemDatabase row mirror could prove the affected count, then materialized the
   physical B-tree deletes at the normal read/commit boundary.
 - Evidence artifacts:
-  baseline profile
-  `tests/artifacts/perf/codex-current-dml-profile-d42c0061-20260516T072957Z/run.log`
-  and candidate profile
-  `tests/artifacts/perf/codex-dense-rowid-delete-candidate-20260516T075343Z/run.log`.
+  current baseline profile
+  `tests/artifacts/perf/codex-current-dml-profiled-20260515T224517Z/summary.md`
+  plus the durable candidate rejection summary
+  `tests/artifacts/perf/codex-dense-rowid-delete-candidate-20260516T075343Z/summary.md`.
+  The candidate's raw remote `run.log`/`update-delete.json` were not retained
+  locally, so the summary preserves the admission counters and root-cause
+  finding that drove the rejection.
 - Result: rejected and unwound uncommitted. The apparent 10k DELETE movement
   was not a valid keep signal: the candidate profile still reported the old
   retained leaf-run counters (`delete_leaf_start=64/67`,
@@ -89,15 +93,15 @@ Each entry should include:
   dense rowid interval, buffered exact transaction-local deleted rowids, and
   materialized physical B-tree deletes at the normal read/commit boundary.
 - Evidence artifacts:
-  correctness-failing first run
-  `tests/artifacts/perf/codex-dense-btree-rowid-delete-candidate-20260516T095949Z/run.log`
-  and fixed-candidate profile
-  `tests/artifacts/perf/codex-dense-btree-rowid-delete-candidate-fixed-20260516T102402Z/run.log`.
-  The remote run reported writing `update-delete.json`, but that JSON artifact
-  was not present in the local artifact directory after retrieval, so the
-  rejection is grounded in the retained `run.log`.
-  Baseline comparison is the current DML profile
-  `tests/artifacts/perf/codex-current-dml-profile-d42c0061-20260516T072957Z/run.log`.
+  correctness-failing first-run summary
+  `tests/artifacts/perf/codex-dense-btree-rowid-delete-candidate-20260516T095949Z/summary.md`,
+  fixed-candidate rejection summary
+  `tests/artifacts/perf/codex-dense-btree-rowid-delete-candidate-fixed-20260516T102402Z/summary.md`,
+  and current baseline profile
+  `tests/artifacts/perf/codex-current-dml-profiled-20260515T224517Z/summary.md`.
+  The candidate raw remote `run.log`/`update-delete.json` artifacts were not
+  retained locally, so the summaries preserve the correctness failure and fixed
+  profile counters that drove the rejection.
 - Result: rejected and unwound uncommitted. The first run crashed during
   `fs_delete_100` teardown with `PRIMARY KEY constraint failed`: when the
   dense oracle skipped a small table it left the cursor parked at the last row,

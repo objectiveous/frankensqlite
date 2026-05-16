@@ -489,8 +489,8 @@ impl Vfs for WindowsVfs {
         Ok((
             WindowsFile {
                 path: resolved,
-                file,
-                os_locks,
+                file: Some(file),
+                os_locks: Some(os_locks),
                 owner_id,
                 lock_level: LockLevel::None,
                 delete_on_close,
@@ -539,8 +539,8 @@ impl Vfs for WindowsVfs {
 #[derive(Debug)]
 pub struct WindowsFile {
     path: PathBuf,
-    file: File,
-    os_locks: WindowsOsLockFiles,
+    file: Option<File>,
+    os_locks: Option<WindowsOsLockFiles>,
     owner_id: u64,
     lock_level: LockLevel,
     delete_on_close: bool,
@@ -549,6 +549,30 @@ pub struct WindowsFile {
 }
 
 impl WindowsFile {
+    fn file_ref(&self) -> Result<&File> {
+        self.file
+            .as_ref()
+            .ok_or_else(|| FrankenError::internal("windows file is closed"))
+    }
+
+    fn file_mut(&mut self) -> Result<&mut File> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| FrankenError::internal("windows file is closed"))
+    }
+
+    fn os_locks_ref(&self) -> Result<&WindowsOsLockFiles> {
+        self.os_locks
+            .as_ref()
+            .ok_or_else(|| FrankenError::internal("windows lock files are closed"))
+    }
+
+    fn os_locks_mut(&mut self) -> Result<&mut WindowsOsLockFiles> {
+        self.os_locks
+            .as_mut()
+            .ok_or_else(|| FrankenError::internal("windows lock files are closed"))
+    }
+
     fn ensure_shm_state(&mut self) -> Result<Arc<Mutex<WindowsShmState>>> {
         if let Some(state) = &self.shm_state {
             return Ok(Arc::clone(state));
@@ -703,10 +727,16 @@ impl WindowsFile {
 
 impl VfsFile for WindowsFile {
     fn close(&mut self, cx: &Cx) -> Result<()> {
+        if self.file.is_none() && self.os_locks.is_none() {
+            return Ok(());
+        }
         self.unlock(cx, LockLevel::None)?;
         self.release_shm_owner_state(self.delete_on_close)?;
+        drop(self.os_locks.take());
+        drop(self.file.take());
         if self.delete_on_close {
             drop(fs::remove_file(&self.path));
+            try_remove_windows_lock_sidecars(&self.path);
         }
         Ok(())
     }
@@ -724,7 +754,7 @@ impl VfsFile for WindowsFile {
                     what: "read offset".to_string(),
                     value: "overflow".to_string(),
                 })?;
-            let n = self.file.seek_read(&mut buf[total..], read_offset)?;
+            let n = self.file_ref()?.seek_read(&mut buf[total..], read_offset)?;
             if n == 0 {
                 break;
             }
@@ -749,7 +779,7 @@ impl VfsFile for WindowsFile {
                     what: "write offset".to_string(),
                     value: "overflow".to_string(),
                 })?;
-            let n = self.file.seek_write(&buf[total..], write_offset)?;
+            let n = self.file_mut()?.seek_write(&buf[total..], write_offset)?;
             if n == 0 {
                 return Err(FrankenError::Io(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
@@ -762,21 +792,21 @@ impl VfsFile for WindowsFile {
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
-        self.file.set_len(size)?;
+        self.file_mut()?.set_len(size)?;
         Ok(())
     }
 
     fn sync(&mut self, _cx: &Cx, flags: SyncFlags) -> Result<()> {
         if flags.contains(SyncFlags::DATAONLY) {
-            self.file.sync_data()?;
+            self.file_mut()?.sync_data()?;
         } else {
-            self.file.sync_all()?;
+            self.file_mut()?.sync_all()?;
         }
         Ok(())
     }
 
     fn file_size(&self, _cx: &Cx) -> Result<u64> {
-        Ok(self.file.metadata()?.len())
+        Ok(self.file_ref()?.metadata()?.len())
     }
 
     fn lock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
@@ -788,9 +818,14 @@ impl VfsFile for WindowsFile {
         while self.lock_level < level {
             let next = next_lock_level(self.lock_level)
                 .ok_or_else(|| FrankenError::internal("invalid lock escalation"))?;
-            if let Err(err) = self.os_locks.try_lock_level(next) {
-                let _ = self.os_locks.unlock_to(prior_level);
-                self.lock_level = self.os_locks.highest_held_level();
+            let lock_result = self.os_locks_mut()?.try_lock_level(next);
+            if let Err(err) = lock_result {
+                let highest_held_level = {
+                    let os_locks = self.os_locks_mut()?;
+                    let _ = os_locks.unlock_to(prior_level);
+                    os_locks.highest_held_level()
+                };
+                self.lock_level = highest_held_level;
                 return Err(err);
             }
             self.lock_level = next;
@@ -802,8 +837,9 @@ impl VfsFile for WindowsFile {
         if level >= self.lock_level {
             return Ok(());
         }
-        if let Err(err) = self.os_locks.unlock_to(level) {
-            self.lock_level = self.os_locks.highest_held_level();
+        let unlock_result = self.os_locks_mut()?.unlock_to(level);
+        if let Err(err) = unlock_result {
+            self.lock_level = self.os_locks_mut()?.highest_held_level();
             return Err(err);
         }
         self.lock_level = level;
@@ -811,7 +847,7 @@ impl VfsFile for WindowsFile {
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
-        self.os_locks.reserved_locked_by_other()
+        self.os_locks_ref()?.reserved_locked_by_other()
     }
 
     fn sector_size(&self) -> u32 {
@@ -1208,9 +1244,24 @@ mod tests {
             | VfsOpenFlags::DELETEONCLOSE;
         let (mut file, _) = vfs.open(&cx, None, flags).expect("open temp");
         let temp_path = file.path.clone();
+        let lock_sidecars = windows_lock_sidecar_paths(&temp_path);
         assert!(temp_path.exists());
+        for sidecar in &lock_sidecars {
+            assert!(
+                sidecar.exists(),
+                "temporary Windows VFS handle should create {}",
+                sidecar.display()
+            );
+        }
         file.close(&cx).expect("close");
         assert!(!temp_path.exists());
+        for sidecar in &lock_sidecars {
+            assert!(
+                !sidecar.exists(),
+                "temporary close should remove advisory lock sidecar {}",
+                sidecar.display()
+            );
+        }
     }
 
     #[test]
@@ -1233,7 +1284,6 @@ mod tests {
         }
 
         file.close(&cx).expect("close file");
-        drop(file);
 
         vfs.delete(&cx, &path, false).expect("delete file");
         assert!(!path.exists(), "Vfs::delete should remove the main DB");

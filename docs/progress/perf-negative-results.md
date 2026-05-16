@@ -12,6 +12,38 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-16 - Repeated direct-simple UPDATE/DELETE microbatch carry
+
+- Target: `comprehensive-bench --quick --filter update-delete`, especially the
+  small fixed-cost UPDATE/DELETE rows, with `FSQLITE_BENCH_PROFILE_DML=1`.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The candidate allowed explicit-txn
+  programless direct-simple prepared UPDATE/DELETE statements to reuse the
+  statement microbatch schema-proof carry even though `may_observe_change_tracking`
+  is conservatively true for UPDATE/DELETE syntax. Fresh review confirmed this
+  was a repeat of the rejected 2026-05-07 and 2026-05-12 microbatch-carry lever,
+  not a materially new optimization.
+- Evidence artifacts:
+  baseline profile
+  `tests/artifacts/perf/codex-current-dml-profile-d42c0061-20260516T072957Z/run.log`
+  and candidate profile
+  `tests/artifacts/perf/codex-direct-dml-microbatch-candidate-20260516T121218Z/run.log`.
+  The remote run reported writing `update-delete.json`, but only `run.log` was
+  present in the local artifact directory after retrieval.
+- Result: rejected and unwound uncommitted. A focused proof test showed the
+  direct-simple UPDATE/DELETE statements could hit the microbatch carry, but the
+  measured benchmark already had `schema_refreshes=1` per batch before this
+  candidate. The matrix did not materially move: `100 rows / update 10 rows`
+  stayed at `F=8.7 us`; `100 rows / delete 5 rows` moved only from
+  `F=9.8 us` to `F=9.5 us` with high candidate CV; `1000 rows / update
+  100 rows` stayed effectively flat (`F=44.0 us` to `F=43.9 us`); and the
+  DELETE rows remained C-SQLite-faster.
+- Do not retry standalone direct-simple UPDATE/DELETE schema-proof carry for the
+  current update-delete matrix. Reconsider only for a benchmark shape that
+  proves repeated schema validations inside the mutation loop, or if profile
+  counters show multiple schema validations eliminated in the target row and the
+  full quick matrix moves.
+
 ## 2026-05-16 - Dense MemDatabase rowid DELETE run
 
 - Target: `comprehensive-bench --quick --filter update-delete` DELETE rows,
@@ -60,9 +92,10 @@ Each entry should include:
   correctness-failing first run
   `tests/artifacts/perf/codex-dense-btree-rowid-delete-candidate-20260516T095949Z/run.log`
   and fixed-candidate profile
-  `tests/artifacts/perf/codex-dense-btree-rowid-delete-candidate-fixed-20260516T102402Z/run.log`
-  plus
-  `tests/artifacts/perf/codex-dense-btree-rowid-delete-candidate-fixed-20260516T102402Z/update-delete.json`.
+  `tests/artifacts/perf/codex-dense-btree-rowid-delete-candidate-fixed-20260516T102402Z/run.log`.
+  The remote run reported writing `update-delete.json`, but that JSON artifact
+  was not present in the local artifact directory after retrieval, so the
+  rejection is grounded in the retained `run.log`.
   Baseline comparison is the current DML profile
   `tests/artifacts/perf/codex-current-dml-profile-d42c0061-20260516T072957Z/run.log`.
 - Result: rejected and unwound uncommitted. The first run crashed during

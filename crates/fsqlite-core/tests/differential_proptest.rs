@@ -57,39 +57,48 @@ fn setup_pair() -> (Connection, rusqlite::Connection) {
 /// We canonicalize each value via the engine's debug-Display so we
 /// don't accidentally hide a real disagreement behind divergent
 /// formatting.
+///
+/// Both-engines-error is treated as agreement, not failure: the
+/// grammar is intentionally narrow so spurious parse errors are
+/// unlikely, but if a query is rejected by both engines that is the
+/// same observable result. Only an asymmetric error (one engine
+/// accepts, the other rejects) or differing row contents constitute
+/// a real disagreement.
 fn rows_match(fconn: &Connection, rconn: &rusqlite::Connection, query: &str) -> bool {
-    let frank_rows = match fconn.query(query) {
-        Ok(rs) => rs
-            .iter()
-            .map(|row| {
-                row.values()
-                    .iter()
-                    .map(format_franken_value)
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>(),
-        Err(_) => return false, // Treat frankensqlite parse/exec errors as a generator miss, not a fail.
-    };
-    let mut stmt = match rconn.prepare(query) {
-        Ok(s) => s,
-        Err(_) => return frank_rows.is_empty(), // Both should reject; if frankensqlite returned rows that's a real disagreement.
-    };
-    let col_count = stmt.column_count();
-    let rusq_rows: Vec<Vec<String>> = match stmt.query_map([], |row| {
-        let mut vals = Vec::with_capacity(col_count);
-        for i in 0..col_count {
-            let v: rusqlite::types::Value = row.get_unwrap(i);
-            vals.push(format_rusq_value(&v));
+    match (fconn.query(query), rconn.prepare(query)) {
+        // Both engines agree on rejection — same observable result.
+        (Err(_), Err(_)) => true,
+        // Asymmetric rejection: real disagreement.
+        (Err(_), Ok(_)) | (Ok(_), Err(_)) => false,
+        (Ok(frank_result), Ok(mut stmt)) => {
+            let frank_rows = frank_result
+                .iter()
+                .map(|row| {
+                    row.values()
+                        .iter()
+                        .map(format_franken_value)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+
+            let col_count = stmt.column_count();
+            let rusq_rows: Vec<Vec<String>> = match stmt.query_map([], |row| {
+                let mut vals = Vec::with_capacity(col_count);
+                for i in 0..col_count {
+                    let v: rusqlite::types::Value = row.get_unwrap(i);
+                    vals.push(format_rusq_value(&v));
+                }
+                Ok(vals)
+            }) {
+                Ok(it) => match it.collect::<Result<Vec<_>, _>>() {
+                    Ok(rs) => rs,
+                    Err(_) => return false,
+                },
+                Err(_) => return false,
+            };
+            frank_rows == rusq_rows
         }
-        Ok(vals)
-    }) {
-        Ok(it) => match it.collect::<Result<Vec<_>, _>>() {
-            Ok(rs) => rs,
-            Err(_) => return false,
-        },
-        Err(_) => return false,
-    };
-    frank_rows == rusq_rows
+    }
 }
 
 fn format_franken_value(v: &SqliteValue) -> String {

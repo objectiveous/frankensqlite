@@ -301,6 +301,7 @@ fn test_prepared_full_reload_reuses_publication_after_cross_connection_ddl() {
 
 /// B3.4 Probe: Measure commit_txn_roundtrip_time_ns for :memory: autocommit INSERTs.
 /// Uses AUTO-ROWID inserts to test the implicit_rowid_hint fast path.
+// ubs:ignore false positive: generated test values are bound parameters, not SQL text.
 #[test]
 fn test_b3_4_memory_autocommit_commit_roundtrip_probe() {
     let _profile_guard = HotPathProfileTestGuard::new();
@@ -653,4 +654,96 @@ fn test_bd_wwqen_3_column_list_insert_direct_path_eligibility() {
         }
     );
     eprintln!("=== END bd-wwqen.3 eligibility test ===");
+}
+
+#[test]
+fn prepared_direct_delete_duplicate_and_absent_counts_match_sqlite() {
+    let conn = Connection::open(":memory:").unwrap();
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    let ddl = "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT NOT NULL);";
+    conn.execute(ddl).unwrap();
+    sqlite.execute(ddl, []).unwrap();
+
+    let insert = conn.prepare("INSERT INTO bench VALUES (?1, ?2);").unwrap();
+    let mut sqlite_insert = sqlite
+        .prepare("INSERT INTO bench VALUES (?1, ?2);")
+        .unwrap();
+    for rowid in 1_i64..=5_i64 {
+        let name = format!("user_{rowid}");
+        sqlite_insert
+            .execute(rusqlite::params![rowid, &name])
+            .unwrap();
+        insert
+            .execute_with_params(&[SqliteValue::Integer(rowid), SqliteValue::Text(name.into())])
+            .unwrap();
+    }
+    drop(sqlite_insert);
+
+    let delete = conn.prepare("DELETE FROM bench WHERE id = ?1;").unwrap();
+    let mut sqlite_delete = sqlite.prepare("DELETE FROM bench WHERE id = ?1;").unwrap();
+    conn.execute("BEGIN;").unwrap();
+    sqlite.execute("BEGIN;", []).unwrap();
+
+    for (rowid, expected_affected) in [(1_i64, 1), (1, 0), (2, 1), (99, 0), (3, 1), (2, 0)] {
+        let fsqlite_affected = conn
+            .execute_prepared_with_params(&delete, &[SqliteValue::Integer(rowid)])
+            .expect("prepared direct delete should execute");
+        let sqlite_affected = sqlite_delete
+            .execute(rusqlite::params![rowid])
+            .expect("sqlite delete should execute");
+        assert_eq!(
+            sqlite_affected, expected_affected,
+            "SQLite reference affected-count mismatch for rowid {rowid}"
+        );
+        assert_eq!(
+            fsqlite_affected, expected_affected,
+            "FrankenSQLite affected-count mismatch for rowid {rowid}"
+        );
+    }
+    drop(sqlite_delete);
+
+    let fsqlite_total = conn
+        .query_row("SELECT count(*) FROM bench;")
+        .expect("fsqlite read-your-writes count should execute");
+    let sqlite_total: i64 = sqlite
+        .query_row("SELECT count(*) FROM bench;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(sqlite_total, 2);
+    assert_eq!(
+        fsqlite_total.values()[0],
+        SqliteValue::Integer(sqlite_total)
+    );
+
+    let fsqlite_survivors = conn
+        .query_row("SELECT count(*) FROM bench WHERE id IN (4, 5);")
+        .expect("fsqlite survivor count should execute");
+    let sqlite_survivors: i64 = sqlite
+        .query_row(
+            "SELECT count(*) FROM bench WHERE id IN (4, 5);",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sqlite_survivors, 2);
+    assert_eq!(
+        fsqlite_survivors.values()[0],
+        SqliteValue::Integer(sqlite_survivors)
+    );
+
+    conn.execute("COMMIT;").unwrap();
+    sqlite.execute("COMMIT;", []).unwrap();
+
+    let fsqlite_remaining = conn
+        .query_row("SELECT count(*) FROM bench WHERE id <= 3;")
+        .expect("fsqlite post-commit deleted count should execute");
+    let sqlite_remaining: i64 = sqlite
+        .query_row("SELECT count(*) FROM bench WHERE id <= 3;", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(sqlite_remaining, 0);
+    assert_eq!(
+        fsqlite_remaining.values()[0],
+        SqliteValue::Integer(sqlite_remaining)
+    );
 }

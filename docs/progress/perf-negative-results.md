@@ -12,6 +12,39 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-16 - Dense MemDatabase rowid DELETE run
+
+- Target: `comprehensive-bench --quick --filter update-delete` DELETE rows,
+  especially `10000 rows / delete 500 rows`, on source checkout `d42c0061`
+  with `FSQLITE_BENCH_PROFILE_DML=1`.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The candidate buffered exact
+  transaction-local DELETE rowids for dense private-memory tables when a clean
+  MemDatabase row mirror could prove the affected count, then materialized the
+  physical B-tree deletes at the normal read/commit boundary.
+- Evidence artifacts:
+  baseline profile
+  `tests/artifacts/perf/codex-current-dml-profile-d42c0061-20260516T072957Z/run.log`
+  and candidate profile
+  `tests/artifacts/perf/codex-dense-rowid-delete-candidate-20260516T075343Z/run.log`.
+- Result: rejected and unwound uncommitted. The apparent 10k DELETE movement
+  was not a valid keep signal: the candidate profile still reported the old
+  retained leaf-run counters (`delete_leaf_start=64/67`,
+  `delete_leaf_active=433/496`, `delete_leaf_miss=63`,
+  `delete_leaf_flush=64/64`), proving the new dense-rowid path did not admit
+  the benchmark workload. Fresh review found the root cause: the proof tests
+  used the default time-travel-capturing mode, but the benchmark applies
+  `PRAGMA fsqlite_capture_time_travel_snapshots=false`, which leaves the
+  MemDatabase row mirror lazy after setup commits and makes the clean-memdb
+  dense-rowid oracle unavailable.
+- Do not retry a standalone dense-rowid DELETE buffer gated on
+  `memdb_rows_loaded && memdb_storage_count_shortcuts_safe`. Reconsider only
+  as part of the broader transaction-local DML mutation operator if it has an
+  exact affected-row oracle that works in the snapshot-free/lazy-MemDatabase
+  benchmark mode, proves read/savepoint/rollback semantics, and the profile
+  counters show the new path actually replaces the retained leaf-run path on
+  the target rows.
+
 ## 2026-05-15 - Current full-quick refresh after DML frontier triage
 
 - Target: current `comprehensive-bench --quick` matrix after the DML profile

@@ -749,3 +749,117 @@ fn prepared_direct_delete_duplicate_and_absent_counts_match_sqlite() {
         "read/commit boundaries should flush buffered direct DELETE work: {profile:?}"
     );
 }
+
+#[test]
+fn prepared_direct_delete_read_and_savepoint_boundaries_match_sqlite() {
+    let _profile_guard = HotPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    let ddl = "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT NOT NULL);";
+    conn.execute(ddl).unwrap();
+    sqlite.execute(ddl, []).unwrap();
+
+    let insert = conn.prepare("INSERT INTO bench VALUES (?1, ?2);").unwrap();
+    let mut sqlite_insert = sqlite
+        .prepare("INSERT INTO bench VALUES (?1, ?2);")
+        .unwrap();
+    for rowid in 1_i64..=6_i64 {
+        let name = format!("user_{rowid}");
+        sqlite_insert
+            .execute(rusqlite::params![rowid, &name])
+            .unwrap();
+        insert
+            .execute_with_params(&[SqliteValue::Integer(rowid), SqliteValue::Text(name.into())])
+            .unwrap();
+    }
+    drop(sqlite_insert);
+
+    let delete = conn.prepare("DELETE FROM bench WHERE id = ?1;").unwrap();
+    let mut sqlite_delete = sqlite.prepare("DELETE FROM bench WHERE id = ?1;").unwrap();
+    conn.execute("BEGIN;").unwrap();
+    sqlite.execute("BEGIN;", []).unwrap();
+
+    for rowid in [2_i64, 4_i64] {
+        let fsqlite_affected = conn
+            .execute_prepared_with_params(&delete, &[SqliteValue::Integer(rowid)])
+            .unwrap();
+        let sqlite_affected = sqlite_delete.execute(rusqlite::params![rowid]).unwrap();
+        assert_eq!(fsqlite_affected, sqlite_affected);
+        assert_eq!(fsqlite_affected, 1);
+    }
+
+    let fsqlite_mid = conn
+        .query("SELECT id, name FROM bench ORDER BY id;")
+        .unwrap();
+    let sqlite_mid = sqlite_rows(&sqlite);
+    assert_eq!(franken_rows(&fsqlite_mid), sqlite_mid);
+
+    conn.execute("SAVEPOINT sp;").unwrap();
+    sqlite.execute("SAVEPOINT sp;", []).unwrap();
+    for rowid in [3_i64, 5_i64] {
+        let fsqlite_affected = conn
+            .execute_prepared_with_params(&delete, &[SqliteValue::Integer(rowid)])
+            .unwrap();
+        let sqlite_affected = sqlite_delete.execute(rusqlite::params![rowid]).unwrap();
+        assert_eq!(fsqlite_affected, sqlite_affected);
+        assert_eq!(fsqlite_affected, 1);
+    }
+    conn.execute("ROLLBACK TO sp;").unwrap();
+    sqlite.execute("ROLLBACK TO sp;", []).unwrap();
+    conn.execute("RELEASE sp;").unwrap();
+    sqlite.execute("RELEASE sp;", []).unwrap();
+    drop(sqlite_delete);
+
+    let fsqlite_after_rollback = conn
+        .query("SELECT id, name FROM bench ORDER BY id;")
+        .unwrap();
+    let sqlite_after_rollback = sqlite_rows(&sqlite);
+    assert_eq!(franken_rows(&fsqlite_after_rollback), sqlite_after_rollback);
+    assert_eq!(
+        sqlite_after_rollback,
+        vec![
+            vec![SqliteValue::Integer(1), SqliteValue::Text("user_1".into())],
+            vec![SqliteValue::Integer(3), SqliteValue::Text("user_3".into())],
+            vec![SqliteValue::Integer(5), SqliteValue::Text("user_5".into())],
+            vec![SqliteValue::Integer(6), SqliteValue::Text("user_6".into())],
+        ]
+    );
+
+    conn.execute("COMMIT;").unwrap();
+    sqlite.execute("COMMIT;", []).unwrap();
+    let fsqlite_final = conn
+        .query("SELECT id, name FROM bench ORDER BY id;")
+        .unwrap();
+    assert_eq!(franken_rows(&fsqlite_final), sqlite_rows(&sqlite));
+
+    let profile = hot_path_profile_snapshot();
+    assert_eq!(
+        profile.prepared_direct_delete_executions, 4,
+        "all proof DELETE statements should stay on the direct-delete path: {profile:?}"
+    );
+    assert!(
+        profile.prepared_direct_delete_leaf_run_dirty_flushes >= 1,
+        "read and savepoint boundaries must publish pending direct DELETE work: {profile:?}"
+    );
+}
+
+fn franken_rows(rows: &[fsqlite_core::connection::Row]) -> Vec<Vec<SqliteValue>> {
+    rows.iter().map(|row| row.values().to_vec()).collect()
+}
+
+fn sqlite_rows(sqlite: &rusqlite::Connection) -> Vec<Vec<SqliteValue>> {
+    let mut stmt = sqlite
+        .prepare("SELECT id, name FROM bench ORDER BY id;")
+        .unwrap();
+    stmt.query_map([], |row| {
+        let id = row.get(0)?;
+        let name: String = row.get(1)?;
+        Ok(vec![
+            SqliteValue::Integer(id),
+            SqliteValue::Text(name.into()),
+        ])
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .unwrap()
+}

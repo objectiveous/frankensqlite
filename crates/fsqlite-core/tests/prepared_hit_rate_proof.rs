@@ -788,14 +788,20 @@ fn prepared_direct_delete_read_and_savepoint_boundaries_match_sqlite() {
         assert_eq!(fsqlite_affected, 1);
     }
 
+    conn.execute("SAVEPOINT sp;").unwrap();
+    sqlite.execute("SAVEPOINT sp;", []).unwrap();
+    let profile_after_savepoint = hot_path_profile_snapshot();
+    assert!(
+        profile_after_savepoint.prepared_direct_delete_leaf_run_dirty_flushes >= 1,
+        "SAVEPOINT must flush pending direct DELETE work before the savepoint boundary: {profile_after_savepoint:?}"
+    );
+
     let fsqlite_mid = conn
         .query("SELECT id, name FROM bench ORDER BY id;")
         .unwrap();
     let sqlite_mid = sqlite_rows(&sqlite);
     assert_eq!(franken_rows(&fsqlite_mid), sqlite_mid);
 
-    conn.execute("SAVEPOINT sp;").unwrap();
-    sqlite.execute("SAVEPOINT sp;", []).unwrap();
     for rowid in [3_i64, 5_i64] {
         let fsqlite_affected = conn
             .execute_prepared_with_params(&delete, &[SqliteValue::Integer(rowid)])

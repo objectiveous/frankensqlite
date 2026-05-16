@@ -1214,6 +1214,39 @@ mod tests {
     }
 
     #[test]
+    fn test_windowsvfs_delete_removes_lock_sidecars() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("delete_sidecars.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open file");
+        let lock_sidecars = windows_lock_sidecar_paths(&path);
+
+        for sidecar in &lock_sidecars {
+            assert!(
+                sidecar.exists(),
+                "opening the Windows VFS handle should create {}",
+                sidecar.display()
+            );
+        }
+
+        file.close(&cx).expect("close file");
+        drop(file);
+
+        vfs.delete(&cx, &path, false).expect("delete file");
+        assert!(!path.exists(), "Vfs::delete should remove the main DB");
+        for sidecar in &lock_sidecars {
+            assert!(
+                !sidecar.exists(),
+                "Vfs::delete should remove advisory lock sidecar {}",
+                sidecar.display()
+            );
+        }
+    }
+
+    #[test]
     fn test_windowsvfs_sector_size_detection() {
         let cx = Cx::new();
         let dir = tempdir().expect("temp dir");

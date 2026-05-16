@@ -4982,6 +4982,7 @@ mod tests {
             prepared_direct_delete_leaf_run_active_hits: 0,
             prepared_direct_delete_leaf_run_active_misses: 0,
             prepared_direct_delete_leaf_run_active_miss_shape_mismatches: 0,
+            prepared_direct_delete_leaf_run_active_miss_staged_runs: 0,
             prepared_direct_delete_leaf_run_active_miss_rowid_not_in_leaf: 0,
             prepared_direct_delete_leaf_run_active_miss_already_deleted: 0,
             prepared_direct_delete_leaf_run_active_miss_nonroot_would_empty_leaf: 0,

@@ -1343,7 +1343,7 @@ pub enum TableLeafDeleteRunDelete {
 ///
 /// The run owns one table-leaf image and accepts only deletes that cannot
 /// require parent separator repair, overflow-chain cleanup, or structural
-/// rebalance. Unsupported rowids return `Ok(false)` so callers can flush and
+/// rebalance. Unsupported rowids return a miss reason so callers can flush and
 /// fall back to the ordinary cursor delete path.
 #[derive(Debug, Clone)]
 pub struct TableLeafDeleteRun {

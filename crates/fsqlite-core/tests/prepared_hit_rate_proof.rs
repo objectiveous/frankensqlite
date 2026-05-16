@@ -751,6 +751,78 @@ fn prepared_direct_delete_duplicate_and_absent_counts_match_sqlite() {
 }
 
 #[test]
+fn prepared_direct_delete_staged_only_absent_probe_records_active_miss() {
+    let _profile_guard = HotPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT NOT NULL);")
+        .unwrap();
+
+    let insert = conn.prepare("INSERT INTO bench VALUES (?1, ?2);").unwrap();
+    conn.execute("BEGIN;").unwrap();
+    for rowid in 1_i64..=1000_i64 {
+        conn.execute_prepared_with_params(
+            &insert,
+            &[
+                SqliteValue::Integer(rowid),
+                SqliteValue::Text(format!("user_{rowid:04}_{}", "x".repeat(256)).into()),
+            ],
+        )
+        .expect("setup insert should execute");
+    }
+    conn.execute("COMMIT;").unwrap();
+
+    let delete = conn.prepare("DELETE FROM bench WHERE id = ?1;").unwrap();
+    reset_hot_path_profile();
+    conn.execute("BEGIN;").unwrap();
+    assert_eq!(
+        conn.execute_prepared_with_params(&delete, &[SqliteValue::Integer(1)])
+            .expect("first delete should start a pending leaf run"),
+        1
+    );
+    assert_eq!(
+        conn.execute_prepared_with_params(&delete, &[SqliteValue::Integer(100_000)])
+            .expect("first absent high rowid should stage the current leaf run"),
+        0
+    );
+    assert_eq!(
+        conn.execute_prepared_with_params(&delete, &[SqliteValue::Integer(100_001)])
+            .expect("second absent high rowid should keep staged runs without flushing"),
+        0
+    );
+
+    let row = conn
+        .query_row("SELECT count(*) FROM bench;")
+        .expect("read should flush the staged delete run");
+    assert_eq!(row.values()[0], SqliteValue::Integer(999));
+    conn.execute("COMMIT;").unwrap();
+
+    let profile = hot_path_profile_snapshot();
+    assert_eq!(
+        profile.prepared_direct_delete_executions, 3,
+        "proof DELETE statements should stay on the prepared direct-delete path: {profile:?}"
+    );
+    assert_eq!(
+        profile.prepared_direct_delete_leaf_run_active_attempts,
+        profile
+            .prepared_direct_delete_leaf_run_active_hits
+            .saturating_add(profile.prepared_direct_delete_leaf_run_active_misses),
+        "active DELETE-run probes should account every attempt as a hit or miss: {profile:?}"
+    );
+    assert!(
+        profile.prepared_direct_delete_leaf_run_active_misses >= 2,
+        "both absent high-rowid probes should be visible as active misses: {profile:?}"
+    );
+    assert!(
+        profile.prepared_direct_delete_leaf_run_active_miss_staged_runs >= 1,
+        "staged-only probes should not be misclassified as shape mismatches: {profile:?}"
+    );
+    assert_eq!(
+        profile.prepared_direct_delete_leaf_run_active_miss_shape_mismatches, 0,
+        "same-shape staged-only probes should not inflate shape mismatch counters: {profile:?}"
+    );
+}
+
+#[test]
 fn prepared_direct_delete_savepoint_boundary_matches_sqlite() {
     let _profile_guard = HotPathProfileTestGuard::new();
     let conn = Connection::open(":memory:").unwrap();

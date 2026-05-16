@@ -12,6 +12,35 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-16 - Current DML staged-run miss refresh found no staged bottleneck
+
+- Target: `comprehensive-bench --quick --filter update-delete` after adding
+  `delete_leaf_miss_staged` profiling for staged-only direct DELETE leaf-run
+  probes.
+- Touched during measurement: no new engine behavior. The retained local diff
+  only splits staged-only active DELETE-run miss accounting from real shape
+  mismatches in `crates/fsqlite-core/src/connection.rs` and prints the counter
+  in the DML profile lines. The benchmark reported clean revision
+  `9e44c6cb581db765f588eacb0fa369d39fa59f99`, but RCH synced and built this
+  dirty instrumentation diff.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-current-dml-profile-staged-miss-20260516T193530Z/summary.md`.
+  RCH did not retain the benchmark JSON locally, so `run.log` is the raw local
+  source for the matrix and profile counters.
+- Result: no staged-run-specific source optimization was attempted. The
+  refreshed DML profile showed `delete_leaf_miss_staged=0` for every measured
+  row. The target DELETE rows remain red (`2.53x`, `1.78x`, and `2.09x`
+  slower), but their counters point back to the already-known retained leaf-run
+  and transaction envelope:
+  the 10k DELETE row still has `delete_leaf_active=433/496`,
+  `delete_leaf_miss=63`, `delete_leaf_miss_out_of_leaf=60`,
+  `delete_leaf_flush=64/64`, `delete_leaf_flush_ns=88203`, and
+  `commit_roundtrip_ns=42123`.
+- Do not pursue staged-only DELETE-run handling as the next optimization lever
+  for the current update-delete matrix. Reconsider only if a future workload
+  shows non-zero `delete_leaf_miss_staged` counts and a same-window candidate
+  improves the focused row plus the full quick primary score.
+
 ## 2026-05-16 - Direct DELETE leaf-run monotone duplicate-check skip
 
 - Target: `comprehensive-bench --quick --filter update-delete`, especially

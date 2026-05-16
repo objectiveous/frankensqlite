@@ -492,15 +492,14 @@ fn test_b3_small_3col_autocommit_direct_insert_profile_breakdown() {
 
 /// bd-wwqen.3: Proof test for column-list INSERT direct path eligibility.
 ///
-/// This test documents the current behavior where column-list INSERT syntax
-/// (e.g., `INSERT INTO t(col1, col2) VALUES(?, ?)`) bypasses the direct insert
-/// fast path. Once the bd-wwqen.3 fix is landed, this test should be updated
-/// to assert that direct_insert_executions equals n.
+/// This test proves that column-list INSERT syntax
+/// (e.g., `INSERT INTO t(col1, col2) VALUES(?, ?)`) stays eligible for the
+/// direct insert fast path, including reordered column lists.
 ///
 /// Key findings:
 /// 1. Without column list: `INSERT INTO t VALUES(?, ?)` → direct path
-/// 2. With column list: `INSERT INTO t(col1, col2) VALUES(?, ?)` → VDBE path
-/// 3. The fix should reorder VALUES to match table column order
+/// 2. With column list: `INSERT INTO t(col1, col2) VALUES(?, ?)` → direct path
+/// 3. Reordered VALUES are mapped back to table column order
 #[test]
 fn test_bd_wwqen_3_column_list_insert_direct_path_eligibility() {
     let _profile_guard = HotPathProfileTestGuard::new();
@@ -545,7 +544,7 @@ fn test_bd_wwqen_3_column_list_insert_direct_path_eligibility() {
     // Clear table for next test
     conn.execute("DELETE FROM col_order_test").unwrap();
 
-    // Test 2: With column list in SAME order (currently bypasses direct path)
+    // Test 2: With column list in SAME order.
     let stmt_same_order = conn
         .prepare("INSERT INTO col_order_test(id, name, value) VALUES(?1, ?2, ?3)")
         .unwrap();
@@ -571,22 +570,12 @@ fn test_bd_wwqen_3_column_list_insert_direct_path_eligibility() {
         snap_same_order.prepared_insert_fast_lane_hits
     );
 
-    // CURRENT BEHAVIOR: Column-list INSERT bypasses direct path
-    // TODO(bd-wwqen.3): After fix, change this to assert_eq!(..., 100)
-    eprintln!(
-        "NOTE: Column-list INSERT currently bypasses direct path (direct_insert_executions={})",
-        snap_same_order.prepared_direct_insert_executions
+    assert_eq!(
+        snap_same_order.prepared_direct_insert_executions, 100,
+        "same-order column-list INSERT should use the direct insert path"
     );
-    // Assert current behavior - will fail when fix is landed, signaling time to update
-    if snap_same_order.prepared_direct_insert_executions == 100 {
-        eprintln!("SUCCESS: bd-wwqen.3 fix is active - column-list INSERT now uses direct path!");
-    } else {
-        eprintln!(
-            "EXPECTED (pre-fix): Column-list INSERT uses VDBE path, direct_insert_executions=0"
-        );
-    }
 
-    // Test 3: With column list in DIFFERENT order (reordering needed)
+    // Test 3: With column list in DIFFERENT order.
     conn.execute("DELETE FROM col_order_test").unwrap();
     let stmt_diff_order = conn
         .prepare("INSERT INTO col_order_test(value, name, id) VALUES(?1, ?2, ?3)")
@@ -628,30 +617,24 @@ fn test_bd_wwqen_3_column_list_insert_direct_path_eligibility() {
     );
     // Verify reordering: value should be 50 * 2.5 = 125.0
     assert_eq!(sample[0].values()[2], SqliteValue::Float(125.0));
+    assert_eq!(
+        snap_diff_order.prepared_direct_insert_executions, 100,
+        "reordered column-list INSERT should use the direct insert path"
+    );
 
-    // Summary for post-fix validation
+    // Summary for regression validation.
     eprintln!("\n=== bd-wwqen.3 VALIDATION SUMMARY ===");
     eprintln!(
         "Test 1 (no col list):    direct_insert_executions = {} (expected: 100)",
         snap_no_cols.prepared_direct_insert_executions
     );
     eprintln!(
-        "Test 2 (same order):     direct_insert_executions = {} (expected after fix: 100)",
+        "Test 2 (same order):     direct_insert_executions = {} (expected: 100)",
         snap_same_order.prepared_direct_insert_executions
     );
     eprintln!(
-        "Test 3 (diff order):     direct_insert_executions = {} (expected after fix: 100)",
+        "Test 3 (diff order):     direct_insert_executions = {} (expected: 100)",
         snap_diff_order.prepared_direct_insert_executions
-    );
-    let fix_active = snap_same_order.prepared_direct_insert_executions == 100
-        && snap_diff_order.prepared_direct_insert_executions == 100;
-    eprintln!(
-        "FIX STATUS: {}",
-        if fix_active {
-            "ACTIVE - column-list INSERT uses direct path"
-        } else {
-            "NOT YET - column-list INSERT still uses VDBE path"
-        }
     );
     eprintln!("=== END bd-wwqen.3 eligibility test ===");
 }

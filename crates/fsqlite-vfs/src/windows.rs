@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::os::windows::fs::FileExt;
+use std::os::windows::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -29,6 +29,9 @@ use crate::traits::{Vfs, VfsFile};
 
 /// SQLite I/O capability bit indicating files cannot be deleted while open.
 const SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN: u32 = 0x0000_0800;
+const WINDOWS_FILE_SHARE_READ: u32 = 0x0000_0001;
+const WINDOWS_FILE_SHARE_WRITE: u32 = 0x0000_0002;
+const WINDOWS_SHARE_READ_WRITE: u32 = WINDOWS_FILE_SHARE_READ | WINDOWS_FILE_SHARE_WRITE;
 
 fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
@@ -36,6 +39,12 @@ fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
 
 fn lock_poisoned(name: &str) -> FrankenError {
     FrankenError::internal(format!("{name} lock poisoned"))
+}
+
+fn windows_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.share_mode(WINDOWS_SHARE_READ_WRITE);
+    options
 }
 
 fn resolve_path(path: &Path) -> Result<PathBuf> {
@@ -93,7 +102,8 @@ fn try_remove_windows_lock_sidecars(path: &Path) {
 }
 
 fn ensure_shm_file_len(path: &Path, min_len: u64) -> Result<()> {
-    let file = OpenOptions::new()
+    let mut options = windows_open_options();
+    let file = options
         .read(true)
         .write(true)
         .create(true)
@@ -248,7 +258,8 @@ struct WindowsOsLockFiles {
 impl WindowsOsLockFiles {
     fn open(path: &Path) -> Result<Self> {
         let open_sidecar = |sidecar: &Path| -> Result<File> {
-            Ok(OpenOptions::new()
+            let mut options = windows_open_options();
+            Ok(options
                 .read(true)
                 .write(true)
                 .create(true)
@@ -454,7 +465,7 @@ impl Vfs for WindowsVfs {
             return Err(FrankenError::CannotOpen { path: resolved });
         }
 
-        let mut options = OpenOptions::new();
+        let mut options = windows_open_options();
         options.read(true);
         if is_rw {
             options.write(true);
@@ -521,12 +532,14 @@ impl Vfs for WindowsVfs {
         }
         match flags {
             f if f == AccessFlags::EXISTS => Ok(true),
-            f if f == AccessFlags::READ => Ok(File::open(resolved).is_ok()),
-            _ => Ok(OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(resolved)
-                .is_ok()),
+            f if f == AccessFlags::READ => {
+                let mut options = windows_open_options();
+                Ok(options.read(true).open(resolved).is_ok())
+            }
+            _ => {
+                let mut options = windows_open_options();
+                Ok(options.read(true).write(true).open(resolved).is_ok())
+            }
         }
     }
 
@@ -739,6 +752,10 @@ impl WindowsFile {
 
 impl VfsFile for WindowsFile {
     fn close(&mut self, cx: &Cx) -> Result<()> {
+        if self.is_closed() && self.shm_state.is_none() {
+            return Ok(());
+        }
+
         let mut first_error = None;
 
         if !self.is_closed() {
@@ -1298,6 +1315,62 @@ mod tests {
             assert!(
                 !sidecar.exists(),
                 "temporary close should remove advisory lock sidecar {}",
+                sidecar.display()
+            );
+        }
+    }
+
+    #[test]
+    fn test_windowsvfs_open_handles_block_delete_sharing() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("delete_sharing.db");
+        let mut options = windows_open_options();
+        let _file = options
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .expect("open file without delete sharing");
+
+        assert!(
+            fs::remove_file(&path).is_err(),
+            "Windows VFS files must reject unlink while an open handle exists"
+        );
+    }
+
+    #[test]
+    fn test_windowsvfs_delete_on_close_is_idempotent() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("idempotent_close.db");
+        let vfs = WindowsVfs::new();
+        let flags = open_flags_create() | VfsOpenFlags::DELETEONCLOSE;
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), flags)
+            .expect("open delete-on-close file");
+        let shm_path = file.shm_path.clone();
+        let lock_sidecars = windows_lock_sidecar_paths(&path);
+
+        file.close(&cx).expect("first close");
+        assert!(!path.exists(), "first close should delete the DB file");
+
+        fs::write(&path, b"replacement db").expect("replacement db");
+        fs::write(&shm_path, b"replacement shm").expect("replacement shm");
+        for sidecar in &lock_sidecars {
+            fs::write(sidecar, b"replacement lock").expect("replacement sidecar");
+        }
+
+        file.close(&cx).expect("second close");
+        assert!(path.exists(), "second close must be a no-op");
+        assert!(
+            shm_path.exists(),
+            "second close must not delete replacement SHM"
+        );
+        for sidecar in &lock_sidecars {
+            assert!(
+                sidecar.exists(),
+                "second close must not delete replacement sidecar {}",
                 sidecar.display()
             );
         }

@@ -180,6 +180,36 @@ Each entry should include:
   `advance_to`/materialize/search churn, and any oracle either preserves the
   caller's cursor position or runs before target-row positioning.
 
+## 2026-05-16 - Current INSERT profile boundary after DML staged-run miss pass
+
+- Target: current `comprehensive-bench --quick --filter insert` matrix with
+  `FSQLITE_BENCH_PROFILE_INSERT=1`, after the retained direct DELETE and
+  Windows VFS follow-up commits. The benchmark source was
+  `ce68d7097d3da6f79bf66b5b8bf1e6cda2251757`; later HEAD changes are outside
+  Linux INSERT hot paths.
+- Files/subsystems inspected: no source patch. This is a benchmark/profile
+  boundary entry over prepared direct INSERT, page-run flush, pager commit,
+  row construction, and preserialization counters.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-current-insert-profile-ce68d709-20260516T210720Z/summary.md`.
+  RCH reported writing `insert.json` on the worker, but only `run.log` was
+  retained locally, so the checked-in summary preserves the matrix and profile
+  counters.
+- Result: no source patch attempted. The focused INSERT matrix reported `25`
+  scenarios with FrankenSQLite faster / comparable / C-SQLite-faster at
+  `15 / 1 / 9` and average F/C time ratio `0.94x`. Remaining red rows are the
+  100-row fixed-cost tails (`1.10x` to `1.49x` slower) plus `large_10col`
+  10K single-transaction (`1.45x` slower) and record-size (`1.30x` slower)
+  rows. The large record-size row paid `row_build_ns=6190021`,
+  `preserialize_ns=5523982`, `direct_flush_ns=2901657`,
+  `commit_roundtrip_ns=3480600`, `pager_mem_flush_ns=1436832`,
+  `pager_cache_finish_ns=1996177`, and `page_pool_misses=2004`.
+- Do not retry standalone INSERT serializer tweaks, row scratch/template
+  tweaks, owned-record flushes, page-image construction, capacity tuning, or
+  direct page-run mechanics from this artifact. Reconsider INSERT source work
+  only as a broader fused row/body/page construction design that proves both
+  this focused INSERT profile and the full quick matrix.
+
 ## 2026-05-15 - Current full-quick refresh after DML frontier triage
 
 - Target: current `comprehensive-bench --quick` matrix after the DML profile

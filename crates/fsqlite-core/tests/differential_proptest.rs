@@ -195,6 +195,7 @@ proptest! {
     #![proptest_config(ProptestConfig {
         cases: 64,                   // keep the test fast; loop already covers a lot of boundaries.
         max_shrink_iters: 256,
+        failure_persistence: None,    // integration-test path layout confuses SourceParallel persistence.
         .. ProptestConfig::default()
     })]
 

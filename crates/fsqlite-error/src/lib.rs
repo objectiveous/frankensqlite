@@ -361,7 +361,9 @@ impl FrankenError {
     pub const fn error_code(&self) -> ErrorCode {
         match self {
             Self::DatabaseNotFound { .. } | Self::CannotOpen { .. } => ErrorCode::CantOpen,
-            Self::DatabaseLocked { .. } | Self::MultiProcessContractViolation { .. } => ErrorCode::Busy,
+            Self::DatabaseLocked { .. } | Self::MultiProcessContractViolation { .. } => {
+                ErrorCode::Busy
+            }
             Self::DatabaseCorrupt { .. } | Self::WalCorrupt { .. } => ErrorCode::Corrupt,
             Self::NotADatabase { .. } => ErrorCode::NotADb,
             Self::DatabaseFull => ErrorCode::Full,
@@ -651,10 +653,16 @@ mod tests {
         assert!(matches!(err, FrankenError::ParseError { offset: 42, .. }));
 
         let err = FrankenError::internal("assertion failed");
-        assert!(matches!(err, FrankenError::Internal(msg) if msg == "assertion failed"));
+        assert!(matches!(err, FrankenError::Internal(_)));
+        if let FrankenError::Internal(msg) = err {
+            assert_eq!(msg, "assertion failed");
+        }
 
         let err = FrankenError::not_implemented("window functions");
-        assert!(matches!(err, FrankenError::NotImplemented(msg) if msg == "window functions"));
+        assert!(matches!(err, FrankenError::NotImplemented(_)));
+        if let FrankenError::NotImplemented(msg) = err {
+            assert_eq!(msg, "window functions");
+        }
     }
 
     #[test]
@@ -1441,7 +1449,10 @@ mod tests {
     #[test]
     fn function_error_constructor() {
         let err = FrankenError::function_error("division by zero");
-        assert!(matches!(err, FrankenError::FunctionError(ref msg) if msg == "division by zero"));
+        assert!(matches!(err, FrankenError::FunctionError(_)));
+        if let FrankenError::FunctionError(msg) = &err {
+            assert_eq!(msg, "division by zero");
+        }
         assert_eq!(err.error_code(), ErrorCode::Error);
     }
 

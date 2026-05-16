@@ -24,9 +24,15 @@ fn connection_env_strict_multi_process_defaults_off() {
 fn connection_env_strict_multi_process_round_trips() {
     let mut env = ConnectionEnv::default();
     env.set_strict_multi_process(true);
-    assert!(env.strict_multi_process(), "after enable, flag should read true");
+    assert!(
+        env.strict_multi_process(),
+        "after enable, flag should read true"
+    );
     env.set_strict_multi_process(false);
-    assert!(!env.strict_multi_process(), "after disable, flag should read false");
+    assert!(
+        !env.strict_multi_process(),
+        "after disable, flag should read false"
+    );
 }
 
 #[test]

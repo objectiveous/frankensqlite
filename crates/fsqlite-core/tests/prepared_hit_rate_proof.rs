@@ -751,7 +751,7 @@ fn prepared_direct_delete_duplicate_and_absent_counts_match_sqlite() {
 }
 
 #[test]
-fn prepared_direct_delete_read_and_savepoint_boundaries_match_sqlite() {
+fn prepared_direct_delete_savepoint_boundary_matches_sqlite() {
     let _profile_guard = HotPathProfileTestGuard::new();
     let conn = Connection::open(":memory:").unwrap();
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
@@ -845,7 +845,7 @@ fn prepared_direct_delete_read_and_savepoint_boundaries_match_sqlite() {
     );
     assert!(
         profile.prepared_direct_delete_leaf_run_dirty_flushes >= 1,
-        "read and savepoint boundaries must publish pending direct DELETE work: {profile:?}"
+        "savepoint boundary must publish pending direct DELETE work: {profile:?}"
     );
 }
 

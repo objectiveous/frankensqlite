@@ -12,6 +12,35 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-16 - Current concurrent shared-table profile confirms no standalone micro-lever
+
+- Target: `comprehensive-bench --quick --filter concurrent` with
+  `FSQLITE_BENCH_PROFILE_CONCURRENT=1`, focused on the remaining low-thread
+  shared-table rows.
+- Touched during measurement: no engine behavior. The run was taken at
+  `main @ b871658b255ac9aeb9003f4383b00ed5a5518dee`; later local commits in
+  this stack only change Windows VFS cleanup and do not affect the Linux
+  release-perf benchmark path.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-current-concurrent-profile-b871658b-20260516T2320Z/summary.md`.
+  RCH reported `concurrent.json` on the worker, but the JSON was not retained
+  locally; `run.log` is the raw local source for the matrix and counters.
+- Result: no source patch attempted. The focused profile reported 2 writers
+  `3.59 ms` C SQLite vs `6.13 ms` FrankenSQLite (`1.71x` slower), 4 writers
+  `11.59 ms` vs `15.71 ms` (`1.36x` slower), and 8 writers `83.52 ms` vs
+  `52.85 ms` (`1.58x` faster). The direct-insert path is already hot
+  (`fast=24012/55130/129524`, `slow=0`) and the remaining red rows point at
+  MVCC page-lock holder churn plus stale snapshots:
+  `mvcc_page_lock_waits=12/84/441`, `mvcc_busy_retries=12/84/441`, and
+  `mvcc_stale_snapshot=12/72/320`.
+- Do not retry standalone low-thread concurrent wait-slice, retry-loop,
+  active-holder, candidate-free fast-path, release-set wakeup, or file-backed
+  page-run admission patches from this evidence. Reconsider concurrent source
+  work only as a broader representation change that batches file-backed page
+  construction and MVCC publication together while preserving
+  first-committer-wins/SSI, and prove it with the same-window focused
+  concurrent matrix plus a full quick gate.
+
 ## 2026-05-16 - Current DML staged-run miss refresh found no staged bottleneck
 
 - Target: `comprehensive-bench --quick --filter update-delete` after adding

@@ -549,6 +549,18 @@ pub struct WindowsFile {
 }
 
 impl WindowsFile {
+    fn is_closed(&self) -> bool {
+        self.file.is_none() && self.os_locks.is_none()
+    }
+
+    fn ensure_open(&self) -> Result<()> {
+        if self.is_closed() {
+            Err(FrankenError::internal("windows file is closed"))
+        } else {
+            Ok(())
+        }
+    }
+
     fn file_ref(&self) -> Result<&File> {
         self.file
             .as_ref()
@@ -727,7 +739,10 @@ impl WindowsFile {
 
 impl VfsFile for WindowsFile {
     fn close(&mut self, cx: &Cx) -> Result<()> {
-        if self.file.is_none() && self.os_locks.is_none() {
+        if self.is_closed() {
+            if self.shm_state.is_some() {
+                self.release_shm_owner_state(self.delete_on_close)?;
+            }
             return Ok(());
         }
         self.unlock(cx, LockLevel::None)?;
@@ -860,6 +875,7 @@ impl VfsFile for WindowsFile {
 
     #[allow(clippy::significant_drop_tightening)]
     fn shm_map(&mut self, _cx: &Cx, region: u32, size: u32, extend: bool) -> Result<ShmRegion> {
+        self.ensure_open()?;
         if size == 0 {
             return Err(FrankenError::LockFailed {
                 detail: "shm_map size must be > 0".to_string(),
@@ -928,6 +944,7 @@ impl VfsFile for WindowsFile {
     }
 
     fn shm_lock(&mut self, _cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
+        self.ensure_open()?;
         let end = Self::validate_shm_request(offset, n)?;
         let lock_requested = flags & SQLITE_SHM_LOCK != 0;
         let unlock_requested = flags & SQLITE_SHM_UNLOCK != 0;
@@ -993,7 +1010,17 @@ impl VfsFile for WindowsFile {
     }
 
     fn shm_unmap(&mut self, _cx: &Cx, delete: bool) -> Result<()> {
+        self.ensure_open()?;
         self.release_shm_owner_state(delete)
+    }
+}
+
+impl Drop for WindowsFile {
+    fn drop(&mut self) {
+        if !self.is_closed() || self.shm_state.is_some() {
+            let cx = Cx::new();
+            let _ = self.close(&cx);
+        }
     }
 }
 
@@ -1262,6 +1289,37 @@ mod tests {
                 sidecar.display()
             );
         }
+    }
+
+    #[test]
+    fn test_windowsvfs_shm_rejects_use_after_close() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("closed_shm.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open file");
+
+        file.close(&cx).expect("close file");
+        assert!(
+            matches!(
+                file.shm_map(&cx, 0, 32 * 1024, true),
+                Err(FrankenError::Internal(_))
+            ),
+            "closed Windows handles must not recreate SHM state"
+        );
+        assert!(
+            matches!(
+                file.shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED),
+                Err(FrankenError::Internal(_))
+            ),
+            "closed Windows handles must reject SHM locks"
+        );
+        assert!(
+            matches!(file.shm_unmap(&cx, false), Err(FrankenError::Internal(_))),
+            "closed Windows handles must reject SHM unmap"
+        );
     }
 
     #[test]

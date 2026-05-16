@@ -8,7 +8,7 @@
 //! infrastructure in follow-up work — the test here proves the opt-in
 //! plumbing itself is in place.
 
-use fsqlite_core::connection::ConnectionEnv;
+use fsqlite_core::connection::{Connection, ConnectionEnv};
 use fsqlite_error::{ErrorCode, FrankenError};
 
 #[test]
@@ -33,6 +33,14 @@ fn connection_env_strict_multi_process_round_trips() {
         !env.strict_multi_process(),
         "after disable, flag should read false"
     );
+}
+
+#[test]
+fn open_strict_multi_process_constructor_opens_a_usable_connection() {
+    let conn = Connection::open_strict_multi_process(":memory:")
+        .expect("strict multi-process constructor should open an in-memory database");
+    conn.execute("CREATE TABLE strict_smoke (id INTEGER PRIMARY KEY)")
+        .expect("strict multi-process connection should execute ordinary DDL");
 }
 
 #[test]

@@ -1,7 +1,9 @@
-# Current-HEAD DML Profile
+# Current DML Profile for Engine Source 1e1abcd5
 
 - Date: 2026-05-16
 - Source: `1e1abcd51d4bf72d215ebb3b1ca7a80a724dc914`
+- Scope: production engine source at the benchmarked commit; later local
+  commits only added tests, documentation, and retained artifacts.
 - Command: `rch exec -- env FSQLITE_BENCH_PROFILE_DML=1 cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --quick --filter update-delete --json-out tests/artifacts/perf/codex-head-dml-profile-1e1abcd5-20260516T130048Z/update-delete.json --no-html`
 - Raw local log: `tests/artifacts/perf/codex-head-dml-profile-1e1abcd5-20260516T130048Z/run.log`
 - Note: the benchmark reported `update-delete.json`, but the JSON report was
@@ -10,8 +12,8 @@
 
 ## Result
 
-The current head still has the same update-delete frontier: UPDATE is already
-faster at 1k/10k rows, but DELETE remains slower than C SQLite.
+The benchmarked engine source still has the same update-delete frontier: UPDATE
+is already faster at 1k/10k rows, but DELETE remains slower than C SQLite.
 
 | Scenario | C SQLite | FrankenSQLite | Ratio | Status |
 |---|---:|---:|---:|---|

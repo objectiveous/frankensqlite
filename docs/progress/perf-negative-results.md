@@ -12,6 +12,84 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-15 - Current full-quick refresh after DML frontier triage
+
+- Target: current `comprehensive-bench --quick` matrix after the DML profile
+  refresh, on source checkout `06a37f61` with staged perf evidence and the
+  unstaged ALTER TABLE rename correctness changes still present.
+- Files/subsystems inspected: no source patch. This was a benchmark and
+  evidence refresh over the remaining DML/INSERT/concurrent-writer frontier.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-fullquick-refresh-20260515T003425Z/summary.md`
+  and
+  `tests/artifacts/perf/codex-current-fullquick-refresh-20260515T003425Z/remaining-gap-triage.md`.
+  The benchmark output timestamp is `2026-05-16 00:41:24 UTC`; the artifact
+  directory name carries the local-date prefix from the shell session. RCH
+  reported writing `full-quick.json` on the remote worker, but the JSON was not
+  present locally after artifact retrieval, so the checked-in summary is parsed
+  from `run.log`.
+- Result: no source patch attempted. The refreshed quick matrix reported `93`
+  scenarios with FrankenSQLite faster / comparable / C-SQLite-faster at
+  `80 / 1 / 12` and average F/C time ratio `0.48x`. The concurrent-writer rows
+  are now green in this run: `2 writers x 1000 rows` at `4.21x` faster,
+  `4 writers x 1000 rows` at `3.28x` faster, and `8 writers x 1000 rows` at
+  `3.31x` faster.
+- Remaining C-SQLite-faster rows are still dominated by DML DELETE
+  (`2.88x`, `1.81x`, and `1.61x` slower for 5-, 50-, and 500-row DELETE) plus
+  the `100 rows / update 10 rows` fixed-cost tail (`1.39x` slower). The other
+  red rows are mostly 100-row INSERT fixed-cost tails or low-ratio large-row
+  construction tails; they do not clear the implementation gate without a
+  sharper profile.
+- Do not use the older low-thread concurrent-writer red rows as current source
+  targets from this evidence. Reconsider source work only as the broader
+  transaction-local DML mutation operator unless a new focused INSERT profile
+  isolates one high-impact helper and the full matrix agrees.
+
+## 2026-05-15 - Current DML profile refresh and mutation-operator card
+
+- Target: remaining `UPDATE/DELETE Throughput` prepared direct DELETE rows on
+  source checkout `06a37f61`, after the ALTER TABLE rename correctness pass and
+  the current DML profile refresh with `FSQLITE_BENCH_PROFILE_DML=1`.
+- Files/subsystems inspected: prepared direct DELETE in
+  `crates/fsqlite-core/src/connection.rs`, retained leaf-run DELETE
+  materialization/search/flush in the B-tree cursor layer, existing
+  transaction-local DML mutation design notes, and the alien-graveyard
+  B-epsilon/Bw-tree delta-message mapping. No source performance patch was
+  applied.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-dml-profiled-20260515T224517Z/summary.md`
+  and
+  `tests/artifacts/perf/codex-current-dml-profiled-20260515T224517Z/transaction-local-dml-mutation-card.md`,
+  plus the all-workload red-row ranking in
+  `tests/artifacts/perf/codex-current-dml-profiled-20260515T224517Z/remaining-fullquick-gap-triage.md`.
+  That all-workload ranking is now superseded for current target selection by
+  `tests/artifacts/perf/codex-current-fullquick-refresh-20260515T003425Z/summary.md`.
+  The refreshed `comprehensive-bench --quick --filter update-delete` profile
+  kept DELETE on the prepared direct path (`direct_delete=500`, `slow=0`,
+  `vdbe_opcodes=0`) and reported DELETE F/C ratios of `1.52x` for
+  `100 rows / delete 5 rows`, `2.61x` for `1000 rows / delete 50 rows`, and
+  `1.60x` for `10000 rows / delete 500 rows`. The 10K/500 profile again paid
+  `delete_leaf_active=433/496`, `delete_leaf_miss=63`,
+  `delete_leaf_flush=64/64`, `delete_leaf_search=560/89746ns`,
+  `delete_leaf_materialize=64/86529ns`, and
+  `delete_leaf_flush_ns=108954`.
+- Result: no one-lever retained-run source edit is justified. The current
+  profile distributes the loss across row-level retained-leaf ceremony,
+  leaf-boundary churn, materialization, and flush/publication rather than
+  isolating a new top-five helper worth patching by itself. The profile also
+  rejects setup-time explanations because `setup_us` is fixture prepopulation
+  outside the measured row.
+- Do not retry standalone retained DELETE search/admission/materialization,
+  direct flush/publication wrappers, cancellation polling weakening,
+  per-connection synced-write caches, tombstone-only overlays, or
+  affected-count-only logical DELETE buffers from this evidence. Reconsider
+  source work only as the broader transaction-local DML mutation operator in
+  the card above: logical rowid/key messages, exact affected-row oracle,
+  read-boundary or delta-aware read-view semantics, savepoint/rollback
+  ownership, QF/count-cache/MemDatabase invalidation, MVCC publication proof,
+  focused DELETE median wins, and full-quick primary-score neutrality or
+  better.
+
 ## 2026-05-15 - Current DELETE frontier recheck after fresh perf pass
 
 - Target: remaining `UPDATE/DELETE Throughput` prepared direct DELETE rows on

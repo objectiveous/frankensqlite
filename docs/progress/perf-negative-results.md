@@ -12,6 +12,38 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-16 - Direct DELETE leaf-run monotone duplicate-check skip
+
+- Target: `comprehensive-bench --quick --filter update-delete`, especially
+  `10000 rows / delete 500 rows`, after the retained delete flush cursor reuse
+  and compact-cache commits.
+- Touched during rejected candidate, then reverted:
+  `crates/fsqlite-btree/src/cursor.rs`. The candidate tracked whether accepted
+  `TableLeafDeleteRun` cell indices remained strictly increasing so it could
+  skip `SmallVec::contains` in duplicate checks until an out-of-order delete
+  forced fallback to the normal scan. A fresh-eyes coverage test for
+  out-of-order duplicate handling was kept.
+- Evidence artifacts:
+  kept baseline/candidate summaries
+  `tests/artifacts/perf/codex-delete-flush-cursor-reuse-candidate-20260516T1604Z/summary.md`
+  and
+  `tests/artifacts/perf/codex-delete-compact-cache-candidate-20260516T1721Z/summary.md`,
+  plus rejection summary
+  `tests/artifacts/perf/codex-delete-dupcheck-monotone-candidate-20260516T1750Z/summary.md`.
+  The raw remote `update-delete.json` was not retained locally, so the summary
+  preserves the session-captured matrix rows and counters.
+- Result: rejected and unwound uncommitted. The target row regressed from the
+  previous kept `F=342.2 us` to `F=443.3 us` (`C=248.9 us`, `1.78x` slower).
+  The duplicate-check counter was only `delete_leaf_dupcheck=500/18128ns`, but
+  the end-to-end row and surrounding counters moved backward
+  (`delete_leaf_search=560/63493ns`, `delete_leaf_compact=497/16795ns`,
+  `delete_leaf_flush_ns=81403`).
+- Do not retry a standalone retained leaf-run duplicate-check micro-optimization.
+  Reconsider duplicate-check work only if a future profile shows it dominates a
+  stable row after materialization/search/flush costs are already resolved, and
+  require the exact update-delete matrix row to improve, not just the local
+  counter.
+
 ## 2026-05-16 - Repeated direct-simple UPDATE/DELETE microbatch carry
 
 - Target: `comprehensive-bench --quick --filter update-delete`, especially the

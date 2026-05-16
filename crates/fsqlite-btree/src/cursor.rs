@@ -17508,6 +17508,50 @@ mod tests {
     }
 
     #[test]
+    fn test_table_leaf_delete_run_handles_out_of_order_duplicate_checks() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        let payloads: Vec<(i64, Vec<u8>)> = (1_i64..=20_i64)
+            .map(|rowid| (rowid, format!("payload-{rowid:02}").into_bytes()))
+            .collect();
+
+        for (rowid, payload) in &payloads {
+            cursor.table_insert(&cx, *rowid, payload).unwrap();
+        }
+        assert!(cursor.table_move_to(&cx, 9).unwrap().is_found());
+        let mut run = cursor
+            .table_leaf_delete_run_current(9)
+            .unwrap()
+            .expect("positioned root leaf should admit a delete run");
+
+        for rowid in [9_i64, 3, 11] {
+            assert_eq!(
+                run.delete_rowid_with_reason(&cx, rowid, USABLE).unwrap(),
+                TableLeafDeleteRunDelete::Deleted,
+                "delete run should accept out-of-order root-leaf rowid {rowid}"
+            );
+        }
+        assert_eq!(
+            run.delete_rowid_with_reason(&cx, 9, USABLE).unwrap(),
+            TableLeafDeleteRunDelete::Miss(TableLeafDeleteRunMissReason::AlreadyDeleted),
+            "out-of-order delete run must still detect duplicate rowids"
+        );
+        cursor.flush_table_leaf_delete_run(&cx, run).unwrap();
+
+        for (rowid, payload) in &payloads {
+            let found = cursor.table_move_to(&cx, *rowid).unwrap().is_found();
+            if [3_i64, 9, 11].contains(rowid) {
+                assert!(!found, "deleted rowid {rowid} should be absent");
+            } else {
+                assert!(found, "surviving rowid {rowid} should remain reachable");
+                assert_eq!(cursor.payload(&cx).unwrap().as_slice(), payload.as_slice());
+            }
+        }
+    }
+
+    #[test]
     fn test_table_leaf_delete_run_defragments_large_root_leaf_delete_set() {
         let cx = Cx::new();
         let root = pn(2);

@@ -1350,6 +1350,7 @@ pub struct TableLeafDeleteRun {
     entry: StackEntry,
     tree_depth: usize,
     dirty: bool,
+    compact_cell_area: bool,
     profile_delete_leaf_run: bool,
     deleted_cell_indices: SmallVec<[u16; 16]>,
 }
@@ -1430,11 +1431,11 @@ impl TableLeafDeleteRun {
         }
         let has_compact_cell_area = if self.profile_delete_leaf_run {
             let compact_check_start = Some(std::time::Instant::now());
-            let has_compact_cell_area = self.has_compact_cell_area(usable_size);
+            let has_compact_cell_area = self.compact_cell_area;
             instrumentation::record_delete_leaf_run_compact_check(compact_check_start);
             has_compact_cell_area
         } else {
-            self.has_compact_cell_area(usable_size)
+            self.compact_cell_area
         };
         if !has_compact_cell_area {
             return Ok(TableLeafDeleteRunDelete::Miss(
@@ -1500,16 +1501,19 @@ impl TableLeafDeleteRun {
     }
 
     fn has_compact_cell_area(&self, usable_size: u32) -> bool {
-        self.entry.header.first_freeblock == 0
-            && self.entry.header.fragmented_free_bytes == 0
-            && self
-                .entry
+        Self::has_compact_cell_area_for_entry(&self.entry, usable_size)
+    }
+
+    fn has_compact_cell_area_for_entry(entry: &StackEntry, usable_size: u32) -> bool {
+        entry.header.first_freeblock == 0
+            && entry.header.fragmented_free_bytes == 0
+            && entry
                 .cell_pointers
                 .iter()
                 .copied()
                 .min()
                 .is_some_and(|min_ptr| {
-                    usize::from(min_ptr) == self.entry.header.content_offset(usable_size)
+                    usize::from(min_ptr) == entry.header.content_offset(usable_size)
                 })
     }
 
@@ -9175,6 +9179,10 @@ impl<P: PageWriter> BtCursor<P> {
             entry: entry.clone(),
             tree_depth,
             dirty: false,
+            compact_cell_area: TableLeafDeleteRun::has_compact_cell_area_for_entry(
+                entry,
+                self.usable_size,
+            ),
             profile_delete_leaf_run: instrumentation::copy_profile_enabled(),
             deleted_cell_indices: SmallVec::new(),
         }))

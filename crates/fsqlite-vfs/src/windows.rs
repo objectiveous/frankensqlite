@@ -739,21 +739,33 @@ impl WindowsFile {
 
 impl VfsFile for WindowsFile {
     fn close(&mut self, cx: &Cx) -> Result<()> {
-        if self.is_closed() {
-            if self.shm_state.is_some() {
-                self.release_shm_owner_state(self.delete_on_close)?;
+        let mut first_error = None;
+
+        if !self.is_closed() {
+            if let Err(err) = self.unlock(cx, LockLevel::None) {
+                first_error = Some(err);
             }
-            return Ok(());
         }
-        self.unlock(cx, LockLevel::None)?;
-        self.release_shm_owner_state(self.delete_on_close)?;
+
+        let release_result = if self.shm_state.is_some() || self.delete_on_close {
+            self.release_shm_owner_state(self.delete_on_close)
+        } else {
+            Ok(())
+        };
+        if first_error.is_none() {
+            first_error = release_result.err();
+        }
+
         drop(self.os_locks.take());
         drop(self.file.take());
+        self.lock_level = LockLevel::None;
+
         if self.delete_on_close {
             drop(fs::remove_file(&self.path));
             try_remove_windows_lock_sidecars(&self.path);
         }
-        Ok(())
+
+        first_error.map_or(Ok(()), Err)
     }
 
     fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {

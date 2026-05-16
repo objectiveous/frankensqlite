@@ -658,6 +658,7 @@ fn test_bd_wwqen_3_column_list_insert_direct_path_eligibility() {
 
 #[test]
 fn prepared_direct_delete_duplicate_and_absent_counts_match_sqlite() {
+    let _profile_guard = HotPathProfileTestGuard::new();
     let conn = Connection::open(":memory:").unwrap();
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     let ddl = "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT NOT NULL);";
@@ -745,5 +746,23 @@ fn prepared_direct_delete_duplicate_and_absent_counts_match_sqlite() {
     assert_eq!(
         fsqlite_remaining.values()[0],
         SqliteValue::Integer(sqlite_remaining)
+    );
+
+    let profile = hot_path_profile_snapshot();
+    assert_eq!(
+        profile.prepared_direct_delete_executions, 6,
+        "every DELETE execution in this proof should stay on the prepared direct-delete path: {profile:?}"
+    );
+    assert!(
+        profile.prepared_direct_delete_leaf_run_start_hits >= 3,
+        "the successful row deletes should exercise the buffered leaf-run path: {profile:?}"
+    );
+    assert!(
+        profile.prepared_direct_delete_leaf_run_active_miss_already_deleted >= 1,
+        "duplicate rowids must be rejected by the active leaf-run before falling back to the physical tree: {profile:?}"
+    );
+    assert!(
+        profile.prepared_direct_delete_leaf_run_dirty_flushes >= 1,
+        "read/commit boundaries should flush buffered direct DELETE work: {profile:?}"
     );
 }

@@ -9,7 +9,7 @@
 //! plumbing itself is in place.
 
 use fsqlite_core::connection::ConnectionEnv;
-use fsqlite_error::FrankenError;
+use fsqlite_error::{ErrorCode, FrankenError};
 
 #[test]
 fn connection_env_strict_multi_process_defaults_off() {
@@ -48,5 +48,10 @@ fn multi_process_contract_violation_carries_detail() {
     assert!(
         msg.contains("freelist trunk page 42"),
         "error display should propagate the detail: {msg}"
+    );
+    assert_eq!(
+        err.error_code(),
+        ErrorCode::Busy,
+        "strict multi-process refusal should preserve SQLite BUSY compatibility"
     );
 }

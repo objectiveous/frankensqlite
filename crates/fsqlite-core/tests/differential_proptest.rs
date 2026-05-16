@@ -7,7 +7,7 @@
 //!
 //! This is a SCAFFOLD: it covers a narrow grammar (single-table
 //! SELECT with WHERE/ORDER BY/LIMIT) and a small numeric/text dataset
-//! to keep tests fast (default proptest config caps at 256 cases per
+//! to keep tests fast (the proptest config below caps this at 64 cases per
 //! property). It's deliberately not trying to subsume the existing
 //! conformance oracles — those exercise specific code paths (joins,
 //! aggregates, window functions, DML) that this grammar doesn't

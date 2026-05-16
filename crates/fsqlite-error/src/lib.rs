@@ -653,16 +653,18 @@ mod tests {
         assert!(matches!(err, FrankenError::ParseError { offset: 42, .. }));
 
         let err = FrankenError::internal("assertion failed");
-        assert!(matches!(err, FrankenError::Internal(_)));
-        if let FrankenError::Internal(msg) = err {
-            assert_eq!(msg, "assertion failed");
-        }
+        let actual = match &err {
+            FrankenError::Internal(msg) => Some(msg.as_str()),
+            _ => None,
+        };
+        assert_eq!(actual, Some("assertion failed"));
 
         let err = FrankenError::not_implemented("window functions");
-        assert!(matches!(err, FrankenError::NotImplemented(_)));
-        if let FrankenError::NotImplemented(msg) = err {
-            assert_eq!(msg, "window functions");
-        }
+        let actual = match &err {
+            FrankenError::NotImplemented(msg) => Some(msg.as_str()),
+            _ => None,
+        };
+        assert_eq!(actual, Some("window functions"));
     }
 
     #[test]
@@ -1449,10 +1451,11 @@ mod tests {
     #[test]
     fn function_error_constructor() {
         let err = FrankenError::function_error("division by zero");
-        assert!(matches!(err, FrankenError::FunctionError(_)));
-        if let FrankenError::FunctionError(msg) = &err {
-            assert_eq!(msg, "division by zero");
-        }
+        let actual = match &err {
+            FrankenError::FunctionError(msg) => Some(msg.as_str()),
+            _ => None,
+        };
+        assert_eq!(actual, Some("division by zero"));
         assert_eq!(err.error_code(), ErrorCode::Error);
     }
 

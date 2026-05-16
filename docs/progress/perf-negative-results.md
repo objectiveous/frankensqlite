@@ -45,6 +45,43 @@ Each entry should include:
   counters show the new path actually replaces the retained leaf-run path on
   the target rows.
 
+## 2026-05-16 - Dense B-tree-proven rowid DELETE run
+
+- Target: `comprehensive-bench --quick --filter update-delete` DELETE rows,
+  especially `10000 rows / delete 500 rows`, after the dense-MemDatabase
+  rejection and on source checkout `3e0e3d19` with an uncommitted
+  `crates/fsqlite-core/src/connection.rs` candidate.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The candidate scanned the table
+  B-tree on the first eligible private-memory prepared rowid DELETE to prove a
+  dense rowid interval, buffered exact transaction-local deleted rowids, and
+  materialized physical B-tree deletes at the normal read/commit boundary.
+- Evidence artifacts:
+  correctness-failing first run
+  `tests/artifacts/perf/codex-dense-btree-rowid-delete-candidate-20260516T095949Z/run.log`
+  and fixed-candidate profile
+  `tests/artifacts/perf/codex-dense-btree-rowid-delete-candidate-fixed-20260516T102402Z/run.log`
+  plus
+  `tests/artifacts/perf/codex-dense-btree-rowid-delete-candidate-fixed-20260516T102402Z/update-delete.json`.
+  Baseline comparison is the current DML profile
+  `tests/artifacts/perf/codex-current-dml-profile-d42c0061-20260516T072957Z/run.log`.
+- Result: rejected and unwound uncommitted. The first run crashed during
+  `fs_delete_100` teardown with `PRIMARY KEY constraint failed`: when the
+  dense oracle skipped a small table it left the cursor parked at the last row,
+  so fallback deletion could target the wrong physical row. A local fix
+  restored the cursor and focused tests passed, but the fixed benchmark
+  regressed the target row: `10000 rows / delete 500 rows` moved from the
+  baseline `F=434.8 us` to `F=765.7 us`. The new path did admit
+  (`delete_leaf_start=0/0`, `delete_leaf_active=0/0`,
+  `delete_leaf_flush=0/0`), but it shifted cost into commit-time materializing
+  and searching (`delete_leaf_materialize=64`, `delete_leaf_search=560`,
+  `direct_flush_ns=502158`, `commit_us=586.1`), making the row worse.
+- Do not retry a standalone dense B-tree proof plus deferred rowid set flush.
+  Reconsider only if the flush is replaced by a true leaf/range-batched
+  mutation operator that is O(number of touched leaves), avoids per-row
+  `advance_to`/materialize/search churn, and any oracle either preserves the
+  caller's cursor position or runs before target-row positioning.
+
 ## 2026-05-15 - Current full-quick refresh after DML frontier triage
 
 - Target: current `comprehensive-bench --quick` matrix after the DML profile

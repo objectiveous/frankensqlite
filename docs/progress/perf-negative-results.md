@@ -12,6 +12,37 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-17 - DML cell-delta boundary refresh keeps source work at operator scope
+
+- Target: next source selection for the remaining `UPDATE/DELETE Throughput`
+  DELETE rows after the current May 16 full-quick, DML, INSERT, and concurrent
+  profiles.
+- Files/subsystems inspected: prepared direct DELETE in
+  `crates/fsqlite-core/src/connection.rs`, retained same-leaf DELETE
+  materialization in `crates/fsqlite-btree/src/cursor.rs`, recent commits,
+  malformed Beads status, stale CASS lexical search results, and the
+  FrankenSQLite mappings in the alien-graveyard corpus. No engine behavior was
+  changed.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-dml-cell-delta-boundary-20260517T011940Z/summary.md`.
+- Result: no source patch attempted. The current DELETE row remains on the
+  prepared direct path (`direct_delete=500`, `slow=0`, `vdbe_opcodes=0`) and
+  the remaining 10K/500 row still spends across retained-leaf ceremony:
+  `delete_leaf_active=433/496`, `delete_leaf_miss=63`,
+  `delete_leaf_flush=64/64`, `delete_leaf_materialize=64/68324`,
+  `delete_leaf_search=560/67225`, and `commit_roundtrip_ns=42123`. The source
+  reread confirms the live path already has active same-leaf runs, monotone
+  cross-leaf staging, and common-shape flush cursor reuse.
+- Do not spend another pass on retained leaf-run search, duplicate-check,
+  compactness, materializer, parent-separator, last-cell, dense-rowid,
+  staged-run, tombstone-only, direct-flush, or synced-root micro-patches unless
+  a newer profile changes the hotspot table. Reconsider source work only at the
+  transaction-local row/key DML mutation-operator boundary: logical messages,
+  exact affected-row oracle, read-your-writes point/scan overlay, rollback and
+  savepoint ownership, QF/count-cache/MemDatabase invalidation, MVCC/page-cell
+  witness publication, focused DELETE wins, and full-quick neutrality or
+  better.
+
 ## 2026-05-16 - Current concurrent shared-table profile confirms no standalone micro-lever
 
 - Target: `comprehensive-bench --quick --filter concurrent` with

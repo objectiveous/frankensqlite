@@ -505,22 +505,45 @@ impl Vfs for WindowsVfs {
             return Err(FrankenError::CannotOpen { path: resolved });
         }
 
+        let mut created_db_file = false;
         let file = loop {
             let mut options = windows_open_options();
             options.read(true);
             if is_rw {
                 options.write(true);
             }
-            if is_temp || is_exclusive_create {
+            if is_create {
                 options.create_new(true);
-            } else if is_create {
-                options.create(true);
             }
 
             match options.open(&resolved) {
-                Ok(file) => break file,
+                Ok(file) => {
+                    created_db_file = is_create;
+                    break file;
+                }
                 Err(err) if is_temp && err.kind() == std::io::ErrorKind::AlreadyExists => {
                     resolved = self.next_temp_path()?;
+                }
+                Err(err)
+                    if is_create
+                        && !is_temp
+                        && !is_exclusive_create
+                        && err.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    let mut open_options = windows_open_options();
+                    open_options.read(true);
+                    if is_rw {
+                        open_options.write(true);
+                    }
+                    break open_options.open(&resolved).map_err(|err| {
+                        if err.kind() == std::io::ErrorKind::NotFound {
+                            FrankenError::CannotOpen {
+                                path: resolved.clone(),
+                            }
+                        } else {
+                            FrankenError::Io(err)
+                        }
+                    })?;
                 }
                 Err(err) => {
                     return Err(if err.kind() == std::io::ErrorKind::NotFound {
@@ -545,7 +568,7 @@ impl Vfs for WindowsVfs {
             Ok(os_locks) => os_locks,
             Err(err) => {
                 drop(file);
-                if is_temp || is_exclusive_create {
+                if created_db_file {
                     let _ = fs::remove_file(&resolved);
                 }
                 return Err(err);
@@ -1475,6 +1498,58 @@ mod tests {
         assert!(
             !shared_path.exists(),
             "failed lock setup should remove the shared sidecar it just created"
+        );
+        assert!(
+            reserved_path.is_dir(),
+            "cleanup must not disturb the path that caused the open failure"
+        );
+    }
+
+    #[test]
+    fn test_windowsvfs_plain_create_failure_cleans_created_db_file() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("partial_plain_create.db");
+        let shared_path = sqlite_shared_lock_path(&path);
+        let reserved_path = sqlite_reserved_lock_path(&path);
+        fs::create_dir(&reserved_path).expect("reserved sidecar blocker");
+        let vfs = WindowsVfs::new();
+
+        assert!(vfs.open(&cx, Some(&path), open_flags_create()).is_err());
+        assert!(
+            !path.exists(),
+            "failed plain create should remove the DB file it just created"
+        );
+        assert!(
+            !shared_path.exists(),
+            "failed lock setup should remove the shared sidecar it just created"
+        );
+        assert!(
+            reserved_path.is_dir(),
+            "cleanup must not disturb the path that caused the open failure"
+        );
+    }
+
+    #[test]
+    fn test_windowsvfs_plain_create_failure_preserves_existing_db_file() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("existing_plain_create.db");
+        let shared_path = sqlite_shared_lock_path(&path);
+        let reserved_path = sqlite_reserved_lock_path(&path);
+        fs::write(&path, b"existing db").expect("existing db");
+        fs::create_dir(&reserved_path).expect("reserved sidecar blocker");
+        let vfs = WindowsVfs::new();
+
+        assert!(vfs.open(&cx, Some(&path), open_flags_create()).is_err());
+        assert_eq!(
+            fs::read(&path).expect("read existing db"),
+            b"existing db",
+            "failed plain create must preserve an existing DB file"
+        );
+        assert!(
+            !shared_path.exists(),
+            "failed lock setup should remove only the shared sidecar it just created"
         );
         assert!(
             reserved_path.is_dir(),

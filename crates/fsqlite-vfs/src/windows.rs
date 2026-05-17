@@ -155,6 +155,18 @@ impl WindowsVfs {
         );
         Self::default()
     }
+
+    fn next_temp_path(&self) -> Result<PathBuf> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| lock_poisoned("windows vfs inner"))?;
+        let id = inner.next_temp_id.max(next_temp_id());
+        inner.next_temp_id = id
+            .checked_add(1)
+            .ok_or_else(|| FrankenError::internal("temp file id overflow"))?;
+        Ok(env::temp_dir().join(format!("fsqlite-windows-{id}.tmp")))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -478,18 +490,11 @@ impl Vfs for WindowsVfs {
     ) -> Result<(Self::File, VfsOpenFlags)> {
         checkpoint_or_abort(cx)?;
 
-        let resolved = if let Some(path) = path {
+        let is_temp = path.is_none();
+        let mut resolved = if let Some(path) = path {
             resolve_path(path)?
         } else {
-            let mut inner = self
-                .inner
-                .lock()
-                .map_err(|_| lock_poisoned("windows vfs inner"))?;
-            let id = inner.next_temp_id.max(next_temp_id());
-            inner.next_temp_id = id
-                .checked_add(1)
-                .ok_or_else(|| FrankenError::internal("temp file id overflow"))?;
-            env::temp_dir().join(format!("fsqlite-windows-{id}.tmp"))
+            self.next_temp_path()?
         };
 
         let is_create = path.is_none() || flags.contains(VfsOpenFlags::CREATE);
@@ -500,37 +505,53 @@ impl Vfs for WindowsVfs {
             return Err(FrankenError::CannotOpen { path: resolved });
         }
 
-        let mut options = windows_open_options();
-        options.read(true);
-        if is_rw {
-            options.write(true);
-        }
-        if is_exclusive_create {
-            options.create_new(true);
-        } else if is_create {
-            options.create(true);
-        }
-
-        let file = options.open(&resolved).map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                FrankenError::CannotOpen {
-                    path: resolved.clone(),
-                }
-            } else {
-                FrankenError::Io(err)
+        let file = loop {
+            let mut options = windows_open_options();
+            options.read(true);
+            if is_rw {
+                options.write(true);
             }
-        })?;
+            if is_temp || is_exclusive_create {
+                options.create_new(true);
+            } else if is_create {
+                options.create(true);
+            }
+
+            match options.open(&resolved) {
+                Ok(file) => break file,
+                Err(err) if is_temp && err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    resolved = self.next_temp_path()?;
+                }
+                Err(err) => {
+                    return Err(if err.kind() == std::io::ErrorKind::NotFound {
+                        FrankenError::CannotOpen { path: resolved }
+                    } else {
+                        FrankenError::Io(err)
+                    });
+                }
+            }
+        };
 
         let owner_id = next_owner_id();
         let shm_path = sqlite_shm_path(&resolved);
 
-        let delete_on_close = flags.contains(VfsOpenFlags::DELETEONCLOSE) || path.is_none();
+        let delete_on_close = flags.contains(VfsOpenFlags::DELETEONCLOSE) || is_temp;
         let out_flags = if is_create {
             flags | VfsOpenFlags::READWRITE
         } else {
             flags
         };
-        let os_locks = WindowsOsLockFiles::open(&resolved)?;
+        let os_locks = match WindowsOsLockFiles::open(&resolved) {
+            Ok(os_locks) => os_locks,
+            Err(err) => {
+                drop(file);
+                if is_temp || is_exclusive_create {
+                    let _ = fs::remove_file(&resolved);
+                    try_remove_windows_lock_sidecars(&resolved);
+                }
+                return Err(err);
+            }
+        };
 
         Ok((
             WindowsFile {
@@ -1091,6 +1112,7 @@ impl Drop for WindowsFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
     use std::process::Command;
     use tempfile::tempdir;
 
@@ -1356,6 +1378,48 @@ mod tests {
     }
 
     #[test]
+    fn test_windowsvfs_temp_file_skips_existing_candidate() {
+        let cx = Cx::new();
+        let seed = 1_000_000_000_000_u64 + u64::from(std::process::id());
+        let blocker = env::temp_dir().join(format!("fsqlite-windows-{seed}.tmp"));
+        let mut blocker_options = windows_open_options();
+        let mut blocker_file = blocker_options
+            .write(true)
+            .create_new(true)
+            .open(&blocker)
+            .expect("existing temp candidate");
+        blocker_file
+            .write_all(b"existing temp candidate")
+            .expect("write existing temp candidate");
+        drop(blocker_file);
+        let vfs = WindowsVfs {
+            inner: Arc::new(Mutex::new(WindowsVfsInner { next_temp_id: seed })),
+        };
+        let flags = VfsOpenFlags::TEMP_DB
+            | VfsOpenFlags::CREATE
+            | VfsOpenFlags::READWRITE
+            | VfsOpenFlags::DELETEONCLOSE;
+
+        let (mut file, _) = vfs.open(&cx, None, flags).expect("open temp");
+        let opened_path = file.path.clone();
+        assert_ne!(
+            opened_path, blocker,
+            "anonymous temp open must not reuse an existing candidate path"
+        );
+        assert!(
+            blocker.exists(),
+            "temp collision handling must preserve the existing candidate file"
+        );
+
+        file.close(&cx).expect("close temp");
+        assert!(
+            !opened_path.exists(),
+            "delete-on-close should remove the actual temp file"
+        );
+        fs::remove_file(&blocker).expect("remove blocker");
+    }
+
+    #[test]
     fn test_windowsvfs_open_handles_block_delete_sharing() {
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("delete_sharing.db");
@@ -1383,6 +1447,32 @@ mod tests {
         fs::create_dir(&reserved_path).expect("reserved sidecar blocker");
 
         assert!(WindowsOsLockFiles::open(&path).is_err());
+        assert!(
+            !shared_path.exists(),
+            "failed lock setup should remove the shared sidecar it just created"
+        );
+        assert!(
+            reserved_path.is_dir(),
+            "cleanup must not disturb the path that caused the open failure"
+        );
+    }
+
+    #[test]
+    fn test_windowsvfs_open_failure_cleans_created_db_file() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("partial_vfs_open.db");
+        let shared_path = sqlite_shared_lock_path(&path);
+        let reserved_path = sqlite_reserved_lock_path(&path);
+        fs::create_dir(&reserved_path).expect("reserved sidecar blocker");
+        let vfs = WindowsVfs::new();
+        let flags = open_flags_create() | VfsOpenFlags::EXCLUSIVE | VfsOpenFlags::DELETEONCLOSE;
+
+        assert!(vfs.open(&cx, Some(&path), flags).is_err());
+        assert!(
+            !path.exists(),
+            "failed exclusive create should remove the DB file it just created"
+        );
         assert!(
             !shared_path.exists(),
             "failed lock setup should remove the shared sidecar it just created"

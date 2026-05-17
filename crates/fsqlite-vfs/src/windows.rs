@@ -547,7 +547,6 @@ impl Vfs for WindowsVfs {
                 drop(file);
                 if is_temp || is_exclusive_create {
                     let _ = fs::remove_file(&resolved);
-                    try_remove_windows_lock_sidecars(&resolved);
                 }
                 return Err(err);
             }
@@ -1476,6 +1475,33 @@ mod tests {
         assert!(
             !shared_path.exists(),
             "failed lock setup should remove the shared sidecar it just created"
+        );
+        assert!(
+            reserved_path.is_dir(),
+            "cleanup must not disturb the path that caused the open failure"
+        );
+    }
+
+    #[test]
+    fn test_windowsvfs_open_failure_preserves_existing_sidecar() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("partial_vfs_open_existing_sidecar.db");
+        let shared_path = sqlite_shared_lock_path(&path);
+        let reserved_path = sqlite_reserved_lock_path(&path);
+        fs::write(&shared_path, b"existing shared sidecar").expect("existing shared sidecar");
+        fs::create_dir(&reserved_path).expect("reserved sidecar blocker");
+        let vfs = WindowsVfs::new();
+        let flags = open_flags_create() | VfsOpenFlags::EXCLUSIVE | VfsOpenFlags::DELETEONCLOSE;
+
+        assert!(vfs.open(&cx, Some(&path), flags).is_err());
+        assert!(
+            !path.exists(),
+            "failed exclusive create should remove the DB file it just created"
+        );
+        assert!(
+            shared_path.exists(),
+            "failed VFS open must preserve a sidecar it did not create"
         );
         assert!(
             reserved_path.is_dir(),

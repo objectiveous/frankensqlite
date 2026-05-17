@@ -9195,6 +9195,7 @@ impl<P: PageWriter> BtCursor<P> {
         cx: &Cx,
         run: TableLeafPayloadPatchRun,
     ) -> Result<()> {
+        observe_cursor_cancellation(cx)?;
         let (leaf_page, page_data) = run.into_page();
         self.pager.write_page_data(cx, leaf_page, page_data)?;
         self.stack.clear();

@@ -12,6 +12,270 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-17 - Post-active-probe-fix DML profile still rejects DELETE micro-patches
+
+- Target: current `comprehensive-bench --quick --filter update-delete` rows
+  after fresh-eyes fixed the `delete_active_probe_ns` attribution so it no
+  longer includes retained-run flush time.
+- Files/subsystems inspected: prepared direct DELETE profiling in
+  `crates/fsqlite-core/src/connection.rs`, DML benchmark profile logging in
+  `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`, retained table leaf
+  DELETE runs in `crates/fsqlite-btree/src/cursor.rs`, and the SQLite
+  reference DELETE path in `legacy_sqlite_code/sqlite/src/btree.c`.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-dml-profile-after-active-probe-fix-20260517T1730Z/update-delete-profile.json`,
+  `tests/artifacts/perf/codex-dml-profile-after-active-probe-fix-20260517T1730Z/run.log`,
+  and
+  `tests/artifacts/perf/codex-dml-profile-after-active-probe-fix-20260517T1730Z/summary.md`.
+- Result: no optimization patch attempted. The focused DML profile reported `6`
+  scenarios with FrankenSQLite faster / comparable / C-SQLite-faster at
+  `2 / 0 / 4`, average ratio `1.5000368728153883`, and observed
+  `write_single` geomean score `1.3701115485179365`. DELETE remains the red
+  surface: 100-row DELETE `2.255x` slower, 1000-row DELETE `1.941x` slower,
+  and 10K DELETE `1.755x` slower. With the attribution fixed, 10K DELETE now
+  shows `delete_active_probe_ns=139492` and `delete_leaf_flush_ns=64079`
+  separately, plus distributed costs in `delete_leaf_materialize=64/50586`,
+  `delete_leaf_search=560/39676`, `delete_dupcheck=500/12345`,
+  `delete_compact=497/11699`, `delete_cellparse=497/13147`,
+  `delete_memdb_abandon=500/12421`, and `delete_memory_sync=500/13111`.
+- Do not retry another standalone retained-run probe, seek, leaf-search,
+  materialization, duplicate-check, MemDatabase invalidation, synced-root, or
+  cursor-setup DELETE tweak from this signal. Revisit DELETE only with the
+  broader transaction-local DML mutation-operator design that removes per-row
+  retained-run ceremony while proving exact affected-row, read-your-writes,
+  rollback/savepoint, missing/duplicate rowid, schema/cache invalidation, and
+  MVCC publication behavior. The focused DML and full quick matrix gates must
+  both move in the same run window.
+
+## 2026-05-17 - UPDATE/DELETE no-retry benchmark harness candidate
+
+- Target: current `comprehensive-bench --quick --filter update-delete` rows,
+  especially whether deterministic single-connection `:memory:` FrankenSQLite
+  UPDATE/DELETE measurements were charging benchmark-level BusySnapshot/Busy
+  retry closure overhead that C SQLite does not pay.
+- Touched during rejected candidate:
+  `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`. The candidate added
+  no-retry FSQLite execute helpers and used them only for UPDATE/DELETE setup,
+  measured mutation loops, teardown, and DML profiling. Concurrent-writer
+  sections kept the retrying helper.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-update-delete-no-retry-harness-20260517T1620Z/baseline-update-delete.json`,
+  `tests/artifacts/perf/codex-update-delete-no-retry-harness-20260517T1620Z/candidate-update-delete.json`,
+  `tests/artifacts/perf/codex-update-delete-no-retry-harness-20260517T1620Z/candidate-run.log`,
+  and
+  `tests/artifacts/perf/codex-update-delete-no-retry-harness-20260517T1620Z/summary.md`.
+- Result: rejected and unwound uncommitted. Same-window focused weighted/geomean
+  UPDATE/DELETE score worsened from `1.488025550482293` to
+  `1.5030257550239214`. The 100-row DELETE tail improved
+  (`F=8.285 us` to `F=7.394 us`) and 10K UPDATE improved (`F=276.618 us` to
+  `F=263.823 us`), but 1000-row DELETE regressed (`F=29.876 us` to
+  `F=31.289 us`) and 10K DELETE regressed (`F=269.745 us` to `F=316.122 us`).
+- Do not retry no-retry FSQLite helper wiring as a standalone benchmark
+  correction. Revisit only as part of a broader paired C/F retry-accounting
+  harness design that improves focused UPDATE/DELETE and full quick matrix
+  scores in the same run window.
+
+## 2026-05-17 - Staged DELETE leaf-run cursor-stack resume hint
+
+- Target: current `comprehensive-bench --quick --filter update-delete` DELETE
+  rows, especially the cross-leaf monotone rowid stream where retained
+  same-leaf DELETE runs stage the completed leaf and the next row currently
+  pays a new root-to-leaf seek.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs` and
+  `crates/fsqlite-core/src/connection.rs`. The candidate captured ancestor
+  cursor-stack entries inside `TableLeafDeleteRun`, then used the last staged
+  run as a forward resume anchor so the next direct DELETE cursor could try
+  `advance_to`/sibling-leaf traversal before falling back to `table_move_to`.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-delete-resume-candidate-20260517T0845Z/update-delete.json`.
+- Result: rejected and unwound uncommitted. Focused B-tree and direct-DELETE
+  correctness tests passed, and the profiled 10K DELETE seek counter fell
+  versus the prior frontier (`delete_seek_ns=61097` here versus about
+  `70898` in the previous DML refresh), but the real focused matrix rows got
+  worse: 1000-row DELETE measured `F=49.9 us` and 10K DELETE measured
+  `F=420.7 us`, compared with the previous profiled frontier around
+  `F=49.6 us` and `F=293.5 us`. The likely root cause is that cloning and
+  retaining ancestor page context for every leaf run adds more ceremony than
+  the occasional root descent saves.
+- Do not retry cursor-stack capture/resume as a standalone retained DELETE
+  optimization. Reconsider only with a lower-overhead path descriptor or a
+  broader transaction-local DML mutation operator that removes per-leaf
+  retained-run ceremony and passes the focused DML plus full quick gates.
+
+## 2026-05-17 - Direct DELETE profile flag plumbing
+
+- Target: current `comprehensive-bench --quick --filter update-delete` DELETE
+  rows, especially whether hoisting the profiling-enabled check through direct
+  DELETE helper calls could trim fixed per-row overhead while keeping the
+  diagnostic counters intact.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The candidate threaded a
+  `profile_direct_delete` boolean through `finish_prepared_direct_simple_delete`,
+  `execute_prepared_direct_simple_delete_with_cursor`, and
+  `try_execute_prepared_direct_simple_delete_active_leaf_run` to avoid repeated
+  `hot_path_profile_enabled()` loads on the direct DELETE path.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-delete-profile-flag-plumb-20260517T105537Z/update-delete.json`
+  and
+  `tests/artifacts/perf/codex-delete-profile-flag-plumb-20260517T105537Z/update-delete-repeat.json`.
+- Result: rejected and unwound uncommitted. The focused DML runs did not show a
+  stable DELETE improvement: 100-row DELETE worsened from the current dirty
+  baseline `F=10.660/20.739 us` to `F=13.826/23.915 us`; 1000-row DELETE was
+  noisy and mixed-beneficial at `F=61.766/31.178 us` versus
+  `F=72.967/57.508 us`; 10K DELETE regressed on the first run and remained
+  mixed on repeat at `F=430.245/361.847 us` versus `F=334.025/383.738 us`.
+- Do not retry profile-flag threading as a standalone optimization. Revisit
+  only if a wider profile-state design removes hot-path atomics or TLS checks
+  across multiple DML operators and passes both focused DML and full quick
+  matrix gates.
+
+## 2026-05-17 - Exact-MemDB logical DELETE rowid queue precondition miss
+
+- Target: current `comprehensive-bench --quick --filter update-delete` DELETE
+  rows, especially the 5-row, 50-row, and 500-row monotone rowid DELETE loops.
+- Touched during abandoned candidate:
+  `crates/fsqlite-core/src/connection.rs`. The candidate queued monotone
+  prepared direct DELETE rowids in a transaction-local logical run when an exact
+  MemDatabase row mirror could prove affected-row, duplicate, and missing-rowid
+  semantics, then planned to flush with one B-tree cursor at read/commit
+  boundaries.
+- Evidence: focused compile passed via
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-rowid-delete-run-20260517 cargo check -p fsqlite-core --lib`.
+  The targeted proof run
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-rowid-delete-run-20260517 cargo test -p fsqlite-core test_prepared_direct_delete_rowid_run -- --nocapture`
+  exposed the target-shape problem before any benchmark run: after the same
+  setup pattern, `memdb_rows_loaded` was false, and
+  `should_hydrate_memdb_rows_for_explicit_begin()` intentionally does not
+  hydrate private `:memory:` rows at `BEGIN` unless time-travel capture is
+  enabled.
+- Result: rejected and unwound uncommitted. The candidate would usually not
+  activate on the real DML benchmark setup, so any benchmark result would be a
+  no-op plus extra code surface. Eagerly hydrating MemDatabase rows to make this
+  queue activate would add an O(table rows) setup cost to the DELETE slice and
+  repeats the already-rejected tombstone/dense-rowid overlay family.
+- Do not retry an exact-MemDB-gated logical DELETE queue as a standalone patch.
+  Reconsider only if a broader transaction-local DML mutation operator obtains
+  affected-row proofs from the physical B-tree/page frontier without full
+  MemDatabase hydration, or if the benchmark setup already has an exact mirror
+  for unrelated reasons and the full quick keep gate is rerun in the same
+  window.
+
+## 2026-05-17 - DML fixed-cost profile rejects another synced-root/memdb micro-pass
+
+- Target: current `comprehensive-bench --quick --filter update-delete` DELETE
+  rows, after adding direct DELETE subcounters for preflush, rowid coercion,
+  active retained-run probe, cursor setup, MemDatabase invalidation, and
+  memory-concurrent synced-root checks.
+- Files/subsystems inspected: prepared direct DELETE in
+  `crates/fsqlite-core/src/connection.rs`, benchmark profile logging in
+  `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`, and the hot-path
+  snapshot fixture in `crates/fsqlite-e2e/src/perf_runner.rs`.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-dml-fixed-cost-profile-20260517T0908Z/summary.md`.
+- Result: no optimization patch attempted. The captured non-profile sanity run
+  reported `6` scenarios with FrankenSQLite faster / comparable /
+  C-SQLite-faster at `2 / 0 / 4`, average ratio `1.627x`, and geomean
+  `1.442x`. The 10K DELETE profile attributed `delete_active_probe_ns=232551`,
+  `delete_leaf_flush_ns=56475`, `delete_seek_ns=48583`, and
+  `delete_leaf_search=560/43203`; the newly measured fixed-cost pieces were
+  smaller (`delete_preflush_ns=13718`, `delete_rowid_ns=13527`,
+  `delete_memdb_abandon=500/13167`, `delete_memory_sync=500/14010`).
+  Fresh-eyes follow-up moved `delete_active_probe_ns` out of the retained-run
+  flush path, so this artifact's `delete_active_probe_ns` includes some flush
+  cost and should not be used as a clean post-fix subcounter without rerunning
+  the profile. The retry boundary below is unchanged.
+- Do not retry standalone synced-root, MemDatabase invalidation, rowid-coercion,
+  preflush, or cursor-setup DELETE tweaks from this signal. Revisit only as
+  part of the broader transaction-local DML mutation-operator design that
+  removes per-row retained-run ceremony while proving read-your-writes,
+  rollback, savepoint, missing/duplicate rowid, and MVCC publication behavior.
+
+## 2026-05-17 - INSERT profile refresh keeps large rows on fused-design target
+
+- Target: current `comprehensive-bench --quick --filter insert` matrix with
+  `FSQLITE_BENCH_PROFILE_INSERT=1`, re-run after the first subprofile refresh
+  produced mostly fixed-cost 100-row red rows.
+- Files/subsystems inspected: prepared direct INSERT record construction in
+  `crates/fsqlite-core/src/connection.rs`, benchmark profile logging in
+  `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`, and the direct INSERT
+  page-run/bulk-load path.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-insert-profile-refresh-20260517T0900Z/summary.md`.
+- Result: no optimization patch attempted. The refreshed profiled INSERT matrix
+  reported `25` scenarios with FrankenSQLite faster / comparable /
+  C-SQLite-faster at `15 / 3 / 7`, average F/C time ratio `0.901x`, geomean
+  `0.876x`, and weighted score `0.974`. The fixed-cost 100-row rows remain
+  noisy, but the large record-size row reproduced as a cleaner red row:
+  C SQLite `10.205 ms` versus FrankenSQLite `11.284 ms` (`1.106x`, C CV
+  `6.36`, F CV `13.09`). Its profiled source time is concentrated in fused
+  row/body construction and page publication: `row_build_ns=20549477`,
+  `preserialize_ns=19952566`, `preserialize_eval_ns=4207683`, and
+  `direct_flush_ns=2837823`.
+- Do not retry isolated affinity, concat, scratch, page-run arena, threshold, or
+  leaf-writer micro-tweaks from this signal; those shapes already failed prior
+  matrix gates. Revisit INSERT only with a broader fused row/body/page
+  construction design that removes duplicate record and page construction
+  together, then require both focused INSERT and full quick weighted-score
+  improvement.
+
+## 2026-05-17 - Owned active page-run record move
+
+- Target: current `comprehensive-bench --quick --filter insert` large-record
+  page-run path, especially `large_10col` 10K single transaction and
+  record-size `large_10col`.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The candidate moved the
+  preserialized large-record scratch `Vec<u8>` into already-active
+  `PendingDirectInsertPageRunRecords::Owned` runs instead of cloning the record
+  bytes into the run. It kept the existing page-run admission gates, rowid
+  monotonicity checks, savepoint boundaries, and bulk-loader selection.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-owned-page-run-candidate-20260517T0718Z/summary.md`,
+  `tests/artifacts/perf/codex-owned-page-run-candidate-20260517T0718Z/insert.json`,
+  and repeat
+  `tests/artifacts/perf/codex-owned-page-run-candidate-repeat-20260517T0725Z/insert.json`.
+- Result: rejected and unwound uncommitted. The first run improved the
+  record-size large row to `1.037x` slower but left large 10K single transaction
+  at `1.066x` slower and pushed p99 to `2.412x`. The repeat failed the keep
+  gate: weighted INSERT score regressed to `0.967` versus current no-profile
+  repeat baseline `0.934`; large 10K single transaction remained effectively
+  unchanged (`1.155x` versus baseline `1.159x`), and only the record-size large
+  row improved (`1.092x` versus baseline `1.135x`).
+- Do not retry moving the reusable preserialized record scratch into active
+  owned page-runs as a standalone optimization. The duplicate copy is not
+  enough on its own; revisit only inside a true fused row/body/page construction
+  design with focused INSERT and full quick keep gates.
+
+## 2026-05-17 - Direct concat-to-record emission
+
+- Target: current `comprehensive-bench --quick --filter insert` large-row
+  direct-record construction, especially the concat-heavy `large_10col` 10K
+  single-transaction and record-size rows.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The candidate temporarily represented
+  direct `ConcatChain` TEXT record cells as measured concat segments, then
+  emitted concat text directly into the SQLite record body during encoding
+  instead of materializing each concat field into
+  `prepared_direct_insert_text_scratch` and copying it into
+  `prepared_direct_insert_record_scratch`.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-concat-direct-record-candidate-20260517Tnext/summary.md`
+  and
+  `tests/artifacts/perf/codex-concat-direct-record-candidate-20260517Tnext/insert.json`.
+  The `Tnext` suffix is literal in the retained artifact directory name; the
+  artifact summary itself records the run date as 2026-05-17.
+- Result: rejected and unwound uncommitted. Focused correctness passed, and the
+  aggregate focused INSERT weighted score improved to `0.887`, but the target
+  rows worsened materially: `large_10col` 10K single transaction was
+  `1.204x` slower (`C=9.948 ms`, `F=11.981 ms`) and record-size `large_10col`
+  was `1.269x` slower (`C=10.199 ms`, `F=12.942 ms`).
+- Do not retry direct concat-to-record emission as a standalone optimization.
+  The extra two-phase concat measurement and expression re-evaluation outweigh
+  the avoided scratch copy on the target rows. Revisit only as part of a broader
+  fused row/body/page builder that avoids duplicate expression work and proves
+  the `large_10col` rows and the full quick weighted score in the same window.
+
 ## 2026-05-17 - DML cell-delta boundary refresh keeps source work at operator scope
 
 - Target: next source selection for the remaining `UPDATE/DELETE Throughput`
@@ -165,6 +429,95 @@ Each entry should include:
   proves repeated schema validations inside the mutation loop, or if profile
   counters show multiple schema validations eliminated in the target row and the
   full quick matrix moves.
+
+## 2026-05-17 - Disabling retained DELETE leaf runs
+
+- Target: current `comprehensive-bench --quick --filter update-delete` DELETE
+  rows, after the retained leaf-run rowid search hint failed the full matrix
+  gate.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The candidate temporarily forced
+  `can_defer_prepared_direct_delete_leaf_run()` to return `false`, bypassing
+  retained same-leaf DELETE batching and falling back to immediate physical
+  deletes for each row.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-disable-delete-leaf-run-candidate-20260517T0700Z/run.log`
+  and
+  `tests/artifacts/perf/codex-disable-delete-leaf-run-candidate-20260517T0700Z/update-delete.json`.
+- Result: rejected and unwound uncommitted. The profiled focused matrix got
+  materially worse on every DELETE row: 100-row DELETE was `F=9.357 us`
+  (`4.04x` slower), 1000-row DELETE was `F=68.117 us` (`4.21x` slower), and
+  10K DELETE was `F=655.216 us` (`4.11x` slower). The previous retained-run
+  profiled baseline for those rows was `F=7.7 us`, `F=30.0 us`, and
+  `F=276.6 us` respectively.
+- Do not disable retained DELETE leaf runs globally from the current evidence.
+  If this area is revisited, the viable shape is a narrower retained-run
+  implementation improvement or a threshold backed by both focused DML and full
+  quick matrix movement.
+
+## 2026-05-17 - DELETE leaf-run rowid search hint
+
+- Target: current `comprehensive-bench --quick --filter update-delete` DELETE
+  rows, especially `10000 rows / delete 500 rows`, after the current DML
+  profile showed retained leaf-run search cost at `delete_leaf_search=560/40882`
+  for that row.
+- Touched during rejected candidate:
+  `crates/fsqlite-btree/src/cursor.rs`. The candidate added a page-local
+  `(rowid, cell_idx)` hint to `TableLeafDeleteRun`, used it to probe the
+  predicted next dense rowid position, and fell back to the existing binary
+  search on the same immutable retained leaf image.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-delete-leaf-search-hint-candidate-20260517T0620Z/summary.md`,
+  profiled DML run
+  `tests/artifacts/perf/codex-delete-leaf-search-hint-candidate-20260517T0620Z/update-delete.json`,
+  non-profile repeats under
+  `tests/artifacts/perf/codex-delete-leaf-search-hint-candidate-noprofile-20260517T0630Z/`
+  and
+  `tests/artifacts/perf/codex-delete-leaf-search-hint-candidate-noprofile-repeat-20260517T0635Z/`,
+  plus full quick matrix
+  `tests/artifacts/perf/codex-delete-leaf-search-hint-fullquick-20260517T0640Z/full-quick.json`.
+- Result: rejected and unwound uncommitted. Focused tests and
+  `cargo check -p fsqlite-btree` passed, and the profiled 10K DELETE search
+  counter fell to `delete_leaf_search=560/18049`. That local win did not pass
+  the matrix gate: full quick weighted score regressed from `0.365835734` to
+  `0.380760547`, FrankenSQLite-faster rows fell from `80` to `77`,
+  C-SQLite-faster rows rose from `10` to `13`, and the full-matrix 10K DELETE
+  row moved only from `F=261.890 us` to `F=255.719 us` while its ratio worsened
+  from `1.194x` to `1.567x`.
+- Do not retry another standalone retained leaf-run rowid search hint from the
+  current evidence. Reconsider only if a new benchmark isolates stable F-side
+  DELETE movement without a full-matrix score regression; otherwise look at the
+  larger retained DELETE flush/materialization or commit-roundtrip costs.
+
+## 2026-05-17 - INSERT preserialize subprofile refresh retargets away from large-row tweaks
+
+- Target: current `comprehensive-bench --quick --filter insert` matrix with
+  `FSQLITE_BENCH_PROFILE_INSERT=1`, after adding profiling-only
+  `preserialize_eval_ns`, `preserialize_affinity_ns`, and
+  `preserialize_layout_ns` counters. The benchmark source was
+  `6b4181415c1e1a38c013b895cdca5f8ace522aaa` plus the dirty profiling
+  counter patch.
+- Files/subsystems inspected: prepared direct INSERT preserialization in
+  `crates/fsqlite-core/src/connection.rs`, benchmark profile logging in
+  `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`, and the hot-path
+  profile fixture in `crates/fsqlite-e2e/src/perf_runner.rs`.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-insert-preserialize-subprofile-fresh-20260517T0040Z/summary.md`.
+- Result: no optimization patch attempted. The focused INSERT matrix reported
+  `25` scenarios with FrankenSQLite faster / comparable / C-SQLite-faster at
+  `15 / 4 / 6`, average F/C time ratio `0.920x`, and geomean F/C time ratio
+  `0.900x`. The prior large-row red rows did not reproduce as a stable current
+  frontier in this run: `large_10col` 10K single-txn was `10.238 ms` C SQLite
+  versus `10.156 ms` FrankenSQLite (`0.99x`), and the record-size large row was
+  `10.424 ms` versus `10.643 ms` (`1.02x`). Remaining red rows over `1.05x`
+  are fixed-cost 100-row tails, especially `small_3col` 100 rows batched
+  100/txn at `1.42x`.
+- Superseded by the later
+  `tests/artifacts/perf/codex-insert-profile-refresh-20260517T0900Z/summary.md`
+  refresh above, where the large-row INSERT gap did reproduce. The retry
+  boundary is unchanged: use these subcounters only for attribution, and retry
+  large-row INSERT only as a broader fused row/body/page construction design,
+  not isolated capacity tuning, scratch reuse, or page-run mechanics.
 
 ## 2026-05-16 - Dense MemDatabase rowid DELETE run
 

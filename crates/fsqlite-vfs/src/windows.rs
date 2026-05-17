@@ -211,6 +211,14 @@ impl WindowsShmTable {
         }
     }
 
+    fn get(&self, path: &Path) -> Result<Option<Arc<Mutex<WindowsShmState>>>> {
+        let map = self
+            .map
+            .lock()
+            .map_err(|_| lock_poisoned("windows shm table"))?;
+        Ok(map.get(path).map(Arc::clone))
+    }
+
     fn get_or_create(&self, path: &Path) -> Result<Arc<Mutex<WindowsShmState>>> {
         let mut map = self
             .map
@@ -1003,8 +1011,59 @@ impl VfsFile for WindowsFile {
                 what: "shm file length".to_string(),
                 value: format!("region={region}, size={size}"),
             })?;
-        ensure_shm_file_len(&self.shm_path, min_len)?;
 
+        if !extend {
+            let mut needs_owner_ref = false;
+            let shm_state = if let Some(state) = &self.shm_state {
+                Arc::clone(state)
+            } else {
+                needs_owner_ref = true;
+                windows_shm_table().get(&self.shm_path)?.ok_or_else(|| {
+                    FrankenError::CannotOpen {
+                        path: self.shm_path.clone(),
+                    }
+                })?
+            };
+
+            let mapped_region = {
+                let mut state = shm_state
+                    .lock()
+                    .map_err(|_| lock_poisoned("windows shm state"))?;
+                let existing = state.regions.get(&region).cloned().ok_or_else(|| {
+                    FrankenError::CannotOpen {
+                        path: self.shm_path.clone(),
+                    }
+                })?;
+                if existing.len() < size_usize {
+                    return Err(FrankenError::LockFailed {
+                        detail: format!(
+                            "shm region {region} is {} bytes, requested {size_usize} bytes without extend",
+                            existing.len()
+                        ),
+                    });
+                }
+                if needs_owner_ref {
+                    *state.owner_refs.entry(self.owner_id).or_insert(0) += 1;
+                }
+                existing
+            };
+
+            if needs_owner_ref {
+                self.shm_state = Some(Arc::clone(&shm_state));
+            }
+
+            debug!(
+                target: "fsqlite_vfs::windows",
+                region,
+                size,
+                path = %self.shm_path.display(),
+                "mapped windows shm region"
+            );
+
+            return Ok(mapped_region);
+        }
+
+        ensure_shm_file_len(&self.shm_path, min_len)?;
         let shm_state = self.ensure_shm_state()?;
         let mapped_region = {
             let mut state = shm_state
@@ -1030,11 +1089,6 @@ impl VfsFile for WindowsFile {
                     occupied.into_mut()
                 }
                 std::collections::hash_map::Entry::Vacant(vacant) => {
-                    if !extend {
-                        return Err(FrankenError::CannotOpen {
-                            path: self.shm_path.clone(),
-                        });
-                    }
                     vacant.insert(ShmRegion::new(size_usize))
                 }
             };
@@ -1282,6 +1336,36 @@ mod tests {
             "resizing must preserve shared backing for existing mappings"
         );
         assert_eq!(region_large.read_u32_le(32).unwrap(), 0xAABB_CCDD);
+    }
+
+    #[test]
+    fn test_windowsvfs_shm_map_extend_false_rejects_missing_without_side_effects() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("shm_missing_no_extend.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open file");
+        let shm_path = file.shm_path.clone();
+
+        let err = file.shm_map(&cx, 2, 64, false).unwrap_err();
+        assert!(
+            matches!(err, FrankenError::CannotOpen { .. }),
+            "missing non-extend shm_map should report CannotOpen, got {err:?}"
+        );
+        assert!(
+            file.shm_state.is_none(),
+            "failed non-extend shm_map must not register shm owner state"
+        );
+        assert!(
+            windows_shm_table().get(&shm_path).unwrap().is_none(),
+            "failed non-extend shm_map must not create a shared state entry"
+        );
+        assert!(
+            !shm_path.exists(),
+            "failed non-extend shm_map must not create a -shm file"
+        );
     }
 
     #[test]

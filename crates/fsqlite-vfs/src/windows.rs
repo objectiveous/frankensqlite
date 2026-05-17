@@ -1402,14 +1402,20 @@ mod tests {
     #[test]
     fn test_windowsvfs_temp_file_skips_existing_candidate() {
         let cx = Cx::new();
-        let seed = 1_000_000_000_000_u64 + u64::from(std::process::id());
-        let blocker = env::temp_dir().join(format!("fsqlite-windows-{seed}.tmp"));
-        let mut blocker_options = windows_open_options();
-        let mut blocker_file = blocker_options
-            .write(true)
-            .create_new(true)
-            .open(&blocker)
-            .expect("existing temp candidate");
+        let seed_base = 1_000_000_000_000_u64 + u64::from(std::process::id()) * 1_024;
+        let (seed, blocker, mut blocker_file) = (0_u64..1_024)
+            .find_map(|offset| {
+                let seed = seed_base + offset;
+                let blocker = env::temp_dir().join(format!("fsqlite-windows-{seed}.tmp"));
+                let mut blocker_options = windows_open_options();
+                blocker_options
+                    .write(true)
+                    .create_new(true)
+                    .open(&blocker)
+                    .ok()
+                    .map(|file| (seed, blocker, file))
+            })
+            .expect("available temp candidate");
         blocker_file
             .write_all(b"existing temp candidate")
             .expect("write existing temp candidate");

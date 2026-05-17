@@ -27,7 +27,7 @@ fsqlite-error = { workspace = true }
 fsqlite-harness = { workspace = true }
 fsqlite-parser = { workspace = true }
 fsqlite-vdbe = { workspace = true }
-fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.4", default-features = false }
+fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.5", default-features = false }
 fsqlite-types = { workspace = true }
 fsqlite-wal = { workspace = true }
 ftui = { workspace = true, features = ["crossterm"], optional = true }

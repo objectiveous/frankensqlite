@@ -117,19 +117,25 @@ fn ensure_shm_file_len(path: &Path, min_len: u64) -> Result<()> {
 }
 
 fn open_windows_lock_sidecar(path: &Path) -> Result<(File, bool)> {
-    let mut create_options = windows_open_options();
-    match create_options
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(file) => Ok((file, true)),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            let mut open_options = windows_open_options();
-            Ok((open_options.read(true).write(true).open(path)?, false))
+    loop {
+        let mut create_options = windows_open_options();
+        match create_options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(file) => return Ok((file, true)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let mut open_options = windows_open_options();
+                match open_options.read(true).write(true).open(path) {
+                    Ok(file) => return Ok((file, false)),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(FrankenError::Io(err)),
+                }
+            }
+            Err(err) => return Err(FrankenError::Io(err)),
         }
-        Err(err) => Err(FrankenError::Io(err)),
     }
 }
 
@@ -535,15 +541,11 @@ impl Vfs for WindowsVfs {
                     if is_rw {
                         open_options.write(true);
                     }
-                    break open_options.open(&resolved).map_err(|err| {
-                        if err.kind() == std::io::ErrorKind::NotFound {
-                            FrankenError::CannotOpen {
-                                path: resolved.clone(),
-                            }
-                        } else {
-                            FrankenError::Io(err)
-                        }
-                    })?;
+                    match open_options.open(&resolved) {
+                        Ok(file) => break file,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(FrankenError::Io(err)),
+                    }
                 }
                 Err(err) => {
                     return Err(if err.kind() == std::io::ErrorKind::NotFound {

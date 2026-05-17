@@ -116,6 +116,23 @@ fn ensure_shm_file_len(path: &Path, min_len: u64) -> Result<()> {
     Ok(())
 }
 
+fn open_windows_lock_sidecar(path: &Path) -> Result<(File, bool)> {
+    let mut create_options = windows_open_options();
+    match create_options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => Ok((file, true)),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut open_options = windows_open_options();
+            Ok((open_options.read(true).write(true).open(path)?, false))
+        }
+        Err(err) => Err(FrankenError::Io(err)),
+    }
+}
+
 #[derive(Debug, Default)]
 struct WindowsVfsInner {
     next_temp_id: u64,
@@ -257,20 +274,38 @@ struct WindowsOsLockFiles {
 
 impl WindowsOsLockFiles {
     fn open(path: &Path) -> Result<Self> {
-        let open_sidecar = |sidecar: &Path| -> Result<File> {
-            let mut options = windows_open_options();
-            Ok(options
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(sidecar)?)
+        let shared_path = sqlite_shared_lock_path(path);
+        let reserved_path = sqlite_reserved_lock_path(path);
+        let pending_path = sqlite_pending_lock_path(path);
+        let (shared_file, shared_created) = open_windows_lock_sidecar(&shared_path)?;
+        let (reserved_file, reserved_created) = match open_windows_lock_sidecar(&reserved_path) {
+            Ok(opened) => opened,
+            Err(err) => {
+                drop(shared_file);
+                if shared_created {
+                    let _ = fs::remove_file(&shared_path);
+                }
+                return Err(err);
+            }
         };
-
+        let (pending_file, _) = match open_windows_lock_sidecar(&pending_path) {
+            Ok(opened) => opened,
+            Err(err) => {
+                drop(reserved_file);
+                drop(shared_file);
+                if reserved_created {
+                    let _ = fs::remove_file(&reserved_path);
+                }
+                if shared_created {
+                    let _ = fs::remove_file(&shared_path);
+                }
+                return Err(err);
+            }
+        };
         Ok(Self {
-            shared_file: open_sidecar(&sqlite_shared_lock_path(path))?,
-            reserved_file: open_sidecar(&sqlite_reserved_lock_path(path))?,
-            pending_file: open_sidecar(&sqlite_pending_lock_path(path))?,
+            shared_file,
+            reserved_file,
+            pending_file,
             held_levels: [false; 4],
         })
     }
@@ -1336,6 +1371,50 @@ mod tests {
         assert!(
             fs::remove_file(&path).is_err(),
             "Windows VFS files must reject unlink while an open handle exists"
+        );
+    }
+
+    #[test]
+    fn test_windowsvfs_lock_open_failure_cleans_created_shared_sidecar() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("partial_lock_open.db");
+        let shared_path = sqlite_shared_lock_path(&path);
+        let reserved_path = sqlite_reserved_lock_path(&path);
+        fs::create_dir(&reserved_path).expect("reserved sidecar blocker");
+
+        assert!(WindowsOsLockFiles::open(&path).is_err());
+        assert!(
+            !shared_path.exists(),
+            "failed lock setup should remove the shared sidecar it just created"
+        );
+        assert!(
+            reserved_path.is_dir(),
+            "cleanup must not disturb the path that caused the open failure"
+        );
+    }
+
+    #[test]
+    fn test_windowsvfs_lock_open_failure_preserves_existing_sidecars() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("existing_partial_lock_open.db");
+        let shared_path = sqlite_shared_lock_path(&path);
+        let reserved_path = sqlite_reserved_lock_path(&path);
+        let pending_path = sqlite_pending_lock_path(&path);
+        fs::write(&shared_path, b"existing shared sidecar").expect("existing shared sidecar");
+        fs::create_dir(&pending_path).expect("pending sidecar blocker");
+
+        assert!(WindowsOsLockFiles::open(&path).is_err());
+        assert!(
+            shared_path.exists(),
+            "failed lock setup must not remove a sidecar it did not create"
+        );
+        assert!(
+            !reserved_path.exists(),
+            "failed lock setup should remove the reserved sidecar it just created"
+        );
+        assert!(
+            pending_path.is_dir(),
+            "cleanup must not disturb the path that caused the open failure"
         );
     }
 

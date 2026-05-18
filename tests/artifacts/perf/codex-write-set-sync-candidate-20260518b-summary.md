@@ -27,6 +27,20 @@
   16-thread shared table, 100 rows/thread, fsqlite 90,327 writes/sec,
   SQLite 4,824 writes/sec, throughput ratio 18.72x, fsqlite failed rows 0,
   SQLite failed rows 0.
-- Decision: rejected. This reduced-row smoke does not reproduce the
-  BUSY_SNAPSHOT storm, and the candidate loses roughly one third of baseline
-  fsqlite throughput.
+- Follow-up baseline benchmark command:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-write-set-sync-baseline-target-20260518 cargo run --profile release-perf -p fsqlite-e2e --bin mt-mvcc-bench -- --rows-per-thread=1000 --threads=16 --iters=3 --json-output=tests/artifacts/perf/codex-write-set-sync-baseline-1000rows-iters3-20260518.json --summary-md=tests/artifacts/perf/codex-write-set-sync-baseline-1000rows-iters3-20260518.md`
+- Follow-up baseline result:
+  16-thread shared table, 1000 rows/thread, 3 iterations, fsqlite
+  214,399 writes/sec, SQLite 30,028 writes/sec, throughput ratio 7.14x,
+  fsqlite failed rows 0, SQLite failed rows 0.
+- Follow-up candidate benchmark command:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-write-set-sync-bench-target-20260518b cargo run --profile release-perf -p fsqlite-e2e --bin mt-mvcc-bench -- --rows-per-thread=1000 --threads=16 --iters=3 --json-output=tests/artifacts/perf/codex-write-set-sync-candidate-1000rows-iters3-20260518b.json --summary-md=tests/artifacts/perf/codex-write-set-sync-candidate-1000rows-iters3-20260518b.md`
+- Follow-up candidate result:
+  16-thread shared table, 1000 rows/thread, 3 iterations, fsqlite
+  161,243 writes/sec, SQLite 30,043 writes/sec, throughput ratio 5.37x,
+  fsqlite failed rows 0, SQLite failed rows 0. The command exited 1 after
+  writing reports because the pass-over-pass ratio gate detected a 31.80%
+  drop.
+- Decision: rejected. Neither row count reproduced the BUSY_SNAPSHOT storm,
+  and the candidate loses throughput against baseline at both 100 and 1000
+  rows/thread.

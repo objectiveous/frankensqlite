@@ -12991,7 +12991,12 @@ set: sessions found by
   produced 60,710 fsqlite writes/sec with 0 failed rows, while the unpatched
   clean archive produced 90,327 fsqlite writes/sec with 0 failed rows. Both
   avoided the BUSY_SNAPSHOT storm at this reduced row count, and the candidate
-  was about 33% slower than baseline.
+  was about 33% slower than baseline. A follow-up default-row-count check
+  `mt-mvcc-bench --rows-per-thread=1000 --threads=16 --iters=3` also rejected
+  it: baseline produced 214,399 fsqlite writes/sec, candidate produced 161,243
+  fsqlite writes/sec, and both had 0 fsqlite failed rows. The candidate run
+  exited 1 after writing reports because the benchmark pass-over-pass gate
+  caught a 31.80% throughput-ratio drop.
 - Do not retry removing the direct-memory root memo short-circuit as a
   standalone optimization. Reconsider only if a larger reproducible
   16-thread shared-table failure shows baseline failures that this exact

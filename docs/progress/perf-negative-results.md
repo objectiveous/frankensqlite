@@ -12927,3 +12927,39 @@ set: sessions found by
   standalone optimization. The count/sum cache is already absent for this
   activation shape, and removing the no-op maintenance call is too small/noisy
   to clear the focused DELETE keep gate.
+
+## 2026-05-18 - Prepared direct logical DELETE rowid messages
+
+- Target: private `:memory:` prepared direct DELETE in
+  `crates/fsqlite-core/src/connection.rs`, after the DML boundary notes pointed
+  at a broader transaction-local mutation operator rather than more retained
+  leaf-run micro-trims.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The scratch candidate added
+  transaction-local logical rowid DELETE messages backed by the exact
+  MemDatabase mirror, then flushed physical B-tree deletes at
+  read/savepoint/commit boundaries. The patch was kept in scratch only and was
+  not promoted to the canonical checkout.
+- Correctness proof before rejection:
+  in scratch checkout `/tmp/frankensqlite-clean-20260518-ops`,
+  `cargo fmt --check`,
+  `cargo test -p fsqlite-core --lib logical_delete -- --nocapture`,
+  `cargo test -p fsqlite-core --lib prepared_direct_delete -- --nocapture`,
+  `cargo test -p fsqlite-core --lib pending_direct_delete -- --nocapture`,
+  `cargo check -p fsqlite-core --lib`, and
+  `cargo clippy -p fsqlite-core --lib -- -D warnings` passed.
+- Fresh-eyes fixes made before rejection:
+  removed the dead-path `concurrent_txn` eligibility rejection because plain
+  `BEGIN` promotes to concurrent mode by default; registered the conservative
+  `:memory:` concurrent write root before mutating the MemDatabase mirror; and
+  adjusted physical delete leaf-run tests to force the old physical path so
+  they still cover that implementation.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-logical-delete-candidate-20260518Tscratch-summary.md`
+  records the scratch proof commands and focused benchmark command.
+- Result: rejected. The focused isolated delete run
+  `perf-update-delete 10000 250 delete compare isolated` measured fsqlite
+  delete time `3259ms` versus SQLite delete time `37ms`, or `87.39x` slower.
+- Do not retry logical rowid-message DELETE batching as a standalone
+  optimization. The exact-MemDB hydration plus deferred physical flush cost
+  overwhelms the intended per-row ceremony savings.

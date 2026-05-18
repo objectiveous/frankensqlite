@@ -12963,3 +12963,36 @@ set: sessions found by
 - Do not retry logical rowid-message DELETE batching as a standalone
   optimization. The exact-MemDB hydration plus deferred physical flush cost
   overwhelms the intended per-row ceremony savings.
+
+## 2026-05-18 - Direct `:memory:` write-set resync without root memo short-circuit
+
+- Target: 16-thread shared-table `mt-mvcc-bench` failure investigation for
+  private `:memory:` prepared direct writes in
+  `crates/fsqlite-core/src/connection.rs`.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` in scratch checkout
+  `/data/tmp/frankensqlite-write-set-sync-scratch-20260518b`. The candidate
+  kept existing call sites but changed `sync_memory_concurrent_pending_write_pages`
+  so the root memo no longer short-circuited later syncs; each direct write
+  resynced the active transaction's conservative page set into the concurrent
+  handle with prepared write markers.
+- Correctness proof before rejection:
+  in scratch checkout `/data/tmp/frankensqlite-write-set-sync-scratch-20260518b`,
+  `cargo fmt --check`,
+  `cargo check -p fsqlite-core --lib`,
+  `cargo test -p fsqlite-core --lib test_prepared_direct_simple_insert_executes_inside_explicit_transaction -- --nocapture`,
+  `cargo test -p fsqlite-core --lib test_prepared_direct_simple_insert_resyncs_after_savepoint_rollback -- --nocapture`,
+  and `cargo clippy -p fsqlite-core --lib -- -D warnings` passed.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-write-set-sync-candidate-20260518b-summary.md`
+  records the scratch proof commands and A/B benchmark commands.
+- Result: rejected. On the same 16-thread shared-table smoke row
+  `mt-mvcc-bench --rows-per-thread=100 --threads=16 --iters=1`, the candidate
+  produced 60,710 fsqlite writes/sec with 0 failed rows, while the unpatched
+  clean archive produced 90,327 fsqlite writes/sec with 0 failed rows. Both
+  avoided the BUSY_SNAPSHOT storm at this reduced row count, and the candidate
+  was about 33% slower than baseline.
+- Do not retry removing the direct-memory root memo short-circuit as a
+  standalone optimization. Reconsider only if a larger reproducible
+  16-thread shared-table failure shows baseline failures that this exact
+  resync strategy eliminates without losing throughput.

@@ -12899,3 +12899,31 @@ set: sessions found by
   text assembly as a standalone optimization. Reconsider only as part of a
   broader concat/preserialization redesign that improves the same-window
   insert-filter matrix, not just one noisy large-row measurement.
+
+## 2026-05-18 - Prepared direct DELETE count/sum no-op trim
+
+- Target: retained same-leaf prepared direct DELETE in
+  `crates/fsqlite-core/src/connection.rs`, after the refreshed focused
+  `update-delete` matrix still showed durable DELETE gaps.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The candidate removed the
+  `retained_autocommit_count_sum_cache_note_delete(..., None)` calls from the
+  retained same-leaf DELETE start/active-hit paths. The source patch was
+  manually unwound after the focused benchmark rejected it.
+- Correctness proof before rejection:
+  `rch exec -- env TMPDIR=/data/tmp CARGO_TARGET_DIR=/data/tmp/frankensqlite-delete-countcache-trim-test cargo test -p fsqlite-core pending_direct_delete_leaf_run -- --nocapture`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-current-update-delete-refresh-20260518Tnext/`
+  records the same-window current refresh, and
+  `tests/artifacts/perf/codex-delete-countsum-noop-trim-candidate-20260518Tnext/`
+  records the candidate run.
+- Result: rejected. The candidate did not improve all DELETE rows in absolute
+  FSQLite time. `100 rows / delete 5 rows` moved `0.024406 ms -> 0.015697 ms`
+  but remained high variance, `1000 rows / delete 50 rows` moved
+  `0.038653 ms -> 0.035671 ms`, and the stable `10000 rows / delete 500 rows`
+  regressed `0.276107 ms -> 0.327832 ms`.
+- Do not retry retained same-leaf DELETE count/sum-cache no-op trimming as a
+  standalone optimization. The count/sum cache is already absent for this
+  activation shape, and removing the no-op maintenance call is too small/noisy
+  to clear the focused DELETE keep gate.

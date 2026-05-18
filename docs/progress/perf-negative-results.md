@@ -12,6 +12,42 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-18 - Dense retained DELETE leaf search candidate
+
+- Target: current `comprehensive-bench --quick --filter update-delete` DELETE
+  rows, especially whether retained `TableLeafDeleteRun` should reuse the dense
+  integer-key leaf proof already used by ordinary `BtCursor` table seeks.
+- Touched during rejected scratch candidate:
+  `crates/fsqlite-btree/src/cursor.rs` in clean scratch checkout
+  `/data/tmp/frankensqlite-delete-operator-scratch-2dad5c28-20260518T0110Z`.
+  The candidate changed `TableLeafDeleteRun::search_table_leaf` to check
+  cancellation first, test first/last rowids, compute and verify a direct dense
+  slot when `first + cell_count - 1 == last`, then fall back to the existing
+  binary search.
+- Correctness proof before rejection:
+  `cargo fmt --check` and
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-delete-operator-target-20260518T0110Z cargo test -p fsqlite-btree --lib table_leaf_delete_run`
+  passed after a fresh-eyes fix restored cancellation-before-search behavior.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-delete-operator-scratch-baseline-20260518T0110Z/update-delete.json`,
+  `tests/artifacts/perf/codex-delete-operator-scratch-baseline-20260518T0110Z/run.log`,
+  `tests/artifacts/perf/codex-delete-operator-scratch-baseline-20260518T0110Z/summary.md`,
+  `tests/artifacts/perf/codex-delete-dense-leaf-search-candidate-20260518T0112Z/update-delete.json`,
+  `tests/artifacts/perf/codex-delete-dense-leaf-search-candidate-20260518T0112Z/run.log`,
+  and
+  `tests/artifacts/perf/codex-delete-dense-leaf-search-candidate-20260518T0112Z/summary.md`.
+- Result: rejected and kept in scratch only. The local 10K DELETE F-side median
+  improved from `0.315661 ms` to `0.257221 ms`, and `delete_leaf_search`
+  dropped from `560/47894` to `560/17797`. The focused keep gate still failed:
+  100-row DELETE regressed from `0.013646 ms` to `0.016611 ms`, average F/C
+  ratio worsened from `1.7522921813538774` to `2.063169978211233`, and
+  write-single geomean worsened from `1.4498564588938154` to
+  `1.5671143028808132`.
+- Do not retry dense retained-leaf search as a standalone patch. Reconsider
+  only inside the broader transaction-local DML mutation operator, where search
+  reduction lands together with fewer retained-run publications, fewer
+  flush/materialization events, and a shorter transaction envelope.
+
 ## 2026-05-17 - Post-active-probe-fix DML profile still rejects DELETE micro-patches
 
 - Target: current `comprehensive-bench --quick --filter update-delete` rows

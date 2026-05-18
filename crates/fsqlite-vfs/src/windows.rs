@@ -1072,21 +1072,12 @@ impl VfsFile for WindowsFile {
 
             let entry = state.regions.entry(region);
             let region_ref = match entry {
-                std::collections::hash_map::Entry::Occupied(mut occupied) => {
-                    if occupied.get().len() < size_usize {
-                        if !extend {
-                            return Err(FrankenError::LockFailed {
-                                detail: format!(
-                                    "shm region {region} is {} bytes, requested {size_usize} bytes without extend",
-                                    occupied.get().len()
-                                ),
-                            });
-                        }
-                        let mut updated_region = occupied.get().clone();
-                        updated_region.try_resize_heap(size_usize)?;
-                        occupied.insert(updated_region);
+                std::collections::hash_map::Entry::Occupied(occupied) => {
+                    let region_ref = occupied.into_mut();
+                    if region_ref.len() < size_usize {
+                        region_ref.try_resize_heap(size_usize)?;
                     }
-                    occupied.into_mut()
+                    region_ref
                 }
                 std::collections::hash_map::Entry::Vacant(vacant) => {
                     vacant.insert(ShmRegion::new(size_usize))
@@ -1193,6 +1184,14 @@ mod tests {
     use std::io::Write as _;
     use std::process::Command;
     use tempfile::tempdir;
+
+    struct TempPathCleanup(PathBuf);
+
+    impl Drop for TempPathCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
 
     fn open_flags_create() -> VfsOpenFlags {
         VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE
@@ -1489,7 +1488,7 @@ mod tests {
     fn test_windowsvfs_temp_file_skips_existing_candidate() {
         let cx = Cx::new();
         let seed_base = 1_000_000_000_000_u64 + u64::from(std::process::id()) * 1_024;
-        let (seed, blocker, mut blocker_file) = (0_u64..1_024)
+        let (seed, blocker, blocker_file) = (0_u64..1_024)
             .find_map(|offset| {
                 let seed = seed_base + offset;
                 let blocker = env::temp_dir().join(format!("fsqlite-windows-{seed}.tmp"));
@@ -1502,6 +1501,8 @@ mod tests {
                     .map(|file| (seed, blocker, file))
             })
             .expect("available temp candidate");
+        let _blocker_cleanup = TempPathCleanup(blocker.clone());
+        let mut blocker_file = blocker_file;
         blocker_file
             .write_all(b"existing temp candidate")
             .expect("write existing temp candidate");
@@ -1530,7 +1531,6 @@ mod tests {
             !opened_path.exists(),
             "delete-on-close should remove the actual temp file"
         );
-        fs::remove_file(&blocker).expect("remove blocker");
     }
 
     #[test]

@@ -12837,3 +12837,65 @@ set: sessions found by
   standalone optimization. Reconsider only if `write_page` grows an
   owned-buffer adoption equivalent, or if a same-window DML profile proves
   the write counter and page-pool misses improve together.
+
+## 2026-05-17 - Prepared direct DELETE transaction-local rowid batch
+
+- Target: prepared direct-simple `DELETE FROM table WHERE id = ?1` in private
+  `:memory:` explicit transactions, after the current quick matrix showed
+  remaining C-faster DELETE rows in the `write_single` family.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The candidate added a guarded
+  transaction-local rowid proof set that activated after 16 repeated DELETEs,
+  scanned the table rowids once, answered later DELETEs from that set, and
+  flushed physical deletes at read/write/commit boundaries. The source patch
+  was manually unwound after the benchmark rejected it.
+- Evidence artifact:
+  `tests/artifacts/perf/codex-delete-rowid-batch-candidate-20260517Tnext/update-delete.json`
+  records the measured focused quick `update-delete` run for the dirty
+  candidate build.
+- Result: rejected. DELETE got worse across the focused matrix: `100/delete 5`
+  measured C `2.2 us` versus F `12.2 us` (`5.53x` slower),
+  `1000/delete 50` measured C `52.3 us` versus F `150.0 us` (`2.87x`
+  slower), and `10000/delete 500` measured C `214.1 us` versus F `1.29 ms`
+  (`6.04x` slower). This underperformed the prior current-full-quick artifact
+  rows in
+  `tests/artifacts/perf/codex-current-fullquick-frontier-20260517T1900Z/summary.md`,
+  where the same DELETE ratios were about `3.33x`, `1.90x`, and `1.70x`
+  slower.
+- Do not retry an O(table rows) rowid proof-set / deferred rowid-delete batch
+  as a standalone DELETE optimization. Reconsider only if it is backed by a
+  different physical representation that avoids full-table activation and
+  flush scans, and if a same-window `update-delete` A/B improves all three
+  DELETE rows in absolute FSQLite time.
+
+## 2026-05-17 - Prepared direct INSERT concat shared integer buffer
+
+- Target: prepared direct-simple INSERT concat text assembly in
+  `crates/fsqlite-core/src/connection.rs`, after the current INSERT profile
+  showed large 10-column rows spending substantial time in direct-record row
+  building and preserialization.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The candidate reused one
+  `itoa::Buffer` per concat-chain evaluation instead of creating a fresh
+  integer-format buffer for every integer segment. A fresh-eyes pass also found
+  and removed an unused compatibility wrapper that would have tripped
+  warning-as-error clippy, then the source patch was manually unwound after the
+  same-window A/B rejected it.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-insert-itofmt-buffer-candidate-20260517Tnext/insert.json`
+  records the dirty candidate run, and
+  `tests/artifacts/perf/codex-insert-itofmt-baseline-samewindow-20260517Tnext/insert.json`
+  records the restored-original baseline run from the same target/build window.
+  `tests/artifacts/perf/codex-insert-itofmt-buffer-candidate-20260517Tnext/summary.md`
+  summarizes the comparison.
+- Result: rejected. The restored-original baseline won the same-window INSERT
+  quick matrix: baseline `20/1/4` faster/comparable/C-faster rows versus
+  candidate `15/2/8`; average ratio `0.8451x` versus `1.0505x`; geomean
+  `0.8110x` versus `0.9662x`; weighted score `0.7837x` versus `0.8547x`
+  (lower is better); p90/p99 `1.1633x`/`1.9335x` versus
+  `1.6336x`/`2.8338x`. The candidate had mixed isolated large-row movement,
+  but it worsened the broader insert-filter matrix and added more red rows.
+- Do not retry shared `itoa::Buffer` reuse for prepared direct INSERT concat
+  text assembly as a standalone optimization. Reconsider only as part of a
+  broader concat/preserialization redesign that improves the same-window
+  insert-filter matrix, not just one noisy large-row measurement.

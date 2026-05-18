@@ -4038,6 +4038,67 @@ impl MemDatabase {
         }
     }
 
+    /// Allocate an implicit rowid and insert the row, recording one undo entry
+    /// for both the rowid counter advance and the row mutation. If
+    /// `rowid_value_column` is present, that column is patched to the allocated
+    /// rowid before insertion.
+    #[must_use]
+    pub fn insert_auto_row<V>(
+        &mut self,
+        root_page: i32,
+        values: V,
+        rowid_value_column: Option<usize>,
+    ) -> Option<i64>
+    where
+        V: Into<MemRowValues>,
+    {
+        let mut values = values.into();
+        if let Some(table) = self.tables.get_mut(&root_page) {
+            let prev_next_rowid = table.next_rowid;
+            let rowid = table.alloc_rowid();
+            if let Some(column) = rowid_value_column
+                && let Some(value) = values.get_mut(column)
+            {
+                *value = SqliteValue::Integer(rowid);
+            }
+            let old_values = table
+                .rows
+                .binary_search_by_key(&rowid, |r| r.rowid)
+                .ok()
+                .map(|idx| table.rows[idx].values.clone());
+            table.insert(rowid, values);
+            self.push_undo(MemDbUndoOp::UpsertRow {
+                root_page,
+                rowid,
+                prev_next_rowid,
+                old_values,
+            });
+            Some(rowid)
+        } else {
+            None
+        }
+    }
+
+    /// Delete a row by rowid, recording undo information for rollback.
+    pub fn delete_rowid(&mut self, root_page: i32, rowid: i64) -> bool {
+        if let Some(table) = self.tables.get_mut(&root_page)
+            && let Ok(index) = table.rows.binary_search_by_key(&rowid, |r| r.rowid)
+        {
+            let prev_next_rowid = table.next_rowid;
+            let row = table.rows.remove(index);
+            table.remove_unique_entries(row.rowid, &row.values);
+            self.push_undo(MemDbUndoOp::DeleteRow {
+                root_page,
+                index,
+                row,
+                prev_next_rowid,
+            });
+            true
+        } else {
+            false
+        }
+    }
+
     #[allow(dead_code)]
     fn delete_at(&mut self, root_page: i32, index: usize) {
         if let Some(table) = self.tables.get_mut(&root_page) {
@@ -9706,13 +9767,11 @@ impl VdbeEngine {
                                         5 => {
                                             // OE_REPLACE: Delete conflicting row(s),
                                             // then insert new.
-                                            if let Some(table) = db.get_table_mut(root) {
-                                                for conflict_rid in unique_conflicts {
-                                                    // Delete conflicting rows that are not the new rowid
-                                                    // (which will be replaced by upsert_row).
-                                                    if conflict_rid != rowid {
-                                                        table.delete_by_rowid(conflict_rid);
-                                                    }
+                                            for conflict_rid in unique_conflicts {
+                                                // Delete conflicting rows that are not the new rowid
+                                                // (which will be replaced by upsert_row).
+                                                if conflict_rid != rowid {
+                                                    db.delete_rowid(root, conflict_rid);
                                                 }
                                             }
                                             db.upsert_row(root, rowid, values);
@@ -25353,6 +25412,79 @@ mod tests {
                 .next_rowid_hint(),
             12,
             "next_rowid should advance from the visible max"
+        );
+    }
+
+    #[test]
+    fn test_memdb_delete_rowid_records_undo() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(2);
+        db.get_table_mut(root)
+            .expect("table should exist")
+            .add_unique_column_group(vec![0]);
+        db.upsert_row(
+            root,
+            1,
+            vec![SqliteValue::Integer(10), SqliteValue::Integer(100)],
+        );
+
+        db.begin_undo();
+        let token = db.undo_version();
+        assert!(db.delete_rowid(root, 1), "delete should find the row");
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(table.row_values_by_rowid(1), None);
+        assert!(
+            table
+                .find_unique_conflicts(&[SqliteValue::Integer(10), SqliteValue::Integer(999)])
+                .is_empty(),
+            "delete should remove the unique-index entry"
+        );
+
+        db.rollback_to(token);
+        let table = db.get_table(root).expect("table should exist");
+        let restored = vec![SqliteValue::Integer(10), SqliteValue::Integer(100)];
+        assert_eq!(table.row_values_by_rowid(1), Some(restored.as_slice()));
+        assert_eq!(
+            table.find_unique_conflicts(&[SqliteValue::Integer(10), SqliteValue::Integer(999)]),
+            vec![1],
+            "rollback should restore the unique-index entry"
+        );
+    }
+
+    #[test]
+    fn test_memdb_insert_auto_row_records_undo_and_patches_rowid_alias() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(2);
+        db.upsert_row(
+            root,
+            5,
+            vec![SqliteValue::Integer(5), SqliteValue::Text("old".into())],
+        );
+
+        db.begin_undo();
+        let token = db.undo_version();
+        let rowid = db
+            .insert_auto_row(
+                root,
+                vec![SqliteValue::Null, SqliteValue::Text("new".into())],
+                Some(0),
+            )
+            .expect("table should exist");
+        assert_eq!(rowid, 6);
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(table.next_rowid_hint(), 7);
+        assert_eq!(
+            table.row_values_by_rowid(6),
+            Some([SqliteValue::Integer(6), SqliteValue::Text("new".into())].as_slice())
+        );
+
+        db.rollback_to(token);
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(table.next_rowid_hint(), 6);
+        assert_eq!(table.row_values_by_rowid(6), None);
+        assert_eq!(
+            table.row_values_by_rowid(5),
+            Some([SqliteValue::Integer(5), SqliteValue::Text("old".into())].as_slice())
         );
     }
 

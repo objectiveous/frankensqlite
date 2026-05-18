@@ -1149,13 +1149,13 @@ The human-readable scope lock for that contract lives in
 Current full-quick benchmark source of truth: `comprehensive-bench --quick` in
 `tests/artifacts/perf/codex-current-fullquick-frontier-20260517T1900Z/full-quick.json`.
 This May 17, 2026 run records `main @
-6b4181415c1e1a38c013b895cdca5f8ace522aaa` with the current dirty profiling
-patch and the `release-perf` profile. It keeps the corrected UPDATE/DELETE
-semantics: population and teardown stay outside the timed interval, DML
-statements are prepared once for both engines before timed samples, and private
-`:memory:` direct DML keeps the memory page I/O skip. Time ratios report
-FrankenSQLite time divided by C SQLite time, so values **below `1.0x` are
-faster for FrankenSQLite**.
+6b4181415c1e1a38c013b895cdca5f8ace522aaa` with local profiling
+instrumentation applied and the `release-perf` profile. It keeps the corrected
+UPDATE/DELETE semantics: population and teardown stay outside the timed
+interval, DML statements are prepared once for both engines before timed
+samples, and private `:memory:` direct DML keeps the memory page I/O skip.
+Time ratios report FrankenSQLite time divided by C SQLite time, so values
+**below `1.0x` are faster for FrankenSQLite**.
 
 Standalone concurrent-writer scaling is measured by `mt-mvcc-bench` in
 `tests/artifacts/perf/may8-current-gap-audit-20260508T2330Z/`

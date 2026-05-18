@@ -2508,6 +2508,25 @@ impl<P: PageReader> BtCursor<P> {
         self.stack.last().map(|entry| entry.page_no)
     }
 
+    /// Return the cursor's current root-to-leaf page path, excluding the root.
+    ///
+    /// Callers that already know the table root can append this slice to their
+    /// own root entry to cover the whole cursor path without double-counting
+    /// root-only trees.
+    #[must_use]
+    pub fn current_page_path(&self) -> Vec<PageNumber> {
+        self.stack
+            .iter()
+            .filter_map(|entry| {
+                if entry.page_no == self.root_page {
+                    None
+                } else {
+                    Some(entry.page_no)
+                }
+            })
+            .collect()
+    }
+
     /// Advance a table cursor to `rowid`, reusing local leaf state when possible.
     ///
     /// This is intended for monotonic rowid probe streams such as the VDBE's

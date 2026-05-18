@@ -3758,7 +3758,6 @@ enum MemDbUndoOp {
     },
     DeleteRow {
         root_page: i32,
-        index: usize,
         row: MemRow,
         prev_next_rowid: i64,
     },
@@ -3805,7 +3804,6 @@ impl MemDbUndoOp {
             }
             Self::DeleteRow {
                 root_page,
-                index: _,
                 row,
                 prev_next_rowid,
             } => {
@@ -4089,7 +4087,6 @@ impl MemDatabase {
             table.remove_unique_entries(row.rowid, &row.values);
             self.push_undo(MemDbUndoOp::DeleteRow {
                 root_page,
-                index,
                 row,
                 prev_next_rowid,
             });
@@ -4108,7 +4105,6 @@ impl MemDatabase {
                 table.remove_unique_entries(row.rowid, &row.values);
                 self.push_undo(MemDbUndoOp::DeleteRow {
                     root_page,
-                    index,
                     row,
                     prev_next_rowid,
                 });
@@ -25485,6 +25481,76 @@ mod tests {
         assert_eq!(
             table.row_values_by_rowid(5),
             Some([SqliteValue::Integer(5), SqliteValue::Text("old".into())].as_slice())
+        );
+    }
+
+    #[test]
+    fn test_memdb_replace_secondary_unique_rollback_restores_deleted_and_replaced_rows() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(2);
+        db.get_table_mut(root)
+            .expect("table should exist")
+            .add_unique_column_group(vec![1]);
+        db.upsert_row(
+            root,
+            1,
+            vec![SqliteValue::Integer(1), SqliteValue::Text("alpha".into())],
+        );
+        db.upsert_row(
+            root,
+            2,
+            vec![SqliteValue::Integer(2), SqliteValue::Text("beta".into())],
+        );
+
+        db.begin_undo();
+        let token = db.undo_version();
+        assert!(
+            db.delete_rowid(root, 1),
+            "REPLACE should delete the secondary-unique conflict"
+        );
+        db.upsert_row(
+            root,
+            2,
+            vec![SqliteValue::Integer(2), SqliteValue::Text("alpha".into())],
+        );
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(table.row_values_by_rowid(1), None);
+        assert_eq!(
+            table.row_values_by_rowid(2),
+            Some([SqliteValue::Integer(2), SqliteValue::Text("alpha".into())].as_slice())
+        );
+        assert_eq!(
+            table.find_unique_conflicts(&[
+                SqliteValue::Integer(99),
+                SqliteValue::Text("alpha".into())
+            ]),
+            vec![2]
+        );
+
+        db.rollback_to(token);
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(table.next_rowid_hint(), 3);
+        assert_eq!(
+            table.row_values_by_rowid(1),
+            Some([SqliteValue::Integer(1), SqliteValue::Text("alpha".into())].as_slice())
+        );
+        assert_eq!(
+            table.row_values_by_rowid(2),
+            Some([SqliteValue::Integer(2), SqliteValue::Text("beta".into())].as_slice())
+        );
+        assert_eq!(
+            table.find_unique_conflicts(&[
+                SqliteValue::Integer(99),
+                SqliteValue::Text("alpha".into())
+            ]),
+            vec![1]
+        );
+        assert_eq!(
+            table.find_unique_conflicts(&[
+                SqliteValue::Integer(99),
+                SqliteValue::Text("beta".into())
+            ]),
+            vec![2]
         );
     }
 

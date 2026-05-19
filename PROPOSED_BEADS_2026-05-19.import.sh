@@ -21,10 +21,24 @@ if ! command -v br >/dev/null 2>&1; then
     exit 1
 fi
 
-# Pre-flight: refuse to run against a corrupted DB so we fail loud, not silent.
-if ! br doctor --quick >/dev/null 2>&1; then
+# Pre-flight: refuse to run against an actively corrupted DB. `br doctor
+# --quick` exit 1 also fires on WARN-level findings (orphaned write locks,
+# preserved recovery artifacts, etc.) — those are operator hygiene, not
+# corruption, and shouldn't block bead creation. So inspect the JSON and
+# refuse only on ERROR-severity anomalies or a `database_corrupt` code.
+preflight=$(br doctor --quick --json 2>/dev/null || true)
+if echo "$preflight" \
+    | jq -e '
+        (.reliability_audit.anomalies // [])
+        | map(select(
+            (.severity? == "error")
+            or (.code? == "database_corrupt")
+            or (.code? == "sqlite_integrity_failed")
+          ))
+        | length > 0' >/dev/null 2>&1; then
     cat >&2 <<'EOF'
-fatal: br doctor --quick failed. Fix the workspace before importing.
+fatal: br doctor --quick reports active corruption (error-severity or
+       database_corrupt anomaly). Fix the workspace before importing.
        Likely Epic 0 (bd-NEW-0.1..0.3) is still pending.
        See PROPOSED_BEADS_2026-05-19.md, section "Epic 0".
 EOF
@@ -36,19 +50,30 @@ declare -A ID    # logical_name → bd-* hash
 # Helper: idempotent create. Echoes the bd-* id.
 new() {
     local name="$1" type="$2" prio="$3" title="$4" desc="$5"
+    # `br list --status=open --json` returns {"issues": [...], ...}; older
+    # builds may return a bare array — handle both.
     local existing
     existing=$(br list --status=open --json 2>/dev/null \
-        | jq -r --arg t "$title" '.[] | select(.title==$t) | .id' \
+        | jq -r --arg t "$title" '
+            (if type == "array" then .
+             else (.issues // .items // []) end)
+            | .[]
+            | select(.title==$t)
+            | .id' \
         | head -n1)
     if [[ -n "$existing" ]]; then
         echo "skip ${name} (already open as ${existing})"
         ID[$name]="$existing"
         return 0
     fi
-    local id
-    id=$(br q --type="$type" --priority="$prio" --title="$title" --description="$desc" 2>/dev/null)
-    if [[ -z "$id" ]]; then
-        echo "fatal: br q returned no id for ${name}" >&2
+    # `br create --json` returns {"id":"bd-...", ...}; extract the id.
+    local create_json id
+    create_json=$(br create --type="$type" --priority="$prio" \
+        --title="$title" --description="$desc" --json 2>&1)
+    id=$(jq -r '.id // empty' <<<"$create_json" 2>/dev/null)
+    if [[ -z "$id" || "$id" == "null" ]]; then
+        echo "fatal: br create returned no id for ${name}" >&2
+        echo "       output: ${create_json:0:200}" >&2
         exit 2
     fi
     ID[$name]="$id"

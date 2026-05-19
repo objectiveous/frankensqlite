@@ -5369,14 +5369,19 @@ fn expr_has_window(expr: &Expr) -> bool {
 
 /// Check whether an expression contains an aggregate function call.
 /// NOTE: `max(x,y,...)` and `min(x,y,...)` with 2+ args are scalar, not aggregate.
+fn is_aggregate_function_call(name: &str, args: &FunctionArgs) -> bool {
+    if !is_aggregate_function(name) {
+        return false;
+    }
+
+    let lower = name.to_ascii_lowercase();
+    !((lower == "max" || lower == "min")
+        && matches!(args, fsqlite_ast::FunctionArgs::List(items) if items.len() >= 2))
+}
+
 fn is_aggregate_expr(expr: &Expr) -> bool {
     match expr {
-        Expr::FunctionCall { name, args, .. } if is_aggregate_function(name) => {
-            // SQLite: max/min with 2+ arguments are scalar functions, not aggregates.
-            let lower = name.to_ascii_lowercase();
-            !((lower == "max" || lower == "min")
-                && matches!(args, fsqlite_ast::FunctionArgs::List(a) if a.len() >= 2))
-        }
+        Expr::FunctionCall { name, args, .. } if is_aggregate_function_call(name, args) => true,
         Expr::BinaryOp { left, right, .. } => is_aggregate_expr(left) || is_aggregate_expr(right),
         Expr::UnaryOp { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. }
@@ -8628,7 +8633,7 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
         ..
     } = expr
     {
-        if is_aggregate_function(agg_name) {
+        if is_aggregate_function_call(agg_name, agg_args) {
             let canon_name = agg_name.to_ascii_uppercase();
             let filt = filter.clone();
             let agg_col = match agg_args {
@@ -8911,7 +8916,7 @@ fn rewrite_aggregates_recursive(
         ..
     } = expr
     {
-        if is_aggregate_function(name) {
+        if is_aggregate_function_call(name, args) {
             let idx = agg_cols.len();
             let canon_name = name.to_ascii_uppercase();
             let filt = filter.clone();
@@ -9003,6 +9008,81 @@ fn rewrite_aggregates_recursive(
             expr: Box::new(rewrite_aggregates_recursive(inner, table, agg_cols)),
             span: *span,
         },
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            not,
+            span,
+        } => Expr::Between {
+            expr: Box::new(rewrite_aggregates_recursive(inner, table, agg_cols)),
+            low: Box::new(rewrite_aggregates_recursive(low, table, agg_cols)),
+            high: Box::new(rewrite_aggregates_recursive(high, table, agg_cols)),
+            not: *not,
+            span: *span,
+        },
+        Expr::In {
+            expr: inner,
+            set,
+            not,
+            span,
+        } => {
+            let rewritten_set = match set {
+                InSet::List(items) => InSet::List(
+                    items
+                        .iter()
+                        .map(|item| rewrite_aggregates_recursive(item, table, agg_cols))
+                        .collect(),
+                ),
+                other => other.clone(),
+            };
+            Expr::In {
+                expr: Box::new(rewrite_aggregates_recursive(inner, table, agg_cols)),
+                set: rewritten_set,
+                not: *not,
+                span: *span,
+            }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            op,
+            not,
+            span,
+        } => Expr::Like {
+            expr: Box::new(rewrite_aggregates_recursive(inner, table, agg_cols)),
+            pattern: Box::new(rewrite_aggregates_recursive(pattern, table, agg_cols)),
+            escape: escape
+                .as_deref()
+                .map(|expr| Box::new(rewrite_aggregates_recursive(expr, table, agg_cols))),
+            op: *op,
+            not: *not,
+            span: *span,
+        },
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            span,
+        } => Expr::Case {
+            operand: operand
+                .as_deref()
+                .map(|expr| Box::new(rewrite_aggregates_recursive(expr, table, agg_cols))),
+            whens: whens
+                .iter()
+                .map(|(when_expr, then_expr)| {
+                    (
+                        rewrite_aggregates_recursive(when_expr, table, agg_cols),
+                        rewrite_aggregates_recursive(then_expr, table, agg_cols),
+                    )
+                })
+                .collect(),
+            else_expr: else_expr
+                .as_deref()
+                .map(|expr| Box::new(rewrite_aggregates_recursive(expr, table, agg_cols))),
+            span: *span,
+        },
         Expr::FunctionCall {
             name,
             args: FunctionArgs::List(exprs),
@@ -9035,6 +9115,42 @@ fn rewrite_aggregates_recursive(
             type_name: type_name.clone(),
             span: *span,
         },
+        Expr::Collate {
+            expr: inner,
+            collation,
+            span,
+        } => Expr::Collate {
+            expr: Box::new(rewrite_aggregates_recursive(inner, table, agg_cols)),
+            collation: collation.clone(),
+            span: *span,
+        },
+        Expr::IsNull {
+            expr: inner,
+            not,
+            span,
+        } => Expr::IsNull {
+            expr: Box::new(rewrite_aggregates_recursive(inner, table, agg_cols)),
+            not: *not,
+            span: *span,
+        },
+        Expr::JsonAccess {
+            expr: inner,
+            path,
+            arrow,
+            span,
+        } => Expr::JsonAccess {
+            expr: Box::new(rewrite_aggregates_recursive(inner, table, agg_cols)),
+            path: Box::new(rewrite_aggregates_recursive(path, table, agg_cols)),
+            arrow: *arrow,
+            span: *span,
+        },
+        Expr::RowValue(items, span) => Expr::RowValue(
+            items
+                .iter()
+                .map(|item| rewrite_aggregates_recursive(item, table, agg_cols))
+                .collect(),
+            *span,
+        ),
         // For all other expression types, return as-is (no aggregates inside).
         other => other.clone(),
     }
@@ -28895,6 +29011,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_codegen_select_aggregate_between_wrapper() -> Result<(), String> {
+        let stmt = select_sql("SELECT SUM(a) BETWEEN 1 AND 10 FROM t");
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).map_err(|err| format!("{err:?}"))?;
+        let prog = b.finish().map_err(|err| format!("{err:?}"))?;
+
+        let agg_steps = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::AggStep)
+            .count();
+        if agg_steps != 1 {
+            return Err(format!("expected one SUM AggStep, got {agg_steps}"));
+        }
+
+        let agg_finals = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::AggFinal)
+            .count();
+        if agg_finals != 1 {
+            return Err(format!("expected one SUM AggFinal, got {agg_finals}"));
+        }
+
+        if !has_opcodes(
+            &prog,
+            &[
+                Opcode::AggStep,
+                Opcode::AggFinal,
+                Opcode::Lt,
+                Opcode::Gt,
+                Opcode::ResultRow,
+            ],
+        ) {
+            return Err(format!(
+                "aggregate BETWEEN wrapper should emit finalized aggregate comparison, got {:?}",
+                opcode_sequence(&prog)
+            ));
+        }
+
+        Ok(())
     }
 
     // === Test 25: Bare column with aggregate (no GROUP BY) ===

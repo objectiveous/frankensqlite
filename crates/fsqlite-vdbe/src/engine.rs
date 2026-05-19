@@ -8463,11 +8463,7 @@ impl VdbeEngine {
                         let cx = self.derive_execution_cx();
                         let mut cursor =
                             BtCursor::new(store, root_pgno, autoindex_page_size, false);
-                        let autoindex_collations = parse_compare_collations(&op.p4)
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(Some)
-                            .collect::<Vec<_>>();
+                        let autoindex_collations = extract_collation_names_owned(&op.p4);
                         if !autoindex_collations.is_empty() {
                             cursor.set_index_collation_context(
                                 autoindex_collations,
@@ -10654,7 +10650,6 @@ impl VdbeEngine {
                     let start_a = op.p1;
                     let start_b = op.p2;
                     let count = op.p3;
-                    let compare_collations = parse_compare_collations(&op.p4);
                     let coll_arc = Arc::clone(&self.collation_registry);
                     let result = {
                         let coll = coll_arc.lock().unwrap_or_else(|e| e.into_inner());
@@ -10663,10 +10658,7 @@ impl VdbeEngine {
                             let val_a = self.get_reg(start_a + i);
                             let val_b = self.get_reg(start_b + i);
                             let coll_name = usize::try_from(i).ok().and_then(|field_idx| {
-                                compare_collation_for_field(
-                                    compare_collations.as_deref(),
-                                    field_idx,
-                                )
+                                compare_collation_for_field_from_p4(&op.p4, field_idx)
                             });
                             // SQLite NULL sort order: NULLs sort before all other
                             // values.  When partial_cmp returns None (NULL vs
@@ -13250,7 +13242,6 @@ impl VdbeEngine {
         let start_a = op.p1;
         let start_b = op.p2;
         let count = op.p3;
-        let compare_collations = parse_compare_collations(&op.p4);
         let coll_arc = Arc::clone(&self.collation_registry);
         let mut coll_guard = None;
         let mut result = Ordering::Equal;
@@ -13258,9 +13249,9 @@ impl VdbeEngine {
         for i in 0..count {
             let val_a = self.get_reg(start_a + i);
             let val_b = self.get_reg(start_b + i);
-            let coll_name = usize::try_from(i).ok().and_then(|field_idx| {
-                compare_collation_for_field(compare_collations.as_deref(), field_idx)
-            });
+            let coll_name = usize::try_from(i)
+                .ok()
+                .and_then(|field_idx| compare_collation_for_field_from_p4(&op.p4, field_idx));
 
             let ord = if let Some(coll_name) = coll_name {
                 if let (SqliteValue::Text(left), SqliteValue::Text(right)) = (val_a, val_b) {
@@ -15259,28 +15250,46 @@ fn fast_compare_same_storage_class(
     }
 }
 
-fn parse_compare_collations(p4: &P4) -> Option<Vec<String>> {
+fn extract_collation_names_owned(p4: &P4) -> Vec<Option<String>> {
     match p4 {
-        P4::Collation(name) => Some(vec![name.clone()]),
-        P4::Str(spec) => {
-            let parsed: Vec<String> = spec
-                .split([',', '|', '\0'])
-                .map(str::trim)
-                .filter(|entry| !entry.is_empty())
-                .map(str::to_owned)
-                .collect();
-            (!parsed.is_empty()).then_some(parsed)
-        }
-        _ => None,
+        P4::Collation(name) => vec![Some(name.clone())],
+        P4::Str(spec) => spec
+            .split([',', '|', '\0'])
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|s| Some(s.to_owned()))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
-fn compare_collation_for_field(collations: Option<&[String]>, field_idx: usize) -> Option<&str> {
-    let collations = collations?;
-    if collations.len() == 1 {
-        return collations.first().map(String::as_str);
+fn compare_collation_for_field_from_p4(p4: &P4, field_idx: usize) -> Option<&str> {
+    match p4 {
+        P4::Collation(name) => Some(name.as_str()),
+        P4::Str(spec) => {
+            let mut idx = 0;
+            for entry in spec.split([',', '|', '\0']) {
+                let trimmed = entry.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if idx == field_idx {
+                    return Some(trimmed);
+                }
+                idx += 1;
+            }
+            if idx == 1 && field_idx > 0 {
+                for entry in spec.split([',', '|', '\0']) {
+                    let trimmed = entry.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
     }
-    collations.get(field_idx).map(String::as_str)
 }
 
 /// For REPLACE conflict resolution: re-seek the index cursor, find the

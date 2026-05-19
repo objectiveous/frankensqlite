@@ -583,6 +583,31 @@ fn emit_upsert_assignments(
     Ok(())
 }
 
+fn upsert_expr_collation_p4(
+    expr: &Expr,
+    existing_ctx: &ScanCtx<'_>,
+    excluded_ctx: &ScanCtx<'_>,
+    table: &TableSchema,
+) -> P4 {
+    if let Some(collation) = extract_collation(expr) {
+        return P4::Collation(collation.to_owned());
+    }
+
+    let inner = if let Expr::Collate { expr: inner, .. } = expr {
+        inner.as_ref()
+    } else {
+        expr
+    };
+    let collation = if let Expr::Column(col_ref, _) = inner
+        && is_upsert_excluded_pseudo_table(col_ref, table, existing_ctx.table_alias)
+    {
+        column_collation(inner, excluded_ctx.table, excluded_ctx.table_alias)
+    } else {
+        column_collation(inner, existing_ctx.table, existing_ctx.table_alias)
+    };
+    collation.map_or(P4::None, |name| P4::Collation(name.to_owned()))
+}
+
 /// Emit an expression that may reference both `excluded.*` and existing row columns.
 ///
 /// Recursively walks the expression tree, dispatching `excluded.col` references
@@ -689,9 +714,13 @@ fn emit_upsert_expr(
                         BinaryOp::Ge => Opcode::Ge,
                         _ => unreachable!(),
                     };
-                    let p4 = extract_collation(left)
-                        .or_else(|| extract_collation(right))
-                        .map_or(P4::None, |c| P4::Collation(c.to_owned()));
+                    let left_p4 =
+                        upsert_expr_collation_p4(left, existing_ctx, excluded_ctx, _table);
+                    let p4 = if matches!(left_p4, P4::None) {
+                        upsert_expr_collation_p4(right, existing_ctx, excluded_ctx, _table)
+                    } else {
+                        left_p4
+                    };
 
                     let null_label = b.emit_label();
                     let true_label = b.emit_label();
@@ -1088,9 +1117,18 @@ fn emit_upsert_expr(
             let false_label = b.emit_label();
             let null_label = b.emit_label();
             let done_label = b.emit_label();
+            let collation_p4 =
+                upsert_expr_collation_p4(operand, existing_ctx, excluded_ctx, _table);
             b.emit_jump_to_label(Opcode::IsNull, r_operand, 0, null_label, P4::None, 0);
-            b.emit_jump_to_label(Opcode::Lt, r_low, r_operand, false_label, P4::None, 0);
-            b.emit_jump_to_label(Opcode::Gt, r_high, r_operand, false_label, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::Lt,
+                r_low,
+                r_operand,
+                false_label,
+                collation_p4.clone(),
+                0,
+            );
+            b.emit_jump_to_label(Opcode::Gt, r_high, r_operand, false_label, collation_p4, 0);
             b.emit_jump_to_label(Opcode::IsNull, r_low, 0, null_label, P4::None, 0);
             b.emit_jump_to_label(Opcode::IsNull, r_high, 0, null_label, P4::None, 0);
             b.emit_op(Opcode::Integer, i32::from(!*not), reg, 0, P4::None, 0);
@@ -30879,6 +30917,63 @@ mod tests {
             !opcode_sequence(&prog).contains(&Opcode::Null),
             "target alias in UPSERT DO UPDATE should resolve to the existing row, not emit NULL"
         );
+    }
+
+    #[test]
+    fn test_codegen_upsert_between_preserves_excluded_operand_collation() -> Result<(), String> {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec!["name".to_owned()],
+            source: InsertSource::Values(vec![vec![placeholder(1)]]),
+            upsert: vec![UpsertClause {
+                target: None,
+                action: UpsertAction::Update {
+                    assignments: vec![Assignment {
+                        target: AssignmentTarget::Column("name".to_owned()),
+                        value: Expr::Between {
+                            expr: Box::new(Expr::Column(
+                                ColumnRef::qualified("excluded", "name"),
+                                Span::ZERO,
+                            )),
+                            low: Box::new(Expr::Literal(
+                                Literal::String("alpha".to_owned()),
+                                Span::ZERO,
+                            )),
+                            high: Box::new(Expr::Literal(
+                                Literal::String("omega".to_owned()),
+                                Span::ZERO,
+                            )),
+                            not: false,
+                            span: Span::ZERO,
+                        },
+                    }],
+                    where_clause: None,
+                },
+            }],
+            returning: vec![],
+        };
+        let schema = test_schema_with_nocase_text_column();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).map_err(|err| format!("{err:?}"))?;
+        let prog = b.finish().map_err(|err| format!("{err:?}"))?;
+
+        let lt_has_nocase = prog.ops().iter().any(|op| {
+            op.opcode == Opcode::Lt && matches!(&op.p4, P4::Collation(name) if name == "NOCASE")
+        });
+        let gt_has_nocase = prog.ops().iter().any(|op| {
+            op.opcode == Opcode::Gt && matches!(&op.p4, P4::Collation(name) if name == "NOCASE")
+        });
+        if !lt_has_nocase || !gt_has_nocase {
+            return Err(format!(
+                "UPSERT BETWEEN comparison opcodes missed NOCASE collation: lt={lt_has_nocase} gt={gt_has_nocase}"
+            ));
+        }
+
+        Ok(())
     }
 
     #[test]

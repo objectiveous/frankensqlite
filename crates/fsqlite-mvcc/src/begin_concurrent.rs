@@ -1725,6 +1725,34 @@ fn release_tracked_page_locks(
     lock_table.release_set(handle.held_lock_pages_iter(), txn_id);
 }
 
+fn finalize_prepared_session_state(
+    registry: &ConcurrentRegistry,
+    session_id: u64,
+    has_in_rw: bool,
+    has_out_rw: bool,
+    finalize_path: &'static str,
+) {
+    if let Some(mut handle) = registry.get_mut(session_id) {
+        if handle.is_active() {
+            handle.has_in_rw.set(has_in_rw);
+            handle.has_out_rw.set(has_out_rw);
+            handle.mark_committed();
+        } else {
+            tracing::warn!(
+                session_id,
+                finalize_path,
+                "finalize_prepared_concurrent_commit_with_ssi: session inactive during finalize; applying commit-index/lock-table side effects"
+            );
+        }
+    } else {
+        tracing::warn!(
+            session_id,
+            finalize_path,
+            "finalize_prepared_concurrent_commit_with_ssi: session missing during finalize; applying commit-index/lock-table side effects"
+        );
+    }
+}
+
 fn merge_unique_incoming_edges(
     incoming_edges: &mut Vec<DiscoveredEdge>,
     seen_sources: &mut HashSet<TxnToken>,
@@ -3081,34 +3109,9 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
     if prepared.used_uncontended_prepare_fast_path()
         && registry.can_use_uncontended_finalize_fast_path(prepared.session_id, prepared.begin_seq)
     {
-        let mut mark_committed = false;
-        if let Some(handle) = registry.get_mut(prepared.session_id) {
-            if handle.is_active() {
-                handle.has_in_rw.set(false);
-                handle.has_out_rw.set(false);
-                mark_committed = true;
-            } else {
-                tracing::warn!(
-                    session_id = prepared.session_id,
-                    "finalize_prepared_concurrent_commit_with_ssi: uncontended fast-path session inactive during finalize; applying commit-index/lock-table side effects"
-                );
-            }
-        } else {
-            tracing::warn!(
-                session_id = prepared.session_id,
-                "finalize_prepared_concurrent_commit_with_ssi: uncontended fast-path session missing during finalize; applying commit-index/lock-table side effects"
-            );
-        }
-
         commit_index.batch_update(&prepared.write_set_pages, committed_seq);
         lock_table.release_set(prepared.held_lock_pages.iter().copied(), txn_id);
-        if mark_committed {
-            if let Some(mut handle) = registry.get_mut(prepared.session_id) {
-                if handle.is_active() {
-                    handle.mark_committed();
-                }
-            }
-        }
+        finalize_prepared_session_state(registry, prepared.session_id, false, false, "uncontended");
         registry.prune_committed_conflict_history();
         return;
     }
@@ -3397,34 +3400,15 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         }
     }
 
-    let mut mark_committed = false;
-    if let Some(handle) = registry.get_mut(prepared.session_id) {
-        if handle.is_active() {
-            handle.has_in_rw.set(has_in_rw);
-            handle.has_out_rw.set(has_out_rw);
-            mark_committed = true;
-        } else {
-            tracing::warn!(
-                session_id = prepared.session_id,
-                "finalize_prepared_concurrent_commit_with_ssi: session inactive during finalize; applying commit-index/lock-table side effects"
-            );
-        }
-    } else {
-        tracing::warn!(
-            session_id = prepared.session_id,
-            "finalize_prepared_concurrent_commit_with_ssi: session missing during finalize; applying commit-index/lock-table side effects"
-        );
-    }
-
     commit_index.batch_update(&prepared.write_set_pages, committed_seq);
     lock_table.release_set(prepared.held_lock_pages.iter().copied(), txn_id);
-    if mark_committed {
-        if let Some(mut handle) = registry.get_mut(prepared.session_id) {
-            if handle.is_active() {
-                handle.mark_committed();
-            }
-        }
-    }
+    finalize_prepared_session_state(
+        registry,
+        prepared.session_id,
+        has_in_rw,
+        has_out_rw,
+        "edgeful",
+    );
 
     if !read_keys.is_empty() {
         registry.committed_readers.push(CommittedReaderInfo {
@@ -3610,7 +3594,7 @@ mod tests {
         TxnToken, WitnessKey,
     };
 
-    use crate::core_types::{CommitIndex, InProcessPageLockTable};
+    use crate::core_types::{CommitIndex, InProcessPageLockTable, TransactionState};
     use crate::lifecycle::MvccError;
     use crate::ssi_validation::ActiveTxnView;
 
@@ -4816,6 +4800,11 @@ mod tests {
         );
 
         let committed = registry.get(session_id).expect("committed handle");
+        assert_eq!(
+            committed.state(),
+            TransactionState::Committed,
+            "uncontended finalize should mark the prepared session committed"
+        );
         assert!(
             !committed.has_in_rw() && !committed.has_out_rw(),
             "uncontended finalize should not manufacture SSI edges"
@@ -5011,6 +5000,11 @@ mod tests {
         let committed = registry
             .get(s1)
             .expect("prepared txn handle should remain present until explicit removal");
+        assert_eq!(
+            committed.state(),
+            TransactionState::Committed,
+            "edgeful finalize should mark the prepared session committed"
+        );
         assert!(
             committed.has_out_rw(),
             "finalize must discover committed writers that were not present during prepare"
@@ -5065,6 +5059,11 @@ mod tests {
         let committed = registry
             .get(s1)
             .expect("prepared txn handle should remain present until explicit removal");
+        assert_eq!(
+            committed.state(),
+            TransactionState::Committed,
+            "edgeful finalize should mark the prepared session committed"
+        );
         assert!(
             committed.has_in_rw(),
             "finalize must discover committed readers that were not present during prepare"

@@ -3,7 +3,7 @@
 //! Provides: tokenizer API (unicode61, ascii, porter, trigram), inverted index,
 //! boolean query parsing (implicit AND, OR, NOT binary-only, phrase, prefix,
 //! NEAR, column filter, caret), BM25 ranking, FTS5 virtual table with content
-//! modes, and secure-delete / contentless-delete configuration.
+//! modes, and secure-delete / contentless-delete / insttoken configuration.
 
 use std::collections::{HashMap, HashSet};
 
@@ -61,13 +61,14 @@ impl std::fmt::Display for DetailMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::struct_field_names)]
+#[allow(clippy::struct_excessive_bools, clippy::struct_field_names)]
 pub struct Fts5Config {
     secure_delete: bool,
     content_mode: ContentMode,
     contentless_delete: bool,
     columnsize: bool,
     detail: DetailMode,
+    insttoken: bool,
 }
 
 impl Fts5Config {
@@ -79,6 +80,7 @@ impl Fts5Config {
             contentless_delete: false,
             columnsize: true,
             detail: DetailMode::Full,
+            insttoken: false,
         }
     }
 
@@ -100,6 +102,11 @@ impl Fts5Config {
     #[must_use]
     pub const fn detail_mode(self) -> DetailMode {
         self.detail
+    }
+
+    #[must_use]
+    pub const fn insttoken_enabled(self) -> bool {
+        self.insttoken
     }
 
     #[must_use]
@@ -147,6 +154,10 @@ impl Fts5Config {
             }
             "contentless_delete" => {
                 self.contentless_delete = value;
+                true
+            }
+            "insttoken" => {
+                self.insttoken = value;
                 true
             }
             _ => false,
@@ -2494,8 +2505,14 @@ impl VirtualTable for Fts5Table {
                                 })?,
                             );
                         }
-                        // Parsed for compatibility but not used in this in-memory path yet.
-                        "insttoken" => {}
+                        "insttoken" => {
+                            config.insttoken = parse_bool_like(value_unquoted.as_str())
+                                .ok_or_else(|| {
+                                    FrankenError::function_error(
+                                        "fts5: insttoken must be a boolean value",
+                                    )
+                                })?;
+                        }
                         _ => {
                             return Err(FrankenError::function_error(format!(
                                 "fts5: unsupported option '{key}'"
@@ -2526,6 +2543,7 @@ impl VirtualTable for Fts5Table {
             secure_delete = config.secure_delete,
             contentless_delete = config.contentless_delete,
             detail = ?config.detail_mode(),
+            insttoken = config.insttoken,
             indexed_columns = ?indexed_columns,
             prefix_lengths = ?prefix_lengths,
             "fts5: connecting virtual table"
@@ -2993,11 +3011,38 @@ impl ScalarFunction for Fts5SourceIdFunc {
     }
 }
 
+/// fts5_insttoken(query) preserves and marks its MATCH argument.
+///
+/// `SqliteValue` does not carry SQLite subtypes yet, so this mirrors SQLite's
+/// value-preserving behavior and leaves subtype-aware planning to the VDBE
+/// boundary.
+pub struct Fts5InsttokenFunc;
+
+impl ScalarFunction for Fts5InsttokenFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        let Some(value) = args.first() else {
+            return Err(FrankenError::function_error(
+                "fts5_insttoken() expects 1 argument",
+            ));
+        };
+        Ok(value.to_owned())
+    }
+
+    fn num_args(&self) -> i32 {
+        1
+    }
+
+    fn name(&self) -> &'static str {
+        "fts5_insttoken"
+    }
+}
+
 /// Register FTS5 scalar functions into a `FunctionRegistry`.
 pub fn register_fts5_scalars(registry: &mut fsqlite_func::FunctionRegistry) {
     registry.register_scalar(Fts5HighlightFunc);
     registry.register_scalar(Fts5SnippetFunc);
     registry.register_scalar(Fts5SourceIdFunc);
+    registry.register_scalar(Fts5InsttokenFunc);
     debug!("fts5: registered scalar functions");
 }
 
@@ -3037,6 +3082,15 @@ mod tests {
         columns: Vec<Fts5ColumnStructure>,
         rows: Vec<(i64, Vec<String>)>,
         terms: Vec<Fts5TermStructure>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5InsttokenStructure {
+        config: Fts5Config,
+        columns: Vec<String>,
+        rows: Vec<(i64, Vec<String>)>,
+        terms: Vec<String>,
     }
 
     fn table_structure(table: &Fts5Table) -> Fts5TableStructure {
@@ -3108,6 +3162,16 @@ mod tests {
         assert!(!config.apply_control_command("secure-delete=maybe"));
         assert!(!config.apply_control_command("integrity-check=1"));
         assert_eq!(config.delete_action(), DeleteAction::Tombstone);
+    }
+
+    #[test]
+    fn test_insttoken_control_command() {
+        let mut config = Fts5Config::default();
+        assert!(!config.insttoken_enabled());
+        assert!(config.apply_control_command("insttoken=1"));
+        assert!(config.insttoken_enabled());
+        assert!(config.apply_control_command("insttoken=off"));
+        assert!(!config.insttoken_enabled());
     }
 
     #[test]
@@ -3844,6 +3908,7 @@ mod tests {
                 "columnsize=0",
                 "detail='column'",
                 "prefix='2 3'",
+                "insttoken=1",
             ],
         )
         .unwrap();
@@ -3853,6 +3918,7 @@ mod tests {
         assert!(vtab.config.contentless_delete_enabled());
         assert!(!vtab.config.columnsize_enabled());
         assert_eq!(vtab.config.detail_mode(), DetailMode::Column);
+        assert!(vtab.config.insttoken_enabled());
         assert_eq!(vtab.indexed_columns(), &[true, false]);
         assert_eq!(vtab.prefix_lengths, vec![2, 3]);
         assert!(!vtab.index().tracks_column_sizes());
@@ -3918,6 +3984,17 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("detail must be full, column, or none")
+        );
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_invalid_insttoken() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "insttoken=maybe"])
+            .expect_err("invalid insttoken should fail");
+        assert!(
+            err.to_string()
+                .contains("insttoken must be a boolean value")
         );
     }
 
@@ -4131,6 +4208,56 @@ mod tests {
     }
 
     #[test]
+    fn test_fts5_structural_snapshot_insttoken() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "insttoken=1"])
+            .map_err(|err| err.to_string())?;
+        table.insert_document(7, &["prefix present precise".to_owned()]);
+
+        let mut terms: Vec<String> = table.index.index.keys().map(ToString::to_string).collect();
+        terms.sort();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5InsttokenStructure {
+                    config: *table.config(),
+                    columns: table.columns().to_vec(),
+                    rows: table.all_rows(),
+                    terms,
+                }
+            ),
+            r#"Fts5InsttokenStructure {
+    config: Fts5Config {
+        secure_delete: false,
+        content_mode: Stored,
+        contentless_delete: false,
+        columnsize: true,
+        detail: Full,
+        insttoken: true,
+    },
+    columns: [
+        "body",
+    ],
+    rows: [
+        (
+            7,
+            [
+                "prefix present precise",
+            ],
+        ),
+    ],
+    terms: [
+        "precise",
+        "prefix",
+        "present",
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_fts5_vtab_update_insert() {
         let cx = Cx::new();
         let mut vtab = Fts5Table::connect(&cx, &["fts5", "main", "t", "content"]).unwrap();
@@ -4209,6 +4336,21 @@ mod tests {
         assert!(registry.find_scalar("highlight", 4).is_some());
         assert!(registry.find_scalar("snippet", 6).is_some());
         assert!(registry.find_scalar("fts5_source_id", 0).is_some());
+        assert!(registry.find_scalar("fts5_insttoken", 1).is_some());
+    }
+
+    #[test]
+    fn test_fts5_insttoken_func_passthrough() {
+        let func = Fts5InsttokenFunc;
+        assert_eq!(func.num_args(), 1);
+        assert_eq!(func.name(), "fts5_insttoken");
+
+        let query = SqliteValue::Text(SmallText::from_string("pre*"));
+        assert_eq!(func.invoke(&[query.clone()]).unwrap(), query);
+        assert_eq!(
+            func.invoke(&[SqliteValue::Null]).unwrap(),
+            SqliteValue::Null
+        );
     }
 
     #[test]

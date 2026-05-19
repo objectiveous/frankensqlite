@@ -218,6 +218,51 @@ fn unquote_fts_arg(value: &str) -> &str {
     trimmed
 }
 
+fn unquote_fts_identifier(value: &str) -> &str {
+    value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '[' | ']'))
+}
+
+fn parse_column_declaration(input: &str) -> Result<Option<(String, bool)>> {
+    let mut segments = input.split_whitespace();
+    let Some(raw_column) = segments.next() else {
+        return Ok(None);
+    };
+
+    let column = unquote_fts_identifier(raw_column);
+    if column.is_empty() {
+        return Ok(None);
+    }
+
+    let mut indexed = true;
+    let mut expect_collation_name = false;
+    for segment in segments {
+        if expect_collation_name {
+            expect_collation_name = false;
+            continue;
+        }
+
+        match segment.to_ascii_lowercase().as_str() {
+            "unindexed" => indexed = false,
+            "collate" => expect_collation_name = true,
+            _ => {
+                return Err(FrankenError::function_error(format!(
+                    "fts5: unsupported column option '{segment}'"
+                )));
+            }
+        }
+    }
+
+    if expect_collation_name {
+        return Err(FrankenError::function_error(
+            "fts5: COLLATE column option requires a collation name",
+        ));
+    }
+
+    Ok(Some((column.to_owned(), indexed)))
+}
+
 // ---------------------------------------------------------------------------
 // Tokenizer API
 // ---------------------------------------------------------------------------
@@ -2097,6 +2142,8 @@ fn difference_sorted(a: &[i64], b: &[i64]) -> Vec<i64> {
 pub struct Fts5Table {
     /// Column names.
     columns: Vec<String>,
+    /// Whether each column participates in the inverted index.
+    indexed_columns: Vec<bool>,
     /// Configuration.
     config: Fts5Config,
     /// Tokenizer.
@@ -2118,6 +2165,7 @@ struct Fts5TableSnapshot {
     config: Fts5Config,
     tokenizer_name: String,
     prefix_lengths: Vec<usize>,
+    indexed_columns: Vec<bool>,
     index: InvertedIndex,
     documents: HashMap<i64, Vec<String>>,
     next_rowid: i64,
@@ -2127,8 +2175,10 @@ impl Fts5Table {
     /// Create a new FTS5 table with the given column names.
     #[must_use]
     pub fn with_columns(columns: Vec<String>) -> Self {
+        let indexed_columns = vec![true; columns.len()];
         Self {
             columns,
+            indexed_columns,
             config: Fts5Config::default(),
             tokenizer_name: "unicode61".to_owned(),
             prefix_lengths: Vec::new(),
@@ -2144,6 +2194,7 @@ impl Fts5Table {
             config: self.config,
             tokenizer_name: self.tokenizer_name.clone(),
             prefix_lengths: self.prefix_lengths.clone(),
+            indexed_columns: self.indexed_columns.clone(),
             index: self.index.clone(),
             documents: self.documents.clone(),
             next_rowid: self.next_rowid,
@@ -2154,6 +2205,7 @@ impl Fts5Table {
         self.config = snapshot.config;
         self.tokenizer_name = snapshot.tokenizer_name;
         self.prefix_lengths = snapshot.prefix_lengths;
+        self.indexed_columns = snapshot.indexed_columns;
         self.index = snapshot.index;
         self.documents = snapshot.documents;
         self.next_rowid = snapshot.next_rowid;
@@ -2167,6 +2219,9 @@ impl Fts5Table {
     ) {
         #[allow(clippy::cast_possible_truncation)]
         for (col_idx, text) in column_values.iter().enumerate() {
+            if matches!(self.indexed_columns.get(col_idx), Some(false)) {
+                continue;
+            }
             self.index.add_text(rowid, col_idx as u32, tokenizer, text);
         }
     }
@@ -2346,6 +2401,11 @@ impl Fts5Table {
     }
 
     #[must_use]
+    pub fn indexed_columns(&self) -> &[bool] {
+        &self.indexed_columns
+    }
+
+    #[must_use]
     pub fn index(&self) -> &InvertedIndex {
         &self.index
     }
@@ -2381,6 +2441,7 @@ impl VirtualTable for Fts5Table {
         Self: Sized,
     {
         let mut columns: Vec<String> = Vec::new();
+        let mut indexed_columns: Vec<bool> = Vec::new();
         let mut config = Fts5Config::default();
         let mut tokenizer_name = "unicode61".to_owned();
         let mut prefix_lengths = Vec::new();
@@ -2444,21 +2505,16 @@ impl VirtualTable for Fts5Table {
                     continue;
                 }
 
-                // Column declarations may include `UNINDEXED` or collation hints;
-                // keep the leading identifier as the column name.
-                let column = trimmed
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or_default()
-                    .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '[' | ']'));
-                if !column.is_empty() {
-                    columns.push(column.to_owned());
+                if let Some((column, indexed)) = parse_column_declaration(trimmed)? {
+                    columns.push(column);
+                    indexed_columns.push(indexed);
                 }
             }
         }
 
         if columns.is_empty() {
             columns.push("content".to_owned());
+            indexed_columns.push(true);
         }
         prefix_lengths.sort_unstable();
         prefix_lengths.dedup();
@@ -2470,11 +2526,13 @@ impl VirtualTable for Fts5Table {
             secure_delete = config.secure_delete,
             contentless_delete = config.contentless_delete,
             detail = ?config.detail_mode(),
+            indexed_columns = ?indexed_columns,
             prefix_lengths = ?prefix_lengths,
             "fts5: connecting virtual table"
         );
 
         let mut table = Self::with_columns(columns);
+        table.indexed_columns = indexed_columns;
         table.config = config;
         table.tokenizer_name = tokenizer_name;
         table.prefix_lengths = prefix_lengths;
@@ -2950,6 +3008,71 @@ pub fn register_fts5_scalars(registry: &mut fsqlite_func::FunctionRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5ColumnStructure {
+        name: String,
+        indexed: bool,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5PostingStructure {
+        docid: i64,
+        column: u32,
+        positions: Vec<u32>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5TermStructure {
+        term: String,
+        postings: Vec<Fts5PostingStructure>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5TableStructure {
+        columns: Vec<Fts5ColumnStructure>,
+        rows: Vec<(i64, Vec<String>)>,
+        terms: Vec<Fts5TermStructure>,
+    }
+
+    fn table_structure(table: &Fts5Table) -> Fts5TableStructure {
+        let columns = table
+            .columns
+            .iter()
+            .zip(&table.indexed_columns)
+            .map(|(name, indexed)| Fts5ColumnStructure {
+                name: name.clone(),
+                indexed: *indexed,
+            })
+            .collect();
+        let mut terms: Vec<Fts5TermStructure> = table
+            .index
+            .index
+            .iter()
+            .map(|(term, postings)| Fts5TermStructure {
+                term: term.as_str().to_owned(),
+                postings: postings
+                    .iter()
+                    .map(|posting| Fts5PostingStructure {
+                        docid: posting.docid,
+                        column: posting.column,
+                        positions: posting.positions.iter().copied().collect(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        terms.sort_by(|left, right| left.term.cmp(&right.term));
+
+        Fts5TableStructure {
+            columns,
+            rows: table.all_rows(),
+            terms,
+        }
+    }
 
     #[test]
     fn test_extension_name_matches_crate_suffix() {
@@ -3730,6 +3853,7 @@ mod tests {
         assert!(vtab.config.contentless_delete_enabled());
         assert!(!vtab.config.columnsize_enabled());
         assert_eq!(vtab.config.detail_mode(), DetailMode::Column);
+        assert_eq!(vtab.indexed_columns(), &[true, false]);
         assert_eq!(vtab.prefix_lengths, vec![2, 3]);
         assert!(!vtab.index().tracks_column_sizes());
         assert_eq!(vtab.index().detail_mode(), DetailMode::Column);
@@ -3795,6 +3919,215 @@ mod tests {
             err.to_string()
                 .contains("detail must be full, column, or none")
         );
+    }
+
+    #[test]
+    fn test_fts5_vtab_unindexed_column_is_stored_but_not_searched()
+    -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut vtab =
+            Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "uuid UNINDEXED"])
+                .map_err(|err| err.to_string())?;
+        vtab.insert_document(1, &["rust guide".to_owned(), "uuidonly".to_owned()]);
+
+        assert_eq!(vtab.indexed_columns(), &[true, false]);
+        let stored = vtab
+            .get_document(1)
+            .ok_or_else(|| "row should be stored".to_owned())?;
+        assert_eq!(stored.first().map(String::as_str), Some("rust guide"));
+        assert_eq!(stored.get(1).map(String::as_str), Some("uuidonly"));
+
+        let title_results = vtab.search("rust").map_err(|err| err.to_string())?;
+        assert_eq!(title_results.len(), 1);
+        assert_eq!(title_results.first().map(|(rowid, _)| *rowid), Some(1));
+        assert!(
+            vtab.search("uuidonly")
+                .map_err(|err| err.to_string())?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_vtab_unindexed_column_filter_returns_no_matches() -> std::result::Result<(), String>
+    {
+        let cx = Cx::new();
+        let mut vtab =
+            Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body UNINDEXED"])
+                .map_err(|err| err.to_string())?;
+        vtab.insert_document(1, &["plain title".to_owned(), "rust body".to_owned()]);
+
+        assert!(
+            vtab.search("body:rust")
+                .map_err(|err| err.to_string())?
+                .is_empty()
+        );
+        let title_results = vtab.search("title:plain").map_err(|err| err.to_string())?;
+        assert_eq!(title_results.first().map(|(rowid, _)| *rowid), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_unknown_column_option() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title INDEXED"])
+            .err()
+            .ok_or_else(|| "unsupported column option should fail".to_owned())?;
+        assert!(err.to_string().contains("unsupported column option"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_unindexed_columns() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "docs", "title", "uuid UNINDEXED", "body"],
+        )
+        .map_err(|err| err.to_string())?;
+        table.insert_document(
+            1,
+            &[
+                "Rust guide".to_owned(),
+                "uuidonly".to_owned(),
+                "systems language".to_owned(),
+            ],
+        );
+        table.insert_document(
+            2,
+            &[
+                "Search guide".to_owned(),
+                "secretmarker".to_owned(),
+                "query language".to_owned(),
+            ],
+        );
+
+        assert_eq!(
+            format!("{:#?}", table_structure(&table)),
+            r#"Fts5TableStructure {
+    columns: [
+        Fts5ColumnStructure {
+            name: "title",
+            indexed: true,
+        },
+        Fts5ColumnStructure {
+            name: "uuid",
+            indexed: false,
+        },
+        Fts5ColumnStructure {
+            name: "body",
+            indexed: true,
+        },
+    ],
+    rows: [
+        (
+            1,
+            [
+                "Rust guide",
+                "uuidonly",
+                "systems language",
+            ],
+        ),
+        (
+            2,
+            [
+                "Search guide",
+                "secretmarker",
+                "query language",
+            ],
+        ),
+    ],
+    terms: [
+        Fts5TermStructure {
+            term: "guide",
+            postings: [
+                Fts5PostingStructure {
+                    docid: 1,
+                    column: 0,
+                    positions: [
+                        1,
+                    ],
+                },
+                Fts5PostingStructure {
+                    docid: 2,
+                    column: 0,
+                    positions: [
+                        1,
+                    ],
+                },
+            ],
+        },
+        Fts5TermStructure {
+            term: "language",
+            postings: [
+                Fts5PostingStructure {
+                    docid: 1,
+                    column: 2,
+                    positions: [
+                        1,
+                    ],
+                },
+                Fts5PostingStructure {
+                    docid: 2,
+                    column: 2,
+                    positions: [
+                        1,
+                    ],
+                },
+            ],
+        },
+        Fts5TermStructure {
+            term: "query",
+            postings: [
+                Fts5PostingStructure {
+                    docid: 2,
+                    column: 2,
+                    positions: [
+                        0,
+                    ],
+                },
+            ],
+        },
+        Fts5TermStructure {
+            term: "rust",
+            postings: [
+                Fts5PostingStructure {
+                    docid: 1,
+                    column: 0,
+                    positions: [
+                        0,
+                    ],
+                },
+            ],
+        },
+        Fts5TermStructure {
+            term: "search",
+            postings: [
+                Fts5PostingStructure {
+                    docid: 2,
+                    column: 0,
+                    positions: [
+                        0,
+                    ],
+                },
+            ],
+        },
+        Fts5TermStructure {
+            term: "systems",
+            postings: [
+                Fts5PostingStructure {
+                    docid: 1,
+                    column: 2,
+                    positions: [
+                        0,
+                    ],
+                },
+            ],
+        },
+    ],
+}"#
+        );
+        Ok(())
     }
 
     #[test]

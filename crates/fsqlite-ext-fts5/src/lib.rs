@@ -3,8 +3,9 @@
 //! Provides: tokenizer API (unicode61, ascii, porter, trigram), inverted index,
 //! boolean query parsing (implicit AND, OR, NOT binary-only, phrase, prefix,
 //! NEAR, column filter, caret), BM25 ranking, FTS5 virtual table with content
-//! modes, and secure-delete / contentless-delete / insttoken configuration.
+//! modes, and secure-delete / contentless-delete / insttoken / locale configuration.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use fsqlite_error::{FrankenError, Result};
@@ -69,6 +70,7 @@ pub struct Fts5Config {
     columnsize: bool,
     detail: DetailMode,
     insttoken: bool,
+    locale: bool,
 }
 
 impl Fts5Config {
@@ -81,6 +83,7 @@ impl Fts5Config {
             columnsize: true,
             detail: DetailMode::Full,
             insttoken: false,
+            locale: false,
         }
     }
 
@@ -107,6 +110,11 @@ impl Fts5Config {
     #[must_use]
     pub const fn insttoken_enabled(self) -> bool {
         self.insttoken
+    }
+
+    #[must_use]
+    pub const fn locale_enabled(self) -> bool {
+        self.locale
     }
 
     #[must_use]
@@ -2513,6 +2521,12 @@ impl VirtualTable for Fts5Table {
                                     )
                                 })?;
                         }
+                        "locale" => {
+                            config.locale = parse_columnsize_option(value_unquoted.as_str())
+                                .ok_or_else(|| {
+                                    FrankenError::function_error("fts5: locale must be 0 or 1")
+                                })?;
+                        }
                         _ => {
                             return Err(FrankenError::function_error(format!(
                                 "fts5: unsupported option '{key}'"
@@ -2544,6 +2558,7 @@ impl VirtualTable for Fts5Table {
             contentless_delete = config.contentless_delete,
             detail = ?config.detail_mode(),
             insttoken = config.insttoken,
+            locale = config.locale,
             indexed_columns = ?indexed_columns,
             prefix_lengths = ?prefix_lengths,
             "fts5: connecting virtual table"
@@ -3037,12 +3052,68 @@ impl ScalarFunction for Fts5InsttokenFunc {
     }
 }
 
+const FTS5_LOCALE_HEADER: [u8; 4] = [0x00, 0xE0, 0xB2, 0xEB];
+
+fn sqlite_text_for_fts5_locale(value: &SqliteValue) -> Option<Cow<'_, str>> {
+    match value {
+        SqliteValue::Null => None,
+        SqliteValue::Text(text) => Some(Cow::Borrowed(text.as_str())),
+        _ => Some(Cow::Owned(value.to_text())),
+    }
+}
+
+fn encode_fts5_locale_blob(locale: &str, text: &str) -> Vec<u8> {
+    let locale_bytes = locale.as_bytes();
+    let text_bytes = text.as_bytes();
+    let mut blob =
+        Vec::with_capacity(FTS5_LOCALE_HEADER.len() + locale_bytes.len() + 1 + text_bytes.len());
+    blob.extend_from_slice(&FTS5_LOCALE_HEADER);
+    blob.extend_from_slice(locale_bytes);
+    blob.push(0);
+    blob.extend_from_slice(text_bytes);
+    blob
+}
+
+/// fts5_locale(locale, text) returns text or a SQLite-compatible locale blob.
+pub struct Fts5LocaleFunc;
+
+impl ScalarFunction for Fts5LocaleFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        let [locale_value, text_value] = args else {
+            return Err(FrankenError::function_error(
+                "fts5_locale() expects 2 arguments",
+            ));
+        };
+
+        let locale = sqlite_text_for_fts5_locale(locale_value);
+        let text = sqlite_text_for_fts5_locale(text_value);
+        let Some(locale) = locale.as_deref().filter(|value| !value.is_empty()) else {
+            return Ok(text.map_or(SqliteValue::Null, |value| {
+                SqliteValue::Text(SmallText::from_string(value.into_owned()))
+            }));
+        };
+
+        Ok(SqliteValue::Blob(
+            encode_fts5_locale_blob(locale, text.as_deref().unwrap_or("")).into(),
+        ))
+    }
+
+    fn num_args(&self) -> i32 {
+        2
+    }
+
+    fn name(&self) -> &'static str {
+        "fts5_locale"
+    }
+}
+
 /// Register FTS5 scalar functions into a `FunctionRegistry`.
 pub fn register_fts5_scalars(registry: &mut fsqlite_func::FunctionRegistry) {
     registry.register_scalar(Fts5HighlightFunc);
     registry.register_scalar(Fts5SnippetFunc);
     registry.register_scalar(Fts5SourceIdFunc);
     registry.register_scalar(Fts5InsttokenFunc);
+    registry.register_scalar(Fts5LocaleFunc);
     debug!("fts5: registered scalar functions");
 }
 
@@ -3087,6 +3158,15 @@ mod tests {
     #[allow(dead_code)]
     #[derive(Debug)]
     struct Fts5InsttokenStructure {
+        config: Fts5Config,
+        columns: Vec<String>,
+        rows: Vec<(i64, Vec<String>)>,
+        terms: Vec<String>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5LocaleStructure {
         config: Fts5Config,
         columns: Vec<String>,
         rows: Vec<(i64, Vec<String>)>,
@@ -3909,6 +3989,7 @@ mod tests {
                 "detail='column'",
                 "prefix='2 3'",
                 "insttoken=1",
+                "locale=1",
             ],
         )
         .unwrap();
@@ -3919,6 +4000,7 @@ mod tests {
         assert!(!vtab.config.columnsize_enabled());
         assert_eq!(vtab.config.detail_mode(), DetailMode::Column);
         assert!(vtab.config.insttoken_enabled());
+        assert!(vtab.config.locale_enabled());
         assert_eq!(vtab.indexed_columns(), &[true, false]);
         assert_eq!(vtab.prefix_lengths, vec![2, 3]);
         assert!(!vtab.index().tracks_column_sizes());
@@ -3996,6 +4078,14 @@ mod tests {
             err.to_string()
                 .contains("insttoken must be a boolean value")
         );
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_invalid_locale() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "locale=true"])
+            .expect_err("invalid locale should fail");
+        assert!(err.to_string().contains("locale must be 0 or 1"));
     }
 
     #[test]
@@ -4235,6 +4325,7 @@ mod tests {
         columnsize: true,
         detail: Full,
         insttoken: true,
+        locale: false,
     },
     columns: [
         "body",
@@ -4251,6 +4342,56 @@ mod tests {
         "precise",
         "prefix",
         "present",
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_locale() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "locale=1"])
+            .map_err(|err| err.to_string())?;
+        table.insert_document(11, &["cafe creme".to_owned()]);
+
+        let mut terms: Vec<String> = table.index.index.keys().map(ToString::to_string).collect();
+        terms.sort();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5LocaleStructure {
+                    config: *table.config(),
+                    columns: table.columns().to_vec(),
+                    rows: table.all_rows(),
+                    terms,
+                }
+            ),
+            r#"Fts5LocaleStructure {
+    config: Fts5Config {
+        secure_delete: false,
+        content_mode: Stored,
+        contentless_delete: false,
+        columnsize: true,
+        detail: Full,
+        insttoken: false,
+        locale: true,
+    },
+    columns: [
+        "body",
+    ],
+    rows: [
+        (
+            11,
+            [
+                "cafe creme",
+            ],
+        ),
+    ],
+    terms: [
+        "cafe",
+        "creme",
     ],
 }"#
         );
@@ -4337,6 +4478,7 @@ mod tests {
         assert!(registry.find_scalar("snippet", 6).is_some());
         assert!(registry.find_scalar("fts5_source_id", 0).is_some());
         assert!(registry.find_scalar("fts5_insttoken", 1).is_some());
+        assert!(registry.find_scalar("fts5_locale", 2).is_some());
     }
 
     #[test]
@@ -4349,6 +4491,47 @@ mod tests {
         assert_eq!(func.invoke(&[query.clone()]).unwrap(), query);
         assert_eq!(
             func.invoke(&[SqliteValue::Null]).unwrap(),
+            SqliteValue::Null
+        );
+    }
+
+    #[test]
+    fn test_fts5_locale_func_encodes_locale_blob() {
+        let func = Fts5LocaleFunc;
+        assert_eq!(func.num_args(), 2);
+        assert_eq!(func.name(), "fts5_locale");
+
+        let result = func
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string("tr_TR")),
+                SqliteValue::Text(SmallText::from_string("Istanbul")),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            result,
+            SqliteValue::Blob(encode_fts5_locale_blob("tr_TR", "Istanbul").into())
+        );
+    }
+
+    #[test]
+    fn test_fts5_locale_func_empty_locale_returns_text() {
+        let func = Fts5LocaleFunc;
+
+        assert_eq!(
+            func.invoke(&[
+                SqliteValue::Text(SmallText::from_string("")),
+                SqliteValue::Integer(42),
+            ])
+            .unwrap(),
+            SqliteValue::Text(SmallText::from_string("42"))
+        );
+        assert_eq!(
+            func.invoke(&[
+                SqliteValue::Text(SmallText::from_string("")),
+                SqliteValue::Null,
+            ])
+            .unwrap(),
             SqliteValue::Null
         );
     }
@@ -4538,6 +4721,8 @@ mod tests {
         assert!(!config.contentless_delete_enabled());
         assert!(config.columnsize_enabled());
         assert_eq!(config.detail_mode(), DetailMode::Full);
+        assert!(!config.insttoken_enabled());
+        assert!(!config.locale_enabled());
     }
 
     #[test]

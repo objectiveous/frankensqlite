@@ -2527,7 +2527,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_with_sorter_cursor_does_not_require_attached_memdb() {
+    fn test_program_with_sorter_cursor_does_not_require_attached_memdb() -> Result<()> {
         let mut b = ProgramBuilder::new();
         let end = b.emit_label();
         b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
@@ -2536,11 +2536,12 @@ mod tests {
         b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         b.resolve_label(end);
 
-        let prog = b.finish().expect("program should build");
+        let prog = b.finish()?;
         assert!(
             !prog.requires_attached_memdb(),
             "sorter-backed temp/exchange state is owned by VDBE and should not force a MemDatabase handoff"
         );
+        Ok(())
     }
 
     #[test]

@@ -2244,6 +2244,11 @@ struct Fts5TableSnapshot {
     next_rowid: i64,
 }
 
+struct DecodedColumnValues {
+    values: Vec<String>,
+    locales: Vec<(usize, SmallText)>,
+}
+
 impl Fts5Table {
     /// Create a new FTS5 table with the given column names.
     #[must_use]
@@ -2365,26 +2370,32 @@ impl Fts5Table {
         self.store_document_with_tokenizer(rowid, column_values, tokenizer.as_ref());
     }
 
-    fn decode_column_values(
-        &self,
-        values: &[SqliteValue],
-    ) -> (Vec<String>, Vec<(usize, SmallText)>) {
+    fn decode_column_values(&self, values: &[SqliteValue]) -> Result<DecodedColumnValues> {
         let mut column_values = Vec::with_capacity(values.len());
         let mut locales = Vec::new();
 
         for (column, value) in values.iter().enumerate() {
-            if self.config.locale_enabled()
-                && let Some(blob) = value.as_blob_bytes()
+            if let Some(blob) = value.as_blob_bytes()
                 && let Some((tag, text)) = decode_fts5_locale_blob(blob)
             {
+                if !self.config.locale_enabled() {
+                    return Err(FrankenError::function_error(
+                        "fts5_locale() requires locale=1",
+                    ));
+                }
                 column_values.push(text.to_owned());
-                locales.push((column, SmallText::new(tag)));
+                if self.indexed_columns.get(column).copied().unwrap_or(true) {
+                    locales.push((column, SmallText::new(tag)));
+                }
                 continue;
             }
             column_values.push(value.to_text());
         }
 
-        (column_values, locales)
+        Ok(DecodedColumnValues {
+            values: column_values,
+            locales,
+        })
     }
 
     /// Insert a document into the FTS5 table.
@@ -2510,6 +2521,17 @@ impl Fts5Table {
         self.row_locales
             .get(&(rowid, column))
             .map(SmallText::as_str)
+    }
+
+    #[must_use]
+    pub fn locale_value(&self, rowid: i64, column: usize) -> SqliteValue {
+        if !self.config.locale_enabled() {
+            return SqliteValue::Null;
+        }
+        self.get_locale(rowid, column)
+            .map_or(SqliteValue::Null, |tag| {
+                SqliteValue::Text(SmallText::new(tag))
+            })
     }
 
     #[must_use]
@@ -2798,7 +2820,10 @@ impl VirtualTable for Fts5Table {
                 Some(values) => values,
                 None => &[],
             };
-            let (col_values, locales) = self.decode_column_values(column_args);
+            let DecodedColumnValues {
+                values: col_values,
+                locales,
+            } = self.decode_column_values(column_args)?;
             let tokenizer = self.create_tokenizer_instance();
             self.store_document_with_tokenizer_and_locales(
                 rowid,
@@ -2831,7 +2856,10 @@ impl VirtualTable for Fts5Table {
             Some(values) => values,
             None => &[],
         };
-        let (col_values, locales) = self.decode_column_values(column_args);
+        let DecodedColumnValues {
+            values: col_values,
+            locales,
+        } = self.decode_column_values(column_args)?;
         let tokenizer = self.create_tokenizer_instance();
         self.store_document_with_tokenizer_and_locales(
             new_rowid,
@@ -3338,9 +3366,20 @@ mod tests {
     #[derive(Debug)]
     struct Fts5LocaleBlobStorageStructure {
         config: Fts5Config,
+        indexed_columns: Vec<bool>,
         rows: Vec<(i64, Vec<String>)>,
         locales: Vec<(i64, usize, String)>,
         matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5LocaleUnindexedDiscardStructure {
+        indexed_columns: Vec<bool>,
+        rows: Vec<(i64, Vec<String>)>,
+        locales: Vec<(i64, usize, String)>,
+        indexed_matches: Vec<i64>,
+        unindexed_matches: Vec<i64>,
     }
 
     #[allow(dead_code)]
@@ -4662,6 +4701,7 @@ mod tests {
             "{:#?}",
             Fts5LocaleBlobStorageStructure {
                 config: *table.config(),
+                indexed_columns: table.indexed_columns().to_vec(),
                 rows: table.all_rows(),
                 locales: table.all_locales(),
                 matches,
@@ -4678,6 +4718,9 @@ mod tests {
         locale: true,
         tokendata: false,
     },
+    indexed_columns: [
+        true,
+    ],
     rows: [
         (
             29,
@@ -4698,6 +4741,134 @@ mod tests {
     ],
 }"#;
         assert!(actual.as_bytes().eq(expected.as_bytes()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_vtab_update_rejects_locale_blob_without_locale_option() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"]).unwrap();
+
+        let err = table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(41),
+                    SqliteValue::Blob(encode_fts5_locale_blob("en_US", "hello").into()),
+                ],
+            )
+            .expect_err("fts5_locale blob must require locale=1");
+
+        assert!(err.to_string().contains("fts5_locale() requires locale=1"));
+        assert!(table.get_document(41).is_none());
+        assert!(table.search("hello").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_fts5_locale_value_returns_text_or_null() {
+        let cx = Cx::new();
+        let mut table =
+            Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "locale=1"]).unwrap();
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(5),
+                    SqliteValue::Blob(encode_fts5_locale_blob("en_US", "hello").into()),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            table.locale_value(5, 0),
+            SqliteValue::Text(SmallText::from_string("en_US"))
+        );
+        assert_eq!(table.locale_value(5, 1), SqliteValue::Null);
+
+        let mut no_locale_table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        no_locale_table.insert_document(5, &["hello".to_owned()]);
+        assert_eq!(no_locale_table.locale_value(5, 0), SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_locale_unindexed_discard() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "body",
+                "external_id UNINDEXED",
+                "locale=1",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(43),
+                    SqliteValue::Blob(encode_fts5_locale_blob("en_US", "localized body").into()),
+                    SqliteValue::Blob(encode_fts5_locale_blob("fr_FR", "secret marker").into()),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+
+        let indexed_matches = table
+            .search("localized")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let unindexed_matches = table
+            .search("secret")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let actual = format!(
+            "{:#?}",
+            Fts5LocaleUnindexedDiscardStructure {
+                indexed_columns: table.indexed_columns().to_vec(),
+                rows: table.all_rows(),
+                locales: table.all_locales(),
+                indexed_matches,
+                unindexed_matches,
+            }
+        );
+        let expected = r#"Fts5LocaleUnindexedDiscardStructure {
+    indexed_columns: [
+        true,
+        false,
+    ],
+    rows: [
+        (
+            43,
+            [
+                "localized body",
+                "secret marker",
+            ],
+        ),
+    ],
+    locales: [
+        (
+            43,
+            0,
+            "en_US",
+        ),
+    ],
+    indexed_matches: [
+        43,
+    ],
+    unindexed_matches: [],
+}"#;
+        assert!(actual.as_bytes().eq(expected.as_bytes()));
+        assert_eq!(table.locale_value(43, 1), SqliteValue::Null);
         Ok(())
     }
 

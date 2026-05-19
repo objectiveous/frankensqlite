@@ -110,6 +110,37 @@ pub const fn serial_type_for_integer(value: i64) -> u64 {
     }
 }
 
+/// Compute the serial type and payload length for an integer in one pass.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+pub const fn integer_serial_type_and_len(value: i64) -> (u64, usize) {
+    let u = if value < 0 {
+        !(value as u64)
+    } else {
+        value as u64
+    };
+
+    if u <= 127 {
+        if value == 0 {
+            return (8, 0);
+        }
+        if value == 1 {
+            return (9, 0);
+        }
+        (1, 1)
+    } else if u <= 32767 {
+        (2, 2)
+    } else if u <= 8_388_607 {
+        (3, 3)
+    } else if u <= 2_147_483_647 {
+        (4, 4)
+    } else if u <= 0x0000_7FFF_FFFF_FFFF {
+        (5, 6)
+    } else {
+        (6, 8)
+    }
+}
+
 /// Compute the serial type for a text value of `len` bytes.
 pub const fn serial_type_for_text(len: u64) -> u64 {
     len.saturating_mul(2).saturating_add(13)

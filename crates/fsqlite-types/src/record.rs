@@ -21,8 +21,9 @@ use std::simd::{
 };
 
 use crate::serial_type::{
-    SerialTypeClass, classify_serial_type, read_varint, serial_type_for_blob,
-    serial_type_for_integer, serial_type_for_text, serial_type_len, varint_len, write_varint,
+    SerialTypeClass, classify_serial_type, integer_serial_type_and_len, read_varint,
+    serial_type_for_blob, serial_type_for_integer, serial_type_for_text, serial_type_len,
+    varint_len, write_varint,
 };
 use crate::value::{SqliteValue, pool_acquire, pool_return_reusable};
 
@@ -1894,20 +1895,7 @@ fn compute_header_size(content_size: usize) -> usize {
 fn serialized_value_layout(value: &SqliteValue) -> (u64, usize) {
     match value {
         SqliteValue::Null => (0, 0),
-        SqliteValue::Integer(i) => {
-            let serial_type = serial_type_for_integer(*i);
-            let payload_len = match serial_type {
-                8 | 9 => 0,
-                1 => 1,
-                2 => 2,
-                3 => 3,
-                4 => 4,
-                5 => 6,
-                6 => 8,
-                _ => unreachable!("integer serial type must be in 1..=9"),
-            };
-            (serial_type, payload_len)
-        }
+        SqliteValue::Integer(i) => integer_serial_type_and_len(*i),
         // SQLite normalizes NaN to NULL for deterministic storage.
         SqliteValue::Float(f) => {
             if f.is_nan() {

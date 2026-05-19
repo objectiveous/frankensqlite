@@ -12642,6 +12642,23 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            Opcode::If => {
+                let val = self.get_reg(op.p1);
+                let should_jump = if val.is_null() {
+                    op.p3 != 0
+                } else {
+                    vdbe_real_is_truthy(val)
+                };
+                if should_jump {
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        *pc = op.p2 as usize;
+                    }
+                } else {
+                    *pc += 1;
+                }
+                Ok(true)
+            }
             Opcode::Next | Opcode::SorterNext => {
                 self.execute_next_hot(op, pc)?;
                 Ok(true)

@@ -3,7 +3,8 @@
 //! Provides: tokenizer API (unicode61, ascii, porter, trigram), inverted index,
 //! boolean query parsing (implicit AND, OR, NOT binary-only, phrase, prefix,
 //! NEAR, column filter, caret), BM25 ranking, FTS5 virtual table with content
-//! modes, and secure-delete / contentless-delete / insttoken / locale / tokendata configuration.
+//! modes, and secure-delete / contentless-delete / insttoken / locale blob / tokendata
+//! configuration.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -2223,6 +2224,8 @@ pub struct Fts5Table {
     index: InvertedIndex,
     /// Stored document content: docid -> (col0, col1, ...).
     documents: HashMap<i64, Vec<String>>,
+    /// Locale metadata decoded from fts5_locale() values: (docid, column) -> locale.
+    row_locales: HashMap<(i64, usize), SmallText>,
     /// Next auto-generated rowid.
     next_rowid: i64,
     /// Snapshot-backed transaction/savepoint state for live VTAB writes.
@@ -2237,6 +2240,7 @@ struct Fts5TableSnapshot {
     indexed_columns: Vec<bool>,
     index: InvertedIndex,
     documents: HashMap<i64, Vec<String>>,
+    row_locales: HashMap<(i64, usize), SmallText>,
     next_rowid: i64,
 }
 
@@ -2253,6 +2257,7 @@ impl Fts5Table {
             prefix_lengths: Vec::new(),
             index: InvertedIndex::with_options(true, &[], DetailMode::Full),
             documents: HashMap::new(),
+            row_locales: HashMap::new(),
             next_rowid: 1,
             txn_state: TransactionalVtabState::default(),
         }
@@ -2266,6 +2271,7 @@ impl Fts5Table {
             indexed_columns: self.indexed_columns.clone(),
             index: self.index.clone(),
             documents: self.documents.clone(),
+            row_locales: self.row_locales.clone(),
             next_rowid: self.next_rowid,
         }
     }
@@ -2277,6 +2283,7 @@ impl Fts5Table {
         self.indexed_columns = snapshot.indexed_columns;
         self.index = snapshot.index;
         self.documents = snapshot.documents;
+        self.row_locales = snapshot.row_locales;
         self.next_rowid = snapshot.next_rowid;
     }
 
@@ -2295,19 +2302,37 @@ impl Fts5Table {
         }
     }
 
+    fn store_document_with_tokenizer_and_locales(
+        &mut self,
+        rowid: i64,
+        column_values: Vec<String>,
+        locales: Vec<(usize, SmallText)>,
+        tokenizer: &dyn Fts5Tokenizer,
+    ) {
+        if self.documents.contains_key(&rowid) {
+            self.index.remove_document(rowid);
+        }
+        self.row_locales.retain(|(existing_rowid, _column), _| {
+            !matches!(existing_rowid.cmp(&rowid), std::cmp::Ordering::Equal)
+        });
+        self.row_locales.extend(
+            locales
+                .into_iter()
+                .map(|(column, tag)| ((rowid, column), tag)),
+        );
+        self.index_document_with_tokenizer(rowid, &column_values, tokenizer);
+        self.next_rowid = self.next_rowid.max(rowid.saturating_add(1));
+        self.documents.insert(rowid, column_values);
+        debug!(rowid, "fts5: indexed document");
+    }
+
     fn store_document_with_tokenizer(
         &mut self,
         rowid: i64,
         column_values: Vec<String>,
         tokenizer: &dyn Fts5Tokenizer,
     ) {
-        if self.documents.contains_key(&rowid) {
-            self.index.remove_document(rowid);
-        }
-        self.index_document_with_tokenizer(rowid, &column_values, tokenizer);
-        self.next_rowid = self.next_rowid.max(rowid.saturating_add(1));
-        self.documents.insert(rowid, column_values);
-        debug!(rowid, "fts5: indexed document");
+        self.store_document_with_tokenizer_and_locales(rowid, column_values, Vec::new(), tokenizer);
     }
 
     pub fn create_tokenizer_instance(&self) -> Box<dyn Fts5Tokenizer> {
@@ -2340,6 +2365,28 @@ impl Fts5Table {
         self.store_document_with_tokenizer(rowid, column_values, tokenizer.as_ref());
     }
 
+    fn decode_column_values(
+        &self,
+        values: &[SqliteValue],
+    ) -> (Vec<String>, Vec<(usize, SmallText)>) {
+        let mut column_values = Vec::with_capacity(values.len());
+        let mut locales = Vec::new();
+
+        for (column, value) in values.iter().enumerate() {
+            if self.config.locale_enabled()
+                && let Some(blob) = value.as_blob_bytes()
+                && let Some((tag, text)) = decode_fts5_locale_blob(blob)
+            {
+                column_values.push(text.to_owned());
+                locales.push((column, SmallText::new(tag)));
+                continue;
+            }
+            column_values.push(value.to_text());
+        }
+
+        (column_values, locales)
+    }
+
     /// Insert a document into the FTS5 table.
     pub fn insert_document(&mut self, rowid: i64, column_values: &[String]) {
         self.insert_document_owned(rowid, column_values.to_vec());
@@ -2349,6 +2396,9 @@ impl Fts5Table {
     pub fn delete_document(&mut self, rowid: i64) {
         self.index.remove_document(rowid);
         self.documents.remove(&rowid);
+        self.row_locales.retain(|(existing_rowid, _column), _| {
+            !matches!(existing_rowid.cmp(&rowid), std::cmp::Ordering::Equal)
+        });
         debug!(rowid, "fts5: removed document");
     }
 
@@ -2361,6 +2411,7 @@ impl Fts5Table {
             self.config.tokendata_enabled(),
         );
         self.documents = HashMap::with_capacity(rows.len());
+        self.row_locales.clear();
         self.next_rowid = 1;
         let tokenizer = create_tokenizer(&self.tokenizer_name)
             .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
@@ -2451,6 +2502,25 @@ impl Fts5Table {
     #[must_use]
     pub fn get_document(&self, rowid: i64) -> Option<&[String]> {
         self.documents.get(&rowid).map(Vec::as_slice)
+    }
+
+    /// Get locale metadata decoded from an fts5_locale() column value.
+    #[must_use]
+    pub fn get_locale(&self, rowid: i64, column: usize) -> Option<&str> {
+        self.row_locales
+            .get(&(rowid, column))
+            .map(SmallText::as_str)
+    }
+
+    #[must_use]
+    pub fn all_locales(&self) -> Vec<(i64, usize, String)> {
+        let mut locales: Vec<(i64, usize, String)> = self
+            .row_locales
+            .iter()
+            .map(|((rowid, column), tag)| (*rowid, *column, tag.to_string()))
+            .collect();
+        locales.sort_unstable_by_key(|entry| (entry.0, entry.1));
+        locales
     }
 
     /// Get the FTS5 config.
@@ -2724,8 +2794,18 @@ impl VirtualTable for Fts5Table {
                 return Err(FrankenError::PrimaryKeyViolation);
             }
 
-            let col_values: Vec<String> = args.iter().skip(2).map(SqliteValue::to_text).collect();
-            self.insert_document_owned(rowid, col_values);
+            let column_args = match args.get(2..) {
+                Some(values) => values,
+                None => &[],
+            };
+            let (col_values, locales) = self.decode_column_values(column_args);
+            let tokenizer = self.create_tokenizer_instance();
+            self.store_document_with_tokenizer_and_locales(
+                rowid,
+                col_values,
+                locales,
+                tokenizer.as_ref(),
+            );
             return Ok(Some(rowid));
         }
 
@@ -2747,8 +2827,18 @@ impl VirtualTable for Fts5Table {
         }
         self.delete_document(old_rowid);
 
-        let col_values: Vec<String> = args.iter().skip(2).map(SqliteValue::to_text).collect();
-        self.insert_document_owned(new_rowid, col_values);
+        let column_args = match args.get(2..) {
+            Some(values) => values,
+            None => &[],
+        };
+        let (col_values, locales) = self.decode_column_values(column_args);
+        let tokenizer = self.create_tokenizer_instance();
+        self.store_document_with_tokenizer_and_locales(
+            new_rowid,
+            col_values,
+            locales,
+            tokenizer.as_ref(),
+        );
         Ok(None)
     }
 
@@ -3133,6 +3223,18 @@ fn encode_fts5_locale_blob(locale: &str, text: &str) -> Vec<u8> {
     blob
 }
 
+fn decode_fts5_locale_blob(blob: &[u8]) -> Option<(&str, &str)> {
+    let body = blob.strip_prefix(&FTS5_LOCALE_HEADER)?;
+    let nul_pos = body.iter().position(|byte| *byte == 0)?;
+    let tag = std::str::from_utf8(body.get(..nul_pos)?).ok()?;
+    if tag.is_empty() {
+        return None;
+    }
+    let text_start = nul_pos.checked_add(1)?;
+    let text = std::str::from_utf8(body.get(text_start..)?).ok()?;
+    Some((tag, text))
+}
+
 /// fts5_locale(locale, text) returns text or a SQLite-compatible locale blob.
 pub struct Fts5LocaleFunc;
 
@@ -3230,6 +3332,15 @@ mod tests {
         columns: Vec<String>,
         rows: Vec<(i64, Vec<String>)>,
         terms: Vec<String>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5LocaleBlobStorageStructure {
+        config: Fts5Config,
+        rows: Vec<(i64, Vec<String>)>,
+        locales: Vec<(i64, usize, String)>,
+        matches: Vec<i64>,
     }
 
     #[allow(dead_code)]
@@ -4526,6 +4637,71 @@ mod tests {
     }
 
     #[test]
+    fn test_fts5_structural_snapshot_locale_blob_storage() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "locale=1"])
+            .map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(29),
+                    SqliteValue::Blob(encode_fts5_locale_blob("tr_TR", "Istanbul").into()),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+
+        let matches = table
+            .search("istanbul")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let actual = format!(
+            "{:#?}",
+            Fts5LocaleBlobStorageStructure {
+                config: *table.config(),
+                rows: table.all_rows(),
+                locales: table.all_locales(),
+                matches,
+            }
+        );
+        let expected = r#"Fts5LocaleBlobStorageStructure {
+    config: Fts5Config {
+        secure_delete: false,
+        content_mode: Stored,
+        contentless_delete: false,
+        columnsize: true,
+        detail: Full,
+        insttoken: false,
+        locale: true,
+        tokendata: false,
+    },
+    rows: [
+        (
+            29,
+            [
+                "Istanbul",
+            ],
+        ),
+    ],
+    locales: [
+        (
+            29,
+            0,
+            "tr_TR",
+        ),
+    ],
+    matches: [
+        29,
+    ],
+}"#;
+        assert!(actual.as_bytes().eq(expected.as_bytes()));
+        Ok(())
+    }
+
+    #[test]
     fn test_fts5_structural_snapshot_tokendata() -> std::result::Result<(), String> {
         let cx = Cx::new();
         let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "tokendata=1"])
@@ -4603,6 +4779,40 @@ mod tests {
             .unwrap();
         assert_eq!(result, Some(1));
         assert!(vtab.get_document(1).is_some());
+    }
+
+    #[test]
+    fn test_fts5_vtab_update_decodes_locale_blob() {
+        let cx = Cx::new();
+        let mut vtab =
+            Fts5Table::connect(&cx, &["fts5", "main", "t", "content", "locale=1"]).unwrap();
+
+        let result = vtab
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(7),
+                    SqliteValue::Blob(encode_fts5_locale_blob("tr_TR", "Istanbul").into()),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(result, Some(7));
+        assert_eq!(
+            vtab.get_document(7)
+                .and_then(|columns| columns.first())
+                .map(String::as_str),
+            Some("Istanbul")
+        );
+        assert!(matches!(vtab.get_locale(7, 0), Some("tr_TR")));
+        assert_eq!(
+            vtab.search("istanbul")
+                .unwrap()
+                .first()
+                .map(|(rowid, _score)| *rowid),
+            Some(7)
+        );
     }
 
     #[test]
@@ -4700,6 +4910,17 @@ mod tests {
             result,
             SqliteValue::Blob(encode_fts5_locale_blob("tr_TR", "Istanbul").into())
         );
+    }
+
+    #[test]
+    fn test_fts5_locale_blob_decode_round_trip() {
+        let blob = encode_fts5_locale_blob("ja_JP", "Tokyo");
+        assert!(matches!(
+            decode_fts5_locale_blob(&blob),
+            Some(("ja_JP", "Tokyo"))
+        ));
+        assert!(decode_fts5_locale_blob(b"plain text").is_none());
+        assert!(decode_fts5_locale_blob(&encode_fts5_locale_blob("", "text")).is_none());
     }
 
     #[test]

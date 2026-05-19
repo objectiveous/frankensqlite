@@ -1890,7 +1890,7 @@ Each frame's checksum incorporates the previous frame's checksum, creating a has
 |-------|-------|---------------|
 | 1 | Page-level | Page type flags, header field ranges, XXH3 checksum (if enabled) |
 | 2 | B-tree structural | Cell pointers within bounds, keys sorted, child pointers valid, freeblock list well-formed |
-| 3 | Record format | Header varints valid, serial types not 10/11, payload sizes match, overflow chains intact |
+| 3 | Record format | Header varints valid, serial type encoding well-formed (types 10/11 tolerated as zero-length per canonical SQLite), payload sizes match, overflow chains intact |
 | 4 | Cross-reference | Every page accounted for, no page in multiple B-trees, freelist consistent, pointer map matches |
 | 5 | Schema | sqlite_master readable, root page numbers match existing B-trees, index entries match table data |
 

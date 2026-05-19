@@ -13037,3 +13037,69 @@ set: sessions found by
   standalone optimization. Reconsider only if a larger reproducible
   16-thread shared-table failure shows baseline failures that this exact
   resync strategy eliminates without losing throughput.
+
+## 2026-05-18 - Prepared direct UPDATE active-run MemDatabase invalidation skip
+
+- Target: `perf-update-delete 1000 80 update compare standard`, after the
+  current full quick matrix showed `1000 rows / update 100 rows` as a noisy
+  C-faster write-single row.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The candidate changed the active
+  same-leaf fixed-width REAL update patch-run hit path to return
+  `abandon_memdb=false`, mirroring the retained DELETE active-hit optimization
+  and trying to avoid repeated exact MemDatabase mirror invalidation after the
+  first row had already invalidated it. The source patch was manually unwound
+  after the focused same-window profile rejected it.
+- Correctness proof before rejection:
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-fresh-eyes-target-20260518 CARGO_BUILD_JOBS=4 cargo test -p fsqlite-core --lib test_prepared_direct_update_leaf_patch_run -- --nocapture --test-threads=1`
+  passed.
+- Evidence:
+  same-window focused profile commands:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-fullquick-after-delete-abandon-skip-20260518T0920Z CARGO_BUILD_JOBS=4 FSQLITE_BENCH_PROFILE_DML=1 cargo run --profile release-perf -p fsqlite-e2e --bin perf-update-delete -- 1000 80 update compare standard`
+  before and after the candidate. No durable per-candidate JSON artifact was
+  preserved for this same-window probe; treat the inline numbers below as a
+  rejection note, not a reusable benchmark artifact. Surrounding current-run
+  DML artifacts from the same investigation are:
+  `tests/artifacts/perf/codex-current-dml-profile-20260518T0815Z/update-delete-profile.json`,
+  `tests/artifacts/perf/codex-delete-active-memdb-abandon-skip-20260518T0905Z/update-delete-profile.json`,
+  and
+  `tests/artifacts/perf/codex-delete-active-memdb-abandon-skip-noprofile-20260518T0910Z/update-delete.json`.
+- Result: rejected. Baseline measured FSQLite at `631ns/update` versus C SQLite
+  `370ns/update` (`1.70x` update ratio). The candidate measured FSQLite at
+  `808ns/update` versus C SQLite `381ns/update` (`2.12x` update ratio).
+- Do not retry the UPDATE analog of the retained DELETE MemDatabase
+  invalidation skip as a standalone optimization. Reconsider only if a future
+  update profile attributes a large counted cost directly to mirror
+  invalidation and the same-window focused update row improves in absolute
+  FSQLite time.
+
+## 2026-05-18 - Prepared direct DELETE active-run preflush/probe skip
+
+- Target: the no-profile `perf-update-delete 100 200 delete compare standard`
+  row after profiling showed small but visible fixed cost in prepared direct
+  DELETE rowid/preflush/active-probe ceremony.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`. The candidate tried to probe a
+  matching active retained DELETE leaf run before the generic preflush path
+  when no update/insert run was pending, while leaving profile-enabled runs on
+  the previous instrumentation path. The source patch was manually unwound.
+- Correctness proof before rejection:
+  `cargo fmt --check --all`,
+  `cargo test -p fsqlite-core --test prepared_hit_rate_proof prepared_direct_delete_staged_only_absent_probe_records_active_miss -- --test-threads=1`,
+  and
+  `cargo test -p fsqlite-core --lib test_prepared_direct_delete_leaf_run -- --test-threads=1`
+  passed.
+- Evidence artifacts:
+  `tests/artifacts/perf/codex-delete-active-preflush-skip-20260518Tnext/summary.md`,
+  `tests/artifacts/perf/codex-delete-active-preflush-skip-20260518Tnext/delete100.log`,
+  and
+  `tests/artifacts/perf/codex-delete-active-preflush-skip-20260518Tnext/full-quick.json`.
+- Result: rejected. The focused 100-row delete run improved in absolute FSQLite
+  time (`1797ns/delete` to `1563ns/delete`) and ratio (`3.79x` to `3.66x`), but
+  the full quick primary weighted score regressed from `0.4089830246` to
+  `0.4270417446`. The full matrix also did not preserve the broader DELETE
+  rows: `1000 rows / delete 50 rows` moved from ratio `0.7460` to `2.6907`,
+  and `10000 rows / delete 500 rows` moved from `1.8853` to `2.3158`.
+- Do not retry this active DELETE preflush/probe skip as a standalone
+  optimization. Reconsider only if a same-window full quick matrix keeps or
+  improves the primary weighted score and the 1000/10000-row DELETE rows.

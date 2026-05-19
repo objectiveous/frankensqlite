@@ -7700,9 +7700,14 @@ fn resolve_join_column_ref(
             }
         }
     }
-    found.ok_or_else(|| CodegenError::ColumnNotFound {
-        table: qualifier.unwrap_or_default().to_owned(),
-        column: name.to_owned(),
+    found.ok_or_else(|| {
+        qualifier.map_or_else(
+            || CodegenError::ColumnNotFound {
+                table: String::new(),
+                column: name.to_owned(),
+            },
+            |qualifier| qualified_column_not_found(qualifier, name),
+        )
     })
 }
 
@@ -7730,9 +7735,14 @@ fn resolve_join_column(
             }
         }
     }
-    found.ok_or_else(|| CodegenError::ColumnNotFound {
-        table: String::new(),
-        column: name.to_owned(),
+    found.ok_or_else(|| {
+        qualifier.map_or_else(
+            || CodegenError::ColumnNotFound {
+                table: String::new(),
+                column: name.to_owned(),
+            },
+            |qualifier| qualified_column_not_found(qualifier, name),
+        )
     })
 }
 
@@ -13136,7 +13146,7 @@ fn emit_column_reads(
                 if let Expr::Column(col_ref, _) = expr {
                     if let Some(qualifier) = &col_ref.table {
                         if !matches_table_or_alias(qualifier, table, table_alias) {
-                            return Err(CodegenError::TableNotFound(qualifier.to_string()));
+                            return Err(qualified_column_not_found(qualifier, &col_ref.column));
                         }
                     }
                     if let Some(col_idx) = table.column_index(&col_ref.column) {
@@ -13147,6 +13157,8 @@ fn emit_column_reads(
                         }
                     } else if table.resolves_to_hidden_rowid(&col_ref.column) {
                         b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
+                    } else if let Some(qualifier) = &col_ref.table {
+                        return Err(qualified_column_not_found(qualifier, &col_ref.column));
                     } else {
                         return Err(CodegenError::ColumnNotFound {
                             table: table.name.clone(),
@@ -13729,6 +13741,16 @@ fn matches_table_or_alias(qualifier: &str, table: &TableSchema, table_alias: Opt
     )
 }
 
+fn qualified_column_not_found(qualifier: &str, column: &str) -> CodegenError {
+    // SQLite reports bad qualified references as "no such column: q.c",
+    // including cases where `q` is a hidden base table name after aliasing.
+    // Keep the qualified spelling in `column` so the public error preserves it.
+    CodegenError::ColumnNotFound {
+        table: qualifier.to_owned(),
+        column: format!("{qualifier}.{column}"),
+    }
+}
+
 /// Source for a sort key: either a table column or the implicit rowid.
 #[derive(Clone)]
 enum SortKeySource {
@@ -14079,12 +14101,15 @@ fn validate_single_table_column_ref(
     if let Some(qualifier) = col_ref.table.as_deref()
         && !matches_table_or_alias(qualifier, table, table_alias)
     {
-        return Err(CodegenError::TableNotFound(qualifier.to_owned()));
+        return Err(qualified_column_not_found(qualifier, &col_ref.column));
     }
     if table.column_index(&col_ref.column).is_some()
         || table.resolves_to_hidden_rowid(&col_ref.column)
     {
         return Ok(());
+    }
+    if let Some(qualifier) = col_ref.table.as_deref() {
+        return Err(qualified_column_not_found(qualifier, &col_ref.column));
     }
     Err(CodegenError::ColumnNotFound {
         table: table.name.clone(),
@@ -14095,14 +14120,20 @@ fn validate_single_table_column_ref(
 fn validate_scan_column_ref(col_ref: &ColumnRef, scan: &ScanCtx<'_>) -> Result<(), CodegenError> {
     if let Some(qualifier) = col_ref.table.as_deref() {
         if matches_table_or_alias(qualifier, scan.table, scan.table_alias) {
-            return validate_table_column_ref(scan.table, &col_ref.column);
+            if table_has_column_or_rowid(scan.table, &col_ref.column) {
+                return Ok(());
+            }
+            return Err(qualified_column_not_found(qualifier, &col_ref.column));
         }
         if let Some(secondary) = &scan.secondary
             && matches_table_or_alias(qualifier, secondary.table, secondary.table_alias)
         {
-            return validate_table_column_ref(secondary.table, &col_ref.column);
+            if table_has_column_or_rowid(secondary.table, &col_ref.column) {
+                return Ok(());
+            }
+            return Err(qualified_column_not_found(qualifier, &col_ref.column));
         }
-        return Err(CodegenError::TableNotFound(qualifier.to_owned()));
+        return Err(qualified_column_not_found(qualifier, &col_ref.column));
     }
 
     let primary_has_column = table_has_column_or_rowid(scan.table, &col_ref.column);
@@ -14127,7 +14158,10 @@ fn validate_upsert_column_ref(
     table_alias: Option<&str>,
 ) -> Result<(), CodegenError> {
     if is_upsert_excluded_pseudo_table(col_ref, table, table_alias) {
-        return validate_table_column_ref(table, &col_ref.column);
+        if table_has_column_or_rowid(table, &col_ref.column) {
+            return Ok(());
+        }
+        return Err(qualified_column_not_found("excluded", &col_ref.column));
     }
     validate_single_table_column_ref(col_ref, table, table_alias)
 }
@@ -14140,16 +14174,6 @@ fn is_upsert_excluded_pseudo_table(
     col_ref.table.as_deref().is_some_and(|qualifier| {
         qualifier.eq_ignore_ascii_case("excluded")
             && !matches_table_or_alias(qualifier, table, table_alias)
-    })
-}
-
-fn validate_table_column_ref(table: &TableSchema, column: &str) -> Result<(), CodegenError> {
-    if table_has_column_or_rowid(table, column) {
-        return Ok(());
-    }
-    Err(CodegenError::ColumnNotFound {
-        table: table.name.clone(),
-        column: column.to_owned(),
     })
 }
 
@@ -20152,7 +20176,7 @@ mod tests {
         let err = codegen_select(&mut b, &stmt, &schema, &ctx)
             .expect_err("mismatched qualifier should be a semantic error");
         assert!(
-            matches!(err, CodegenError::TableNotFound(ref name) if name == "u"),
+            matches!(err, CodegenError::ColumnNotFound { ref table, ref column } if table == "u" && column == "u.a"),
             "unexpected error: {err:?}"
         );
     }
@@ -22939,7 +22963,7 @@ mod tests {
         let err = codegen_select(&mut b, &stmt, &schema, &ctx)
             .expect_err("mismatched qualifier should be a semantic error");
         assert!(
-            matches!(err, CodegenError::TableNotFound(ref name) if name == "u"),
+            matches!(err, CodegenError::ColumnNotFound { ref table, ref column } if table == "u" && column == "u.b"),
             "unexpected error: {err:?}"
         );
     }
@@ -23428,7 +23452,7 @@ mod tests {
         let err = codegen_select(&mut b, &stmt, &schema, &ctx)
             .expect_err("mismatched qualifier should be a semantic error");
         assert!(
-            matches!(err, CodegenError::TableNotFound(ref name) if name == "u"),
+            matches!(err, CodegenError::ColumnNotFound { ref table, ref column } if table == "u" && column == "u.b"),
             "unexpected error: {err:?}"
         );
     }
@@ -23600,7 +23624,7 @@ mod tests {
         let err = codegen_insert(&mut b, &stmt, &schema, &ctx)
             .expect_err("RETURNING expression should reject wrong qualifier");
         assert!(
-            matches!(err, CodegenError::TableNotFound(ref name) if name == "u"),
+            matches!(err, CodegenError::ColumnNotFound { ref table, ref column } if table == "u" && column == "u.a"),
             "unexpected error: {err:?}"
         );
     }
@@ -24159,7 +24183,7 @@ mod tests {
         let err = codegen_select(&mut b, &stmt, &schema, &ctx)
             .expect_err("mismatched ORDER BY qualifier should be a semantic error");
         assert!(
-            matches!(err, CodegenError::TableNotFound(ref name) if name == "u"),
+            matches!(err, CodegenError::ColumnNotFound { ref table, ref column } if table == "u" && column == "u.b"),
             "unexpected error: {err:?}"
         );
     }
@@ -24181,7 +24205,7 @@ mod tests {
         let err = codegen_select(&mut b, &stmt, &schema, &ctx)
             .expect_err("base-table qualifier should not resolve after FROM aliasing");
         assert!(
-            matches!(err, CodegenError::TableNotFound(ref name) if name == "t"),
+            matches!(err, CodegenError::ColumnNotFound { ref table, ref column } if table == "t" && column == "t.b"),
             "unexpected error: {err:?}"
         );
     }
@@ -29389,7 +29413,7 @@ mod tests {
         let err = codegen_select(&mut b, &stmt, &schema, &ctx)
             .expect_err("projection expression should reject wrong qualifier");
         assert!(
-            matches!(err, CodegenError::TableNotFound(ref name) if name == "u"),
+            matches!(err, CodegenError::ColumnNotFound { ref table, ref column } if table == "u" && column == "u.a"),
             "unexpected error: {err:?}"
         );
     }
@@ -29426,7 +29450,7 @@ mod tests {
         let err = codegen_update(&mut b, &stmt, &schema, &ctx)
             .expect_err("base table qualifier should be hidden by UPDATE alias");
         assert!(
-            matches!(err, CodegenError::TableNotFound(ref name) if name == "t"),
+            matches!(err, CodegenError::ColumnNotFound { ref table, ref column } if table == "t" && column == "t.a"),
             "unexpected error: {err:?}"
         );
     }
@@ -29783,7 +29807,7 @@ mod tests {
         let err = codegen_select(&mut b, &stmt, &schema, &ctx)
             .expect_err("base table qualifier must not resolve after aliasing");
         assert!(
-            matches!(err, CodegenError::TableNotFound(ref name) if name == "t"),
+            matches!(err, CodegenError::ColumnNotFound { ref table, ref column } if table == "t" && column == "t.a"),
             "unexpected error: {err:?}"
         );
     }
@@ -29870,7 +29894,7 @@ mod tests {
         let err = codegen_select(&mut b, &stmt, &schema, &ctx)
             .expect_err("JOIN qualifier must use the table alias once present");
         assert!(
-            matches!(err, CodegenError::ColumnNotFound { ref table, ref column } if table == "t" && column == "a"),
+            matches!(err, CodegenError::ColumnNotFound { ref table, ref column } if table == "t" && column == "t.a"),
             "unexpected error: {err:?}"
         );
     }
@@ -29945,7 +29969,7 @@ mod tests {
         let err = codegen_delete(&mut b, &stmt, &schema, &ctx)
             .expect_err("base table qualifier should be hidden by DELETE alias");
         assert!(
-            matches!(err, CodegenError::TableNotFound(ref name) if name == "t"),
+            matches!(err, CodegenError::ColumnNotFound { ref table, ref column } if table == "t" && column == "t.a"),
             "unexpected error: {err:?}"
         );
     }
@@ -30889,7 +30913,7 @@ mod tests {
             .expect_err("UPSERT target alias should hide the base table qualifier");
 
         assert!(
-            matches!(err, CodegenError::TableNotFound(ref name) if name == "t"),
+            matches!(err, CodegenError::ColumnNotFound { ref table, ref column } if table == "t" && column == "t.score"),
             "unexpected error: {err:?}"
         );
     }

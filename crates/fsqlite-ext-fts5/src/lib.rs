@@ -3,7 +3,7 @@
 //! Provides: tokenizer API (unicode61, ascii, porter, trigram), inverted index,
 //! boolean query parsing (implicit AND, OR, NOT binary-only, phrase, prefix,
 //! NEAR, column filter, caret), BM25 ranking, FTS5 virtual table with content
-//! modes, and secure-delete / contentless-delete / insttoken / locale configuration.
+//! modes, and secure-delete / contentless-delete / insttoken / locale / tokendata configuration.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -71,6 +71,7 @@ pub struct Fts5Config {
     detail: DetailMode,
     insttoken: bool,
     locale: bool,
+    tokendata: bool,
 }
 
 impl Fts5Config {
@@ -84,6 +85,7 @@ impl Fts5Config {
             detail: DetailMode::Full,
             insttoken: false,
             locale: false,
+            tokendata: false,
         }
     }
 
@@ -115,6 +117,11 @@ impl Fts5Config {
     #[must_use]
     pub const fn locale_enabled(self) -> bool {
         self.locale
+    }
+
+    #[must_use]
+    pub const fn tokendata_enabled(self) -> bool {
+        self.tokendata
     }
 
     #[must_use]
@@ -201,6 +208,19 @@ fn parse_detail_option(value: &str) -> Option<DetailMode> {
         "column" => Some(DetailMode::Column),
         "none" => Some(DetailMode::None),
         _ => None,
+    }
+}
+
+fn tokendata_query_key(term: &str) -> &str {
+    match term.as_bytes().iter().position(|byte| *byte == 0) {
+        Some(nul_pos) => {
+            if let Some(query_key) = term.get(..nul_pos) {
+                query_key
+            } else {
+                term
+            }
+        }
+        None => term,
     }
 }
 
@@ -1253,6 +1273,8 @@ pub struct InvertedIndex {
     prefix_indexes: HashMap<usize, HashMap<SmallText, PostingList>>,
     /// How much positional detail is retained for each posting.
     detail: DetailMode,
+    /// Whether terms may carry token-data suffixes after the first NUL byte.
+    tokendata: bool,
     /// Set of rowids currently present in the index.
     doc_ids: HashSet<i64>,
     /// Total token count per document (for BM25 avgdl)
@@ -1282,6 +1304,16 @@ impl InvertedIndex {
         prefix_lengths: &[usize],
         detail: DetailMode,
     ) -> Self {
+        Self::with_options_and_tokendata(track_column_sizes, prefix_lengths, detail, false)
+    }
+
+    #[must_use]
+    pub fn with_options_and_tokendata(
+        track_column_sizes: bool,
+        prefix_lengths: &[usize],
+        detail: DetailMode,
+        tokendata: bool,
+    ) -> Self {
         Self {
             index: HashMap::new(),
             prefix_indexes: prefix_lengths
@@ -1290,6 +1322,7 @@ impl InvertedIndex {
                 .map(|prefix_length| (prefix_length, HashMap::new()))
                 .collect(),
             detail,
+            tokendata,
             doc_ids: HashSet::new(),
             doc_lengths: track_column_sizes.then(HashMap::new),
         }
@@ -1310,7 +1343,21 @@ impl InvertedIndex {
         self.detail
     }
 
+    #[must_use]
+    pub const fn tokendata_enabled(&self) -> bool {
+        self.tokendata
+    }
+
+    fn index_key<'a>(&self, term: &'a str) -> &'a str {
+        if self.tokendata {
+            tokendata_query_key(term)
+        } else {
+            term
+        }
+    }
+
     fn append_position(&mut self, term: &str, docid: i64, column: u32, position: u32) {
+        let term = self.index_key(term);
         let stored_column = if self.detail == DetailMode::None {
             0
         } else {
@@ -1401,12 +1448,15 @@ impl InvertedIndex {
     /// Look up postings for a term.
     #[must_use]
     pub fn get_postings(&self, term: &str) -> &[Posting] {
-        self.index.get(term).map_or(&[], SmallVec::as_slice)
+        self.index
+            .get(self.index_key(term))
+            .map_or(&[], SmallVec::as_slice)
     }
 
     /// Look up postings for terms matching a prefix.
     #[must_use]
     pub fn get_prefix_postings(&self, prefix: &str) -> Vec<&Posting> {
+        let prefix = self.index_key(prefix);
         if let Some(prefix_index) = self.prefix_indexes.get(&prefix.chars().count()) {
             return prefix_index
                 .get(prefix)
@@ -2304,10 +2354,11 @@ impl Fts5Table {
 
     /// Rebuild the in-memory index and rowid allocator from persisted rows.
     pub fn rebuild_documents(&mut self, rows: Vec<(i64, Vec<String>)>) {
-        self.index = InvertedIndex::with_options(
+        self.index = InvertedIndex::with_options_and_tokendata(
             self.config.columnsize_enabled(),
             &self.prefix_lengths,
             self.config.detail_mode(),
+            self.config.tokendata_enabled(),
         );
         self.documents = HashMap::with_capacity(rows.len());
         self.next_rowid = 1;
@@ -2527,6 +2578,12 @@ impl VirtualTable for Fts5Table {
                                     FrankenError::function_error("fts5: locale must be 0 or 1")
                                 })?;
                         }
+                        "tokendata" => {
+                            config.tokendata = parse_columnsize_option(value_unquoted.as_str())
+                                .ok_or_else(|| {
+                                    FrankenError::function_error("fts5: tokendata must be 0 or 1")
+                                })?;
+                        }
                         _ => {
                             return Err(FrankenError::function_error(format!(
                                 "fts5: unsupported option '{key}'"
@@ -2559,6 +2616,7 @@ impl VirtualTable for Fts5Table {
             detail = ?config.detail_mode(),
             insttoken = config.insttoken,
             locale = config.locale,
+            tokendata = config.tokendata,
             indexed_columns = ?indexed_columns,
             prefix_lengths = ?prefix_lengths,
             "fts5: connecting virtual table"
@@ -2569,10 +2627,11 @@ impl VirtualTable for Fts5Table {
         table.config = config;
         table.tokenizer_name = tokenizer_name;
         table.prefix_lengths = prefix_lengths;
-        table.index = InvertedIndex::with_options(
+        table.index = InvertedIndex::with_options_and_tokendata(
             table.config.columnsize_enabled(),
             &table.prefix_lengths,
             table.config.detail_mode(),
+            table.config.tokendata_enabled(),
         );
         Ok(table)
     }
@@ -3173,6 +3232,34 @@ mod tests {
         terms: Vec<String>,
     }
 
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5TokendataStructure {
+        config: Fts5Config,
+        terms: Vec<String>,
+        rows: Vec<(i64, Vec<String>)>,
+        matches: Vec<i64>,
+    }
+
+    struct TokendataTestTokenizer;
+
+    impl Fts5Tokenizer for TokendataTestTokenizer {
+        fn name(&self) -> &'static str {
+            "tokendata_test"
+        }
+
+        fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
+            let mut token_with_data = String::new();
+            for token in text.split_whitespace() {
+                token_with_data.clear();
+                token_with_data.push_str(token);
+                token_with_data.push('\0');
+                token_with_data.push_str("payload");
+                sink(token_with_data.as_str(), 0, token.len(), false);
+            }
+        }
+    }
+
     fn table_structure(table: &Fts5Table) -> Fts5TableStructure {
         let columns = table
             .columns
@@ -3495,6 +3582,34 @@ mod tests {
         assert_eq!(index.doc_frequency("world"), 1);
         assert_eq!(index.doc_frequency("rust"), 1);
         assert_eq!(index.term_frequency("hello", 1), 1);
+    }
+
+    #[test]
+    fn test_inverted_index_tokendata_uses_query_key_before_nul() {
+        let mut index =
+            InvertedIndex::with_options_and_tokendata(true, &[3], DetailMode::Full, true);
+        let tokens = vec![
+            Fts5Token {
+                term: "alpha\0noun".to_owned(),
+                start: 0,
+                end: 5,
+                colocated: false,
+            },
+            Fts5Token {
+                term: "beta\0verb".to_owned(),
+                start: 6,
+                end: 10,
+                colocated: false,
+            },
+        ];
+        index.add_document(1, 0, &tokens);
+
+        assert!(index.tokendata_enabled());
+        assert_eq!(tokendata_query_key("alpha\0query"), "alpha");
+        assert_eq!(index.doc_frequency("alpha"), 1);
+        assert_eq!(index.doc_frequency("alpha\0noun"), 1);
+        assert_eq!(index.get_prefix_postings("alp").len(), 1);
+        assert!(index.get_postings("noun").is_empty());
     }
 
     #[test]
@@ -3990,6 +4105,7 @@ mod tests {
                 "prefix='2 3'",
                 "insttoken=1",
                 "locale=1",
+                "tokendata=1",
             ],
         )
         .unwrap();
@@ -4001,6 +4117,7 @@ mod tests {
         assert_eq!(vtab.config.detail_mode(), DetailMode::Column);
         assert!(vtab.config.insttoken_enabled());
         assert!(vtab.config.locale_enabled());
+        assert!(vtab.config.tokendata_enabled());
         assert_eq!(vtab.indexed_columns(), &[true, false]);
         assert_eq!(vtab.prefix_lengths, vec![2, 3]);
         assert!(!vtab.index().tracks_column_sizes());
@@ -4086,6 +4203,14 @@ mod tests {
         let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "locale=true"])
             .expect_err("invalid locale should fail");
         assert!(err.to_string().contains("locale must be 0 or 1"));
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_invalid_tokendata() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "tokendata=true"])
+            .expect_err("invalid tokendata should fail");
+        assert!(err.to_string().contains("tokendata must be 0 or 1"));
     }
 
     #[test]
@@ -4326,6 +4451,7 @@ mod tests {
         detail: Full,
         insttoken: true,
         locale: false,
+        tokendata: false,
     },
     columns: [
         "body",
@@ -4377,6 +4503,7 @@ mod tests {
         detail: Full,
         insttoken: false,
         locale: true,
+        tokendata: false,
     },
     columns: [
         "body",
@@ -4392,6 +4519,67 @@ mod tests {
     terms: [
         "cafe",
         "creme",
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_tokendata() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "tokendata=1"])
+            .map_err(|err| err.to_string())?;
+        table.insert_document_owned_with_tokenizer(
+            17,
+            vec!["alpha beta".to_owned()],
+            &TokendataTestTokenizer,
+        );
+
+        let mut terms: Vec<String> = table.index.index.keys().map(ToString::to_string).collect();
+        terms.sort();
+        let matches = table
+            .search("alpha")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5TokendataStructure {
+                    config: *table.config(),
+                    terms,
+                    rows: table.all_rows(),
+                    matches,
+                }
+            ),
+            r#"Fts5TokendataStructure {
+    config: Fts5Config {
+        secure_delete: false,
+        content_mode: Stored,
+        contentless_delete: false,
+        columnsize: true,
+        detail: Full,
+        insttoken: false,
+        locale: false,
+        tokendata: true,
+    },
+    terms: [
+        "alpha",
+        "beta",
+    ],
+    rows: [
+        (
+            17,
+            [
+                "alpha beta",
+            ],
+        ),
+    ],
+    matches: [
+        17,
     ],
 }"#
         );
@@ -4723,6 +4911,7 @@ mod tests {
         assert_eq!(config.detail_mode(), DetailMode::Full);
         assert!(!config.insttoken_enabled());
         assert!(!config.locale_enabled());
+        assert!(!config.tokendata_enabled());
     }
 
     #[test]

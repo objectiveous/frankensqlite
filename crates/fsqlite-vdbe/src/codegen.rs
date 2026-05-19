@@ -4951,9 +4951,7 @@ fn codegen_select_ordered_scan(
         .collect();
 
     let num_sort_keys = sort_keys.len();
-    let num_data_cols = usize::try_from(out_col_count).map_err(|_| {
-        CodegenError::Unsupported("negative output column count in ordered SELECT".to_owned())
-    })?;
+    let num_data_cols = result_column_count_usize(columns, table);
     let total_sorter_cols = num_sort_keys + num_data_cols;
 
     // Sorter cursor is separate from the table cursor.

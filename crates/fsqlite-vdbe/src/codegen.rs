@@ -4618,9 +4618,7 @@ fn codegen_select_distinct_scan(
     done_label: crate::Label,
     end_label: crate::Label,
 ) -> Result<(), CodegenError> {
-    let num_data_cols = usize::try_from(out_col_count).map_err(|_| {
-        CodegenError::Unsupported("negative output column count in DISTINCT SELECT".to_owned())
-    })?;
+    let num_data_cols = result_column_count_usize(columns, table);
 
     // Sorter cursor is separate from the table cursor.
     let sorter_cursor = cursor + 1;
@@ -13115,11 +13113,15 @@ fn register_table_index_meta(b: &mut ProgramBuilder, table: &TableSchema, table_
 /// Count result columns (handling `SELECT *`).
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn result_column_count(columns: &[ResultColumn], table: &TableSchema) -> i32 {
-    let mut count = 0i32;
+    result_column_count_usize(columns, table) as i32
+}
+
+fn result_column_count_usize(columns: &[ResultColumn], table: &TableSchema) -> usize {
+    let mut count = 0usize;
     for col in columns {
         match col {
             ResultColumn::Star | ResultColumn::TableStar(_) => {
-                count += table.columns.len() as i32;
+                count += table.columns.len();
             }
             ResultColumn::Expr { .. } => count += 1,
         }

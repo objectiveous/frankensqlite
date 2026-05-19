@@ -1637,7 +1637,8 @@ pub fn codegen_select(
             ..
         } => (columns, from, where_clause, group_by, having, *distinct),
         SelectCore::Values(rows) => {
-            return codegen_values_select(b, rows);
+            codegen_values_select(b, rows);
+            return Ok(());
         }
     };
 
@@ -7844,9 +7845,14 @@ fn emit_join_result_columns(
 
 ///
 /// Handles `VALUES (1, 'a'), (2, 'b')` etc.
-fn codegen_values_select(b: &mut ProgramBuilder, rows: &[Vec<Expr>]) -> Result<(), CodegenError> {
+fn codegen_values_select(b: &mut ProgramBuilder, rows: &[Vec<Expr>]) {
     if rows.is_empty() {
-        return Err(CodegenError::Unsupported("empty VALUES".to_owned()));
+        let end_label = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+        b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end_label);
+        return;
     }
 
     let end_label = b.emit_label();
@@ -7876,8 +7882,6 @@ fn codegen_values_select(b: &mut ProgramBuilder, rows: &[Vec<Expr>]) -> Result<(
 
     // End target for Init jump.
     b.resolve_label(end_label);
-
-    Ok(())
 }
 
 /// Generate VDBE bytecode for SELECT without FROM clause.
@@ -21405,6 +21409,36 @@ mod tests {
             copy_count >= 2,
             "explicit target-column mapping should reorder both projected values"
         );
+    }
+
+    #[test]
+    fn test_codegen_empty_values_select_emits_no_rows() -> Result<(), String> {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Values(vec![]),
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).map_err(|err| format!("{err:?}"))?;
+        let prog = b.finish().map_err(|err| format!("{err:?}"))?;
+
+        let ops = opcode_sequence(&prog);
+        if ops.contains(&Opcode::ResultRow) {
+            return Err("empty VALUES should not emit result rows".to_owned());
+        }
+        if !has_opcodes(&prog, &[Opcode::Init, Opcode::Transaction, Opcode::Halt]) {
+            return Err(format!(
+                "empty VALUES should emit a valid no-row program, got {ops:?}"
+            ));
+        }
+
+        Ok(())
     }
 
     // === Test: SELECT DISTINCT full scan ===

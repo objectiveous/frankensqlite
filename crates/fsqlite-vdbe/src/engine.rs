@@ -8692,7 +8692,9 @@ impl VdbeEngine {
                 Opcode::Next | Opcode::SorterNext => {
                     // Advance cursor to the next row. Jump to p2 if more rows.
                     let cursor_id = op.p1;
-                    let has_next = if self.pending_next_after_delete.remove(&cursor_id) {
+                    let has_next = if !self.pending_next_after_delete.is_empty()
+                        && self.pending_next_after_delete.remove(&cursor_id)
+                    {
                         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                             !cursor.cursor.eof()
                         } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
@@ -8772,7 +8774,9 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     // Prev repositions the cursor, so clear any pending
                     // delete/next state before evaluating movement.
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    if !self.pending_next_after_delete.is_empty() {
+                        self.pending_next_after_delete.remove(&cursor_id);
+                    }
                     let has_prev = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                         cursor.cursor.prev(&cursor.cx)?
                     } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
@@ -12662,7 +12666,9 @@ impl VdbeEngine {
     #[inline(always)]
     fn execute_next_hot(&mut self, op: &VdbeOp, pc: &mut usize) -> Result<()> {
         let cursor_id = op.p1;
-        let has_next = if self.pending_next_after_delete.remove(&cursor_id) {
+        let has_next = if !self.pending_next_after_delete.is_empty()
+            && self.pending_next_after_delete.remove(&cursor_id)
+        {
             if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                 !cursor.cursor.eof()
             } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {

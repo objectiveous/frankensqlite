@@ -12642,8 +12642,94 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            Opcode::Next | Opcode::SorterNext => {
+                self.execute_next_hot(op, pc)?;
+                Ok(true)
+            }
             _ => Ok(false),
         }
+    }
+
+    #[inline(always)]
+    fn execute_next_hot(&mut self, op: &VdbeOp, pc: &mut usize) -> Result<()> {
+        let cursor_id = op.p1;
+        let has_next = if self.pending_next_after_delete.remove(&cursor_id) {
+            if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                !cursor.cursor.eof()
+            } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                if cursor.is_pseudo {
+                    false
+                } else if let Some(pos) = cursor.position {
+                    if let Some(table) = self
+                        .db
+                        .as_ref()
+                        .and_then(|db| db.get_table(cursor.root_page))
+                    {
+                        if pos < table.rows.len() {
+                            true
+                        } else {
+                            cursor.position = None;
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
+            if let Some(pos) = sorter.position {
+                let next = pos + 1;
+                if next < sorter.rows.len() {
+                    sorter.position = Some(next);
+                    true
+                } else {
+                    sorter.position = None;
+                    false
+                }
+            } else {
+                false
+            }
+        } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+            if cursor.is_pseudo {
+                false
+            } else if let Some(db) = self.db.as_ref() {
+                if let Some(table) = db.get_table(cursor.root_page) {
+                    if let Some(pos) = cursor.position {
+                        let next = pos + 1;
+                        if next < table.rows.len() {
+                            cursor.position = Some(next);
+                            true
+                        } else {
+                            cursor.position = None;
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+            cursor.cursor.next(&cursor.cx)?
+        } else {
+            false
+        };
+        if has_next {
+            #[allow(clippy::cast_sign_loss)]
+            {
+                *pc = op.p2 as usize;
+            }
+        } else {
+            *pc += 1;
+        }
+        Ok(())
     }
 
     #[inline(always)]

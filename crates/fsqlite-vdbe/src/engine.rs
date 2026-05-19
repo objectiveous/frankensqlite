@@ -8719,6 +8719,8 @@ impl VdbeEngine {
                         } else {
                             false
                         }
+                    } else if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                        cursor.cursor.next(&cursor.cx)?
                     } else if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
                         if let Some(pos) = sorter.position {
                             let next = pos + 1;
@@ -8755,8 +8757,6 @@ impl VdbeEngine {
                         } else {
                             false
                         }
-                    } else if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                        cursor.cursor.next(&cursor.cx)?
                     } else {
                         false
                     };
@@ -12689,6 +12689,8 @@ impl VdbeEngine {
             } else {
                 false
             }
+        } else if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+            cursor.cursor.next(&cursor.cx)?
         } else if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
             if let Some(pos) = sorter.position {
                 let next = pos + 1;
@@ -12725,8 +12727,6 @@ impl VdbeEngine {
             } else {
                 false
             }
-        } else if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-            cursor.cursor.next(&cursor.cx)?
         } else {
             false
         };
@@ -13242,7 +13242,12 @@ impl VdbeEngine {
         let start_a = op.p1;
         let start_b = op.p2;
         let count = op.p3;
-        let coll_arc = Arc::clone(&self.collation_registry);
+        let has_collation = matches!(op.p4, P4::Collation(_) | P4::Str(_));
+        let coll_arc = if has_collation {
+            Some(Arc::clone(&self.collation_registry))
+        } else {
+            None
+        };
         let mut coll_guard = None;
         let mut result = Ordering::Equal;
 
@@ -13257,18 +13262,21 @@ impl VdbeEngine {
                 if let (SqliteValue::Text(left), SqliteValue::Text(right)) = (val_a, val_b) {
                     if let Some(fast) = builtin_collation_compare_text(left, right, coll_name) {
                         Some(fast)
-                    } else {
-                        let coll = coll_guard.get_or_insert_with(|| {
-                            coll_arc.lock().unwrap_or_else(|e| e.into_inner())
-                        });
+                    } else if let Some(arc) = coll_arc.as_ref() {
+                        let coll = coll_guard
+                            .get_or_insert_with(|| arc.lock().unwrap_or_else(|e| e.into_inner()));
                         collate_compare(val_a, val_b, coll_name, coll)
+                    } else {
+                        val_a.partial_cmp(val_b)
                     }
                 } else if let Some(fast) = fast_compare_same_storage_class(val_a, val_b, &op.p4) {
                     fast
-                } else {
+                } else if let Some(arc) = coll_arc.as_ref() {
                     let coll = coll_guard
-                        .get_or_insert_with(|| coll_arc.lock().unwrap_or_else(|e| e.into_inner()));
+                        .get_or_insert_with(|| arc.lock().unwrap_or_else(|e| e.into_inner()));
                     collate_compare(val_a, val_b, coll_name, coll)
+                } else {
+                    val_a.partial_cmp(val_b)
                 }
             } else if let Some(fast) = fast_compare_same_storage_class(val_a, val_b, &P4::None) {
                 fast

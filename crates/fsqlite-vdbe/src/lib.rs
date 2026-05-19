@@ -909,21 +909,25 @@ fn peephole_fuse_append_insert(ops: &mut smallvec::SmallVec<[VdbeOp; 64]>) {
 /// lets hot prepared table executions skip the `MemDatabase` handoff entirely.
 fn compute_requires_attached_memdb(ops: &[VdbeOp]) -> bool {
     let mut storage_cursor_ids = HashSet::new();
+    let mut sorter_cursor_ids = HashSet::new();
 
     for op in ops {
         match op.opcode {
             Opcode::OpenRead | Opcode::OpenWrite | Opcode::FusedOpenWriteLast => {
                 storage_cursor_ids.insert(op.p1);
             }
+            Opcode::SorterOpen => {
+                sorter_cursor_ids.insert(op.p1);
+            }
             Opcode::Close => {
                 storage_cursor_ids.remove(&op.p1);
+                sorter_cursor_ids.remove(&op.p1);
             }
             Opcode::OpenEphemeral
             | Opcode::OpenAutoindex
             | Opcode::OpenPseudo
             | Opcode::OpenDup
             | Opcode::ReopenIdx
-            | Opcode::SorterOpen
             | Opcode::CreateBtree
             | Opcode::Clear
             | Opcode::Destroy
@@ -977,7 +981,7 @@ fn compute_requires_attached_memdb(ops: &[VdbeOp]) -> bool {
             | Opcode::SetSnapshot
             | Opcode::CountIndexEqRun
             | Opcode::FusedAppendInsert
-                if !storage_cursor_ids.contains(&op.p1) =>
+                if !storage_cursor_ids.contains(&op.p1) && !sorter_cursor_ids.contains(&op.p1) =>
             {
                 return true;
             }
@@ -2519,6 +2523,23 @@ mod tests {
         assert!(
             prog.requires_attached_memdb(),
             "ephemeral table programs still depend on the attached MemDatabase"
+        );
+    }
+
+    #[test]
+    fn test_program_with_sorter_cursor_does_not_require_attached_memdb() {
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::SorterOpen, 0, 1, 0, P4::Str("+".to_owned()), 0);
+        b.emit_op(Opcode::Column, 0, 0, 1, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        assert!(
+            !prog.requires_attached_memdb(),
+            "sorter-backed temp/exchange state is owned by VDBE and should not force a MemDatabase handoff"
         );
     }
 

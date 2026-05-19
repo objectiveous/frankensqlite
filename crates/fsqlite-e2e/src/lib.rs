@@ -47,6 +47,7 @@ pub mod sqlite3_baseline;
 pub mod sqlite_executor;
 pub mod validation;
 pub mod verification_gates;
+pub mod verify_csqlite;
 pub mod workload;
 
 // ─── Deterministic Seed Constants (bd-mblr.4.3.1) ────────────────────────────

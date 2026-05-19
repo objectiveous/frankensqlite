@@ -638,8 +638,10 @@ fn measure(s: &str) -> u32 {
 /// Trigram tokenizer: generates all 3-character substrings of the input.
 #[derive(Debug, Default)]
 pub struct TrigramTokenizer {
-    /// Whether to also remove diacritics before generating trigrams.
+    /// Whether matching is case-sensitive.
     pub case_sensitive: bool,
+    /// Whether to remove common Latin diacritics before generating trigrams.
+    pub remove_diacritics: bool,
 }
 
 impl Fts5Tokenizer for TrigramTokenizer {
@@ -657,14 +659,57 @@ impl Fts5Tokenizer for TrigramTokenizer {
             let start = window[0].0;
             let end_char = window[2];
             let end = end_char.0 + end_char.1.len_utf8();
-            let term: String = if self.case_sensitive {
-                window.iter().map(|(_, c)| *c).collect()
-            } else {
-                window.iter().flat_map(|(_, c)| c.to_lowercase()).collect()
-            };
+            let mut term = String::new();
+            for (_, ch) in window {
+                push_trigram_char(&mut term, *ch, self.case_sensitive, self.remove_diacritics);
+            }
             sink(term.as_str(), start, end, false);
         }
     }
+}
+
+fn push_trigram_char(term: &mut String, ch: char, case_sensitive: bool, remove_diacritics: bool) {
+    let ch = if remove_diacritics {
+        latin_diacritic_base(ch).unwrap_or(ch)
+    } else {
+        ch
+    };
+
+    if case_sensitive {
+        term.push(ch);
+    } else {
+        term.extend(ch.to_lowercase());
+    }
+}
+
+fn latin_diacritic_base(ch: char) -> Option<char> {
+    Some(match ch {
+        'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' | 'Ā' | 'Ă' | 'Ą' | 'à' | 'á' | 'â' | 'ã' | 'ä' | 'å'
+        | 'ā' | 'ă' | 'ą' => 'a',
+        'Ç' | 'Ć' | 'Ĉ' | 'Ċ' | 'Č' | 'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => 'c',
+        'Ð' | 'Ď' | 'Đ' | 'ð' | 'ď' | 'đ' => 'd',
+        'È' | 'É' | 'Ê' | 'Ë' | 'Ē' | 'Ĕ' | 'Ė' | 'Ę' | 'Ě' | 'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ'
+        | 'ė' | 'ę' | 'ě' => 'e',
+        'Ĝ' | 'Ğ' | 'Ġ' | 'Ģ' | 'ĝ' | 'ğ' | 'ġ' | 'ģ' => 'g',
+        'Ĥ' | 'Ħ' | 'ĥ' | 'ħ' => 'h',
+        'Ì' | 'Í' | 'Î' | 'Ï' | 'Ĩ' | 'Ī' | 'Ĭ' | 'Į' | 'İ' | 'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī'
+        | 'ĭ' | 'į' | 'ı' => 'i',
+        'Ĵ' | 'ĵ' => 'j',
+        'Ķ' | 'ķ' => 'k',
+        'Ĺ' | 'Ļ' | 'Ľ' | 'Ŀ' | 'Ł' | 'ĺ' | 'ļ' | 'ľ' | 'ŀ' | 'ł' => 'l',
+        'Ñ' | 'Ń' | 'Ņ' | 'Ň' | 'ñ' | 'ń' | 'ņ' | 'ň' => 'n',
+        'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' | 'Ø' | 'Ō' | 'Ŏ' | 'Ő' | 'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø'
+        | 'ō' | 'ŏ' | 'ő' => 'o',
+        'Ŕ' | 'Ŗ' | 'Ř' | 'ŕ' | 'ŗ' | 'ř' => 'r',
+        'Ś' | 'Ŝ' | 'Ş' | 'Š' | 'ś' | 'ŝ' | 'ş' | 'š' => 's',
+        'Ţ' | 'Ť' | 'Ŧ' | 'ţ' | 'ť' | 'ŧ' => 't',
+        'Ù' | 'Ú' | 'Û' | 'Ü' | 'Ũ' | 'Ū' | 'Ŭ' | 'Ů' | 'Ű' | 'Ų' | 'ù' | 'ú' | 'û' | 'ü' | 'ũ'
+        | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => 'u',
+        'Ŵ' | 'ŵ' => 'w',
+        'Ý' | 'Ŷ' | 'Ÿ' | 'ý' | 'ÿ' | 'ŷ' => 'y',
+        'Ź' | 'Ż' | 'Ž' | 'ź' | 'ż' | 'ž' => 'z',
+        _ => return None,
+    })
 }
 
 fn split_fts5_tokenizer_spec(spec: &str) -> Vec<String> {
@@ -733,6 +778,29 @@ fn unicode61_tokenizer_from_args(args: &[String]) -> Unicode61Tokenizer {
     tokenizer
 }
 
+fn trigram_tokenizer_from_args(args: &[String]) -> Option<TrigramTokenizer> {
+    let mut tokenizer = TrigramTokenizer::default();
+    let mut index = 0;
+
+    while let Some((key, value)) = take_tokenizer_option(args, &mut index) {
+        match key.to_ascii_lowercase().as_str() {
+            "case_sensitive" => {
+                tokenizer.case_sensitive = parse_columnsize_option(value)?;
+            }
+            "remove_diacritics" => {
+                tokenizer.remove_diacritics = parse_columnsize_option(value)?;
+            }
+            _ => return None,
+        }
+    }
+
+    if tokenizer.case_sensitive && tokenizer.remove_diacritics {
+        return None;
+    }
+
+    Some(tokenizer)
+}
+
 fn create_tokenizer_from_parts(parts: &[String]) -> Option<Box<dyn Fts5Tokenizer>> {
     let name = parts.first()?.to_ascii_lowercase();
     let args = &parts[1..];
@@ -748,7 +816,7 @@ fn create_tokenizer_from_parts(parts: &[String]) -> Option<Box<dyn Fts5Tokenizer
             };
             Some(Box::new(PorterTokenizer::new(inner)))
         }
-        "trigram" => Some(Box::new(TrigramTokenizer::default())),
+        "trigram" => Some(Box::new(trigram_tokenizer_from_args(args)?)),
         _ => None,
     }
 }
@@ -1808,9 +1876,8 @@ fn evaluate_expr_impl(
 ) -> Vec<i64> {
     match expr {
         Fts5Expr::Term(term) => {
-            let lower = term.to_lowercase();
             let mut docs: Vec<i64> = index
-                .get_postings(&lower)
+                .get_postings(term)
                 .iter()
                 .filter(|posting| posting_matches_allowed_columns(posting.column, allowed_columns))
                 .map(|p| p.docid)
@@ -1820,9 +1887,8 @@ fn evaluate_expr_impl(
             docs
         }
         Fts5Expr::Prefix(prefix) => {
-            let lower = prefix.to_lowercase();
             let mut docs: Vec<i64> = index
-                .get_prefix_postings(&lower)
+                .get_prefix_postings(prefix)
                 .iter()
                 .filter(|posting| posting_matches_allowed_columns(posting.column, allowed_columns))
                 .map(|p| p.docid)
@@ -1858,9 +1924,8 @@ fn evaluate_expr_impl(
             // appears at position 0.
             match inner.as_ref() {
                 Fts5Expr::Term(term) => {
-                    let lower = term.to_lowercase();
                     let mut docs: Vec<i64> = index
-                        .get_postings(&lower)
+                        .get_postings(term)
                         .iter()
                         .filter(|posting| {
                             posting.positions.contains(&0)
@@ -1873,9 +1938,8 @@ fn evaluate_expr_impl(
                     docs
                 }
                 Fts5Expr::Prefix(prefix) => {
-                    let lower = prefix.to_lowercase();
                     let mut docs: Vec<i64> = index
-                        .get_prefix_postings(&lower)
+                        .get_prefix_postings(prefix)
                         .iter()
                         .filter(|posting| {
                             posting.positions.contains(&0)
@@ -1892,8 +1956,7 @@ fn evaluate_expr_impl(
                     if words.is_empty() {
                         return Vec::new();
                     }
-                    let first_lower = words[0].to_lowercase();
-                    let first_postings = index.get_postings(&first_lower);
+                    let first_postings = index.get_postings(&words[0]);
                     let mut result = Vec::new();
 
                     for first_p in first_postings {
@@ -1909,7 +1972,7 @@ fn evaluate_expr_impl(
                         for (offset, word) in words.iter().enumerate().skip(1) {
                             #[allow(clippy::cast_possible_truncation)]
                             let target_pos = offset as u32; // implied start_pos = 0
-                            let found = index.get_postings(&word.to_lowercase()).iter().any(|p| {
+                            let found = index.get_postings(word).iter().any(|p| {
                                 p.docid == first_p.docid
                                     && p.column == first_p.column
                                     && p.positions.contains(&target_pos)
@@ -2066,7 +2129,7 @@ fn evaluate_phrase(
             for (offset, word) in words.iter().enumerate().skip(1) {
                 #[allow(clippy::cast_possible_truncation)]
                 let target_pos = start_pos + offset as u32; // implied start_pos = 0
-                let found = index.get_postings(&word.to_lowercase()).iter().any(|p| {
+                let found = index.get_postings(word).iter().any(|p| {
                     p.docid == first_p.docid
                         && p.column == first_p.column
                         && p.positions.contains(&target_pos)
@@ -2095,8 +2158,7 @@ fn evaluate_near(
         return Vec::new();
     }
 
-    let first_lower = terms[0].to_lowercase();
-    let first_postings = index.get_postings(&first_lower);
+    let first_postings = index.get_postings(&terms[0]);
     let mut result = Vec::new();
 
     for first_p in first_postings {
@@ -2106,8 +2168,7 @@ fn evaluate_near(
         let mut all_near = true;
 
         for term in &terms[1..] {
-            let lower = term.to_lowercase();
-            let found = index.get_postings(&lower).iter().any(|p| {
+            let found = index.get_postings(term).iter().any(|p| {
                 if p.docid != first_p.docid || p.column != first_p.column {
                     return false;
                 }
@@ -2576,15 +2637,15 @@ impl Fts5Table {
 /// Extract all leaf-level terms from an expression tree for BM25 scoring.
 fn extract_query_terms(expr: &Fts5Expr) -> Vec<String> {
     match expr {
-        Fts5Expr::Term(t) => vec![t.to_lowercase()],
-        Fts5Expr::Prefix(p) => vec![p.to_lowercase()],
+        Fts5Expr::Term(t) => vec![t.clone()],
+        Fts5Expr::Prefix(p) => vec![p.clone()],
         Fts5Expr::Phrase(words) => words.clone(),
         Fts5Expr::And(l, r) | Fts5Expr::Or(l, r) | Fts5Expr::Not(l, r) => {
             let mut terms = extract_query_terms(l);
             terms.extend(extract_query_terms(r));
             terms
         }
-        Fts5Expr::Near(terms, _) => terms.iter().map(|t| t.to_lowercase()).collect(),
+        Fts5Expr::Near(terms, _) => terms.clone(),
         Fts5Expr::ColumnFilter(_, inner) | Fts5Expr::InitialToken(inner) => {
             extract_query_terms(inner)
         }
@@ -2621,6 +2682,11 @@ impl VirtualTable for Fts5Table {
                     let value_unquoted = value_unquoted_raw.to_ascii_lowercase();
                     match key_lower.as_str() {
                         "tokenize" => {
+                            if create_tokenizer(value_unquoted_raw).is_none() {
+                                return Err(FrankenError::function_error(
+                                    "fts5: unsupported tokenizer specification",
+                                ));
+                            }
                             value_unquoted_raw.clone_into(&mut tokenizer_name);
                         }
                         "content" => {
@@ -3389,6 +3455,16 @@ mod tests {
         terms: Vec<String>,
         rows: Vec<(i64, Vec<String>)>,
         matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5TrigramCaseSensitiveStructure {
+        tokenizer: String,
+        terms: Vec<String>,
+        rows: Vec<(i64, Vec<String>)>,
+        upper_matches: Vec<i64>,
+        lower_matches: Vec<i64>,
     }
 
     struct TokendataTestTokenizer;
@@ -4285,6 +4361,26 @@ mod tests {
     }
 
     #[test]
+    fn test_fts5_vtab_connect_rejects_invalid_tokenizer_spec() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "body",
+                "tokenize='trigram case_sensitive 1 remove_diacritics 1'",
+            ],
+        )
+        .expect_err("invalid tokenizer should fail");
+        assert!(
+            err.to_string()
+                .contains("unsupported tokenizer specification")
+        );
+    }
+
+    #[test]
     fn test_fts5_vtab_connect_rejects_invalid_columnsize() {
         let cx = Cx::new();
         let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "columnsize=2"])
@@ -4934,6 +5030,79 @@ mod tests {
     }
 
     #[test]
+    fn test_fts5_structural_snapshot_trigram_case_sensitive() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "tri",
+                "body",
+                "tokenize='trigram case_sensitive 1'",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        table.insert_document(1, &["ABC".to_owned()]);
+        table.insert_document(2, &["abc".to_owned()]);
+
+        let mut terms: Vec<String> = table.index.index.keys().map(ToString::to_string).collect();
+        terms.sort();
+        let upper_matches = table
+            .search("ABC")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let lower_matches = table
+            .search("abc")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+
+        let actual = format!(
+            "{:#?}",
+            Fts5TrigramCaseSensitiveStructure {
+                tokenizer: table.tokenizer_name.clone(),
+                terms,
+                rows: table.all_rows(),
+                upper_matches,
+                lower_matches,
+            }
+        );
+        let expected = r#"Fts5TrigramCaseSensitiveStructure {
+    tokenizer: "trigram case_sensitive 1",
+    terms: [
+        "ABC",
+        "abc",
+    ],
+    rows: [
+        (
+            1,
+            [
+                "ABC",
+            ],
+        ),
+        (
+            2,
+            [
+                "abc",
+            ],
+        ),
+    ],
+    upper_matches: [
+        1,
+    ],
+    lower_matches: [
+        2,
+    ],
+}"#;
+        assert!(actual.as_bytes().eq(expected.as_bytes()));
+        Ok(())
+    }
+
+    #[test]
     fn test_fts5_vtab_update_insert() {
         let cx = Cx::new();
         let mut vtab = Fts5Table::connect(&cx, &["fts5", "main", "t", "content"]).unwrap();
@@ -5523,6 +5692,7 @@ mod tests {
     fn test_trigram_case_sensitive() {
         let tok = TrigramTokenizer {
             case_sensitive: true,
+            remove_diacritics: false,
         };
         let tokens = tok.tokenize("ABC");
         assert_eq!(tokens.len(), 1);
@@ -5533,10 +5703,33 @@ mod tests {
     fn test_trigram_case_insensitive() {
         let tok = TrigramTokenizer {
             case_sensitive: false,
+            remove_diacritics: false,
         };
         let tokens = tok.tokenize("ABC");
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].term, "abc");
+    }
+
+    #[test]
+    fn test_create_tokenizer_trigram_case_sensitive_arg() {
+        let tok = create_tokenizer("trigram case_sensitive 1").unwrap();
+        let tokens = tok.tokenize("ABC");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].term, "ABC");
+    }
+
+    #[test]
+    fn test_create_tokenizer_trigram_remove_diacritics_arg() {
+        let tok = create_tokenizer("trigram remove_diacritics 1").unwrap();
+        let tokens = tok.tokenize("ábC");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].term, "abc");
+    }
+
+    #[test]
+    fn test_create_tokenizer_trigram_rejects_invalid_options() {
+        assert!(create_tokenizer("trigram case_sensitive 1 remove_diacritics 1").is_none());
+        assert!(create_tokenizer("trigram case_sensitive maybe").is_none());
     }
 
     #[test]
@@ -6288,7 +6481,7 @@ mod tests {
             )),
         );
         let terms = extract_query_terms(&expr);
-        assert_eq!(terms, vec!["hello", "wor", "exact", "match"]);
+        assert_eq!(terms, vec!["Hello", "Wor", "exact", "match"]);
     }
 
     #[test]

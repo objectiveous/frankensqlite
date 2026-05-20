@@ -201,14 +201,7 @@ pub fn codegen_select(
     }
     let from_clause = from.as_ref().expect("checked above");
 
-    let table_name = match &from_clause.source {
-        fsqlite_ast::TableOrSubquery::Table { name, .. } => &name.name,
-        _ => {
-            return Err(CodegenError::Unsupported(
-                "non-table FROM source".to_owned(),
-            ));
-        }
-    };
+    let table_name = single_table_select_source_name(&from_clause.source)?;
 
     let table = find_table(schema, table_name)?;
     let cursor = 0_i32;
@@ -412,6 +405,26 @@ fn codegen_select_values(b: &mut ProgramBuilder, rows: &[Vec<Expr>]) -> Result<(
     b.resolve_label(end_label);
 
     Ok(())
+}
+
+fn single_table_select_source_name(
+    source: &fsqlite_ast::TableOrSubquery,
+) -> Result<&str, CodegenError> {
+    match source {
+        fsqlite_ast::TableOrSubquery::Table { name, .. } => Ok(&name.name),
+        fsqlite_ast::TableOrSubquery::ParenJoin(inner) if inner.joins.is_empty() => {
+            single_table_select_source_name(&inner.source)
+        }
+        fsqlite_ast::TableOrSubquery::ParenJoin(_) => Err(CodegenError::Unsupported(
+            "parenthesized JOIN source in single-table SELECT".to_owned(),
+        )),
+        fsqlite_ast::TableOrSubquery::Subquery { .. } => Err(CodegenError::Unsupported(
+            "subquery FROM source in single-table SELECT".to_owned(),
+        )),
+        fsqlite_ast::TableOrSubquery::TableFunction { .. } => Err(CodegenError::Unsupported(
+            "table-valued function FROM source in single-table SELECT".to_owned(),
+        )),
+    }
 }
 
 /// Codegen for a full table scan SELECT.
@@ -2211,6 +2224,66 @@ mod tests {
             .find(|op| op.opcode == Opcode::Transaction)
             .unwrap();
         assert_eq!(txn.p2, 0);
+    }
+
+    #[test]
+    fn test_codegen_select_parenthesized_single_table_source() -> Result<(), String> {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::bare("b"), Span::ZERO),
+                        alias: None,
+                    }],
+                    from: Some(FromClause {
+                        source: TableOrSubquery::ParenJoin(Box::new(from_table("t"))),
+                        joins: vec![],
+                    }),
+                    where_clause: Some(rowid_eq_param()),
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).map_err(|err| format!("{err:?}"))?;
+        let prog = b.finish().map_err(|err| format!("{err:?}"))?;
+
+        if !has_opcodes(
+            &prog,
+            &[
+                Opcode::OpenRead,
+                Opcode::SeekRowid,
+                Opcode::Column,
+                Opcode::ResultRow,
+            ],
+        ) {
+            return Err(format!(
+                "parenthesized table source should use table SELECT path, got {:?}",
+                opcode_sequence(&prog)
+            ));
+        }
+
+        let open_read_root = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::OpenRead)
+            .map(|op| op.p2);
+        if open_read_root != Some(2) {
+            return Err(format!(
+                "expected OpenRead root page 2, got {open_read_root:?}"
+            ));
+        }
+
+        Ok(())
     }
 
     #[test]

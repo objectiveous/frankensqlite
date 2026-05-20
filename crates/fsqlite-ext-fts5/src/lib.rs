@@ -728,17 +728,21 @@ impl Fts5Tokenizer for TrigramTokenizer {
     }
 
     fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
-        let chars: Vec<(usize, char)> = text.char_indices().collect();
-        if chars.len() < 3 {
-            return;
-        }
-
-        for window in chars.windows(3) {
+        let mut window = SmallVec::<[(usize, char); 3]>::new();
+        let mut term = String::new();
+        for item in text.char_indices() {
+            if window.len() == 3 {
+                let _ = window.remove(0);
+            }
+            window.push(item);
+            if window.len() < 3 {
+                continue;
+            }
             let start = window[0].0;
             let end_char = window[2];
             let end = end_char.0 + end_char.1.len_utf8();
-            let mut term = String::new();
-            for (_, ch) in window {
+            term.clear();
+            for (_, ch) in &window {
                 push_trigram_char(&mut term, *ch, self.case_sensitive, self.remove_diacritics);
             }
             sink(term.as_str(), start, end, false);
@@ -4659,6 +4663,15 @@ mod tests {
         rows: Vec<(i64, Vec<String>)>,
         upper_matches: Vec<i64>,
         lower_matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5TrigramStreamingStructure {
+        tokens: Vec<(String, usize, usize)>,
+        short_input_tokens: usize,
+        accented_matches: Vec<i64>,
+        ascii_matches: Vec<i64>,
     }
 
     #[allow(dead_code)]
@@ -8938,6 +8951,82 @@ mod tests {
         assert!(!tokens.is_empty());
         // "café" has 4 chars, so we get 2 trigrams.
         assert_eq!(tokens.len(), 2);
+    }
+
+    #[test]
+    fn test_trigram_streaming_preserves_unicode_offsets() {
+        let tok = TrigramTokenizer::default();
+        let tokens = tok.tokenize("éABC");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].term, "éab");
+        assert_eq!(tokens[0].start, 0);
+        assert_eq!(tokens[0].end, 4);
+        assert_eq!(tokens[1].term, "abc");
+        assert_eq!(tokens[1].start, 2);
+        assert_eq!(tokens[1].end, 5);
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_trigram_streaming() -> std::result::Result<(), String> {
+        let tok = TrigramTokenizer::default();
+        let tokens = tok
+            .tokenize("éABC")
+            .into_iter()
+            .map(|token| (token.term, token.start, token.end))
+            .collect();
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "tri",
+                "body",
+                "tokenize='trigram remove_diacritics 1'",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        table.insert_document(1, &["éABC".to_owned()]);
+        table.insert_document(2, &["zabc".to_owned()]);
+        let mut accented_matches = search_rowids(&table, "eab")?;
+        accented_matches.sort_unstable();
+        let mut ascii_matches = search_rowids(&table, "abc")?;
+        ascii_matches.sort_unstable();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5TrigramStreamingStructure {
+                    tokens,
+                    short_input_tokens: tok.tokenize("éA").len(),
+                    accented_matches,
+                    ascii_matches,
+                }
+            ),
+            r#"Fts5TrigramStreamingStructure {
+    tokens: [
+        (
+            "éab",
+            0,
+            4,
+        ),
+        (
+            "abc",
+            2,
+            5,
+        ),
+    ],
+    short_input_tokens: 0,
+    accented_matches: [
+        1,
+    ],
+    ascii_matches: [
+        1,
+        2,
+    ],
+}"#
+        );
+        Ok(())
     }
 
     #[test]

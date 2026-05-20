@@ -575,6 +575,40 @@ const ATTACHED_DROP_CASES: &[QueryCase] = &[
     },
 ];
 
+const ATTACHED_CREATE_VIEW_SETUP: &str = "
+    ATTACH DATABASE ':memory:' AS aux;
+
+    CREATE TABLE aux.base (
+        id INTEGER PRIMARY KEY,
+        value TEXT NOT NULL,
+        qty INTEGER NOT NULL
+    );
+    INSERT INTO aux.base VALUES
+        (1, 'alpha', 10),
+        (2, 'beta', 20),
+        (3, 'gamma', 30);
+
+    CREATE VIEW aux.filtered AS
+        SELECT id, value, qty * 2 AS doubled
+        FROM base
+        WHERE qty >= 20;
+";
+
+const ATTACHED_CREATE_VIEW_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "attached create view projected rows",
+        sql: "SELECT id, value, doubled FROM aux.filtered ORDER BY id",
+    },
+    QueryCase {
+        name: "attached create view sqlite_master row",
+        sql: "SELECT type, name FROM aux.sqlite_master WHERE name = 'filtered'",
+    },
+    QueryCase {
+        name: "attached create view aggregate",
+        sql: "SELECT COUNT(*), SUM(doubled), MIN(value), MAX(value) FROM aux.filtered",
+    },
+];
+
 const ERROR_PATH_SETUP: &str = "
     CREATE TABLE constrained (
         id INTEGER PRIMARY KEY,
@@ -1211,6 +1245,12 @@ fn attached_drop_delegation_matches_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(ATTACHED_DROP_SETUP);
     harness.execute_script(ATTACHED_DROP_SCRIPT);
     harness.assert_queries_match("attached DROP", ATTACHED_DROP_CASES);
+}
+
+#[test]
+fn attached_create_view_delegation_matches_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(ATTACHED_CREATE_VIEW_SETUP);
+    harness.assert_queries_match("attached CREATE VIEW", ATTACHED_CREATE_VIEW_CASES);
 }
 
 #[test]

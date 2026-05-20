@@ -354,6 +354,68 @@ const CAST_COLLATION_CASES: &[QueryCase] = &[
     },
 ];
 
+const SUBQUERY_SETUP: &str = "
+    CREATE TABLE customers (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        tier TEXT NOT NULL
+    );
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER NOT NULL,
+        amount INTEGER NOT NULL,
+        status TEXT NOT NULL
+    );
+    CREATE TABLE flags (
+        customer_id INTEGER PRIMARY KEY,
+        blocked INTEGER NOT NULL
+    );
+
+    INSERT INTO customers VALUES
+        (1, 'Ada', 'gold'),
+        (2, 'Bert', 'silver'),
+        (3, 'Cara', 'gold'),
+        (4, 'Drew', 'bronze'),
+        (5, 'Eli', 'silver');
+    INSERT INTO orders VALUES
+        (10, 1, 120, 'shipped'),
+        (11, 1, 40, 'pending'),
+        (12, 2, 75, 'shipped'),
+        (13, 3, 200, 'cancelled'),
+        (14, 3, 30, 'shipped'),
+        (15, 5, 15, 'pending');
+    INSERT INTO flags VALUES
+        (2, 1),
+        (4, 1);
+";
+
+const SUBQUERY_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "scalar correlated aggregate",
+        sql: "SELECT c.name, (SELECT SUM(o.amount) FROM orders o WHERE o.customer_id = c.id) AS total_amount FROM customers c ORDER BY c.id",
+    },
+    QueryCase {
+        name: "in grouped subquery",
+        sql: "SELECT name FROM customers WHERE id IN (SELECT customer_id FROM orders GROUP BY customer_id HAVING SUM(amount) >= 100) ORDER BY name",
+    },
+    QueryCase {
+        name: "correlated exists",
+        sql: "SELECT c.name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.status = 'shipped') ORDER BY c.name",
+    },
+    QueryCase {
+        name: "correlated not exists",
+        sql: "SELECT c.name FROM customers c WHERE NOT EXISTS (SELECT 1 FROM flags f WHERE f.customer_id = c.id AND f.blocked = 1) ORDER BY c.name",
+    },
+    QueryCase {
+        name: "derived table aggregate",
+        sql: "SELECT tier, COUNT(*), SUM(total_amount) FROM (SELECT c.id, c.tier, SUM(o.amount) AS total_amount FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.id, c.tier) totals GROUP BY tier ORDER BY tier",
+    },
+    QueryCase {
+        name: "scalar threshold subquery",
+        sql: "SELECT id, amount FROM orders WHERE amount > (SELECT AVG(amount) FROM orders) ORDER BY id",
+    },
+];
+
 #[test]
 fn select_join_group_by_aggregates_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
@@ -386,4 +448,10 @@ fn window_functions_match_rusqlite() {
 fn cast_and_collation_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CAST_COLLATION_SETUP);
     harness.assert_queries_match("CAST/collation", CAST_COLLATION_CASES);
+}
+
+#[test]
+fn subqueries_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(SUBQUERY_SETUP);
+    harness.assert_queries_match("subquery", SUBQUERY_CASES);
 }

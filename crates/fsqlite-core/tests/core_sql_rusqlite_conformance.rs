@@ -519,8 +519,7 @@ const DDL_CASES: &[QueryCase] = &[
     },
     QueryCase {
         name: "index schema registration",
-        sql:
-            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = 'idx_accounts_tier'",
+        sql: "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = 'idx_accounts_tier'",
     },
     QueryCase {
         name: "view schema registration",

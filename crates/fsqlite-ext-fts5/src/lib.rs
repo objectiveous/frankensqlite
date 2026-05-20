@@ -432,11 +432,22 @@ impl Unicode61Tokenizer {
         Self::default()
     }
 
+    #[inline]
+    fn option_contains(option_chars: &str, ch: char) -> bool {
+        if ch.is_ascii() {
+            let mut encoded = [0; 4];
+            let needle = ch.encode_utf8(&mut encoded).as_bytes()[0];
+            option_chars.as_bytes().contains(&needle)
+        } else {
+            option_chars.contains(ch)
+        }
+    }
+
     fn is_token_char(&self, ch: char) -> bool {
-        if !self.token_chars.is_empty() && self.token_chars.contains(ch) {
+        if !self.token_chars.is_empty() && Self::option_contains(&self.token_chars, ch) {
             return true;
         }
-        if !self.separators.is_empty() && self.separators.contains(ch) {
+        if !self.separators.is_empty() && Self::option_contains(&self.separators, ch) {
             return false;
         }
         ch.is_alphanumeric()
@@ -4773,6 +4784,16 @@ mod tests {
         rejected_specs: Vec<String>,
     }
 
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5Unicode61CharClassStructure {
+        tokens: Vec<(String, usize, usize)>,
+        terms: Vec<String>,
+        section_matches: Vec<i64>,
+        alpha_matches: Vec<i64>,
+        cafe_matches: Vec<i64>,
+    }
+
     struct TokendataTestTokenizer;
 
     impl Fts5Tokenizer for TokendataTestTokenizer {
@@ -5027,6 +5048,119 @@ mod tests {
     ],
 }"#
         );
+    }
+
+    #[test]
+    fn test_unicode61_option_char_class_fast_path() {
+        let tok = create_tokenizer("unicode61 tokenchars '§-' separators 'é_' remove_diacritics 0")
+            .unwrap();
+        let tokens = tok.tokenize("sec§tion well-known café alpha_beta");
+        let terms: Vec<&str> = tokens.iter().map(|token| token.term.as_str()).collect();
+
+        assert_eq!(
+            terms,
+            vec!["sec§tion", "well-known", "caf", "alpha", "beta"]
+        );
+        assert_eq!(tokens[0].start, 0);
+        assert_eq!(tokens[0].end, 9);
+        assert_eq!(tokens[2].start, 21);
+        assert_eq!(tokens[2].end, 24);
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_unicode61_char_class() -> std::result::Result<(), String> {
+        let tokenizer_spec = "unicode61 tokenchars '§-' separators 'é_' remove_diacritics 0";
+        let tok = create_tokenizer(tokenizer_spec).unwrap();
+        let tokens = tok
+            .tokenize("sec§tion well-known café alpha_beta")
+            .into_iter()
+            .map(|token| (token.term, token.start, token.end))
+            .collect();
+
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "unicode_docs",
+                "body",
+                "tokenize=\"unicode61 tokenchars '§-' separators 'é_' remove_diacritics 0\"",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        table.insert_document(1, &["sec§tion well-known café alpha_beta".to_owned()]);
+        table.insert_document(2, &["section alpha cafe".to_owned()]);
+        let structure = table_structure(&table);
+
+        let mut section_matches = search_rowids(&table, "sec§tion")?;
+        section_matches.sort_unstable();
+        let mut alpha_matches = search_rowids(&table, "alpha")?;
+        alpha_matches.sort_unstable();
+        let mut cafe_matches = search_rowids(&table, "cafe")?;
+        cafe_matches.sort_unstable();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5Unicode61CharClassStructure {
+                    tokens,
+                    terms: structure.terms.into_iter().map(|term| term.term).collect(),
+                    section_matches,
+                    alpha_matches,
+                    cafe_matches,
+                }
+            ),
+            r#"Fts5Unicode61CharClassStructure {
+    tokens: [
+        (
+            "sec§tion",
+            0,
+            9,
+        ),
+        (
+            "well-known",
+            10,
+            20,
+        ),
+        (
+            "caf",
+            21,
+            24,
+        ),
+        (
+            "alpha",
+            27,
+            32,
+        ),
+        (
+            "beta",
+            33,
+            37,
+        ),
+    ],
+    terms: [
+        "alpha",
+        "beta",
+        "caf",
+        "cafe",
+        "section",
+        "sec§tion",
+        "well-known",
+    ],
+    section_matches: [
+        1,
+    ],
+    alpha_matches: [
+        1,
+        2,
+    ],
+    cafe_matches: [
+        2,
+    ],
+}"#
+        );
+        Ok(())
     }
 
     #[test]

@@ -30,7 +30,10 @@ use smallvec::SmallVec;
 
 use crate::journal::{JournalHeader, JournalPageRecord};
 use crate::page_buf::{PageBuf, PageBufPool};
-use crate::page_cache::{PageCacheMetricsSnapshot, PageCachePageSnapshot, ShardedPageCache};
+use crate::page_cache::{
+    PageCacheEvictionPolicy, PageCacheMetricsSnapshot, PageCachePageSnapshot, ShardedPageCache,
+};
+use crate::s3_fifo::S3FifoConfig;
 use crate::traits::{self, JournalMode, MvccPager, TransactionHandle, TransactionMode, WalBackend};
 
 /// Identity-hashed `HashMap<PageNumber, V>` used on the INSERT hot path.
@@ -5694,6 +5697,9 @@ where
         let resolved_max = crate::page_cache::resolve_page_buffer_max(page_buffer_max);
         let cache =
             ShardedPageCache::with_max_buffers_for_initial_pages(page_size, resolved_max, db_size);
+        cache.set_eviction_policy(PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::new(
+            resolved_max,
+        )));
         let pool = cache.pool().clone();
         Ok(Self {
             vfs,
@@ -5879,6 +5885,9 @@ where
         let resolved_max = crate::page_cache::resolve_page_buffer_max(page_buffer_max);
         let cache =
             ShardedPageCache::with_max_buffers_for_initial_pages(page_size, resolved_max, db_size);
+        cache.set_eviction_policy(PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::new(
+            resolved_max,
+        )));
         let pool = cache.pool().clone();
         Ok(Self {
             vfs,
@@ -15865,7 +15874,9 @@ mod tests {
     #[test]
     fn test_group_commit_fault_hook_after_flush_before_publish_wakes_waiters_with_error_and_records_context()
      {
-        let _guard = FAULT_HOOK_TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = FAULT_HOOK_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for attempt in 0..32 {
             crate::fault_hooks::clear();
 
@@ -15994,7 +16005,9 @@ mod tests {
     /// Replay: `cargo test -p fsqlite-pager --lib -- test_fault_drop_condvar_notify --nocapture`
     #[test]
     fn test_fault_drop_condvar_notify_waiters_recover_via_timeout() {
-        let _guard = FAULT_HOOK_TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = FAULT_HOOK_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for attempt in 0..32 {
             crate::fault_hooks::clear();
 
@@ -16103,7 +16116,9 @@ mod tests {
     /// Replay: `cargo test -p fsqlite-pager --lib -- test_fault_during_phase_c --nocapture`
     #[test]
     fn test_fault_during_phase_c_returns_error_and_wal_frames_survive() {
-        let _guard = FAULT_HOOK_TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = FAULT_HOOK_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::fault_hooks::clear();
 
         let cx = Cx::new();

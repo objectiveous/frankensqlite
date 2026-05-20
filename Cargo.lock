@@ -1260,6 +1260,7 @@ dependencies = [
  "fsqlite-error",
  "fsqlite-parser",
  "fsqlite-types",
+ "insta",
  "lru",
  "proptest",
  "serde",

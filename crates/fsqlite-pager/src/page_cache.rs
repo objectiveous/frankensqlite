@@ -7226,6 +7226,128 @@ mod tests {
     }
 
     #[test]
+    fn test_track_q_flat_hash_capacity_rehash_preserves_pages() {
+        const COLLIDERS: usize = 16;
+
+        let small_capacity = round_flat_slot_capacity(FLAT_SLOTS_MIN_CAPACITY / 2);
+        let large_capacity = round_flat_slot_capacity(FLAT_SLOTS_MIN_CAPACITY + 1);
+        assert_eq!(
+            small_capacity, FLAT_SLOTS_MIN_CAPACITY,
+            "small profile should clamp to the minimum flat-slot capacity"
+        );
+        assert_eq!(
+            large_capacity,
+            FLAT_SLOTS_MIN_CAPACITY * 2,
+            "large profile should round to the next flat-slot capacity"
+        );
+
+        let small_slots = FlatPageSlots::new(small_capacity);
+        let large_slots = FlatPageSlots::new(large_capacity);
+        let small_bucket = small_slots.hash_pgno(PageNumber::ONE.get());
+        let mut colliders = Vec::with_capacity(COLLIDERS);
+        let mut candidate = 1_u32;
+        let mut first_large_bucket = None;
+        let mut split_across_large_buckets = false;
+        while colliders.len() < COLLIDERS || !split_across_large_buckets {
+            let page_no = PageNumber::new(candidate).expect("rehash candidate page number");
+            if small_slots.hash_pgno(candidate) == small_bucket {
+                let large_bucket = large_slots.hash_pgno(candidate);
+                if let Some(first) = first_large_bucket {
+                    split_across_large_buckets |= large_bucket != first;
+                } else {
+                    first_large_bucket = Some(large_bucket);
+                }
+                if colliders.len() < COLLIDERS {
+                    colliders.push(page_no);
+                }
+            }
+            candidate = candidate
+                .checked_add(1)
+                .expect("rehash collision search should not exhaust page numbers");
+        }
+        assert!(
+            split_across_large_buckets,
+            "larger flat-slot mask should rehash the small-bucket collision set"
+        );
+
+        for page_no in colliders.iter().copied() {
+            assert!(
+                small_slots
+                    .try_insert(page_no, track_q_page_buf(page_no))
+                    .expect("small-capacity collider should fit in the probe window"),
+                "small-capacity collider should be newly inserted"
+            );
+            assert!(
+                large_slots
+                    .try_insert(page_no, track_q_page_buf(page_no))
+                    .expect("large-capacity collider should fit after rehashing"),
+                "large-capacity collider should be newly inserted"
+            );
+        }
+
+        small_slots.reset_metrics();
+        large_slots.reset_metrics();
+        let started = monotonic_test_clock();
+        let mut small_chain_walk_count = 0_u64;
+        let mut large_chain_walk_count = 0_u64;
+        for page_no in colliders.iter().copied() {
+            let small_copy = small_slots
+                .get_copy(page_no)
+                .expect("small-capacity collider should remain readable");
+            assert_track_q_page(page_no, &small_copy);
+            let large_copy = large_slots
+                .get_copy(page_no)
+                .expect("large-capacity collider should remain readable");
+            assert_track_q_page(page_no, &large_copy);
+
+            small_chain_walk_count = small_chain_walk_count.saturating_add(
+                u64::try_from(track_q_probe_distance(&small_slots, page_no))
+                    .expect("small probe distance fits u64"),
+            );
+            large_chain_walk_count = large_chain_walk_count.saturating_add(
+                u64::try_from(track_q_probe_distance(&large_slots, page_no))
+                    .expect("large probe distance fits u64"),
+            );
+        }
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            small_slots.len(),
+            colliders.len(),
+            "small-capacity table should retain the whole collision set"
+        );
+        assert_eq!(
+            large_slots.len(),
+            colliders.len(),
+            "large-capacity table should retain the whole rehashed collision set"
+        );
+        assert!(
+            large_chain_walk_count < small_chain_walk_count,
+            "larger capacity should rehash the collision set into shorter probe chains"
+        );
+
+        let hits = large_slots.hits.load(Ordering::Relaxed);
+        emit_track_q_log(
+            "test_track_q_flat_hash_capacity_rehash_preserves_pages",
+            "verify",
+            elapsed,
+            colliders.len(),
+            hits,
+            large_chain_walk_count,
+            1,
+            track_q_hit_rate(hits, large_slots.misses.load(Ordering::Relaxed)),
+            json!({
+                "small_capacity": small_capacity,
+                "large_capacity": large_capacity,
+                "small_chain_walk_count": small_chain_walk_count,
+                "large_chain_walk_count": large_chain_walk_count,
+                "small_bucket": small_bucket,
+                "resident_pages": large_slots.len()
+            }),
+        );
+    }
+
+    #[test]
     fn test_track_q_flat_hash_remove_and_reclaim_tombstone_slots() {
         let slots = FlatPageSlots::new(64);
         let target_bucket = slots.hash_pgno(PageNumber::ONE.get());

@@ -5213,8 +5213,7 @@ mod tests {
 
     #[test]
     fn test_fts5_structural_snapshot_ascii_tokenizer_lazy_casefold()
-    -> std::result::Result<(), String>
-    {
+    -> std::result::Result<(), String> {
         let tok = AsciiTokenizer;
         let tokens = tok
             .tokenize("ABCédef 123XYZ")

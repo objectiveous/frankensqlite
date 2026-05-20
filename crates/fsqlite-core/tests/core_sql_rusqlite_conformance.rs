@@ -291,6 +291,69 @@ const WINDOW_CASES: &[QueryCase] = &[
     },
 ];
 
+const CAST_COLLATION_SETUP: &str = "
+    CREATE TABLE typed (
+        id INTEGER PRIMARY KEY,
+        raw TEXT,
+        amount TEXT
+    );
+    INSERT INTO typed VALUES
+        (1, '456', '3.14'),
+        (2, 'abc', '123.45abc'),
+        (3, '', ''),
+        (4, NULL, NULL);
+
+    CREATE TABLE tags (tag TEXT COLLATE NOCASE);
+    INSERT INTO tags VALUES
+        ('Rust'),
+        ('rust'),
+        ('RUST'),
+        ('Python'),
+        ('python');
+
+    CREATE TABLE words (w TEXT COLLATE NOCASE);
+    INSERT INTO words VALUES
+        ('banana'),
+        ('Apple'),
+        ('cherry'),
+        ('APRICOT'),
+        ('Blueberry');
+
+    CREATE TABLE padded (id INTEGER PRIMARY KEY, label TEXT COLLATE RTRIM);
+    INSERT INTO padded VALUES
+        (1, 'abc'),
+        (2, 'abc  '),
+        (3, 'ABC'),
+        (4, 'abd');
+";
+
+const CAST_COLLATION_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "cast text numeric prefixes",
+        sql: "SELECT id, CAST(raw AS INTEGER), typeof(CAST(raw AS INTEGER)), CAST(amount AS REAL), typeof(CAST(amount AS REAL)) FROM typed ORDER BY id",
+    },
+    QueryCase {
+        name: "cast scalar storage classes",
+        sql: "SELECT CAST(123 AS TEXT), typeof(CAST(123 AS TEXT)), CAST(3.99 AS INTEGER), CAST(NULL AS TEXT), typeof(CAST(NULL AS TEXT))",
+    },
+    QueryCase {
+        name: "nocase distinct aggregate",
+        sql: "SELECT COUNT(DISTINCT tag), MIN(tag), MAX(tag) FROM tags",
+    },
+    QueryCase {
+        name: "nocase grouping",
+        sql: "SELECT tag, COUNT(*) FROM tags GROUP BY tag ORDER BY tag",
+    },
+    QueryCase {
+        name: "nocase ordering",
+        sql: "SELECT w FROM words ORDER BY w",
+    },
+    QueryCase {
+        name: "rtrim equality",
+        sql: "SELECT id, label FROM padded WHERE label = 'abc' ORDER BY id",
+    },
+];
+
 #[test]
 fn select_join_group_by_aggregates_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
@@ -317,4 +380,10 @@ fn cte_queries_match_rusqlite() {
 fn window_functions_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(WINDOW_SETUP);
     harness.assert_queries_match("window", WINDOW_CASES);
+}
+
+#[test]
+fn cast_and_collation_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CAST_COLLATION_SETUP);
+    harness.assert_queries_match("CAST/collation", CAST_COLLATION_CASES);
 }

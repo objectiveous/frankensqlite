@@ -114,6 +114,10 @@ harness = false
 name = "concurrent_write_persistent_bench"
 harness = false
 
+[[bench]]
+name = "pipeline_stage_bench"
+harness = false
+
 [[bin]]
 name = "comprehensive-bench"
 path = "src/bin/comprehensive_bench.rs"

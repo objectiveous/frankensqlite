@@ -7559,9 +7559,9 @@ fn emit_join_expr(
                     b.emit_op(Opcode::Integer, 0, target, 0, P4::None, 0);
                 }
                 Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp => {
-                    return Err(CodegenError::Unsupported(
-                        "datetime literal in JOIN codegen".to_owned(),
-                    ));
+                    if let Some(text) = current_time_literal_text(lit) {
+                        b.emit_op(Opcode::String8, 0, target, 0, P4::Str(text), 0);
+                    }
                 }
             }
             Ok(())
@@ -29949,6 +29949,37 @@ mod tests {
             .find(|op| op.opcode == Opcode::Eq && op.p5 == 0x20)
             .expect("JOIN ON equality should emit an Eq STOREP2 opcode");
         assert_eq!(join_cmp.p4, P4::Collation("NOCASE".to_owned()));
+    }
+
+    #[test]
+    fn test_codegen_join_where_current_date_literal_emits_string() -> Result<(), String> {
+        let stmt = select_sql(
+            "SELECT c.name FROM customers c CROSS JOIN orders o WHERE CURRENT_DATE IS NOT NULL",
+        );
+        let schema = test_schema_with_join_lookup();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).map_err(|err| format!("{err:?}"))?;
+        let prog = b.finish().map_err(|err| format!("{err:?}"))?;
+
+        let has_current_date = prog.ops().iter().any(|op| {
+            matches!(
+                &op.p4,
+                P4::Str(text)
+                    if op.opcode == Opcode::String8
+                        && text.len() == 10
+                        && text.as_bytes().get(4) == Some(&b'-')
+                        && text.as_bytes().get(7) == Some(&b'-')
+            )
+        });
+        if !has_current_date {
+            return Err(format!(
+                "JOIN WHERE CURRENT_DATE should emit a date String8 literal, got {:?}",
+                opcode_sequence(&prog)
+            ));
+        }
+
+        Ok(())
     }
 
     fn ambiguous_join_on_stmt(column: &str) -> SelectStatement {

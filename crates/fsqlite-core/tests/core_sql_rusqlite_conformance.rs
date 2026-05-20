@@ -478,6 +478,57 @@ const ATTACHED_UPDATE_CASES: &[QueryCase] = &[
     },
 ];
 
+const ATTACHED_INSERT_SELECT_SETUP: &str = "
+    ATTACH DATABASE ':memory:' AS aux;
+
+    CREATE TABLE source_items (
+        id INTEGER PRIMARY KEY,
+        value TEXT NOT NULL,
+        qty INTEGER NOT NULL
+    );
+    INSERT INTO source_items VALUES
+        (1, 'alpha', 10),
+        (2, 'beta', 20),
+        (3, 'gamma', 30),
+        (4, 'delta', 40);
+
+    CREATE TABLE main_filter (id INTEGER PRIMARY KEY);
+    INSERT INTO main_filter VALUES (1), (3);
+
+    CREATE TABLE aux.t (
+        id INTEGER PRIMARY KEY,
+        value TEXT NOT NULL UNIQUE,
+        qty INTEGER NOT NULL
+    );
+
+    INSERT INTO aux.t(id, value, qty)
+        SELECT id, value, qty
+        FROM source_items
+        WHERE qty >= 20
+        ORDER BY id;
+
+    INSERT INTO aux.t(id, value, qty)
+        SELECT id + 10, value || '-copy', qty + 1
+        FROM source_items
+        WHERE id IN (SELECT id FROM main_filter)
+        ORDER BY id;
+";
+
+const ATTACHED_INSERT_SELECT_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "attached insert select persisted rows",
+        sql: "SELECT id, value, qty FROM aux.t ORDER BY id",
+    },
+    QueryCase {
+        name: "attached insert select aggregate",
+        sql: "SELECT COUNT(*), SUM(qty), MIN(value), MAX(value) FROM aux.t",
+    },
+    QueryCase {
+        name: "attached insert select copied filtered rows",
+        sql: "SELECT id, value, qty FROM aux.t WHERE id >= 10 ORDER BY id",
+    },
+];
+
 const ERROR_PATH_SETUP: &str = "
     CREATE TABLE constrained (
         id INTEGER PRIMARY KEY,
@@ -1101,6 +1152,12 @@ fn dml_insert_update_delete_match_rusqlite() {
 fn attached_update_delegation_matches_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(ATTACHED_UPDATE_SETUP);
     harness.assert_queries_match("attached UPDATE", ATTACHED_UPDATE_CASES);
+}
+
+#[test]
+fn attached_insert_select_delegation_matches_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(ATTACHED_INSERT_SELECT_SETUP);
+    harness.assert_queries_match("attached INSERT SELECT", ATTACHED_INSERT_SELECT_CASES);
 }
 
 #[test]

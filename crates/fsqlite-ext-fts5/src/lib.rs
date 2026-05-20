@@ -8,6 +8,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::ScalarFunction;
@@ -3182,6 +3183,233 @@ fn create_tokenizer_from_parts(parts: &[String]) -> Option<Box<dyn Fts5Tokenizer
 pub fn create_tokenizer(name: &str) -> Option<Box<dyn Fts5Tokenizer>> {
     let parts = split_fts5_tokenizer_spec(name);
     create_tokenizer_from_parts(&parts)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fts5TokenizeReason {
+    Document,
+    Query,
+    Prefix,
+    Auxiliary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fts5TokenizeRequest<'a> {
+    pub text: &'a str,
+    pub reason: Fts5TokenizeReason,
+    pub locale: Option<&'a str>,
+}
+
+impl<'a> Fts5TokenizeRequest<'a> {
+    #[must_use]
+    pub const fn new(text: &'a str, reason: Fts5TokenizeReason) -> Self {
+        Self {
+            text,
+            reason,
+            locale: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_locale(mut self, locale: &'a str) -> Self {
+        self.locale = Some(locale);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5ExtensionContext<'a> {
+    pub table_name: &'a str,
+    pub columns: &'a [String],
+    pub query_terms: &'a [String],
+    pub rowid: Option<i64>,
+    pub row: Option<&'a [String]>,
+    pub locale: Option<&'a str>,
+}
+
+impl<'a> Fts5ExtensionContext<'a> {
+    #[must_use]
+    pub const fn new(table_name: &'a str, columns: &'a [String]) -> Self {
+        Self {
+            table_name,
+            columns,
+            query_terms: &[],
+            rowid: None,
+            row: None,
+            locale: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_query_terms(mut self, query_terms: &'a [String]) -> Self {
+        self.query_terms = query_terms;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_row(mut self, rowid: i64, row: &'a [String]) -> Self {
+        self.rowid = Some(rowid);
+        self.row = Some(row);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_locale(mut self, locale: &'a str) -> Self {
+        self.locale = Some(locale);
+        self
+    }
+}
+
+type Fts5TokenizerFactory = Arc<dyn Fn(&[String]) -> Option<Box<dyn Fts5Tokenizer>> + Send + Sync>;
+type Fts5AuxiliaryFunction =
+    Arc<dyn Fn(&Fts5ExtensionContext<'_>, &[SqliteValue]) -> Result<SqliteValue> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct Fts5ExtensionApi {
+    tokenizers: BTreeMap<String, Fts5TokenizerFactory>,
+    auxiliaries: BTreeMap<String, Fts5AuxiliaryFunction>,
+}
+
+impl std::fmt::Debug for Fts5ExtensionApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fts5ExtensionApi")
+            .field("tokenizers", &self.tokenizer_names())
+            .field("auxiliaries", &self.auxiliary_names())
+            .finish()
+    }
+}
+
+impl Default for Fts5ExtensionApi {
+    fn default() -> Self {
+        Self::with_builtins()
+    }
+}
+
+impl Fts5ExtensionApi {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            tokenizers: BTreeMap::new(),
+            auxiliaries: BTreeMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_builtins() -> Self {
+        let mut api = Self::new();
+        let _ = api.register_tokenizer("unicode61", |args| {
+            Some(Box::new(unicode61_tokenizer_from_args(args)?))
+        });
+        let _ = api.register_tokenizer("ascii", |args| {
+            args.is_empty()
+                .then_some(Box::new(AsciiTokenizer) as Box<dyn Fts5Tokenizer>)
+        });
+        let _ = api.register_tokenizer("porter", |args| {
+            let inner = if args.is_empty() {
+                Box::new(Unicode61Tokenizer::new()) as Box<dyn Fts5Tokenizer>
+            } else {
+                create_tokenizer_from_parts(args)?
+            };
+            Some(Box::new(PorterTokenizer::new(inner)))
+        });
+        let _ = api.register_tokenizer("trigram", |args| {
+            Some(Box::new(trigram_tokenizer_from_args(args)?))
+        });
+        let _ = api.register_auxiliary("rowid", |ctx, _args| {
+            Ok(ctx.rowid.map_or(SqliteValue::Null, SqliteValue::Integer))
+        });
+        let _ = api.register_auxiliary("column_count", |ctx, _args| {
+            Ok(SqliteValue::Integer(
+                i64::try_from(ctx.columns.len()).unwrap_or(i64::MAX),
+            ))
+        });
+        api
+    }
+
+    pub fn register_tokenizer<F>(
+        &mut self,
+        name: impl AsRef<str>,
+        factory: F,
+    ) -> Option<Fts5TokenizerFactory>
+    where
+        F: Fn(&[String]) -> Option<Box<dyn Fts5Tokenizer>> + Send + Sync + 'static,
+    {
+        self.tokenizers
+            .insert(canonical_fts5_api_name(name.as_ref()), Arc::new(factory))
+    }
+
+    #[must_use]
+    pub fn find_tokenizer(&self, name: &str) -> Option<Fts5TokenizerFactory> {
+        self.tokenizers
+            .get(&canonical_fts5_api_name(name))
+            .map(Arc::clone)
+    }
+
+    #[must_use]
+    pub fn create_tokenizer(&self, spec: &str) -> Option<Box<dyn Fts5Tokenizer>> {
+        let parts = split_fts5_tokenizer_spec(spec);
+        let name = parts.first()?;
+        self.find_tokenizer(name)?.as_ref()(&parts[1..])
+    }
+
+    pub fn tokenize(&self, spec: &str, request: Fts5TokenizeRequest<'_>) -> Result<Vec<Fts5Token>> {
+        let tokenizer = self.create_tokenizer(spec).ok_or_else(|| {
+            FrankenError::function_error(format!("fts5: unknown tokenizer '{spec}'"))
+        })?;
+        let mut tokens = tokenizer.tokenize(request.text);
+        if request.reason == Fts5TokenizeReason::Prefix {
+            tokens.retain(|token| !token.term.is_empty());
+        }
+        Ok(tokens)
+    }
+
+    pub fn register_auxiliary<F>(
+        &mut self,
+        name: impl AsRef<str>,
+        function: F,
+    ) -> Option<Fts5AuxiliaryFunction>
+    where
+        F: Fn(&Fts5ExtensionContext<'_>, &[SqliteValue]) -> Result<SqliteValue>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.auxiliaries
+            .insert(canonical_fts5_api_name(name.as_ref()), Arc::new(function))
+    }
+
+    #[must_use]
+    pub fn find_auxiliary(&self, name: &str) -> Option<Fts5AuxiliaryFunction> {
+        self.auxiliaries
+            .get(&canonical_fts5_api_name(name))
+            .map(Arc::clone)
+    }
+
+    pub fn invoke_auxiliary(
+        &self,
+        name: &str,
+        context: &Fts5ExtensionContext<'_>,
+        args: &[SqliteValue],
+    ) -> Result<SqliteValue> {
+        let function = self.find_auxiliary(name).ok_or_else(|| {
+            FrankenError::function_error(format!("fts5: unknown auxiliary function '{name}'"))
+        })?;
+        function(context, args)
+    }
+
+    #[must_use]
+    pub fn tokenizer_names(&self) -> Vec<String> {
+        self.tokenizers.keys().cloned().collect()
+    }
+
+    #[must_use]
+    pub fn auxiliary_names(&self) -> Vec<String> {
+        self.auxiliaries.keys().cloned().collect()
+    }
+}
+
+fn canonical_fts5_api_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
 }
 
 // ---------------------------------------------------------------------------
@@ -7619,6 +7847,18 @@ mod tests {
 
     #[allow(dead_code)]
     #[derive(Debug)]
+    struct Fts5ExtensionApiStructure {
+        tokenizers: Vec<String>,
+        auxiliaries: Vec<String>,
+        document_tokens: Vec<Fts5Token>,
+        query_tokens: Vec<Fts5Token>,
+        prefix_tokens: Vec<Fts5Token>,
+        aux_value: SqliteValue,
+        missing_aux_error: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
     struct Fts5ColumnFilterSetStructure {
         tokens: Vec<(Fts5QueryTokenKind, String)>,
         braced_matches: Vec<i64>,
@@ -7999,6 +8239,31 @@ mod tests {
                 token_with_data.push('\0');
                 token_with_data.push_str("payload");
                 sink(token_with_data.as_str(), 0, token.len(), false);
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct SynonymTestTokenizer {
+        suffix: String,
+    }
+
+    impl Fts5Tokenizer for SynonymTestTokenizer {
+        fn name(&self) -> &'static str {
+            "synonym_test"
+        }
+
+        fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
+            let mut synonym = String::new();
+            for token in text.split_whitespace() {
+                let start = text.find(token).unwrap_or(0);
+                let end = start + token.len();
+                let normalized = token.to_ascii_lowercase();
+                sink(normalized.as_str(), start, end, false);
+                synonym.clear();
+                synonym.push_str(&normalized);
+                synonym.push_str(&self.suffix);
+                sink(synonym.as_str(), start, end, true);
             }
         }
     }
@@ -10511,6 +10776,196 @@ mod tests {
         assert!(create_tokenizer("porter").is_some());
         assert!(create_tokenizer("trigram").is_some());
         assert!(create_tokenizer("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_fts5_extension_api_registers_custom_tokenizer_and_aux()
+    -> std::result::Result<(), String> {
+        let mut api = Fts5ExtensionApi::with_builtins();
+        let _ = api.register_tokenizer("synonym", |args| {
+            let suffix = args.first().cloned().unwrap_or_else(|| "_syn".to_owned());
+            Some(Box::new(SynonymTestTokenizer { suffix }))
+        });
+        let _ = api.register_auxiliary("query_term_count", |ctx, args| {
+            let extra = args.first().map_or(0, SqliteValue::to_integer);
+            Ok(SqliteValue::Integer(
+                i64::try_from(ctx.query_terms.len()).unwrap_or(i64::MAX) + extra,
+            ))
+        });
+
+        let tokens = api
+            .tokenize(
+                "synonym _alias",
+                Fts5TokenizeRequest::new("Rust", Fts5TokenizeReason::Query).with_locale("en_US"),
+            )
+            .map_err(|err| err.to_string())?;
+        assert_eq!(
+            tokens,
+            vec![
+                Fts5Token {
+                    term: "rust".to_owned(),
+                    start: 0,
+                    end: 4,
+                    colocated: false,
+                },
+                Fts5Token {
+                    term: "rust_alias".to_owned(),
+                    start: 0,
+                    end: 4,
+                    colocated: true,
+                },
+            ]
+        );
+
+        let columns = vec!["body".to_owned()];
+        let terms = vec!["rust".to_owned(), "sqlite".to_owned()];
+        let context = Fts5ExtensionContext::new("docs", &columns)
+            .with_query_terms(&terms)
+            .with_locale("en_US");
+        let value = api
+            .invoke_auxiliary("query_term_count", &context, &[SqliteValue::Integer(3)])
+            .map_err(|err| err.to_string())?;
+        assert_eq!(value, SqliteValue::Integer(5));
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_extension_api() -> std::result::Result<(), String> {
+        let mut api = Fts5ExtensionApi::with_builtins();
+        let _ = api.register_tokenizer("synonym", |args| {
+            let suffix = args.first().cloned().unwrap_or_else(|| "_syn".to_owned());
+            Some(Box::new(SynonymTestTokenizer { suffix }))
+        });
+        let _ = api.register_auxiliary("row_summary", |ctx, args| {
+            let label = args.first().map_or_else(String::new, SqliteValue::to_text);
+            let rowid = ctx.rowid.unwrap_or_default();
+            let locale = ctx.locale.unwrap_or("none");
+            Ok(SqliteValue::Text(SmallText::from_string(format!(
+                "{label}:{rowid}:{locale}:{}",
+                ctx.query_terms.join("|")
+            ))))
+        });
+
+        let columns = vec!["title".to_owned(), "body".to_owned()];
+        let row = vec!["Rust".to_owned(), "SQLite".to_owned()];
+        let query_terms = vec!["rust".to_owned(), "sqlite".to_owned()];
+        let context = Fts5ExtensionContext::new("docs", &columns)
+            .with_query_terms(&query_terms)
+            .with_row(42, &row)
+            .with_locale("en_US");
+
+        let missing_aux_error = api
+            .invoke_auxiliary("missing_aux", &context, &[])
+            .expect_err("missing custom aux should be explicit")
+            .to_string();
+        let snapshot = Fts5ExtensionApiStructure {
+            tokenizers: api.tokenizer_names(),
+            auxiliaries: api.auxiliary_names(),
+            document_tokens: api
+                .tokenize(
+                    "unicode61",
+                    Fts5TokenizeRequest::new("Café Rust", Fts5TokenizeReason::Document),
+                )
+                .map_err(|err| err.to_string())?,
+            query_tokens: api
+                .tokenize(
+                    "synonym _q",
+                    Fts5TokenizeRequest::new("Rust", Fts5TokenizeReason::Query)
+                        .with_locale("en_US"),
+                )
+                .map_err(|err| err.to_string())?,
+            prefix_tokens: api
+                .tokenize(
+                    "trigram",
+                    Fts5TokenizeRequest::new("Prefix", Fts5TokenizeReason::Prefix),
+                )
+                .map_err(|err| err.to_string())?,
+            aux_value: api
+                .invoke_auxiliary(
+                    "row_summary",
+                    &context,
+                    &[SqliteValue::Text(SmallText::from_string("hit"))],
+                )
+                .map_err(|err| err.to_string())?,
+            missing_aux_error,
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5ExtensionApiStructure {
+    tokenizers: [
+        "ascii",
+        "porter",
+        "synonym",
+        "trigram",
+        "unicode61",
+    ],
+    auxiliaries: [
+        "column_count",
+        "row_summary",
+        "rowid",
+    ],
+    document_tokens: [
+        Fts5Token {
+            term: "cafe",
+            start: 0,
+            end: 5,
+            colocated: false,
+        },
+        Fts5Token {
+            term: "rust",
+            start: 6,
+            end: 10,
+            colocated: false,
+        },
+    ],
+    query_tokens: [
+        Fts5Token {
+            term: "rust",
+            start: 0,
+            end: 4,
+            colocated: false,
+        },
+        Fts5Token {
+            term: "rust_q",
+            start: 0,
+            end: 4,
+            colocated: true,
+        },
+    ],
+    prefix_tokens: [
+        Fts5Token {
+            term: "pre",
+            start: 0,
+            end: 3,
+            colocated: false,
+        },
+        Fts5Token {
+            term: "ref",
+            start: 1,
+            end: 4,
+            colocated: false,
+        },
+        Fts5Token {
+            term: "efi",
+            start: 2,
+            end: 5,
+            colocated: false,
+        },
+        Fts5Token {
+            term: "fix",
+            start: 3,
+            end: 6,
+            colocated: false,
+        },
+    ],
+    aux_value: Text(
+        "hit:42:en_US:rust|sqlite",
+    ),
+    missing_aux_error: "fts5: unknown auxiliary function 'missing_aux'",
+}"#
+        );
+        Ok(())
     }
 
     // -- Query parsing tests --

@@ -264,11 +264,20 @@ pub fn codegen_select(
         b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
     } else if let Some((col_name, param_idx)) = &index_eq {
         // --- Index-seek SELECT ---
-        let idx_schema = table.index_for_column(col_name).ok_or_else(|| {
-            CodegenError::Unsupported(format!(
-                "SELECT WHERE `{col_name} = ?` requires an index on `{col_name}`"
-            ))
-        })?;
+        let Some(idx_schema) = table.index_for_column(col_name) else {
+            return codegen_select_column_eq_scan(
+                b,
+                cursor,
+                table,
+                columns,
+                out_regs,
+                out_col_count,
+                done_label,
+                end_label,
+                col_name,
+                *param_idx,
+            );
+        };
         let idx_cursor = 1_i32;
         index_cursor_to_close = Some(idx_cursor);
         let param_reg = b.alloc_reg();
@@ -469,6 +478,78 @@ fn codegen_select_full_scan(
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
     // End target for Init jump.
+    b.resolve_label(end_label);
+
+    Ok(())
+}
+
+/// Codegen for `SELECT ... FROM table WHERE column = ?` when no usable index exists.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+fn codegen_select_column_eq_scan(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    columns: &[ResultColumn],
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: Label,
+    end_label: Label,
+    filter_column: &str,
+    param_idx: i32,
+) -> Result<(), CodegenError> {
+    let filter_col_idx =
+        table
+            .column_index(filter_column)
+            .ok_or_else(|| CodegenError::ColumnNotFound {
+                table: table.name.clone(),
+                column: filter_column.to_owned(),
+            })?;
+    let param_reg = b.alloc_reg();
+    let value_reg = b.alloc_reg();
+    b.emit_op(Opcode::Variable, param_idx, param_reg, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+
+    let loop_start = b.current_addr();
+    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, done_label, P4::None, 0);
+
+    let skip_row_label = b.emit_label();
+    b.emit_op(
+        Opcode::Column,
+        cursor,
+        filter_col_idx as i32,
+        value_reg,
+        P4::None,
+        0,
+    );
+    b.emit_jump_to_label(
+        Opcode::Ne,
+        param_reg,
+        value_reg,
+        skip_row_label,
+        P4::None,
+        0x10,
+    );
+    emit_column_reads(b, cursor, columns, table, out_regs)?;
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    b.resolve_label(skip_row_label);
+
+    let loop_body = (loop_start + 1) as i32;
+    b.emit_op(Opcode::Next, cursor, loop_body, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
 
     Ok(())
@@ -3217,6 +3298,75 @@ mod tests {
             .find(|op| op.opcode == Opcode::Next)
             .expect("index equality path must iterate duplicates");
         assert_eq!(next.p1, 1, "Next should advance the index cursor");
+    }
+
+    #[test]
+    fn test_codegen_select_unindexed_column_eq_uses_filtered_scan() {
+        let stmt = simple_select(&["b"], "t", Some(col_eq_param("a", 2)));
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let open_reads = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::OpenRead)
+            .count();
+        assert_eq!(
+            open_reads, 1,
+            "unindexed equality should scan the table without opening an index"
+        );
+        assert!(
+            !prog
+                .ops()
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::SeekGE | Opcode::IdxGT | Opcode::IdxRowid)),
+            "unindexed equality should not emit index-probe opcodes"
+        );
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Init,
+                Opcode::Transaction,
+                Opcode::Variable,
+                Opcode::OpenRead,
+                Opcode::Rewind,
+                Opcode::Column,
+                Opcode::Ne,
+                Opcode::Column,
+                Opcode::ResultRow,
+                Opcode::Next,
+                Opcode::Close,
+                Opcode::Halt,
+            ]
+        ));
+
+        let variable = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Variable)
+            .expect("Variable should load the equality parameter");
+        assert_eq!(variable.p1, 2, "numbered placeholder should be preserved");
+        let ne = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Ne)
+            .expect("filtered scan should skip rows that do not match");
+        assert_eq!(ne.p1, variable.p2);
+        assert_ne!(
+            ne.p5 & 0x10,
+            0,
+            "WHERE equality must skip NULL comparisons instead of returning them"
+        );
+
+        let next = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Next)
+            .expect("filtered scan should advance the table cursor");
+        assert_eq!(next.p1, 0, "Next should advance the table cursor");
     }
 
     // === Test 10: INSERT RETURNING ===

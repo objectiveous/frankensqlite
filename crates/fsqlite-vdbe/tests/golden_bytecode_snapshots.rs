@@ -384,3 +384,27 @@ fn golden_vdbe_subquery_cte_bytecode_family() -> Result<(), String> {
 
     Ok(())
 }
+
+#[test]
+fn golden_vdbe_upsert_on_conflict_bytecode_family() -> Result<(), String> {
+    let do_nothing = render_statement_bytecode_case(
+        "upsert_on_conflict_do_nothing",
+        "INSERT INTO docs (id, category_id, title, body, score) \
+             VALUES (1, 2, 'title', 'body', 10) \
+             ON CONFLICT (id) DO NOTHING",
+    )?;
+    insta::assert_snapshot!("upsert_on_conflict_do_nothing", do_nothing);
+
+    let do_update = render_statement_bytecode_case(
+        "upsert_on_conflict_do_update",
+        "INSERT INTO docs (id, category_id, title, body, score) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (id) DO UPDATE SET \
+                 title = excluded.title, \
+                 score = excluded.score \
+             WHERE excluded.score > docs.score",
+    )?;
+    insta::assert_snapshot!("upsert_on_conflict_do_update", do_update);
+
+    Ok(())
+}

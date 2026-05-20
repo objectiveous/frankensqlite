@@ -7146,6 +7146,86 @@ mod tests {
     }
 
     #[test]
+    fn test_track_q_flat_hash_eviction_under_pool_pressure_stays_bounded() {
+        const POOL_CAPACITY: usize = 4;
+        const PAGE_COUNT: u32 = 12;
+
+        let cache =
+            ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, POOL_CAPACITY, 1);
+        let started = monotonic_test_clock();
+        let mut eviction_attempts = 0_u64;
+
+        for raw_pgno in 1..=PAGE_COUNT {
+            let page_no = PageNumber::new(raw_pgno).expect("page number");
+            loop {
+                let result = cache.insert_fresh(page_no, |data| {
+                    let page = track_q_page_buf(page_no);
+                    data.copy_from_slice(page.as_slice());
+                });
+                match result {
+                    Ok(()) => break,
+                    Err(FrankenError::OutOfMemory) => {
+                        eviction_attempts = eviction_attempts.saturating_add(1);
+                        assert!(
+                            cache.evict_any(),
+                            "bounded cache should have a resident victim before retrying page {}",
+                            page_no.get()
+                        );
+                    }
+                    Err(err) => {
+                        assert!(
+                            matches!(err, FrankenError::OutOfMemory),
+                            "unexpected insert error for page {}: {err}",
+                            page_no.get()
+                        );
+                    }
+                }
+            }
+
+            assert!(
+                cache.len() <= POOL_CAPACITY,
+                "resident pages should stay within pool capacity after admitting page {}",
+                page_no.get()
+            );
+            let copy = cache
+                .get_copy(page_no)
+                .expect("latest admitted page should survive pressure eviction");
+            assert_track_q_page(page_no, &copy);
+        }
+        let elapsed = started.elapsed();
+
+        let metrics = cache.metrics_snapshot();
+        assert_eq!(
+            metrics.pool_capacity, POOL_CAPACITY,
+            "metrics should report the configured pressure-test pool capacity"
+        );
+        assert!(
+            metrics.cached_pages <= POOL_CAPACITY,
+            "metrics should never report more resident pages than the pool capacity"
+        );
+        assert!(
+            metrics.evictions >= u64::from(PAGE_COUNT) - u64::try_from(POOL_CAPACITY).unwrap(),
+            "pressure test should evict enough pages to admit the over-capacity workload"
+        );
+
+        emit_track_q_log(
+            "test_track_q_flat_hash_eviction_under_pool_pressure_stays_bounded",
+            "verify",
+            elapsed,
+            usize::try_from(PAGE_COUNT).expect("page count fits usize"),
+            u64::from(PAGE_COUNT),
+            0,
+            metrics.evictions,
+            track_q_hit_rate(metrics.hits, metrics.misses),
+            json!({
+                "pool_capacity": POOL_CAPACITY,
+                "resident_pages": metrics.cached_pages,
+                "eviction_attempts": eviction_attempts
+            }),
+        );
+    }
+
+    #[test]
     fn test_track_q_flat_hash_remove_and_reclaim_tombstone_slots() {
         let slots = FlatPageSlots::new(64);
         let target_bucket = slots.hash_pgno(PageNumber::ONE.get());

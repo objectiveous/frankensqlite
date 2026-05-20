@@ -631,7 +631,22 @@ fn porter_stem(word: &str) -> String {
 }
 
 fn contains_vowel(s: &str) -> bool {
-    s.chars().any(|c| matches!(c, 'a' | 'e' | 'i' | 'o' | 'u'))
+    let mut has_previous = false;
+    let mut previous_was_vowel = false;
+
+    for ch in s.chars() {
+        let is_vowel = porter_is_vowel(ch, has_previous, previous_was_vowel);
+        if is_vowel {
+            return true;
+        }
+        has_previous = true;
+        previous_was_vowel = is_vowel;
+    }
+    false
+}
+
+fn porter_is_vowel(ch: char, has_previous: bool, previous_was_vowel: bool) -> bool {
+    matches!(ch, 'a' | 'e' | 'i' | 'o' | 'u') || (ch == 'y' && has_previous && !previous_was_vowel)
 }
 
 fn step1b_fixup(s: &mut String) {
@@ -699,15 +714,19 @@ fn apply_step3(s: &mut String) {
 fn measure(s: &str) -> u32 {
     let mut m = 0u32;
     let mut in_vowel_seq = false;
+    let mut has_previous = false;
+    let mut previous_was_vowel = false;
 
     for ch in s.chars() {
-        let is_vowel = matches!(ch, 'a' | 'e' | 'i' | 'o' | 'u');
+        let is_vowel = porter_is_vowel(ch, has_previous, previous_was_vowel);
         if is_vowel {
             in_vowel_seq = true;
         } else if in_vowel_seq {
             m += 1;
             in_vowel_seq = false;
         }
+        has_previous = true;
+        previous_was_vowel = is_vowel;
     }
 
     m
@@ -4690,6 +4709,17 @@ mod tests {
         diacritic_terms: Vec<String>,
         upper_matches: Vec<i64>,
         lower_matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5PorterYVowelStructure {
+        stems: Vec<(String, String)>,
+        vowel_checks: Vec<(String, bool)>,
+        measures: Vec<(String, u32)>,
+        cry_matches: Vec<i64>,
+        fly_matches: Vec<i64>,
+        sky_matches: Vec<i64>,
     }
 
     #[allow(dead_code)]
@@ -8886,6 +8916,128 @@ mod tests {
     }
 
     #[test]
+    fn test_porter_stem_treats_y_as_vowel_after_consonant() {
+        assert!(contains_vowel("cry"));
+        assert!(contains_vowel("fly"));
+        assert!(!contains_vowel("sk"));
+        assert_eq!(porter_stem("crying"), "cry");
+        assert_eq!(porter_stem("flying"), "fly");
+        assert_eq!(porter_stem("sky"), "sky");
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_porter_y_vowel() -> std::result::Result<(), String> {
+        let words = ["crying", "flying", "happy", "sky"];
+        let stems = words
+            .into_iter()
+            .map(|word| (word.to_owned(), porter_stem(word)))
+            .collect();
+        let vowel_checks = ["cr", "cry", "fly", "sky"]
+            .into_iter()
+            .map(|word| (word.to_owned(), contains_vowel(word)))
+            .collect();
+        let measures = ["cr", "cry", "trouble", "relate"]
+            .into_iter()
+            .map(|word| (word.to_owned(), measure(word)))
+            .collect();
+
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "body",
+                "tokenize='porter unicode61'",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        table.insert_document(1, &["crying flying".to_owned()]);
+        table.insert_document(2, &["sky".to_owned()]);
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5PorterYVowelStructure {
+                    stems,
+                    vowel_checks,
+                    measures,
+                    cry_matches: search_rowids(&table, "cry")?,
+                    fly_matches: search_rowids(&table, "fly")?,
+                    sky_matches: search_rowids(&table, "sky")?,
+                }
+            ),
+            r#"Fts5PorterYVowelStructure {
+    stems: [
+        (
+            "crying",
+            "cry",
+        ),
+        (
+            "flying",
+            "fly",
+        ),
+        (
+            "happy",
+            "happi",
+        ),
+        (
+            "sky",
+            "sky",
+        ),
+    ],
+    vowel_checks: [
+        (
+            "cr",
+            false,
+        ),
+        (
+            "cry",
+            true,
+        ),
+        (
+            "fly",
+            true,
+        ),
+        (
+            "sky",
+            true,
+        ),
+    ],
+    measures: [
+        (
+            "cr",
+            0,
+        ),
+        (
+            "cry",
+            0,
+        ),
+        (
+            "trouble",
+            1,
+        ),
+        (
+            "relate",
+            2,
+        ),
+    ],
+    cry_matches: [
+        1,
+    ],
+    fly_matches: [
+        1,
+    ],
+    sky_matches: [
+        2,
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_porter_stem_step2_ational() {
         assert_eq!(porter_stem("relational"), "relate");
     }
@@ -8914,7 +9066,7 @@ mod tests {
     fn test_contains_vowel_function() {
         assert!(contains_vowel("hello"));
         assert!(contains_vowel("a"));
-        assert!(!contains_vowel("xyz"));
+        assert!(!contains_vowel("xzz"));
         assert!(!contains_vowel(""));
     }
 

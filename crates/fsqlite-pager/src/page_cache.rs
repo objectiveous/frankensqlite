@@ -532,7 +532,7 @@ fn scale_nonzero_for_eviction_policy(
 }
 
 fn choose_synthetic_miss_page(resident_pages: &HashSet<PageNumber>) -> Option<PageNumber> {
-    let mut candidate = u32::MAX;
+    let mut candidate = u32::MAX - 1;
     loop {
         let page_no = PageNumber::new(candidate)?;
         if !resident_pages.contains(&page_no) {
@@ -4708,7 +4708,7 @@ mod tests {
     }
 
     fn choose_synthetic_miss_page_for_bench(cache: &PageCache) -> Option<PageNumber> {
-        let mut candidate = u32::MAX;
+        let mut candidate = u32::MAX - 1;
         loop {
             let page_no = PageNumber::new(candidate)?;
             if !cache.pages.contains_key(&page_no) {

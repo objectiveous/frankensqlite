@@ -3707,11 +3707,19 @@ pub const fn is_concurrent_mode(mode: TransactionMode) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::Arc,
+    };
 
     use fsqlite_types::{
         CommitSeq, PageData, PageNumber, PageSize, SchemaEpoch, Snapshot, TxnEpoch, TxnId,
         TxnToken, WitnessKey,
+    };
+    use proptest::{
+        collection::vec as prop_vec,
+        prelude::*,
+        test_runner::{Config as ProptestConfig, TestCaseError},
     };
 
     use crate::core_types::{CommitIndex, InProcessPageLockTable, TransactionState};
@@ -3757,6 +3765,131 @@ mod tests {
             TxnId::new(id).expect("test transaction id"),
             TxnEpoch::new(id as u32 + 1),
         )
+    }
+
+    const MVCC_METAMORPHIC_PROPTEST_CASES: u32 = 64;
+
+    fn tagged_test_data(tag: u8) -> PageData {
+        let mut data = test_data();
+        data.as_bytes_mut()[0] = tag;
+        data
+    }
+
+    fn unique_test_pages(raw_pages: &[u32]) -> Vec<PageNumber> {
+        let mut seen = BTreeSet::new();
+        raw_pages
+            .iter()
+            .filter_map(|raw| PageNumber::new(*raw))
+            .filter(|page| seen.insert(*page))
+            .collect()
+    }
+
+    fn run_disjoint_commit_schedule(
+        pages: &[PageNumber],
+        commit_order: &[usize],
+    ) -> Result<BTreeMap<PageNumber, u8>, String> {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+        let mut sessions = Vec::with_capacity(pages.len());
+
+        for _ in pages {
+            sessions.push(
+                registry
+                    .begin_concurrent(test_snapshot(10))
+                    .map_err(|err| format!("begin_concurrent failed: {err:?}"))?,
+            );
+        }
+
+        for (idx, (session_id, page)) in sessions.iter().zip(pages).enumerate() {
+            let mut handle = registry
+                .get_mut(*session_id)
+                .ok_or_else(|| format!("missing session handle {session_id}"))?;
+            let tag = u8::try_from(idx + 1).expect("proptest limits writers to <= 8");
+            concurrent_write_page(
+                &mut handle,
+                &lock_table,
+                *session_id,
+                *page,
+                tagged_test_data(tag),
+            )
+            .map_err(|err| {
+                format!(
+                    "write page {} in session {session_id} failed: {err:?}",
+                    page.get()
+                )
+            })?;
+        }
+
+        for (order_idx, writer_idx) in commit_order.iter().copied().enumerate() {
+            let session_id = sessions
+                .get(writer_idx)
+                .copied()
+                .ok_or_else(|| format!("commit order references writer {writer_idx}"))?;
+            let mut handle = registry
+                .get_mut(session_id)
+                .ok_or_else(|| format!("missing session handle {session_id}"))?;
+            let commit_seq = CommitSeq::new(11 + order_idx as u64);
+            concurrent_commit(
+                &mut handle,
+                &commit_index,
+                &lock_table,
+                session_id,
+                commit_seq,
+            )
+            .map_err(|(err, fcw)| {
+                format!("commit writer {writer_idx} session {session_id} failed: {err:?} {fcw:?}")
+            })?;
+        }
+
+        if lock_table.lock_count() != 0 {
+            return Err(format!(
+                "expected all page locks released, found {}",
+                lock_table.lock_count()
+            ));
+        }
+
+        let mut final_state = BTreeMap::new();
+        for (idx, (session_id, page)) in sessions.iter().zip(pages).enumerate() {
+            let tag = u8::try_from(idx + 1).expect("proptest limits writers to <= 8");
+            if commit_index.latest(*page).is_none() {
+                return Err(format!("page {} missing committed sequence", page.get()));
+            }
+            final_state.insert(*page, tag);
+            let removed = registry.remove_and_recycle(*session_id);
+            if !removed {
+                return Err(format!("session {session_id} was not removed"));
+            }
+        }
+
+        Ok(final_state)
+    }
+
+    // Metamorphic strength matrix:
+    // - MR1 commit-order independence: fault sensitivity 5, independence 4,
+    //   execution cost 1. It detects false global writer serialization or
+    //   order-dependent FCW failures for disjoint page writes.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(MVCC_METAMORPHIC_PROPTEST_CASES))]
+
+        #[test]
+        fn metamorphic_commit_order_independence_for_disjoint_writers(
+            raw_pages in prop_vec(1_u32..=2048, 1..=8),
+        ) {
+            let pages = unique_test_pages(&raw_pages);
+            prop_assert!(!pages.is_empty());
+
+            let forward_order = (0..pages.len()).collect::<Vec<_>>();
+            let mut reverse_order = forward_order.clone();
+            reverse_order.reverse();
+
+            let forward_state = run_disjoint_commit_schedule(&pages, &forward_order)
+                .map_err(TestCaseError::fail)?;
+            let reverse_state = run_disjoint_commit_schedule(&pages, &reverse_order)
+                .map_err(TestCaseError::fail)?;
+
+            prop_assert_eq!(forward_state, reverse_state);
+        }
     }
 
     struct ConflictHeatTelemetryGuard;

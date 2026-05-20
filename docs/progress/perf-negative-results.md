@@ -12,6 +12,37 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-20 - B-tree leaf cell-parse hunt found no bounded lever
+
+- Target: the per-cell B-tree leaf parse hot path — `CellRef::parse`, the
+  lightweight `read_table_leaf_rowid_at_offset`, and `cell_on_page_size_fast`
+  in `crates/fsqlite-btree/src/cell.rs`. These run once per cell on every leaf
+  scan, seek, and defragmentation pass.
+- New durable infra (kept): added `crates/fsqlite-btree/benches/cell_parse_hot_paths.rs`
+  (custom-main `harness = false`, like the planner benches; the btree crate had
+  no benches before this) and the `[[bench]]` entry in
+  `crates/fsqlite-btree/Cargo.toml`. It builds synthetic no-overflow table-leaf
+  and index-leaf 4 KiB pages and prints deterministic `*_ns_per_op` lines.
+- Baseline (2M iters, bench profile, CARGO_TARGET_DIR=/data/tmp/cc3-target,
+  median of 3 runs): `cellref_parse_table_leaf` ~5.4 ns, `cellref_parse_index_leaf`
+  ~3.95 ns, `read_table_leaf_rowid` ~4.2 ns, `cell_on_page_size_table_leaf`
+  ~5.6 ns, `cell_on_page_size_index_leaf` ~4.1 ns.
+- Hunt outcome: NO lever landed. The path is already well-optimized by prior
+  sessions (`read_varint` is 3-tier fast-pathed; `parse_leaf_table` has the
+  no-overflow `payload_size <= max_local` shortcut; `local_payload_size`
+  internally early-returns on the same condition). The candidate hypothesis —
+  that the general/index parse path pays unconditional `local_payload_size`
+  spill math vs the table-leaf inline fast-path — was refuted by measurement:
+  index-leaf parse (~3.95 ns) is FASTER than table-leaf (~5.4 ns). The gap is
+  simply the second varint (rowid) that table cells must decode and index cells
+  do not; it is inherent, not a defect. At 4-6 ns/cell these functions are
+  dominated by the unavoidable 1-2 varint reads + bounds checks.
+- Do not re-hunt cell-parse micro-levers from a cold read. The remaining btree
+  cost is at the traversal/seek-descent and page-cache layers, which this
+  per-cell microbench does not cover; reach for the MT8 / comprehensive-bench
+  attribution (not a scoped build) before attempting btree work again, and use
+  this bench only to guard cell-parse regressions.
+
 ## 2026-05-20 - Planner reuse of rowid_equality_term for RowidLookup probe
 
 - Target: `oltp_cost_estimation_hot_paths` planner microbench, point-lookup

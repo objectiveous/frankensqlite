@@ -1067,7 +1067,7 @@ fn tokenize_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>, 
         // Read a word.
         let mut word = String::new();
         while let Some(word_ch) = chars.peek().copied() {
-            if word_ch.is_ascii_whitespace() || matches!(word_ch, '(' | ')' | '"' | '^') {
+            if word_ch.is_ascii_whitespace() || matches!(word_ch, '(' | ')' | '"' | '+' | '^') {
                 break;
             }
             let _ = chars.next();
@@ -4525,6 +4525,16 @@ mod tests {
 
     #[allow(dead_code)]
     #[derive(Debug)]
+    struct Fts5TightPhraseConcatStructure {
+        tokens: Vec<(Fts5QueryTokenKind, String)>,
+        expr: Fts5Expr,
+        adjacent_matches: Vec<i64>,
+        separated_matches: Vec<i64>,
+        column_filtered_matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
     struct Fts5InsttokenStructure {
         config: Fts5Config,
         columns: Vec<String>,
@@ -5935,6 +5945,101 @@ mod tests {
             .collect::<Vec<_>>();
         matches.sort_unstable();
         assert_eq!(matches, vec![1, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_query_tight_phrase_concatenation() -> std::result::Result<(), String> {
+        let tokens = parse_fts5_query("one+two").map_err(|err| err.to_string())?;
+        assert_eq!(
+            tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
+            vec![
+                Fts5QueryTokenKind::Term,
+                Fts5QueryTokenKind::Plus,
+                Fts5QueryTokenKind::Term,
+            ]
+        );
+        assert!(matches!(
+            build_expr(&tokens).map_err(|err| err.to_string())?,
+            Fts5Expr::Phrase(_)
+        ));
+
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["one two".to_owned()]);
+        table.insert_document(2, &["one gap two".to_owned()]);
+
+        assert_eq!(search_rowids(&table, "one+two")?, vec![1]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_tight_phrase_concatenation() -> std::result::Result<(), String>
+    {
+        let mut table = Fts5Table::with_columns(vec!["title".to_owned(), "body".to_owned()]);
+        table.insert_document(1, &["one two".to_owned(), "plain body".to_owned()]);
+        table.insert_document(2, &["one gap two".to_owned(), "one two".to_owned()]);
+        table.insert_document(3, &["plain title".to_owned(), "one gap two".to_owned()]);
+
+        let query = "one+two";
+        let tokens = parse_fts5_query(query)
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|token| (token.kind, token.lexeme))
+            .collect::<Vec<_>>();
+        let expr = build_expr(&parse_fts5_query(query).map_err(|err| err.to_string())?)
+            .map_err(|err| err.to_string())?;
+        let mut adjacent_matches = search_rowids(&table, query)?;
+        adjacent_matches.sort_unstable();
+        let mut separated_matches = search_rowids(&table, r#""one gap two""#)?;
+        separated_matches.sort_unstable();
+        let mut column_filtered_matches = search_rowids(&table, "title:one+two")?;
+        column_filtered_matches.sort_unstable();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5TightPhraseConcatStructure {
+                    tokens,
+                    expr,
+                    adjacent_matches,
+                    separated_matches,
+                    column_filtered_matches,
+                }
+            ),
+            r#"Fts5TightPhraseConcatStructure {
+    tokens: [
+        (
+            Term,
+            "one",
+        ),
+        (
+            Plus,
+            "+",
+        ),
+        (
+            Term,
+            "two",
+        ),
+    ],
+    expr: Phrase(
+        [
+            "one",
+            "two",
+        ],
+    ),
+    adjacent_matches: [
+        1,
+        2,
+    ],
+    separated_matches: [
+        2,
+        3,
+    ],
+    column_filtered_matches: [
+        1,
+    ],
+}"#
+        );
         Ok(())
     }
 

@@ -227,3 +227,29 @@ fn golden_vdbe_window_rank_bytecode_family() -> Result<(), String> {
 
     Ok(())
 }
+
+#[test]
+fn golden_vdbe_multi_table_join_bytecode_family() -> Result<(), String> {
+    let three_way_ordered = render_bytecode_case(
+        "multi_join_three_way_ordered",
+        "SELECT docs.id, categories.name, events.score \
+             FROM docs \
+             JOIN categories ON docs.category_id = categories.id \
+             JOIN events ON events.category_id = categories.id \
+             WHERE docs.category_id = 7 \
+             ORDER BY events.score DESC",
+    )?;
+    insta::assert_snapshot!("multi_join_three_way_ordered", three_way_ordered);
+
+    let filtered_join = render_bytecode_case(
+        "multi_join_filtered_predicates",
+        "SELECT categories.name, docs.title \
+             FROM categories \
+             JOIN docs ON docs.category_id = categories.id \
+             JOIN events ON events.category_id = docs.category_id \
+             WHERE events.score > 10 AND docs.category_id = 3",
+    )?;
+    insta::assert_snapshot!("multi_join_filtered_predicates", filtered_join);
+
+    Ok(())
+}

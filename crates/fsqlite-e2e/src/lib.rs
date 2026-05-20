@@ -18,6 +18,7 @@ pub mod comparison;
 pub mod concurrency_showcase;
 pub mod corruption;
 pub mod corruption_demo_sqlite;
+pub mod corruption_fingerprint;
 pub mod corruption_scenarios;
 pub mod corruption_walkthrough;
 pub mod executor;

@@ -831,6 +831,33 @@ const TRIGGER_CASES: &[QueryCase] = &[
     },
 ];
 
+const DATE_TIME_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "basic date time datetime projections",
+        sql: "SELECT date('2024-01-15'), time('2024-01-15 13:45:30'), datetime('2024-01-15 13:45:30')",
+    },
+    QueryCase {
+        name: "calendar boundary modifiers",
+        sql: "SELECT date('2024-01-31', '+1 month'), date('2024-02-29', '+1 year'), date('2024-03-01', '-1 day')",
+    },
+    QueryCase {
+        name: "time arithmetic modifiers",
+        sql: "SELECT datetime('2024-01-15 12:00:00', '+90 minutes'), time('23:30:00', '+2 hours')",
+    },
+    QueryCase {
+        name: "strftime calendar fields",
+        sql: "SELECT strftime('%Y-%m-%d %H:%M:%S', '2024-02-29 23:59:01'), strftime('%j', '2024-12-31')",
+    },
+    QueryCase {
+        name: "unixepoch and julianday storage class",
+        sql: "SELECT unixepoch('1970-01-02 00:00:00'), typeof(julianday('2024-01-15'))",
+    },
+    QueryCase {
+        name: "invalid and null date inputs",
+        sql: "SELECT date(NULL), time('not-a-date'), datetime('2024-01-15', 'bogus')",
+    },
+];
+
 #[test]
 fn select_join_group_by_aggregates_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
@@ -920,4 +947,10 @@ fn triggers_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(TRIGGER_SETUP);
     harness.execute_script(TRIGGER_SCRIPT);
     harness.assert_queries_match("trigger", TRIGGER_CASES);
+}
+
+#[test]
+fn date_time_functions_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new("");
+    harness.assert_queries_match("date/time", DATE_TIME_CASES);
 }

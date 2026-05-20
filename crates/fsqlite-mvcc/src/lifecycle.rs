@@ -6330,8 +6330,25 @@ mod tests {
         assert!(txn3.has_version_guard());
 
         drop(txn1);
-        // Guard drops when Transaction drops (not just on explicit commit/abort).
-        // But note: explicit release_all_resources is needed for proper cleanup.
+        assert_eq!(
+            mgr.version_guard_registry().active_guard_count(),
+            2,
+            "dropping a transaction must unregister its guard ticket"
+        );
+
+        drop(txn2);
+        assert_eq!(
+            mgr.version_guard_registry().active_guard_count(),
+            1,
+            "remaining transactions should keep their guards pinned independently"
+        );
+
+        drop(txn3);
+        assert_eq!(
+            mgr.version_guard_registry().active_guard_count(),
+            0,
+            "all guard tickets should unpin when their transactions drop"
+        );
     }
 
     #[test]

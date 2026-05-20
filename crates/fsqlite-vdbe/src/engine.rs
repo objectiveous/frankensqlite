@@ -3719,6 +3719,12 @@ struct StorageCursor {
     cached_rowid: Option<i64>,
     /// Cached result of payload_includes_rowid_alias check for the current row.
     payload_includes_rowid_alias: Option<bool>,
+    /// Schema-derived IPK column index for this root page (avoids per-Column HashMap probes).
+    ipk_col_idx: Option<usize>,
+    /// Schema-derived column count for this root page.
+    table_column_count: Option<usize>,
+    /// Schema-derived first NOT NULL non-IPK column for this root page.
+    first_not_null_non_ipk_col: Option<usize>,
 }
 
 /// Lightweight version token for `MemDatabase` undo/rollback (bd-g6eo).
@@ -8493,6 +8499,9 @@ impl VdbeEngine {
                                 last_rightmost_unique_index_position: None,
                                 cached_rowid: None,
                                 payload_includes_rowid_alias: None,
+                                ipk_col_idx: None,
+                                table_column_count: None,
+                                first_not_null_non_ipk_col: None,
                             },
                         );
                     }
@@ -13551,6 +13560,9 @@ impl VdbeEngine {
                 last_successful_insert_rowid: None,
                 last_rightmost_unique_index_prefix: None,
                 last_rightmost_unique_index_position: None,
+                ipk_col_idx: old_sc.ipk_col_idx,
+                table_column_count: old_sc.table_column_count,
+                first_not_null_non_ipk_col: old_sc.first_not_null_non_ipk_col,
             },
         );
         tracing::info!(
@@ -13913,43 +13925,17 @@ impl VdbeEngine {
 
         ensure_storage_cursor_row_layout(cursor, 0, collect_vdbe_metrics)?;
 
-        let root_page = self.cursor_root_pages.get(&cursor_id).copied();
-        let ipk_col_idx = root_page
-            .and_then(|rp| self.rowid_alias_col_by_root_page.get(&rp))
-            .copied();
+        let ipk_col_idx = cursor.ipk_col_idx;
         let payload_includes = if let Some(ipk) = ipk_col_idx {
             if let Some(cached) = cursor.payload_includes_rowid_alias {
                 cached
-            } else if let Some(rp) = root_page {
+            } else {
                 let includes = payload_includes_rowid_alias_without_rowid(
                     &cursor.row_decode,
                     ipk,
-                    self.table_column_count_by_root_page.get(&rp).copied(),
-                    self.first_not_null_non_ipk_col_by_root_page
-                        .get(&rp)
-                        .copied(),
+                    cursor.table_column_count,
+                    cursor.first_not_null_non_ipk_col,
                 );
-                cursor.payload_includes_rowid_alias = Some(includes);
-                includes
-            } else {
-                let rowid = storage_cursor_cached_rowid(cursor)?;
-                if let Some(ipk_col) = cursor.row_decode.column_offset(ipk).copied()
-                    && let Some(ipk_end) = column_payload_end(&ipk_col)
-                {
-                    ensure_storage_cursor_row_layout(cursor, ipk_end, collect_vdbe_metrics)?;
-                }
-                let includes = root_page.is_some_and(|rp| {
-                    payload_includes_rowid_alias_lazy(
-                        &cursor.row_decode,
-                        &cursor.payload_buf,
-                        rowid,
-                        ipk,
-                        self.table_column_count_by_root_page.get(&rp).copied(),
-                        self.first_not_null_non_ipk_col_by_root_page
-                            .get(&rp)
-                            .copied(),
-                    )
-                });
                 cursor.payload_includes_rowid_alias = Some(includes);
                 includes
             }
@@ -14047,49 +14033,17 @@ impl VdbeEngine {
             ensure_storage_cursor_row_layout(cursor, 0, self.collect_vdbe_metrics)?;
 
         // ── Resolve IPK alias and payload column index ────────────
-        let root_page = self.cursor_root_pages.get(&cursor_id).copied();
-        let ipk_col_idx = root_page
-            .and_then(|rp| self.rowid_alias_col_by_root_page.get(&rp))
-            .copied();
+        let ipk_col_idx = cursor.ipk_col_idx;
         let payload_includes = if let Some(ipk) = ipk_col_idx {
             if let Some(cached) = cursor.payload_includes_rowid_alias {
                 cached
-            } else if let Some(rp) = root_page {
+            } else {
                 let includes = payload_includes_rowid_alias_without_rowid(
                     &cursor.row_decode,
                     ipk,
-                    self.table_column_count_by_root_page.get(&rp).copied(),
-                    self.first_not_null_non_ipk_col_by_root_page
-                        .get(&rp)
-                        .copied(),
+                    cursor.table_column_count,
+                    cursor.first_not_null_non_ipk_col,
                 );
-                cursor.payload_includes_rowid_alias = Some(includes);
-                includes
-            } else {
-                let rowid = storage_cursor_cached_rowid(cursor)?;
-                if let Some(ipk_col) = cursor.row_decode.column_offset(ipk).copied()
-                    && let Some(ipk_end) = column_payload_end(&ipk_col)
-                {
-                    let ipk_refresh = ensure_storage_cursor_row_layout(
-                        cursor,
-                        ipk_end,
-                        self.collect_vdbe_metrics,
-                    )?;
-                    refresh_state.refreshed |= ipk_refresh.refreshed;
-                    refresh_state.eager_values_ready |= ipk_refresh.eager_values_ready;
-                }
-                let includes = root_page.is_some_and(|rp| {
-                    payload_includes_rowid_alias_lazy(
-                        &cursor.row_decode,
-                        &cursor.payload_buf,
-                        rowid,
-                        ipk,
-                        self.table_column_count_by_root_page.get(&rp).copied(),
-                        self.first_not_null_non_ipk_col_by_root_page
-                            .get(&rp)
-                            .copied(),
-                    )
-                });
                 cursor.payload_includes_rowid_alias = Some(includes);
                 includes
             }
@@ -14239,53 +14193,17 @@ impl VdbeEngine {
             let mut refresh_state =
                 ensure_storage_cursor_row_layout(cursor, 0, collect_vdbe_metrics)?;
 
-            let root_page = self.cursor_root_pages.get(&cursor_id).copied();
-            let ipk_col_idx = root_page
-                .and_then(|root_page| self.rowid_alias_col_by_root_page.get(&root_page))
-                .copied();
+            let ipk_col_idx = cursor.ipk_col_idx;
             let payload_includes_rowid_alias = if let Some(ipk_col_idx) = ipk_col_idx {
                 if let Some(cached) = cursor.payload_includes_rowid_alias {
                     cached
-                } else if let Some(root_page) = root_page {
+                } else {
                     let includes = payload_includes_rowid_alias_without_rowid(
                         &cursor.row_decode,
                         ipk_col_idx,
-                        self.table_column_count_by_root_page
-                            .get(&root_page)
-                            .copied(),
-                        self.first_not_null_non_ipk_col_by_root_page
-                            .get(&root_page)
-                            .copied(),
+                        cursor.table_column_count,
+                        cursor.first_not_null_non_ipk_col,
                     );
-                    cursor.payload_includes_rowid_alias = Some(includes);
-                    includes
-                } else {
-                    let rowid = storage_cursor_cached_rowid(cursor)?;
-                    if let Some(ipk_col) = cursor.row_decode.column_offset(ipk_col_idx).copied()
-                        && let Some(ipk_end) = column_payload_end(&ipk_col)
-                    {
-                        let ipk_refresh = ensure_storage_cursor_row_layout(
-                            cursor,
-                            ipk_end,
-                            collect_vdbe_metrics,
-                        )?;
-                        refresh_state.refreshed |= ipk_refresh.refreshed;
-                        refresh_state.eager_values_ready |= ipk_refresh.eager_values_ready;
-                    }
-                    let includes = root_page.is_some_and(|root_page| {
-                        payload_includes_rowid_alias_lazy(
-                            &cursor.row_decode,
-                            &cursor.payload_buf,
-                            rowid,
-                            ipk_col_idx,
-                            self.table_column_count_by_root_page
-                                .get(&root_page)
-                                .copied(),
-                            self.first_not_null_non_ipk_col_by_root_page
-                                .get(&root_page)
-                                .copied(),
-                        )
-                    });
                     cursor.payload_includes_rowid_alias = Some(includes);
                     includes
                 }
@@ -14724,6 +14642,15 @@ impl VdbeEngine {
                         );
                     }
                     configure_btree_cursor_page_size(&mut cursor, page_layout);
+                    let ipk_col_idx = self.rowid_alias_col_by_root_page.get(&root_page).copied();
+                    let table_column_count = self
+                        .table_column_count_by_root_page
+                        .get(&root_page)
+                        .copied();
+                    let first_not_null_non_ipk_col = self
+                        .first_not_null_non_ipk_col_by_root_page
+                        .get(&root_page)
+                        .copied();
                     self.storage_cursors.insert(
                         cursor_id,
                         StorageCursor {
@@ -14744,6 +14671,9 @@ impl VdbeEngine {
                             last_position_stamp: None,
                             cached_rowid: None,
                             payload_includes_rowid_alias: None,
+                            ipk_col_idx,
+                            table_column_count,
+                            first_not_null_non_ipk_col,
                         },
                     );
                     self.cursor_root_pages.insert(cursor_id, root_page);
@@ -14838,6 +14768,15 @@ impl VdbeEngine {
                         );
                     }
                     configure_btree_cursor_page_size(&mut cursor, page_layout);
+                    let ipk_col_idx = self.rowid_alias_col_by_root_page.get(&root_page).copied();
+                    let table_column_count = self
+                        .table_column_count_by_root_page
+                        .get(&root_page)
+                        .copied();
+                    let first_not_null_non_ipk_col = self
+                        .first_not_null_non_ipk_col_by_root_page
+                        .get(&root_page)
+                        .copied();
                     self.storage_cursors.insert(
                         cursor_id,
                         StorageCursor {
@@ -14858,6 +14797,9 @@ impl VdbeEngine {
                             last_position_stamp: None,
                             cached_rowid: None,
                             payload_includes_rowid_alias: None,
+                            ipk_col_idx,
+                            table_column_count,
+                            first_not_null_non_ipk_col,
                         },
                     );
                     self.cursor_root_pages.insert(cursor_id, root_page);
@@ -14974,6 +14916,15 @@ impl VdbeEngine {
             }
         }
 
+        let ipk_col_idx = self.rowid_alias_col_by_root_page.get(&root_page).copied();
+        let table_column_count = self
+            .table_column_count_by_root_page
+            .get(&root_page)
+            .copied();
+        let first_not_null_non_ipk_col = self
+            .first_not_null_non_ipk_col_by_root_page
+            .get(&root_page)
+            .copied();
         self.storage_cursors.insert(
             cursor_id,
             StorageCursor {
@@ -14994,6 +14945,9 @@ impl VdbeEngine {
                 last_position_stamp: None,
                 cached_rowid: None,
                 payload_includes_rowid_alias: None,
+                ipk_col_idx,
+                table_column_count,
+                first_not_null_non_ipk_col,
             },
         );
         self.cursor_root_pages.insert(cursor_id, root_page);
@@ -16465,75 +16419,6 @@ fn payload_includes_rowid_alias_without_rowid(
         return false;
     };
     matches!(classify_serial_type(col.serial_type), SerialTypeClass::Null)
-}
-
-/// Lazy-decode variant of [`payload_includes_rowid_alias`] that works
-/// with the header offset table instead of requiring all columns to be
-/// pre-decoded.
-///
-/// Only the serial type is inspected. Integer equality is deliberately
-/// ignored because a shifted first stored user column can coincidentally equal
-/// the physical rowid after `ALTER TABLE ADD COLUMN`.
-fn payload_includes_rowid_alias_lazy(
-    row_decode: &RowDecodeScratch,
-    _payload_buf: &[u8],
-    _rowid: i64,
-    ipk_col_idx: usize,
-    table_column_count: Option<usize>,
-    first_not_null_non_ipk_col_idx: Option<usize>,
-) -> bool {
-    use fsqlite_types::serial_type::{SerialTypeClass, classify_serial_type};
-
-    let payload_cols = row_decode.column_count();
-    if let Some(table_cols) = table_column_count {
-        if payload_cols == table_cols {
-            return true;
-        }
-        if ipk_col_idx < payload_cols {
-            // The IPK position exists in the payload. Check its serial
-            // type. SQLite-format INTEGER PRIMARY KEY aliases are stored as
-            // NULL placeholders, while a non-NULL value at this position may
-            // be a shifted user column from a shorter payload.
-            if let Some(col) = row_decode.column_offset(ipk_col_idx) {
-                let serial_class = classify_serial_type(col.serial_type);
-                if matches!(serial_class, SerialTypeClass::Null) {
-                    // NULL placeholder at IPK position → IPK is included.
-                    return true;
-                }
-                if matches!(serial_class, SerialTypeClass::Integer) {
-                    return false;
-                }
-            }
-        }
-        if let Some(not_null_col_idx) =
-            first_not_null_non_ipk_col_idx.filter(|idx| *idx > ipk_col_idx)
-        {
-            let omitted_payload_idx = not_null_col_idx - 1;
-            let present_payload_idx = not_null_col_idx;
-            if omitted_payload_idx < payload_cols
-                && present_payload_idx < payload_cols
-                && let Some(col) = row_decode.column_offset(omitted_payload_idx)
-            {
-                if matches!(classify_serial_type(col.serial_type), SerialTypeClass::Null) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-    if payload_cols <= ipk_col_idx {
-        return false;
-    }
-
-    let Some(col) = row_decode.column_offset(ipk_col_idx) else {
-        return false;
-    };
-
-    match classify_serial_type(col.serial_type) {
-        // NULL serial type → rowid alias is present (stored as NULL placeholder).
-        SerialTypeClass::Null => true,
-        _ => false,
-    }
 }
 
 fn column_payload_end(col: &ColumnOffset) -> Option<usize> {

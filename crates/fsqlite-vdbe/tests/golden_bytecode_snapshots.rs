@@ -253,3 +253,29 @@ fn golden_vdbe_multi_table_join_bytecode_family() -> Result<(), String> {
 
     Ok(())
 }
+
+#[test]
+fn golden_vdbe_aggregate_group_by_bytecode_family() -> Result<(), String> {
+    let filtered_group = render_bytecode_case(
+        "aggregate_group_by_filtered",
+        "SELECT category_id, count(*), sum(score) \
+             FROM docs \
+             WHERE score > 0 \
+             GROUP BY category_id \
+             HAVING count(*) > 1 \
+             ORDER BY category_id",
+    )?;
+    insta::assert_snapshot!("aggregate_group_by_filtered", filtered_group);
+
+    let events_group = render_bytecode_case(
+        "aggregate_group_by_events_limit",
+        "SELECT category_id, count(*), sum(score) \
+             FROM events \
+             GROUP BY category_id \
+             ORDER BY category_id \
+             LIMIT 10",
+    )?;
+    insta::assert_snapshot!("aggregate_group_by_joined", events_group);
+
+    Ok(())
+}

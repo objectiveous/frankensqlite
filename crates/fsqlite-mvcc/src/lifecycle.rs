@@ -4064,6 +4064,55 @@ mod tests {
     }
 
     #[test]
+    fn test_fcw_abort_releases_snapshot_guard_and_page_locks() {
+        let mut m = mgr();
+        m.set_write_merge_policy(WriteMergePolicy::Off)
+            .expect("OFF must be accepted");
+
+        let pgno = PageNumber::new(8_024).unwrap();
+        let mut first = m.begin(BeginKind::Concurrent).unwrap();
+        let mut stale = m.begin(BeginKind::Concurrent).unwrap();
+        let stale_snapshot = stale.snapshot.high;
+
+        assert_eq!(m.cached_gc_horizon(), Some(stale_snapshot));
+        assert_eq!(m.version_guard_registry().active_guard_count(), 2);
+
+        m.write_page(&mut first, pgno, test_data(0x2B))
+            .expect("first writer should stage a page");
+        let first_commit = m.commit(&mut first).expect("first writer commit");
+        assert!(first_commit > stale_snapshot);
+        assert_eq!(m.cached_gc_horizon(), Some(stale_snapshot));
+        assert_eq!(
+            m.version_guard_registry().active_guard_count(),
+            1,
+            "stale writer should be the only remaining active guard"
+        );
+
+        m.write_page(&mut stale, pgno, test_data(0x2C))
+            .expect("stale writer should acquire the page lock before FCW validation");
+        assert!(stale.page_locks.contains(&pgno));
+
+        let result = m.commit(&mut stale);
+        assert_eq!(result.unwrap_err(), MvccError::BusySnapshot);
+        assert_eq!(stale.state, TransactionState::Aborted);
+        assert!(
+            !stale.snapshot_established,
+            "FCW abort must unregister the active snapshot"
+        );
+        assert!(
+            !stale.has_version_guard(),
+            "FCW abort must unpin the EBR guard"
+        );
+        assert!(
+            stale.page_locks.is_empty(),
+            "FCW abort must release page locks held by the stale writer"
+        );
+        assert!(m.cached_gc_horizon().is_none());
+        assert_eq!(m.shm.load_gc_horizon(), CommitSeq::ZERO);
+        assert_eq!(m.version_guard_registry().active_guard_count(), 0);
+    }
+
+    #[test]
     fn test_pragma_write_merge_safe() {
         let mut m = mgr();
         m.set_write_merge_policy(WriteMergePolicy::Safe)

@@ -858,6 +858,37 @@ const DATE_TIME_CASES: &[QueryCase] = &[
     },
 ];
 
+const JSON1_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "json validation and canonicalization",
+        sql: r#"SELECT json('[1,2,3]'), json_valid('{"a":1}'), json_valid('[1,2,]')"#,
+    },
+    QueryCase {
+        name: "json extract scalar and multi path",
+        sql: r#"SELECT json_extract('{"a":[10,20,30],"b":{"c":"see"}}', '$.a[1]'), json_extract('{"a":1,"b":2}', '$.a', '$.b', '$.missing')"#,
+    },
+    QueryCase {
+        name: "json type and array length",
+        sql: r#"SELECT json_type('{"a":[1,null,"x"]}', '$.a'), json_type('{"a":[1,null,"x"]}', '$.a[1]'), json_array_length('{"a":[1,2,3]}', '$.a')"#,
+    },
+    QueryCase {
+        name: "json constructors and quote",
+        sql: r#"SELECT json_array(1, 'two', NULL), json_object('a', 1, 'b', json('[2,3]')), json_quote('needs "quotes"')"#,
+    },
+    QueryCase {
+        name: "json mutators",
+        sql: r#"SELECT json_set('{"a":[1,2]}', '$.a[#]', 3), json_insert('{"a":1}', '$.a', 99, '$.b', 2), json_replace('{"a":1,"b":2}', '$.a', 7, '$.missing', 8)"#,
+    },
+    QueryCase {
+        name: "json remove and patch",
+        sql: r#"SELECT json_remove('{"a":[1,2,3],"b":4}', '$.a[#-2]', '$.b'), json_patch('{"a":{"b":1,"c":2},"d":3}', '{"a":{"b":9,"c":null},"e":4}')"#,
+    },
+    QueryCase {
+        name: "json_each table valued rows",
+        sql: r#"SELECT key, value, type FROM json_each('["a",2,null,true]') ORDER BY key"#,
+    },
+];
+
 #[test]
 fn select_join_group_by_aggregates_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
@@ -953,4 +984,10 @@ fn triggers_match_rusqlite() {
 fn date_time_functions_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new("");
     harness.assert_queries_match("date/time", DATE_TIME_CASES);
+}
+
+#[test]
+fn json1_functions_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new("");
+    harness.assert_queries_match("JSON1", JSON1_CASES);
 }

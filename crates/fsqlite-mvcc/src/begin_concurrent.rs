@@ -3865,10 +3865,41 @@ mod tests {
         Ok(final_state)
     }
 
+    fn reader_snapshot_view(
+        handle: &ConcurrentHandle,
+        commit_index: &CommitIndex,
+        pages: &[PageNumber],
+    ) -> BTreeMap<PageNumber, (Option<u64>, bool, Option<u8>)> {
+        let snapshot_high = handle.snapshot().high;
+        let mut view = BTreeMap::new();
+        for page in pages {
+            let committed = commit_index
+                .latest(*page)
+                .filter(|seq| *seq <= snapshot_high)
+                .map(CommitSeq::get);
+            let (is_freed, has_staged_write) = concurrent_page_read_status(handle, *page);
+            let local_tag = has_staged_write
+                .then(|| concurrent_read_page(handle, *page).map(|data| data.as_bytes()[0]))
+                .flatten();
+            view.insert(*page, (committed, is_freed, local_tag));
+        }
+        view
+    }
+
+    fn union_pages(left: &[PageNumber], right: &[PageNumber]) -> Vec<PageNumber> {
+        let mut pages = BTreeSet::new();
+        pages.extend(left.iter().copied());
+        pages.extend(right.iter().copied());
+        pages.into_iter().collect()
+    }
+
     // Metamorphic strength matrix:
     // - MR1 commit-order independence: fault sensitivity 5, independence 4,
     //   execution cost 1. It detects false global writer serialization or
     //   order-dependent FCW failures for disjoint page writes.
+    // - MR2 snapshot isolation: fault sensitivity 5, independence 5,
+    //   execution cost 1. It detects leaked uncommitted writer state in a
+    //   reader's already-established snapshot view.
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(MVCC_METAMORPHIC_PROPTEST_CASES))]
 
@@ -3889,6 +3920,82 @@ mod tests {
                 .map_err(TestCaseError::fail)?;
 
             prop_assert_eq!(forward_state, reverse_state);
+        }
+
+        #[test]
+        fn metamorphic_snapshot_isolation_hides_uncommitted_writes(
+            raw_base_pages in prop_vec(1_u32..=2048, 1..=8),
+            raw_writer_pages in prop_vec(1_u32..=2048, 1..=8),
+        ) {
+            let base_pages = unique_test_pages(&raw_base_pages);
+            let writer_pages = unique_test_pages(&raw_writer_pages);
+            prop_assert!(!base_pages.is_empty());
+            prop_assert!(!writer_pages.is_empty());
+
+            let lock_table = InProcessPageLockTable::new();
+            let commit_index = CommitIndex::new();
+            for (idx, page) in base_pages.iter().enumerate() {
+                commit_index.update(*page, CommitSeq::new(2 + idx as u64));
+            }
+
+            let all_pages = union_pages(&base_pages, &writer_pages);
+            let mut registry = ConcurrentRegistry::new();
+            let reader_session = registry
+                .begin_concurrent(test_snapshot(10))
+                .map_err(|err| TestCaseError::fail(format!("begin reader failed: {err:?}")))?;
+            let writer_session = registry
+                .begin_concurrent(test_snapshot(10))
+                .map_err(|err| TestCaseError::fail(format!("begin writer failed: {err:?}")))?;
+
+            let before = {
+                let reader = registry
+                    .get(reader_session)
+                    .ok_or_else(|| TestCaseError::fail("missing reader handle"))?;
+                reader_snapshot_view(&reader, &commit_index, &all_pages)
+            };
+
+            {
+                let mut writer = registry
+                    .get_mut(writer_session)
+                    .ok_or_else(|| TestCaseError::fail("missing writer handle"))?;
+                for (idx, page) in writer_pages.iter().enumerate() {
+                    let tag = u8::try_from(idx + 1).expect("proptest limits writers to <= 8");
+                    concurrent_write_page(
+                        &mut writer,
+                        &lock_table,
+                        writer_session,
+                        *page,
+                        tagged_test_data(tag),
+                    )
+                    .map_err(|err| {
+                        TestCaseError::fail(format!(
+                            "uncommitted writer page {} failed: {err:?}",
+                            page.get()
+                        ))
+                    })?;
+                    let writer_tag = concurrent_read_page(&writer, *page)
+                        .map(|data| data.as_bytes()[0]);
+                    prop_assert_eq!(writer_tag, Some(tag));
+                }
+            }
+
+            let after = {
+                let reader = registry
+                    .get(reader_session)
+                    .ok_or_else(|| TestCaseError::fail("missing reader handle"))?;
+                reader_snapshot_view(&reader, &commit_index, &all_pages)
+            };
+            prop_assert_eq!(before, after);
+
+            {
+                let mut writer = registry
+                    .get_mut(writer_session)
+                    .ok_or_else(|| TestCaseError::fail("missing writer handle"))?;
+                concurrent_abort(&mut writer, &lock_table, writer_session);
+            }
+            prop_assert_eq!(lock_table.lock_count(), 0);
+            prop_assert!(registry.remove_and_recycle(reader_session));
+            prop_assert!(registry.remove_and_recycle(writer_session));
         }
     }
 

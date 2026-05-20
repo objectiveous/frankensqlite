@@ -11778,27 +11778,7 @@ pub fn codegen_update(
     b.emit_op(Opcode::Transaction, 0, 1, 0, P4::None, 0);
 
     // Resolve assignment targets to column indices.
-    let assignment_cols: Vec<usize> = stmt
-        .assignments
-        .iter()
-        .map(|assign| {
-            let col_name = match &assign.target {
-                fsqlite_ast::AssignmentTarget::Column(name) => name.as_str(),
-                fsqlite_ast::AssignmentTarget::ColumnList(_) => {
-                    return Err(CodegenError::Unsupported(
-                        "multi-column SET (a, b) = (...) assignment is not yet supported"
-                            .to_owned(),
-                    ));
-                }
-            };
-            table
-                .column_index(col_name)
-                .ok_or_else(|| CodegenError::ColumnNotFound {
-                    table: table.name.clone(),
-                    column: col_name.to_owned(),
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let assignment_cols = collect_update_assignment_columns(table, &stmt.assignments)?;
     let update_index_mask = update_index_maintenance_mask(table, &assignment_cols);
 
     // OpenWrite for table.
@@ -11973,16 +11953,7 @@ pub fn codegen_update(
     };
     // Reset placeholder counter to 1 for SET expressions (they appear first in SQL text).
     b.set_next_anon_placeholder(1);
-    for (assign_idx, col_idx) in assignment_cols.iter().enumerate() {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let target = col_regs + *col_idx as i32;
-        emit_expr(
-            b,
-            &stmt.assignments[assign_idx].value,
-            target,
-            Some(&update_ctx),
-        );
-    }
+    emit_update_assignments(b, &stmt.assignments, table, col_regs, &update_ctx)?;
 
     // UPDATE is delete+insert: remove the current row first, then insert the
     // rewritten record (possibly at a new rowid).
@@ -12122,6 +12093,93 @@ pub fn codegen_update(
     Ok(())
 }
 
+fn collect_update_assignment_columns(
+    table: &TableSchema,
+    assignments: &[fsqlite_ast::Assignment],
+) -> Result<Vec<usize>, CodegenError> {
+    let mut columns = Vec::with_capacity(assignments.len());
+    for assignment in assignments {
+        match &assignment.target {
+            AssignmentTarget::Column(name) => {
+                columns.push(table.column_index(name).ok_or_else(|| {
+                    CodegenError::ColumnNotFound {
+                        table: table.name.clone(),
+                        column: name.to_owned(),
+                    }
+                })?);
+            }
+            AssignmentTarget::ColumnList(names) => {
+                if names.is_empty() {
+                    return Err(CodegenError::Unsupported(
+                        "multi-column SET requires at least one target column".to_owned(),
+                    ));
+                }
+                for name in names {
+                    columns.push(table.column_index(name).ok_or_else(|| {
+                        CodegenError::ColumnNotFound {
+                            table: table.name.clone(),
+                            column: name.to_owned(),
+                        }
+                    })?);
+                }
+            }
+        }
+    }
+    Ok(columns)
+}
+
+fn emit_update_assignments(
+    b: &mut ProgramBuilder,
+    assignments: &[fsqlite_ast::Assignment],
+    table: &TableSchema,
+    col_regs: i32,
+    scan: &ScanCtx<'_>,
+) -> Result<(), CodegenError> {
+    for assignment in assignments {
+        match &assignment.target {
+            AssignmentTarget::Column(name) => {
+                let col_idx =
+                    table
+                        .column_index(name)
+                        .ok_or_else(|| CodegenError::ColumnNotFound {
+                            table: table.name.clone(),
+                            column: name.to_owned(),
+                        })?;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let target_reg = col_regs + col_idx as i32;
+                emit_expr(b, &assignment.value, target_reg, Some(scan));
+            }
+            AssignmentTarget::ColumnList(names) => {
+                let Expr::RowValue(values, _) = &assignment.value else {
+                    return Err(CodegenError::Unsupported(
+                        "multi-column SET requires a row-value expression".to_owned(),
+                    ));
+                };
+                if names.len() != values.len() {
+                    return Err(CodegenError::Unsupported(format!(
+                        "multi-column SET arity mismatch: {} targets, {} values",
+                        names.len(),
+                        values.len()
+                    )));
+                }
+                for (name, value) in names.iter().zip(values) {
+                    let col_idx =
+                        table
+                            .column_index(name)
+                            .ok_or_else(|| CodegenError::ColumnNotFound {
+                                table: table.name.clone(),
+                                column: name.to_owned(),
+                            })?;
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                    let target_reg = col_regs + col_idx as i32;
+                    emit_expr(b, value, target_reg, Some(scan));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn update_index_maintenance_mask(table: &TableSchema, assignment_cols: &[usize]) -> Vec<bool> {
     table
         .indexes
@@ -12228,28 +12286,8 @@ fn codegen_update_from(
     // Transaction (write).
     b.emit_op(Opcode::Transaction, 0, 1, 0, P4::None, 0);
 
-    // Resolve assignment targets to column indices.
-    let assignment_cols: Vec<usize> = stmt
-        .assignments
-        .iter()
-        .map(|assign| {
-            let col_name = match &assign.target {
-                fsqlite_ast::AssignmentTarget::Column(name) => name.as_str(),
-                fsqlite_ast::AssignmentTarget::ColumnList(_) => {
-                    return Err(CodegenError::Unsupported(
-                        "multi-column SET (a, b) = (...) assignment is not yet supported"
-                            .to_owned(),
-                    ));
-                }
-            };
-            target
-                .column_index(col_name)
-                .ok_or_else(|| CodegenError::ColumnNotFound {
-                    table: target.name.clone(),
-                    column: col_name.to_owned(),
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    // Validate assignment targets before emitting loops.
+    collect_update_assignment_columns(target, &stmt.assignments)?;
 
     // Cursor allocation: 0 = target (write), 1..N = indexes, N+1 = FROM (read).
     let target_cursor = 0_i32;
@@ -12397,16 +12435,7 @@ fn codegen_update_from(
 
     // Evaluate SET assignments. Reset placeholder counter to 1 (SET first in SQL text).
     b.set_next_anon_placeholder(1);
-    for (assign_idx, col_idx) in assignment_cols.iter().enumerate() {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let target_reg = col_regs + *col_idx as i32;
-        emit_expr(
-            b,
-            &stmt.assignments[assign_idx].value,
-            target_reg,
-            Some(&scan),
-        );
-    }
+    emit_update_assignments(b, &stmt.assignments, target, col_regs, &scan)?;
 
     // Get old rowid.
     let old_rowid_reg = b.alloc_reg();

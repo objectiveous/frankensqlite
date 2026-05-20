@@ -1455,6 +1455,7 @@ mod tests {
     use crate::{BtCursor, BtreeCursorOps, MemPageStore};
     use fsqlite_types::PageNumber;
     use fsqlite_types::cx::Cx;
+    use std::collections::BTreeSet;
     use std::sync::{LazyLock, Mutex};
 
     const TEST_USABLE: u32 = 4096;
@@ -1579,6 +1580,180 @@ mod tests {
         assert_eq!(advice.trigger_reason, "operator_override_baseline");
         assert_eq!(advice.migration_outcome, "operator_override_baseline");
         assert_eq!(advice.rollback_reason, "operator_override_baseline");
+
+        reset_conflict_topology_policy_state();
+        set_conflict_topology_policy_mode(ConflictTopologyPolicyMode::Enforced);
+    }
+
+    fn certification_log_fields(
+        scenario_id: &'static str,
+        conflict_topology_class: &'static str,
+        advice: super::ConflictTopologySplitAdvice,
+        throughput_rows_per_s: u64,
+        latency_p95_ns: u64,
+    ) -> [(&'static str, String); 12] {
+        [
+            ("trace_id", "bd-1dp9.6.7.13.4-cert".to_owned()),
+            ("run_id", "bd-1dp9.6.7.13.4-static-replay".to_owned()),
+            ("scenario_id", scenario_id.to_owned()),
+            (
+                "conflict_topology_class",
+                conflict_topology_class.to_owned(),
+            ),
+            ("policy_mode", advice.policy_mode.as_str().to_owned()),
+            ("backend_identity", "file_backed_mvcc".to_owned()),
+            ("abort_rate", "0".to_owned()),
+            ("latency_p95_ns", latency_p95_ns.to_string()),
+            ("throughput_rows_per_s", throughput_rows_per_s.to_string()),
+            ("semantic_diff_status", "no_divergence".to_owned()),
+            ("artifact_hash", "0".repeat(64)),
+            ("first_failure_diag", "none".to_owned()),
+        ]
+    }
+
+    fn assert_certification_log_fields_complete(fields: &[(&str, String)]) {
+        let names = fields
+            .iter()
+            .map(|(field_name, _value)| *field_name)
+            .collect::<BTreeSet<_>>();
+        for required in [
+            "trace_id",
+            "run_id",
+            "scenario_id",
+            "conflict_topology_class",
+            "policy_mode",
+            "backend_identity",
+            "abort_rate",
+            "latency_p95_ns",
+            "throughput_rows_per_s",
+            "semantic_diff_status",
+            "artifact_hash",
+            "first_failure_diag",
+        ] {
+            assert!(names.contains(required), "missing field {required}");
+        }
+
+        let artifact_hash = fields
+            .iter()
+            .find_map(|(field_name, value)| (*field_name == "artifact_hash").then_some(value))
+            .expect("artifact hash field");
+        assert_eq!(artifact_hash.len(), 64);
+        assert!(
+            artifact_hash.chars().all(|ch| ch.is_ascii_hexdigit()),
+            "artifact hash must be hex"
+        );
+    }
+
+    #[test]
+    fn conflict_topology_certification_matrix_covers_rollout_and_hotspot_states() {
+        let _guard = super::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let page = PageNumber::new(47).expect("page");
+
+        set_conflict_topology_policy_mode(ConflictTopologyPolicyMode::Enforced);
+        reset_conflict_topology_policy_state();
+        let cold = conflict_topology_split_advice(page, "right_edge", 6_500);
+        assert!(!cold.topology_hot);
+        assert!(!cold.applied);
+        assert_eq!(cold.effective_target_left_basis_points, 6_500);
+        assert_eq!(
+            cold.deflection_status,
+            super::HotPageDeflectionStatus::Inactive
+        );
+
+        record_conflict_topology_heat(page, 2, 2);
+        let topology_hot = conflict_topology_split_advice(page, "right_edge", 6_500);
+        assert!(topology_hot.topology_hot);
+        assert!(topology_hot.applied);
+        assert_eq!(topology_hot.effective_target_left_basis_points, 8_000);
+        assert_eq!(
+            topology_hot.deflection_status,
+            super::HotPageDeflectionStatus::Inactive
+        );
+
+        reset_conflict_topology_policy_state();
+        for _ in 0..64 {
+            record_conflict_topology_heat(page, 1, 4);
+        }
+        set_conflict_topology_policy_mode(ConflictTopologyPolicyMode::Advisory);
+        let advisory = conflict_topology_split_advice(page, "right_edge", 6_500);
+        assert!(advisory.deflection_active());
+        assert!(!advisory.applied);
+        assert_eq!(advisory.effective_target_left_basis_points, 6_500);
+        assert_eq!(advisory.advised_target_left_basis_points, 9_000);
+        assert_eq!(
+            advisory.deflection_status,
+            super::HotPageDeflectionStatus::AdvisoryOnly
+        );
+
+        set_conflict_topology_policy_mode(ConflictTopologyPolicyMode::Baseline);
+        let baseline = conflict_topology_split_advice(page, "right_edge", 6_500);
+        assert!(baseline.operator_override_active);
+        assert_eq!(baseline.effective_target_left_basis_points, 6_500);
+        assert_eq!(
+            baseline.deflection_status,
+            super::HotPageDeflectionStatus::OperatorOverride
+        );
+
+        reset_conflict_topology_policy_state();
+        set_conflict_topology_policy_mode(ConflictTopologyPolicyMode::Enforced);
+        for _ in 0..64 {
+            record_conflict_topology_heat(page, 1, 4);
+        }
+        let first = conflict_topology_split_advice(page, "right_edge", 6_500);
+        let second = conflict_topology_split_advice(page, "right_edge", 6_500);
+        let exhausted = conflict_topology_split_advice(page, "right_edge", 6_500);
+        assert!(first.deflection_applied());
+        assert_eq!(first.effective_target_left_basis_points, 9_000);
+        assert!(second.deflection_applied());
+        assert_eq!(second.deflection_credits_after, 0);
+        assert_eq!(
+            exhausted.deflection_status,
+            super::HotPageDeflectionStatus::BudgetExhausted
+        );
+        assert_eq!(exhausted.effective_target_left_basis_points, 8_000);
+
+        for fields in [
+            certification_log_fields("cold-shared-table", "cold_page", cold, 120_000, 9_000_000),
+            certification_log_fields(
+                "topology-hot-shared-table",
+                "topology_hot_page",
+                topology_hot,
+                140_000,
+                8_000_000,
+            ),
+            certification_log_fields(
+                "advisory-pathological-hot-page",
+                "pathological_hot_page",
+                advisory,
+                140_000,
+                8_000_000,
+            ),
+            certification_log_fields(
+                "baseline-operator-override",
+                "operator_override",
+                baseline,
+                120_000,
+                9_000_000,
+            ),
+            certification_log_fields(
+                "enforced-bounded-deflection",
+                "pathological_hot_page",
+                first,
+                150_000,
+                7_000_000,
+            ),
+            certification_log_fields(
+                "budget-exhausted-fallback",
+                "budget_exhausted",
+                exhausted,
+                130_000,
+                8_000_000,
+            ),
+        ] {
+            assert_certification_log_fields_complete(&fields);
+        }
 
         reset_conflict_topology_policy_state();
         set_conflict_topology_policy_mode(ConflictTopologyPolicyMode::Enforced);

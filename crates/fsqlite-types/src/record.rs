@@ -3735,6 +3735,58 @@ mod tests {
         .boxed()
     }
 
+    fn arb_boundary_length_sqlite_value() -> BoxedStrategy<SqliteValue> {
+        prop_oneof![
+            2 => Just(SqliteValue::Null),
+            4 => prop_oneof![
+                Just(0_i64),
+                Just(1_i64),
+                Just(-1_i64),
+                Just(127_i64),
+                Just(-128_i64),
+                Just(128_i64),
+                Just(32_767_i64),
+                Just(-32_768_i64),
+                Just(i64::MAX),
+                Just(i64::MIN),
+            ].prop_map(SqliteValue::Integer),
+            2 => prop_oneof![
+                Just(0.0_f64),
+                Just(-0.0_f64),
+                Just(1.0_f64),
+                Just(-1.0_f64),
+                Just(f64::MIN_POSITIVE),
+            ].prop_map(SqliteValue::Float),
+            5 => prop_oneof![
+                Just(0_usize),
+                Just(1_usize),
+                Just(2_usize),
+                Just(56_usize),
+                Just(57_usize),
+                Just(58_usize),
+                Just(59_usize),
+                Just(120_usize),
+                Just(121_usize),
+                Just(122_usize),
+            ]
+            .prop_map(|len| SqliteValue::Text(SmallText::from_string("x".repeat(len)))),
+            5 => prop_oneof![
+                Just(0_usize),
+                Just(1_usize),
+                Just(2_usize),
+                Just(56_usize),
+                Just(57_usize),
+                Just(58_usize),
+                Just(59_usize),
+                Just(120_usize),
+                Just(121_usize),
+                Just(122_usize),
+            ]
+            .prop_map(|len| SqliteValue::Blob(Arc::from(vec![0xAB; len].as_slice()))),
+        ]
+        .boxed()
+    }
+
     #[test]
     fn simd_integer_record_matches_scalar_record_bytes() {
         let row = vec![
@@ -3929,6 +3981,68 @@ mod tests {
                 values[0],
                 decoded[0]
             );
+        }
+
+        /// bd-7ij9b: Stress record-header varint boundaries where text/blob
+        /// serial types cross from one-byte to two-byte header entries.
+        #[test]
+        fn prop_record_roundtrip_header_varint_boundaries(
+            values in proptest::collection::vec(arb_boundary_length_sqlite_value(), 0..24)
+        ) {
+            let via_vec = serialize_record(&values);
+            let exact = record_iter_exact_size(values.iter());
+            prop_assert_eq!(
+                exact,
+                via_vec.len(),
+                "bead_id=bd-7ij9b case=exact_size_mismatch exact={exact} vec_len={}",
+                via_vec.len()
+            );
+
+            let mut via_slice = vec![0u8; exact];
+            serialize_record_iter_into_slice(values.iter(), via_slice.as_mut_slice())
+                .expect("boundary-focused slice serialize must succeed");
+            prop_assert_eq!(
+                via_slice,
+                via_vec,
+                "bead_id=bd-7ij9b case=slice_vs_vec_mismatch values={values:?}"
+            );
+
+            let parsed = parse_record(&via_vec).expect("serialized record must parse");
+            prop_assert_eq!(
+                parsed.len(),
+                values.len(),
+                "bead_id=bd-7ij9b case=parse_len_mismatch expected={} got={}",
+                values.len(),
+                parsed.len()
+            );
+
+            let mut scratch = Vec::new();
+            parse_record_into(&via_vec, &mut scratch).expect("serialized record must parse into scratch");
+            prop_assert_eq!(
+                scratch.len(),
+                values.len(),
+                "bead_id=bd-7ij9b case=parse_into_len_mismatch expected={} got={}",
+                values.len(),
+                scratch.len()
+            );
+
+            for (i, ((expected, decoded), reused)) in values
+                .iter()
+                .zip(parsed.iter())
+                .zip(scratch.iter())
+                .enumerate()
+            {
+                prop_assert!(
+                    values_bitwise_eq(expected, decoded),
+                    "bead_id=bd-7ij9b case=parse_mismatch col={} expected={expected:?} decoded={decoded:?}",
+                    i
+                );
+                prop_assert!(
+                    values_bitwise_eq(expected, reused),
+                    "bead_id=bd-7ij9b case=parse_into_mismatch col={} expected={expected:?} decoded={reused:?}",
+                    i
+                );
+            }
         }
 
         /// INV-PBT-4: Lazy header-only parse + per-column decode matches full parse.

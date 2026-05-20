@@ -182,6 +182,8 @@ pub enum DataflowOperator {
     ConsolidateByKey { key_columns: Vec<usize> },
     /// Consolidate algebraic weights by complete row value.
     ConsolidateRows,
+    /// Multiply every row weight by `factor`, eliding zero-weight output rows.
+    ScaleWeight { factor: i64 },
     /// Compute `DeltaLeft JOIN Right`, with the current stream as the delta-left input.
     DeltaJoinLeft {
         stable_right: Vec<WeightedRow>,
@@ -221,6 +223,7 @@ impl DataflowOperator {
                 .collect(),
             Self::ConsolidateByKey { key_columns } => consolidate_by_key(rows, key_columns),
             Self::ConsolidateRows => Ok(consolidate_rows(rows.iter().cloned().collect())),
+            Self::ScaleWeight { factor } => Ok(scale_weights(rows, *factor)),
             Self::DeltaJoinLeft {
                 stable_right,
                 key_spec,
@@ -325,6 +328,20 @@ pub fn consolidate_rows(rows: Vec<WeightedRow>) -> Vec<WeightedRow> {
     groups
         .into_iter()
         .filter_map(|(values, weight)| (weight != 0).then(|| WeightedRow::new(values, weight)))
+        .collect()
+}
+
+/// Multiply row weights by an algebraic factor, preserving row order and values.
+pub fn scale_weights(rows: &[WeightedRow], factor: i64) -> Vec<WeightedRow> {
+    if factor == 0 {
+        return Vec::new();
+    }
+
+    rows.iter()
+        .filter_map(|row| {
+            let weight = row.weight.saturating_mul(factor);
+            (weight != 0).then(|| WeightedRow::new(row.values.clone(), weight))
+        })
         .collect()
 }
 
@@ -436,7 +453,7 @@ pub fn delta_join_update(
 mod tests {
     use super::{
         DataflowAutomaton, DataflowError, DataflowOperator, JoinKeySpec, WeightedRow,
-        delta_join_left, delta_join_right, delta_join_update,
+        delta_join_left, delta_join_right, delta_join_update, scale_weights,
     };
     use fsqlite_types::SqliteValue;
 
@@ -521,6 +538,47 @@ mod tests {
         let actual = automaton.execute(&rows).expect("dataflow should execute");
 
         assert_eq!(actual, vec![WeightedRow::new(vec![int(1), int(10)], 7)]);
+    }
+
+    #[test]
+    fn scale_weight_operator_inverts_weights_and_elides_zeroes() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::ScaleWeight { factor: -1 }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), int(10)], 3),
+            WeightedRow::new(vec![int(2), int(20)], -2),
+            WeightedRow::new(vec![int(3), int(30)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(1), int(10)], -3),
+                WeightedRow::new(vec![int(2), int(20)], 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn scale_weights_zero_factor_elides_all_rows() {
+        let rows = vec![
+            WeightedRow::new(vec![int(1)], 3),
+            WeightedRow::new(vec![int(2)], -2),
+        ];
+
+        let actual = scale_weights(&rows, 0);
+
+        assert_eq!(actual, Vec::<WeightedRow>::new());
+    }
+
+    #[test]
+    fn scale_weights_saturates_on_overflow() {
+        let rows = vec![WeightedRow::new(vec![int(1)], i64::MAX)];
+
+        let actual = scale_weights(&rows, 2);
+
+        assert_eq!(actual, vec![WeightedRow::new(vec![int(1)], i64::MAX)]);
     }
 
     #[test]

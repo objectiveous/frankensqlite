@@ -1315,9 +1315,17 @@ pub enum Fts5Expr {
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
     Not(Box<Self>, Box<Self>),
-    Near(Vec<String>, u32),
+    Near(Vec<Fts5NearOperand>, u32),
     ColumnFilter(String, Box<Self>),
     InitialToken(Box<Self>),
+}
+
+/// A phrase-like operand inside an FTS5 NEAR group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fts5NearOperand {
+    Term(String),
+    Prefix(String),
+    Phrase(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1357,6 +1365,26 @@ fn parse_column_filter_spec(raw: &str) -> Option<Fts5ColumnFilterSpec> {
     }
 
     (!columns.is_empty()).then_some(Fts5ColumnFilterSpec { exclude, columns })
+}
+
+fn near_operand_from_token(token: &Fts5QueryToken) -> Option<Fts5NearOperand> {
+    match token.kind {
+        Fts5QueryTokenKind::Term if !token.lexeme.trim().is_empty() => {
+            Some(Fts5NearOperand::Term(token.lexeme.trim().to_owned()))
+        }
+        Fts5QueryTokenKind::Prefix if !token.lexeme.trim().is_empty() => {
+            Some(Fts5NearOperand::Prefix(token.lexeme.trim().to_owned()))
+        }
+        Fts5QueryTokenKind::Phrase => {
+            let terms: Vec<String> = token
+                .lexeme
+                .split_whitespace()
+                .map(str::to_lowercase)
+                .collect();
+            (!terms.is_empty()).then_some(Fts5NearOperand::Phrase(terms))
+        }
+        _ => None,
+    }
 }
 
 /// Build an expression tree from parsed FTS5 query tokens.
@@ -1443,7 +1471,6 @@ fn parse_primary(
             Ok((Fts5Expr::ColumnFilter(col, Box::new(inner)), rest))
         }
         Fts5QueryTokenKind::Near => {
-            // Supported subset: NEAR(term1 term2 ..., N) with bare term operands.
             let mut rest = &tokens[1..];
             if !rest
                 .first()
@@ -1452,7 +1479,7 @@ fn parse_primary(
                 return Err(Fts5QueryError::InvalidNearSyntax);
             }
             rest = &rest[1..]; // skip (
-            let mut terms = Vec::new();
+            let mut operands = Vec::new();
             let mut distance = 10u32; // default NEAR distance
             let mut expect_distance = false;
 
@@ -1463,23 +1490,21 @@ fn parse_primary(
                 }
 
                 if t.kind == Fts5QueryTokenKind::RParen {
-                    if expect_distance || terms.len() < 2 {
+                    if expect_distance || operands.len() < 2 {
                         return Err(Fts5QueryError::InvalidNearSyntax);
                     }
                     rest = &rest[1..];
                     break;
                 }
 
-                if t.kind != Fts5QueryTokenKind::Term {
-                    return Err(Fts5QueryError::InvalidNearSyntax);
-                }
-
-                let lexeme = t.lexeme.trim();
-                if lexeme.is_empty() {
-                    return Err(Fts5QueryError::InvalidNearSyntax);
-                }
-
                 if expect_distance {
+                    if t.kind != Fts5QueryTokenKind::Term {
+                        return Err(Fts5QueryError::InvalidNearSyntax);
+                    }
+                    let lexeme = t.lexeme.trim();
+                    if lexeme.is_empty() {
+                        return Err(Fts5QueryError::InvalidNearSyntax);
+                    }
                     let raw_distance = lexeme.strip_prefix(',').unwrap_or(lexeme);
                     distance = raw_distance
                         .parse::<u32>()
@@ -1489,49 +1514,59 @@ fn parse_primary(
                     continue;
                 }
 
-                if lexeme == "," {
-                    if terms.len() < 2 {
+                if t.kind == Fts5QueryTokenKind::Term {
+                    let lexeme = t.lexeme.trim();
+                    if lexeme.is_empty() {
                         return Err(Fts5QueryError::InvalidNearSyntax);
                     }
-                    expect_distance = true;
-                    rest = &rest[1..];
-                    continue;
-                }
 
-                if let Some((raw_term, raw_distance)) = lexeme.split_once(',') {
-                    let term = raw_term.trim();
-                    let trailing = raw_distance.trim();
-
-                    if term.is_empty() {
-                        if terms.len() < 2 || trailing.is_empty() {
+                    if lexeme == "," {
+                        if operands.len() < 2 {
                             return Err(Fts5QueryError::InvalidNearSyntax);
                         }
-                        distance = trailing
-                            .parse::<u32>()
-                            .map_err(|_| Fts5QueryError::InvalidNearSyntax)?;
-                    } else {
-                        terms.push(term.to_owned());
-                        if trailing.is_empty() {
-                            expect_distance = true;
-                        } else {
+                        expect_distance = true;
+                        rest = &rest[1..];
+                        continue;
+                    }
+
+                    if let Some((raw_term, raw_distance)) = lexeme.split_once(',') {
+                        let term = raw_term.trim();
+                        let trailing = raw_distance.trim();
+
+                        if term.is_empty() {
+                            if operands.len() < 2 || trailing.is_empty() {
+                                return Err(Fts5QueryError::InvalidNearSyntax);
+                            }
                             distance = trailing
                                 .parse::<u32>()
                                 .map_err(|_| Fts5QueryError::InvalidNearSyntax)?;
+                        } else {
+                            operands.push(Fts5NearOperand::Term(term.to_owned()));
+                            if trailing.is_empty() {
+                                expect_distance = true;
+                            } else {
+                                distance = trailing
+                                    .parse::<u32>()
+                                    .map_err(|_| Fts5QueryError::InvalidNearSyntax)?;
+                            }
                         }
+                        rest = &rest[1..];
+                        continue;
                     }
-                    rest = &rest[1..];
-                    continue;
                 }
 
-                terms.push(lexeme.to_owned());
+                let Some(operand) = near_operand_from_token(t) else {
+                    return Err(Fts5QueryError::InvalidNearSyntax);
+                };
+                operands.push(operand);
                 rest = &rest[1..];
             }
 
-            if expect_distance || terms.len() < 2 {
+            if expect_distance || operands.len() < 2 {
                 return Err(Fts5QueryError::InvalidNearSyntax);
             }
 
-            Ok((Fts5Expr::Near(terms, distance), rest))
+            Ok((Fts5Expr::Near(operands, distance), rest))
         }
         _ => Err(Fts5QueryError::EmptyQuery),
     }
@@ -1964,6 +1999,33 @@ fn normalize_query_phrase_terms(phrase: &[String], tokenizer: &dyn Fts5Tokenizer
     }
 }
 
+fn normalize_near_operand_with_tokenizer(
+    operand: Fts5NearOperand,
+    tokenizer: &dyn Fts5Tokenizer,
+) -> Fts5NearOperand {
+    match operand {
+        Fts5NearOperand::Term(term) => {
+            let terms = tokenize_query_leaf(tokenizer, &term);
+            match terms.as_slice() {
+                [] => Fts5NearOperand::Term(term.to_lowercase()),
+                [single] => Fts5NearOperand::Term(single.clone()),
+                _ => Fts5NearOperand::Phrase(terms),
+            }
+        }
+        Fts5NearOperand::Prefix(prefix) => {
+            let terms = tokenize_query_leaf(tokenizer, &prefix);
+            let normalized = terms
+                .first()
+                .cloned()
+                .unwrap_or_else(|| prefix.to_lowercase());
+            Fts5NearOperand::Prefix(normalized)
+        }
+        Fts5NearOperand::Phrase(words) => {
+            Fts5NearOperand::Phrase(normalize_query_phrase_terms(&words, tokenizer))
+        }
+    }
+}
+
 fn normalize_query_expr_with_tokenizer(expr: Fts5Expr, tokenizer: &dyn Fts5Tokenizer) -> Fts5Expr {
     match expr {
         Fts5Expr::Term(term) => normalize_query_term_expr(term, tokenizer),
@@ -1990,13 +2052,13 @@ fn normalize_query_expr_with_tokenizer(expr: Fts5Expr, tokenizer: &dyn Fts5Token
             Box::new(normalize_query_expr_with_tokenizer(*left, tokenizer)),
             Box::new(normalize_query_expr_with_tokenizer(*right, tokenizer)),
         ),
-        Fts5Expr::Near(terms, distance) => {
-            let normalized = terms
-                .iter()
-                .flat_map(|term| tokenize_query_leaf(tokenizer, term))
-                .collect();
-            Fts5Expr::Near(normalized, distance)
-        }
+        Fts5Expr::Near(operands, distance) => Fts5Expr::Near(
+            operands
+                .into_iter()
+                .map(|operand| normalize_near_operand_with_tokenizer(operand, tokenizer))
+                .collect(),
+            distance,
+        ),
         Fts5Expr::ColumnFilter(column_name, inner) => Fts5Expr::ColumnFilter(
             column_name,
             Box::new(normalize_query_expr_with_tokenizer(*inner, tokenizer)),
@@ -2409,39 +2471,129 @@ fn evaluate_phrase(
     result
 }
 
-fn evaluate_near(
+#[derive(Debug, Clone, Copy)]
+struct Fts5NearSpan {
+    docid: i64,
+    column: u32,
+    start: u32,
+    end: u32,
+}
+
+fn near_operand_spans(
     index: &InvertedIndex,
-    terms: &[String],
-    distance: u32,
+    operand: &Fts5NearOperand,
     allowed_columns: Option<&[u32]>,
-) -> Vec<i64> {
-    if terms.len() < 2 {
+) -> Vec<Fts5NearSpan> {
+    match operand {
+        Fts5NearOperand::Term(term) => index
+            .get_postings(term)
+            .iter()
+            .filter(|posting| posting_matches_allowed_columns(posting.column, allowed_columns))
+            .flat_map(|posting| {
+                posting.positions.iter().map(|position| Fts5NearSpan {
+                    docid: posting.docid,
+                    column: posting.column,
+                    start: *position,
+                    end: *position,
+                })
+            })
+            .collect(),
+        Fts5NearOperand::Prefix(prefix) => index
+            .get_prefix_postings(prefix)
+            .into_iter()
+            .filter(|posting| posting_matches_allowed_columns(posting.column, allowed_columns))
+            .flat_map(|posting| {
+                posting.positions.iter().map(|position| Fts5NearSpan {
+                    docid: posting.docid,
+                    column: posting.column,
+                    start: *position,
+                    end: *position,
+                })
+            })
+            .collect(),
+        Fts5NearOperand::Phrase(words) => phrase_near_spans(index, words, allowed_columns),
+    }
+}
+
+fn phrase_near_spans(
+    index: &InvertedIndex,
+    words: &[String],
+    allowed_columns: Option<&[u32]>,
+) -> Vec<Fts5NearSpan> {
+    if words.is_empty() {
         return Vec::new();
     }
 
-    let first_postings = index.get_postings(&terms[0]);
-    let mut result = Vec::new();
-
-    for first_p in first_postings {
+    let mut spans = Vec::new();
+    for first_p in index.get_postings(&words[0]) {
         if !posting_matches_allowed_columns(first_p.column, allowed_columns) {
             continue;
         }
-        let mut all_near = true;
 
-        for term in &terms[1..] {
-            let found = index.get_postings(term).iter().any(|p| {
-                if p.docid != first_p.docid || p.column != first_p.column {
-                    return false;
+        'positions: for &start_pos in &first_p.positions {
+            for (offset, word) in words.iter().enumerate().skip(1) {
+                #[allow(clippy::cast_possible_truncation)]
+                let target_pos = start_pos + offset as u32;
+                let found = index.get_postings(word).iter().any(|posting| {
+                    posting.docid == first_p.docid
+                        && posting.column == first_p.column
+                        && posting.positions.contains(&target_pos)
+                });
+                if !found {
+                    continue 'positions;
                 }
-                if !posting_matches_allowed_columns(p.column, allowed_columns) {
-                    return false;
-                }
-                // Check if any position pair is within distance.
-                first_p.positions.iter().any(|&pos1| {
-                    p.positions
-                        .iter()
-                        .any(|&pos2| pos1.abs_diff(pos2) <= distance)
-                })
+            }
+
+            #[allow(clippy::cast_possible_truncation)]
+            spans.push(Fts5NearSpan {
+                docid: first_p.docid,
+                column: first_p.column,
+                start: start_pos,
+                end: start_pos + (words.len() - 1) as u32,
+            });
+        }
+    }
+    spans
+}
+
+fn near_span_distance(left: Fts5NearSpan, right: Fts5NearSpan) -> u32 {
+    if left.end < right.start {
+        right.start - left.end
+    } else {
+        left.start.saturating_sub(right.end)
+    }
+}
+
+fn evaluate_near(
+    index: &InvertedIndex,
+    operands: &[Fts5NearOperand],
+    distance: u32,
+    allowed_columns: Option<&[u32]>,
+) -> Vec<i64> {
+    if operands.len() < 2 {
+        return Vec::new();
+    }
+
+    let operand_spans: Vec<Vec<Fts5NearSpan>> = operands
+        .iter()
+        .map(|operand| near_operand_spans(index, operand, allowed_columns))
+        .collect();
+    let Some(first_spans) = operand_spans.first() else {
+        return Vec::new();
+    };
+    if first_spans.is_empty() || operand_spans.iter().any(Vec::is_empty) {
+        return Vec::new();
+    }
+
+    let mut result = Vec::new();
+
+    for first_span in first_spans {
+        let mut all_near = true;
+        for spans in &operand_spans[1..] {
+            let found = spans.iter().any(|span| {
+                span.docid == first_span.docid
+                    && span.column == first_span.column
+                    && near_span_distance(*first_span, *span) <= distance
             });
             if !found {
                 all_near = false;
@@ -2449,11 +2601,12 @@ fn evaluate_near(
             }
         }
 
-        if all_near && !result.contains(&first_p.docid) {
-            result.push(first_p.docid);
+        if all_near && !result.contains(&first_span.docid) {
+            result.push(first_span.docid);
         }
     }
 
+    result.sort_unstable();
     result
 }
 
@@ -2918,6 +3071,13 @@ impl Fts5Table {
 
 /// Extract all leaf-level terms from an expression tree for BM25 scoring.
 fn extract_query_terms(expr: &Fts5Expr) -> Vec<String> {
+    fn near_operand_terms(operand: &Fts5NearOperand) -> Vec<String> {
+        match operand {
+            Fts5NearOperand::Term(term) | Fts5NearOperand::Prefix(term) => vec![term.clone()],
+            Fts5NearOperand::Phrase(terms) => terms.clone(),
+        }
+    }
+
     match expr {
         Fts5Expr::Term(t) => vec![t.clone()],
         Fts5Expr::Prefix(p) => vec![p.clone()],
@@ -2927,7 +3087,7 @@ fn extract_query_terms(expr: &Fts5Expr) -> Vec<String> {
             terms.extend(extract_query_terms(r));
             terms
         }
-        Fts5Expr::Near(terms, _) => terms.clone(),
+        Fts5Expr::Near(operands, _) => operands.iter().flat_map(near_operand_terms).collect(),
         Fts5Expr::ColumnFilter(_, inner) | Fts5Expr::InitialToken(inner) => {
             extract_query_terms(inner)
         }
@@ -3733,6 +3893,16 @@ mod tests {
 
     #[allow(dead_code)]
     #[derive(Debug)]
+    struct Fts5NearPhraseStructure {
+        operands: Vec<Fts5NearOperand>,
+        distance: u32,
+        phrase_matches: Vec<i64>,
+        prefix_matches: Vec<i64>,
+        query_terms: Vec<String>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
     struct Fts5InsttokenStructure {
         config: Fts5Config,
         columns: Vec<String>,
@@ -3832,6 +4002,18 @@ mod tests {
                 sink(token_with_data.as_str(), 0, token.len(), false);
             }
         }
+    }
+
+    fn near_term(term: &str) -> Fts5NearOperand {
+        Fts5NearOperand::Term(term.to_owned())
+    }
+
+    fn near_phrase(terms: &[&str]) -> Fts5NearOperand {
+        Fts5NearOperand::Phrase(terms.iter().map(ToString::to_string).collect())
+    }
+
+    fn near_prefix(prefix: &str) -> Fts5NearOperand {
+        Fts5NearOperand::Prefix(prefix.to_owned())
     }
 
     fn table_structure(table: &Fts5Table) -> Fts5TableStructure {
@@ -6542,11 +6724,123 @@ mod tests {
         // "hello" at pos 0, "world" at pos 6 -> NOT within distance 5
         index.add_document(3, 0, &tok.tokenize("hello a b c d e world"));
 
-        let expr = Fts5Expr::Near(vec!["hello".to_owned(), "world".to_owned()], 5);
+        let expr = Fts5Expr::Near(vec![near_term("hello"), near_term("world")], 5);
         let docs = evaluate_expr(&index, &expr);
         assert!(docs.contains(&1));
         assert!(docs.contains(&2));
         assert!(!docs.contains(&3));
+    }
+
+    #[test]
+    fn test_fts5_near_phrase_operands() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["hello world near rust language".to_owned()]);
+        table.insert_document(2, &["hello world gap gap rust language".to_owned()]);
+
+        let matches = table
+            .search(r#"NEAR("hello world" "rust language", 2)"#)
+            .map_err(|err| err.to_string())?;
+        assert_eq!(
+            matches
+                .into_iter()
+                .map(|(rowid, _score)| rowid)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_near_prefix_operand() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["hello world near rustacean".to_owned()]);
+        table.insert_document(2, &["hello world gap gap rustacean".to_owned()]);
+
+        let matches = table
+            .search(r#"NEAR("hello world" rusta* , 2)"#)
+            .map_err(|err| err.to_string())?;
+        assert_eq!(
+            matches
+                .into_iter()
+                .map(|(rowid, _score)| rowid)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_near_phrase_operands() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["hello world near rust language".to_owned()]);
+        table.insert_document(2, &["hello world gap gap rust language".to_owned()]);
+        table.insert_document(3, &["hello world near rustacean".to_owned()]);
+
+        let phrase_query = r#"NEAR("hello world" "rust language", 2)"#;
+        let expr = build_expr(&parse_fts5_query(phrase_query).map_err(|err| err.to_string())?)
+            .map_err(|err| err.to_string())?;
+        let (operands, distance) = match expr {
+            Fts5Expr::Near(operands, distance) => (operands, distance),
+            other => return Err(format!("expected NEAR expression, got {other:?}")),
+        };
+        let phrase_matches = table
+            .search(phrase_query)
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let prefix_matches = table
+            .search(r#"NEAR("hello world" rusta* , 2)"#)
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let query_terms = table
+            .query_terms_for_queries(&[phrase_query])
+            .map_err(|err| err.to_string())?;
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5NearPhraseStructure {
+                    operands,
+                    distance,
+                    phrase_matches,
+                    prefix_matches,
+                    query_terms,
+                }
+            ),
+            r#"Fts5NearPhraseStructure {
+    operands: [
+        Phrase(
+            [
+                "hello",
+                "world",
+            ],
+        ),
+        Phrase(
+            [
+                "rust",
+                "language",
+            ],
+        ),
+    ],
+    distance: 2,
+    phrase_matches: [
+        1,
+    ],
+    prefix_matches: [
+        3,
+    ],
+    query_terms: [
+        "hello",
+        "world",
+        "rust",
+        "language",
+    ],
+}"#
+        );
+        Ok(())
     }
 
     // -- Edge case tests --
@@ -6954,8 +7248,8 @@ mod tests {
         let tokens = parse_fts5_query("NEAR(hello world)").unwrap();
         let expr = build_expr(&tokens).unwrap();
         match expr {
-            Fts5Expr::Near(terms, distance) => {
-                assert_eq!(terms, vec!["hello".to_owned(), "world".to_owned()]);
+            Fts5Expr::Near(operands, distance) => {
+                assert_eq!(operands, vec![near_term("hello"), near_term("world")]);
                 assert_eq!(distance, 10);
             }
             other => panic!("expected NEAR expression, got {other:?}"),
@@ -6967,8 +7261,8 @@ mod tests {
         let tokens = parse_fts5_query("NEAR(hello world, 5)").unwrap();
         let expr = build_expr(&tokens).unwrap();
         match expr {
-            Fts5Expr::Near(terms, distance) => {
-                assert_eq!(terms, vec!["hello".to_owned(), "world".to_owned()]);
+            Fts5Expr::Near(operands, distance) => {
+                assert_eq!(operands, vec![near_term("hello"), near_term("world")]);
                 assert_eq!(distance, 5);
             }
             other => panic!("expected NEAR expression, got {other:?}"),
@@ -6980,12 +7274,30 @@ mod tests {
         let tokens = parse_fts5_query("NEAR(hello world,5)").unwrap();
         let expr = build_expr(&tokens).unwrap();
         match expr {
-            Fts5Expr::Near(terms, distance) => {
-                assert_eq!(terms, vec!["hello".to_owned(), "world".to_owned()]);
+            Fts5Expr::Near(operands, distance) => {
+                assert_eq!(operands, vec![near_term("hello"), near_term("world")]);
                 assert_eq!(distance, 5);
             }
             other => panic!("expected NEAR expression, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_build_expr_near_phrase_and_prefix_operands() -> std::result::Result<(), String> {
+        let tokens =
+            parse_fts5_query(r#"NEAR("hello world" rust*)"#).map_err(|err| err.to_string())?;
+        let expr = build_expr(&tokens).map_err(|err| err.to_string())?;
+        match expr {
+            Fts5Expr::Near(operands, distance) => {
+                assert_eq!(
+                    operands,
+                    vec![near_phrase(&["hello", "world"]), near_prefix("rust")]
+                );
+                assert_eq!(distance, 10);
+            }
+            other => return Err(format!("expected NEAR expression, got {other:?}")),
+        }
+        Ok(())
     }
 
     #[test]
@@ -7076,7 +7388,7 @@ mod tests {
     #[test]
     fn test_evaluate_near_single_term() {
         let index = InvertedIndex::new();
-        let expr = Fts5Expr::Near(vec!["only".to_owned()], 5);
+        let expr = Fts5Expr::Near(vec![near_term("only")], 5);
         let docs = evaluate_expr(&index, &expr);
         assert!(docs.is_empty());
     }

@@ -13,7 +13,7 @@ anchor = "Err(FrankenError::NotImplemented("
 [[resolved_runtime_stubs]]
 stub_id = "RSTUB-0009"
 file = "crates/fsqlite-core/src/connection.rs"
-line = 4708
+line = 6201
 kind = "resolved"
 kind_description = "trigger WHEN clauses now use the connection-level subquery evaluator"
 severity = "resolved"

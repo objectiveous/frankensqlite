@@ -570,6 +570,47 @@ const TRANSACTION_CASES: &[QueryCase] = &[
     },
 ];
 
+const COMPOUND_SETUP: &str = "
+    CREATE TABLE left_values (group_name TEXT NOT NULL, value INTEGER NOT NULL);
+    CREATE TABLE right_values (group_name TEXT NOT NULL, value INTEGER NOT NULL);
+
+    INSERT INTO left_values VALUES
+        ('a', 1),
+        ('a', 2),
+        ('a', 3),
+        ('b', 3),
+        ('b', 4);
+    INSERT INTO right_values VALUES
+        ('a', 3),
+        ('a', 4),
+        ('a', 5),
+        ('b', 4),
+        ('b', 6);
+";
+
+const COMPOUND_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "union distinct",
+        sql: "SELECT value FROM left_values WHERE group_name = 'a' UNION SELECT value FROM right_values WHERE group_name = 'a' ORDER BY value",
+    },
+    QueryCase {
+        name: "union all preserves duplicates",
+        sql: "SELECT value FROM left_values WHERE value >= 3 UNION ALL SELECT value FROM right_values WHERE value <= 4 ORDER BY value",
+    },
+    QueryCase {
+        name: "intersect",
+        sql: "SELECT value FROM left_values INTERSECT SELECT value FROM right_values ORDER BY value",
+    },
+    QueryCase {
+        name: "except",
+        sql: "SELECT value FROM left_values EXCEPT SELECT value FROM right_values ORDER BY value",
+    },
+    QueryCase {
+        name: "compound order limit offset",
+        sql: "SELECT value FROM left_values UNION ALL SELECT value FROM right_values ORDER BY value LIMIT 4 OFFSET 2",
+    },
+];
+
 const SUBQUERY_SETUP: &str = "
     CREATE TABLE customers (
         id INTEGER PRIMARY KEY,
@@ -690,6 +731,12 @@ fn transactions_and_savepoints_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(TRANSACTION_SETUP);
     harness.execute_script(TRANSACTION_SCRIPT);
     harness.assert_queries_match("transaction/savepoint", TRANSACTION_CASES);
+}
+
+#[test]
+fn compound_selects_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(COMPOUND_SETUP);
+    harness.assert_queries_match("compound SELECT", COMPOUND_CASES);
 }
 
 #[test]

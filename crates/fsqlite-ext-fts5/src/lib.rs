@@ -4066,16 +4066,82 @@ fn snippet_with_terms(
     snippet_with_patterns(text, &patterns, open_tag, close_tag, ellipsis, max_tokens)
 }
 
-fn first_highlight_match_token_index(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fts5SnippetWindow {
+    first: usize,
+    last_exclusive: usize,
+    distinct: u32,
+    total: u32,
+}
+
+fn score_snippet_window(
     tokens: &[Fts5Token],
     patterns: &[Fts5HighlightPattern],
-) -> Option<usize> {
-    tokens.iter().enumerate().find_map(|(index, _)| {
-        patterns
-            .iter()
-            .any(|pattern| pattern.matches_at(tokens, index).is_some())
-            .then_some(index)
-    })
+    first: usize,
+    last_exclusive: usize,
+) -> Fts5SnippetWindow {
+    const MAX_PATTERN_BITS: usize = 128;
+
+    let mut seen = 0_u128;
+    let mut overflow_seen = SmallVec::<[usize; 4]>::new();
+    let mut total = 0_u32;
+
+    for token_index in first..last_exclusive {
+        for (pattern_index, pattern) in patterns.iter().enumerate() {
+            if pattern
+                .matches_at(tokens, token_index)
+                .is_some_and(|match_end| match_end <= last_exclusive)
+            {
+                total = total.saturating_add(1);
+                if pattern_index < MAX_PATTERN_BITS {
+                    seen |= 1_u128 << pattern_index;
+                } else if !overflow_seen.contains(&pattern_index) {
+                    overflow_seen.push(pattern_index);
+                }
+            }
+        }
+    }
+
+    let overflow_distinct = u32::try_from(overflow_seen.len()).unwrap_or(u32::MAX);
+    Fts5SnippetWindow {
+        first,
+        last_exclusive,
+        distinct: seen.count_ones().saturating_add(overflow_distinct),
+        total,
+    }
+}
+
+fn snippet_window_is_better(candidate: Fts5SnippetWindow, best: Fts5SnippetWindow) -> bool {
+    candidate.distinct > best.distinct
+        || (candidate.distinct == best.distinct
+            && (candidate.total > best.total
+                || (candidate.total == best.total && candidate.first < best.first)))
+}
+
+fn select_snippet_window(
+    tokens: &[Fts5Token],
+    patterns: &[Fts5HighlightPattern],
+    max_tokens: usize,
+) -> Fts5SnippetWindow {
+    let token_count = max_tokens.min(tokens.len());
+    if token_count == 0 {
+        return Fts5SnippetWindow {
+            first: 0,
+            last_exclusive: 0,
+            distinct: 0,
+            total: 0,
+        };
+    }
+
+    let mut best = score_snippet_window(tokens, patterns, 0, token_count);
+    for first in 1..=tokens.len() - token_count {
+        let candidate = score_snippet_window(tokens, patterns, first, first + token_count);
+        if snippet_window_is_better(candidate, best) {
+            best = candidate;
+        }
+    }
+
+    best
 }
 
 #[allow(clippy::similar_names)]
@@ -4094,20 +4160,14 @@ fn snippet_with_patterns(
     let tokenizer = Unicode61Tokenizer::new();
     let tokens = tokenizer.tokenize(text);
 
-    // Find first matching token position.
-    let match_pos = first_highlight_match_token_index(&tokens, patterns).unwrap_or(0);
-
-    // Calculate window around match.
-    let half = max_tokens / 2;
-    let start = match_pos.saturating_sub(half);
-    let end = (start + max_tokens).min(tokens.len());
+    let window = select_snippet_window(&tokens, patterns, max_tokens);
 
     let mut result = String::new();
-    if start > 0 {
+    if window.first > 0 {
         result.push_str(ellipsis);
     }
 
-    let window_tokens = &tokens[start..end];
+    let window_tokens = &tokens[window.first..window.last_exclusive];
     if let (Some(first), Some(last)) = (window_tokens.first(), window_tokens.last()) {
         let slice = &text[first.start..last.end];
 
@@ -4117,7 +4177,7 @@ fn snippet_with_patterns(
         ));
     }
 
-    if end < tokens.len() {
+    if window.last_exclusive < tokens.len() {
         result.push_str(ellipsis);
     }
 
@@ -4513,6 +4573,14 @@ mod tests {
         rendered_phrase: String,
         rendered_prefix_snippet: String,
         negated_rhs_rendering: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5SnippetWindowStructure {
+        scored_window: Fts5SnippetWindow,
+        rendered_snippet: String,
+        no_match_window: Fts5SnippetWindow,
     }
 
     #[allow(dead_code)]
@@ -7295,6 +7363,27 @@ mod tests {
     }
 
     #[test]
+    fn test_snippet_scalar_func_selects_densest_query_window() -> std::result::Result<(), String> {
+        let func = Fts5SnippetFunc;
+        let result = func
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string("alpha one gap gap two three omega")),
+                SqliteValue::Text(SmallText::from_string("one OR two OR three")),
+                SqliteValue::Text(SmallText::from_string("[")),
+                SqliteValue::Text(SmallText::from_string("]")),
+                SqliteValue::Text(SmallText::from_string("...")),
+                SqliteValue::Integer(3),
+            ])
+            .map_err(|err| err.to_string())?;
+
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::from_string("...gap [two] [three]..."))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_fts5_structural_snapshot_highlight_prefix_terms() {
         assert_eq!(
             format!(
@@ -7407,6 +7496,44 @@ mod tests {
     rendered_phrase: "<b>alpha beta</b> gamma",
     rendered_prefix_snippet: "alpha [one two threefold]...",
     negated_rhs_rendering: "<b>alpha beta</b> gamma",
+}"#
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_snippet_window_scoring() {
+        let text = "alpha one gap gap two three omega";
+        let patterns = highlight_patterns_from_query_text("one OR two OR three");
+        let tokenizer = Unicode61Tokenizer::new();
+        let tokens = tokenizer.tokenize(text);
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5SnippetWindowStructure {
+                    scored_window: select_snippet_window(&tokens, &patterns, 3),
+                    rendered_snippet: snippet_with_patterns(text, &patterns, "[", "]", "...", 3,),
+                    no_match_window: select_snippet_window(
+                        &tokens,
+                        &highlight_patterns_from_query_text("absent"),
+                        3,
+                    ),
+                }
+            ),
+            r#"Fts5SnippetWindowStructure {
+    scored_window: Fts5SnippetWindow {
+        first: 3,
+        last_exclusive: 6,
+        distinct: 2,
+        total: 2,
+    },
+    rendered_snippet: "...gap [two] [three]...",
+    no_match_window: Fts5SnippetWindow {
+        first: 0,
+        last_exclusive: 3,
+        distinct: 0,
+        total: 0,
+    },
 }"#
         );
     }

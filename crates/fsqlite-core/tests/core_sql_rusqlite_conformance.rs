@@ -205,6 +205,53 @@ const UPSERT_CASES: &[QueryCase] = &[
     },
 ];
 
+const CTE_SETUP: &str = "
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        manager_id INTEGER,
+        salary INTEGER NOT NULL
+    );
+    INSERT INTO employees VALUES
+        (1, 'Ada', NULL, 100),
+        (2, 'Bert', 1, 80),
+        (3, 'Cara', 1, 90),
+        (4, 'Drew', 2, 60),
+        (5, 'Eli', 2, 55),
+        (6, 'Fay', 3, 70);
+
+    CREATE TABLE facts (category TEXT NOT NULL, value INTEGER NOT NULL);
+    INSERT INTO facts VALUES
+        ('a', 10),
+        ('a', 20),
+        ('b', 7),
+        ('b', 13),
+        ('c', 5);
+";
+
+const CTE_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "ordinary aggregate cte",
+        sql: "WITH totals AS (SELECT category, SUM(value) AS total FROM facts GROUP BY category) SELECT category, total FROM totals WHERE total >= 20 ORDER BY category",
+    },
+    QueryCase {
+        name: "multi cte join",
+        sql: "WITH totals AS (SELECT category, SUM(value) AS total FROM facts GROUP BY category), counts AS (SELECT category, COUNT(*) AS cnt FROM facts GROUP BY category) SELECT totals.category, totals.total, counts.cnt FROM totals JOIN counts ON counts.category = totals.category ORDER BY totals.category",
+    },
+    QueryCase {
+        name: "recursive hierarchy",
+        sql: "WITH RECURSIVE org(id, name, depth) AS (SELECT id, name, 0 FROM employees WHERE manager_id IS NULL UNION ALL SELECT e.id, e.name, org.depth + 1 FROM employees e JOIN org ON e.manager_id = org.id) SELECT name, depth FROM org ORDER BY depth, name",
+    },
+    QueryCase {
+        name: "recursive numeric aggregate",
+        sql: "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 8) SELECT SUM(x), COUNT(*), MAX(x) FROM cnt",
+    },
+    QueryCase {
+        name: "cte self join materialization",
+        sql: "WITH vals AS (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3) SELECT a.n, b.n FROM vals a, vals b WHERE a.n < b.n ORDER BY a.n, b.n",
+    },
+];
+
 #[test]
 fn select_join_group_by_aggregates_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
@@ -219,4 +266,10 @@ fn upsert_conflict_handling_matches_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(UPSERT_SETUP);
     harness.execute_script(UPSERT_SCRIPT);
     harness.assert_queries_match("UPSERT", UPSERT_CASES);
+}
+
+#[test]
+fn cte_queries_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CTE_SETUP);
+    harness.assert_queries_match("CTE", CTE_CASES);
 }

@@ -3893,6 +3893,104 @@ mod tests {
         pages.into_iter().collect()
     }
 
+    fn write_set_with_extras(overlap: &[PageNumber], extras: &[PageNumber]) -> Vec<PageNumber> {
+        union_pages(overlap, extras)
+    }
+
+    fn stage_tagged_pages(
+        handle: &mut ConcurrentHandle,
+        lock_table: &InProcessPageLockTable,
+        session_id: u64,
+        pages: &[PageNumber],
+    ) -> Result<(), String> {
+        for (idx, page) in pages.iter().enumerate() {
+            let tag = u8::try_from(idx + 1)
+                .map_err(|err| format!("tag conversion for page {} failed: {err}", page.get()))?;
+            concurrent_write_page(handle, lock_table, session_id, *page, tagged_test_data(tag))
+                .map_err(|err| {
+                    format!(
+                        "write page {} in session {session_id} failed: {err:?}",
+                        page.get()
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    fn run_conflict_direction(
+        first_pages: &[PageNumber],
+        second_pages: &[PageNumber],
+    ) -> Result<BTreeSet<PageNumber>, String> {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+        let first_session = registry
+            .begin_concurrent(test_snapshot(10))
+            .map_err(|err| format!("begin first failed: {err:?}"))?;
+        let second_session = registry
+            .begin_concurrent(test_snapshot(10))
+            .map_err(|err| format!("begin second failed: {err:?}"))?;
+
+        {
+            let mut first = registry
+                .get_mut(first_session)
+                .ok_or_else(|| "missing first handle".to_string())?;
+            stage_tagged_pages(&mut first, &lock_table, first_session, first_pages)?;
+            concurrent_commit(
+                &mut first,
+                &commit_index,
+                &lock_table,
+                first_session,
+                CommitSeq::new(11),
+            )
+            .map_err(|(err, fcw)| format!("first commit failed: {err:?} {fcw:?}"))?;
+        }
+
+        let conflict_pages = {
+            let mut second = registry
+                .get_mut(second_session)
+                .ok_or_else(|| "missing second handle".to_string())?;
+            stage_tagged_pages(&mut second, &lock_table, second_session, second_pages)?;
+            match concurrent_commit(
+                &mut second,
+                &commit_index,
+                &lock_table,
+                second_session,
+                CommitSeq::new(12),
+            ) {
+                Err((
+                    MvccError::BusySnapshot,
+                    FcwResult::Conflict {
+                        conflicting_pages, ..
+                    },
+                )) => conflicting_pages.into_iter().collect::<BTreeSet<_>>(),
+                Err((err, fcw)) => {
+                    return Err(format!(
+                        "second commit failed without FCW conflict: {err:?} {fcw:?}"
+                    ));
+                }
+                Ok(seq) => {
+                    return Err(format!("second commit unexpectedly succeeded at {seq}"));
+                }
+            }
+        };
+
+        if lock_table.lock_count() != 0 {
+            return Err(format!(
+                "expected conflict path to release locks, found {}",
+                lock_table.lock_count()
+            ));
+        }
+        if !registry.remove_and_recycle(first_session) {
+            return Err(format!("first session {first_session} was not removed"));
+        }
+        if !registry.remove_and_recycle(second_session) {
+            return Err(format!("second session {second_session} was not removed"));
+        }
+
+        Ok(conflict_pages)
+    }
+
     // Metamorphic strength matrix:
     // - MR1 commit-order independence: fault sensitivity 5, independence 4,
     //   execution cost 1. It detects false global writer serialization or
@@ -3900,6 +3998,9 @@ mod tests {
     // - MR2 snapshot isolation: fault sensitivity 5, independence 5,
     //   execution cost 1. It detects leaked uncommitted writer state in a
     //   reader's already-established snapshot view.
+    // - MR3 conflict symmetry: fault sensitivity 4, independence 4,
+    //   execution cost 1. It detects asymmetric FCW overlap accounting when
+    //   the same two write sets are committed in opposite directions.
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(MVCC_METAMORPHIC_PROPTEST_CASES))]
 
@@ -3996,6 +4097,30 @@ mod tests {
             prop_assert_eq!(lock_table.lock_count(), 0);
             prop_assert!(registry.remove_and_recycle(reader_session));
             prop_assert!(registry.remove_and_recycle(writer_session));
+        }
+
+        #[test]
+        fn metamorphic_conflict_symmetry_reports_same_overlap(
+            raw_overlap_pages in prop_vec(1_u32..=256, 1..=8),
+            raw_left_extra_pages in prop_vec(1001_u32..=2048, 0..=4),
+            raw_right_extra_pages in prop_vec(3001_u32..=4096, 0..=4),
+        ) {
+            let overlap_pages = unique_test_pages(&raw_overlap_pages);
+            prop_assert!(!overlap_pages.is_empty());
+            let left_extra_pages = unique_test_pages(&raw_left_extra_pages);
+            let right_extra_pages = unique_test_pages(&raw_right_extra_pages);
+            let left_pages = write_set_with_extras(&overlap_pages, &left_extra_pages);
+            let right_pages = write_set_with_extras(&overlap_pages, &right_extra_pages);
+            let expected_overlap = overlap_pages.iter().copied().collect::<BTreeSet<_>>();
+
+            let left_then_right = run_conflict_direction(&left_pages, &right_pages)
+                .map_err(TestCaseError::fail)?;
+            let right_then_left = run_conflict_direction(&right_pages, &left_pages)
+                .map_err(TestCaseError::fail)?;
+
+            prop_assert_eq!(&left_then_right, &expected_overlap);
+            prop_assert_eq!(&right_then_left, &expected_overlap);
+            prop_assert_eq!(left_then_right, right_then_left);
         }
     }
 

@@ -17,6 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fsqlite::{Connection, FrankenError, SqliteValue};
+use fsqlite_e2e::verify_csqlite::{verify_concurrency_artifact, write_artifact_bundle};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -334,6 +335,9 @@ fn run_parent(config: RunConfig) -> HarnessResult<bool> {
         validate_worker_jsonl(&run_dir, config.workers)
     });
     let wal_corruption = wal_corruption_criterion(&wal_shape, &wal_checkpoint);
+    let csqlite_cross = timed_criterion("csqlite_cross_check", || {
+        csqlite_cross_check(&db_path, &run_dir)
+    });
     let criteria = vec![
         open_check,
         worker_process_criterion(&worker_reports),
@@ -347,6 +351,7 @@ fn run_parent(config: RunConfig) -> HarnessResult<bool> {
         wal_checkpoint,
         fsqlite_integrity,
         sqlite_integrity,
+        csqlite_cross,
         final_visibility,
     ];
 
@@ -465,8 +470,9 @@ fn run_child_workload(
                     format!("failed to create jsonl dir `{}`: {err}", parent.display())
                 })?;
             }
-            let file = File::create(path)
-                .map_err(|err| format!("failed to create jsonl file `{}`: {err}", path.display()))?;
+            let file = File::create(path).map_err(|err| {
+                format!("failed to create jsonl file `{}`: {err}", path.display())
+            })?;
             Ok(std::io::BufWriter::new(file))
         })
         .transpose()?;
@@ -488,7 +494,15 @@ fn run_child_workload(
             commit_mixed_transaction(&conn, config, child, &mut state, counters, &mut rng)?;
         counters.iterations = counters.iterations.saturating_add(1);
         if let Some(writer) = jsonl_writer.as_mut() {
-            emit_op_jsonl(writer, config, child, op_id, "mixed_commit", "ok", &committed);
+            emit_op_jsonl(
+                writer,
+                config,
+                child,
+                op_id,
+                "mixed_commit",
+                "ok",
+                &committed,
+            );
             op_id += 1;
         }
         verify_committed_own_row(&conn, config, child.worker_id, &committed, counters)?;
@@ -1345,6 +1359,30 @@ fn run_sqlite_integrity_check(db_path: &Path, config: &RunConfig) -> HarnessResu
     }
 }
 
+fn csqlite_cross_check(db_path: &Path, run_dir: &Path) -> HarnessResult<String> {
+    let (report, artifact) = verify_concurrency_artifact(db_path)
+        .map_err(|err| format!("csqlite cross-check failed: {err}"))?;
+
+    if let Some(ref art) = artifact {
+        let artifact_dir = run_dir.join("verify_artifacts");
+        if let Err(e) = write_artifact_bundle(art, &artifact_dir, "swarm") {
+            eprintln!("[swarm] WARNING: failed to write verify artifact: {e}");
+        }
+    }
+
+    if report.ok {
+        Ok(format!(
+            "csqlite cross-check PASSED: {} pages, {} tables, {:.1}ms",
+            report.page_count, report.table_count, report.timings.total_ms
+        ))
+    } else {
+        Err(format!(
+            "csqlite cross-check FAILED: quick_check={}, integrity_check={}, wal_checkpoint={}",
+            report.quick_check, report.integrity_check, report.wal_checkpoint
+        ))
+    }
+}
+
 fn verify_final_progress_visibility(db_path: &Path, config: &RunConfig) -> HarnessResult<String> {
     let conn = open_fsqlite(db_path)?;
     configure_fsqlite(&conn, config)?;
@@ -1678,16 +1716,26 @@ where
 fn validate_worker_jsonl(run_dir: &Path, workers: usize) -> HarnessResult<String> {
     let mut total_lines = 0_u64;
     let mut invalid_lines = 0_u64;
-    let required_fields = ["ts_unix_nanos", "level", "target", "run_id", "trace_id",
-                           "workspace_id", "host", "process_id", "op_id", "op_type", "outcome"];
+    let required_fields = [
+        "ts_unix_nanos",
+        "level",
+        "target",
+        "run_id",
+        "trace_id",
+        "workspace_id",
+        "host",
+        "process_id",
+        "op_id",
+        "op_type",
+        "outcome",
+    ];
     for worker_id in 0..workers {
         let jsonl_path = run_dir.join(format!("worker_{worker_id}.jsonl"));
         if !jsonl_path.exists() {
             continue;
         }
-        let content = fs::read_to_string(&jsonl_path).map_err(|err| {
-            format!("failed to read `{}`: {err}", jsonl_path.display())
-        })?;
+        let content = fs::read_to_string(&jsonl_path)
+            .map_err(|err| format!("failed to read `{}`: {err}", jsonl_path.display()))?;
         for line in content.lines().filter(|l| !l.trim().is_empty()) {
             total_lines += 1;
             match serde_json::from_str::<serde_json::Value>(line) {

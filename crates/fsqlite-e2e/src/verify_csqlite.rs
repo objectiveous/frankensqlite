@@ -123,6 +123,40 @@ impl std::fmt::Display for VerifyReport {
     }
 }
 
+/// Raw diagnostics from direct file I/O when rusqlite cannot open the database.
+///
+/// Reads the SQLite database header (first 100 bytes) and WAL header (first 32
+/// bytes) directly from disk, producing a best-effort diagnostic without any
+/// SQL engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawPageDiagnostics {
+    pub magic_ok: bool,
+    pub header_page_size: u32,
+    pub header_page_count: u32,
+    pub header_free_pages: u32,
+    pub wal_exists: bool,
+    pub wal_size_bytes: u64,
+    pub wal_magic_ok: bool,
+    pub wal_frame_count_estimate: u32,
+    pub db_header_hex: String,
+    pub wal_header_hex: String,
+}
+
+/// Full artifact bundle captured when verification detects an anomaly.
+///
+/// Contains the structured verify report plus raw diagnostics and file
+/// snapshots for offline triage. Serializable via serde for CI artifact upload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyArtifact {
+    pub report: VerifyReport,
+    pub raw_diagnostics: Option<RawPageDiagnostics>,
+    pub db_path: String,
+    pub db_size_bytes: u64,
+    pub wal_size_bytes: u64,
+    pub walindex_size_bytes: u64,
+    pub captured_at_unix_ms: u64,
+}
+
 /// Error returned when verification infrastructure itself fails.
 #[derive(Debug, thiserror::Error)]
 pub enum VerifyError {
@@ -278,6 +312,165 @@ fn count_user_tables(conn: &rusqlite::Connection) -> u32 {
         |row| row.get::<_, u32>(0),
     )
     .unwrap_or(0)
+}
+
+const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+const WAL_MAGIC_LE: u32 = 0x377f_0682;
+const WAL_MAGIC_BE: u32 = 0x377f_0683;
+
+/// Read raw diagnostics from the database file and its WAL directly via
+/// file I/O (no SQL engine). This is the fallback tier when rusqlite cannot
+/// open the file.
+fn raw_page_diagnostics(db_path: &Path) -> RawPageDiagnostics {
+    let mut diag = RawPageDiagnostics {
+        magic_ok: false,
+        header_page_size: 0,
+        header_page_count: 0,
+        header_free_pages: 0,
+        wal_exists: false,
+        wal_size_bytes: 0,
+        wal_magic_ok: false,
+        wal_frame_count_estimate: 0,
+        db_header_hex: String::new(),
+        wal_header_hex: String::new(),
+    };
+
+    if let Ok(data) = std::fs::read(db_path) {
+        let len = data.len().min(100);
+        diag.db_header_hex = hex_encode(&data[..len]);
+
+        if data.len() >= 100 {
+            diag.magic_ok = data[..16] == *SQLITE_MAGIC;
+            let raw_ps = u16::from_be_bytes([data[16], data[17]]);
+            diag.header_page_size = if raw_ps == 1 {
+                65536
+            } else {
+                u32::from(raw_ps)
+            };
+            diag.header_page_count = u32::from_be_bytes([data[28], data[29], data[30], data[31]]);
+            diag.header_free_pages = u32::from_be_bytes([data[36], data[37], data[38], data[39]]);
+        }
+    }
+
+    let wal_path = db_path.with_extension(wal_extension(db_path));
+    if let Ok(meta) = std::fs::metadata(&wal_path) {
+        diag.wal_exists = true;
+        diag.wal_size_bytes = meta.len();
+
+        if let Ok(data) = std::fs::read(&wal_path) {
+            let len = data.len().min(32);
+            diag.wal_header_hex = hex_encode(&data[..len]);
+
+            if data.len() >= 32 && diag.header_page_size > 0 {
+                let magic = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+                diag.wal_magic_ok = magic == WAL_MAGIC_LE || magic == WAL_MAGIC_BE;
+                let ps = diag.header_page_size;
+                let frame_size = ps + 24;
+                if frame_size > 0 && data.len() > 32 {
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        diag.wal_frame_count_estimate =
+                            ((data.len() as u64 - 32) / u64::from(frame_size)) as u32;
+                    }
+                }
+            }
+        }
+    }
+
+    diag
+}
+
+fn wal_extension(db_path: &Path) -> String {
+    let ext = db_path
+        .extension()
+        .map_or("db", |e| e.to_str().unwrap_or("db"));
+    format!("{ext}-wal")
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |m| m.len())
+}
+
+fn current_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Verify a concurrency test artifact with tiered fallback.
+///
+/// Tier 1: `verify_with_c_sqlite` (rusqlite PRAGMA checks).
+/// Tier 2: If rusqlite can't open or report is not ok, capture
+///         `RawPageDiagnostics` from direct file I/O.
+///
+/// Returns `(report, Some(artifact))` when the report is non-ok or rusqlite
+/// fell back to skipped mode. Returns `(report, None)` on a clean pass.
+///
+/// # Errors
+///
+/// Propagates [`VerifyError::FileNotFound`] if the database file doesn't exist.
+pub fn verify_concurrency_artifact(
+    path: &Path,
+) -> Result<(VerifyReport, Option<VerifyArtifact>), VerifyError> {
+    let report = verify_with_c_sqlite(path)?;
+
+    if report.ok {
+        return Ok((report, None));
+    }
+
+    let raw_diag = raw_page_diagnostics(path);
+    let wal_ext = wal_extension(path);
+    let wal_path = path.with_extension(&wal_ext);
+    let walindex_path = path.with_extension(format!("{wal_ext}index"));
+    // Construct the shm path the way SQLite does: db-wal → db-shm style
+    let shm_path = path.with_extension(path.extension().map_or("db-shm".to_owned(), |e| {
+        format!("{}-shm", e.to_str().unwrap_or("db"))
+    }));
+
+    let artifact = VerifyArtifact {
+        report: report.clone(),
+        raw_diagnostics: Some(raw_diag),
+        db_path: path.display().to_string(),
+        db_size_bytes: file_size(path),
+        wal_size_bytes: file_size(&wal_path),
+        walindex_size_bytes: file_size(&shm_path).max(file_size(&walindex_path)),
+        captured_at_unix_ms: current_unix_ms(),
+    };
+
+    Ok((report, Some(artifact)))
+}
+
+/// Write a [`VerifyArtifact`] as JSON to the given directory.
+///
+/// Returns the path to the written artifact file.
+///
+/// # Errors
+///
+/// Returns `std::io::Error` on filesystem failures.
+pub fn write_artifact_bundle(
+    artifact: &VerifyArtifact,
+    output_dir: &Path,
+    label: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(output_dir)?;
+    let filename = format!(
+        "verify_artifact_{label}_{}.json",
+        artifact.captured_at_unix_ms
+    );
+    let out_path = output_dir.join(filename);
+    let json = serde_json::to_string_pretty(artifact)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(&out_path, json)?;
+    Ok(out_path)
 }
 
 #[cfg(test)]

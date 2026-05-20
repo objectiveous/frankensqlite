@@ -19163,6 +19163,7 @@ pub fn emit_backfill_key_expr(
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use super::*;
     use crate::ProgramBuilder;
     use crate::engine::{ExecOutcome, MemDatabase, VdbeEngine};
@@ -19799,6 +19800,100 @@ mod tests {
         }
     }
 
+    fn fuzz_literal() -> impl Strategy<Value = String> {
+        prop_oneof![
+            any::<i16>().prop_map(|n| n.to_string()),
+            Just("NULL".to_owned()),
+            Just("TRUE".to_owned()),
+            Just("FALSE".to_owned()),
+        ]
+    }
+
+    fn fuzz_column() -> impl Strategy<Value = &'static str> {
+        prop_oneof![Just("a"), Just("b")]
+    }
+
+    fn fuzz_expr(depth: u32) -> BoxedStrategy<String> {
+        if depth == 0 {
+            prop_oneof![
+                fuzz_literal(),
+                fuzz_column().prop_map(str::to_owned),
+            ]
+            .boxed()
+        } else {
+            prop_oneof![
+                4 => fuzz_expr(0),
+                2 => (fuzz_expr(depth - 1), prop_oneof![
+                    Just("+"), Just("-"), Just("*"), Just("/"),
+                    Just("="), Just("!="), Just("<"), Just("<="),
+                    Just(">"), Just(">="), Just("AND"), Just("OR"),
+                ], fuzz_expr(depth - 1))
+                    .prop_map(|(l, op, r)| format!("({l} {op} {r})")),
+                1 => fuzz_expr(depth - 1).prop_map(|e| format!("(-{e})")),
+                1 => fuzz_expr(depth - 1).prop_map(|e| format!("(NOT {e})")),
+                1 => fuzz_expr(depth - 1).prop_map(|e| format!("ABS({e})")),
+            ]
+            .boxed()
+        }
+    }
+
+    fn fuzz_predicate() -> BoxedStrategy<String> {
+        fuzz_expr(2)
+    }
+
+    fn fuzz_select_sql() -> BoxedStrategy<String> {
+        use std::fmt::Write as _;
+
+        (
+            prop::collection::vec(fuzz_expr(2), 1..=3),
+            prop::option::of(fuzz_predicate()),
+            prop::option::of(fuzz_column()),
+            prop::option::of(0_u8..=5),
+        )
+            .prop_map(|(cols, where_clause, order_by, limit)| {
+                let mut sql = format!("SELECT {} FROM t", cols.join(", "));
+                if let Some(pred) = where_clause {
+                    write!(sql, " WHERE {pred}").expect("writing to String should not fail");
+                }
+                if let Some(col) = order_by {
+                    write!(sql, " ORDER BY {col}").expect("writing to String should not fail");
+                }
+                if let Some(lim) = limit {
+                    write!(sql, " LIMIT {lim}").expect("writing to String should not fail");
+                }
+                sql
+            })
+            .boxed()
+    }
+
+    fn fuzz_insert_sql() -> BoxedStrategy<String> {
+        (fuzz_literal(), fuzz_literal())
+            .prop_map(|(a, b)| format!("INSERT INTO t (a, b) VALUES ({a}, {b})"))
+            .boxed()
+    }
+
+    fn fuzz_update_sql() -> BoxedStrategy<String> {
+        (fuzz_column(), fuzz_expr(2), fuzz_predicate())
+            .prop_map(|(col, expr, pred)| format!("UPDATE t SET {col} = {expr} WHERE {pred}"))
+            .boxed()
+    }
+
+    fn fuzz_delete_sql() -> BoxedStrategy<String> {
+        fuzz_predicate()
+            .prop_map(|pred| format!("DELETE FROM t WHERE {pred}"))
+            .boxed()
+    }
+
+    fn fuzz_supported_sql() -> BoxedStrategy<String> {
+        prop_oneof![
+            5 => fuzz_select_sql(),
+            2 => fuzz_insert_sql(),
+            1 => fuzz_update_sql(),
+            1 => fuzz_delete_sql(),
+        ]
+        .boxed()
+    }
+
     fn first_result_expr(select: &SelectStatement) -> &Expr {
         let SelectCore::Select { columns, .. } = &select.body.select else {
             unreachable!("expected SELECT core");
@@ -19814,7 +19909,10 @@ mod tests {
         let stmt = select_sql(
             "SELECT SUM(a) OVER (PARTITION BY ? ORDER BY ? ROWS BETWEEN ? PRECEDING AND ? FOLLOWING EXCLUDE TIES) FROM t",
         );
-        let Expr::FunctionCall { over: Some(spec), .. } = first_result_expr(&stmt) else {
+        let Expr::FunctionCall {
+            over: Some(spec), ..
+        } = first_result_expr(&stmt)
+        else {
             unreachable!("expected window function expression");
         };
 
@@ -19828,13 +19926,54 @@ mod tests {
         let stmt = select_sql(
             "SELECT SUM(a) OVER (ORDER BY a GROUPS BETWEEN CURRENT ROW AND CURRENT ROW EXCLUDE GROUP) FROM t",
         );
-        let Expr::FunctionCall { over: Some(spec), .. } = first_result_expr(&stmt) else {
+        let Expr::FunctionCall {
+            over: Some(spec), ..
+        } = first_result_expr(&stmt)
+        else {
             unreachable!("expected window function expression");
         };
 
         assert_eq!(count_anon_placeholders_in_window_spec(spec), 0);
         let frame = spec.frame.as_ref().expect("window frame should exist");
         assert_eq!(frame.exclude, Some(fsqlite_ast::FrameExclude::Group));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn test_parser_vdbe_codegen_supported_sql_no_panic(sql in fuzz_supported_sql()) {
+            let Some((statement, tail)) =
+                parse_first_statement_with_tail(&sql).expect("generated SQL should parse without parser panics")
+            else {
+                prop_assert!(false, "generator produced no statement: {sql}");
+                return Ok(());
+            };
+            prop_assert_eq!(tail, sql.len(), "parser left trailing SQL for generated input: {sql}");
+
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let mut builder = ProgramBuilder::new();
+                let schema = test_schema();
+                let ctx = CodegenContext::default();
+                match statement {
+                    Statement::Select(stmt) => {
+                        let _ = codegen_select(&mut builder, &stmt, &schema, &ctx);
+                    }
+                    Statement::Insert(stmt) => {
+                        let _ = codegen_insert(&mut builder, &stmt, &schema, &ctx);
+                    }
+                    Statement::Update(stmt) => {
+                        let _ = codegen_update(&mut builder, &stmt, &schema, &ctx);
+                    }
+                    Statement::Delete(stmt) => {
+                        let _ = codegen_delete(&mut builder, &stmt, &schema, &ctx);
+                    }
+                    other => panic!("unsupported generated statement variant: {other:?}"),
+                }
+            }));
+
+            prop_assert!(result.is_ok(), "parser->vdbe codegen panicked for sql: {sql}");
+        }
     }
 
     fn lower_name_eq_param(n: u32) -> Box<Expr> {

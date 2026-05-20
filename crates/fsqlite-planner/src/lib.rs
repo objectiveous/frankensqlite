@@ -1689,8 +1689,17 @@ fn best_access_path_internal(
     let not_indexed = matches!(index_hint, Some(IndexHint::NotIndexed));
     let rowid_equality_candidate =
         find_rowid_equality_term(&table.name, where_terms, rowid_alias_hints).is_some();
-    let rowid_range_candidate =
-        find_rowid_range_column(&table.name, where_terms, rowid_alias_hints).is_some();
+    // The range branch below is only reached when the equality branch did not
+    // match, so the range candidate is dead work in the common point-lookup
+    // case — short-circuit it. When it is needed, probe with the
+    // allocation-free matcher instead of `find_rowid_range_column`, which
+    // clones the matched column name only to discard it for this boolean.
+    // `where_term_matches_rowid_range` already requires a present column, so
+    // `.any(..)` is equivalent to the previous `.is_some()`.
+    let rowid_range_candidate = !rowid_equality_candidate
+        && where_terms
+            .iter()
+            .any(|term| where_term_matches_rowid_range(&table.name, term, rowid_alias_hints));
 
     let mut best = if explicit_indexed_by.is_some() {
         AccessPath {

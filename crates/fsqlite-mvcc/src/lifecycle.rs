@@ -1276,11 +1276,16 @@ impl TransactionManager {
         if cached_commit_epoch != commit_epoch.get() {
             return None;
         }
+        let cached_schema_epoch = self.snapshot_reuse_schema_epoch.load(Ordering::Acquire);
+        let shared_schema_epoch = self.shm.load_schema_epoch().get();
+        if cached_schema_epoch != shared_schema_epoch {
+            return None;
+        }
         #[cfg(test)]
         self.snapshot_reuse_hits.fetch_add(1, Ordering::Relaxed);
         Some(Snapshot::new(
             commit_epoch,
-            SchemaEpoch::new(self.snapshot_reuse_schema_epoch.load(Ordering::Relaxed)),
+            SchemaEpoch::new(cached_schema_epoch),
         ))
     }
 
@@ -6994,6 +6999,55 @@ mod tests {
             mgr.snapshot_reuse_stats(),
             (2, 1),
             "once refreshed, later begins at the same epoch should hit the reuse path again"
+        );
+        mgr.abort(&mut reused);
+    }
+
+    #[test]
+    fn test_snapshot_reuse_invalidates_when_shared_schema_epoch_advances() {
+        let mgr = mgr();
+
+        let mut first = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("first begin should succeed");
+        let first_snapshot = first.snapshot;
+        assert_eq!(mgr.snapshot_reuse_stats(), (1, 0));
+        mgr.abort(&mut first);
+
+        let published_schema_epoch = SchemaEpoch::new(first_snapshot.schema_epoch.get() + 1);
+        mgr.shm.publish_snapshot(
+            first_snapshot.high,
+            published_schema_epoch,
+            mgr.shm.load_ecs_epoch(),
+        );
+
+        let mut refreshed = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("begin after schema epoch publish should succeed");
+        assert_eq!(
+            refreshed.snapshot,
+            Snapshot::new(first_snapshot.high, published_schema_epoch),
+            "schema epoch changes at the same commit epoch must force a fresh snapshot load"
+        );
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (1, 1),
+            "schema-only publication should miss once and refresh the reuse cache"
+        );
+        mgr.abort(&mut refreshed);
+
+        let mut reused = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("subsequent begin should reuse refreshed schema epoch");
+        assert_eq!(
+            reused.snapshot,
+            Snapshot::new(first_snapshot.high, published_schema_epoch),
+            "refreshed schema epoch should become reusable after the miss"
+        );
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (2, 1),
+            "once refreshed, later begins at the same pair should hit the reuse path"
         );
         mgr.abort(&mut reused);
     }

@@ -889,6 +889,37 @@ const JSON1_CASES: &[QueryCase] = &[
     },
 ];
 
+const STRING_FUNCTION_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "substr positive and omitted length",
+        sql: "SELECT substr('hello world', 7), substr('hello world', 7, 5), substr('abcdef', 2, 3)",
+    },
+    QueryCase {
+        name: "substr negative and zero positions",
+        sql: "SELECT substr('hello world', -5), substr('hello', 0, 3), substr('hello', -2, 1)",
+    },
+    QueryCase {
+        name: "substr zero and negative lengths",
+        sql: "SELECT substr('hello', 1, 0), substr('hello', 1, -1), substr('', 1, 1), substr(NULL, 1, 3)",
+    },
+    QueryCase {
+        name: "replace normal overlapping and empty needle",
+        sql: "SELECT replace('hello world', 'world', 'there'), replace('aaaa', 'aa', 'b'), replace('hello', '', 'x')",
+    },
+    QueryCase {
+        name: "replace deletion and null propagation",
+        sql: "SELECT replace('banana', 'na', ''), replace(NULL, 'a', 'b'), replace('abc', NULL, 'x')",
+    },
+    QueryCase {
+        name: "instr hits misses and empty needle",
+        sql: "SELECT instr('hello world', 'world'), instr('hello world', 'xyz'), instr('hello', ''), instr('', '')",
+    },
+    QueryCase {
+        name: "instr null propagation and case sensitivity",
+        sql: "SELECT instr(NULL, 'x'), instr('abc', NULL), instr('Hello', 'he'), instr('Hello', 'He')",
+    },
+];
+
 #[test]
 fn select_join_group_by_aggregates_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
@@ -990,4 +1021,10 @@ fn date_time_functions_match_rusqlite() {
 fn json1_functions_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new("");
     harness.assert_queries_match("JSON1", JSON1_CASES);
+}
+
+#[test]
+fn string_functions_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new("");
+    harness.assert_queries_match("string functions", STRING_FUNCTION_CASES);
 }

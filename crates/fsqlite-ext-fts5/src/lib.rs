@@ -12,7 +12,9 @@ use std::collections::{HashMap, HashSet};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::ScalarFunction;
 use fsqlite_func::vtab::{
-    ColumnContext, IndexInfo, TransactionalVtabState, VirtualTable, VirtualTableCursor,
+    ColumnContext, IndexInfo, ShadowTablePolicy, TransactionalVtabState, VirtualTable,
+    VirtualTableCursor, VtabIntegrityPolicy, VtabLifecyclePolicy, VtabModuleMetadata,
+    VtabRiskLevel,
 };
 use fsqlite_types::cx::Cx;
 use fsqlite_types::value::{SmallText, SqliteValue};
@@ -3557,6 +3559,38 @@ fn extract_highlight_patterns(expr: &Fts5Expr) -> Vec<Fts5HighlightPattern> {
 
 impl VirtualTable for Fts5Table {
     type Cursor = Fts5Cursor;
+
+    fn module_metadata(_args: &[&str]) -> VtabModuleMetadata
+    where
+        Self: Sized,
+    {
+        VtabModuleMetadata::shadow_owning(
+            VtabLifecyclePolicy::SeparateCreateAndConnect,
+            VtabIntegrityPolicy::ShadowAware,
+            VtabRiskLevel::innocuous(),
+        )
+    }
+
+    fn shadow_table_policy(vtab_name: &str, table_name: &str) -> ShadowTablePolicy
+    where
+        Self: Sized,
+    {
+        let lower_table_name = table_name.to_ascii_lowercase();
+        let lower_vtab_name = vtab_name.to_ascii_lowercase();
+        let Some(suffix) = lower_table_name
+            .strip_prefix(&lower_vtab_name)
+            .filter(|suffix| suffix.starts_with('_'))
+        else {
+            return ShadowTablePolicy::ordinary();
+        };
+
+        match suffix {
+            "_data" | "_idx" | "_config" | "_content" | "_docsize" => {
+                ShadowTablePolicy::owned_shadow()
+            }
+            _ => ShadowTablePolicy::ordinary(),
+        }
+    }
 
     fn connect(_cx: &Cx, args: &[&str]) -> Result<Self>
     where
@@ -8140,6 +8174,23 @@ mod tests {
             .unwrap();
         assert_eq!(result, Some(1));
         assert!(vtab.get_document(1).is_some());
+    }
+
+    #[test]
+    fn test_fts5_vtab_metadata_declares_owned_shadow_tables() {
+        let metadata = Fts5Table::module_metadata(&["fts5", "main", "docs", "body"]);
+        assert!(metadata.owns_shadow_tables);
+        assert_eq!(
+            metadata.lifecycle,
+            VtabLifecyclePolicy::SeparateCreateAndConnect
+        );
+        assert_eq!(metadata.integrity, VtabIntegrityPolicy::ShadowAware);
+
+        assert!(Fts5Table::shadow_table_policy("docs", "docs_data").is_shadow());
+        assert!(Fts5Table::shadow_table_policy("docs", "docs_idx").is_shadow());
+        assert!(Fts5Table::shadow_table_policy("docs", "docs_config").is_shadow());
+        assert!(!Fts5Table::shadow_table_policy("docs", "docs_segments").is_shadow());
+        assert!(!Fts5Table::shadow_table_policy("docs", "other_data").is_shadow());
     }
 
     #[test]

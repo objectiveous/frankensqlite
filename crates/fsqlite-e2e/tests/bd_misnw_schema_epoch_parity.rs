@@ -83,10 +83,9 @@ macro_rules! oracle_assert_rows_eq {
         );
         for (i, (f, c)) in $f_rows.iter().zip($c_rows.iter()).enumerate() {
             let f_vals = f.values();
-            let c_vals: Vec<fsqlite_types::value::SqliteValue> =
-                (0..c.as_ref().column_count())
-                    .map(|col| csqlite_val_to_fsqlite(c.as_ref(), col))
-                    .collect();
+            let c_vals: Vec<fsqlite_types::value::SqliteValue> = (0..c.as_ref().column_count())
+                .map(|col| csqlite_val_to_fsqlite(c.as_ref(), col))
+                .collect();
             assert_eq!(
                 f_vals.as_ref(),
                 c_vals.as_slice(),
@@ -134,16 +133,12 @@ impl OracleRow {
     fn get_ref(&self, col: usize) -> Result<rusqlite::types::ValueRef<'_>, rusqlite::Error> {
         Ok(match &self.vals[col] {
             fsqlite_types::value::SqliteValue::Null => rusqlite::types::ValueRef::Null,
-            fsqlite_types::value::SqliteValue::Integer(n) => {
-                rusqlite::types::ValueRef::Integer(*n)
-            }
+            fsqlite_types::value::SqliteValue::Integer(n) => rusqlite::types::ValueRef::Integer(*n),
             fsqlite_types::value::SqliteValue::Float(f) => rusqlite::types::ValueRef::Real(*f),
             fsqlite_types::value::SqliteValue::Text(s) => {
                 rusqlite::types::ValueRef::Text(s.as_str().as_bytes())
             }
-            fsqlite_types::value::SqliteValue::Blob(b) => {
-                rusqlite::types::ValueRef::Blob(b)
-            }
+            fsqlite_types::value::SqliteValue::Blob(b) => rusqlite::types::ValueRef::Blob(b),
         })
     }
 }
@@ -222,7 +217,9 @@ fn s01_ddl_invalidates_prepared_select() {
     let c1 = csqlite_query(&cconn, "SELECT a, b FROM t1 ORDER BY a");
     assert_fsqlite_csqlite_eq(tn, "before_alter", &f1, &c1);
 
-    fconn.execute("ALTER TABLE t1 ADD COLUMN c INTEGER DEFAULT 99").unwrap();
+    fconn
+        .execute("ALTER TABLE t1 ADD COLUMN c INTEGER DEFAULT 99")
+        .unwrap();
     cconn
         .execute_batch("ALTER TABLE t1 ADD COLUMN c INTEGER DEFAULT 99;")
         .unwrap();
@@ -250,11 +247,19 @@ fn s02_ddl_invalidates_prepared_insert() {
     fconn.execute("INSERT INTO t2 VALUES (1)").unwrap();
     cconn.execute_batch("INSERT INTO t2 VALUES (1);").unwrap();
 
-    fconn.execute("ALTER TABLE t2 ADD COLUMN b TEXT DEFAULT 'dflt'").unwrap();
-    cconn.execute_batch("ALTER TABLE t2 ADD COLUMN b TEXT DEFAULT 'dflt';").unwrap();
+    fconn
+        .execute("ALTER TABLE t2 ADD COLUMN b TEXT DEFAULT 'dflt'")
+        .unwrap();
+    cconn
+        .execute_batch("ALTER TABLE t2 ADD COLUMN b TEXT DEFAULT 'dflt';")
+        .unwrap();
 
-    fconn.execute("INSERT INTO t2 (a, b) VALUES (2, 'new')").unwrap();
-    cconn.execute_batch("INSERT INTO t2 (a, b) VALUES (2, 'new');").unwrap();
+    fconn
+        .execute("INSERT INTO t2 (a, b) VALUES (2, 'new')")
+        .unwrap();
+    cconn
+        .execute_batch("INSERT INTO t2 (a, b) VALUES (2, 'new');")
+        .unwrap();
 
     let f = fconn.query("SELECT a, b FROM t2 ORDER BY a").unwrap();
     let c = csqlite_query(&cconn, "SELECT a, b FROM t2 ORDER BY a");
@@ -273,11 +278,17 @@ fn s03_create_table_visible_immediately() {
     let fconn = fsqlite::Connection::open(":memory:").unwrap();
     let cconn = rusqlite::Connection::open_in_memory().unwrap();
 
-    fconn.execute("CREATE TABLE t3 (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    cconn.execute_batch("CREATE TABLE t3 (id INTEGER PRIMARY KEY, val TEXT);").unwrap();
+    fconn
+        .execute("CREATE TABLE t3 (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    cconn
+        .execute_batch("CREATE TABLE t3 (id INTEGER PRIMARY KEY, val TEXT);")
+        .unwrap();
 
     fconn.execute("INSERT INTO t3 VALUES (1, 'hello')").unwrap();
-    cconn.execute_batch("INSERT INTO t3 VALUES (1, 'hello');").unwrap();
+    cconn
+        .execute_batch("INSERT INTO t3 VALUES (1, 'hello');")
+        .unwrap();
 
     let f = fconn.query("SELECT id, val FROM t3").unwrap();
     let c = csqlite_query(&cconn, "SELECT id, val FROM t3");
@@ -332,13 +343,19 @@ fn s05_create_index_doesnt_break_queries() {
     let f_before = fconn.query("SELECT a, b FROM t5 ORDER BY a").unwrap();
 
     fconn.execute("CREATE INDEX idx_t5_a ON t5(a)").unwrap();
-    cconn.execute_batch("CREATE INDEX idx_t5_a ON t5(a);").unwrap();
+    cconn
+        .execute_batch("CREATE INDEX idx_t5_a ON t5(a);")
+        .unwrap();
 
     let f_after = fconn.query("SELECT a, b FROM t5 ORDER BY a").unwrap();
     let c_after = csqlite_query(&cconn, "SELECT a, b FROM t5 ORDER BY a");
 
     assert_fsqlite_csqlite_eq(tn, "after_index", &f_after, &c_after);
-    assert_eq!(f_before.len(), f_after.len(), "row count changed after index");
+    assert_eq!(
+        f_before.len(),
+        f_after.len(),
+        "row count changed after index"
+    );
 
     emit_log(tn, "result", json!({"pass": true}));
 }
@@ -361,16 +378,30 @@ fn s06_alter_add_column_schema_epoch() {
         cconn.execute_batch(&format!("{sql};")).unwrap();
     }
 
-    fconn.execute("ALTER TABLE t6 ADD COLUMN name TEXT DEFAULT 'anon'").unwrap();
-    cconn.execute_batch("ALTER TABLE t6 ADD COLUMN name TEXT DEFAULT 'anon';").unwrap();
+    fconn
+        .execute("ALTER TABLE t6 ADD COLUMN name TEXT DEFAULT 'anon'")
+        .unwrap();
+    cconn
+        .execute_batch("ALTER TABLE t6 ADD COLUMN name TEXT DEFAULT 'anon';")
+        .unwrap();
 
-    fconn.execute("ALTER TABLE t6 ADD COLUMN score REAL DEFAULT 0.0").unwrap();
-    cconn.execute_batch("ALTER TABLE t6 ADD COLUMN score REAL DEFAULT 0.0;").unwrap();
+    fconn
+        .execute("ALTER TABLE t6 ADD COLUMN score REAL DEFAULT 0.0")
+        .unwrap();
+    cconn
+        .execute_batch("ALTER TABLE t6 ADD COLUMN score REAL DEFAULT 0.0;")
+        .unwrap();
 
-    fconn.execute("INSERT INTO t6 (id, name, score) VALUES (4, 'new', 99.5)").unwrap();
-    cconn.execute_batch("INSERT INTO t6 (id, name, score) VALUES (4, 'new', 99.5);").unwrap();
+    fconn
+        .execute("INSERT INTO t6 (id, name, score) VALUES (4, 'new', 99.5)")
+        .unwrap();
+    cconn
+        .execute_batch("INSERT INTO t6 (id, name, score) VALUES (4, 'new', 99.5);")
+        .unwrap();
 
-    let f = fconn.query("SELECT id, name, score FROM t6 ORDER BY id").unwrap();
+    let f = fconn
+        .query("SELECT id, name, score FROM t6 ORDER BY id")
+        .unwrap();
     let c = csqlite_query(&cconn, "SELECT id, name, score FROM t6 ORDER BY id");
     assert_fsqlite_csqlite_eq(tn, "multi_alter", &f, &c);
 
@@ -481,7 +512,9 @@ fn s10_create_trigger_fires() {
         cconn.execute_batch(&format!("{sql};")).unwrap();
     }
 
-    let f = fconn.query("SELECT msg FROM t10_log ORDER BY rowid").unwrap();
+    let f = fconn
+        .query("SELECT msg FROM t10_log ORDER BY rowid")
+        .unwrap();
     let c = csqlite_query(&cconn, "SELECT msg FROM t10_log ORDER BY rowid");
     assert_fsqlite_csqlite_eq(tn, "trigger_log", &f, &c);
 
@@ -498,10 +531,7 @@ fn s11_savepoint_ddl_rollback_reverts() {
     let fconn = fsqlite::Connection::open(":memory:").unwrap();
     let cconn = rusqlite::Connection::open_in_memory().unwrap();
 
-    for sql in [
-        "CREATE TABLE t11 (a INTEGER)",
-        "INSERT INTO t11 VALUES (1)",
-    ] {
+    for sql in ["CREATE TABLE t11 (a INTEGER)", "INSERT INTO t11 VALUES (1)"] {
         fconn.execute(sql).unwrap();
         cconn.execute_batch(&format!("{sql};")).unwrap();
     }
@@ -540,10 +570,7 @@ fn s12_savepoint_ddl_release_persists() {
     let fconn = fsqlite::Connection::open(":memory:").unwrap();
     let cconn = rusqlite::Connection::open_in_memory().unwrap();
 
-    for sql in [
-        "CREATE TABLE t12 (a INTEGER)",
-        "INSERT INTO t12 VALUES (1)",
-    ] {
+    for sql in ["CREATE TABLE t12 (a INTEGER)", "INSERT INTO t12 VALUES (1)"] {
         fconn.execute(sql).unwrap();
         cconn.execute_batch(&format!("{sql};")).unwrap();
     }
@@ -575,10 +602,7 @@ fn s13_nested_savepoint_ddl_rollback() {
     let fconn = fsqlite::Connection::open(":memory:").unwrap();
     let cconn = rusqlite::Connection::open_in_memory().unwrap();
 
-    for sql in [
-        "CREATE TABLE t13 (a INTEGER)",
-        "INSERT INTO t13 VALUES (1)",
-    ] {
+    for sql in ["CREATE TABLE t13 (a INTEGER)", "INSERT INTO t13 VALUES (1)"] {
         fconn.execute(sql).unwrap();
         cconn.execute_batch(&format!("{sql};")).unwrap();
     }
@@ -651,7 +675,9 @@ fn s15_prepared_cache_lru_eviction() {
     let cconn = rusqlite::Connection::open_in_memory().unwrap();
 
     fconn.execute("CREATE TABLE t15 (a INTEGER)").unwrap();
-    cconn.execute_batch("CREATE TABLE t15 (a INTEGER);").unwrap();
+    cconn
+        .execute_batch("CREATE TABLE t15 (a INTEGER);")
+        .unwrap();
 
     fconn.execute("INSERT INTO t15 VALUES (10)").unwrap();
     cconn.execute_batch("INSERT INTO t15 VALUES (10);").unwrap();
@@ -662,8 +688,12 @@ fn s15_prepared_cache_lru_eviction() {
     }
 
     // DDL should invalidate cache
-    fconn.execute("ALTER TABLE t15 ADD COLUMN b INTEGER DEFAULT 0").unwrap();
-    cconn.execute_batch("ALTER TABLE t15 ADD COLUMN b INTEGER DEFAULT 0;").unwrap();
+    fconn
+        .execute("ALTER TABLE t15 ADD COLUMN b INTEGER DEFAULT 0")
+        .unwrap();
+    cconn
+        .execute_batch("ALTER TABLE t15 ADD COLUMN b INTEGER DEFAULT 0;")
+        .unwrap();
 
     // Fresh prepare after DDL must see new schema
     let f = fconn.query("SELECT a, b FROM t15").unwrap();
@@ -700,7 +730,9 @@ fn s16_mixed_dml_ddl_interleave() {
         cconn.execute_batch(&format!("{sql};")).unwrap();
     }
 
-    let f = fconn.query("SELECT id, val, extra FROM t16 ORDER BY id").unwrap();
+    let f = fconn
+        .query("SELECT id, val, extra FROM t16 ORDER BY id")
+        .unwrap();
     let c = csqlite_query(&cconn, "SELECT id, val, extra FROM t16 ORDER BY id");
     assert_fsqlite_csqlite_eq(tn, "final_state", &f, &c);
 
@@ -759,7 +791,9 @@ fn s18_alter_column_default() {
         cconn.execute_batch(&format!("{sql};")).unwrap();
     }
 
-    let f = fconn.query("SELECT id, status FROM t18 ORDER BY id").unwrap();
+    let f = fconn
+        .query("SELECT id, status FROM t18 ORDER BY id")
+        .unwrap();
     let c = csqlite_query(&cconn, "SELECT id, status FROM t18 ORDER BY id");
     assert_fsqlite_csqlite_eq(tn, "default_applied", &f, &c);
 
@@ -785,7 +819,9 @@ fn s19_index_on_expression() {
         cconn.execute_batch(&format!("{sql};")).unwrap();
     }
 
-    let f = fconn.query("SELECT name, score FROM t19 ORDER BY score").unwrap();
+    let f = fconn
+        .query("SELECT name, score FROM t19 ORDER BY score")
+        .unwrap();
     let c = csqlite_query(&cconn, "SELECT name, score FROM t19 ORDER BY score");
     assert_fsqlite_csqlite_eq(tn, "after_expr_index", &f, &c);
 
@@ -805,7 +841,9 @@ fn s20_multiple_connections_same_db() {
 
     let fconn1 = fsqlite::Connection::open(path_str).unwrap();
     fconn1.execute("CREATE TABLE t20 (v INTEGER)").unwrap();
-    fconn1.execute("INSERT INTO t20 VALUES (1), (2), (3)").unwrap();
+    fconn1
+        .execute("INSERT INTO t20 VALUES (1), (2), (3)")
+        .unwrap();
 
     // Second connection should see the table and data
     let fconn2 = fsqlite::Connection::open(path_str).unwrap();
@@ -813,7 +851,9 @@ fn s20_multiple_connections_same_db() {
     assert_eq!(f.len(), 3, "[{tn}] second conn should see 3 rows");
 
     // DDL from conn1, then query from conn2
-    fconn1.execute("ALTER TABLE t20 ADD COLUMN label TEXT DEFAULT 'x'").unwrap();
+    fconn1
+        .execute("ALTER TABLE t20 ADD COLUMN label TEXT DEFAULT 'x'")
+        .unwrap();
     let f2 = fconn2.query("SELECT v, label FROM t20 ORDER BY v").unwrap();
     assert_eq!(f2.len(), 3, "[{tn}] conn2 sees rows after alter");
 
@@ -841,8 +881,12 @@ fn s21_prepared_select_star_after_alter() {
     let f1 = fconn.query("SELECT * FROM t21").unwrap();
     assert_eq!(f1[0].values().len(), 2, "before alter: 2 columns");
 
-    fconn.execute("ALTER TABLE t21 ADD COLUMN c REAL DEFAULT 3.14").unwrap();
-    cconn.execute_batch("ALTER TABLE t21 ADD COLUMN c REAL DEFAULT 3.14;").unwrap();
+    fconn
+        .execute("ALTER TABLE t21 ADD COLUMN c REAL DEFAULT 3.14")
+        .unwrap();
+    cconn
+        .execute_batch("ALTER TABLE t21 ADD COLUMN c REAL DEFAULT 3.14;")
+        .unwrap();
 
     let f2 = fconn.query("SELECT * FROM t21").unwrap();
     let c2 = csqlite_query(&cconn, "SELECT * FROM t21");
@@ -876,7 +920,9 @@ fn s22_trigger_after_drop_recreate() {
         cconn.execute_batch(&format!("{sql};")).unwrap();
     }
 
-    let f = fconn.query("SELECT msg FROM t22_audit ORDER BY rowid").unwrap();
+    let f = fconn
+        .query("SELECT msg FROM t22_audit ORDER BY rowid")
+        .unwrap();
     let c = csqlite_query(&cconn, "SELECT msg FROM t22_audit ORDER BY rowid");
     assert_fsqlite_csqlite_eq(tn, "trigger_versions", &f, &c);
 
@@ -993,8 +1039,13 @@ fn s26_insert_returning_after_ddl() {
         cconn.execute_batch(&format!("{sql};")).unwrap();
     }
 
-    let f = fconn.query("INSERT INTO t26 (id, name) VALUES (2, 'second') RETURNING id, name, ts").unwrap();
-    let c = csqlite_query(&cconn, "INSERT INTO t26 (id, name) VALUES (2, 'second') RETURNING id, name, ts");
+    let f = fconn
+        .query("INSERT INTO t26 (id, name) VALUES (2, 'second') RETURNING id, name, ts")
+        .unwrap();
+    let c = csqlite_query(
+        &cconn,
+        "INSERT INTO t26 (id, name) VALUES (2, 'second') RETURNING id, name, ts",
+    );
     assert_fsqlite_csqlite_eq(tn, "returning_after_ddl", &f, &c);
 
     emit_log(tn, "result", json!({"pass": true}));
@@ -1020,7 +1071,9 @@ fn s27_update_after_add_column() {
         cconn.execute_batch(&format!("{sql};")).unwrap();
     }
 
-    let f = fconn.query("SELECT id, val, flag FROM t27 ORDER BY id").unwrap();
+    let f = fconn
+        .query("SELECT id, val, flag FROM t27 ORDER BY id")
+        .unwrap();
     let c = csqlite_query(&cconn, "SELECT id, val, flag FROM t27 ORDER BY id");
     assert_fsqlite_csqlite_eq(tn, "update_new_col", &f, &c);
 
@@ -1047,7 +1100,9 @@ fn s28_delete_after_create_index() {
         cconn.execute_batch(&format!("{sql};")).unwrap();
     }
 
-    let f = fconn.query("SELECT id, score FROM t28 ORDER BY id").unwrap();
+    let f = fconn
+        .query("SELECT id, score FROM t28 ORDER BY id")
+        .unwrap();
     let c = csqlite_query(&cconn, "SELECT id, score FROM t28 ORDER BY id");
     assert_fsqlite_csqlite_eq(tn, "after_indexed_delete", &f, &c);
 
@@ -1075,17 +1130,31 @@ fn s29_compound_select_after_ddl() {
     }
 
     // UNION
-    let f = fconn.query("SELECT v FROM t29a UNION SELECT v FROM t29b ORDER BY v").unwrap();
-    let c = csqlite_query(&cconn, "SELECT v FROM t29a UNION SELECT v FROM t29b ORDER BY v");
+    let f = fconn
+        .query("SELECT v FROM t29a UNION SELECT v FROM t29b ORDER BY v")
+        .unwrap();
+    let c = csqlite_query(
+        &cconn,
+        "SELECT v FROM t29a UNION SELECT v FROM t29b ORDER BY v",
+    );
     assert_fsqlite_csqlite_eq(tn, "union", &f, &c);
 
     // Now DDL: add column to t29a
-    fconn.execute("ALTER TABLE t29a ADD COLUMN label TEXT DEFAULT 'a'").unwrap();
-    cconn.execute_batch("ALTER TABLE t29a ADD COLUMN label TEXT DEFAULT 'a';").unwrap();
+    fconn
+        .execute("ALTER TABLE t29a ADD COLUMN label TEXT DEFAULT 'a'")
+        .unwrap();
+    cconn
+        .execute_batch("ALTER TABLE t29a ADD COLUMN label TEXT DEFAULT 'a';")
+        .unwrap();
 
     // INTERSECT on original column still works
-    let f2 = fconn.query("SELECT v FROM t29a INTERSECT SELECT v FROM t29b ORDER BY v").unwrap();
-    let c2 = csqlite_query(&cconn, "SELECT v FROM t29a INTERSECT SELECT v FROM t29b ORDER BY v");
+    let f2 = fconn
+        .query("SELECT v FROM t29a INTERSECT SELECT v FROM t29b ORDER BY v")
+        .unwrap();
+    let c2 = csqlite_query(
+        &cconn,
+        "SELECT v FROM t29a INTERSECT SELECT v FROM t29b ORDER BY v",
+    );
     assert_fsqlite_csqlite_eq(tn, "intersect_after_alter", &f2, &c2);
 
     emit_log(tn, "result", json!({"pass": true}));
@@ -1112,8 +1181,12 @@ fn s30_subquery_after_schema_change() {
     }
 
     // DDL: add column
-    fconn.execute("ALTER TABLE t30_parent ADD COLUMN active INTEGER DEFAULT 1").unwrap();
-    cconn.execute_batch("ALTER TABLE t30_parent ADD COLUMN active INTEGER DEFAULT 1;").unwrap();
+    fconn
+        .execute("ALTER TABLE t30_parent ADD COLUMN active INTEGER DEFAULT 1")
+        .unwrap();
+    cconn
+        .execute_batch("ALTER TABLE t30_parent ADD COLUMN active INTEGER DEFAULT 1;")
+        .unwrap();
 
     // Correlated subquery referencing new column
     let sql = "SELECT p.name, (SELECT SUM(c.val) FROM t30_child c WHERE c.parent_id = p.id) AS total FROM t30_parent p WHERE p.active = 1 ORDER BY p.name";
@@ -1193,7 +1266,9 @@ fn s32_reanalyze_after_bulk_insert() {
     cconn.execute_batch("ANALYZE;").unwrap();
 
     // Query after ANALYZE should still be correct
-    let f = fconn.query("SELECT COUNT(*) FROM t32 WHERE val < 50").unwrap();
+    let f = fconn
+        .query("SELECT COUNT(*) FROM t32 WHERE val < 50")
+        .unwrap();
     let c = csqlite_query(&cconn, "SELECT COUNT(*) FROM t32 WHERE val < 50");
     assert_fsqlite_csqlite_eq(tn, "after_analyze", &f, &c);
 

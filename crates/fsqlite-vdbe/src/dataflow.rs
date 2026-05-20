@@ -184,6 +184,8 @@ pub enum DataflowOperator {
     ConsolidateRows,
     /// Multiply every row weight by `factor`, eliding zero-weight output rows.
     ScaleWeight { factor: i64 },
+    /// Keep rows with positive accumulated weight as set membership.
+    ThresholdPositive,
     /// Compute `DeltaLeft JOIN Right`, with the current stream as the delta-left input.
     DeltaJoinLeft {
         stable_right: Vec<WeightedRow>,
@@ -224,6 +226,7 @@ impl DataflowOperator {
             Self::ConsolidateByKey { key_columns } => consolidate_by_key(rows, key_columns),
             Self::ConsolidateRows => Ok(consolidate_rows(rows.iter().cloned().collect())),
             Self::ScaleWeight { factor } => Ok(scale_weights(rows, *factor)),
+            Self::ThresholdPositive => Ok(threshold_positive(rows)),
             Self::DeltaJoinLeft {
                 stable_right,
                 key_spec,
@@ -345,6 +348,14 @@ pub fn scale_weights(rows: &[WeightedRow], factor: i64) -> Vec<WeightedRow> {
         .collect()
 }
 
+/// Convert accumulated differential counts into positive set membership.
+pub fn threshold_positive(rows: &[WeightedRow]) -> Vec<WeightedRow> {
+    consolidate_rows(rows.to_vec())
+        .into_iter()
+        .filter_map(|row| (row.weight > 0).then(|| WeightedRow::insert(row.values)))
+        .collect()
+}
+
 /// Compute `DeltaLeft JOIN Right`, preserving algebraic weights.
 pub fn delta_join_left(
     delta_left: &[WeightedRow],
@@ -453,7 +464,7 @@ pub fn delta_join_update(
 mod tests {
     use super::{
         DataflowAutomaton, DataflowError, DataflowOperator, JoinKeySpec, WeightedRow,
-        delta_join_left, delta_join_right, delta_join_update, scale_weights,
+        delta_join_left, delta_join_right, delta_join_update, scale_weights, threshold_positive,
     };
     use fsqlite_types::SqliteValue;
 
@@ -579,6 +590,38 @@ mod tests {
         let actual = scale_weights(&rows, 2);
 
         assert_eq!(actual, vec![WeightedRow::new(vec![int(1)], i64::MAX)]);
+    }
+
+    #[test]
+    fn threshold_positive_consolidates_and_normalizes_membership() {
+        let rows = vec![
+            WeightedRow::new(vec![int(1), int(10)], 2),
+            WeightedRow::new(vec![int(2), int(20)], 1),
+            WeightedRow::new(vec![int(1), int(10)], -1),
+            WeightedRow::new(vec![int(2), int(20)], -1),
+            WeightedRow::new(vec![int(3), int(30)], -4),
+            WeightedRow::new(vec![int(4), int(40)], 0),
+        ];
+
+        let actual = threshold_positive(&rows);
+
+        assert_eq!(actual, vec![WeightedRow::insert(vec![int(1), int(10)])]);
+    }
+
+    #[test]
+    fn threshold_positive_operator_can_follow_weight_scaling() {
+        let automaton = DataflowAutomaton::new(vec![
+            DataflowOperator::ScaleWeight { factor: -1 },
+            DataflowOperator::ThresholdPositive,
+        ]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1)], -3),
+            WeightedRow::new(vec![int(2)], 2),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(actual, vec![WeightedRow::insert(vec![int(1)])]);
     }
 
     #[test]

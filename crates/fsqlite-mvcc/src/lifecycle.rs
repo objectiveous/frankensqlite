@@ -1142,7 +1142,7 @@ impl TransactionManager {
     /// - Release page locks.
     /// - Discard write_set.
     /// - Serialized: release mutex if held.
-    /// - Concurrent: SSI witnesses preserved (safe overapproximation).
+    /// - Discard transaction-local SSI witnesses.
     pub fn abort(&self, txn: &mut Transaction) {
         if txn.state != TransactionState::Active {
             return; // already finalized
@@ -1885,6 +1885,7 @@ impl TransactionManager {
         txn.write_set.clear();
         Arc::make_mut(&mut txn.write_set_data).clear();
         txn.intent_log.clear();
+        txn.read_keys.clear();
         txn.write_keys.clear();
 
         // Release serialized write mutex if held.
@@ -3652,7 +3653,7 @@ mod tests {
     }
 
     #[test]
-    fn test_abort_concurrent_witnesses_preserved() {
+    fn test_abort_concurrent_witnesses_cleared() {
         let m = mgr();
         let mut txn = m.begin(BeginKind::Concurrent).unwrap();
         let read_pg = PageNumber::new(1).unwrap();
@@ -3673,14 +3674,13 @@ mod tests {
             "write tracking must be cleared on abort"
         );
 
-        // Witnesses are NOT cleared on abort (safe overapproximation per spec).
         assert!(
-            !txn.read_keys.is_empty(),
-            "SSI read witnesses must be preserved after abort"
+            txn.read_keys.is_empty(),
+            "SSI read witnesses must be cleared after transaction finalization"
         );
         assert!(
-            !txn.write_keys.is_empty(),
-            "SSI write witnesses must be preserved after abort"
+            txn.write_keys.is_empty(),
+            "SSI write witnesses must be cleared after transaction finalization"
         );
     }
 

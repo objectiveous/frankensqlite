@@ -38,6 +38,15 @@ impl CoreSqlConformanceHarness {
         }
     }
 
+    fn execute_script(&self, sql: &str) {
+        self.franken
+            .execute_batch(sql)
+            .expect("execute FrankenSQLite SQL script");
+        self.sqlite
+            .execute_batch(sql)
+            .expect("execute rusqlite SQL script");
+    }
+
     fn franken_query_rows(&self, sql: &str) -> Vec<Vec<String>> {
         self.franken
             .query(sql)
@@ -153,6 +162,49 @@ const SELECT_JOIN_GROUP_AGGREGATE_CASES: &[QueryCase] = &[
     },
 ];
 
+const UPSERT_SETUP: &str = "
+    CREATE TABLE kv (
+        id INTEGER PRIMARY KEY,
+        key TEXT NOT NULL UNIQUE,
+        value INTEGER NOT NULL,
+        updated INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT INTO kv(id, key, value, updated) VALUES
+        (1, 'alpha', 10, 0),
+        (2, 'beta', 20, 0),
+        (3, 'gamma', 30, 0);
+";
+
+const UPSERT_SCRIPT: &str = "
+    INSERT INTO kv(id, key, value)
+        VALUES (4, 'delta', 40)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated = updated + 1;
+    INSERT INTO kv(id, key, value)
+        VALUES (5, 'alpha', 15)
+        ON CONFLICT(key) DO UPDATE SET value = value + excluded.value, updated = updated + 1;
+    INSERT INTO kv(id, key, value)
+        VALUES (2, 'beta-replaced', 99)
+        ON CONFLICT(id) DO UPDATE SET key = excluded.key, value = excluded.value, updated = updated + 1;
+    INSERT INTO kv(id, key, value)
+        VALUES (6, 'gamma', 999)
+        ON CONFLICT(key) DO NOTHING;
+";
+
+const UPSERT_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "final row order",
+        sql: "SELECT id, key, value, updated FROM kv ORDER BY id",
+    },
+    QueryCase {
+        name: "updated row count",
+        sql: "SELECT COUNT(*) FROM kv WHERE updated > 0",
+    },
+    QueryCase {
+        name: "value aggregate",
+        sql: "SELECT SUM(value), MIN(value), MAX(value) FROM kv",
+    },
+];
+
 #[test]
 fn select_join_group_by_aggregates_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
@@ -160,4 +212,11 @@ fn select_join_group_by_aggregates_match_rusqlite() {
         "SELECT/JOIN/GROUP BY/aggregate",
         SELECT_JOIN_GROUP_AGGREGATE_CASES,
     );
+}
+
+#[test]
+fn upsert_conflict_handling_matches_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(UPSERT_SETUP);
+    harness.execute_script(UPSERT_SCRIPT);
+    harness.assert_queries_match("UPSERT", UPSERT_CASES);
 }

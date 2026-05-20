@@ -182,9 +182,7 @@ pub fn codegen_select(
 ) -> Result<(), CodegenError> {
     let core = match &stmt.body.select {
         SelectCore::Select { .. } => &stmt.body.select,
-        SelectCore::Values(_) => {
-            return Err(CodegenError::Unsupported("VALUES in SELECT".to_owned()));
-        }
+        SelectCore::Values(rows) => return codegen_select_values(b, rows),
     };
 
     let (columns, from, where_clause) = match core {
@@ -367,6 +365,47 @@ pub fn codegen_select(
         b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
     }
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+    // End target for Init jump.
+    b.resolve_label(end_label);
+
+    Ok(())
+}
+
+/// Codegen for a top-level `VALUES (..), (..)` SELECT core.
+fn codegen_select_values(b: &mut ProgramBuilder, rows: &[Vec<Expr>]) -> Result<(), CodegenError> {
+    let end_label = b.emit_label();
+
+    // Init: jump to end.
+    b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+
+    // Read-only transaction.
+    b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+
+    let Some(first_row) = rows.first() else {
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end_label);
+        return Ok(());
+    };
+
+    let out_col_count = i32::try_from(first_row.len())
+        .map_err(|_| CodegenError::Unsupported("VALUES row has too many columns".to_owned()))?;
+
+    if rows.iter().any(|row| row.len() != first_row.len()) {
+        return Err(CodegenError::Unsupported(
+            "VALUES rows must have the same arity".to_owned(),
+        ));
+    }
+
+    let out_regs = b.alloc_regs(out_col_count);
+    for row in rows {
+        for (reg, expr) in (out_regs..).zip(row.iter()) {
+            emit_expr(b, expr, reg)?;
+        }
+        b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    }
+
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
     // End target for Init jump.
@@ -2172,6 +2211,91 @@ mod tests {
             .find(|op| op.opcode == Opcode::Transaction)
             .unwrap();
         assert_eq!(txn.p2, 0);
+    }
+
+    #[test]
+    fn test_codegen_select_values_multirow() -> Result<(), String> {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Values(vec![
+                    vec![
+                        Expr::Literal(Literal::Integer(1), Span::ZERO),
+                        Expr::Literal(Literal::String("alpha".to_owned()), Span::ZERO),
+                    ],
+                    vec![
+                        Expr::Literal(Literal::Integer(2), Span::ZERO),
+                        Expr::Literal(Literal::String("beta".to_owned()), Span::ZERO),
+                    ],
+                ]),
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &[], &ctx).map_err(|err| format!("{err:?}"))?;
+        let prog = b.finish().map_err(|err| format!("{err:?}"))?;
+
+        if !has_opcodes(
+            &prog,
+            &[
+                Opcode::Init,
+                Opcode::Transaction,
+                Opcode::Integer,
+                Opcode::String8,
+                Opcode::ResultRow,
+                Opcode::Integer,
+                Opcode::String8,
+                Opcode::ResultRow,
+                Opcode::Halt,
+            ],
+        ) {
+            return Err(format!(
+                "VALUES SELECT should emit one result row per VALUES row, got {:?}",
+                opcode_sequence(&prog)
+            ));
+        }
+
+        let result_row_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::ResultRow && op.p2 == 2)
+            .count();
+        if result_row_count != 2 {
+            return Err(format!(
+                "VALUES SELECT should emit two two-column ResultRow ops, got {result_row_count}"
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_codegen_select_values_rejects_mismatched_arity() -> Result<(), String> {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Values(vec![
+                    vec![Expr::Literal(Literal::Integer(1), Span::ZERO)],
+                    vec![
+                        Expr::Literal(Literal::Integer(2), Span::ZERO),
+                        Expr::Literal(Literal::Integer(3), Span::ZERO),
+                    ],
+                ]),
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+
+        match codegen_select(&mut b, &stmt, &[], &ctx) {
+            Err(CodegenError::Unsupported(msg)) if msg.contains("same arity") => Ok(()),
+            other => Err(format!("expected VALUES arity error, got {other:?}")),
+        }
     }
 
     // === Test 2: INSERT VALUES ===

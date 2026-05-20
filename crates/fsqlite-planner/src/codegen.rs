@@ -3673,13 +3673,51 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_select_where_without_supported_pattern_is_error() {
+    fn test_codegen_select_unindexed_filter_projected_column_uses_filtered_scan() {
         let stmt = simple_select(&["a"], "t", Some(col_eq_param("a", 1)));
         let schema = test_schema();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
-        let err = codegen_select(&mut b, &stmt, &schema, &ctx).expect_err("should fail");
-        assert!(matches!(err, CodegenError::Unsupported(_)));
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Variable,
+                Opcode::OpenRead,
+                Opcode::Rewind,
+                Opcode::Column,
+                Opcode::Ne,
+                Opcode::Column,
+                Opcode::ResultRow,
+                Opcode::Next,
+            ]
+        ));
+        let column_reads: Vec<_> = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Column)
+            .collect();
+        assert_eq!(
+            column_reads.len(),
+            2,
+            "filtering and projecting the same unindexed column should read it for both the predicate and output"
+        );
+        assert!(
+            column_reads.iter().all(|op| op.p2 == 0),
+            "both reads should target column a"
+        );
+        let ne = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Ne)
+            .expect("filtered scan should skip non-matching rows");
+        assert_ne!(
+            ne.p5 & 0x10,
+            0,
+            "WHERE equality must skip NULL comparisons instead of returning them"
+        );
     }
 
     #[test]

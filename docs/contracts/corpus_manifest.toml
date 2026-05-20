@@ -47,6 +47,39 @@ include_extensions = ["json"]
 content_hash = "27206d784700e7135e4e4195ba937258f9b837c9df35e2124b284141dc5fa1d6"
 min_files = 8
 
+[coverage_accounting]
+schema_version = "1.0.0"
+bead_id = "bd-2yqp6.3.3"
+release_gate = "missing_required_features_block"
+status_semantics = "none=no in-scope manifest entries; partial=in-scope entries exist but none are executable fixtures; full=at least one executable fixture entry"
+required_feature_ids = [
+  "F-FUN.01",
+  "F-FUN.02",
+  "F-FUN.03",
+  "F-FUN.05",
+  "F-FUN.16",
+  "F-PGM.01",
+  "F-PGM.02",
+  "F-PGM.03",
+  "F-PGM.04",
+  "F-SQL.02",
+  "F-SQL.03",
+  "F-SQL.04",
+  "F-SQL.05",
+  "F-SQL.06",
+  "F-SQL.10",
+  "F-SQL.11",
+  "F-SQL.14",
+  "F-SQL.15",
+  "F-SQL.16",
+  "F-SQL.22",
+  "F-SQL.23",
+  "F-SQL.24",
+  "F-SQL.26",
+  "F-SQL.27",
+  "F-SQL.32",
+]
+
 [[category_floors]]
 category = "ddl"
 min_entries = 4

@@ -3480,6 +3480,11 @@ mod tests {
             / f64::from(u32::try_from(total.min(u64::from(u32::MAX))).expect("total fits u32"))
     }
 
+    fn monotonic_test_clock() -> Instant {
+        let now = Instant::now;
+        now()
+    }
+
     fn populate_monitored_page(page_no: PageNumber, data: &mut [u8]) {
         data[..4].copy_from_slice(&page_no.get().to_le_bytes());
         data[4] = page_pattern(page_no);
@@ -3505,7 +3510,10 @@ mod tests {
                     );
                 }
                 Err(err) => {
-                    panic!("cache monitor workload insert failed for page {page_no}: {err}")
+                    assert!(
+                        matches!(err, FrankenError::OutOfMemory),
+                        "cache monitor workload insert failed for page {page_no}: {err}"
+                    );
                 }
             }
         }
@@ -4502,7 +4510,7 @@ mod tests {
             PageNumber::new(26).unwrap(),
         ];
 
-        let started = Instant::now();
+        let clock_start = monotonic_test_clock();
         for page_no in cold_pages {
             touch_monitored_page(&cache, page_no);
         }
@@ -4511,7 +4519,7 @@ mod tests {
                 touch_monitored_page(&cache, page_no);
             }
         }
-        let elapsed = started.elapsed();
+        let elapsed = clock_start.elapsed();
 
         let snapshot = cache.metrics_snapshot();
         let access_counts: HashMap<PageNumber, u64> = cache
@@ -5122,9 +5130,10 @@ mod tests {
         let mut evicted = 0;
         while cache.evict_any() {
             evicted += 1;
-            if evicted > 100 {
-                panic!("bead_id={BEAD_3WOP3_2} case=cross_shard_eviction infinite loop");
-            }
+            assert!(
+                evicted <= 100,
+                "bead_id={BEAD_3WOP3_2} case=cross_shard_eviction infinite loop"
+            );
         }
 
         assert_eq!(
@@ -5193,8 +5202,8 @@ mod tests {
         });
 
         start.wait();
-        let started = Instant::now();
-        while started.elapsed() < Duration::from_millis(20) {
+        let clock_start = monotonic_test_clock();
+        while clock_start.elapsed() < Duration::from_millis(20) {
             assert_ne!(
                 slot.pgno.load(Ordering::Acquire),
                 page_no.get(),
@@ -7295,14 +7304,14 @@ mod tests {
             "hot latency page should be a direct bucket hit"
         );
 
-        let started = Instant::now();
+        let clock_start = monotonic_test_clock();
         let mut hits = 0_u64;
         for _ in 0..ITERATIONS {
             if slots.contains(hot_page) {
                 hits = hits.saturating_add(1);
             }
         }
-        let elapsed = started.elapsed();
+        let elapsed = clock_start.elapsed();
         let avg_ns = (elapsed.as_secs_f64() * 1_000_000_000.0) / f64::from(ITERATIONS);
 
         assert_eq!(

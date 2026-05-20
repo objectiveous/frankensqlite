@@ -2,7 +2,10 @@ use fsqlite_ast::{SelectStatement, Statement};
 use fsqlite_parser::parse_first_statement_with_tail;
 use fsqlite_vdbe::{
     ProgramBuilder,
-    codegen::{CodegenContext, ColumnInfo, IndexSchema, TableSchema, codegen_select},
+    codegen::{
+        CodegenContext, ColumnInfo, IndexSchema, TableSchema, codegen_delete, codegen_insert,
+        codegen_select, codegen_update,
+    },
 };
 
 fn parse_select(sql: &str) -> Result<SelectStatement, String> {
@@ -22,6 +25,22 @@ fn parse_select(sql: &str) -> Result<SelectStatement, String> {
         Statement::Select(select) => Ok(select),
         other => Err(format!("expected SELECT statement, got {other:?}")),
     }
+}
+
+fn parse_statement(sql: &str) -> Result<Statement, String> {
+    let Some((stmt, consumed)) =
+        parse_first_statement_with_tail(sql).map_err(|error| error.to_string())?
+    else {
+        return Err("expected a parsed statement".to_owned());
+    };
+    if consumed != sql.len() {
+        return Err(format!(
+            "parser consumed {consumed} bytes from a {} byte statement",
+            sql.len()
+        ));
+    }
+
+    Ok(stmt)
 }
 
 fn column(name: &str, affinity: char, is_ipk: bool) -> ColumnInfo {
@@ -106,6 +125,70 @@ fn render_bytecode_case(name: &str, sql: &str) -> Result<String, String> {
     output.push_str(&format!("sql: {sql}\n"));
 
     match codegen_select(&mut builder, &select, &schema, &CodegenContext::default()) {
+        Ok(()) => match builder.finish() {
+            Ok(program) => {
+                output.push_str("status: ok\n");
+                output.push_str(&format!("registers: {}\n", program.register_count()));
+                match program.max_bind_parameter_index() {
+                    Ok(max_index) => {
+                        output.push_str(&format!("bind_parameters: {max_index}\n"));
+                    }
+                    Err(bad_index) => {
+                        output.push_str(&format!("bind_parameters_error: {bad_index}\n"));
+                    }
+                }
+                output.push_str(&format!(
+                    "requires_attached_memdb: {}\n",
+                    program.requires_attached_memdb()
+                ));
+                output.push_str(&format!(
+                    "requires_version_store: {}\n",
+                    program.requires_version_store()
+                ));
+                output.push('\n');
+                output.push_str(&program.disassemble());
+            }
+            Err(error) => {
+                output.push_str("status: builder_error\n");
+                output.push_str(&format!("error: {error}\n"));
+            }
+        },
+        Err(error) => {
+            output.push_str("status: codegen_error\n");
+            output.push_str(&format!("error: {error}\n"));
+        }
+    }
+
+    Ok(output)
+}
+
+fn render_statement_bytecode_case(name: &str, sql: &str) -> Result<String, String> {
+    let statement = parse_statement(sql)?;
+    let schema = snapshot_schema();
+    let mut builder = ProgramBuilder::new();
+    let mut output = String::new();
+    let dml_ctx = CodegenContext {
+        concurrent_mode: true,
+        rowid_alias_col_idx: Some(0),
+        ..CodegenContext::default()
+    };
+
+    output.push_str(&format!("case: {name}\n"));
+    output.push_str(&format!("sql: {sql}\n"));
+
+    let codegen_result = match &statement {
+        Statement::Select(select) => {
+            codegen_select(&mut builder, select, &schema, &CodegenContext::default())
+        }
+        Statement::Insert(insert) => codegen_insert(&mut builder, insert, &schema, &dml_ctx),
+        Statement::Update(update) => codegen_update(&mut builder, update, &schema, &dml_ctx),
+        Statement::Delete(delete) => codegen_delete(&mut builder, delete, &schema, &dml_ctx),
+        other => Err(fsqlite_vdbe::codegen::CodegenError::Unsupported(format!(
+            "golden renderer does not compile {other:?}"
+        ))),
+    };
+
+    match codegen_result {
         Ok(()) => match builder.finish() {
             Ok(program) => {
                 output.push_str("status: ok\n");
@@ -276,6 +359,28 @@ fn golden_vdbe_aggregate_group_by_bytecode_family() -> Result<(), String> {
              LIMIT 10",
     )?;
     insta::assert_snapshot!("aggregate_group_by_joined", events_group);
+
+    Ok(())
+}
+
+#[test]
+fn golden_vdbe_subquery_cte_bytecode_family() -> Result<(), String> {
+    let in_subquery = render_statement_bytecode_case(
+        "subquery_in_predicate",
+        "SELECT id, title \
+             FROM docs \
+             WHERE category_id IN (SELECT id FROM categories WHERE name = 'docs') \
+             ORDER BY id",
+    )?;
+    insta::assert_snapshot!("subquery_in_predicate", in_subquery);
+
+    let cte_reference = render_statement_bytecode_case(
+        "cte_reference_filter",
+        "WITH picked AS (SELECT id FROM categories WHERE name = 'docs') \
+             SELECT id, title FROM docs \
+             WHERE category_id IN (SELECT id FROM picked)",
+    )?;
+    insta::assert_snapshot!("cte_reference_filter", cte_reference);
 
     Ok(())
 }

@@ -354,6 +354,67 @@ const CAST_COLLATION_CASES: &[QueryCase] = &[
     },
 ];
 
+const DML_SETUP: &str = "
+    CREATE TABLE inventory (
+        id INTEGER PRIMARY KEY,
+        sku TEXT NOT NULL UNIQUE,
+        category TEXT NOT NULL,
+        qty INTEGER NOT NULL,
+        price_cents INTEGER NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1
+    );
+
+    INSERT INTO inventory(id, sku, category, qty, price_cents, active) VALUES
+        (1, 'bolt', 'hardware', 100, 50, 1),
+        (2, 'screw', 'hardware', 80, 25, 1),
+        (3, 'old', 'clearance', 4, 300, 1),
+        (4, 'gizmo', 'gadget', 12, 500, 1);
+";
+
+const DML_SCRIPT: &str = "
+    INSERT INTO inventory(id, sku, category, qty, price_cents)
+        VALUES (5, 'nut', 'hardware', 40, 75);
+    INSERT INTO inventory(id, sku, category, qty, price_cents, active)
+        VALUES (6, 'kit', 'bundle', 37, 500, 1);
+
+    UPDATE inventory
+        SET qty = qty + 5
+        WHERE category = 'hardware' AND active = 1;
+    UPDATE inventory
+        SET active = 0, price_cents = price_cents - 25
+        WHERE sku = 'old';
+    UPDATE inventory
+        SET qty = qty - 15
+        WHERE sku = 'bolt';
+    UPDATE inventory
+        SET qty = qty + 20
+        WHERE sku = 'screw';
+
+    DELETE FROM inventory
+        WHERE active = 0 AND qty < 10;
+    DELETE FROM inventory
+        WHERE category = 'gadget' AND qty <= 12;
+";
+
+const DML_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "final mutated rows",
+        sql: "SELECT id, sku, category, qty, price_cents, active FROM inventory ORDER BY id",
+    },
+    QueryCase {
+        name: "category summaries after dml",
+        sql: "SELECT category, COUNT(*), SUM(qty), MIN(price_cents), MAX(price_cents) FROM inventory GROUP BY category ORDER BY category",
+    },
+    QueryCase {
+        name: "active inventory value",
+        sql: "SELECT COUNT(*), SUM(qty), SUM(price_cents * qty) FROM inventory WHERE active = 1",
+    },
+    QueryCase {
+        name: "deleted row absence",
+        sql: "SELECT COUNT(*) FROM inventory WHERE sku IN ('old', 'gizmo')",
+    },
+];
+
 const SUBQUERY_SETUP: &str = "
     CREATE TABLE customers (
         id INTEGER PRIMARY KEY,
@@ -448,6 +509,13 @@ fn window_functions_match_rusqlite() {
 fn cast_and_collation_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CAST_COLLATION_SETUP);
     harness.assert_queries_match("CAST/collation", CAST_COLLATION_CASES);
+}
+
+#[test]
+fn dml_insert_update_delete_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(DML_SETUP);
+    harness.execute_script(DML_SCRIPT);
+    harness.assert_queries_match("DML", DML_CASES);
 }
 
 #[test]

@@ -3337,6 +3337,48 @@ mod tests {
     }
 
     #[test]
+    fn test_schema_epoch_abort_releases_lifecycle_resources() {
+        let mut m = mgr();
+        let pgno = PageNumber::new(8_023).unwrap();
+        let mut txn = m.begin(BeginKind::Immediate).unwrap();
+
+        assert!(txn.snapshot_established);
+        assert!(txn.has_version_guard());
+        assert_eq!(m.cached_gc_horizon(), Some(txn.snapshot.high));
+        assert_eq!(m.shm.load_gc_horizon(), txn.snapshot.high);
+        assert_eq!(m.version_guard_registry().active_guard_count(), 1);
+        assert_eq!(m.write_mutex().holder(), Some(txn.txn_id));
+        assert!(
+            txn.serialized_write_lock_held,
+            "IMMEDIATE transaction should hold serialized writer exclusion"
+        );
+
+        m.write_page(&mut txn, pgno, test_data(0x5E))
+            .expect("writer should stage a page before schema mismatch");
+        m.advance_schema_epoch();
+
+        let result = m.commit(&mut txn);
+        assert_eq!(result.unwrap_err(), MvccError::Schema);
+        assert_eq!(txn.state, TransactionState::Aborted);
+        assert!(
+            !txn.snapshot_established,
+            "schema-mismatch abort must release the active snapshot"
+        );
+        assert!(
+            !txn.has_version_guard(),
+            "schema-mismatch abort must unpin the EBR guard"
+        );
+        assert!(
+            !txn.serialized_write_lock_held,
+            "schema-mismatch abort must release serialized writer exclusion"
+        );
+        assert_eq!(m.version_guard_registry().active_guard_count(), 0);
+        assert!(m.cached_gc_horizon().is_none());
+        assert_eq!(m.shm.load_gc_horizon(), CommitSeq::ZERO);
+        assert!(m.write_mutex().holder().is_none());
+    }
+
+    #[test]
     fn test_commit_serialized_fcw_freshness() {
         let m = mgr();
 

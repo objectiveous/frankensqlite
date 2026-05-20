@@ -19866,6 +19866,63 @@ mod tests {
             .boxed()
     }
 
+    fn fuzz_window_func() -> impl Strategy<Value = &'static str> {
+        prop_oneof![
+            Just("ROW_NUMBER"),
+            Just("RANK"),
+            Just("DENSE_RANK"),
+            Just("SUM"),
+            Just("COUNT"),
+            Just("AVG"),
+        ]
+    }
+
+    fn fuzz_window_frame() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW".to_owned()),
+            Just("ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING".to_owned()),
+            Just("ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING".to_owned()),
+            Just("RANGE BETWEEN CURRENT ROW AND CURRENT ROW".to_owned()),
+            Just("GROUPS BETWEEN CURRENT ROW AND CURRENT ROW".to_owned()),
+        ]
+    }
+
+    fn fuzz_window_exclude() -> impl Strategy<Value = &'static str> {
+        prop_oneof![
+            Just(""),
+            Just(" EXCLUDE CURRENT ROW"),
+            Just(" EXCLUDE TIES"),
+            Just(" EXCLUDE GROUP"),
+        ]
+    }
+
+    fn fuzz_window_select_sql() -> BoxedStrategy<String> {
+        (
+            fuzz_window_func(),
+            fuzz_column(),
+            prop::option::of(Just("b")),
+            fuzz_window_frame(),
+            fuzz_window_exclude(),
+        )
+            .prop_map(|(func, order_col, partition_col, frame, exclude)| {
+                let over = if let Some(partition_col) = partition_col {
+                    format!(
+                        "PARTITION BY {partition_col} ORDER BY {order_col} {frame}{exclude}"
+                    )
+                } else {
+                    format!("ORDER BY {order_col} {frame}{exclude}")
+                };
+
+                let call = match func {
+                    "ROW_NUMBER" | "RANK" | "DENSE_RANK" => format!("{func}() OVER ({over})"),
+                    _ => format!("{func}(a) OVER ({over})"),
+                };
+
+                format!("SELECT a, b, {call} AS w FROM t")
+            })
+            .boxed()
+    }
+
     fn fuzz_insert_sql() -> BoxedStrategy<String> {
         (fuzz_literal(), fuzz_literal())
             .prop_map(|(a, b)| format!("INSERT INTO t (a, b) VALUES ({a}, {b})"))
@@ -19886,7 +19943,8 @@ mod tests {
 
     fn fuzz_supported_sql() -> BoxedStrategy<String> {
         prop_oneof![
-            5 => fuzz_select_sql(),
+            4 => fuzz_select_sql(),
+            2 => fuzz_window_select_sql(),
             2 => fuzz_insert_sql(),
             1 => fuzz_update_sql(),
             1 => fuzz_delete_sql(),

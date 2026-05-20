@@ -190,6 +190,13 @@ pub enum DataflowOperator {
         stable_left: Vec<WeightedRow>,
         key_spec: JoinKeySpec,
     },
+    /// Compute the full join delta for simultaneous left and right relation changes.
+    DeltaJoinUpdate {
+        stable_left: Vec<WeightedRow>,
+        stable_right: Vec<WeightedRow>,
+        delta_right: Vec<WeightedRow>,
+        key_spec: JoinKeySpec,
+    },
 }
 
 impl DataflowOperator {
@@ -219,6 +226,12 @@ impl DataflowOperator {
                 stable_left,
                 key_spec,
             } => delta_join_right(stable_left, rows, key_spec),
+            Self::DeltaJoinUpdate {
+                stable_left,
+                stable_right,
+                delta_right,
+                key_spec,
+            } => delta_join_update(stable_left, rows, stable_right, delta_right, key_spec),
         }
     }
 }
@@ -287,6 +300,28 @@ fn index_weighted_rows<'a>(
         index.entry(key).or_default().push(row);
     }
     Ok(index)
+}
+
+fn consolidate_full_rows(rows: Vec<WeightedRow>) -> Vec<WeightedRow> {
+    let mut groups: Vec<(Vec<SqliteValue>, i64)> = Vec::new();
+    for row in rows {
+        if row.is_zero() {
+            continue;
+        }
+        let values = row.values;
+        if let Some((_, weight)) = groups
+            .iter_mut()
+            .find(|(candidate, _)| candidate == &values)
+        {
+            *weight = weight.saturating_add(row.weight);
+        } else {
+            groups.push((values, row.weight));
+        }
+    }
+    groups
+        .into_iter()
+        .filter_map(|(values, weight)| (weight != 0).then(|| WeightedRow::new(values, weight)))
+        .collect()
 }
 
 /// Compute `DeltaLeft JOIN Right`, preserving algebraic weights.
@@ -363,11 +398,41 @@ pub fn delta_join_right(
     Ok(joined)
 }
 
+/// Compute the full join delta for simultaneous left and right relation changes.
+///
+/// Given old stable relations `L` and `R`, plus input deltas `dL` and `dR`,
+/// this emits `(dL JOIN R) UNION (L JOIN dR) UNION (dL JOIN dR)` and
+/// consolidates duplicate output rows by algebraic weight.
+pub fn delta_join_update(
+    stable_left: &[WeightedRow],
+    delta_left: &[WeightedRow],
+    stable_right: &[WeightedRow],
+    delta_right: &[WeightedRow],
+    key_spec: &JoinKeySpec,
+) -> DataflowResult<Vec<WeightedRow>> {
+    key_spec.validate()?;
+    let mut joined = delta_join_left(delta_left, stable_right, key_spec)?;
+    joined.extend(delta_join_right(stable_left, delta_right, key_spec)?);
+    joined.extend(delta_join_left(delta_left, delta_right, key_spec)?);
+    let joined = consolidate_full_rows(joined);
+
+    tracing::debug!(
+        target: "fsqlite_vdbe::dataflow",
+        event = "delta_join_update",
+        stable_left_rows = stable_left.len(),
+        delta_left_rows = delta_left.len(),
+        stable_right_rows = stable_right.len(),
+        delta_right_rows = delta_right.len(),
+        output_rows = joined.len()
+    );
+    Ok(joined)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DataflowAutomaton, DataflowError, DataflowOperator, JoinKeySpec, WeightedRow,
-        delta_join_left, delta_join_right,
+        delta_join_left, delta_join_right, delta_join_update,
     };
     use fsqlite_types::SqliteValue;
 
@@ -492,6 +557,82 @@ mod tests {
         assert_eq!(
             err,
             DataflowError::JoinKeyArityMismatch { left: 2, right: 1 }
+        );
+    }
+
+    #[test]
+    fn delta_join_update_includes_both_sides_and_delta_delta_term() {
+        let spec = JoinKeySpec::new(vec![0], vec![0]);
+        let stable_left = vec![WeightedRow::new(vec![int(1), int(10)], 1)];
+        let stable_right = vec![WeightedRow::new(vec![int(1), int(100)], 1)];
+        let delta_left = vec![WeightedRow::new(vec![int(1), int(11)], 1)];
+        let delta_right = vec![WeightedRow::new(vec![int(1), int(101)], 1)];
+
+        let actual = delta_join_update(
+            &stable_left,
+            &delta_left,
+            &stable_right,
+            &delta_right,
+            &spec,
+        )
+        .expect("join update should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(1), int(11), int(1), int(100)], 1),
+                WeightedRow::new(vec![int(1), int(10), int(1), int(101)], 1),
+                WeightedRow::new(vec![int(1), int(11), int(1), int(101)], 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn delta_join_update_consolidates_duplicate_output_rows() {
+        let spec = JoinKeySpec::new(vec![0], vec![0]);
+        let stable_left = vec![WeightedRow::new(vec![int(1), int(10)], 1)];
+        let stable_right = vec![WeightedRow::new(vec![int(1), int(100)], 1)];
+        let delta_left = vec![WeightedRow::new(vec![int(1), int(10)], 1)];
+        let delta_right = vec![WeightedRow::new(vec![int(1), int(100)], -1)];
+
+        let actual = delta_join_update(
+            &stable_left,
+            &delta_left,
+            &stable_right,
+            &delta_right,
+            &spec,
+        )
+        .expect("join update should execute");
+
+        assert_eq!(
+            actual,
+            vec![WeightedRow::new(
+                vec![int(1), int(10), int(1), int(100)],
+                -1
+            )]
+        );
+    }
+
+    #[test]
+    fn automaton_delta_join_update_uses_current_rows_as_left_delta() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::DeltaJoinUpdate {
+            stable_left: vec![WeightedRow::new(vec![int(1), int(10)], 1)],
+            stable_right: vec![WeightedRow::new(vec![int(1), int(100)], 1)],
+            delta_right: vec![WeightedRow::new(vec![int(1), int(101)], 1)],
+            key_spec: JoinKeySpec::new(vec![0], vec![0]),
+        }]);
+
+        let actual = automaton
+            .execute(&[WeightedRow::new(vec![int(1), int(11)], 1)])
+            .expect("join update operator should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(1), int(11), int(1), int(100)], 1),
+                WeightedRow::new(vec![int(1), int(10), int(1), int(101)], 1),
+                WeightedRow::new(vec![int(1), int(11), int(1), int(101)], 1),
+            ]
         );
     }
 }

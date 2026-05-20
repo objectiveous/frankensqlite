@@ -947,6 +947,75 @@ const MATH_FUNCTION_CASES: &[QueryCase] = &[
     },
 ];
 
+const PATTERN_SETUP: &str = "
+    CREATE TABLE patterns (
+        id INTEGER PRIMARY KEY,
+        name TEXT
+    );
+    INSERT INTO patterns VALUES
+        (1, 'hello'),
+        (2, 'HELLO'),
+        (3, 'he_lo'),
+        (4, 'he%llo'),
+        (5, 'help'),
+        (6, 'shell'),
+        (7, '');
+";
+
+const PATTERN_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "like ascii case insensitive prefix",
+        sql: "SELECT id FROM patterns WHERE name LIKE 'he%' ORDER BY id",
+    },
+    QueryCase {
+        name: "like escape literal underscore",
+        sql: "SELECT id FROM patterns WHERE name LIKE 'he!_%' ESCAPE '!' ORDER BY id",
+    },
+    QueryCase {
+        name: "like escape literal percent",
+        sql: "SELECT id FROM patterns WHERE name LIKE 'he!%%' ESCAPE '!' ORDER BY id",
+    },
+    QueryCase {
+        name: "not like and null predicate",
+        sql: "SELECT id FROM patterns WHERE name NOT LIKE 'he%' OR name LIKE NULL ORDER BY id",
+    },
+    QueryCase {
+        name: "glob case sensitive prefix",
+        sql: "SELECT id FROM patterns WHERE name GLOB 'he*' ORDER BY id",
+    },
+    QueryCase {
+        name: "glob case sensitive uppercase prefix",
+        sql: "SELECT id FROM patterns WHERE name GLOB 'HE*' ORDER BY id",
+    },
+    QueryCase {
+        name: "glob question wildcard",
+        sql: "SELECT id FROM patterns WHERE name GLOB 'he?lo' ORDER BY id",
+    },
+    QueryCase {
+        name: "not glob case sensitive",
+        sql: "SELECT id FROM patterns WHERE name NOT GLOB 'he*' ORDER BY id",
+    },
+    QueryCase {
+        name: "scalar like glob null behavior",
+        sql: "SELECT 'abc' LIKE 'ABC', 'abc' GLOB 'ABC', NULL LIKE 'a%', 'abc' GLOB NULL",
+    },
+];
+
+const REGEXP_ERROR_CASES: &[StatementCase] = &[
+    StatementCase {
+        name: "regexp without registered function",
+        sql: "SELECT 'abc' REGEXP 'a.*'",
+    },
+    StatementCase {
+        name: "not regexp without registered function",
+        sql: "SELECT 'abc' NOT REGEXP 'z.*'",
+    },
+    StatementCase {
+        name: "table regexp without registered function",
+        sql: "SELECT id FROM patterns WHERE name REGEXP '^he'",
+    },
+];
+
 #[test]
 fn select_join_group_by_aggregates_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
@@ -1060,4 +1129,11 @@ fn string_functions_match_rusqlite() {
 fn math_functions_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new("");
     harness.assert_queries_match("math functions", MATH_FUNCTION_CASES);
+}
+
+#[test]
+fn pattern_matching_functions_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(PATTERN_SETUP);
+    harness.assert_queries_match("LIKE/GLOB", PATTERN_CASES);
+    harness.assert_statement_errors_match("REGEXP", REGEXP_ERROR_CASES);
 }

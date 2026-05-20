@@ -2699,14 +2699,19 @@ mod tests {
         assert_eq!(values.len(), 4, "expected 4 columns, got {values:?}");
 
         // Column 0: empty text.
-        match &values[0] {
-            SqliteValue::Text(text) => assert_eq!(
-                text.as_str(),
-                "",
-                "empty-text column should decode as the empty string"
-            ),
-            other => panic!("col 0 should be Text(\"\"), got {other:?}"),
-        }
+        let SqliteValue::Text(text) = &values[0] else {
+            assert!(
+                matches!(values[0], SqliteValue::Text(_)),
+                "col 0 should be Text(\"\"), got {:?}",
+                values[0]
+            );
+            return;
+        };
+        assert_eq!(
+            text.as_str(),
+            "",
+            "empty-text column should decode as the empty string"
+        );
 
         // Column 1: serial type 10 → NULL.
         assert!(
@@ -3994,7 +3999,8 @@ mod tests {
             prop_assert_eq!(
                 exact,
                 via_vec.len(),
-                "bead_id=bd-7ij9b case=exact_size_mismatch exact={exact} vec_len={}",
+                "bead_id=bd-7ij9b case=exact_size_mismatch exact={} vec_len={}",
+                exact,
                 via_vec.len()
             );
 
@@ -4002,9 +4008,10 @@ mod tests {
             serialize_record_iter_into_slice(values.iter(), via_slice.as_mut_slice())
                 .expect("boundary-focused slice serialize must succeed");
             prop_assert_eq!(
-                via_slice,
-                via_vec,
-                "bead_id=bd-7ij9b case=slice_vs_vec_mismatch values={values:?}"
+                via_slice.as_slice(),
+                via_vec.as_slice(),
+                "bead_id=bd-7ij9b case=slice_vs_vec_mismatch values={:?}",
+                values
             );
 
             let parsed = parse_record(&via_vec).expect("serialized record must parse");

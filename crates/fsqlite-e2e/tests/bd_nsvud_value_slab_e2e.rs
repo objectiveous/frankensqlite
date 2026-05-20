@@ -39,10 +39,30 @@ fn emit_log(test_name: &str, phase: &str, data: serde_json::Value) {
     );
 }
 
+fn integer_value(
+    value: &fsqlite_types::value::SqliteValue,
+    context: String,
+) -> Result<i64, String> {
+    match value {
+        fsqlite_types::value::SqliteValue::Integer(n) => Ok(*n),
+        other => Err(format!("{context}: expected integer, got {other:?}")),
+    }
+}
+
+fn text_value<'a>(
+    value: &'a fsqlite_types::value::SqliteValue,
+    context: String,
+) -> Result<&'a str, String> {
+    match value {
+        fsqlite_types::value::SqliteValue::Text(s) => Ok(s.as_str()),
+        other => Err(format!("{context}: expected text, got {other:?}")),
+    }
+}
+
 // ─── E1: 10K row INSERT + oracle comparison ──────────────────────────
 
 #[test]
-fn e1_insert_10k_oracle_comparison() {
+fn e1_insert_10k_oracle_comparison() -> Result<(), String> {
     let test_name = "e1_insert_10k";
     let row_count = 10_000i64;
 
@@ -87,10 +107,7 @@ fn e1_insert_10k_oracle_comparison() {
     let f_rows = fconn
         .query("SELECT COUNT(*) FROM slab_test")
         .expect("fsqlite count");
-    let f_count = match &f_rows[0].values()[0] {
-        fsqlite_types::value::SqliteValue::Integer(n) => *n,
-        other => panic!("unexpected type: {other:?}"),
-    };
+    let f_count = integer_value(&f_rows[0].values()[0], "count result".to_owned())?;
     let c_count: i64 = cconn
         .query_row("SELECT COUNT(*) FROM slab_test", [], |row| row.get(0))
         .expect("csqlite count");
@@ -119,22 +136,10 @@ fn e1_insert_10k_oracle_comparison() {
     let mut mismatches = 0u64;
     for (i, (f_row, c_row)) in f_data.iter().zip(c_data.iter()).enumerate() {
         let f_vals = f_row.values();
-        let f_id = match &f_vals[0] {
-            fsqlite_types::value::SqliteValue::Integer(n) => *n,
-            other => panic!("row {i}: unexpected id type: {other:?}"),
-        };
-        let f_tid = match &f_vals[1] {
-            fsqlite_types::value::SqliteValue::Integer(n) => *n,
-            other => panic!("row {i}: unexpected thread_id type: {other:?}"),
-        };
-        let f_val = match &f_vals[2] {
-            fsqlite_types::value::SqliteValue::Integer(n) => *n,
-            other => panic!("row {i}: unexpected val type: {other:?}"),
-        };
-        let f_label = match &f_vals[3] {
-            fsqlite_types::value::SqliteValue::Text(s) => s.as_str().to_owned(),
-            other => panic!("row {i}: unexpected label type: {other:?}"),
-        };
+        let f_id = integer_value(&f_vals[0], format!("row {i} id"))?;
+        let f_tid = integer_value(&f_vals[1], format!("row {i} thread_id"))?;
+        let f_val = integer_value(&f_vals[2], format!("row {i} val"))?;
+        let f_label = text_value(&f_vals[3], format!("row {i} label"))?.to_owned();
 
         if f_id != c_row.0 || f_tid != c_row.1 || f_val != c_row.2 || f_label != c_row.3 {
             mismatches += 1;
@@ -166,12 +171,13 @@ fn e1_insert_10k_oracle_comparison() {
         mismatches, 0,
         "[E1] {mismatches} value mismatches between fsqlite and csqlite"
     );
+    Ok(())
 }
 
 // ─── E2: Mixed types (INTEGER, TEXT, BLOB, REAL, NULL) ───────────────
 
 #[test]
-fn e2_mixed_types() {
+fn e2_mixed_types() -> Result<(), String> {
     let test_name = "e2_mixed_types";
 
     emit_log(test_name, "start", json!({}));
@@ -276,10 +282,7 @@ fn e2_mixed_types() {
         let f_vals = f_row.values();
 
         // Verify id
-        let f_id = match &f_vals[0] {
-            fsqlite_types::value::SqliteValue::Integer(n) => *n,
-            other => panic!("row {i}: unexpected id type: {other:?}"),
-        };
+        let f_id = integer_value(&f_vals[0], format!("row {i} id"))?;
         assert_eq!(f_id, c_row.0, "row {i}: id mismatch");
 
         // Verify int_col (may be NULL)
@@ -288,7 +291,11 @@ fn e2_mixed_types() {
             (fsqlite_types::value::SqliteValue::Integer(f), Some(c)) => {
                 assert_eq!(*f, *c, "row {i}: int_col mismatch");
             }
-            (f, c) => panic!("row {i}: int_col type mismatch: fsqlite={f:?}, csqlite={c:?}"),
+            (f, c) => {
+                return Err(format!(
+                    "row {i}: int_col type mismatch: fsqlite={f:?}, csqlite={c:?}"
+                ));
+            }
         }
 
         // Verify text_col (may be NULL)
@@ -297,7 +304,11 @@ fn e2_mixed_types() {
             (fsqlite_types::value::SqliteValue::Text(f), Some(c)) => {
                 assert_eq!(f.as_str(), c.as_str(), "row {i}: text_col mismatch");
             }
-            (f, c) => panic!("row {i}: text_col type mismatch: fsqlite={f:?}, csqlite={c:?}"),
+            (f, c) => {
+                return Err(format!(
+                    "row {i}: text_col type mismatch: fsqlite={f:?}, csqlite={c:?}"
+                ));
+            }
         }
 
         // Verify real_col (may be NULL)
@@ -306,7 +317,11 @@ fn e2_mixed_types() {
             (fsqlite_types::value::SqliteValue::Float(f), Some(c)) => {
                 assert_eq!(*f, *c, "row {i}: real_col mismatch");
             }
-            (f, c) => panic!("row {i}: real_col mismatch: fsqlite={f:?}, csqlite={c:?}"),
+            (f, c) => {
+                return Err(format!(
+                    "row {i}: real_col mismatch: fsqlite={f:?}, csqlite={c:?}"
+                ));
+            }
         }
 
         // Verify typeof(real_col) — compare type name string
@@ -314,7 +329,11 @@ fn e2_mixed_types() {
             (fsqlite_types::value::SqliteValue::Text(f), c) => {
                 assert_eq!(f.as_str(), c.as_str(), "row {i}: real_col typeof mismatch");
             }
-            (f, c) => panic!("row {i}: typeof(real_col) mismatch: fsqlite={f:?}, csqlite={c:?}"),
+            (f, c) => {
+                return Err(format!(
+                    "row {i}: typeof(real_col) mismatch: fsqlite={f:?}, csqlite={c:?}"
+                ));
+            }
         }
 
         // Verify blob_col (may be NULL)
@@ -323,7 +342,11 @@ fn e2_mixed_types() {
             (fsqlite_types::value::SqliteValue::Blob(f), Some(c)) => {
                 assert_eq!(f.as_ref(), c.as_slice(), "row {i}: blob_col mismatch");
             }
-            (f, c) => panic!("row {i}: blob_col mismatch: fsqlite={f:?}, csqlite={c:?}"),
+            (f, c) => {
+                return Err(format!(
+                    "row {i}: blob_col mismatch: fsqlite={f:?}, csqlite={c:?}"
+                ));
+            }
         }
 
         // Verify null_col
@@ -332,7 +355,11 @@ fn e2_mixed_types() {
             (fsqlite_types::value::SqliteValue::Text(f), Some(c)) => {
                 assert_eq!(f.as_str(), c.as_str(), "row {i}: null_col mismatch");
             }
-            (f, c) => panic!("row {i}: null_col mismatch: fsqlite={f:?}, csqlite={c:?}"),
+            (f, c) => {
+                return Err(format!(
+                    "row {i}: null_col mismatch: fsqlite={f:?}, csqlite={c:?}"
+                ));
+            }
         }
 
         type_checks_passed += 1;
@@ -349,12 +376,13 @@ fn e2_mixed_types() {
     );
 
     assert_eq!(type_checks_passed, test_cases.len() as u64);
+    Ok(())
 }
 
 // ─── E3: INSERT-then-SELECT cycles to stress pool turnover ───────────
 
 #[test]
-fn e3_insert_readback_cycle() {
+fn e3_insert_readback_cycle() -> Result<(), String> {
     let test_name = "e3_insert_readback_cycle";
     let cycles = 50u64;
     let rows_per_cycle = 200u64;
@@ -429,14 +457,8 @@ fn e3_insert_readback_cycle() {
 
         for (f_row, c_row) in f_rows.iter().zip(c_rows.iter()) {
             let f_vals = f_row.values();
-            let f_id = match &f_vals[0] {
-                fsqlite_types::value::SqliteValue::Integer(n) => *n,
-                other => panic!("unexpected id: {other:?}"),
-            };
-            let f_val = match &f_vals[2] {
-                fsqlite_types::value::SqliteValue::Text(s) => s.as_str(),
-                other => panic!("unexpected val: {other:?}"),
-            };
+            let f_id = integer_value(&f_vals[0], "cycle row id".to_owned())?;
+            let f_val = text_value(&f_vals[2], "cycle row val".to_owned())?;
 
             if f_id != c_row.0 || f_val != c_row.2 {
                 total_mismatches += 1;
@@ -461,4 +483,5 @@ fn e3_insert_readback_cycle() {
         total_mismatches, 0,
         "[E3] {total_mismatches} mismatches across {cycles} INSERT-readback cycles"
     );
+    Ok(())
 }

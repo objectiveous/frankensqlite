@@ -1,6 +1,7 @@
 //! Track G certification-policy integration tests (bd-2yqp6.7).
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use fsqlite_harness::adversarial_search::CampaignResult;
 use fsqlite_harness::certification_policy::{
@@ -175,6 +176,58 @@ fn canonical_policy_matches_track_g_requirements() {
             lane.as_str(),
         );
     }
+}
+
+#[test]
+fn canonical_policy_exposes_explicit_blocking_gate_and_ratchet_dimensions() {
+    let policy = canonical_certification_policy();
+
+    let gate_ids: BTreeSet<_> = policy.gates.iter().map(|gate| gate.gate_id.as_str()).collect();
+    for required_gate in [
+        "declared_surface_parity",
+        "verification_contract",
+        "release_evidence_completeness",
+        "critical_path_evidence",
+    ] {
+        assert!(
+            gate_ids.contains(required_gate),
+            "bead_id={BEAD_ID} case=missing_gate gate={required_gate}",
+        );
+    }
+
+    for lane in REQUIRED_CERTIFICATION_LANES {
+        let gate_id = format!("required_suite_pass::{}", lane.as_str());
+        assert!(
+            gate_ids.contains(gate_id.as_str()),
+            "bead_id={BEAD_ID} case=missing_required_suite_gate gate={gate_id}",
+        );
+    }
+
+    assert!(
+        policy.gates.iter().all(|gate| gate.blocking),
+        "bead_id={BEAD_ID} case=non_blocking_gate_present",
+    );
+
+    let ratchet_ids: BTreeSet<_> = policy
+        .ratchets
+        .iter()
+        .map(|ratchet| ratchet.ratchet_id.as_str())
+        .collect();
+    let expected_ratchets = BTreeSet::from([
+        "global_lower_bound",
+        "category_lower_bounds",
+        "required_suite_pass_rate",
+        "traceability_link_coverage",
+        "artifact_hash_integrity",
+    ]);
+    assert_eq!(
+        ratchet_ids, expected_ratchets,
+        "bead_id={BEAD_ID} case=ratchet_dimension_drift",
+    );
+    assert!(
+        policy.ratchets.iter().all(|ratchet| ratchet.blocking),
+        "bead_id={BEAD_ID} case=non_blocking_ratchet_present",
+    );
 }
 
 #[test]

@@ -75,6 +75,33 @@ const MATCH_CASES: &[MatchCase] = &[
     },
 ];
 
+const PHRASE_PREFIX_NEAR_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "quoted phrase",
+        query: r#""full text""#,
+    },
+    MatchCase {
+        name: "quoted phrase across title terms",
+        query: r#""rust sqlite""#,
+    },
+    MatchCase {
+        name: "term prefix",
+        query: "search*",
+    },
+    MatchCase {
+        name: "phrase final prefix",
+        query: "full + tex*",
+    },
+    MatchCase {
+        name: "near terms",
+        query: "NEAR(rust sqlite, 3)",
+    },
+    MatchCase {
+        name: "near phrase and term",
+        query: r#"NEAR("full text" prefix, 3)"#,
+    },
+];
+
 struct Fts5ConformanceHarness {
     franken: Fts5Table,
     sqlite: Connection,
@@ -147,6 +174,21 @@ fn match_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "MATCH conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn phrase_prefix_near_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in PHRASE_PREFIX_NEAR_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "phrase/prefix/NEAR conformance case failed: {} ({})",
             case.name,
             case.query
         );

@@ -2982,6 +2982,15 @@ impl Fts5Table {
         self.next_rowid = snapshot.next_rowid;
     }
 
+    fn restore_transaction_snapshot(&mut self, snapshot: Option<Fts5TableSnapshot>) -> bool {
+        if let Some(snapshot) = snapshot {
+            self.restore_state(snapshot);
+            true
+        } else {
+            false
+        }
+    }
+
     fn index_document_with_tokenizer(
         &mut self,
         rowid: i64,
@@ -3801,9 +3810,8 @@ impl VirtualTable for Fts5Table {
     }
 
     fn rollback(&mut self, _cx: &Cx) -> Result<()> {
-        if let Some(snapshot) = self.txn_state.rollback() {
-            self.restore_state(snapshot);
-        }
+        let snapshot = self.txn_state.rollback();
+        self.restore_transaction_snapshot(snapshot);
         Ok(())
     }
 
@@ -3818,9 +3826,8 @@ impl VirtualTable for Fts5Table {
     }
 
     fn rollback_to(&mut self, _cx: &Cx, n: i32) -> Result<()> {
-        if let Some(snapshot) = self.txn_state.rollback_to(n) {
-            self.restore_state(snapshot);
-        }
+        let snapshot = self.txn_state.rollback_to(n);
+        self.restore_transaction_snapshot(snapshot);
         Ok(())
     }
 }
@@ -4581,6 +4588,18 @@ mod tests {
         scored_window: Fts5SnippetWindow,
         rendered_snippet: String,
         no_match_window: Fts5SnippetWindow,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5TransactionRollbackStructure {
+        savepoint_rows: Vec<(i64, Vec<String>)>,
+        savepoint_matches: Vec<i64>,
+        full_rows: Vec<(i64, Vec<String>)>,
+        full_matches: Vec<i64>,
+        full_locales: Vec<(i64, usize, String)>,
+        reused_auto_rowid: Option<i64>,
+        rows_after_auto: Vec<(i64, Vec<String>)>,
     }
 
     #[allow(dead_code)]
@@ -7536,6 +7555,171 @@ mod tests {
     },
 }"#
         );
+    }
+
+    #[test]
+    fn test_fts5_vtab_rollback_restores_inserted_rows() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"])
+            .map_err(|err| err.to_string())?;
+
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text(SmallText::from_string("stable root")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        table.begin(&cx).map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text(SmallText::from_string("transient branch")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+
+        assert_eq!(search_rowids(&table, "transient")?, vec![2]);
+        table.rollback(&cx).map_err(|err| err.to_string())?;
+
+        assert_eq!(table.all_rows(), vec![(1, vec!["stable root".to_owned()])]);
+        assert!(search_rowids(&table, "transient")?.is_empty());
+        assert_eq!(search_rowids(&table, "stable")?, vec![1]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_transaction_rollback() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "locale=1"])
+            .map_err(|err| err.to_string())?;
+
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(1),
+                    SqliteValue::Blob(encode_fts5_locale_blob("tr_TR", "stable root").into()),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        table.begin(&cx).map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text(SmallText::from_string("transient branch")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        table.savepoint(&cx, 1).map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(3),
+                    SqliteValue::Text(SmallText::from_string("deep branch")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        table.rollback_to(&cx, 1).map_err(|err| err.to_string())?;
+        let savepoint_rows = table.all_rows();
+        let savepoint_matches = search_rowids(&table, "transient OR deep")?;
+
+        table.rollback(&cx).map_err(|err| err.to_string())?;
+        let full_rows = table.all_rows();
+        let full_matches = search_rowids(&table, "stable OR transient OR deep")?;
+        let full_locales = table.all_locales();
+        let reused_auto_rowid = table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Null,
+                    SqliteValue::Text(SmallText::from_string("auto after rollback")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5TransactionRollbackStructure {
+                    savepoint_rows,
+                    savepoint_matches,
+                    full_rows,
+                    full_matches,
+                    full_locales,
+                    reused_auto_rowid,
+                    rows_after_auto: table.all_rows(),
+                }
+            ),
+            r#"Fts5TransactionRollbackStructure {
+    savepoint_rows: [
+        (
+            1,
+            [
+                "stable root",
+            ],
+        ),
+        (
+            2,
+            [
+                "transient branch",
+            ],
+        ),
+    ],
+    savepoint_matches: [
+        2,
+    ],
+    full_rows: [
+        (
+            1,
+            [
+                "stable root",
+            ],
+        ),
+    ],
+    full_matches: [
+        1,
+    ],
+    full_locales: [
+        (
+            1,
+            0,
+            "tr_TR",
+        ),
+    ],
+    reused_auto_rowid: Some(
+        2,
+    ),
+    rows_after_auto: [
+        (
+            1,
+            [
+                "stable root",
+            ],
+        ),
+        (
+            2,
+            [
+                "auto after rollback",
+            ],
+        ),
+    ],
+}"#
+        );
+        Ok(())
     }
 
     #[test]

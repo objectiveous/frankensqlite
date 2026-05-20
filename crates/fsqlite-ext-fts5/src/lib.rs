@@ -3,8 +3,8 @@
 //! Provides: tokenizer API (unicode61, ascii, porter, trigram), inverted index,
 //! boolean query parsing (implicit AND, OR, NOT binary-only, phrase, prefix,
 //! NEAR, column filter, caret), BM25 ranking, FTS5 virtual table with content
-//! modes, and secure-delete / contentless-delete / contentless-unindexed /
-//! insttoken / locale blob / tokendata configuration.
+//! modes, schema validation, and secure-delete / contentless-delete /
+//! contentless-unindexed / insttoken / locale blob / tokendata configuration.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -327,6 +327,41 @@ fn parse_column_declaration(input: &str) -> Result<Option<(String, bool)>> {
     }
 
     Ok(Some((column.to_owned(), indexed)))
+}
+
+fn validate_column_names(table_name: &str, columns: &[String]) -> Result<()> {
+    let normalized_table_name = table_name.to_ascii_lowercase();
+    let mut seen = HashSet::with_capacity(columns.len());
+
+    for column in columns {
+        let normalized = column.to_ascii_lowercase();
+        match normalized.as_str() {
+            "rowid" => {
+                return Err(FrankenError::function_error(
+                    "fts5: column name 'rowid' is reserved",
+                ));
+            }
+            "rank" => {
+                return Err(FrankenError::function_error(
+                    "fts5: column name 'rank' is reserved",
+                ));
+            }
+            _ if !normalized_table_name.is_empty() && normalized == normalized_table_name => {
+                return Err(FrankenError::function_error(format!(
+                    "fts5: column name '{column}' conflicts with table name"
+                )));
+            }
+            _ => {}
+        }
+
+        if !seen.insert(normalized) {
+            return Err(FrankenError::function_error(format!(
+                "fts5: duplicate column name '{column}'"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2836,6 +2871,7 @@ impl VirtualTable for Fts5Table {
             columns.push("content".to_owned());
             indexed_columns.push(true);
         }
+        validate_column_names(args.get(2).copied().unwrap_or_default(), &columns)?;
         prefix_lengths.sort_unstable();
         prefix_lengths.dedup();
 
@@ -4435,6 +4471,85 @@ mod tests {
         assert_eq!(vtab.index().detail_mode(), DetailMode::Column);
         assert!(vtab.index().tracks_prefix_length(2));
         assert!(vtab.index().tracks_prefix_length(3));
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_reserved_column_names() {
+        let cx = Cx::new();
+        for (column, expected) in [
+            ("rowid", "column name 'rowid' is reserved"),
+            ("Rank", "column name 'rank' is reserved"),
+        ] {
+            let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", column])
+                .expect_err("reserved column name should fail");
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_column_matching_table_name() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "Docs"])
+            .expect_err("column matching table name should fail");
+        assert!(
+            err.to_string()
+                .contains("column name 'Docs' conflicts with table name")
+        );
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_duplicate_column_names() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "\"Title\""])
+            .expect_err("duplicate column name should fail");
+        assert!(
+            err.to_string()
+                .contains("fts5: duplicate column name 'Title'")
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_schema_column_validation() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "mail",
+                "sender",
+                "\"subject\" UNINDEXED",
+                "body COLLATE nocase",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+
+        let structure = table_structure(&table);
+        assert_eq!(
+            format!("{structure:#?}"),
+            r#"Fts5TableStructure {
+    columns: [
+        Fts5ColumnStructure {
+            name: "sender",
+            indexed: true,
+        },
+        Fts5ColumnStructure {
+            name: "subject",
+            indexed: false,
+        },
+        Fts5ColumnStructure {
+            name: "body",
+            indexed: true,
+        },
+    ],
+    rows: [],
+    terms: [],
+}"#
+        );
+        Ok(())
     }
 
     #[test]

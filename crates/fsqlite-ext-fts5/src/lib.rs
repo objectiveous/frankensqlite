@@ -230,11 +230,15 @@ fn parse_columnsize_option(value: &str) -> Option<bool> {
 }
 
 fn parse_detail_option(value: &str) -> Option<DetailMode> {
-    match value.trim() {
-        "full" => Some(DetailMode::Full),
-        "column" => Some(DetailMode::Column),
-        "none" => Some(DetailMode::None),
-        _ => None,
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("full") {
+        Some(DetailMode::Full)
+    } else if value.eq_ignore_ascii_case("column") {
+        Some(DetailMode::Column)
+    } else if value.eq_ignore_ascii_case("none") {
+        Some(DetailMode::None)
+    } else {
+        None
     }
 }
 
@@ -4802,6 +4806,16 @@ mod tests {
         cafe_matches: Vec<i64>,
     }
 
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5DetailOptionStructure {
+        parsed: Vec<(String, Option<DetailMode>)>,
+        config_detail: DetailMode,
+        index_detail: DetailMode,
+        matches: Vec<i64>,
+        phrase_error: String,
+    }
+
     struct TokendataTestTokenizer;
 
     impl Fts5Tokenizer for TokendataTestTokenizer {
@@ -5260,6 +5274,83 @@ mod tests {
     cafe_matches: [
         1,
     ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_detail_option_parses_case_insensitively_without_allocating() {
+        assert_eq!(parse_detail_option("FULL"), Some(DetailMode::Full));
+        assert_eq!(parse_detail_option(" Column "), Some(DetailMode::Column));
+        assert_eq!(parse_detail_option("NoNe"), Some(DetailMode::None));
+        assert_eq!(parse_detail_option("offsets"), None);
+        assert_eq!(parse_detail_option(""), None);
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_detail_option_casefold() -> std::result::Result<(), String> {
+        let parsed = ["FULL", " Column ", "NoNe", "offsets"]
+            .into_iter()
+            .map(|value| (value.to_owned(), parse_detail_option(value)))
+            .collect();
+
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "detail_docs", "body", "detail=CoLuMn"],
+        )
+        .map_err(|err| err.to_string())?;
+        table.insert_document(1, &["alpha beta".to_owned()]);
+        let mut matches = search_rowids(&table, "alpha")?;
+        matches.sort_unstable();
+        let phrase_error = table
+            .search("\"alpha beta\"")
+            .expect_err("detail=column should reject phrase queries")
+            .to_string();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5DetailOptionStructure {
+                    parsed,
+                    config_detail: table.config.detail_mode(),
+                    index_detail: table.index.detail_mode(),
+                    matches,
+                    phrase_error,
+                }
+            ),
+            r#"Fts5DetailOptionStructure {
+    parsed: [
+        (
+            "FULL",
+            Some(
+                Full,
+            ),
+        ),
+        (
+            " Column ",
+            Some(
+                Column,
+            ),
+        ),
+        (
+            "NoNe",
+            Some(
+                None,
+            ),
+        ),
+        (
+            "offsets",
+            None,
+        ),
+    ],
+    config_detail: Column,
+    index_detail: Column,
+    matches: [
+        1,
+    ],
+    phrase_error: "detail=column does not support phrase queries",
 }"#
         );
         Ok(())

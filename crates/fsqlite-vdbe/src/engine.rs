@@ -21967,6 +21967,46 @@ mod tests {
             );
         }
 
+        #[test]
+        fn test_codegen_insert_current_timestamp_uses_runtime_make_record() {
+            let schema = test_schema();
+            let ctx = CodegenContext::default();
+            let stmt = InsertStatement {
+                with: None,
+                or_conflict: None,
+                table: QualifiedName {
+                    schema: None,
+                    name: "t".to_owned(),
+                },
+                alias: None,
+                columns: vec![],
+                source: InsertSource::Values(vec![vec![
+                    Expr::Literal(Literal::CurrentTimestamp, span()),
+                    Expr::Literal(Literal::String("runtime".to_owned()), span()),
+                ]]),
+                upsert: vec![],
+                returning: vec![],
+            };
+
+            let mut b = ProgramBuilder::new();
+            codegen_insert(&mut b, &stmt, &schema, &ctx).expect("codegen should succeed");
+            let prog = b.finish().expect("program should build");
+            let insert = prog
+                .ops()
+                .iter()
+                .find(|op| op.opcode == Opcode::Insert)
+                .expect("program should contain Insert");
+
+            assert!(
+                prog.ops().iter().any(|op| op.opcode == Opcode::MakeRecord),
+                "volatile CURRENT_TIMESTAMP values must stay on the runtime record assembly path"
+            );
+            assert!(
+                !matches!(&insert.p4, P4::Blob(_)),
+                "volatile CURRENT_TIMESTAMP values must not be captured in a preformatted Insert payload"
+            );
+        }
+
         /// Verify emit_expr handles arithmetic BinaryOp in INSERT values.
         #[test]
         fn test_codegen_insert_arithmetic_expr() {

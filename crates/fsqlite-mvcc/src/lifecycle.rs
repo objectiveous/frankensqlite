@@ -6844,6 +6844,52 @@ mod tests {
     }
 
     #[test]
+    fn test_read_only_commit_releases_cached_gc_horizon() {
+        let mgr = mgr();
+        let pgno = PageNumber::new(6_781).unwrap();
+        let data = test_data(0x61);
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut writer, pgno, data.clone())
+            .expect("writer should stage seed page");
+        let commit_seq = mgr.commit(&mut writer).expect("seed writer commit");
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).unwrap();
+        assert_eq!(
+            mgr.cached_gc_horizon(),
+            Some(commit_seq),
+            "active read-only transaction should pin the current snapshot horizon"
+        );
+        assert_eq!(mgr.shm.load_gc_horizon(), commit_seq);
+        assert_eq!(
+            mgr.read_page(&mut reader, pgno),
+            Some(data),
+            "read-only transaction should resolve the committed seed page"
+        );
+
+        let read_only_commit = mgr
+            .commit(&mut reader)
+            .expect("read-only transaction should commit");
+
+        assert_eq!(
+            read_only_commit,
+            CommitSeq::ZERO,
+            "read-only commit should not publish a new commit sequence"
+        );
+        assert_eq!(reader.state, TransactionState::Committed);
+        assert!(
+            !reader.snapshot_established,
+            "read-only commit must mark the snapshot as released"
+        );
+        assert_eq!(mgr.version_guard_registry().active_guard_count(), 0);
+        assert!(
+            mgr.cached_gc_horizon().is_none(),
+            "read-only commit should release the last cached GC horizon"
+        );
+        assert_eq!(mgr.shm.load_gc_horizon(), CommitSeq::ZERO);
+    }
+
+    #[test]
     fn test_cached_gc_horizon_tracks_deferred_first_write_lifecycle() {
         let mgr = mgr();
         let pgno = PageNumber::new(6_784).unwrap();

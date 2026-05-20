@@ -234,8 +234,36 @@ const HOT_PAGE_DEFLECTION_TARGET_SHIFT_BPS: usize = 1_000;
 const HOT_PAGE_DEFLECTION_BUDGET_PAGES: u8 = 2;
 const HOT_PAGE_DEFLECTION_BUDGET_NS: u64 = 0;
 
+// ── Adaptive fill-factor control (bd-1dp9.6.7.13.2) ──────────────────────
+//
+// The topology policy above applies a *flat* fill-factor shift the moment a
+// page is judged "topology hot". Adaptive fill-factor control instead scales an
+// additional, bounded shift in proportion to the accumulated conflict heat, so
+// a page that keeps getting hotter cedes progressively more slack to the
+// contended side — never exceeding explicit clamps. It is opt-in and
+// default-disabled, so the baseline/topology split policy is byte-identical
+// until an operator enables it (rollout discipline: observe -> advise ->
+// enforce, with a reversible kill switch).
+const ADAPTIVE_FILL_FACTOR_POLICY_ID: &str = "btree.adaptive_fill_factor.v1";
+const ADAPTIVE_FILL_FACTOR_ENV: &str = "FSQLITE_ADAPTIVE_FILL_FACTOR";
+// Heat at/below which the adaptive ramp adds zero extra shift, preserving the
+// flat topology behavior at first contact. Anchored to the hot threshold.
+const ADAPTIVE_FILL_FACTOR_KNEE_HEAT: u64 = CONFLICT_TOPOLOGY_HOT_HEAT_THRESHOLD;
+// Heat at which the adaptive ramp saturates at its maximum extra shift. Anchored
+// to the pathological-hotspot threshold so the ramp spans the topology-hot band.
+const ADAPTIVE_FILL_FACTOR_SATURATION_HEAT: u64 = HOT_PAGE_DEFLECTION_HEAT_THRESHOLD;
+// Maximum *additional* fill-factor shift the ramp may add on top of the flat
+// topology shift, in basis points.
+const ADAPTIVE_FILL_FACTOR_MAX_EXTRA_SHIFT_BPS: usize = 1_500;
+// Explicit clamps for the adaptive path: wider than the flat topology clamps,
+// but still bounded and operator-visible.
+const ADAPTIVE_FILL_FACTOR_LEFT_FLOOR_BPS: usize = 1_500;
+const ADAPTIVE_FILL_FACTOR_RIGHT_CEIL_BPS: usize = 9_000;
+
 static CONFLICT_TOPOLOGY_POLICY_MODE: AtomicU64 = AtomicU64::new(2);
 static CONFLICT_TOPOLOGY_POLICY_ENV_APPLIED: AtomicBool = AtomicBool::new(false);
+static ADAPTIVE_FILL_FACTOR_ENABLED: AtomicBool = AtomicBool::new(false);
+static ADAPTIVE_FILL_FACTOR_ENV_APPLIED: AtomicBool = AtomicBool::new(false);
 static CONFLICT_TOPOLOGY_STATE: LazyLock<Mutex<ConflictTopologyState>> =
     LazyLock::new(|| Mutex::new(ConflictTopologyState::default()));
 
@@ -447,6 +475,113 @@ pub fn conflict_topology_policy_mode() -> ConflictTopologyPolicyMode {
 #[must_use]
 pub fn conflict_topology_policy_enabled() -> bool {
     conflict_topology_policy_mode() != ConflictTopologyPolicyMode::Baseline
+}
+
+/// Stable policy identifier for adaptive fill-factor control.
+#[must_use]
+pub const fn adaptive_fill_factor_policy_id() -> &'static str {
+    ADAPTIVE_FILL_FACTOR_POLICY_ID
+}
+
+fn apply_adaptive_fill_factor_env_once() {
+    if ADAPTIVE_FILL_FACTOR_ENV_APPLIED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let Ok(raw) = std::env::var(ADAPTIVE_FILL_FACTOR_ENV) else {
+        return;
+    };
+    if let Some(enabled) = parse_adaptive_fill_factor_flag(raw.as_str()) {
+        ADAPTIVE_FILL_FACTOR_ENABLED.store(enabled, Ordering::Relaxed);
+    }
+}
+
+fn parse_adaptive_fill_factor_flag(raw: &str) -> Option<bool> {
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("on")
+        || raw.eq_ignore_ascii_case("true")
+        || raw.eq_ignore_ascii_case("enforced")
+        || raw == "1"
+    {
+        Some(true)
+    } else if raw.eq_ignore_ascii_case("off")
+        || raw.eq_ignore_ascii_case("false")
+        || raw.eq_ignore_ascii_case("baseline")
+        || raw == "0"
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Whether adaptive fill-factor control is enabled (default: disabled).
+///
+/// Honors the `FSQLITE_ADAPTIVE_FILL_FACTOR` operator override once per process.
+#[must_use]
+pub fn adaptive_fill_factor_enabled() -> bool {
+    apply_adaptive_fill_factor_env_once();
+    ADAPTIVE_FILL_FACTOR_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Set the process-local adaptive fill-factor enable flag (reversible kill switch).
+pub fn set_adaptive_fill_factor_enabled(enabled: bool) {
+    ADAPTIVE_FILL_FACTOR_ENV_APPLIED.store(true, Ordering::Release);
+    ADAPTIVE_FILL_FACTOR_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Additional fill-factor shift (basis points) the adaptive ramp adds for a
+/// given accumulated conflict heat.
+///
+/// Zero at or below the knee heat (so first contact matches the flat topology
+/// policy), increasing linearly to `ADAPTIVE_FILL_FACTOR_MAX_EXTRA_SHIFT_BPS` at
+/// the saturation heat, and clamped flat above it. Pure and deterministic.
+#[must_use]
+fn adaptive_fill_factor_extra_shift_bps(conflict_heat: u64) -> usize {
+    if conflict_heat <= ADAPTIVE_FILL_FACTOR_KNEE_HEAT {
+        return 0;
+    }
+    let span = ADAPTIVE_FILL_FACTOR_SATURATION_HEAT.saturating_sub(ADAPTIVE_FILL_FACTOR_KNEE_HEAT);
+    if span == 0 {
+        return ADAPTIVE_FILL_FACTOR_MAX_EXTRA_SHIFT_BPS;
+    }
+    let pos = (conflict_heat - ADAPTIVE_FILL_FACTOR_KNEE_HEAT).min(span);
+    let max = ADAPTIVE_FILL_FACTOR_MAX_EXTRA_SHIFT_BPS as u64;
+    let extra = max * pos / span;
+    usize::try_from(extra).unwrap_or(ADAPTIVE_FILL_FACTOR_MAX_EXTRA_SHIFT_BPS)
+}
+
+/// Refine a topology-aware split target with adaptive fill-factor control.
+///
+/// When adaptive control is disabled this returns `topology_target_left_basis_points`
+/// unchanged, guaranteeing the baseline/topology split policy is byte-identical.
+/// When enabled it biases the target further toward the contended side in
+/// proportion to `conflict_heat`, clamped to explicit bounds. Interior splits
+/// carry no directional bias and are returned unchanged.
+#[must_use]
+pub fn adaptive_fill_factor_target(
+    predicted_hot_side: &str,
+    topology_target_left_basis_points: usize,
+    conflict_heat: u64,
+) -> usize {
+    if !adaptive_fill_factor_enabled() {
+        return topology_target_left_basis_points;
+    }
+    let extra = adaptive_fill_factor_extra_shift_bps(conflict_heat);
+    if extra == 0 {
+        return topology_target_left_basis_points;
+    }
+    match predicted_hot_side {
+        "left_edge" => topology_target_left_basis_points
+            .saturating_sub(extra)
+            .max(ADAPTIVE_FILL_FACTOR_LEFT_FLOOR_BPS),
+        "right_edge" => topology_target_left_basis_points
+            .saturating_add(extra)
+            .min(ADAPTIVE_FILL_FACTOR_RIGHT_CEIL_BPS),
+        _ => topology_target_left_basis_points,
+    }
 }
 
 /// Clear accumulated conflict-topology heat.
@@ -1444,13 +1579,14 @@ pub(crate) static CONFLICT_TOPOLOGY_POLICY_TEST_LOCK: std::sync::LazyLock<std::s
 #[cfg(test)]
 mod tests {
     use super::{
-        BtreeOpType, ConflictTopologyPolicyMode, btree_copy_profile_snapshot,
+        BtreeOpType, ConflictTopologyPolicyMode, adaptive_fill_factor_enabled,
+        adaptive_fill_factor_policy_id, adaptive_fill_factor_target, btree_copy_profile_snapshot,
         btree_leaf_reuse_snapshot, btree_metrics_snapshot, conflict_topology_split_advice,
         record_conflict_topology_heat, record_conservative_reload_fallback,
         record_no_split_reuse_hit, record_operation, record_page_header_rebuild,
         reset_btree_copy_profile, reset_btree_metrics, reset_conflict_topology_policy_state,
-        set_btree_copy_profile_enabled, set_btree_metrics_enabled,
-        set_conflict_topology_policy_mode,
+        set_adaptive_fill_factor_enabled, set_btree_copy_profile_enabled,
+        set_btree_metrics_enabled, set_conflict_topology_policy_mode,
     };
     use crate::{BtCursor, BtreeCursorOps, MemPageStore};
     use fsqlite_types::PageNumber;
@@ -1460,6 +1596,95 @@ mod tests {
 
     const TEST_USABLE: u32 = 4096;
     static COPY_PROFILE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn adaptive_fill_factor_disabled_is_a_noop() {
+        let _guard = super::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_adaptive_fill_factor_enabled(false);
+
+        // Disabled: every side/heat returns the topology target verbatim, so the
+        // baseline/topology split policy is byte-identical to pre-adaptive code.
+        for heat in [0_u64, 2, 3, 32, 64, 4096] {
+            assert_eq!(adaptive_fill_factor_target("right_edge", 6_500, heat), 6_500);
+            assert_eq!(adaptive_fill_factor_target("left_edge", 4_500, heat), 4_500);
+            assert_eq!(adaptive_fill_factor_target("interior", 5_000, heat), 5_000);
+        }
+
+        set_adaptive_fill_factor_enabled(false);
+    }
+
+    #[test]
+    fn adaptive_fill_factor_ramps_monotonically_within_bounds() {
+        let _guard = super::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_adaptive_fill_factor_enabled(true);
+
+        // At/below the knee heat the ramp adds nothing (matches the flat topology shift).
+        assert_eq!(adaptive_fill_factor_target("right_edge", 8_000, 0), 8_000);
+        assert_eq!(adaptive_fill_factor_target("right_edge", 8_000, 2), 8_000);
+
+        // Right-edge: extra shift grows with heat, monotonically, clamped to the ceiling.
+        let mut prev = 8_000;
+        for heat in [3_u64, 16, 33, 50, 64] {
+            let target = adaptive_fill_factor_target("right_edge", 8_000, heat);
+            assert!(target >= prev, "right-edge target must be monotonic in heat");
+            assert!(target <= 9_000, "right-edge target must respect the ceiling");
+            prev = target;
+        }
+        // Saturation heat yields the full extra shift, then clamps flat above it.
+        assert_eq!(adaptive_fill_factor_target("right_edge", 8_000, 64), 9_000);
+        assert_eq!(adaptive_fill_factor_target("right_edge", 8_000, 10_000), 9_000);
+
+        // Left-edge: target descends with heat, clamped to the floor.
+        let mut prev = 4_500;
+        for heat in [3_u64, 16, 33, 50, 64] {
+            let target = adaptive_fill_factor_target("left_edge", 4_500, heat);
+            assert!(target <= prev, "left-edge target must be monotonic in heat");
+            assert!(target >= 1_500, "left-edge target must respect the floor");
+            prev = target;
+        }
+        assert_eq!(adaptive_fill_factor_target("left_edge", 4_500, 64), 3_000);
+
+        // Interior carries no directional bias regardless of heat.
+        assert_eq!(adaptive_fill_factor_target("interior", 5_000, 64), 5_000);
+
+        set_adaptive_fill_factor_enabled(false);
+    }
+
+    #[test]
+    fn adaptive_fill_factor_extra_shift_is_bounded_and_proportional() {
+        // Pure ramp function: zero at/below the knee, full at saturation, clamped above.
+        assert_eq!(super::adaptive_fill_factor_extra_shift_bps(0), 0);
+        assert_eq!(super::adaptive_fill_factor_extra_shift_bps(2), 0);
+        assert!(super::adaptive_fill_factor_extra_shift_bps(3) > 0);
+        assert_eq!(super::adaptive_fill_factor_extra_shift_bps(64), 1_500);
+        assert_eq!(super::adaptive_fill_factor_extra_shift_bps(u64::MAX), 1_500);
+        // Midpoint heat lands near half the maximum extra shift.
+        let mid = super::adaptive_fill_factor_extra_shift_bps(33);
+        assert!((720..=780).contains(&mid), "midpoint extra shift was {mid}");
+    }
+
+    #[test]
+    fn adaptive_fill_factor_kill_switch_reverts_to_baseline() {
+        let _guard = super::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        set_adaptive_fill_factor_enabled(true);
+        assert!(adaptive_fill_factor_enabled());
+        let hot = adaptive_fill_factor_target("right_edge", 8_000, 64);
+        assert_eq!(hot, 9_000);
+
+        // Operator override flips it off: behavior reverts to the topology target.
+        set_adaptive_fill_factor_enabled(false);
+        assert!(!adaptive_fill_factor_enabled());
+        assert_eq!(adaptive_fill_factor_target("right_edge", 8_000, 64), 8_000);
+
+        assert_eq!(adaptive_fill_factor_policy_id(), "btree.adaptive_fill_factor.v1");
+    }
 
     #[test]
     fn conflict_topology_advice_applies_hot_right_edge_fill_shift() {

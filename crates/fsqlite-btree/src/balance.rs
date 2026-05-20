@@ -216,9 +216,19 @@ fn leaf_table_split_policy_for_page(
         },
     );
 
+    // Adaptive fill-factor control: bias the topology-aware target further
+    // toward the contended side in proportion to accumulated conflict heat,
+    // within explicit clamps. A no-op (returns the topology target unchanged)
+    // unless an operator has enabled it.
+    let target_left_basis_points = instrumentation::adaptive_fill_factor_target(
+        heat.as_str(),
+        topology_advice.effective_target_left_basis_points,
+        topology_advice.conflict_heat,
+    );
+
     LeafTableSplitPolicy {
         heat,
-        target_left_basis_points: topology_advice.effective_target_left_basis_points,
+        target_left_basis_points,
         topology_advice,
     }
 }
@@ -1234,6 +1244,8 @@ fn prepare_leaf_table_local_split<W: PageWriter>(
         split_reason = split_policy.topology_advice.split_reason(),
         trigger_reason = split_policy.topology_advice.trigger_reason,
         fill_factor = split_policy.target_left_basis_points as u32,
+        adaptive_fill_factor_active = instrumentation::adaptive_fill_factor_enabled(),
+        adaptive_policy_id = instrumentation::adaptive_fill_factor_policy_id(),
         page_role = "table_leaf",
         predicted_overlap_delta = split_policy.topology_advice.predicted_overlap_delta,
         observed_overlap_delta = 0_i64,
@@ -3280,6 +3292,49 @@ mod tests {
             "budget_exhausted"
         );
 
+        crate::instrumentation::reset_conflict_topology_policy_state();
+        crate::instrumentation::set_conflict_topology_policy_mode(
+            crate::instrumentation::ConflictTopologyPolicyMode::Enforced,
+        );
+    }
+
+    #[test]
+    fn test_adaptive_fill_factor_biases_hot_leaf_split_further_when_enabled() {
+        let _guard = crate::instrumentation::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hot_page = pn(47);
+        crate::instrumentation::set_conflict_topology_policy_mode(
+            crate::instrumentation::ConflictTopologyPolicyMode::Enforced,
+        );
+        crate::instrumentation::reset_conflict_topology_policy_state();
+        // Heat well inside the topology-hot band but below the deflection
+        // threshold, so the topology target is the flat 8_000 right-edge cap.
+        crate::instrumentation::record_conflict_topology_heat(hot_page, 33, 4);
+
+        // Disabled (default): topology-only target, byte-identical to pre-adaptive.
+        crate::instrumentation::set_adaptive_fill_factor_enabled(false);
+        let topology_only = leaf_table_split_policy_for_page(Some(hot_page), 12, 11);
+        assert_eq!(topology_only.target_left_basis_points, 8_000);
+
+        // Enabled: the adaptive ramp adds a bounded extra shift on top (750 bps at heat 33).
+        crate::instrumentation::set_adaptive_fill_factor_enabled(true);
+        let adaptive = leaf_table_split_policy_for_page(Some(hot_page), 12, 11);
+        assert_eq!(adaptive.target_left_basis_points, 8_750);
+
+        // A higher fill target keeps more payload on the left page, so the split
+        // index lands at least as far right as the topology-only decision.
+        let cells = fixed_cost_cells(12, 180);
+        let topology_split =
+            choose_leaf_table_split_index(&cells, 0, 0, USABLE, topology_only).expect("split");
+        let adaptive_split =
+            choose_leaf_table_split_index(&cells, 0, 0, USABLE, adaptive).expect("split");
+        assert!(
+            adaptive_split >= topology_split,
+            "adaptive fill-factor should bias the split further toward the hot right edge"
+        );
+
+        crate::instrumentation::set_adaptive_fill_factor_enabled(false);
         crate::instrumentation::reset_conflict_topology_policy_state();
         crate::instrumentation::set_conflict_topology_policy_mode(
             crate::instrumentation::ConflictTopologyPolicyMode::Enforced,

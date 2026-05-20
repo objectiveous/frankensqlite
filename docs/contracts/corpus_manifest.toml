@@ -38,6 +38,15 @@ required_category_families = [
   "error_paths",
 ]
 
+[[fixture_roots.hash_locked_roots]]
+root_id = "canonical-conformance-json"
+path = "crates/fsqlite-harness/conformance"
+kind = "fixture_json"
+hash_algorithm = "sha256-tree-v1"
+include_extensions = ["json"]
+content_hash = "27206d784700e7135e4e4195ba937258f9b837c9df35e2124b284141dc5fa1d6"
+min_files = 8
+
 [[category_floors]]
 category = "ddl"
 min_entries = 4

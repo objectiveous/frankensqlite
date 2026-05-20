@@ -681,6 +681,15 @@ jobs:
             --output artifacts/e2e-correctness --json run-correctness \
             2>&1 | tee artifacts/e2e_correctness.json
 
+      - name: Cross-engine integrity check (bd-aiica)
+        if: always()
+        run: |
+          echo "=== Cross-engine integrity check ==="
+          ./scripts/ci_integrity_check.sh target/test-artifacts/concurrent || true
+          if [ -f /tmp/fsqlite-integrity-results/summary.md ]; then
+            cat /tmp/fsqlite-integrity-results/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          fi
+
       - name: Run Phase 1-3 verification gates
         run: |
           cargo run -p fsqlite-harness --bin phase_1_3_gate_runner -- artifacts/phase_1_3_gate_report.json \

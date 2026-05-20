@@ -45,6 +45,7 @@ pub mod run_workspace;
 pub mod smoke;
 pub mod sqlite3_baseline;
 pub mod sqlite_executor;
+pub mod tracing_schema;
 pub mod validation;
 pub mod verification_gates;
 pub mod verify_csqlite;

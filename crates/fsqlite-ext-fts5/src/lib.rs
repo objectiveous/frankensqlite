@@ -3345,6 +3345,58 @@ impl Fts5HighlightTerm {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fts5HighlightPattern {
+    parts: Vec<Fts5HighlightTerm>,
+}
+
+impl Fts5HighlightPattern {
+    fn singleton(term: Fts5HighlightTerm) -> Self {
+        Self { parts: vec![term] }
+    }
+
+    fn exact_phrase(words: &[String]) -> Self {
+        Self {
+            parts: words
+                .iter()
+                .map(|word| Fts5HighlightTerm::exact(word))
+                .collect(),
+        }
+    }
+
+    fn phrase_prefix(words: &[String], prefix: &str) -> Self {
+        let mut parts = Vec::with_capacity(words.len() + 1);
+        parts.extend(words.iter().map(|word| Fts5HighlightTerm::exact(word)));
+        parts.push(Fts5HighlightTerm::prefix(prefix));
+        Self { parts }
+    }
+
+    fn token_count(&self) -> usize {
+        self.parts.len()
+    }
+
+    fn matches_at(&self, tokens: &[Fts5Token], start: usize) -> Option<usize> {
+        let end = start.checked_add(self.parts.len())?;
+        if self.parts.is_empty() || end > tokens.len() {
+            return None;
+        }
+
+        tokens
+            .get(start..end)?
+            .iter()
+            .zip(&self.parts)
+            .all(|(token, part)| part.matches_token(&token.term))
+            .then_some(end)
+    }
+}
+
+fn highlight_patterns_from_terms(terms: &[Fts5HighlightTerm]) -> Vec<Fts5HighlightPattern> {
+    let mut patterns = Vec::with_capacity(terms.len());
+    patterns.extend(terms.iter().cloned().map(Fts5HighlightPattern::singleton));
+    patterns
+}
+
+#[cfg(test)]
 fn extract_highlight_terms(expr: &Fts5Expr) -> Vec<Fts5HighlightTerm> {
     fn near_operand_terms(operand: &Fts5NearOperand) -> Vec<Fts5HighlightTerm> {
         match operand {
@@ -3381,6 +3433,51 @@ fn extract_highlight_terms(expr: &Fts5Expr) -> Vec<Fts5HighlightTerm> {
         Fts5Expr::Near(operands, _) => operands.iter().flat_map(near_operand_terms).collect(),
         Fts5Expr::ColumnFilter(_, inner) | Fts5Expr::InitialToken(inner) => {
             extract_highlight_terms(inner)
+        }
+    }
+}
+
+fn extract_highlight_patterns(expr: &Fts5Expr) -> Vec<Fts5HighlightPattern> {
+    fn near_operand_patterns(operand: &Fts5NearOperand) -> Vec<Fts5HighlightPattern> {
+        match operand {
+            Fts5NearOperand::Term(term) => {
+                vec![Fts5HighlightPattern::singleton(Fts5HighlightTerm::exact(
+                    term,
+                ))]
+            }
+            Fts5NearOperand::Prefix(prefix) => {
+                vec![Fts5HighlightPattern::singleton(Fts5HighlightTerm::prefix(
+                    prefix,
+                ))]
+            }
+            Fts5NearOperand::Phrase(terms) => {
+                vec![Fts5HighlightPattern::exact_phrase(terms)]
+            }
+        }
+    }
+
+    match expr {
+        Fts5Expr::Term(term) => vec![Fts5HighlightPattern::singleton(Fts5HighlightTerm::exact(
+            term,
+        ))],
+        Fts5Expr::Prefix(prefix) => {
+            vec![Fts5HighlightPattern::singleton(Fts5HighlightTerm::prefix(
+                prefix,
+            ))]
+        }
+        Fts5Expr::Phrase(words) => vec![Fts5HighlightPattern::exact_phrase(words)],
+        Fts5Expr::PhrasePrefix(words, prefix) => {
+            vec![Fts5HighlightPattern::phrase_prefix(words, prefix)]
+        }
+        Fts5Expr::And(left, right) | Fts5Expr::Or(left, right) => {
+            let mut patterns = extract_highlight_patterns(left);
+            patterns.extend(extract_highlight_patterns(right));
+            patterns
+        }
+        Fts5Expr::Not(left, _) => extract_highlight_patterns(left),
+        Fts5Expr::Near(operands, _) => operands.iter().flat_map(near_operand_patterns).collect(),
+        Fts5Expr::ColumnFilter(_, inner) | Fts5Expr::InitialToken(inner) => {
+            extract_highlight_patterns(inner)
         }
     }
 }
@@ -3856,29 +3953,81 @@ pub fn highlight(text: &str, terms: &[String], open_tag: &str, close_tag: &str) 
         .iter()
         .map(|term| Fts5HighlightTerm::exact(term))
         .collect();
-    highlight_with_terms(text, &highlight_terms, open_tag, close_tag)
+    let patterns = highlight_patterns_from_terms(&highlight_terms);
+    highlight_with_patterns(text, &patterns, open_tag, close_tag)
 }
 
+#[cfg(test)]
 fn highlight_with_terms(
     text: &str,
     terms: &[Fts5HighlightTerm],
     open_tag: &str,
     close_tag: &str,
 ) -> String {
+    let patterns = highlight_patterns_from_terms(terms);
+    highlight_with_patterns(text, &patterns, open_tag, close_tag)
+}
+
+fn highlight_spans(tokens: &[Fts5Token], patterns: &[Fts5HighlightPattern]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut token_index = 0;
+
+    while token_index < tokens.len() {
+        let best_match = patterns
+            .iter()
+            .filter(|pattern| pattern.token_count() > 0)
+            .filter_map(|pattern| {
+                pattern
+                    .matches_at(tokens, token_index)
+                    .map(|end_index| (end_index, pattern.token_count()))
+            })
+            .max_by_key(|(end_index, token_count)| (*end_index, *token_count));
+
+        if let Some((end_index, _)) = best_match {
+            if let (Some(first), Some(last)) = (
+                tokens.get(token_index),
+                tokens.get(end_index.saturating_sub(1)),
+            ) {
+                match spans.last_mut() {
+                    Some((_, previous_end)) if first.start < *previous_end => {
+                        *previous_end = (*previous_end).max(last.end);
+                    }
+                    _ => spans.push((first.start, last.end)),
+                }
+            }
+            token_index = end_index;
+        } else {
+            token_index += 1;
+        }
+    }
+
+    spans
+}
+
+fn highlight_with_patterns(
+    text: &str,
+    patterns: &[Fts5HighlightPattern],
+    open_tag: &str,
+    close_tag: &str,
+) -> String {
+    if patterns.is_empty() {
+        return text.to_owned();
+    }
+
     let tokenizer = Unicode61Tokenizer::new();
     let tokens = tokenizer.tokenize(text);
+    let spans = highlight_spans(&tokens, patterns);
 
-    let mut result = String::new();
+    let mut result =
+        String::with_capacity(text.len() + spans.len() * (open_tag.len() + close_tag.len()));
     let mut last_end = 0;
 
-    for token in &tokens {
-        if terms.iter().any(|term| term.matches_token(&token.term)) {
-            result.push_str(&text[last_end..token.start]);
-            result.push_str(open_tag);
-            result.push_str(&text[token.start..token.end]);
-            result.push_str(close_tag);
-            last_end = token.end;
-        }
+    for (start, end) in spans {
+        result.push_str(&text[last_end..start]);
+        result.push_str(open_tag);
+        result.push_str(&text[start..end]);
+        result.push_str(close_tag);
+        last_end = end;
     }
 
     result.push_str(&text[last_end..]);
@@ -3900,19 +4049,39 @@ pub fn snippet(
         .iter()
         .map(|term| Fts5HighlightTerm::exact(term))
         .collect();
-    snippet_with_terms(
-        text,
-        &highlight_terms,
-        open_tag,
-        close_tag,
-        ellipsis,
-        max_tokens,
-    )
+    let patterns = highlight_patterns_from_terms(&highlight_terms);
+    snippet_with_patterns(text, &patterns, open_tag, close_tag, ellipsis, max_tokens)
 }
 
+#[cfg(test)]
 fn snippet_with_terms(
     text: &str,
     terms: &[Fts5HighlightTerm],
+    open_tag: &str,
+    close_tag: &str,
+    ellipsis: &str,
+    max_tokens: usize,
+) -> String {
+    let patterns = highlight_patterns_from_terms(terms);
+    snippet_with_patterns(text, &patterns, open_tag, close_tag, ellipsis, max_tokens)
+}
+
+fn first_highlight_match_token_index(
+    tokens: &[Fts5Token],
+    patterns: &[Fts5HighlightPattern],
+) -> Option<usize> {
+    tokens.iter().enumerate().find_map(|(index, _)| {
+        patterns
+            .iter()
+            .any(|pattern| pattern.matches_at(tokens, index).is_some())
+            .then_some(index)
+    })
+}
+
+#[allow(clippy::similar_names)]
+fn snippet_with_patterns(
+    text: &str,
+    patterns: &[Fts5HighlightPattern],
     open_tag: &str,
     close_tag: &str,
     ellipsis: &str,
@@ -3926,10 +4095,7 @@ fn snippet_with_terms(
     let tokens = tokenizer.tokenize(text);
 
     // Find first matching token position.
-    let match_pos = tokens
-        .iter()
-        .position(|token| terms.iter().any(|term| term.matches_token(&token.term)))
-        .unwrap_or(0);
+    let match_pos = first_highlight_match_token_index(&tokens, patterns).unwrap_or(0);
 
     // Calculate window around match.
     let half = max_tokens / 2;
@@ -3946,7 +4112,9 @@ fn snippet_with_terms(
         let slice = &text[first.start..last.end];
 
         // Highlight matching terms within the snippet.
-        result.push_str(&highlight_with_terms(slice, terms, open_tag, close_tag));
+        result.push_str(&highlight_with_patterns(
+            slice, patterns, open_tag, close_tag,
+        ));
     }
 
     if end < tokens.len() {
@@ -3992,6 +4160,20 @@ fn fallback_highlight_terms(query: &str) -> Vec<Fts5HighlightTerm> {
     terms
 }
 
+fn fallback_highlight_patterns(query: &str) -> Vec<Fts5HighlightPattern> {
+    highlight_patterns_from_terms(&fallback_highlight_terms(query))
+}
+
+fn highlight_patterns_from_query_text(query: &str) -> Vec<Fts5HighlightPattern> {
+    parse_fts5_query(query)
+        .and_then(|tokens| build_expr(&tokens))
+        .map_or_else(
+            |_| fallback_highlight_patterns(query),
+            |expr| extract_highlight_patterns(&expr),
+        )
+}
+
+#[cfg(test)]
 fn highlight_terms_from_query_text(query: &str) -> Vec<Fts5HighlightTerm> {
     parse_fts5_query(query)
         .and_then(|tokens| build_expr(&tokens))
@@ -4014,10 +4196,10 @@ impl ScalarFunction for Fts5HighlightFunc {
         let query = args[1].to_text();
         let open_tag = args[2].to_text();
         let close_tag = args[3].to_text();
-        let terms = highlight_terms_from_query_text(&query);
+        let patterns = highlight_patterns_from_query_text(&query);
 
         Ok(SqliteValue::Text(SmallText::from_string(
-            highlight_with_terms(&text, &terms, &open_tag, &close_tag),
+            highlight_with_patterns(&text, &patterns, &open_tag, &close_tag),
         )))
     }
 
@@ -4046,10 +4228,12 @@ impl ScalarFunction for Fts5SnippetFunc {
         let close_tag = args[3].to_text();
         let ellipsis = args[4].to_text();
         let max_tokens = usize::try_from(args[5].to_integer()).unwrap_or(0);
-        let terms = highlight_terms_from_query_text(&query);
+        let patterns = highlight_patterns_from_query_text(&query);
 
         Ok(SqliteValue::Text(SmallText::from_string(
-            snippet_with_terms(&text, &terms, &open_tag, &close_tag, &ellipsis, max_tokens),
+            snippet_with_patterns(
+                &text, &patterns, &open_tag, &close_tag, &ellipsis, max_tokens,
+            ),
         )))
     }
 
@@ -4320,6 +4504,15 @@ mod tests {
         phrase_prefix_snippet: String,
         fallback_prefix_highlight: String,
         exact_highlight: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5PhraseSpanStructure {
+        phrase_patterns: Vec<Fts5HighlightPattern>,
+        rendered_phrase: String,
+        rendered_prefix_snippet: String,
+        negated_rhs_rendering: String,
     }
 
     #[allow(dead_code)]
@@ -7063,6 +7256,25 @@ mod tests {
     }
 
     #[test]
+    fn test_highlight_scalar_func_preserves_phrase_span() -> std::result::Result<(), String> {
+        let func = Fts5HighlightFunc;
+        let result = func
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string("alpha beta gamma")),
+                SqliteValue::Text(SmallText::from_string(r#""alpha beta""#)),
+                SqliteValue::Text(SmallText::from_string("<b>")),
+                SqliteValue::Text(SmallText::from_string("</b>")),
+            ])
+            .map_err(|err| err.to_string())?;
+
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::from_string("<b>alpha beta</b> gamma"))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_snippet_scalar_func_matches_phrase_prefix_query() {
         let func = Fts5SnippetFunc;
         let result = func
@@ -7078,7 +7290,7 @@ mod tests {
 
         assert_eq!(
             result,
-            SqliteValue::Text(SmallText::from_string("alpha [one] [two] [threefold]..."))
+            SqliteValue::Text(SmallText::from_string("alpha [one two threefold]..."))
         );
     }
 
@@ -7136,6 +7348,65 @@ mod tests {
     phrase_prefix_snippet: "alpha [one] [two] [threefold]...",
     fallback_prefix_highlight: "<i>prelude</i> <i>prefix</i> other",
     exact_highlight: "prefix prevent <b>pre</b>",
+}"#
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_phrase_highlight_spans() {
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5PhraseSpanStructure {
+                    phrase_patterns: highlight_patterns_from_query_text(r#""alpha beta" OR gam*"#),
+                    rendered_phrase: highlight_with_patterns(
+                        "alpha beta gamma",
+                        &highlight_patterns_from_query_text(r#""alpha beta""#),
+                        "<b>",
+                        "</b>",
+                    ),
+                    rendered_prefix_snippet: snippet_with_patterns(
+                        "alpha one two threefold omega",
+                        &highlight_patterns_from_query_text("one + two + thr*"),
+                        "[",
+                        "]",
+                        "...",
+                        4,
+                    ),
+                    negated_rhs_rendering: highlight_with_patterns(
+                        "alpha beta gamma",
+                        &highlight_patterns_from_query_text(r#""alpha beta" NOT gamma"#),
+                        "<b>",
+                        "</b>",
+                    ),
+                }
+            ),
+            r#"Fts5PhraseSpanStructure {
+    phrase_patterns: [
+        Fts5HighlightPattern {
+            parts: [
+                Fts5HighlightTerm {
+                    term: "alpha",
+                    prefix: false,
+                },
+                Fts5HighlightTerm {
+                    term: "beta",
+                    prefix: false,
+                },
+            ],
+        },
+        Fts5HighlightPattern {
+            parts: [
+                Fts5HighlightTerm {
+                    term: "gam",
+                    prefix: true,
+                },
+            ],
+        },
+    ],
+    rendered_phrase: "<b>alpha beta</b> gamma",
+    rendered_prefix_snippet: "alpha [one two threefold]...",
+    negated_rhs_rendering: "<b>alpha beta</b> gamma",
 }"#
         );
     }

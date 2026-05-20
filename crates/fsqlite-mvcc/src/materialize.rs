@@ -1587,13 +1587,130 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Helper: create N insert deltas with payloads of the given size, using
+    /// sequential rowids and commit sequences.
+    fn create_bulk_inserts(
+        count: usize,
+        payload_size: usize,
+        commit_seq_base: u64,
+    ) -> Vec<CellDelta> {
+        (0..count)
+            .map(|i| {
+                let payload: Vec<u8> = (0..payload_size).map(|b| (b + i) as u8).collect();
+                create_delta_insert((i + 1) as i64, &payload, commit_seq_base + i as u64)
+            })
+            .collect()
+    }
+
     #[test]
-    #[ignore = "requires B-tree split integration (C-TRANSITION)"]
     fn test_split_trigger_materializes() {
-        // Test that filling a page via cell deltas until it needs to split
-        // triggers materialization before the split operation.
-        // This requires integration with the B-tree cursor and balance code.
-        todo!("integration test: B-tree split triggers materialize_page()");
+        // Simulate the pre-split path: accumulate cell deltas that fill most
+        // of a page, then materialise with `Structural` trigger — the same
+        // trigger the real B-tree split code would use.
+        //
+        // A 4096-byte page has 8 bytes of header.  Each cell costs:
+        //   2 bytes (cell pointer) + varint(payload_len) + varint(rowid) + payload
+        // With 100-byte payloads the per-cell cost is ~104 bytes, so ~38
+        // cells saturate the page.  We pick 35 cells to stay just under the
+        // limit, then verify the materialised page is valid.
+
+        let base = create_empty_leaf_table_page();
+        let page_no = PageNumber::new(2).unwrap();
+        let snapshot = test_snapshot(50);
+
+        // ------- Phase 1: materialize a nearly-full page ---------
+        let deltas = create_bulk_inserts(35, 100, 1);
+        let result = materialize_page(
+            &base,
+            page_no,
+            &deltas,
+            &snapshot,
+            USABLE_SIZE,
+            MaterializationTrigger::Structural,
+        )
+        .expect("structural materialization of 35 cells should succeed");
+
+        assert_eq!(result.deltas_applied, 35);
+        assert_eq!(result.cell_count, 35);
+        assert!(result.duration_us < 10_000_000, "should be fast");
+
+        // Verify header is consistent.
+        let header = BtreePageHeader::parse(result.page.as_bytes(), 0).unwrap();
+        assert_eq!(header.cell_count, 35);
+        assert_eq!(header.page_type, BtreePageType::LeafTable);
+        assert_eq!(
+            header.fragmented_free_bytes, 0,
+            "freshly packed page has no fragmentation"
+        );
+        // Cell content area must start above the header + pointer array.
+        let ptr_array_end = 8 + 35 * CELL_POINTER_SIZE as usize;
+        assert!(
+            header.cell_content_offset as usize >= ptr_array_end,
+            "cell content offset ({}) must be past pointer array ({})",
+            header.cell_content_offset,
+            ptr_array_end,
+        );
+
+        // Verify all 35 rows are present with correct rowids and payloads.
+        let payloads = materialized_table_payloads(&result.page).unwrap();
+        assert_eq!(payloads.len(), 35);
+        // Rows must be in rowid-sorted order (B-tree invariant).
+        for (i, (rowid, payload)) in payloads.iter().enumerate() {
+            let expected_rowid = (i + 1) as i64;
+            assert_eq!(*rowid, expected_rowid, "row {i} has wrong rowid");
+            assert_eq!(payload.len(), 100, "row {i} has wrong payload length");
+            // First byte of payload encodes (byte_offset + row_index) mod 256.
+            assert_eq!(payload[0], i as u8, "row {i} has wrong payload content");
+        }
+
+        // ------- Phase 2: verify overflow detection --------
+        // With 50 cells of 100 bytes each (~5200 bytes needed) the page
+        // (4096 usable) must overflow.
+        let overflow_deltas = create_bulk_inserts(50, 100, 1);
+        let overflow_result = materialize_page(
+            &base,
+            page_no,
+            &overflow_deltas,
+            &snapshot,
+            USABLE_SIZE,
+            MaterializationTrigger::Structural,
+        );
+        assert!(
+            overflow_result.is_err(),
+            "50 cells x 100-byte payload should overflow a 4096-byte page"
+        );
+
+        // ------- Phase 3: structural trigger with mixed committed + new ----
+        // Simulate the real split flow: some deltas are already committed
+        // (visible to snapshot) and some arrive in a new batch. Materialise
+        // them together with the Structural trigger.
+        let committed = create_bulk_inserts(20, 80, 1);
+        let extra: Vec<CellDelta> = (20..30)
+            .map(|i| {
+                let payload: Vec<u8> = (0..80_usize).map(|b| (b + i) as u8).collect();
+                create_delta_insert((i + 1) as i64, &payload, (i + 1) as u64)
+            })
+            .collect();
+        let all_deltas: Vec<CellDelta> = committed.into_iter().chain(extra).collect();
+        let result2 = materialize_page(
+            &base,
+            page_no,
+            &all_deltas,
+            &snapshot,
+            USABLE_SIZE,
+            MaterializationTrigger::Structural,
+        )
+        .expect("structural materialization of 30 cells should succeed");
+
+        assert_eq!(result2.deltas_applied, 30);
+        assert_eq!(result2.cell_count, 30);
+
+        // Verify B-tree ordering is maintained.
+        let payloads2 = materialized_table_payloads(&result2.page).unwrap();
+        let rowids: Vec<i64> = payloads2.iter().map(|(r, _)| *r).collect();
+        let mut sorted = rowids.clone();
+        sorted.sort();
+        assert_eq!(rowids, sorted, "rows must be in ascending rowid order");
     }
 
     #[test]

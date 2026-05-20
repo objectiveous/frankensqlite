@@ -1002,6 +1002,52 @@ fn compute_attached_memdb_requirement_reason(ops: &[VdbeOp]) -> Option<&'static 
 
 pub(crate) type TableIndexMetaMap = HashMap<i32, Box<[fsqlite_types::opcode::IndexCursorMeta]>>;
 
+/// Static storage role inferred from a VDBE root cursor open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageRootRole {
+    Table,
+    Index,
+    Unknown,
+}
+
+/// Static storage access kind inferred from a VDBE root cursor open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageRootAccess {
+    Read,
+    Write,
+}
+
+/// Deterministic storage-root usage emitted by finalized bytecode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageRootUsage {
+    pub pc: usize,
+    pub cursor_id: i32,
+    pub root_page: i32,
+    pub access: StorageRootAccess,
+    pub role: StorageRootRole,
+}
+
+fn storage_root_usage_for_op(pc: usize, op: &VdbeOp) -> Option<StorageRootUsage> {
+    let access = match op.opcode {
+        Opcode::OpenRead => StorageRootAccess::Read,
+        Opcode::OpenWrite | Opcode::FusedOpenWriteLast => StorageRootAccess::Write,
+        _ => return None,
+    };
+    let role = match &op.p4 {
+        P4::Table(_) => StorageRootRole::Table,
+        P4::Index(_) => StorageRootRole::Index,
+        _ => StorageRootRole::Unknown,
+    };
+
+    Some(StorageRootUsage {
+        pc,
+        cursor_id: op.p1,
+        root_page: op.p2,
+        access,
+        role,
+    })
+}
+
 /// A finalized VDBE bytecode program ready for execution.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VdbeProgram {
@@ -1182,6 +1228,17 @@ impl VdbeProgram {
     /// Table-to-index cursor metadata for REPLACE conflict resolution.
     pub fn table_index_meta(&self) -> &TableIndexMetaMap {
         self.table_index_meta.as_ref()
+    }
+
+    /// Returns storage B-tree root usage in deterministic instruction order.
+    ///
+    /// Conflict-topology and backend-identity diagnostics can use this to tie
+    /// bytecode to root-page level heat without ad hoc opcode scans.
+    pub fn storage_root_usages(&self) -> impl Iterator<Item = StorageRootUsage> + '_ {
+        self.ops
+            .iter()
+            .enumerate()
+            .filter_map(|(pc, op)| storage_root_usage_for_op(pc, op))
     }
 
     pub(crate) fn shared_table_index_meta(&self) -> &Arc<TableIndexMetaMap> {

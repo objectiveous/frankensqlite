@@ -6938,6 +6938,114 @@ mod tests {
     }
 
     #[test]
+    fn test_gc_bounded_pruning_preserves_oldest_live_snapshot_version() {
+        let mut mgr = mgr();
+        mgr.set_max_chain_length(4);
+        mgr.set_chain_length_warning(2);
+        let pgno = PageNumber::new(6_786).unwrap();
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut seed, pgno, test_data(0x10))
+            .expect("seed writer should stage page");
+        let seq1 = mgr.commit(&mut seed).expect("seed writer should commit");
+
+        let mut oldest_reader = mgr.begin(BeginKind::Concurrent).unwrap();
+        let oldest_visible = mgr.read_page(&mut oldest_reader, pgno).unwrap();
+        assert_eq!(oldest_visible.as_bytes()[0], 0x10);
+        assert_eq!(oldest_reader.read_version_for_page(pgno), Some(seq1));
+
+        let mut writer_a = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut writer_a, pgno, test_data(0x11))
+            .expect("writer_a should stage page");
+        let seq2 = mgr.commit(&mut writer_a).expect("writer_a should commit");
+
+        let mut writer_b = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut writer_b, pgno, test_data(0x12))
+            .expect("writer_b should stage page");
+        let seq3 = mgr.commit(&mut writer_b).expect("writer_b should commit");
+
+        assert_eq!(
+            mgr.version_store()
+                .walk_chain(pgno)
+                .iter()
+                .map(|version| version.commit_seq)
+                .collect::<Vec<_>>(),
+            vec![seq3, seq2, seq1],
+            "oldest live reader should keep the full chain back to seq1"
+        );
+
+        let mut pinned_reader = mgr.begin(BeginKind::Concurrent).unwrap();
+        assert_eq!(
+            pinned_reader.snapshot.high, seq3,
+            "new live reader should pin the newest committed sequence"
+        );
+        let pinned_visible = mgr.read_page(&mut pinned_reader, pgno).unwrap();
+        assert_eq!(pinned_visible.as_bytes()[0], 0x12);
+        assert_eq!(pinned_reader.read_version_for_page(pgno), Some(seq3));
+
+        mgr.abort(&mut oldest_reader);
+        assert_eq!(
+            mgr.cached_gc_horizon(),
+            Some(seq3),
+            "releasing the older reader should advance the GC horizon to the oldest remaining live snapshot"
+        );
+
+        let mut writer_c = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut writer_c, pgno, test_data(0x13))
+            .expect("writer_c should stage page");
+        let seq4 = mgr.commit(&mut writer_c).expect("writer_c should commit");
+
+        let chain_after_prune = mgr
+            .version_store()
+            .walk_chain(pgno)
+            .iter()
+            .map(|version| version.commit_seq)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            chain_after_prune,
+            vec![seq4, seq3],
+            "GC must prune versions older than the live horizon and stop at the version visible to the pinned reader"
+        );
+
+        let pinned_after_prune = mgr.read_page(&mut pinned_reader, pgno).unwrap();
+        assert_eq!(
+            pinned_after_prune.as_bytes()[0],
+            0x12,
+            "pinned reader must still see the version visible at its snapshot after GC"
+        );
+        assert_eq!(pinned_reader.read_version_for_page(pgno), Some(seq3));
+
+        let mut writer_d = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut writer_d, pgno, test_data(0x14))
+            .expect("writer_d should stage page");
+        let seq5 = mgr.commit(&mut writer_d).expect("writer_d should commit");
+
+        let chain_after_second_prune = mgr
+            .version_store()
+            .walk_chain(pgno)
+            .iter()
+            .map(|version| version.commit_seq)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            chain_after_second_prune,
+            vec![seq5, seq4, seq3],
+            "repeated pruning must remain bounded at the oldest live snapshot instead of chasing past it"
+        );
+        assert!(
+            !chain_after_second_prune.contains(&seq1) && !chain_after_second_prune.contains(&seq2),
+            "versions older than the oldest live snapshot should stay pruned"
+        );
+
+        let mut fresh_reader = mgr.begin(BeginKind::Concurrent).unwrap();
+        let fresh_visible = mgr.read_page(&mut fresh_reader, pgno).unwrap();
+        assert_eq!(fresh_visible.as_bytes()[0], 0x14);
+        assert_eq!(fresh_reader.read_version_for_page(pgno), Some(seq5));
+
+        mgr.abort(&mut pinned_reader);
+        mgr.abort(&mut fresh_reader);
+    }
+
+    #[test]
     fn test_version_guard_registry_accessor() {
         let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
         let registry = mgr.version_guard_registry();

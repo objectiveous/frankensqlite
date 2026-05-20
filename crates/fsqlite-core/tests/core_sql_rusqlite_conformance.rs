@@ -711,6 +711,57 @@ const SUBQUERY_CASES: &[QueryCase] = &[
     },
 ];
 
+const PRAGMA_SETUP: &str = "
+    PRAGMA foreign_keys = ON;
+    PRAGMA user_version = 123;
+    PRAGMA application_id = 456789;
+
+    CREATE TABLE pragma_parent (
+        id INTEGER PRIMARY KEY,
+        code TEXT NOT NULL UNIQUE
+    );
+    CREATE TABLE pragma_child (
+        id INTEGER PRIMARY KEY,
+        parent_id INTEGER NOT NULL REFERENCES pragma_parent(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        score INTEGER DEFAULT 0,
+        note TEXT DEFAULT 'new'
+    );
+    CREATE UNIQUE INDEX idx_pragma_child_name ON pragma_child(name);
+    CREATE INDEX idx_pragma_child_parent_score ON pragma_child(parent_id, score);
+";
+
+const PRAGMA_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "table info includes constraints and defaults",
+        sql: "PRAGMA table_info(pragma_child)",
+    },
+    QueryCase {
+        name: "index list includes uniqueness and origin",
+        sql: "PRAGMA index_list(pragma_child)",
+    },
+    QueryCase {
+        name: "index info preserves indexed column order",
+        sql: "PRAGMA index_info(idx_pragma_child_parent_score)",
+    },
+    QueryCase {
+        name: "foreign key list exposes referenced table and action",
+        sql: "PRAGMA foreign_key_list(pragma_child)",
+    },
+    QueryCase {
+        name: "user version round trip",
+        sql: "PRAGMA user_version",
+    },
+    QueryCase {
+        name: "application id round trip",
+        sql: "PRAGMA application_id",
+    },
+    QueryCase {
+        name: "foreign keys setting round trip",
+        sql: "PRAGMA foreign_keys",
+    },
+];
+
 #[test]
 fn select_join_group_by_aggregates_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
@@ -787,4 +838,10 @@ fn case_and_null_logic_match_rusqlite() {
 fn subqueries_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(SUBQUERY_SETUP);
     harness.assert_queries_match("subquery", SUBQUERY_CASES);
+}
+
+#[test]
+fn pragmas_and_schema_introspection_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(PRAGMA_SETUP);
+    harness.assert_queries_match("PRAGMA/schema introspection", PRAGMA_CASES);
 }

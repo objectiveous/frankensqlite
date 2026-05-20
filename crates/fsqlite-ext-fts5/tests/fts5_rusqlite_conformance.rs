@@ -1,6 +1,8 @@
-use fsqlite_ext_fts5::Fts5Table;
+use fsqlite_ext_fts5::{Fts5HighlightFunc, Fts5SnippetFunc, Fts5Table};
+use fsqlite_func::ScalarFunction;
 use fsqlite_func::vtab::VirtualTable;
 use fsqlite_types::cx::Cx;
+use fsqlite_types::value::{SmallText, SqliteValue};
 use rusqlite::Connection;
 
 #[derive(Clone, Copy)]
@@ -25,6 +27,12 @@ struct TokenizerCase {
 
 #[derive(Clone, Copy)]
 struct RankingCase {
+    name: &'static str,
+    query: &'static str,
+}
+
+#[derive(Clone, Copy)]
+struct AuxiliaryCase {
     name: &'static str,
     query: &'static str,
 }
@@ -212,6 +220,21 @@ const BM25_CASES: &[RankingCase] = &[
     },
 ];
 
+const AUXILIARY_CASES: &[AuxiliaryCase] = &[
+    AuxiliaryCase {
+        name: "single term",
+        query: "rust",
+    },
+    AuxiliaryCase {
+        name: "phrase span",
+        query: r#""full text""#,
+    },
+    AuxiliaryCase {
+        name: "prefix term",
+        query: "search*",
+    },
+];
+
 const TOKENIZER_CASES: &[TokenizerCase] = &[
     TokenizerCase {
         name: "unicode61 remove_diacritics",
@@ -322,6 +345,86 @@ impl Fts5ConformanceHarness {
             .collect::<std::result::Result<Vec<_>, _>>()
             .expect("read rusqlite FTS5 BM25 rowids")
     }
+
+    fn franken_highlight_body_rows(&self, query: &str) -> Vec<(i64, String)> {
+        let func = Fts5HighlightFunc;
+        let mut rows: Vec<(i64, String)> = self
+            .franken
+            .search_rows(query)
+            .expect("FrankenSQLite FTS5 rows for highlight")
+            .into_iter()
+            .map(|(rowid, _score, columns)| {
+                let highlighted = func
+                    .invoke(&[
+                        SqliteValue::Text(SmallText::from_string(columns[1].clone())),
+                        SqliteValue::Text(SmallText::from_string(query.to_owned())),
+                        SqliteValue::Text(SmallText::from_string("<b>".to_owned())),
+                        SqliteValue::Text(SmallText::from_string("</b>".to_owned())),
+                    ])
+                    .expect("FrankenSQLite FTS5 highlight");
+                (rowid, highlighted.to_text())
+            })
+            .collect();
+        rows.sort_by_key(|(rowid, _text)| *rowid);
+        rows
+    }
+
+    fn sqlite_highlight_body_rows(&self, query: &str) -> Vec<(i64, String)> {
+        let mut stmt = self
+            .sqlite
+            .prepare(
+                "SELECT rowid, highlight(docs, 1, '<b>', '</b>') \
+                 FROM docs WHERE docs MATCH ?1 ORDER BY rowid",
+            )
+            .expect("prepare rusqlite FTS5 highlight query");
+        stmt.query_map([query], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("query rusqlite FTS5 highlight rows")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("read rusqlite FTS5 highlight rows")
+    }
+
+    fn franken_snippet_body_rows(&self, query: &str) -> Vec<(i64, String)> {
+        let func = Fts5SnippetFunc;
+        let mut rows: Vec<(i64, String)> = self
+            .franken
+            .search_rows(query)
+            .expect("FrankenSQLite FTS5 rows for snippet")
+            .into_iter()
+            .map(|(rowid, _score, columns)| {
+                let snippet = func
+                    .invoke(&[
+                        SqliteValue::Text(SmallText::from_string(columns[1].clone())),
+                        SqliteValue::Text(SmallText::from_string(query.to_owned())),
+                        SqliteValue::Text(SmallText::from_string("[".to_owned())),
+                        SqliteValue::Text(SmallText::from_string("]".to_owned())),
+                        SqliteValue::Text(SmallText::from_string("...".to_owned())),
+                        SqliteValue::Integer(64),
+                    ])
+                    .expect("FrankenSQLite FTS5 snippet");
+                (rowid, snippet.to_text())
+            })
+            .collect();
+        rows.sort_by_key(|(rowid, _text)| *rowid);
+        rows
+    }
+
+    fn sqlite_snippet_body_rows(&self, query: &str) -> Vec<(i64, String)> {
+        let mut stmt = self
+            .sqlite
+            .prepare(
+                "SELECT rowid, snippet(docs, 1, '[', ']', '...', 64) \
+                 FROM docs WHERE docs MATCH ?1 ORDER BY rowid",
+            )
+            .expect("prepare rusqlite FTS5 snippet query");
+        stmt.query_map([query], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("query rusqlite FTS5 snippet rows")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("read rusqlite FTS5 snippet rows")
+    }
 }
 
 #[test]
@@ -377,6 +480,28 @@ fn bm25_ranking_matches_rusqlite_reference() {
             harness.franken_ranked_rowids(case.query),
             harness.sqlite_bm25_rowids(case.query),
             "BM25 conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn highlight_and_snippet_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in AUXILIARY_CASES {
+        assert_eq!(
+            harness.franken_highlight_body_rows(case.query),
+            harness.sqlite_highlight_body_rows(case.query),
+            "highlight conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+        assert_eq!(
+            harness.franken_snippet_body_rows(case.query),
+            harness.sqlite_snippet_body_rows(case.query),
+            "snippet conformance case failed: {} ({})",
             case.name,
             case.query
         );

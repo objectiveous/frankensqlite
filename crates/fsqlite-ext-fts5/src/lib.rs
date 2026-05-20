@@ -983,7 +983,8 @@ pub fn parse_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>,
 }
 
 fn tokenize_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>, Fts5QueryError> {
-    let mut chars = query.chars().peekable();
+    let normalized_query = normalize_column_filter_syntax(query);
+    let mut chars = normalized_query.chars().peekable();
     let mut tokens = Vec::new();
 
     while let Some(ch) = chars.peek().copied() {
@@ -1072,6 +1073,102 @@ fn tokenize_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>, 
         return Err(Fts5QueryError::EmptyQuery);
     }
     Ok(tokens)
+}
+
+fn normalize_column_filter_syntax(query: &str) -> Cow<'_, str> {
+    if !query.as_bytes().contains(&b':') {
+        return Cow::Borrowed(query);
+    }
+
+    let chars: Vec<char> = query.chars().collect();
+    let mut normalized = String::with_capacity(query.len());
+    let mut idx = 0;
+
+    while idx < chars.len() {
+        if chars[idx] == '-' {
+            let filter_start = skip_query_whitespace(&chars, idx + 1);
+            if let Some((filter, next_idx)) = read_column_filter_at(&chars, filter_start) {
+                normalized.push('-');
+                normalized.push_str(&filter);
+                idx = next_idx;
+                continue;
+            }
+        }
+
+        if let Some((filter, next_idx)) = read_column_filter_at(&chars, idx) {
+            normalized.push_str(&filter);
+            idx = next_idx;
+            continue;
+        }
+
+        normalized.push(chars[idx]);
+        idx += 1;
+    }
+
+    Cow::Owned(normalized)
+}
+
+fn skip_query_whitespace(chars: &[char], mut idx: usize) -> usize {
+    while idx < chars.len() && chars[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    idx
+}
+
+fn read_column_filter_at(chars: &[char], idx: usize) -> Option<(String, usize)> {
+    if chars.get(idx) == Some(&'{') {
+        return read_braced_column_filter_at(chars, idx);
+    }
+
+    read_single_column_filter_at(chars, idx)
+}
+
+fn read_braced_column_filter_at(chars: &[char], idx: usize) -> Option<(String, usize)> {
+    let mut end = idx + 1;
+    while end < chars.len() && chars[end] != '}' {
+        end += 1;
+    }
+    if end >= chars.len() {
+        return None;
+    }
+
+    let colon_idx = skip_query_whitespace(chars, end + 1);
+    if chars.get(colon_idx) != Some(&':') {
+        return None;
+    }
+
+    let inner: String = chars[idx + 1..end].iter().collect();
+    let columns = inner
+        .split(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+        .filter(|column| !column.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    if columns.is_empty() {
+        return None;
+    }
+
+    Some((format!("{{{columns}}}:"), colon_idx + 1))
+}
+
+fn read_single_column_filter_at(chars: &[char], idx: usize) -> Option<(String, usize)> {
+    let mut end = idx;
+    while end < chars.len()
+        && !chars[end].is_ascii_whitespace()
+        && !matches!(chars[end], ':' | '(' | ')' | '"' | '^')
+    {
+        end += 1;
+    }
+    if end == idx {
+        return None;
+    }
+
+    let colon_idx = skip_query_whitespace(chars, end);
+    if chars.get(colon_idx) != Some(&':') {
+        return None;
+    }
+
+    let column: String = chars[idx..end].iter().collect();
+    Some((format!("{column}:"), colon_idx + 1))
 }
 
 fn push_query_word_tokens(word: &str, tokens: &mut Vec<Fts5QueryToken>) {
@@ -1221,6 +1318,45 @@ pub enum Fts5Expr {
     Near(Vec<String>, u32),
     ColumnFilter(String, Box<Self>),
     InitialToken(Box<Self>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fts5ColumnFilterSpec {
+    exclude: bool,
+    columns: SmallVec<[String; 4]>,
+}
+
+fn parse_column_filter_spec(raw: &str) -> Option<Fts5ColumnFilterSpec> {
+    let trimmed = raw.trim();
+    let (exclude, body) = if let Some(rest) = trimmed.strip_prefix('-') {
+        (true, rest.trim())
+    } else {
+        (false, trimmed)
+    };
+
+    if body.is_empty() {
+        return None;
+    }
+
+    let mut columns = SmallVec::new();
+    if let Some(inner) = body
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+    {
+        for column in inner.split(|ch: char| ch == ',' || ch.is_ascii_whitespace()) {
+            let column = unquote_fts_identifier(column);
+            if !column.is_empty() {
+                columns.push(column.to_owned());
+            }
+        }
+    } else {
+        let column = unquote_fts_identifier(body);
+        if !column.is_empty() {
+            columns.push(column.to_owned());
+        }
+    }
+
+    (!columns.is_empty()).then_some(Fts5ColumnFilterSpec { exclude, columns })
 }
 
 /// Build an expression tree from parsed FTS5 query tokens.
@@ -1997,8 +2133,14 @@ fn evaluate_expr_impl(
             difference_sorted(&left_docs, &right_docs)
         }
         Fts5Expr::Near(terms, distance) => evaluate_near(index, terms, *distance, allowed_columns),
-        Fts5Expr::ColumnFilter(column_name, inner) => {
-            let resolved_columns = resolve_allowed_columns(columns, column_name);
+        Fts5Expr::ColumnFilter(column_filter, inner) => {
+            let Some(filter_spec) = parse_column_filter_spec(column_filter) else {
+                return Vec::new();
+            };
+            let Some(resolved_columns) = resolve_column_filter_columns(columns, &filter_spec)
+            else {
+                return Vec::new();
+            };
             let combined_columns = combine_allowed_columns(allowed_columns, &resolved_columns);
             evaluate_expr_impl(index, inner, columns, Some(combined_columns.as_slice()))
         }
@@ -2099,6 +2241,37 @@ fn resolve_allowed_columns(columns: &[String], column_name: &str) -> Vec<u32> {
         .collect()
 }
 
+fn resolve_column_filter_columns(
+    columns: &[String],
+    filter_spec: &Fts5ColumnFilterSpec,
+) -> Option<Vec<u32>> {
+    let mut selected = Vec::with_capacity(filter_spec.columns.len());
+    for column_name in &filter_spec.columns {
+        let resolved = resolve_allowed_columns(columns, column_name);
+        if resolved.is_empty() {
+            return None;
+        }
+        selected.extend(resolved);
+    }
+    selected.sort_unstable();
+    selected.dedup();
+
+    if !filter_spec.exclude {
+        return Some(selected);
+    }
+
+    let mut allowed = Vec::with_capacity(columns.len().saturating_sub(selected.len()));
+    for idx in 0..columns.len() {
+        let Ok(column_id) = u32::try_from(idx) else {
+            continue;
+        };
+        if !selected.contains(&column_id) {
+            allowed.push(column_id);
+        }
+    }
+    Some(allowed)
+}
+
 fn combine_allowed_columns(existing: Option<&[u32]>, resolved: &[u32]) -> Vec<u32> {
     match existing {
         Some(existing) => existing
@@ -2119,9 +2292,14 @@ fn validate_column_filters(
             validate_column_filters(left, columns)?;
             validate_column_filters(right, columns)
         }
-        Fts5Expr::ColumnFilter(column_name, inner) => {
-            if resolve_allowed_columns(columns, column_name).is_empty() {
-                return Err(Fts5QueryError::InvalidColumnFilter(column_name.clone()));
+        Fts5Expr::ColumnFilter(column_filter, inner) => {
+            let Some(filter_spec) = parse_column_filter_spec(column_filter) else {
+                return Err(Fts5QueryError::InvalidColumnFilter(column_filter.clone()));
+            };
+            for column_name in &filter_spec.columns {
+                if resolve_allowed_columns(columns, column_name).is_empty() {
+                    return Err(Fts5QueryError::InvalidColumnFilter(column_name.clone()));
+                }
             }
             validate_column_filters(inner, columns)
         }
@@ -3545,6 +3723,16 @@ mod tests {
 
     #[allow(dead_code)]
     #[derive(Debug)]
+    struct Fts5ColumnFilterSetStructure {
+        tokens: Vec<(Fts5QueryTokenKind, String)>,
+        braced_matches: Vec<i64>,
+        negative_matches: Vec<i64>,
+        complement_matches: Vec<i64>,
+        invalid_error: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
     struct Fts5InsttokenStructure {
         config: Fts5Config,
         columns: Vec<String>,
@@ -4135,6 +4323,39 @@ mod tests {
     }
 
     #[test]
+    fn test_fts5_query_braced_column_filter_set() -> std::result::Result<(), String> {
+        let tokens = parse_fts5_query("{title body}: rust").map_err(|err| err.to_string())?;
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].kind, Fts5QueryTokenKind::ColumnFilter);
+        assert_eq!(tokens[0].lexeme, "{title,body}");
+        assert_eq!(tokens[1].kind, Fts5QueryTokenKind::Term);
+        assert_eq!(tokens[1].lexeme, "rust");
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_query_negative_column_filter() -> std::result::Result<(), String> {
+        let tokens = parse_fts5_query("- tag : rust").map_err(|err| err.to_string())?;
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].kind, Fts5QueryTokenKind::ColumnFilter);
+        assert_eq!(tokens[0].lexeme, "-tag");
+        assert_eq!(tokens[1].kind, Fts5QueryTokenKind::Term);
+        assert_eq!(tokens[1].lexeme, "rust");
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_query_negative_braced_column_filter_set() -> std::result::Result<(), String> {
+        let tokens = parse_fts5_query("- {title body}: rust").map_err(|err| err.to_string())?;
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].kind, Fts5QueryTokenKind::ColumnFilter);
+        assert_eq!(tokens[0].lexeme, "-{title,body}");
+        assert_eq!(tokens[1].kind, Fts5QueryTokenKind::Term);
+        assert_eq!(tokens[1].lexeme, "rust");
+        Ok(())
+    }
+
+    #[test]
     fn test_fts5_query_unbalanced_parens() {
         let err = parse_fts5_query("(hello").unwrap_err();
         assert_eq!(err, Fts5QueryError::UnbalancedParentheses);
@@ -4595,6 +4816,184 @@ mod tests {
             error,
             Fts5QueryError::InvalidColumnFilter("summary".to_owned())
         );
+    }
+
+    #[test]
+    fn test_fts5_table_search_column_filter_set_and_negative() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec![
+            "title".to_owned(),
+            "body".to_owned(),
+            "tag".to_owned(),
+        ]);
+        table.insert_document(
+            1,
+            &[
+                "rust title".to_owned(),
+                "plain body".to_owned(),
+                "meta tag".to_owned(),
+            ],
+        );
+        table.insert_document(
+            2,
+            &[
+                "plain title".to_owned(),
+                "rust body".to_owned(),
+                "meta tag".to_owned(),
+            ],
+        );
+        table.insert_document(
+            3,
+            &[
+                "plain title".to_owned(),
+                "plain body".to_owned(),
+                "rust tag".to_owned(),
+            ],
+        );
+
+        let mut braced_matches: Vec<i64> = table
+            .search("{title body}:rust")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        braced_matches.sort_unstable();
+        assert_eq!(braced_matches, vec![1, 2]);
+
+        let mut negative_matches: Vec<i64> = table
+            .search("- tag : rust")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        negative_matches.sort_unstable();
+        assert_eq!(negative_matches, vec![1, 2]);
+
+        let mut complement_matches: Vec<i64> = table
+            .search("- {title body}: rust")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        complement_matches.sort_unstable();
+        assert_eq!(complement_matches, vec![3]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_table_search_invalid_column_filter_set() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["title".to_owned(), "body".to_owned()]);
+        table.insert_document(1, &["Rust title".to_owned(), "plain body".to_owned()]);
+
+        let Err(error) = table.search("{title summary}:rust") else {
+            return Err("unknown column inside a set should fail".to_owned());
+        };
+        assert_eq!(
+            error,
+            Fts5QueryError::InvalidColumnFilter("summary".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_column_filter_sets() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec![
+            "title".to_owned(),
+            "body".to_owned(),
+            "tag".to_owned(),
+        ]);
+        table.insert_document(
+            1,
+            &[
+                "rust title".to_owned(),
+                "plain body".to_owned(),
+                "meta tag".to_owned(),
+            ],
+        );
+        table.insert_document(
+            2,
+            &[
+                "plain title".to_owned(),
+                "rust body".to_owned(),
+                "meta tag".to_owned(),
+            ],
+        );
+        table.insert_document(
+            3,
+            &[
+                "plain title".to_owned(),
+                "plain body".to_owned(),
+                "rust tag".to_owned(),
+            ],
+        );
+
+        let tokens = parse_fts5_query("- {title body}: rust")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|token| (token.kind, token.lexeme))
+            .collect();
+        let mut braced_matches: Vec<i64> = table
+            .search("{title body}:rust")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        braced_matches.sort_unstable();
+        let mut negative_matches: Vec<i64> = table
+            .search("- tag : rust")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        negative_matches.sort_unstable();
+        let mut complement_matches: Vec<i64> = table
+            .search("- {title body}: rust")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        complement_matches.sort_unstable();
+        let Err(invalid_error) = table.search("{title missing}:rust") else {
+            return Err("unknown column inside a set should fail".to_owned());
+        };
+        let invalid_error = invalid_error.to_string();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5ColumnFilterSetStructure {
+                    tokens,
+                    braced_matches,
+                    negative_matches,
+                    complement_matches,
+                    invalid_error,
+                }
+            ),
+            r#"Fts5ColumnFilterSetStructure {
+    tokens: [
+        (
+            ColumnFilter,
+            "-{title,body}",
+        ),
+        (
+            Term,
+            "rust",
+        ),
+    ],
+    braced_matches: [
+        1,
+        2,
+    ],
+    negative_matches: [
+        1,
+        2,
+    ],
+    complement_matches: [
+        3,
+    ],
+    invalid_error: "invalid column filter: missing",
+}"#
+        );
+        Ok(())
     }
 
     #[test]

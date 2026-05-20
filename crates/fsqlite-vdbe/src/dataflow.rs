@@ -63,6 +63,8 @@ impl WeightedRow {
 pub enum DataflowError {
     /// A requested column index exceeded the row width.
     ColumnOutOfBounds { column: usize, width: usize },
+    /// Integer aggregate operators only accept integer value inputs.
+    AggregateValueNotInteger { column: usize },
     /// Join key mappings must specify the same number of left and right columns.
     JoinKeyArityMismatch { left: usize, right: usize },
     /// Input no longer matches the schema width captured when the automaton was built.
@@ -77,6 +79,9 @@ impl fmt::Display for DataflowError {
         match self {
             Self::ColumnOutOfBounds { column, width } => {
                 write!(f, "column {column} out of bounds for row width {width}")
+            }
+            Self::AggregateValueNotInteger { column } => {
+                write!(f, "aggregate value column {column} is not an integer")
             }
             Self::JoinKeyArityMismatch { left, right } => {
                 write!(f, "join key arity mismatch: left={left}, right={right}")
@@ -182,6 +187,11 @@ pub enum DataflowOperator {
     ConsolidateByKey { key_columns: Vec<usize> },
     /// Emit one materialized `COUNT(*)` row per key.
     CountByKey { key_columns: Vec<usize> },
+    /// Emit one materialized integer `SUM(value_column)` row per key.
+    SumIntegerByKey {
+        key_columns: Vec<usize>,
+        value_column: usize,
+    },
     /// Consolidate algebraic weights by complete row value.
     ConsolidateRows,
     /// Multiply every row weight by `factor`, eliding zero-weight output rows.
@@ -227,6 +237,10 @@ impl DataflowOperator {
                 .collect(),
             Self::ConsolidateByKey { key_columns } => consolidate_by_key(rows, key_columns),
             Self::CountByKey { key_columns } => count_by_key(rows, key_columns),
+            Self::SumIntegerByKey {
+                key_columns,
+                value_column,
+            } => sum_integer_by_key(rows, key_columns, *value_column),
             Self::ConsolidateRows => Ok(consolidate_rows(rows.iter().cloned().collect())),
             Self::ScaleWeight { factor } => Ok(scale_weights(rows, *factor)),
             Self::ThresholdPositive => Ok(threshold_positive(rows)),
@@ -320,6 +334,51 @@ fn count_by_key(rows: &[WeightedRow], key_columns: &[usize]) -> DataflowResult<V
                 return None;
             }
             values.push(SqliteValue::Integer(count));
+            Some(WeightedRow::insert(values))
+        })
+        .collect())
+}
+
+fn sum_integer_by_key(
+    rows: &[WeightedRow],
+    key_columns: &[usize],
+    value_column: usize,
+) -> DataflowResult<Vec<WeightedRow>> {
+    let mut groups: Vec<(Vec<SqliteValue>, i64)> = Vec::new();
+    for row in rows {
+        if row.is_zero() {
+            continue;
+        }
+        let key = row.project(key_columns)?;
+        let value = match row.values.get(value_column) {
+            Some(SqliteValue::Integer(value)) => *value,
+            Some(_) => {
+                return Err(DataflowError::AggregateValueNotInteger {
+                    column: value_column,
+                });
+            }
+            None => {
+                return Err(DataflowError::ColumnOutOfBounds {
+                    column: value_column,
+                    width: row.width(),
+                });
+            }
+        };
+        let weighted_value = value.saturating_mul(row.weight);
+        if let Some((_, sum)) = groups.iter_mut().find(|(candidate, _)| *candidate == key) {
+            *sum = sum.saturating_add(weighted_value);
+        } else {
+            groups.push((key, weighted_value));
+        }
+    }
+
+    Ok(groups
+        .into_iter()
+        .filter_map(|(mut values, sum)| {
+            if sum == 0 {
+                return None;
+            }
+            values.push(SqliteValue::Integer(sum));
             Some(WeightedRow::insert(values))
         })
         .collect())
@@ -615,6 +674,39 @@ mod tests {
                 width: 2
             }
         );
+    }
+
+    #[test]
+    fn sum_integer_by_key_appends_weighted_sums_and_elides_zero_groups() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::SumIntegerByKey {
+            key_columns: vec![0],
+            value_column: 1,
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(2), int(20)], 1),
+            WeightedRow::new(vec![int(1), int(10)], 4),
+            WeightedRow::new(vec![int(2), int(20)], -1),
+            WeightedRow::new(vec![int(1), int(11)], 3),
+            WeightedRow::new(vec![int(3), int(30)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(actual, vec![WeightedRow::insert(vec![int(1), int(73)])]);
+    }
+
+    #[test]
+    fn sum_integer_by_key_rejects_non_integer_values() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::SumIntegerByKey {
+            key_columns: vec![0],
+            value_column: 1,
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), SqliteValue::Float(1.5)])])
+            .expect_err("non-integer aggregate input should fail");
+
+        assert_eq!(err, DataflowError::AggregateValueNotInteger { column: 1 });
     }
 
     #[test]

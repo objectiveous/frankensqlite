@@ -180,6 +180,8 @@ pub enum DataflowOperator {
     Project { columns: Vec<usize> },
     /// Consolidate algebraic weights by key and elide zero-weight results.
     ConsolidateByKey { key_columns: Vec<usize> },
+    /// Emit one materialized `COUNT(*)` row per key.
+    CountByKey { key_columns: Vec<usize> },
     /// Consolidate algebraic weights by complete row value.
     ConsolidateRows,
     /// Multiply every row weight by `factor`, eliding zero-weight output rows.
@@ -224,6 +226,7 @@ impl DataflowOperator {
                 .map(|row| Ok(WeightedRow::new(row.project(columns)?, row.weight)))
                 .collect(),
             Self::ConsolidateByKey { key_columns } => consolidate_by_key(rows, key_columns),
+            Self::CountByKey { key_columns } => count_by_key(rows, key_columns),
             Self::ConsolidateRows => Ok(consolidate_rows(rows.iter().cloned().collect())),
             Self::ScaleWeight { factor } => Ok(scale_weights(rows, *factor)),
             Self::ThresholdPositive => Ok(threshold_positive(rows)),
@@ -293,6 +296,32 @@ fn consolidate_by_key(
     Ok(groups
         .into_iter()
         .filter_map(|(values, weight)| (weight != 0).then(|| WeightedRow::new(values, weight)))
+        .collect())
+}
+
+fn count_by_key(rows: &[WeightedRow], key_columns: &[usize]) -> DataflowResult<Vec<WeightedRow>> {
+    let mut groups: Vec<(Vec<SqliteValue>, i64)> = Vec::new();
+    for row in rows {
+        if row.is_zero() {
+            continue;
+        }
+        let key = row.project(key_columns)?;
+        if let Some((_, count)) = groups.iter_mut().find(|(candidate, _)| *candidate == key) {
+            *count = count.saturating_add(row.weight);
+        } else {
+            groups.push((key, row.weight));
+        }
+    }
+
+    Ok(groups
+        .into_iter()
+        .filter_map(|(mut values, count)| {
+            if count == 0 {
+                return None;
+            }
+            values.push(SqliteValue::Integer(count));
+            Some(WeightedRow::insert(values))
+        })
         .collect())
 }
 
@@ -549,6 +578,43 @@ mod tests {
         let actual = automaton.execute(&rows).expect("dataflow should execute");
 
         assert_eq!(actual, vec![WeightedRow::new(vec![int(1), int(10)], 7)]);
+    }
+
+    #[test]
+    fn count_by_key_appends_counts_and_elides_zero_groups() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::CountByKey {
+            key_columns: vec![0],
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(2), int(20)], 1),
+            WeightedRow::new(vec![int(1), int(10)], 4),
+            WeightedRow::new(vec![int(2), int(21)], -1),
+            WeightedRow::new(vec![int(1), int(11)], 3),
+            WeightedRow::new(vec![int(3), int(30)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(actual, vec![WeightedRow::insert(vec![int(1), int(7)])]);
+    }
+
+    #[test]
+    fn count_by_key_rejects_out_of_bounds_key_columns() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::CountByKey {
+            key_columns: vec![2],
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), int(2)])])
+            .expect_err("invalid key column should fail");
+
+        assert_eq!(
+            err,
+            DataflowError::ColumnOutOfBounds {
+                column: 2,
+                width: 2
+            }
+        );
     }
 
     #[test]

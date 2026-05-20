@@ -611,6 +611,45 @@ const COMPOUND_CASES: &[QueryCase] = &[
     },
 ];
 
+const CASE_NULL_SETUP: &str = "
+    CREATE TABLE expr_rows (
+        id INTEGER PRIMARY KEY,
+        a INTEGER,
+        b INTEGER,
+        label TEXT
+    );
+
+    INSERT INTO expr_rows VALUES
+        (1, 10, 5, 'high'),
+        (2, 5, 5, 'same'),
+        (3, 2, 9, NULL),
+        (4, NULL, 7, 'missing-a'),
+        (5, 4, NULL, NULL);
+";
+
+const CASE_NULL_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "searched case null aware comparisons",
+        sql: "SELECT id, CASE WHEN a IS NULL THEN 'missing-a' WHEN b IS NULL THEN 'missing-b' WHEN a > b THEN 'gt' WHEN a = b THEN 'eq' ELSE 'lt' END FROM expr_rows ORDER BY id",
+    },
+    QueryCase {
+        name: "simple case expression",
+        sql: "SELECT id, CASE label WHEN 'high' THEN 1 WHEN 'same' THEN 2 ELSE 0 END FROM expr_rows ORDER BY id",
+    },
+    QueryCase {
+        name: "case aggregate over nulls",
+        sql: "SELECT SUM(CASE WHEN label IS NULL THEN 1 ELSE 0 END), SUM(CASE WHEN a IS NULL OR b IS NULL THEN 1 ELSE 0 END) FROM expr_rows",
+    },
+    QueryCase {
+        name: "coalesce projection",
+        sql: "SELECT id, COALESCE(label, 'none'), COALESCE(a, b, 0) FROM expr_rows ORDER BY id",
+    },
+    QueryCase {
+        name: "boolean precedence with null predicates",
+        sql: "SELECT id FROM expr_rows WHERE NOT (a > 3 AND b > 3) OR label IS NULL ORDER BY id",
+    },
+];
+
 const SUBQUERY_SETUP: &str = "
     CREATE TABLE customers (
         id INTEGER PRIMARY KEY,
@@ -737,6 +776,12 @@ fn transactions_and_savepoints_match_rusqlite() {
 fn compound_selects_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(COMPOUND_SETUP);
     harness.assert_queries_match("compound SELECT", COMPOUND_CASES);
+}
+
+#[test]
+fn case_and_null_logic_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
+    harness.assert_queries_match("CASE/null logic", CASE_NULL_CASES);
 }
 
 #[test]

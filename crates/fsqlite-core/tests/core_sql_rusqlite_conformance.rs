@@ -529,6 +529,52 @@ const ATTACHED_INSERT_SELECT_CASES: &[QueryCase] = &[
     },
 ];
 
+const ATTACHED_DROP_SETUP: &str = "
+    ATTACH DATABASE ':memory:' AS aux;
+
+    CREATE TABLE aux.keep (
+        id INTEGER PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    INSERT INTO aux.keep VALUES (1, 'stay');
+
+    CREATE TABLE aux.drop_me (
+        id INTEGER PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    INSERT INTO aux.drop_me VALUES (1, 'gone');
+
+    CREATE TABLE aux.drop_index_only (
+        id INTEGER PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    INSERT INTO aux.drop_index_only VALUES (1, 'indexed'), (2, 'also-indexed');
+
+    CREATE INDEX aux.idx_drop_me_value ON drop_me(value);
+    CREATE INDEX aux.idx_drop_index_only_value ON drop_index_only(value);
+";
+
+const ATTACHED_DROP_SCRIPT: &str = "
+    DROP INDEX aux.idx_drop_index_only_value;
+    DROP TABLE aux.drop_me;
+    DROP TABLE IF EXISTS aux.missing_table;
+";
+
+const ATTACHED_DROP_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "attached drop removes table and indexes",
+        sql: "SELECT type, name FROM aux.sqlite_master WHERE name IN ('drop_me', 'idx_drop_me_value', 'drop_index_only', 'idx_drop_index_only_value', 'keep') ORDER BY type, name",
+    },
+    QueryCase {
+        name: "attached drop preserves unrelated table rows",
+        sql: "SELECT id, value FROM aux.keep ORDER BY id",
+    },
+    QueryCase {
+        name: "attached drop index preserves table rows",
+        sql: "SELECT id, value FROM aux.drop_index_only ORDER BY id",
+    },
+];
+
 const ERROR_PATH_SETUP: &str = "
     CREATE TABLE constrained (
         id INTEGER PRIMARY KEY,
@@ -1158,6 +1204,13 @@ fn attached_update_delegation_matches_rusqlite() {
 fn attached_insert_select_delegation_matches_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(ATTACHED_INSERT_SELECT_SETUP);
     harness.assert_queries_match("attached INSERT SELECT", ATTACHED_INSERT_SELECT_CASES);
+}
+
+#[test]
+fn attached_drop_delegation_matches_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(ATTACHED_DROP_SETUP);
+    harness.execute_script(ATTACHED_DROP_SCRIPT);
+    harness.assert_queries_match("attached DROP", ATTACHED_DROP_CASES);
 }
 
 #[test]

@@ -8,7 +8,7 @@
 //! - [`Savepoint`]: Transaction-local write snapshots for page and cell deltas.
 //! - [`CommitResponse`]: Result type for the commit sequencer.
 
-use std::collections::{BTreeMap, HashMap, btree_map::Entry as BTreeEntry};
+use std::collections::{BTreeMap, HashMap, HashSet, btree_map::Entry as BTreeEntry};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -408,6 +408,8 @@ pub struct Savepoint {
         Arc<HashMap<PageNumber, PageData, fsqlite_types::PageNumberBuildHasher>>,
     /// Number of pages in write_set when savepoint was created.
     pub write_set_len: usize,
+    /// Snapshot of structural page tracking at savepoint creation.
+    pub structural_pages_snapshot: HashSet<PageNumber>,
     /// Number of cell-level deltas tracked for this transaction at savepoint creation.
     pub cell_delta_len: usize,
 }
@@ -1178,6 +1180,7 @@ impl TransactionManager {
             name: name.to_owned(),
             write_set_snapshot: txn.write_set_data.clone(),
             write_set_len: txn.write_set.len(),
+            structural_pages_snapshot: txn.structural_pages.clone(),
             cell_delta_len: self.cell_log.txn_delta_count(txn.token()),
         }
     }
@@ -1206,6 +1209,7 @@ impl TransactionManager {
         txn.write_set.truncate(savepoint.write_set_len);
         txn.write_set_versions
             .retain(|pgno, _| txn.write_set_data.contains_key(pgno));
+        txn.structural_pages = savepoint.structural_pages_snapshot.clone();
 
         tracing::debug!(
             txn_id = %txn.txn_id,
@@ -3758,6 +3762,32 @@ mod tests {
         assert!(
             txn.write_version_for_page(p2).is_none(),
             "savepoint rollback must prune write-version entries for removed pages"
+        );
+    }
+
+    #[test]
+    fn test_rollback_to_savepoint_restores_structural_page_tracking() {
+        let m = mgr();
+        let mut txn = m.begin(BeginKind::Concurrent).unwrap();
+        let p1 = PageNumber::new(1).unwrap();
+        let p2 = PageNumber::new(2).unwrap();
+
+        m.write_page(&mut txn, p1, test_data(0x01)).unwrap();
+        let sp = m.savepoint(&txn, "sp_structural");
+        m.write_page(&mut txn, p2, test_data(0x02)).unwrap();
+
+        assert!(txn.structural_pages.contains(&p1));
+        assert!(txn.structural_pages.contains(&p2));
+
+        m.rollback_to_savepoint(&mut txn, &sp);
+
+        assert!(
+            txn.structural_pages.contains(&p1),
+            "pre-savepoint structural page must remain tracked"
+        );
+        assert!(
+            !txn.structural_pages.contains(&p2),
+            "rolled-back structural page must not leave stale classification"
         );
     }
 

@@ -4380,6 +4380,49 @@ mod tests {
     }
 
     #[test]
+    fn test_theorem1_no_read_skew_across_pages() {
+        let m = mgr();
+        let page_a = PageNumber::new(1_203).unwrap();
+        let page_b = PageNumber::new(1_204).unwrap();
+
+        let mut seed = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut seed, page_a, test_data(0x10)).unwrap();
+        m.write_page(&mut seed, page_b, test_data(0x20)).unwrap();
+        m.commit(&mut seed).unwrap();
+
+        let mut reader = m.begin(BeginKind::Concurrent).unwrap();
+        let first_a = m.read_page(&mut reader, page_a).unwrap();
+        assert_eq!(first_a.as_bytes()[0], 0x10);
+
+        let mut writer_a = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut writer_a, page_a, test_data(0xA0))
+            .unwrap();
+        m.commit(&mut writer_a).unwrap();
+
+        let mut writer_b = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut writer_b, page_b, test_data(0xB0))
+            .unwrap();
+        m.commit(&mut writer_b).unwrap();
+
+        let second_b = m.read_page(&mut reader, page_b).unwrap();
+        let second_a = m.read_page(&mut reader, page_a).unwrap();
+        assert_eq!(
+            (second_a.as_bytes()[0], second_b.as_bytes()[0]),
+            (0x10, 0x20),
+            "reader must keep a transaction-consistent pair, not mix old and new page versions"
+        );
+
+        let mut later_reader = m.begin(BeginKind::Concurrent).unwrap();
+        let later_a = m.read_page(&mut later_reader, page_a).unwrap();
+        let later_b = m.read_page(&mut later_reader, page_b).unwrap();
+        assert_eq!(
+            (later_a.as_bytes()[0], later_b.as_bytes()[0]),
+            (0xA0, 0xB0),
+            "later snapshots must observe both committed updates"
+        );
+    }
+
+    #[test]
     fn test_theorem1_no_phantom_reads() {
         let m = mgr();
         let base_pages = [1_301_u32, 1_302, 1_303];

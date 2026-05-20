@@ -98,14 +98,16 @@ resolved_by = "cod_2"
 [[runtime_stubs]]
 stub_id = "RSTUB-0022"
 file = "crates/fsqlite-core/src/connection.rs"
-line = 3827
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
+line = 5646
+kind = "resolved"
+kind_description = "prepared table program execution carries the prepared function registry into reusable scalar-function evaluation"
+severity = "resolved"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "Err(FrankenError::NotImplemented(format!("
+closure_strategy = "implemented"
+anchor = "prepared table program missing function registry"
+resolved_date = "2026-05-20"
+resolved_by = "cod_2"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-1000"

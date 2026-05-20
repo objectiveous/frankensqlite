@@ -39,6 +39,10 @@ use parking_lot::{Mutex, MutexGuard};
 
 use crate::core_types::{CommitIndex, InProcessPageLockTable, TransactionMode, TransactionState};
 use crate::lifecycle::MvccError;
+use crate::observability::{
+    ConflictHeatContext, ConflictHeatEdge, ConflictHeatObservation, ConflictOverlapDirection,
+    conflict_heat_telemetry_enabled, record_conflict_heat_observation,
+};
 use crate::rcu::{ActiveTxnSnapshotEntry, QsbrHandle, RcuActiveTxnSnapshotTable};
 use crate::ssi_validation::{
     ActiveTxnView, CommittedReaderInfo, CommittedWriterInfo, DiscoveredEdge, SsiAbortReason,
@@ -2518,6 +2522,83 @@ fn evaluate_prepare_t3_dro(
     ))
 }
 
+fn record_prepare_conflict_heat(
+    txn: TxnToken,
+    planned_commit_seq: CommitSeq,
+    incoming_edges: &[DiscoveredEdge],
+    outgoing_edges: &[DiscoveredEdge],
+    write_set_pages: &[PageNumber],
+) {
+    if !conflict_heat_telemetry_enabled() {
+        return;
+    }
+    let edge_count = incoming_edges.len().saturating_add(outgoing_edges.len());
+    if edge_count == 0 {
+        return;
+    }
+
+    let mut edges = Vec::with_capacity(edge_count);
+    let mut peer_tokens = Vec::with_capacity(edge_count);
+    for edge in incoming_edges {
+        edges.push(ConflictHeatEdge {
+            from: edge.from,
+            to: edge.to,
+            overlap_page: witness_key_page(&edge.overlap_key),
+            direction: ConflictOverlapDirection::Incoming,
+            source_is_active: edge.source_is_active,
+        });
+        peer_tokens.push((
+            edge.from.id.get(),
+            edge.from.epoch.get(),
+            edge.source_is_active,
+        ));
+    }
+    for edge in outgoing_edges {
+        edges.push(ConflictHeatEdge {
+            from: edge.from,
+            to: edge.to,
+            overlap_page: witness_key_page(&edge.overlap_key),
+            direction: ConflictOverlapDirection::Outgoing,
+            source_is_active: edge.source_is_active,
+        });
+        peer_tokens.push((edge.to.id.get(), edge.to.epoch.get(), edge.source_is_active));
+    }
+    peer_tokens.sort_unstable();
+    peer_tokens.dedup();
+
+    let writer_overlap_estimate = u32::try_from(peer_tokens.len()).unwrap_or(u32::MAX);
+    let conflict_heat = u64::try_from(edge_count).unwrap_or(u64::MAX);
+    let observation = ConflictHeatObservation {
+        context: ConflictHeatContext {
+            trace_id: "mvcc-ssi-prepare",
+            run_id: "local",
+            scenario_id: "prepare_concurrent_commit_with_ssi",
+            btree_id: 0,
+            table_or_index_role: "unknown",
+            split_pressure: 0,
+            allocation_class: "unknown",
+            elapsed_ns: 0,
+            first_failure_diag: "none",
+        },
+        commit_seq: planned_commit_seq,
+        writer_overlap_estimate,
+        conflict_heat,
+        overlap_edges: &edges,
+        fallback_pages: write_set_pages,
+    };
+    tracing::debug!(
+        target: "fsqlite.mvcc.conflict_heat",
+        txn_id = txn.id.get(),
+        txn_epoch = txn.epoch.get(),
+        commit_seq = planned_commit_seq.get(),
+        writer_overlap_estimate,
+        conflict_heat,
+        edge_count,
+        "mvcc conflict heat prepare observation"
+    );
+    record_conflict_heat_observation(&observation);
+}
+
 /// Commit a concurrent transaction.
 ///
 /// Validates with first-committer-wins, then SSI (Serializable Snapshot
@@ -2791,6 +2872,13 @@ pub fn prepare_concurrent_commit_with_ssi(
             &active_reader_candidates,
             &committed_reader_candidates,
         );
+        record_prepare_conflict_heat(
+            txn,
+            planned_commit_seq,
+            &incoming_edges,
+            &[],
+            &write_set_pages,
+        );
         let dro_t3_decision = evaluate_prepare_t3_dro(
             txn,
             &incoming_edges,
@@ -2910,6 +2998,13 @@ pub fn prepare_concurrent_commit_with_ssi(
         &sorted_read_keys,
         &active_writer_candidates,
         &committed_writer_candidates,
+    );
+    record_prepare_conflict_heat(
+        txn,
+        planned_commit_seq,
+        &incoming_edges,
+        &outgoing_edges,
+        &write_set_pages,
     );
 
     let has_in_rw = !incoming_edges.is_empty();
@@ -3596,7 +3691,11 @@ mod tests {
 
     use crate::core_types::{CommitIndex, InProcessPageLockTable, TransactionState};
     use crate::lifecycle::MvccError;
-    use crate::ssi_validation::ActiveTxnView;
+    use crate::observability::{
+        conflict_heat_telemetry_snapshot, reset_conflict_heat_telemetry,
+        set_conflict_heat_telemetry_enabled,
+    };
+    use crate::ssi_validation::{ActiveTxnView, SsiAbortReason};
 
     use super::{
         ActiveEdgeDiscoveryIndex, CommittedReaderInfo, CommittedWriterInfo, ConcurrentHandle,
@@ -3633,6 +3732,21 @@ mod tests {
             TxnId::new(id).expect("test transaction id"),
             TxnEpoch::new(id as u32 + 1),
         )
+    }
+
+    struct ConflictHeatTelemetryGuard;
+
+    impl Drop for ConflictHeatTelemetryGuard {
+        fn drop(&mut self) {
+            set_conflict_heat_telemetry_enabled(false);
+            reset_conflict_heat_telemetry();
+        }
+    }
+
+    fn enable_conflict_heat_telemetry_for_test() -> ConflictHeatTelemetryGuard {
+        reset_conflict_heat_telemetry();
+        set_conflict_heat_telemetry_enabled(true);
+        ConflictHeatTelemetryGuard
     }
 
     // -----------------------------------------------------------------------
@@ -5501,6 +5615,74 @@ mod tests {
         assert_eq!(decision.active_readers, 1);
         assert_eq!(decision.active_writers, 1);
         assert!(decision.threshold >= 0.0);
+    }
+
+    #[test]
+    fn test_conflict_heat_adversarial_overlap_workload_records_page_heat_graph() {
+        let _guard = enable_conflict_heat_telemetry_for_test();
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let s3 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        {
+            let mut h1 = registry.get_mut(s1).unwrap();
+            h1.record_read(test_page(10));
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(20), test_data()).unwrap();
+        }
+        {
+            let mut h2 = registry.get_mut(s2).unwrap();
+            h2.record_read(test_page(20));
+            concurrent_write_page(&mut h2, &lock_table, s2, test_page(10), test_data()).unwrap();
+        }
+        {
+            let mut h3 = registry.get_mut(s3).unwrap();
+            h3.record_read(test_page(20));
+            concurrent_write_page(&mut h3, &lock_table, s3, test_page(30), test_data()).unwrap();
+        }
+
+        let result = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(11),
+        );
+
+        assert!(matches!(
+            result,
+            Err((
+                MvccError::BusySnapshot,
+                FcwResult::Abort {
+                    reason: SsiAbortReason::Pivot
+                }
+            ))
+        ));
+
+        let snapshot = conflict_heat_telemetry_snapshot();
+        assert_eq!(snapshot.schema_version, "fsqlite.mvcc.conflict_heat.v1");
+        assert_eq!(snapshot.observations_total, 1);
+        assert_eq!(snapshot.max_writer_overlap_estimate, 2);
+        assert_eq!(snapshot.max_conflict_heat, 3);
+        assert_eq!(snapshot.overlap_edges.len(), 3);
+
+        let hot_page = snapshot
+            .top_pages
+            .iter()
+            .find(|page| page.page_no == 20)
+            .expect("page 20 should be the incoming overlap hotspot");
+        assert_eq!(hot_page.conflict_heat, 2);
+        assert_eq!(hot_page.writer_overlap_estimate, 2);
+
+        let outgoing_page = snapshot
+            .top_pages
+            .iter()
+            .find(|page| page.page_no == 10)
+            .expect("page 10 should record the outgoing overlap");
+        assert_eq!(outgoing_page.conflict_heat, 1);
     }
 
     #[test]

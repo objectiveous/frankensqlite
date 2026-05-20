@@ -627,7 +627,7 @@ fn record_conflict_heat_observation_slow(observation: &ConflictHeatObservation<'
         state.first_failure_diag = Some(observation.context.first_failure_diag.to_owned());
     }
 
-    let per_edge_heat = observation.conflict_heat.max(1);
+    let per_edge_heat = 1_u64;
     let mut emitted_page_event = false;
     for edge in observation.overlap_edges {
         if let Some(page) = edge.overlap_page {

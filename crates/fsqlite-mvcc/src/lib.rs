@@ -304,12 +304,17 @@ pub use materialize::{
     MaterializationTrigger, materialize_page, should_materialize_eagerly,
 };
 pub use observability::{
-    CasMetricsSnapshot, CasRetriesHistogram, SharedObserver, SnapshotReadMetricsSnapshot,
-    SsiMetricsSnapshot, VersionsTraversedHistogram, cas_metrics_snapshot, emit_conflict_resolved,
+    CasMetricsSnapshot, CasRetriesHistogram, ConflictHeatContext, ConflictHeatEdge,
+    ConflictHeatObservation, ConflictHeatPageSummary, ConflictHeatSnapshot,
+    ConflictOverlapDirection, ConflictOverlapSummary, SharedObserver, SnapshotReadMetricsSnapshot,
+    SsiMetricsSnapshot, VersionsTraversedHistogram, cas_metrics_snapshot,
+    conflict_heat_telemetry_enabled, conflict_heat_telemetry_snapshot, emit_conflict_resolved,
     emit_fcw_base_drift, emit_page_lock_contention, emit_ssi_abort, mvcc_snapshot_established,
     mvcc_snapshot_metrics_snapshot, mvcc_snapshot_released, record_cas_attempt,
-    record_snapshot_read_versions_traversed, record_ssi_abort, record_ssi_commit,
-    reset_cas_metrics, reset_mvcc_snapshot_metrics, reset_ssi_metrics, ssi_metrics_snapshot,
+    record_conflict_heat_observation, record_snapshot_read_versions_traversed, record_ssi_abort,
+    record_ssi_commit, reset_cas_metrics, reset_conflict_heat_telemetry,
+    reset_mvcc_snapshot_metrics, reset_ssi_metrics, set_conflict_heat_telemetry_enabled,
+    ssi_metrics_snapshot,
 };
 pub use physical_merge::{
     CellOp, CellOpKind, FreeSpaceOp, HeaderOp, MergeError, MergeLadderResult, ParsedCell,

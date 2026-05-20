@@ -16,6 +16,13 @@ struct MatchCase {
     query: &'static str,
 }
 
+struct TokenizerCase {
+    name: &'static str,
+    options: &'static [&'static str],
+    docs: &'static [Doc],
+    query: &'static str,
+}
+
 const DOCS: &[Doc] = &[
     Doc {
         rowid: 1,
@@ -43,6 +50,64 @@ const DOCS: &[Doc] = &[
         body: "Rust and SQLite examples for reliable search tests",
     },
 ];
+
+const UNICODE61_DIACRITIC_DOCS: &[Doc] = &[
+    Doc {
+        rowid: 1,
+        title: "Cafe accents",
+        body: "café crème résumé",
+    },
+    Doc {
+        rowid: 2,
+        title: "Plain cafe",
+        body: "cafe creme resume",
+    },
+    Doc {
+        rowid: 3,
+        title: "Tea notes",
+        body: "oolong sencha",
+    },
+];
+
+const PORTER_DOCS: &[Doc] = &[
+    Doc {
+        rowid: 1,
+        title: "Running tests",
+        body: "I am running the reliable search tests",
+    },
+    Doc {
+        rowid: 2,
+        title: "Run book",
+        body: "run fast and test often",
+    },
+    Doc {
+        rowid: 3,
+        title: "Runner notes",
+        body: "runner teams write docs",
+    },
+];
+
+const TRIGRAM_DOCS: &[Doc] = &[
+    Doc {
+        rowid: 1,
+        title: "Upper token",
+        body: "ABC sigma",
+    },
+    Doc {
+        rowid: 2,
+        title: "Embedded token",
+        body: "zabc tail",
+    },
+    Doc {
+        rowid: 3,
+        title: "Too short",
+        body: "ab",
+    },
+];
+
+const UNICODE61_DIACRITIC_OPTIONS: &[&str] = &["tokenize='unicode61 remove_diacritics 2'"];
+const PORTER_OPTIONS: &[&str] = &["tokenize='porter'"];
+const TRIGRAM_OPTIONS: &[&str] = &["tokenize='trigram'"];
 
 const MATCH_CASES: &[MatchCase] = &[
     MatchCase {
@@ -102,6 +167,27 @@ const PHRASE_PREFIX_NEAR_CASES: &[MatchCase] = &[
     },
 ];
 
+const TOKENIZER_CASES: &[TokenizerCase] = &[
+    TokenizerCase {
+        name: "unicode61 remove_diacritics",
+        options: UNICODE61_DIACRITIC_OPTIONS,
+        docs: UNICODE61_DIACRITIC_DOCS,
+        query: "cafe",
+    },
+    TokenizerCase {
+        name: "porter stemming",
+        options: PORTER_OPTIONS,
+        docs: PORTER_DOCS,
+        query: "run",
+    },
+    TokenizerCase {
+        name: "trigram case folding",
+        options: TRIGRAM_OPTIONS,
+        docs: TRIGRAM_DOCS,
+        query: "abc",
+    },
+];
+
 struct Fts5ConformanceHarness {
     franken: Fts5Table,
     sqlite: Connection,
@@ -109,12 +195,16 @@ struct Fts5ConformanceHarness {
 
 impl Fts5ConformanceHarness {
     fn new(options: &[&str]) -> Self {
+        Self::with_docs(options, DOCS)
+    }
+
+    fn with_docs(options: &[&str], docs: &[Doc]) -> Self {
         let mut args = vec!["fts5", "main", "docs", "title", "body"];
         args.extend_from_slice(options);
 
         let cx = Cx::new();
         let mut franken = Fts5Table::connect(&cx, &args).expect("connect FrankenSQLite FTS5 table");
-        for doc in DOCS {
+        for doc in docs {
             franken.insert_document(doc.rowid, &[doc.title.to_owned(), doc.body.to_owned()]);
         }
 
@@ -129,7 +219,7 @@ impl Fts5ConformanceHarness {
                 "CREATE VIRTUAL TABLE docs USING fts5(title, body{sql_options});"
             ))
             .expect("create rusqlite FTS5 table");
-        for doc in DOCS {
+        for doc in docs {
             sqlite
                 .execute(
                     "INSERT INTO docs(rowid, title, body) VALUES (?1, ?2, ?3)",
@@ -189,6 +279,20 @@ fn phrase_prefix_near_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "phrase/prefix/NEAR conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn tokenizer_queries_match_rusqlite_reference() {
+    for case in TOKENIZER_CASES {
+        let harness = Fts5ConformanceHarness::with_docs(case.options, case.docs);
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "tokenizer conformance case failed: {} ({})",
             case.name,
             case.query
         );

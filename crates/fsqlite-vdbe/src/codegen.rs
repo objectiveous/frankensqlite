@@ -1656,6 +1656,13 @@ pub fn codegen_select(
     schema: &[TableSchema],
     ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
+    if stmt.with.is_some() {
+        return Err(CodegenError::Unsupported(
+            "WITH clauses require connection-level CTE lowering or an explicit fallback boundary"
+                .to_owned(),
+        ));
+    }
+
     let (columns, from, where_clause, group_by, having, distinct) = match &stmt.body.select {
         SelectCore::Select {
             columns,
@@ -23170,6 +23177,29 @@ mod tests {
         let err =
             codegen_select(&mut b, &stmt, &schema, &ctx).expect_err("unknown table qualifier");
         assert_eq!(err, CodegenError::TableNotFound("u".to_owned()));
+    }
+
+    #[test]
+    fn test_codegen_select_with_clause_fails_closed() {
+        let stmt = select_sql("WITH picked AS (SELECT b FROM s) SELECT a FROM t");
+        let schema = test_schema_with_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_select(&mut b, &stmt, &schema, &ctx)
+            .expect_err("WITH lowering must not silently bypass CTE semantics");
+
+        match err {
+            CodegenError::Unsupported(message) => assert!(
+                message.contains("WITH clauses require connection-level CTE lowering"),
+                "unexpected unsupported message: {message}"
+            ),
+            other => panic!("expected explicit unsupported WITH boundary, got {other:?}"),
+        }
+        assert_eq!(
+            b.current_addr(),
+            0,
+            "fail-closed WITH handling should not emit partial bytecode"
+        );
     }
 
     // === Test 9: SELECT with indexed predicate ===

@@ -270,18 +270,16 @@ fn parse_option_assignment(input: &str) -> Option<(&str, &str)> {
 
 fn unquote_fts_arg(value: &str) -> &str {
     let trimmed = value.trim();
-    if trimmed.len() >= 2 {
-        let bytes = trimmed.as_bytes();
-        let first = bytes[0];
-        let last = bytes[trimmed.len() - 1];
-        if (first == b'\'' && last == b'\'')
-            || (first == b'"' && last == b'"')
-            || (first == b'`' && last == b'`')
-        {
-            return &trimmed[1..trimmed.len() - 1];
+    for quote in ['\'', '"', '`'] {
+        if let Some(unquoted) = strip_fts_quote_pair(trimmed, quote) {
+            return unquoted;
         }
     }
     trimmed
+}
+
+fn strip_fts_quote_pair(value: &str, quote: char) -> Option<&str> {
+    value.strip_prefix(quote)?.strip_suffix(quote)
 }
 
 fn unquote_fts_identifier(value: &str) -> &str {
@@ -4794,6 +4792,16 @@ mod tests {
         cafe_matches: Vec<i64>,
     }
 
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5QuotedOptionStructure {
+        unquoted: Vec<(String, String)>,
+        tokenizer: String,
+        prefix_lengths: Vec<usize>,
+        terms: Vec<String>,
+        cafe_matches: Vec<i64>,
+    }
+
     struct TokendataTestTokenizer;
 
     impl Fts5Tokenizer for TokendataTestTokenizer {
@@ -5157,6 +5165,100 @@ mod tests {
     ],
     cafe_matches: [
         2,
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_unquote_fts_arg_strips_matching_quote_pairs() {
+        assert_eq!(
+            unquote_fts_arg(" 'unicode61 remove_diacritics 2' "),
+            "unicode61 remove_diacritics 2"
+        );
+        assert_eq!(unquote_fts_arg("\"café\""), "café");
+        assert_eq!(unquote_fts_arg("`2 3`"), "2 3");
+        assert_eq!(unquote_fts_arg("'mismatch`"), "'mismatch`");
+        assert_eq!(unquote_fts_arg("''"), "");
+        assert_eq!(unquote_fts_arg("plain"), "plain");
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_quoted_options() -> std::result::Result<(), String> {
+        let unquoted = [
+            "'unicode61 remove_diacritics 2'",
+            "\"2 3\"",
+            "`quoted`",
+            "'mismatch`",
+            "plain",
+        ]
+        .into_iter()
+        .map(|raw| (raw.to_owned(), unquote_fts_arg(raw).to_owned()))
+        .collect();
+
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "quoted_docs",
+                "body",
+                "tokenize='unicode61 remove_diacritics 2'",
+                "prefix='2 3'",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        table.insert_document(1, &["café".to_owned()]);
+        let structure = table_structure(&table);
+        let mut cafe_matches = search_rowids(&table, "cafe")?;
+        cafe_matches.sort_unstable();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5QuotedOptionStructure {
+                    unquoted,
+                    tokenizer: table.tokenizer_name.clone(),
+                    prefix_lengths: table.prefix_lengths.clone(),
+                    terms: structure.terms.into_iter().map(|term| term.term).collect(),
+                    cafe_matches,
+                }
+            ),
+            r#"Fts5QuotedOptionStructure {
+    unquoted: [
+        (
+            "'unicode61 remove_diacritics 2'",
+            "unicode61 remove_diacritics 2",
+        ),
+        (
+            "\"2 3\"",
+            "2 3",
+        ),
+        (
+            "`quoted`",
+            "quoted",
+        ),
+        (
+            "'mismatch`",
+            "'mismatch`",
+        ),
+        (
+            "plain",
+            "plain",
+        ),
+    ],
+    tokenizer: "unicode61 remove_diacritics 2",
+    prefix_lengths: [
+        2,
+        3,
+    ],
+    terms: [
+        "cafe",
+    ],
+    cafe_matches: [
+        1,
     ],
 }"#
         );

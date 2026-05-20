@@ -93,6 +93,15 @@ const FTS5_DEFAULT_DELETE_AUTOMERGE: i64 = 10;
 pub const FTS5_AVERAGES_ROWID: i64 = 1;
 pub const FTS5_STRUCTURE_ROWID: i64 = 10;
 const FTS5_STRUCTURE_V2_MARKER: [u8; 4] = [0xFF, 0x00, 0x00, 0x01];
+const FTS5_DATA_ID_BITS: u64 = 16;
+const FTS5_DATA_DLI_BITS: u64 = 1;
+const FTS5_DATA_HEIGHT_BITS: u64 = 5;
+const FTS5_DATA_PAGE_BITS: u64 = 31;
+const FTS5_DATA_PAGE_MASK: u64 = (1 << FTS5_DATA_PAGE_BITS) - 1;
+const FTS5_DATA_HEIGHT_MASK: u64 = (1 << FTS5_DATA_HEIGHT_BITS) - 1;
+const FTS5_DATA_DLI_MASK: u64 = (1 << FTS5_DATA_DLI_BITS) - 1;
+const FTS5_DATA_ID_LIMIT: u64 = 1 << FTS5_DATA_ID_BITS;
+const FTS5_IDX_MAX_BTREE_PAGE: u32 = (1 << FTS5_DATA_PAGE_BITS) - 1;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fts5ConfigRecord {
@@ -531,6 +540,666 @@ impl Fts5DataMetadata {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fts5DataRowid {
+    Averages,
+    Structure,
+    SegmentLeaf { segid: u32, pgno: u32 },
+    DoclistIndex { segid: u32, height: u8, pgno: u32 },
+    Tombstone { segid: u32, hash_pgno: u32 },
+}
+
+impl Fts5DataRowid {
+    pub fn encode(self) -> Result<i64> {
+        match self {
+            Self::Averages => Ok(FTS5_AVERAGES_ROWID),
+            Self::Structure => Ok(FTS5_STRUCTURE_ROWID),
+            Self::SegmentLeaf { segid, pgno } => {
+                fts5_data_rowid(segid, false, 0, pgno, "segment leaf")
+            }
+            Self::DoclistIndex {
+                segid,
+                height,
+                pgno,
+            } => fts5_data_rowid(segid, true, height, pgno, "doclist index"),
+            Self::Tombstone { segid, hash_pgno } => {
+                let tombstone_segid = u64::from(segid) + FTS5_DATA_ID_LIMIT;
+                fts5_data_rowid_from_parts(tombstone_segid, false, 0, hash_pgno)
+            }
+        }
+    }
+
+    pub fn decode(rowid: i64) -> Result<Self> {
+        match rowid {
+            FTS5_AVERAGES_ROWID => return Ok(Self::Averages),
+            FTS5_STRUCTURE_ROWID => return Ok(Self::Structure),
+            _ => {}
+        }
+
+        let raw = u64::try_from(rowid)
+            .map_err(|_| fts5_data_error("negative segment rowid in %_data"))?;
+        let pgno = u32::try_from(raw & FTS5_DATA_PAGE_MASK)
+            .map_err(|_| fts5_data_error("page number exceeds u32"))?;
+        let height = u8::try_from((raw >> FTS5_DATA_PAGE_BITS) & FTS5_DATA_HEIGHT_MASK)
+            .map_err(|_| fts5_data_error("dlidx height exceeds u8"))?;
+        let dlidx =
+            ((raw >> (FTS5_DATA_PAGE_BITS + FTS5_DATA_HEIGHT_BITS)) & FTS5_DATA_DLI_MASK) != 0;
+        let segid_raw = raw >> (FTS5_DATA_PAGE_BITS + FTS5_DATA_HEIGHT_BITS + FTS5_DATA_DLI_BITS);
+
+        if dlidx {
+            let segid =
+                u32::try_from(segid_raw).map_err(|_| fts5_data_error("dlidx segid overflow"))?;
+            return Ok(Self::DoclistIndex {
+                segid,
+                height,
+                pgno,
+            });
+        }
+
+        if segid_raw >= FTS5_DATA_ID_LIMIT {
+            let segid = u32::try_from(segid_raw - FTS5_DATA_ID_LIMIT)
+                .map_err(|_| fts5_data_error("tombstone segid overflow"))?;
+            return Ok(Self::Tombstone {
+                segid,
+                hash_pgno: pgno,
+            });
+        }
+
+        let segid =
+            u32::try_from(segid_raw).map_err(|_| fts5_data_error("segment segid overflow"))?;
+        Ok(Self::SegmentLeaf { segid, pgno })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5IdxRow {
+    pub segid: u32,
+    pub term: Vec<u8>,
+    pub btree_page: u32,
+    pub has_doclist_index: bool,
+}
+
+impl Fts5IdxRow {
+    #[must_use]
+    pub fn new(
+        segid: u32,
+        term: impl Into<Vec<u8>>,
+        btree_page: u32,
+        has_doclist_index: bool,
+    ) -> Self {
+        Self {
+            segid,
+            term: term.into(),
+            btree_page,
+            has_doclist_index,
+        }
+    }
+
+    pub fn encoded_pgno(&self) -> Result<i64> {
+        if self.btree_page > FTS5_IDX_MAX_BTREE_PAGE {
+            return Err(fts5_data_error("%_idx btree page exceeds 31-bit limit"));
+        }
+        Ok((i64::from(self.btree_page) << 1) | i64::from(self.has_doclist_index))
+    }
+
+    pub fn from_encoded_pgno(
+        segid: u32,
+        term: impl Into<Vec<u8>>,
+        encoded_pgno: i64,
+    ) -> Result<Self> {
+        if encoded_pgno < 0 {
+            return Err(fts5_data_error("negative %_idx pgno"));
+        }
+        let encoded =
+            u64::try_from(encoded_pgno).map_err(|_| fts5_data_error("%_idx pgno overflow"))?;
+        let btree_page = u32::try_from(encoded >> 1)
+            .map_err(|_| fts5_data_error("%_idx btree page overflow"))?;
+        if btree_page > FTS5_IDX_MAX_BTREE_PAGE {
+            return Err(fts5_data_error("%_idx btree page exceeds 31-bit limit"));
+        }
+        Ok(Self {
+            segid,
+            term: term.into(),
+            btree_page,
+            has_doclist_index: (encoded & 1) != 0,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5ColumnPositions {
+    pub column: u32,
+    pub offsets: Vec<u32>,
+}
+
+impl Fts5ColumnPositions {
+    #[must_use]
+    pub fn new(column: u32, offsets: Vec<u32>) -> Self {
+        Self { column, offsets }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5Poslist {
+    pub delete: bool,
+    pub columns: Vec<Fts5ColumnPositions>,
+}
+
+impl Fts5Poslist {
+    #[must_use]
+    pub fn new(delete: bool, columns: Vec<Fts5ColumnPositions>) -> Self {
+        Self { delete, columns }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut body = Vec::new();
+        let mut columns = self.columns.clone();
+        columns.sort_unstable_by_key(|column| column.column);
+
+        for column in columns {
+            if column.column != 0 || !body.is_empty() {
+                body.push(0x01);
+                fts5_push_varint(&mut body, u64::from(column.column));
+            }
+            let mut previous_offset = 0_u32;
+            let mut offsets = column.offsets;
+            offsets.sort_unstable();
+            for offset in offsets {
+                if offset < previous_offset {
+                    return Err(fts5_data_error("poslist offsets are not monotonic"));
+                }
+                fts5_push_varint(&mut body, u64::from(offset - previous_offset + 2));
+                previous_offset = offset;
+            }
+        }
+
+        let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
+        let header = body_len
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(u64::from(self.delete)))
+            .ok_or_else(|| fts5_data_error("poslist too large"))?;
+        let mut encoded = Vec::with_capacity(body.len() + 9);
+        fts5_push_varint(&mut encoded, header);
+        encoded.extend_from_slice(&body);
+        Ok(encoded)
+    }
+
+    pub fn decode(block: &[u8], offset: &mut usize) -> Result<Self> {
+        let header = fts5_read_varint(block, offset, "poslist size")?;
+        let body_len =
+            usize::try_from(header >> 1).map_err(|_| fts5_data_error("poslist body too large"))?;
+        let delete = (header & 1) != 0;
+        let end = offset
+            .checked_add(body_len)
+            .ok_or_else(|| fts5_data_error("poslist length overflow"))?;
+        if end > block.len() {
+            return Err(fts5_data_error("truncated poslist body"));
+        }
+
+        let mut columns = Vec::new();
+        let mut current_column = 0;
+        while *offset < end {
+            if block[*offset] == 0x01 {
+                *offset += 1;
+                current_column = fts5_read_u32(block, offset, "poslist column")?;
+                if *offset >= end {
+                    return Err(fts5_data_error("poslist column has no offsets"));
+                }
+            }
+
+            let mut offsets = Vec::new();
+            let mut previous_offset = 0_u32;
+            while *offset < end && block[*offset] != 0x01 {
+                let delta = fts5_read_u32(block, offset, "poslist offset delta")?;
+                if delta < 2 {
+                    return Err(fts5_data_error("poslist offset delta below 2"));
+                }
+                let offset_value = previous_offset
+                    .checked_add(delta - 2)
+                    .ok_or_else(|| fts5_data_error("poslist offset overflow"))?;
+                offsets.push(offset_value);
+                previous_offset = offset_value;
+            }
+            if offsets.is_empty() {
+                return Err(fts5_data_error("poslist column has no offsets"));
+            }
+            columns.push(Fts5ColumnPositions {
+                column: current_column,
+                offsets,
+            });
+        }
+
+        Ok(Self { delete, columns })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5DoclistEntry {
+    pub rowid: u64,
+    pub poslist: Fts5Poslist,
+}
+
+impl Fts5DoclistEntry {
+    #[must_use]
+    pub fn new(rowid: u64, poslist: Fts5Poslist) -> Self {
+        Self { rowid, poslist }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5Doclist {
+    pub entries: Vec<Fts5DoclistEntry>,
+}
+
+impl Fts5Doclist {
+    #[must_use]
+    pub fn new(entries: Vec<Fts5DoclistEntry>) -> Self {
+        Self { entries }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut encoded = Vec::new();
+        let mut previous_rowid = 0_u64;
+        for (index, entry) in self.entries.iter().enumerate() {
+            if index == 0 {
+                fts5_push_varint(&mut encoded, entry.rowid);
+            } else {
+                if entry.rowid <= previous_rowid {
+                    return Err(fts5_data_error(
+                        "doclist rowids must be strictly increasing",
+                    ));
+                }
+                fts5_push_varint(&mut encoded, entry.rowid - previous_rowid);
+            }
+            encoded.extend_from_slice(&entry.poslist.encode()?);
+            previous_rowid = entry.rowid;
+        }
+        Ok(encoded)
+    }
+
+    pub fn decode(block: &[u8]) -> Result<Self> {
+        let mut offset = 0;
+        let mut entries = Vec::new();
+        let mut previous_rowid = 0_u64;
+        while offset < block.len() {
+            let raw_rowid = fts5_read_varint(block, &mut offset, "doclist rowid")?;
+            let rowid = if entries.is_empty() {
+                raw_rowid
+            } else {
+                if raw_rowid == 0 {
+                    return Err(fts5_data_error("doclist rowid delta must be positive"));
+                }
+                previous_rowid
+                    .checked_add(raw_rowid)
+                    .ok_or_else(|| fts5_data_error("doclist rowid overflow"))?
+            };
+            let poslist = Fts5Poslist::decode(block, &mut offset)?;
+            entries.push(Fts5DoclistEntry { rowid, poslist });
+            previous_rowid = rowid;
+        }
+        Ok(Self { entries })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5SegmentTerm {
+    pub term: Vec<u8>,
+    pub doclist: Fts5Doclist,
+}
+
+impl Fts5SegmentTerm {
+    #[must_use]
+    pub fn new(term: impl Into<Vec<u8>>, doclist: Fts5Doclist) -> Self {
+        Self {
+            term: term.into(),
+            doclist,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5SegmentLeaf {
+    pub first_rowid_offset: u16,
+    pub terms: Vec<Fts5SegmentTerm>,
+}
+
+impl Fts5SegmentLeaf {
+    #[must_use]
+    pub fn new(terms: Vec<Fts5SegmentTerm>) -> Self {
+        Self {
+            first_rowid_offset: 0,
+            terms,
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut page = vec![0, 0, 0, 0];
+        let mut term_offsets = Vec::with_capacity(self.terms.len());
+        let mut previous_term: &[u8] = &[];
+        let mut first_rowid_offset = 0;
+
+        for (index, entry) in self.terms.iter().enumerate() {
+            if index > 0 && entry.term.as_slice() <= previous_term {
+                return Err(fts5_data_error("segment terms must be strictly increasing"));
+            }
+            let term_offset = u16::try_from(page.len())
+                .map_err(|_| fts5_data_error("segment leaf term offset exceeds u16"))?;
+            term_offsets.push(term_offset);
+
+            if index == 0 {
+                fts5_push_varint(
+                    &mut page,
+                    u64::try_from(entry.term.len()).unwrap_or(u64::MAX),
+                );
+                page.extend_from_slice(&entry.term);
+            } else {
+                let prefix_len = common_prefix_len(previous_term, &entry.term);
+                fts5_push_varint(&mut page, u64::try_from(prefix_len).unwrap_or(u64::MAX));
+                fts5_push_varint(
+                    &mut page,
+                    u64::try_from(entry.term.len() - prefix_len).unwrap_or(u64::MAX),
+                );
+                page.extend_from_slice(&entry.term[prefix_len..]);
+            }
+
+            if index == 0 {
+                first_rowid_offset = u16::try_from(page.len())
+                    .map_err(|_| fts5_data_error("segment leaf rowid offset exceeds u16"))?;
+            }
+            page.extend_from_slice(&entry.doclist.encode()?);
+            previous_term = &entry.term;
+        }
+
+        let footer_offset = u16::try_from(page.len())
+            .map_err(|_| fts5_data_error("segment leaf footer offset exceeds u16"))?;
+        let mut previous_offset = 0;
+        for offset in term_offsets {
+            let delta = offset
+                .checked_sub(previous_offset)
+                .ok_or_else(|| fts5_data_error("segment footer offset underflow"))?;
+            fts5_push_varint(&mut page, u64::from(delta));
+            previous_offset = offset;
+        }
+
+        write_be_u16(&mut page[0..2], first_rowid_offset);
+        write_be_u16(&mut page[2..4], footer_offset);
+        Ok(page)
+    }
+
+    pub fn decode(page: &[u8]) -> Result<Self> {
+        if page.len() < 4 {
+            return Err(fts5_data_error("segment leaf missing header"));
+        }
+        let first_rowid_offset = read_be_u16(&page[0..2]);
+        let footer_offset = usize::from(read_be_u16(&page[2..4]));
+        if !(4..=page.len()).contains(&footer_offset) {
+            return Err(fts5_data_error("segment leaf footer offset out of range"));
+        }
+
+        let mut footer_cursor = footer_offset;
+        let mut term_offsets = Vec::new();
+        let mut previous_term_offset = 0_u16;
+        while footer_cursor < page.len() {
+            let delta = fts5_read_u32(page, &mut footer_cursor, "segment footer offset delta")?;
+            let next_offset = u32::from(previous_term_offset)
+                .checked_add(delta)
+                .ok_or_else(|| fts5_data_error("segment footer offset overflow"))?;
+            let next_offset = u16::try_from(next_offset)
+                .map_err(|_| fts5_data_error("segment footer offset exceeds u16"))?;
+            let next_offset_usize = usize::from(next_offset);
+            if next_offset_usize < 4 || next_offset_usize >= footer_offset {
+                return Err(fts5_data_error("segment term offset out of range"));
+            }
+            term_offsets.push(next_offset);
+            previous_term_offset = next_offset;
+        }
+
+        let mut terms = Vec::with_capacity(term_offsets.len());
+        let mut previous_term = Vec::new();
+        for (index, term_offset) in term_offsets.iter().copied().enumerate() {
+            let entry_end = term_offsets
+                .get(index + 1)
+                .map_or(footer_offset, |offset| usize::from(*offset));
+            let mut cursor = usize::from(term_offset);
+
+            let term = if index == 0 {
+                let term_len = fts5_read_usize(page, &mut cursor, "segment first term")?;
+                let end = cursor
+                    .checked_add(term_len)
+                    .ok_or_else(|| fts5_data_error("segment first term length overflow"))?;
+                if end > entry_end {
+                    return Err(fts5_data_error("segment first term extends past entry"));
+                }
+                let term = page[cursor..end].to_vec();
+                cursor = end;
+                term
+            } else {
+                let prefix_len = fts5_read_usize(page, &mut cursor, "segment term prefix")?;
+                let suffix_len = fts5_read_usize(page, &mut cursor, "segment term suffix")?;
+                if prefix_len > previous_term.len() {
+                    return Err(fts5_data_error("segment term prefix exceeds previous term"));
+                }
+                let suffix_end = cursor
+                    .checked_add(suffix_len)
+                    .ok_or_else(|| fts5_data_error("segment term suffix length overflow"))?;
+                if suffix_end > entry_end {
+                    return Err(fts5_data_error("segment term suffix extends past entry"));
+                }
+                let mut term = previous_term[..prefix_len].to_vec();
+                term.extend_from_slice(&page[cursor..suffix_end]);
+                cursor = suffix_end;
+                term
+            };
+
+            let doclist = Fts5Doclist::decode(&page[cursor..entry_end])?;
+            previous_term = term.clone();
+            terms.push(Fts5SegmentTerm { term, doclist });
+        }
+
+        Ok(Self {
+            first_rowid_offset,
+            terms,
+        })
+    }
+
+    pub fn to_data_row(&self, segid: u32, pgno: u32) -> Result<Fts5DataRow> {
+        Ok(Fts5DataRow::new(
+            Fts5DataRowid::SegmentLeaf { segid, pgno }.encode()?,
+            self.encode()?,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5DlidxPage {
+    pub flags: u8,
+    pub leaf_pgno: u32,
+    pub first_rowid: u64,
+    pub rowid_deltas: Vec<Option<u64>>,
+}
+
+impl Fts5DlidxPage {
+    #[must_use]
+    pub fn new(
+        flags: u8,
+        leaf_pgno: u32,
+        first_rowid: u64,
+        rowid_deltas: Vec<Option<u64>>,
+    ) -> Self {
+        Self {
+            flags,
+            leaf_pgno,
+            first_rowid,
+            rowid_deltas,
+        }
+    }
+
+    #[must_use]
+    pub fn is_root(&self) -> bool {
+        (self.flags & 0x01) == 0
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut page = Vec::with_capacity(1 + 18 + self.rowid_deltas.len() * 9);
+        page.push(self.flags);
+        fts5_push_varint(&mut page, u64::from(self.leaf_pgno));
+        fts5_push_varint(&mut page, self.first_rowid);
+        for delta in &self.rowid_deltas {
+            fts5_push_varint(&mut page, delta.unwrap_or(0));
+        }
+        page
+    }
+
+    pub fn decode(page: &[u8]) -> Result<Self> {
+        if page.is_empty() {
+            return Err(fts5_data_error("dlidx page missing flags"));
+        }
+        let flags = page[0];
+        let mut offset = 1;
+        let leaf_pgno = fts5_read_u32(page, &mut offset, "dlidx leaf page")?;
+        let first_rowid = fts5_read_varint(page, &mut offset, "dlidx first rowid")?;
+        let mut rowid_deltas = Vec::new();
+        while offset < page.len() {
+            let delta = fts5_read_varint(page, &mut offset, "dlidx rowid delta")?;
+            rowid_deltas.push((delta != 0).then_some(delta));
+        }
+
+        Ok(Self {
+            flags,
+            leaf_pgno,
+            first_rowid,
+            rowid_deltas,
+        })
+    }
+
+    pub fn to_data_row(&self, segid: u32, height: u8, pgno: u32) -> Result<Fts5DataRow> {
+        Ok(Fts5DataRow::new(
+            Fts5DataRowid::DoclistIndex {
+                segid,
+                height,
+                pgno,
+            }
+            .encode()?,
+            self.encode(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5TombstonePage {
+    pub key_size: u8,
+    pub rowid_zero: bool,
+    pub slots: Vec<Option<u64>>,
+}
+
+impl Fts5TombstonePage {
+    #[must_use]
+    pub fn new(key_size: u8, rowid_zero: bool, slots: Vec<Option<u64>>) -> Self {
+        Self {
+            key_size,
+            rowid_zero,
+            slots,
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        if self.key_size != 4 && self.key_size != 8 {
+            return Err(fts5_data_error("tombstone key size must be 4 or 8"));
+        }
+        let key_size = usize::from(self.key_size);
+        let mut page = vec![0; 8 + self.slots.len() * key_size];
+        page[0] = self.key_size;
+        page[1] = u8::from(self.rowid_zero);
+        let entry_count = self.slots.iter().filter(|slot| slot.is_some()).count();
+        let entry_count = u32::try_from(entry_count)
+            .map_err(|_| fts5_data_error("tombstone entry count exceeds u32"))?;
+        write_be_u32(&mut page[4..8], entry_count);
+
+        for (index, slot) in self.slots.iter().enumerate() {
+            let Some(rowid) = slot else {
+                continue;
+            };
+            let offset = 8 + index * key_size;
+            if self.key_size == 4 {
+                let rowid = u32::try_from(*rowid)
+                    .map_err(|_| fts5_data_error("rowid exceeds 4-byte tombstone slot"))?;
+                write_be_u32(&mut page[offset..offset + 4], rowid);
+            } else {
+                write_be_u64(&mut page[offset..offset + 8], *rowid);
+            }
+        }
+
+        Ok(page)
+    }
+
+    pub fn decode(page: &[u8]) -> Result<Self> {
+        if page.len() < 8 {
+            return Err(fts5_data_error("tombstone page missing header"));
+        }
+        let key_size = if page[0] == 4 { 4 } else { 8 };
+        let key_size_usize = usize::from(key_size);
+        let payload_len = page.len() - 8;
+        if payload_len % key_size_usize != 0 {
+            return Err(fts5_data_error("tombstone slot area is misaligned"));
+        }
+        let declared_entries = read_be_u32(&page[4..8]);
+        let mut slots = Vec::with_capacity(payload_len / key_size_usize);
+        let mut actual_entries = 0_u32;
+        for slot in page[8..].chunks_exact(key_size_usize) {
+            let value = if key_size == 4 {
+                u64::from(read_be_u32(slot))
+            } else {
+                read_be_u64(slot)
+            };
+            if value == 0 {
+                slots.push(None);
+            } else {
+                actual_entries = actual_entries
+                    .checked_add(1)
+                    .ok_or_else(|| fts5_data_error("tombstone entry count overflow"))?;
+                slots.push(Some(value));
+            }
+        }
+        if actual_entries != declared_entries {
+            return Err(fts5_data_error("tombstone entry count mismatch"));
+        }
+
+        Ok(Self {
+            key_size,
+            rowid_zero: page[1] != 0,
+            slots,
+        })
+    }
+
+    #[must_use]
+    pub fn contains_rowid(&self, hash_page_count: u32, rowid: u64) -> bool {
+        if rowid == 0 {
+            return self.rowid_zero;
+        }
+        if hash_page_count == 0 || self.slots.is_empty() {
+            return false;
+        }
+        let hash_page_count = u64::from(hash_page_count);
+        let slot_count = u64::try_from(self.slots.len()).unwrap_or(u64::MAX);
+        let mut slot = usize::try_from((rowid / hash_page_count) % slot_count).unwrap_or(0);
+        for _ in 0..self.slots.len() {
+            match self.slots[slot] {
+                Some(value) if value == rowid => return true,
+                None => return false,
+                _ => slot = (slot + 1) % self.slots.len(),
+            }
+        }
+        false
+    }
+
+    pub fn to_data_row(&self, segid: u32, hash_pgno: u32) -> Result<Fts5DataRow> {
+        Ok(Fts5DataRow::new(
+            Fts5DataRowid::Tombstone { segid, hash_pgno }.encode()?,
+            self.encode()?,
+        ))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fts5ShadowRows {
     pub data: Vec<Fts5DataRow>,
@@ -775,6 +1444,11 @@ fn fts5_read_varint(block: &[u8], offset: &mut usize, field: &str) -> Result<u64
     Ok(value)
 }
 
+fn fts5_read_usize(block: &[u8], offset: &mut usize, field: &str) -> Result<usize> {
+    let value = fts5_read_varint(block, offset, field)?;
+    usize::try_from(value).map_err(|_| fts5_data_error(format!("{field} exceeds usize")))
+}
+
 fn fts5_read_bounded_usize(block: &[u8], offset: &mut usize, field: &str) -> Result<usize> {
     let value = fts5_read_varint(block, offset, field)?;
     if value > FTS5_MAX_SEGMENT_U64 {
@@ -786,6 +1460,66 @@ fn fts5_read_bounded_usize(block: &[u8], offset: &mut usize, field: &str) -> Res
 fn fts5_read_u32(block: &[u8], offset: &mut usize, field: &str) -> Result<u32> {
     let value = fts5_read_varint(block, offset, field)?;
     u32::try_from(value).map_err(|_| fts5_data_error(format!("{field} exceeds u32")))
+}
+
+fn fts5_data_rowid(segid: u32, dlidx: bool, height: u8, pgno: u32, kind: &str) -> Result<i64> {
+    if segid == 0 {
+        return Err(fts5_data_error(format!("{kind} segid must be non-zero")));
+    }
+    if u64::from(segid) >= FTS5_DATA_ID_LIMIT {
+        return Err(fts5_data_error(format!(
+            "{kind} segid exceeds 16-bit limit"
+        )));
+    }
+    fts5_data_rowid_from_parts(u64::from(segid), dlidx, height, pgno)
+}
+
+fn fts5_data_rowid_from_parts(segid: u64, dlidx: bool, height: u8, pgno: u32) -> Result<i64> {
+    if u64::from(height) > FTS5_DATA_HEIGHT_MASK {
+        return Err(fts5_data_error("dlidx height exceeds 5-bit limit"));
+    }
+    if u64::from(pgno) > FTS5_DATA_PAGE_MASK {
+        return Err(fts5_data_error("page number exceeds 31-bit limit"));
+    }
+
+    let rowid = (segid << (FTS5_DATA_PAGE_BITS + FTS5_DATA_HEIGHT_BITS + FTS5_DATA_DLI_BITS))
+        | (u64::from(dlidx) << (FTS5_DATA_PAGE_BITS + FTS5_DATA_HEIGHT_BITS))
+        | (u64::from(height) << FTS5_DATA_PAGE_BITS)
+        | u64::from(pgno);
+    i64::try_from(rowid).map_err(|_| fts5_data_error("segment rowid exceeds i64"))
+}
+
+fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn read_be_u16(bytes: &[u8]) -> u16 {
+    u16::from_be_bytes([bytes[0], bytes[1]])
+}
+
+fn write_be_u16(bytes: &mut [u8], value: u16) {
+    bytes[..2].copy_from_slice(&value.to_be_bytes());
+}
+
+fn read_be_u32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn write_be_u32(bytes: &mut [u8], value: u32) {
+    bytes[..4].copy_from_slice(&value.to_be_bytes());
+}
+
+fn read_be_u64(bytes: &[u8]) -> u64 {
+    u64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
+}
+
+fn write_be_u64(bytes: &mut [u8], value: u64) {
+    bytes[..8].copy_from_slice(&value.to_be_bytes());
 }
 
 impl Fts5Config {
@@ -5583,6 +6317,19 @@ mod tests {
 
     #[allow(dead_code)]
     #[derive(Debug)]
+    struct Fts5SegmentCodecStructure {
+        idx_row: Fts5IdxRow,
+        idx_pgno: i64,
+        data_rowids: Vec<(i64, Fts5DataRowid)>,
+        leaf: Fts5SegmentLeaf,
+        leaf_bytes: Vec<u8>,
+        dlidx: Fts5DlidxPage,
+        tombstone: Fts5TombstonePage,
+        tombstone_hits: Vec<(u64, bool)>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
     struct Fts5ShadowRowsStructure {
         data: Vec<(i64, Vec<u8>)>,
         config: Vec<(String, String)>,
@@ -6220,6 +6967,378 @@ mod tests {
         "ru",
         "sh",
         "ta",
+    ],
+}"#
+        );
+    }
+
+    fn sample_segment_leaf() -> Fts5SegmentLeaf {
+        let mut leaf = Fts5SegmentLeaf::new(vec![
+            Fts5SegmentTerm::new(
+                b"rust".to_vec(),
+                Fts5Doclist::new(vec![
+                    Fts5DoclistEntry::new(
+                        7,
+                        Fts5Poslist::new(
+                            false,
+                            vec![
+                                Fts5ColumnPositions::new(0, vec![1, 4]),
+                                Fts5ColumnPositions::new(2, vec![9]),
+                            ],
+                        ),
+                    ),
+                    Fts5DoclistEntry::new(
+                        12,
+                        Fts5Poslist::new(true, vec![Fts5ColumnPositions::new(0, vec![2])]),
+                    ),
+                ]),
+            ),
+            Fts5SegmentTerm::new(
+                b"rusty".to_vec(),
+                Fts5Doclist::new(vec![Fts5DoclistEntry::new(
+                    20,
+                    Fts5Poslist::new(false, vec![Fts5ColumnPositions::new(1, vec![0])]),
+                )]),
+            ),
+        ]);
+        leaf.first_rowid_offset = 9;
+        leaf
+    }
+
+    #[test]
+    fn test_fts5_idx_and_data_rowid_codecs_round_trip() {
+        let idx = Fts5IdxRow::new(7, b"rusty".to_vec(), 3, true);
+        assert_eq!(idx.encoded_pgno().unwrap(), 7);
+        assert_eq!(
+            Fts5IdxRow::from_encoded_pgno(7, b"rusty".to_vec(), 7).unwrap(),
+            idx
+        );
+
+        let rowids = [
+            Fts5DataRowid::SegmentLeaf { segid: 7, pgno: 3 },
+            Fts5DataRowid::DoclistIndex {
+                segid: 7,
+                height: 2,
+                pgno: 3,
+            },
+            Fts5DataRowid::Tombstone {
+                segid: 7,
+                hash_pgno: 1,
+            },
+        ];
+        for rowid in rowids {
+            let encoded = rowid.encode().unwrap();
+            assert_eq!(Fts5DataRowid::decode(encoded).unwrap(), rowid);
+        }
+    }
+
+    #[test]
+    fn test_fts5_segment_leaf_dlidx_and_tombstone_round_trip() {
+        let leaf = sample_segment_leaf();
+        let encoded_leaf = leaf.encode().unwrap();
+        assert_eq!(
+            encoded_leaf,
+            vec![
+                0, 9, 0, 27, 4, 114, 117, 115, 116, 7, 10, 3, 5, 1, 2, 11, 5, 3, 4, 4, 1, 121, 20,
+                6, 1, 1, 2, 4, 15,
+            ]
+        );
+        assert_eq!(Fts5SegmentLeaf::decode(&encoded_leaf).unwrap(), leaf);
+
+        let dlidx = Fts5DlidxPage::new(0, 3, 7, vec![Some(5), None, Some(9)]);
+        assert!(dlidx.is_root());
+        assert_eq!(dlidx.encode(), vec![0, 3, 7, 5, 0, 9]);
+        assert_eq!(Fts5DlidxPage::decode(&dlidx.encode()).unwrap(), dlidx);
+
+        let tombstone = Fts5TombstonePage::new(4, true, vec![None, Some(9), None, Some(15)]);
+        assert_eq!(
+            tombstone.encode().unwrap(),
+            vec![
+                4, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 15,
+            ]
+        );
+        let decoded_tombstone = Fts5TombstonePage::decode(&tombstone.encode().unwrap()).unwrap();
+        assert_eq!(decoded_tombstone, tombstone);
+        assert!(decoded_tombstone.contains_rowid(1, 0));
+        assert!(decoded_tombstone.contains_rowid(1, 9));
+        assert!(decoded_tombstone.contains_rowid(1, 15));
+        assert!(!decoded_tombstone.contains_rowid(1, 8));
+    }
+
+    #[test]
+    fn test_fts5_segment_codecs_reject_malformed_payloads() {
+        let unsorted_doclist = Fts5Doclist::new(vec![
+            Fts5DoclistEntry::new(9, Fts5Poslist::new(false, Vec::new())),
+            Fts5DoclistEntry::new(7, Fts5Poslist::new(false, Vec::new())),
+        ]);
+        assert!(
+            unsorted_doclist
+                .encode()
+                .expect_err("doclist rowids must be ordered")
+                .to_string()
+                .contains("strictly increasing")
+        );
+
+        let mut bad_leaf = sample_segment_leaf().encode().unwrap();
+        bad_leaf[2] = 0;
+        bad_leaf[3] = 3;
+        assert!(
+            Fts5SegmentLeaf::decode(&bad_leaf)
+                .expect_err("footer before header should fail")
+                .to_string()
+                .contains("footer offset")
+        );
+
+        let bad_tombstone_count = vec![4, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 5];
+        assert!(
+            Fts5TombstonePage::decode(&bad_tombstone_count)
+                .expect_err("declared tombstone count must match slots")
+                .to_string()
+                .contains("entry count")
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_segment_codecs() {
+        let idx_row = Fts5IdxRow::new(7, b"rusty".to_vec(), 3, true);
+        let leaf = Fts5SegmentLeaf::decode(&sample_segment_leaf().encode().unwrap()).unwrap();
+        let dlidx = Fts5DlidxPage::decode(
+            &Fts5DlidxPage::new(0, 3, 7, vec![Some(5), None, Some(9)]).encode(),
+        )
+        .unwrap();
+        let tombstone = Fts5TombstonePage::decode(
+            &Fts5TombstonePage::new(4, true, vec![None, Some(9), None, Some(15)])
+                .encode()
+                .unwrap(),
+        )
+        .unwrap();
+        let data_rowids = vec![
+            Fts5DataRowid::SegmentLeaf { segid: 7, pgno: 3 },
+            Fts5DataRowid::DoclistIndex {
+                segid: 7,
+                height: 2,
+                pgno: 3,
+            },
+            Fts5DataRowid::Tombstone {
+                segid: 7,
+                hash_pgno: 1,
+            },
+        ]
+        .into_iter()
+        .map(|rowid| (rowid.encode().unwrap(), rowid))
+        .collect();
+
+        let snapshot = Fts5SegmentCodecStructure {
+            idx_pgno: idx_row.encoded_pgno().unwrap(),
+            idx_row,
+            data_rowids,
+            leaf_bytes: leaf.encode().unwrap(),
+            leaf,
+            dlidx,
+            tombstone_hits: vec![
+                (0, tombstone.contains_rowid(1, 0)),
+                (8, tombstone.contains_rowid(1, 8)),
+                (9, tombstone.contains_rowid(1, 9)),
+                (15, tombstone.contains_rowid(1, 15)),
+            ],
+            tombstone,
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5SegmentCodecStructure {
+    idx_row: Fts5IdxRow {
+        segid: 7,
+        term: [
+            114,
+            117,
+            115,
+            116,
+            121,
+        ],
+        btree_page: 3,
+        has_doclist_index: true,
+    },
+    idx_pgno: 7,
+    data_rowids: [
+        (
+            962072674307,
+            SegmentLeaf {
+                segid: 7,
+                pgno: 3,
+            },
+        ),
+        (
+            1035087118339,
+            DoclistIndex {
+                segid: 7,
+                height: 2,
+                pgno: 3,
+            },
+        ),
+        (
+            9008161327415297,
+            Tombstone {
+                segid: 7,
+                hash_pgno: 1,
+            },
+        ),
+    ],
+    leaf: Fts5SegmentLeaf {
+        first_rowid_offset: 9,
+        terms: [
+            Fts5SegmentTerm {
+                term: [
+                    114,
+                    117,
+                    115,
+                    116,
+                ],
+                doclist: Fts5Doclist {
+                    entries: [
+                        Fts5DoclistEntry {
+                            rowid: 7,
+                            poslist: Fts5Poslist {
+                                delete: false,
+                                columns: [
+                                    Fts5ColumnPositions {
+                                        column: 0,
+                                        offsets: [
+                                            1,
+                                            4,
+                                        ],
+                                    },
+                                    Fts5ColumnPositions {
+                                        column: 2,
+                                        offsets: [
+                                            9,
+                                        ],
+                                    },
+                                ],
+                            },
+                        },
+                        Fts5DoclistEntry {
+                            rowid: 12,
+                            poslist: Fts5Poslist {
+                                delete: true,
+                                columns: [
+                                    Fts5ColumnPositions {
+                                        column: 0,
+                                        offsets: [
+                                            2,
+                                        ],
+                                    },
+                                ],
+                            },
+                        },
+                    ],
+                },
+            },
+            Fts5SegmentTerm {
+                term: [
+                    114,
+                    117,
+                    115,
+                    116,
+                    121,
+                ],
+                doclist: Fts5Doclist {
+                    entries: [
+                        Fts5DoclistEntry {
+                            rowid: 20,
+                            poslist: Fts5Poslist {
+                                delete: false,
+                                columns: [
+                                    Fts5ColumnPositions {
+                                        column: 1,
+                                        offsets: [
+                                            0,
+                                        ],
+                                    },
+                                ],
+                            },
+                        },
+                    ],
+                },
+            },
+        ],
+    },
+    leaf_bytes: [
+        0,
+        9,
+        0,
+        27,
+        4,
+        114,
+        117,
+        115,
+        116,
+        7,
+        10,
+        3,
+        5,
+        1,
+        2,
+        11,
+        5,
+        3,
+        4,
+        4,
+        1,
+        121,
+        20,
+        6,
+        1,
+        1,
+        2,
+        4,
+        15,
+    ],
+    dlidx: Fts5DlidxPage {
+        flags: 0,
+        leaf_pgno: 3,
+        first_rowid: 7,
+        rowid_deltas: [
+            Some(
+                5,
+            ),
+            None,
+            Some(
+                9,
+            ),
+        ],
+    },
+    tombstone: Fts5TombstonePage {
+        key_size: 4,
+        rowid_zero: true,
+        slots: [
+            None,
+            Some(
+                9,
+            ),
+            None,
+            Some(
+                15,
+            ),
+        ],
+    },
+    tombstone_hits: [
+        (
+            0,
+            true,
+        ),
+        (
+            8,
+            false,
+        ),
+        (
+            9,
+            true,
+        ),
+        (
+            15,
+            true,
+        ),
     ],
 }"#
         );

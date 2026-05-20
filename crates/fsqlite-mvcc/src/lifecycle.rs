@@ -7154,6 +7154,78 @@ mod tests {
     }
 
     #[test]
+    fn test_snapshot_reuse_survives_read_only_commit_without_epoch_advance() {
+        let mgr = mgr();
+        let pgno = PageNumber::new(8_022).unwrap();
+
+        let mut writer = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("writer begin should use the primed initial snapshot");
+        mgr.write_page(&mut writer, pgno, test_data(0x4C))
+            .expect("writer should stage a page");
+        let commit_seq = mgr.commit(&mut writer).expect("writer commit");
+        assert_eq!(mgr.shm.load_commit_seq(), commit_seq);
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (1, 0),
+            "local write commit should publish the new snapshot into the reuse cache"
+        );
+
+        let mut reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("reader begin after local commit should succeed");
+        assert_eq!(
+            reader.snapshot,
+            Snapshot::new(commit_seq, SchemaEpoch::ZERO)
+        );
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (2, 0),
+            "reader should hit the locally published snapshot cache"
+        );
+        assert_eq!(
+            mgr.read_page(&mut reader, pgno),
+            Some(test_data(0x4C)),
+            "reader should observe the committed page before read-only commit"
+        );
+
+        let read_only_commit = mgr
+            .commit(&mut reader)
+            .expect("read-only transaction should commit");
+        assert_eq!(
+            read_only_commit,
+            CommitSeq::ZERO,
+            "read-only commit must not allocate or publish a commit sequence"
+        );
+        assert_eq!(reader.state, TransactionState::Committed);
+        assert_eq!(
+            mgr.shm.load_commit_seq(),
+            commit_seq,
+            "read-only commit must leave the shared commit epoch unchanged"
+        );
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (2, 0),
+            "read-only commit should not reload or invalidate the snapshot cache"
+        );
+
+        let mut next_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("next reader should reuse the unchanged epoch");
+        assert_eq!(
+            next_reader.snapshot,
+            Snapshot::new(commit_seq, SchemaEpoch::ZERO),
+            "next reader should see the same reusable snapshot pair"
+        );
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (3, 0),
+            "next begin should remain on the reuse path after read-only commit"
+        );
+        mgr.abort(&mut next_reader);
+    }
+
+    #[test]
     fn test_commit_releases_writer_pinned_chain_immediately_when_horizon_advances() {
         let mgr = mgr();
         let pgno = PageNumber::new(6_785).unwrap();

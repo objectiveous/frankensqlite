@@ -195,12 +195,16 @@ pub fn evaluate_certification_ratchets(
         regressed_ratchets.push("global_lower_bound".to_owned());
     }
 
-    if baseline.category_lower_bounds.iter().any(|(category, approved)| {
-        candidate
-            .category_lower_bounds
-            .get(category)
-            .is_none_or(|current| current < approved)
-    }) {
+    if baseline
+        .category_lower_bounds
+        .iter()
+        .any(|(category, approved)| {
+            candidate
+                .category_lower_bounds
+                .get(category)
+                .is_none_or(|current| current < approved)
+        })
+    {
         regressed_ratchets.push("category_lower_bounds".to_owned());
     }
 

@@ -1154,6 +1154,10 @@ impl TransactionManager {
         txn.clear_structural_pages();
 
         txn.abort();
+        txn.write_set.clear();
+        Arc::make_mut(&mut txn.write_set_data).clear();
+        txn.intent_log.clear();
+        txn.write_keys.clear();
         self.release_all_resources(txn);
 
         tracing::info!(
@@ -3601,6 +3605,22 @@ mod tests {
 
         m.abort(&mut txn);
         assert_eq!(txn.state, TransactionState::Aborted);
+        assert!(
+            txn.write_set.is_empty(),
+            "abort must discard staged page numbers"
+        );
+        assert!(
+            txn.write_set_data.is_empty(),
+            "abort must discard staged page buffers"
+        );
+        assert!(
+            txn.write_set_versions.is_empty(),
+            "abort must discard write-version metadata"
+        );
+        assert!(
+            txn.write_keys.is_empty(),
+            "abort must discard SSI write keys"
+        );
 
         // Data should not be visible to a new transaction.
         let mut txn2 = m.begin(BeginKind::Concurrent).unwrap();

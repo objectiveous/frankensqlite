@@ -166,8 +166,9 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_types::record::{
     ColumnOffset, PrecomputedSerialTypeKind, RecordProfileScope, enter_record_profile_scope,
-    parse_record, serialize_record, serialize_record_iter_with_precomputed_header_into,
-    simd_serialize_integer_record,
+    parse_record, record_iter_with_precomputed_header_exact_size, serialize_record,
+    serialize_record_iter_with_precomputed_header_into,
+    serialize_record_iter_with_precomputed_header_into_slice, simd_serialize_integer_record,
 };
 use fsqlite_types::serial_type::{
     SerialTypeClass, classify_serial_type, read_varint, serial_type_len,
@@ -184,8 +185,8 @@ use crate::{
     TableIndexMetaMap, VdbeProgram, enter_vdbe_decode_profile_stage,
     enter_vdbe_execute_profile_stage,
     jit::{
-        CompiledProgram, ConstantResultRowTemplate, FullScanSelectTemplate, InsertValueSource,
-        RowidLookupSelectTemplate, SimpleInsertTemplate, try_compile_program,
+        CompiledProgram, CompiledRecordBuilder, ConstantResultRowTemplate, FullScanSelectTemplate,
+        InsertValueSource, RowidLookupSelectTemplate, SimpleInsertTemplate, try_compile_program,
     },
     opcode_register_spans,
 };
@@ -5180,7 +5181,17 @@ fn estimate_compiled_program_size(compiled_program: &CompiledProgram) -> u64 {
         }
         CompiledProgram::SimpleInsert(template) => {
             let value_count = u64::try_from(template.value_sources.len()).unwrap_or(u64::MAX);
-            value_count.saturating_mul(32).saturating_add(96)
+            let builder_bytes = match &template.record_builder {
+                CompiledRecordBuilder::Generic => 0,
+                CompiledRecordBuilder::PrecomputedHeader(header) => {
+                    u64::try_from(header.template.len() + header.slots.len() * 8)
+                        .unwrap_or(u64::MAX)
+                }
+            };
+            value_count
+                .saturating_mul(32)
+                .saturating_add(96)
+                .saturating_add(builder_bytes)
         }
         CompiledProgram::RowidLookupSelect(template) => {
             let col_count = u64::try_from(template.column_indices.len()).unwrap_or(u64::MAX);
@@ -5369,6 +5380,69 @@ impl MakeRecordStatementLookaside {
     fn as_slice(&self) -> &[u8] {
         self.buf.as_slice()
     }
+}
+
+enum CompiledRecordWritePlan<'a> {
+    PrecomputedHeader {
+        values: &'a [SqliteValue],
+        header: &'a fsqlite_types::record::PrecomputedRecordHeader,
+        exact_size: usize,
+    },
+    Generic(fsqlite_types::record::PlannedRecordSerialization<'a>),
+}
+
+impl CompiledRecordWritePlan<'_> {
+    #[must_use]
+    fn exact_size(&self) -> usize {
+        match self {
+            Self::PrecomputedHeader { exact_size, .. } => *exact_size,
+            Self::Generic(plan) => plan.exact_size(),
+        }
+    }
+
+    #[allow(clippy::result_unit_err)]
+    fn write_into_slice(self, dst: &mut [u8]) -> std::result::Result<(), ()> {
+        match self {
+            Self::PrecomputedHeader { values, header, .. } => {
+                serialize_record_iter_with_precomputed_header_into_slice(values.iter(), header, dst)
+            }
+            Self::Generic(plan) => plan.write_into_slice(dst),
+        }
+    }
+}
+
+fn build_compiled_record_write_plan<'a>(
+    values: &'a [SqliteValue],
+    record_builder: &'a CompiledRecordBuilder,
+) -> CompiledRecordWritePlan<'a> {
+    if let CompiledRecordBuilder::PrecomputedHeader(header) = record_builder
+        && let Some(exact_size) =
+            record_iter_with_precomputed_header_exact_size(values.iter(), header)
+    {
+        return CompiledRecordWritePlan::PrecomputedHeader {
+            values,
+            header,
+            exact_size,
+        };
+    }
+
+    CompiledRecordWritePlan::Generic(fsqlite_types::record::plan_record_iter_serialization(
+        values.iter(),
+    ))
+}
+
+fn serialize_compiled_record_into_vec(
+    values: &[SqliteValue],
+    record_builder: &CompiledRecordBuilder,
+    buf: &mut Vec<u8>,
+) {
+    if let CompiledRecordBuilder::PrecomputedHeader(header) = record_builder
+        && serialize_record_iter_with_precomputed_header_into(values.iter(), header, buf)
+    {
+        return;
+    }
+
+    fsqlite_types::record::serialize_record_iter_into(values.iter(), buf);
 }
 
 /// The VDBE bytecode interpreter.
@@ -12986,7 +13060,8 @@ impl VdbeEngine {
             };
             rowid
         };
-        let record_plan = fsqlite_types::record::plan_record_iter_serialization(values.iter());
+        let record_plan =
+            build_compiled_record_write_plan(values.as_slice(), &template.record_builder);
         let payload_len = record_plan.exact_size();
         let appended_directly = if let Some(sc) = self.storage_cursors.get_mut(&template.cursor_id)
         {
@@ -13013,7 +13088,11 @@ impl VdbeEngine {
         };
         if !appended_directly {
             let mut payload_buf = self.make_record_lookaside.take_buf();
-            fsqlite_types::record::serialize_record_iter_into(values.iter(), &mut payload_buf);
+            serialize_compiled_record_into_vec(
+                values.as_slice(),
+                &template.record_builder,
+                &mut payload_buf,
+            );
             let append_result = if let Some(sc) = self.storage_cursors.get_mut(&template.cursor_id)
             {
                 let result =
@@ -16364,6 +16443,23 @@ fn payload_includes_rowid_alias(
     }
 
     matches!(payload_values.get(ipk_col_idx), Some(SqliteValue::Null))
+}
+
+#[allow(dead_code)]
+fn payload_includes_rowid_alias_lazy(
+    row_decode: &RowDecodeScratch,
+    _record: &[u8],
+    _rowid: i64,
+    ipk_col_idx: usize,
+    table_column_count: Option<usize>,
+    first_not_null_non_ipk_col_idx: Option<usize>,
+) -> bool {
+    payload_includes_rowid_alias_without_rowid(
+        row_decode,
+        ipk_col_idx,
+        table_column_count,
+        first_not_null_non_ipk_col_idx,
+    )
 }
 
 /// Resolve the rowid-alias payload shape from record-header metadata alone.
@@ -24227,6 +24323,66 @@ mod tests {
             precomputed_values,
             vec![SqliteValue::Null, SqliteValue::Integer(5)],
             "compiled INSERT must preserve MakeRecord precomputed-header IPK placeholders",
+        );
+    }
+
+    #[test]
+    fn test_compiled_record_builder_precomputed_header_matches_generic_and_logs_microbench() {
+        let header = fsqlite_types::record::PrecomputedRecordHeader::new(&[
+            fsqlite_types::record::PrecomputedSerialTypeKind::NullPlaceholder,
+            fsqlite_types::record::PrecomputedSerialTypeKind::IntegerOrNull,
+            fsqlite_types::record::PrecomputedSerialTypeKind::RealOrNull,
+        ]);
+        let builder = CompiledRecordBuilder::PrecomputedHeader(header);
+        let mut values = vec![
+            SqliteValue::Null,
+            SqliteValue::Integer(200),
+            SqliteValue::Float(2.5),
+        ];
+        let expected = serialize_record(&values);
+
+        let plan = build_compiled_record_write_plan(values.as_slice(), &builder);
+        assert_eq!(plan.exact_size(), expected.len());
+        let mut fused = vec![0; plan.exact_size()];
+        plan.write_into_slice(&mut fused)
+            .expect("precomputed record plan should write");
+        assert_eq!(fused, expected);
+
+        let mut fallback_buf = Vec::new();
+        serialize_compiled_record_into_vec(values.as_slice(), &builder, &mut fallback_buf);
+        assert_eq!(fallback_buf, expected);
+
+        let iterations = 20_000usize;
+        let mut generic_dst = Vec::new();
+        let generic_start = Instant::now();
+        for i in 0..iterations {
+            values[1] = SqliteValue::Integer(200 + i64::try_from(i % 100).unwrap_or(0));
+            let plan = fsqlite_types::record::plan_record_iter_serialization(values.iter());
+            generic_dst.resize(plan.exact_size(), 0);
+            plan.write_into_slice(generic_dst.as_mut_slice())
+                .expect("generic plan should write");
+            std::hint::black_box(&generic_dst);
+        }
+        let generic_elapsed = generic_start.elapsed();
+
+        let mut fused_dst = Vec::new();
+        let fused_start = Instant::now();
+        for i in 0..iterations {
+            values[1] = SqliteValue::Integer(200 + i64::try_from(i % 100).unwrap_or(0));
+            let plan = build_compiled_record_write_plan(values.as_slice(), &builder);
+            fused_dst.resize(plan.exact_size(), 0);
+            plan.write_into_slice(fused_dst.as_mut_slice())
+                .expect("precomputed plan should write");
+            std::hint::black_box(&fused_dst);
+        }
+        let fused_elapsed = fused_start.elapsed();
+
+        assert_eq!(fused_dst, generic_dst);
+        eprintln!(
+            "bd-q7qj6 record assembly microbench: iterations={iterations}, generic_plan_ns={}, fused_precomputed_ns={}, record_bytes={}",
+            generic_elapsed.as_nanos(),
+            fused_elapsed.as_nanos(),
+            fused_dst.len()
         );
     }
 

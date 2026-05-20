@@ -266,7 +266,11 @@ fn g1_group_commit_ordering_2t() {
 
     assert!(integrity_ok, "[G1] integrity_check failed");
     for t in &threads {
-        assert_eq!(t.ops_completed, ops, "[G1] thread {} didn't complete all ops", t.thread_id);
+        assert_eq!(
+            t.ops_completed, ops,
+            "[G1] thread {} didn't complete all ops",
+            t.thread_id
+        );
     }
 }
 
@@ -349,7 +353,11 @@ fn g2_group_commit_ordering_4t() {
 
     assert!(integrity_ok, "[G2] integrity_check failed");
     for t in &threads {
-        assert_eq!(t.ops_completed, ops, "[G2] thread {} didn't complete all ops", t.thread_id);
+        assert_eq!(
+            t.ops_completed, ops,
+            "[G2] thread {} didn't complete all ops",
+            t.thread_id
+        );
     }
 }
 
@@ -505,7 +513,12 @@ fn g4_group_commit_crash_recovery() {
                 let row_id = base + batch_id * batch_size + i;
                 conn.execute(
                     "INSERT INTO gc_bench (id, thread_id, batch_id, val) VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![row_id as i64, tid as i64, batch_id as i64, (row_id * 7) as i64],
+                    rusqlite::params![
+                        row_id as i64,
+                        tid as i64,
+                        batch_id as i64,
+                        (row_id * 7) as i64
+                    ],
                 )
                 .expect("insert");
             }
@@ -689,11 +702,7 @@ fn g6_group_commit_metrics_evidence() {
     let total_wall_ns = wall_start.elapsed().as_nanos() as u64;
 
     let count = fsqlite_extract_count(&conn);
-    assert_eq!(
-        count,
-        n_threads as u64 * ops,
-        "[G6] row count mismatch"
-    );
+    assert_eq!(count, n_threads as u64 * ops, "[G6] row count mismatch");
 
     let snap = GLOBAL_CONSOLIDATION_METRICS.snapshot();
 

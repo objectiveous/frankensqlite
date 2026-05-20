@@ -157,13 +157,11 @@ fn int_col(rows: &[Row], col: usize) -> Vec<i64> {
         .collect()
 }
 
-const NOT_EXISTS_PROBE_SQL: &str =
-    "SELECT message_id FROM message_metrics \
+const NOT_EXISTS_PROBE_SQL: &str = "SELECT message_id FROM message_metrics \
      WHERE NOT EXISTS (SELECT 1 FROM messages WHERE messages.id = message_metrics.message_id) \
      ORDER BY message_id";
 
-const NOT_IN_PROBE_SQL: &str =
-    "SELECT message_id FROM message_metrics \
+const NOT_IN_PROBE_SQL: &str = "SELECT message_id FROM message_metrics \
      WHERE message_id NOT IN (SELECT id FROM messages) \
      ORDER BY message_id";
 
@@ -290,7 +288,11 @@ fn dynamic_in_delete_with_positional_placeholders_deletes_exactly_bound_ids() {
         "DELETE FROM message_metrics WHERE message_id IN ({})",
         positional_placeholders(to_delete.len())
     );
-    let params: Vec<SqliteValue> = to_delete.iter().copied().map(SqliteValue::Integer).collect();
+    let params: Vec<SqliteValue> = to_delete
+        .iter()
+        .copied()
+        .map(SqliteValue::Integer)
+        .collect();
     let _ = conn.query_with_params(&sql, &params).unwrap();
 
     let remaining = conn
@@ -310,7 +312,11 @@ fn dynamic_in_delete_at_chunk_size_256() {
         "DELETE FROM message_metrics WHERE message_id IN ({})",
         positional_placeholders(to_delete.len())
     );
-    let params: Vec<SqliteValue> = to_delete.iter().copied().map(SqliteValue::Integer).collect();
+    let params: Vec<SqliteValue> = to_delete
+        .iter()
+        .copied()
+        .map(SqliteValue::Integer)
+        .collect();
     let _ = conn.query_with_params(&sql, &params).unwrap();
 
     let remaining = conn.query("SELECT COUNT(*) FROM message_metrics").unwrap();

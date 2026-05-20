@@ -36,8 +36,8 @@ fn p1_swarm_runs_with_minimal_config() {
         &format!("--artifact-root={}", artifact_root.display()),
     ]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value =
-        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("invalid JSON output: {e}\n{stdout}"));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("invalid JSON output: {e}\n{stdout}"));
     assert!(
         parsed.get("schema").is_some(),
         "report must have schema field"
@@ -184,8 +184,17 @@ fn p5_jsonl_lines_contain_required_fields() {
             }
             let content = std::fs::read_to_string(&jsonl).unwrap();
             let required = [
-                "ts_unix_nanos", "level", "target", "run_id", "trace_id",
-                "workspace_id", "host", "process_id", "op_id", "op_type", "outcome",
+                "ts_unix_nanos",
+                "level",
+                "target",
+                "run_id",
+                "trace_id",
+                "workspace_id",
+                "host",
+                "process_id",
+                "op_id",
+                "op_type",
+                "outcome",
             ];
             for line in content.lines().filter(|l| !l.trim().is_empty()) {
                 let parsed: serde_json::Value = serde_json::from_str(line)

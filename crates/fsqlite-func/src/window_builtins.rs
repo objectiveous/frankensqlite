@@ -1691,10 +1691,8 @@ mod tests {
 
     #[test]
     fn test_cume_dist_null_peers_share_same_peer_group() {
-        let results = run_window_two_pass(
-            &CumeDistFunc,
-            &[vec![null()], vec![null()], vec![int(1)]],
-        );
+        let results =
+            run_window_two_pass(&CumeDistFunc, &[vec![null()], vec![null()], vec![int(1)]]);
         assert_float_near(&results[0], 2.0 / 3.0);
         assert_float_near(&results[1], 2.0 / 3.0);
         assert_float_near(&results[2], 1.0);

@@ -7,7 +7,7 @@
 //! contentless-unindexed / insttoken / locale blob / tokendata configuration.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::ScalarFunction;
@@ -103,6 +103,8 @@ const FTS5_DATA_DLI_MASK: u64 = (1 << FTS5_DATA_DLI_BITS) - 1;
 const FTS5_DATA_ID_LIMIT: u64 = 1 << FTS5_DATA_ID_BITS;
 const FTS5_IDX_MAX_BTREE_PAGE: u32 = (1 << FTS5_DATA_PAGE_BITS) - 1;
 const FTS5_MAIN_PREFIX_BYTE: u8 = b'0';
+const FTS5_SEGMENT_CHECKSUM_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FTS5_SEGMENT_CHECKSUM_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fts5ConfigRecord {
@@ -1544,6 +1546,304 @@ impl Fts5MergeScheduler {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5LazyPostings {
+    pub entries: Vec<Fts5DoclistEntry>,
+}
+
+impl Fts5LazyPostings {
+    #[must_use]
+    pub fn new(entries: Vec<Fts5DoclistEntry>) -> Self {
+        Self { entries }
+    }
+
+    #[must_use]
+    pub fn rowids(&self) -> Vec<u64> {
+        self.entries.iter().map(|entry| entry.rowid).collect()
+    }
+
+    #[must_use]
+    pub fn union_rowids(&self, other: &Self) -> Vec<u64> {
+        self.entries
+            .iter()
+            .chain(&other.entries)
+            .map(|entry| entry.rowid)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    #[must_use]
+    pub fn intersect_rowids(&self, other: &Self) -> Vec<u64> {
+        let right: BTreeSet<_> = other.entries.iter().map(|entry| entry.rowid).collect();
+        self.entries
+            .iter()
+            .map(|entry| entry.rowid)
+            .filter(|rowid| right.contains(rowid))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn phrase_rowids(&self, next: &Self) -> Vec<u64> {
+        self.rowids_with_position_match(next, |left, right| right == left.saturating_add(1))
+    }
+
+    #[must_use]
+    pub fn near_rowids(&self, other: &Self, distance: u32) -> Vec<u64> {
+        self.rowids_with_position_match(other, |left, right| left.abs_diff(right) <= distance)
+    }
+
+    fn rowids_with_position_match(
+        &self,
+        other: &Self,
+        matches_positions: impl Fn(u32, u32) -> bool,
+    ) -> Vec<u64> {
+        let mut right_by_rowid: BTreeMap<u64, &Fts5DoclistEntry> = BTreeMap::new();
+        for entry in &other.entries {
+            right_by_rowid.insert(entry.rowid, entry);
+        }
+
+        let mut rowids = Vec::new();
+        for left in &self.entries {
+            let Some(right) = right_by_rowid.get(&left.rowid) else {
+                continue;
+            };
+            if postings_have_position_match(left, right, &matches_positions) {
+                rowids.push(left.rowid);
+            }
+        }
+        rowids
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5LazyTermMatch {
+    pub term: Vec<u8>,
+    pub postings: Fts5LazyPostings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5SegmentIntegrityReport {
+    pub segment_count: usize,
+    pub leaf_page_count: usize,
+    pub idx_row_count: usize,
+    pub term_count: usize,
+    pub checksum: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Fts5SegmentRowSet<'a> {
+    data_rows: &'a [Fts5DataRow],
+    idx_rows: &'a [Fts5IdxRow],
+}
+
+impl<'a> Fts5SegmentRowSet<'a> {
+    #[must_use]
+    pub const fn new(data_rows: &'a [Fts5DataRow], idx_rows: &'a [Fts5IdxRow]) -> Self {
+        Self {
+            data_rows,
+            idx_rows,
+        }
+    }
+
+    #[must_use]
+    pub fn reader(&self, segment: &'a Fts5StructureSegment) -> Fts5SegmentReader<'a> {
+        Fts5SegmentReader {
+            segment,
+            data_rows: self.data_rows,
+            idx_rows: self.idx_rows,
+        }
+    }
+
+    pub fn integrity_report(
+        &self,
+        structure: &Fts5StructureRecord,
+    ) -> Result<Fts5SegmentIntegrityReport> {
+        let mut seen_segids = BTreeSet::new();
+        let mut known_segids = BTreeSet::new();
+        let mut leaf_page_count = 0;
+        let mut term_count = 0;
+        let mut checksum = FTS5_SEGMENT_CHECKSUM_OFFSET;
+
+        for level in &structure.levels {
+            for segment in &level.segments {
+                if !seen_segids.insert(segment.segid) {
+                    return Err(fts5_data_error("duplicate segment id in structure"));
+                }
+                known_segids.insert(segment.segid);
+                let reader = self.reader(segment);
+                for pgno in segment.pgno_first..=segment.pgno_last {
+                    let row = reader
+                        .data_row(pgno)
+                        .ok_or_else(|| fts5_data_error("missing segment leaf page"))?;
+                    checksum = fts5_checksum_i64(checksum, row.id);
+                    checksum = fts5_checksum_bytes(checksum, &row.block);
+                    let leaf = Fts5SegmentLeaf::decode(&row.block)?;
+                    term_count += leaf.terms.len();
+                    leaf_page_count += 1;
+                }
+            }
+        }
+
+        let mut idx_row_count = 0;
+        for row in self.idx_rows {
+            if !known_segids.contains(&row.segid) {
+                return Err(fts5_data_error("%_idx row references unknown segment"));
+            }
+            checksum = fts5_checksum_u32(checksum, row.segid);
+            checksum = fts5_checksum_bytes(checksum, &row.term);
+            checksum = fts5_checksum_u32(checksum, row.btree_page);
+            checksum = fts5_checksum_u8(checksum, u8::from(row.has_doclist_index));
+            idx_row_count += 1;
+        }
+
+        for row in self.data_rows {
+            match Fts5DataRowid::decode(row.id)? {
+                Fts5DataRowid::SegmentLeaf { segid, .. }
+                | Fts5DataRowid::DoclistIndex { segid, .. }
+                | Fts5DataRowid::Tombstone { segid, .. } => {
+                    if !known_segids.contains(&segid) {
+                        return Err(fts5_data_error("%_data row references unknown segment"));
+                    }
+                }
+                Fts5DataRowid::Averages | Fts5DataRowid::Structure => {}
+            }
+        }
+
+        Ok(Fts5SegmentIntegrityReport {
+            segment_count: seen_segids.len(),
+            leaf_page_count,
+            idx_row_count,
+            term_count,
+            checksum,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Fts5SegmentReader<'a> {
+    segment: &'a Fts5StructureSegment,
+    data_rows: &'a [Fts5DataRow],
+    idx_rows: &'a [Fts5IdxRow],
+}
+
+impl<'a> Fts5SegmentReader<'a> {
+    #[must_use]
+    pub const fn segment(&self) -> &'a Fts5StructureSegment {
+        self.segment
+    }
+
+    pub fn leaf(&self, pgno: u32) -> Result<Option<Fts5SegmentLeaf>> {
+        if pgno < self.segment.pgno_first || pgno > self.segment.pgno_last {
+            return Err(fts5_data_error("segment leaf page outside structure range"));
+        }
+        self.data_row(pgno)
+            .map(|row| Fts5SegmentLeaf::decode(&row.block))
+            .transpose()
+    }
+
+    #[must_use]
+    pub fn term_cursor(&self) -> Fts5SegmentTermCursor<'a> {
+        self.term_cursor_from(self.segment.pgno_first)
+    }
+
+    #[must_use]
+    pub fn term_cursor_from(&self, pgno: u32) -> Fts5SegmentTermCursor<'a> {
+        Fts5SegmentTermCursor {
+            reader: *self,
+            next_pgno: pgno,
+            current_terms: Vec::new().into_iter(),
+        }
+    }
+
+    pub fn exact_postings(&self, term: &[u8]) -> Result<Option<Fts5LazyPostings>> {
+        let mut cursor = self.term_cursor_from(self.candidate_page(term));
+        for entry in &mut cursor {
+            let entry = entry?;
+            match entry.term.as_slice().cmp(term) {
+                std::cmp::Ordering::Equal => {
+                    return Ok(Some(Fts5LazyPostings::new(entry.doclist.entries)));
+                }
+                std::cmp::Ordering::Greater => return Ok(None),
+                std::cmp::Ordering::Less => {}
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn prefix_matches(&self, prefix: &[u8]) -> Result<Vec<Fts5LazyTermMatch>> {
+        let mut matches = Vec::new();
+        let mut cursor = self.term_cursor_from(self.candidate_page(prefix));
+        for entry in &mut cursor {
+            let entry = entry?;
+            if entry.term.starts_with(prefix) {
+                matches.push(Fts5LazyTermMatch {
+                    term: entry.term,
+                    postings: Fts5LazyPostings::new(entry.doclist.entries),
+                });
+                continue;
+            }
+            if !matches.is_empty() || entry.term.as_slice() > prefix {
+                break;
+            }
+        }
+        Ok(matches)
+    }
+
+    fn candidate_page(&self, term: &[u8]) -> u32 {
+        self.idx_rows
+            .iter()
+            .filter(|row| row.segid == self.segment.segid && row.term.as_slice() <= term)
+            .max_by(|left, right| left.term.cmp(&right.term))
+            .map_or(self.segment.pgno_first, |row| {
+                row.btree_page
+                    .clamp(self.segment.pgno_first, self.segment.pgno_last)
+            })
+    }
+
+    fn data_row(&self, pgno: u32) -> Option<&'a Fts5DataRow> {
+        self.data_rows.iter().find(|row| {
+            matches!(
+                Fts5DataRowid::decode(row.id),
+                Ok(Fts5DataRowid::SegmentLeaf { segid, pgno: row_pgno })
+                    if segid == self.segment.segid && row_pgno == pgno
+            )
+        })
+    }
+}
+
+pub struct Fts5SegmentTermCursor<'a> {
+    reader: Fts5SegmentReader<'a>,
+    next_pgno: u32,
+    current_terms: std::vec::IntoIter<Fts5SegmentTerm>,
+}
+
+impl Iterator for Fts5SegmentTermCursor<'_> {
+    type Item = Result<Fts5SegmentTerm>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(term) = self.current_terms.next() {
+                return Some(Ok(term));
+            }
+            if self.next_pgno > self.reader.segment.pgno_last {
+                return None;
+            }
+
+            match self.reader.leaf(self.next_pgno) {
+                Ok(Some(leaf)) => {
+                    self.next_pgno = self.next_pgno.saturating_add(1);
+                    self.current_terms = leaf.terms.into_iter();
+                }
+                Ok(None) => {
+                    return Some(Err(fts5_data_error("missing segment leaf page")));
+                }
+                Err(err) => return Some(Err(err)),
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fts5ShadowRows {
     pub data: Vec<Fts5DataRow>,
@@ -1864,6 +2164,52 @@ fn read_be_u64(bytes: &[u8]) -> u64 {
 
 fn write_be_u64(bytes: &mut [u8], value: u64) {
     bytes[..8].copy_from_slice(&value.to_be_bytes());
+}
+
+fn fts5_checksum_u8(checksum: u64, value: u8) -> u64 {
+    (checksum ^ u64::from(value)).wrapping_mul(FTS5_SEGMENT_CHECKSUM_PRIME)
+}
+
+fn fts5_checksum_bytes(mut checksum: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        checksum = fts5_checksum_u8(checksum, *byte);
+    }
+    checksum
+}
+
+fn fts5_checksum_u32(checksum: u64, value: u32) -> u64 {
+    fts5_checksum_bytes(checksum, &value.to_be_bytes())
+}
+
+fn fts5_checksum_i64(checksum: u64, value: i64) -> u64 {
+    fts5_checksum_bytes(checksum, &value.to_be_bytes())
+}
+
+fn postings_have_position_match(
+    left: &Fts5DoclistEntry,
+    right: &Fts5DoclistEntry,
+    matches_positions: &impl Fn(u32, u32) -> bool,
+) -> bool {
+    for left_column in &left.poslist.columns {
+        let Some(right_column) = right
+            .poslist
+            .columns
+            .iter()
+            .find(|column| column.column == left_column.column)
+        else {
+            continue;
+        };
+        for left_offset in &left_column.offsets {
+            if right_column
+                .offsets
+                .iter()
+                .any(|right_offset| matches_positions(*left_offset, *right_offset))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 impl Fts5Config {
@@ -6709,6 +7055,18 @@ mod tests {
 
     #[allow(dead_code)]
     #[derive(Debug)]
+    struct Fts5SegmentReaderStructure {
+        cursor_terms: Vec<Vec<u8>>,
+        exact_brown_rowids: Vec<u64>,
+        prefix_ru_terms: Vec<Vec<u8>>,
+        union_brown_fox: Vec<u64>,
+        phrase_brown_fox: Vec<u64>,
+        near_brown_fox: Vec<u64>,
+        integrity: Fts5SegmentIntegrityReport,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
     struct Fts5ShadowRowsStructure {
         data: Vec<(i64, Vec<u8>)>,
         config: Vec<(String, String)>,
@@ -7384,6 +7742,68 @@ mod tests {
         leaf
     }
 
+    fn sample_lazy_segment_rows() -> (Fts5StructureRecord, Vec<Fts5DataRow>, Vec<Fts5IdxRow>) {
+        let first_leaf = Fts5SegmentLeaf::new(vec![
+            Fts5SegmentTerm::new(
+                b"brown".to_vec(),
+                Fts5Doclist::new(vec![
+                    Fts5DoclistEntry::new(
+                        1,
+                        Fts5Poslist::new(false, vec![Fts5ColumnPositions::new(0, vec![1])]),
+                    ),
+                    Fts5DoclistEntry::new(
+                        4,
+                        Fts5Poslist::new(false, vec![Fts5ColumnPositions::new(0, vec![3])]),
+                    ),
+                ]),
+            ),
+            Fts5SegmentTerm::new(
+                b"fox".to_vec(),
+                Fts5Doclist::new(vec![
+                    Fts5DoclistEntry::new(
+                        1,
+                        Fts5Poslist::new(false, vec![Fts5ColumnPositions::new(0, vec![2])]),
+                    ),
+                    Fts5DoclistEntry::new(
+                        3,
+                        Fts5Poslist::new(false, vec![Fts5ColumnPositions::new(0, vec![0])]),
+                    ),
+                ]),
+            ),
+        ]);
+        let second_leaf = Fts5SegmentLeaf::new(vec![
+            Fts5SegmentTerm::new(
+                b"rust".to_vec(),
+                Fts5Doclist::new(vec![Fts5DoclistEntry::new(
+                    7,
+                    Fts5Poslist::new(false, vec![Fts5ColumnPositions::new(0, vec![1, 4])]),
+                )]),
+            ),
+            Fts5SegmentTerm::new(
+                b"rusty".to_vec(),
+                Fts5Doclist::new(vec![Fts5DoclistEntry::new(
+                    20,
+                    Fts5Poslist::new(false, vec![Fts5ColumnPositions::new(1, vec![0])]),
+                )]),
+            ),
+        ]);
+        let structure = Fts5StructureRecord {
+            cookie: 0,
+            write_counter: 2,
+            origin_counter: 0,
+            levels: vec![Fts5StructureLevel::new(
+                0,
+                vec![Fts5StructureSegment::new(5, 1, 2)],
+            )],
+        };
+        let data_rows = vec![
+            first_leaf.to_data_row(5, 1).unwrap(),
+            second_leaf.to_data_row(5, 2).unwrap(),
+        ];
+        let idx_rows = vec![Fts5IdxRow::new(5, b"rust".to_vec(), 2, false)];
+        (structure, data_rows, idx_rows)
+    }
+
     #[test]
     fn test_fts5_idx_and_data_rowid_codecs_round_trip() {
         let idx = Fts5IdxRow::new(7, b"rusty".to_vec(), 3, true);
@@ -7949,6 +8369,163 @@ mod tests {
             merge_inputs: 4,
         },
     ),
+}"#
+        );
+    }
+
+    #[test]
+    fn test_fts5_lazy_segment_reader_exact_prefix_and_merge_primitives() {
+        let (structure, data_rows, idx_rows) = sample_lazy_segment_rows();
+        let row_set = Fts5SegmentRowSet::new(&data_rows, &idx_rows);
+        let reader = row_set.reader(&structure.levels[0].segments[0]);
+
+        let terms: Vec<Vec<u8>> = reader
+            .term_cursor()
+            .map(|term| term.unwrap().term)
+            .collect();
+        assert_eq!(
+            terms,
+            vec![
+                b"brown".to_vec(),
+                b"fox".to_vec(),
+                b"rust".to_vec(),
+                b"rusty".to_vec()
+            ]
+        );
+
+        let brown = reader.exact_postings(b"brown").unwrap().unwrap();
+        let fox = reader.exact_postings(b"fox").unwrap().unwrap();
+        assert_eq!(brown.rowids(), vec![1, 4]);
+        assert_eq!(fox.rowids(), vec![1, 3]);
+        assert_eq!(brown.union_rowids(&fox), vec![1, 3, 4]);
+        assert_eq!(brown.intersect_rowids(&fox), vec![1]);
+        assert_eq!(brown.phrase_rowids(&fox), vec![1]);
+        assert_eq!(brown.near_rowids(&fox, 2), vec![1]);
+
+        let prefix_terms: Vec<Vec<u8>> = reader
+            .prefix_matches(b"ru")
+            .unwrap()
+            .into_iter()
+            .map(|term| term.term)
+            .collect();
+        assert_eq!(prefix_terms, vec![b"rust".to_vec(), b"rusty".to_vec()]);
+    }
+
+    #[test]
+    fn test_fts5_segment_integrity_rejects_missing_and_orphan_rows() {
+        let (structure, mut data_rows, idx_rows) = sample_lazy_segment_rows();
+        let row_set = Fts5SegmentRowSet::new(&data_rows[..1], &idx_rows);
+        assert!(
+            row_set
+                .integrity_report(&structure)
+                .expect_err("missing second leaf should fail")
+                .to_string()
+                .contains("missing segment leaf")
+        );
+
+        data_rows.push(Fts5SegmentLeaf::new(Vec::new()).to_data_row(6, 1).unwrap());
+        let row_set = Fts5SegmentRowSet::new(&data_rows, &idx_rows);
+        assert!(
+            row_set
+                .integrity_report(&structure)
+                .expect_err("orphan segment row should fail")
+                .to_string()
+                .contains("unknown segment")
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_lazy_segment_reader() {
+        let (structure, data_rows, idx_rows) = sample_lazy_segment_rows();
+        let row_set = Fts5SegmentRowSet::new(&data_rows, &idx_rows);
+        let reader = row_set.reader(&structure.levels[0].segments[0]);
+        let brown = reader.exact_postings(b"brown").unwrap().unwrap();
+        let fox = reader.exact_postings(b"fox").unwrap().unwrap();
+        let snapshot = Fts5SegmentReaderStructure {
+            cursor_terms: reader
+                .term_cursor()
+                .map(|term| term.unwrap().term)
+                .collect(),
+            exact_brown_rowids: brown.rowids(),
+            prefix_ru_terms: reader
+                .prefix_matches(b"ru")
+                .unwrap()
+                .into_iter()
+                .map(|term| term.term)
+                .collect(),
+            union_brown_fox: brown.union_rowids(&fox),
+            phrase_brown_fox: brown.phrase_rowids(&fox),
+            near_brown_fox: brown.near_rowids(&fox, 2),
+            integrity: row_set.integrity_report(&structure).unwrap(),
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5SegmentReaderStructure {
+    cursor_terms: [
+        [
+            98,
+            114,
+            111,
+            119,
+            110,
+        ],
+        [
+            102,
+            111,
+            120,
+        ],
+        [
+            114,
+            117,
+            115,
+            116,
+        ],
+        [
+            114,
+            117,
+            115,
+            116,
+            121,
+        ],
+    ],
+    exact_brown_rowids: [
+        1,
+        4,
+    ],
+    prefix_ru_terms: [
+        [
+            114,
+            117,
+            115,
+            116,
+        ],
+        [
+            114,
+            117,
+            115,
+            116,
+            121,
+        ],
+    ],
+    union_brown_fox: [
+        1,
+        3,
+        4,
+    ],
+    phrase_brown_fox: [
+        1,
+    ],
+    near_brown_fox: [
+        1,
+    ],
+    integrity: Fts5SegmentIntegrityReport {
+        segment_count: 1,
+        leaf_page_count: 2,
+        idx_row_count: 1,
+        term_count: 4,
+        checksum: 3861481483356166922,
+    },
 }"#
         );
     }

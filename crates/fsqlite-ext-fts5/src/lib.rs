@@ -828,22 +828,27 @@ fn take_tokenizer_option<'a>(parts: &'a [String], index: &mut usize) -> Option<(
     Some((raw.as_str(), value.as_str()))
 }
 
-fn unicode61_tokenizer_from_args(args: &[String]) -> Unicode61Tokenizer {
+fn unicode61_tokenizer_from_args(args: &[String]) -> Option<Unicode61Tokenizer> {
     let mut tokenizer = Unicode61Tokenizer::new();
     let mut index = 0;
 
-    while let Some((key, value)) = take_tokenizer_option(args, &mut index) {
+    while index < args.len() {
+        let (key, value) = take_tokenizer_option(args, &mut index)?;
         match key.to_ascii_lowercase().as_str() {
             "tokenchars" | "token_chars" => value.clone_into(&mut tokenizer.token_chars),
             "separators" => value.clone_into(&mut tokenizer.separators),
             "remove_diacritics" => {
-                tokenizer.remove_diacritics = value.parse().unwrap_or(tokenizer.remove_diacritics);
+                let remove_diacritics = value.parse::<u8>().ok()?;
+                if remove_diacritics > 2 {
+                    return None;
+                }
+                tokenizer.remove_diacritics = remove_diacritics;
             }
-            _ => {}
+            _ => return None,
         }
     }
 
-    tokenizer
+    Some(tokenizer)
 }
 
 fn trigram_tokenizer_from_args(args: &[String]) -> Option<TrigramTokenizer> {
@@ -874,7 +879,7 @@ fn create_tokenizer_from_parts(parts: &[String]) -> Option<Box<dyn Fts5Tokenizer
     let args = &parts[1..];
 
     match name.as_str() {
-        "unicode61" => Some(Box::new(unicode61_tokenizer_from_args(args))),
+        "unicode61" => Some(Box::new(unicode61_tokenizer_from_args(args)?)),
         "ascii" => Some(Box::new(AsciiTokenizer)),
         "porter" => {
             let inner = if args.is_empty() {
@@ -3605,6 +3610,13 @@ mod tests {
         accent_matches: Vec<i64>,
     }
 
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5Unicode61OptionValidationStructure {
+        accepted_terms: Vec<String>,
+        rejected_specs: Vec<String>,
+    }
+
     struct TokendataTestTokenizer;
 
     impl Fts5Tokenizer for TokendataTestTokenizer {
@@ -3750,6 +3762,60 @@ mod tests {
         let tokens = tok.tokenize("café résumé naïve");
         let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
         assert_eq!(terms, vec!["cafe", "resume", "naive"]);
+    }
+
+    #[test]
+    fn test_create_tokenizer_unicode61_rejects_invalid_options() {
+        for spec in [
+            "unicode61 unknown 1",
+            "unicode61 remove_diacritics maybe",
+            "unicode61 remove_diacritics 3",
+            "unicode61 tokenchars",
+        ] {
+            assert!(
+                create_tokenizer(spec).is_none(),
+                "invalid unicode61 spec should fail: {spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_unicode61_option_validation() {
+        let tokenizer = create_tokenizer("unicode61 tokenchars=-_ remove_diacritics=2").unwrap();
+        let accepted_terms = tokenizer
+            .tokenize("café-file_name")
+            .into_iter()
+            .map(|token| token.term)
+            .collect();
+        let rejected_specs = [
+            "unicode61 bogus 1",
+            "unicode61 remove_diacritics=-1",
+            "unicode61 remove_diacritics=4",
+            "unicode61 separators",
+        ]
+        .into_iter()
+        .filter(|spec| create_tokenizer(spec).is_none())
+        .map(str::to_owned)
+        .collect();
+        let snapshot = Fts5Unicode61OptionValidationStructure {
+            accepted_terms,
+            rejected_specs,
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5Unicode61OptionValidationStructure {
+    accepted_terms: [
+        "cafe-file_name",
+    ],
+    rejected_specs: [
+        "unicode61 bogus 1",
+        "unicode61 remove_diacritics=-1",
+        "unicode61 remove_diacritics=4",
+        "unicode61 separators",
+    ],
+}"#
+        );
     }
 
     #[test]

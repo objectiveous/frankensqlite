@@ -3,8 +3,8 @@
 //! Provides: tokenizer API (unicode61, ascii, porter, trigram), inverted index,
 //! boolean query parsing (implicit AND, OR, NOT binary-only, phrase, prefix,
 //! NEAR, column filter, caret), BM25 ranking, FTS5 virtual table with content
-//! modes, and secure-delete / contentless-delete / insttoken / locale blob / tokendata
-//! configuration.
+//! modes, and secure-delete / contentless-delete / contentless-unindexed /
+//! insttoken / locale blob / tokendata configuration.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -68,6 +68,7 @@ pub struct Fts5Config {
     secure_delete: bool,
     content_mode: ContentMode,
     contentless_delete: bool,
+    contentless_unindexed: bool,
     columnsize: bool,
     detail: DetailMode,
     insttoken: bool,
@@ -82,6 +83,7 @@ impl Fts5Config {
             secure_delete: false,
             content_mode,
             contentless_delete: false,
+            contentless_unindexed: false,
             columnsize: true,
             detail: DetailMode::Full,
             insttoken: false,
@@ -98,6 +100,11 @@ impl Fts5Config {
     #[must_use]
     pub const fn contentless_delete_enabled(self) -> bool {
         self.contentless_delete
+    }
+
+    #[must_use]
+    pub const fn contentless_unindexed_enabled(self) -> bool {
+        self.contentless_unindexed
     }
 
     #[must_use]
@@ -179,6 +186,25 @@ impl Fts5Config {
             _ => false,
         }
     }
+}
+
+fn validate_contentless_options(config: Fts5Config) -> Result<()> {
+    if config.contentless_delete && config.content_mode != ContentMode::Contentless {
+        return Err(FrankenError::function_error(
+            "contentless_delete=1 requires a contentless table",
+        ));
+    }
+    if config.contentless_delete && !config.columnsize {
+        return Err(FrankenError::function_error(
+            "contentless_delete=1 is incompatible with columnsize=0",
+        ));
+    }
+    if config.contentless_unindexed && config.content_mode != ContentMode::Contentless {
+        return Err(FrankenError::function_error(
+            "contentless_unindexed=1 requires a contentless table",
+        ));
+    }
+    Ok(())
 }
 
 impl Default for Fts5Config {
@@ -2388,8 +2414,29 @@ impl Fts5Table {
         );
         self.index_document_with_tokenizer(rowid, &column_values, tokenizer);
         self.next_rowid = self.next_rowid.max(rowid.saturating_add(1));
-        self.documents.insert(rowid, column_values);
+        let stored_values = self.content_values_for_storage(&column_values);
+        self.documents.insert(rowid, stored_values);
         debug!(rowid, "fts5: indexed document");
+    }
+
+    fn content_values_for_storage(&self, column_values: &[String]) -> Vec<String> {
+        if self.config.content_mode != ContentMode::Contentless {
+            return column_values.to_vec();
+        }
+
+        column_values
+            .iter()
+            .enumerate()
+            .map(|(column, value)| {
+                if self.config.contentless_unindexed
+                    && matches!(self.indexed_columns.get(column), Some(false))
+                {
+                    value.clone()
+                } else {
+                    String::new()
+                }
+            })
+            .collect()
     }
 
     fn store_document_with_tokenizer(
@@ -2696,8 +2743,33 @@ impl VirtualTable for Fts5Table {
                                 config.content_mode = ContentMode::Stored;
                             }
                         }
-                        "contentless_delete" | "secure_delete" | "secure-delete" => {
-                            let _ = config.apply_control_command(&format!("{key}={value}"));
+                        "contentless_delete" => {
+                            config.contentless_delete = parse_columnsize_option(
+                                value_unquoted.as_str(),
+                            )
+                            .ok_or_else(|| {
+                                FrankenError::function_error(
+                                    "fts5: contentless_delete must be 0 or 1",
+                                )
+                            })?;
+                        }
+                        "secure_delete" | "secure-delete" => {
+                            config.secure_delete = parse_bool_like(value_unquoted.as_str())
+                                .ok_or_else(|| {
+                                    FrankenError::function_error(
+                                        "fts5: secure_delete must be a boolean value",
+                                    )
+                                })?;
+                        }
+                        "contentless_unindexed" => {
+                            config.contentless_unindexed = parse_columnsize_option(
+                                value_unquoted.as_str(),
+                            )
+                            .ok_or_else(|| {
+                                FrankenError::function_error(
+                                    "fts5: contentless_unindexed must be 0 or 1",
+                                )
+                            })?;
                         }
                         "columnsize" => {
                             config.columnsize = parse_columnsize_option(value_unquoted.as_str())
@@ -2758,6 +2830,8 @@ impl VirtualTable for Fts5Table {
             }
         }
 
+        validate_contentless_options(config)?;
+
         if columns.is_empty() {
             columns.push("content".to_owned());
             indexed_columns.push(true);
@@ -2771,6 +2845,7 @@ impl VirtualTable for Fts5Table {
             content_mode = ?config.content_mode,
             secure_delete = config.secure_delete,
             contentless_delete = config.contentless_delete,
+            contentless_unindexed = config.contentless_unindexed,
             detail = ?config.detail_mode(),
             insttoken = config.insttoken,
             locale = config.locale,
@@ -3465,6 +3540,16 @@ mod tests {
         rows: Vec<(i64, Vec<String>)>,
         upper_matches: Vec<i64>,
         lower_matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5ContentlessUnindexedStructure {
+        config: Fts5Config,
+        indexed_columns: Vec<bool>,
+        rows: Vec<(i64, Vec<String>)>,
+        indexed_matches: Vec<i64>,
+        unindexed_matches: Vec<i64>,
     }
 
     struct TokendataTestTokenizer;
@@ -4325,7 +4410,7 @@ mod tests {
                 "body UNINDEXED",
                 "tokenize='porter'",
                 "content=''",
-                "contentless_delete=1",
+                "contentless_unindexed=1",
                 "columnsize=0",
                 "detail='column'",
                 "prefix='2 3'",
@@ -4338,7 +4423,7 @@ mod tests {
         assert_eq!(vtab.columns(), &["title", "body"]);
         assert_eq!(vtab.tokenizer_name, "porter");
         assert_eq!(vtab.config.content_mode(), ContentMode::Contentless);
-        assert!(vtab.config.contentless_delete_enabled());
+        assert!(vtab.config.contentless_unindexed_enabled());
         assert!(!vtab.config.columnsize_enabled());
         assert_eq!(vtab.config.detail_mode(), DetailMode::Column);
         assert!(vtab.config.insttoken_enabled());
@@ -4350,6 +4435,26 @@ mod tests {
         assert_eq!(vtab.index().detail_mode(), DetailMode::Column);
         assert!(vtab.index().tracks_prefix_length(2));
         assert!(vtab.index().tracks_prefix_length(3));
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_accepts_valid_contentless_delete() {
+        let cx = Cx::new();
+        let vtab = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "body",
+                "content=''",
+                "contentless_delete=1",
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(vtab.config.content_mode(), ContentMode::Contentless);
+        assert!(vtab.config.contentless_delete_enabled());
     }
 
     #[test]
@@ -4386,6 +4491,112 @@ mod tests {
         let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "columnsize=2"])
             .expect_err("invalid columnsize should fail");
         assert!(err.to_string().contains("columnsize must be 0 or 1"));
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_invalid_contentless_unindexed() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "content=''",
+                "contentless_unindexed=true",
+            ],
+        )
+        .expect_err("invalid contentless_unindexed should fail");
+        assert!(
+            err.to_string()
+                .contains("contentless_unindexed must be 0 or 1")
+        );
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_invalid_contentless_delete() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "content=''",
+                "contentless_delete=maybe",
+            ],
+        )
+        .expect_err("invalid contentless_delete should fail");
+        assert!(
+            err.to_string()
+                .contains("contentless_delete must be 0 or 1")
+        );
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_invalid_secure_delete() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "docs", "title", "secure-delete=maybe"],
+        )
+        .expect_err("invalid secure-delete should fail");
+        assert!(
+            err.to_string()
+                .contains("secure_delete must be a boolean value")
+        );
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_contentless_delete_on_stored_table() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "docs", "title", "contentless_delete=1"],
+        )
+        .expect_err("contentless_delete should require contentless mode");
+        assert!(
+            err.to_string()
+                .contains("contentless_delete=1 requires a contentless table")
+        );
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_contentless_delete_columnsize_zero() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "content=''",
+                "contentless_delete=1",
+                "columnsize=0",
+            ],
+        )
+        .expect_err("contentless_delete should reject columnsize=0");
+        assert!(
+            err.to_string()
+                .contains("contentless_delete=1 is incompatible with columnsize=0")
+        );
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_contentless_unindexed_on_stored_table() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "docs", "title", "contentless_unindexed=1"],
+        )
+        .expect_err("contentless_unindexed should require contentless mode");
+        assert!(
+            err.to_string()
+                .contains("contentless_unindexed=1 requires a contentless table")
+        );
     }
 
     #[test]
@@ -4482,6 +4693,158 @@ mod tests {
             vtab.search("uuidonly")
                 .map_err(|err| err.to_string())?
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_contentless_hides_all_column_values() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut vtab = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "uuid UNINDEXED",
+                "content=''",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        vtab.insert_document(1, &["rust guide".to_owned(), "uuidonly".to_owned()]);
+
+        assert_eq!(
+            vtab.get_document(1)
+                .ok_or_else(|| "row should be stored".to_owned())?,
+            &["".to_owned(), "".to_owned()]
+        );
+        assert_eq!(
+            vtab.search("rust")
+                .map_err(|err| err.to_string())?
+                .first()
+                .map(|(rowid, _score)| *rowid),
+            Some(1)
+        );
+        assert!(
+            vtab.search("uuidonly")
+                .map_err(|err| err.to_string())?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_contentless_unindexed_keeps_only_unindexed_values()
+    -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut vtab = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "uuid UNINDEXED",
+                "content=''",
+                "contentless_unindexed=1",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        vtab.insert_document(1, &["rust guide".to_owned(), "uuidonly".to_owned()]);
+
+        assert_eq!(
+            vtab.get_document(1)
+                .ok_or_else(|| "row should be stored".to_owned())?,
+            &["".to_owned(), "uuidonly".to_owned()]
+        );
+        assert_eq!(
+            vtab.search("rust")
+                .map_err(|err| err.to_string())?
+                .first()
+                .map(|(rowid, _score)| *rowid),
+            Some(1)
+        );
+        assert!(
+            vtab.search("uuidonly")
+                .map_err(|err| err.to_string())?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_contentless_unindexed() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "uuid UNINDEXED",
+                "content=''",
+                "contentless_unindexed=1",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        table.insert_document(7, &["rust guide".to_owned(), "uuidonly".to_owned()]);
+
+        let indexed_matches = table
+            .search("rust")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let unindexed_matches = table
+            .search("uuidonly")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5ContentlessUnindexedStructure {
+                    config: *table.config(),
+                    indexed_columns: table.indexed_columns().to_vec(),
+                    rows: table.all_rows(),
+                    indexed_matches,
+                    unindexed_matches,
+                }
+            ),
+            r#"Fts5ContentlessUnindexedStructure {
+    config: Fts5Config {
+        secure_delete: false,
+        content_mode: Contentless,
+        contentless_delete: false,
+        contentless_unindexed: true,
+        columnsize: true,
+        detail: Full,
+        insttoken: false,
+        locale: false,
+        tokendata: false,
+    },
+    indexed_columns: [
+        true,
+        false,
+    ],
+    rows: [
+        (
+            7,
+            [
+                "",
+                "uuidonly",
+            ],
+        ),
+    ],
+    indexed_matches: [
+        7,
+    ],
+    unindexed_matches: [],
+}"#
         );
         Ok(())
     }
@@ -4693,6 +5056,7 @@ mod tests {
         secure_delete: false,
         content_mode: Stored,
         contentless_delete: false,
+        contentless_unindexed: false,
         columnsize: true,
         detail: Full,
         insttoken: true,
@@ -4745,6 +5109,7 @@ mod tests {
         secure_delete: false,
         content_mode: Stored,
         contentless_delete: false,
+        contentless_unindexed: false,
         columnsize: true,
         detail: Full,
         insttoken: false,
@@ -4808,6 +5173,7 @@ mod tests {
         secure_delete: false,
         content_mode: Stored,
         contentless_delete: false,
+        contentless_unindexed: false,
         columnsize: true,
         detail: Full,
         insttoken: false,
@@ -5003,6 +5369,7 @@ mod tests {
         secure_delete: false,
         content_mode: Stored,
         contentless_delete: false,
+        contentless_unindexed: false,
         columnsize: true,
         detail: Full,
         insttoken: false,
@@ -5468,6 +5835,7 @@ mod tests {
         assert_eq!(config.content_mode(), ContentMode::Stored);
         assert!(!config.secure_delete_enabled());
         assert!(!config.contentless_delete_enabled());
+        assert!(!config.contentless_unindexed_enabled());
         assert!(config.columnsize_enabled());
         assert_eq!(config.detail_mode(), DetailMode::Full);
         assert!(!config.insttoken_enabled());

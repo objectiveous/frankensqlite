@@ -23,6 +23,12 @@ struct TokenizerCase {
     query: &'static str,
 }
 
+#[derive(Clone, Copy)]
+struct RankingCase {
+    name: &'static str,
+    query: &'static str,
+}
+
 const DOCS: &[Doc] = &[
     Doc {
         rowid: 1,
@@ -48,6 +54,34 @@ const DOCS: &[Doc] = &[
         rowid: 5,
         title: "Search cookbook",
         body: "Rust and SQLite examples for reliable search tests",
+    },
+];
+
+const BM25_DOCS: &[Doc] = &[
+    Doc {
+        rowid: 1,
+        title: "Dense rust",
+        body: "rust rust rust rust rust search",
+    },
+    Doc {
+        rowid: 2,
+        title: "Short rust",
+        body: "rust rust search",
+    },
+    Doc {
+        rowid: 3,
+        title: "Long rust",
+        body: "rust search compatibility writers pages tokens tokens tokens tokens tokens",
+    },
+    Doc {
+        rowid: 4,
+        title: "SQLite dense",
+        body: "sqlite sqlite sqlite search",
+    },
+    Doc {
+        rowid: 5,
+        title: "Plain note",
+        body: "plain cooking note",
     },
 ];
 
@@ -167,6 +201,17 @@ const PHRASE_PREFIX_NEAR_CASES: &[MatchCase] = &[
     },
 ];
 
+const BM25_CASES: &[RankingCase] = &[
+    RankingCase {
+        name: "single term frequency",
+        query: "rust",
+    },
+    RankingCase {
+        name: "multi term frequency",
+        query: "rust search",
+    },
+];
+
 const TOKENIZER_CASES: &[TokenizerCase] = &[
     TokenizerCase {
         name: "unicode61 remove_diacritics",
@@ -253,6 +298,30 @@ impl Fts5ConformanceHarness {
             .collect::<std::result::Result<Vec<_>, _>>()
             .expect("read rusqlite FTS5 rowids")
     }
+
+    fn franken_ranked_rowids(&self, query: &str) -> Vec<i64> {
+        let mut ranked = self
+            .franken
+            .search(query)
+            .expect("FrankenSQLite FTS5 ranked query");
+        ranked.sort_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        ranked.into_iter().map(|(rowid, _score)| rowid).collect()
+    }
+
+    fn sqlite_bm25_rowids(&self, query: &str) -> Vec<i64> {
+        let mut stmt = self
+            .sqlite
+            .prepare("SELECT rowid FROM docs WHERE docs MATCH ?1 ORDER BY bm25(docs), rowid")
+            .expect("prepare rusqlite FTS5 BM25 query");
+        stmt.query_map([query], |row| row.get::<_, i64>(0))
+            .expect("query rusqlite FTS5 BM25 rowids")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("read rusqlite FTS5 BM25 rowids")
+    }
 }
 
 #[test]
@@ -293,6 +362,21 @@ fn tokenizer_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "tokenizer conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn bm25_ranking_matches_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::with_docs(&[], BM25_DOCS);
+
+    for case in BM25_CASES {
+        assert_eq!(
+            harness.franken_ranked_rowids(case.query),
+            harness.sqlite_bm25_rowids(case.query),
+            "BM25 conformance case failed: {} ({})",
             case.name,
             case.query
         );

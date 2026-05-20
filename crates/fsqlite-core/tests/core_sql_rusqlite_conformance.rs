@@ -762,6 +762,75 @@ const PRAGMA_CASES: &[QueryCase] = &[
     },
 ];
 
+const TRIGGER_SETUP: &str = "
+    CREATE TABLE trigger_items (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        qty INTEGER NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE TABLE trigger_audit (
+        seq INTEGER PRIMARY KEY,
+        action TEXT NOT NULL,
+        item_id INTEGER NOT NULL,
+        old_name TEXT,
+        new_name TEXT,
+        old_qty INTEGER,
+        new_qty INTEGER
+    );
+
+    CREATE TRIGGER trigger_items_ai
+        AFTER INSERT ON trigger_items
+        BEGIN
+            INSERT INTO trigger_audit(action, item_id, old_name, new_name, old_qty, new_qty)
+            VALUES ('insert', NEW.id, NULL, NEW.name, NULL, NEW.qty);
+        END;
+    CREATE TRIGGER trigger_items_au
+        AFTER UPDATE ON trigger_items
+        BEGIN
+            INSERT INTO trigger_audit(action, item_id, old_name, new_name, old_qty, new_qty)
+            VALUES ('update', NEW.id, OLD.name, NEW.name, OLD.qty, NEW.qty);
+        END;
+    CREATE TRIGGER trigger_items_ad
+        AFTER DELETE ON trigger_items
+        BEGIN
+            INSERT INTO trigger_audit(action, item_id, old_name, new_name, old_qty, new_qty)
+            VALUES ('delete', OLD.id, OLD.name, NULL, OLD.qty, NULL);
+        END;
+";
+
+const TRIGGER_SCRIPT: &str = "
+    INSERT INTO trigger_items(id, name, qty) VALUES (1, 'bolt', 10);
+    INSERT INTO trigger_items(id, name, qty) VALUES (2, 'nut', 20);
+    UPDATE trigger_items
+        SET name = 'bolt-plus', qty = qty + 5
+        WHERE id = 1;
+    UPDATE trigger_items
+        SET active = 0
+        WHERE id = 2;
+    DELETE FROM trigger_items
+        WHERE active = 0;
+";
+
+const TRIGGER_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "final trigger table rows",
+        sql: "SELECT id, name, qty, active FROM trigger_items ORDER BY id",
+    },
+    QueryCase {
+        name: "trigger audit old new values",
+        sql: "SELECT action, item_id, old_name, new_name, old_qty, new_qty FROM trigger_audit ORDER BY seq",
+    },
+    QueryCase {
+        name: "trigger action aggregate",
+        sql: "SELECT action, COUNT(*) FROM trigger_audit GROUP BY action ORDER BY action",
+    },
+    QueryCase {
+        name: "trigger schema registration",
+        sql: "SELECT type, name, tbl_name FROM sqlite_schema WHERE type = 'trigger' ORDER BY name",
+    },
+];
+
 #[test]
 fn select_join_group_by_aggregates_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
@@ -844,4 +913,11 @@ fn subqueries_match_rusqlite() {
 fn pragmas_and_schema_introspection_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(PRAGMA_SETUP);
     harness.assert_queries_match("PRAGMA/schema introspection", PRAGMA_CASES);
+}
+
+#[test]
+fn triggers_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(TRIGGER_SETUP);
+    harness.execute_script(TRIGGER_SCRIPT);
+    harness.assert_queries_match("trigger", TRIGGER_CASES);
 }

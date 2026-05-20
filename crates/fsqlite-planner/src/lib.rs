@@ -4185,11 +4185,16 @@ pub fn order_joins_with_hints_and_features(
             table_index_hints,
             cracking_hints.as_deref(),
         );
+        // Move the access path into the plan rather than cloning it (its cost
+        // is a Copy f64, captured first), so the single owned AccessPath — which
+        // carries two heap Strings — is not duplicated on this dominant
+        // single-table planning path.
+        let total_cost = ap.estimated_cost;
         let plan = QueryPlan {
             join_order: vec![tables[0].name.clone()],
-            access_paths: vec![ap.clone()],
+            access_paths: vec![ap],
             join_segments: vec![],
-            total_cost: ap.estimated_cost,
+            total_cost,
             morsel_eligibility: None,
         };
         if let Some(store) = cracking_hints {
@@ -4304,10 +4309,11 @@ pub fn order_joins_with_hints_and_features(
             cracking_hints.as_deref(),
         );
         let cumulative_rows = ap.estimated_rows;
+        let cost = ap.estimated_cost;
         paths.push(PartialPath {
             tables: vec![t.name.clone()],
-            access_paths: vec![ap.clone()],
-            cost: ap.estimated_cost,
+            access_paths: vec![ap],
+            cost,
             cumulative_rows,
         });
     }
@@ -4399,11 +4405,13 @@ pub fn order_joins_with_hints_and_features(
                 table_index_hints,
                 cracking_hints.as_deref(),
             );
+            let cost = ap.estimated_cost;
+            let cumulative_rows = ap.estimated_rows;
             paths.push(PartialPath {
                 tables: vec![t.name.clone()],
-                access_paths: vec![ap.clone()],
-                cost: ap.estimated_cost,
-                cumulative_rows: ap.estimated_rows,
+                access_paths: vec![ap],
+                cost,
+                cumulative_rows,
             });
         }
     }

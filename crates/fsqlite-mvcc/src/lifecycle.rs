@@ -2960,6 +2960,61 @@ mod tests {
     }
 
     #[test]
+    fn test_serialized_schema_drift_deferred_upgrade_releases_baton() {
+        let m = mgr();
+
+        let pgno = PageNumber::new(4).unwrap();
+        let mut seed = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut seed, pgno, test_data(0x04)).unwrap();
+        let seed_commit = m.commit(&mut seed).unwrap();
+
+        let mut reader_then_writer = m.begin(BeginKind::Deferred).unwrap();
+        assert_eq!(
+            m.read_page(&mut reader_then_writer, pgno),
+            Some(test_data(0x04))
+        );
+        assert!(reader_then_writer.snapshot_established);
+        assert_eq!(reader_then_writer.snapshot.high, seed_commit);
+        assert_eq!(m.cached_gc_horizon(), Some(seed_commit));
+        assert_eq!(m.version_guard_registry().active_guard_count(), 1);
+        assert!(m.write_mutex().holder().is_none());
+
+        let newer_schema_epoch =
+            SchemaEpoch::new(reader_then_writer.snapshot.schema_epoch.get() + 1);
+        m.shm
+            .publish_snapshot(seed_commit, newer_schema_epoch, m.shm.load_ecs_epoch());
+
+        let result = m.write_page(
+            &mut reader_then_writer,
+            PageNumber::new(5).unwrap(),
+            test_data(0x05),
+        );
+        assert_eq!(result.unwrap_err(), MvccError::Schema);
+        assert_eq!(reader_then_writer.state, TransactionState::Active);
+        assert!(
+            !reader_then_writer.serialized_write_lock_held,
+            "schema-drift deferred upgrade must not retain serialized writer exclusion"
+        );
+        assert!(
+            m.write_mutex().holder().is_none(),
+            "Schema during deferred upgrade must release the writer baton"
+        );
+        assert_eq!(
+            m.cached_gc_horizon(),
+            Some(seed_commit),
+            "the live reader snapshot remains pinned until explicit abort"
+        );
+        assert!(reader_then_writer.has_version_guard());
+        assert_eq!(m.version_guard_registry().active_guard_count(), 1);
+
+        m.abort(&mut reader_then_writer);
+        assert!(m.cached_gc_horizon().is_none());
+        assert_eq!(m.shm.load_gc_horizon(), CommitSeq::ZERO);
+        assert_eq!(m.version_guard_registry().active_guard_count(), 0);
+        assert!(m.write_mutex().holder().is_none());
+    }
+
+    #[test]
     fn test_serialized_no_page_lock_needed() {
         let m = mgr();
         let mut txn = m.begin(BeginKind::Immediate).unwrap();

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub mod codegen;
+pub mod dataflow;
 pub mod engine;
 pub mod frame;
 pub mod jit;

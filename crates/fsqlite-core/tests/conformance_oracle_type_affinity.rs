@@ -226,7 +226,6 @@ fn affinity_comparison_applies_column_affinity() {
 /// bounds, exactly as `>=`/`<=` do. Today an INTEGER column compared against
 /// text bounds matches nothing because the bounds are not coerced.
 #[test]
-#[ignore = "bd-36kv6: BETWEEN does not apply column comparison affinity to its bounds"]
 fn affinity_between_applies_column_affinity() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();

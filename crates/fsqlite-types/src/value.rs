@@ -718,25 +718,7 @@ impl SqliteValue {
                     Self::Text(SmallText::from_string(t))
                 }
             },
-            TypeAffinity::Numeric => match &self {
-                Self::Text(s) => try_coerce_text_to_numeric(s.as_str()).unwrap_or(self),
-                // A REAL whose value is integral and in i64 range is reduced to
-                // INTEGER, identical to INTEGER affinity. NUMERIC and INTEGER
-                // affinity perform the same storage/comparison coercion (they
-                // differ only inside CAST), so `4.0` stored in a NUMERIC column
-                // becomes the integer `4`, matching SQLite.
-                Self::Float(f) => {
-                    if *f >= -9_223_372_036_854_775_808.0 && *f < 9_223_372_036_854_775_808.0 {
-                        let i = *f as i64;
-                        if (i as f64) == *f {
-                            return Self::Integer(i);
-                        }
-                    }
-                    self
-                }
-                _ => self,
-            },
-            TypeAffinity::Integer => match &self {
+            TypeAffinity::Numeric | TypeAffinity::Integer => match &self {
                 Self::Text(s) => try_coerce_text_to_numeric(s.as_str()).unwrap_or(self),
                 Self::Float(f) => {
                     if *f >= -9_223_372_036_854_775_808.0 && *f < 9_223_372_036_854_775_808.0 {

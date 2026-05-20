@@ -16710,6 +16710,8 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             // Resolve collation from the operand (e.g. column-level NOCASE).
             let collation_p4 = effective_collation_ctx(operand, ctx)
                 .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
+            let low_aff = comparison_affinity_p5(operand, low, ctx);
+            let high_aff = comparison_affinity_p5(operand, high, ctx);
             let false_label = b.emit_label();
             let null_label = b.emit_label();
             let done_label = b.emit_label();
@@ -16722,10 +16724,17 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 r_operand,
                 false_label,
                 collation_p4.clone(),
-                0,
+                low_aff,
             );
             // Jump to false if operand > high (NULL high → no jump, handled below).
-            b.emit_jump_to_label(Opcode::Gt, r_high, r_operand, false_label, collation_p4, 0);
+            b.emit_jump_to_label(
+                Opcode::Gt,
+                r_high,
+                r_operand,
+                false_label,
+                collation_p4,
+                high_aff,
+            );
             // Passed both comparisons.  If either bound was NULL the comparison
             // silently fell through instead of confirming the range, so the
             // correct three-valued result is NULL, not TRUE.

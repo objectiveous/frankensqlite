@@ -227,6 +227,12 @@ const CONFLICT_TOPOLOGY_POLICY_ENV: &str = "FSQLITE_CONFLICT_TOPOLOGY_POLICY";
 const CONFLICT_TOPOLOGY_HOT_HEAT_THRESHOLD: u64 = 2;
 const CONFLICT_TOPOLOGY_HOT_OVERLAP_THRESHOLD: u32 = 2;
 const CONFLICT_TOPOLOGY_TARGET_SHIFT_BPS: usize = 1_500;
+const HOT_PAGE_DEFLECTION_POLICY_ID: &str = "btree.hot_page_deflection.v1";
+const HOT_PAGE_DEFLECTION_HEAT_THRESHOLD: u64 = 64;
+const HOT_PAGE_DEFLECTION_OVERLAP_THRESHOLD: u32 = 4;
+const HOT_PAGE_DEFLECTION_TARGET_SHIFT_BPS: usize = 1_000;
+const HOT_PAGE_DEFLECTION_BUDGET_PAGES: u8 = 2;
+const HOT_PAGE_DEFLECTION_BUDGET_NS: u64 = 0;
 
 static CONFLICT_TOPOLOGY_POLICY_MODE: AtomicU64 = AtomicU64::new(2);
 static CONFLICT_TOPOLOGY_POLICY_ENV_APPLIED: AtomicBool = AtomicBool::new(false);
@@ -272,10 +278,56 @@ impl ConflictTopologyPolicyMode {
     }
 }
 
+/// Bounded hotspot-deflection state for a split decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum HotPageDeflectionStatus {
+    /// No pathological hotspot signal selected the deflection path.
+    Inactive,
+    /// Advisory mode observed a hotspot but did not mutate split placement.
+    AdvisoryOnly,
+    /// Enforced mode consumed one bounded split-deflection credit.
+    Applied,
+    /// The page remains hot but its bounded deflection budget is exhausted.
+    BudgetExhausted,
+    /// Operator policy forced baseline placement.
+    OperatorOverride,
+}
+
+impl HotPageDeflectionStatus {
+    /// Stable log label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inactive => "inactive",
+            Self::AdvisoryOnly => "advisory_only",
+            Self::Applied => "applied",
+            Self::BudgetExhausted => "budget_exhausted",
+            Self::OperatorOverride => "operator_override",
+        }
+    }
+
+    /// Whether this status represents an active pathological-hotspot signal.
+    #[must_use]
+    pub const fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::AdvisoryOnly | Self::Applied | Self::BudgetExhausted
+        )
+    }
+
+    /// Whether this status consumed a split-deflection credit.
+    #[must_use]
+    pub const fn is_applied(self) -> bool {
+        matches!(self, Self::Applied)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct ConflictTopologyPageState {
     heat: u64,
     max_writer_overlap_estimate: u32,
+    deflection_armed: bool,
+    deflection_credits_remaining: u8,
 }
 
 #[derive(Debug, Default)]
@@ -288,8 +340,12 @@ struct ConflictTopologyState {
 pub struct ConflictTopologySplitAdvice {
     /// Stable policy identifier for logs and artifacts.
     pub policy_id: &'static str,
+    /// Stable mitigation policy identifier for hotspot escape hatches.
+    pub mitigation_policy_id: &'static str,
     /// Current rollout mode.
     pub policy_mode: ConflictTopologyPolicyMode,
+    /// Page selected by the heat-map signal, or zero when no page is known.
+    pub hot_page_id: u32,
     /// Baseline split target before topology adjustment.
     pub baseline_target_left_basis_points: usize,
     /// Advisory topology-aware target, even when mode is advisory.
@@ -304,6 +360,28 @@ pub struct ConflictTopologySplitAdvice {
     pub topology_hot: bool,
     /// Whether the effective target differs from baseline.
     pub applied: bool,
+    /// Bounded deflection outcome for this split decision.
+    pub deflection_status: HotPageDeflectionStatus,
+    /// Deflection credits available before this advice was produced.
+    pub deflection_credits_before: u8,
+    /// Deflection credits remaining after this advice was produced.
+    pub deflection_credits_after: u8,
+    /// Maximum synchronous budget consumed by this split-time mitigation.
+    pub budget_ns: u64,
+    /// Maximum page-level deflections allowed for this armed hotspot.
+    pub budget_pages: u8,
+    /// Snapshot generation published by a physical recluster path, if any.
+    pub publication_generation: u64,
+    /// Conflict heat before the mitigation estimate.
+    pub heat_before: u64,
+    /// Conflict heat after the mitigation estimate.
+    pub heat_after: u64,
+    /// Why the pathological-hotspot path did or did not trigger.
+    pub trigger_reason: &'static str,
+    /// Operator-facing outcome for the bounded mitigation path.
+    pub migration_outcome: &'static str,
+    /// Reversal or rollback reason, when the mitigation is not applied.
+    pub rollback_reason: &'static str,
     /// Positive means the policy predicts fewer future hot-page overlaps.
     pub predicted_overlap_delta: i64,
     /// Whether an operator override forced baseline behavior.
@@ -315,7 +393,11 @@ impl ConflictTopologySplitAdvice {
     #[must_use]
     pub const fn placement_policy(self) -> &'static str {
         if self.applied {
-            "topology_aware_fill_factor"
+            if self.deflection_applied() {
+                "hot_page_deflection_fill_factor"
+            } else {
+                "topology_aware_fill_factor"
+            }
         } else {
             "baseline"
         }
@@ -326,11 +408,25 @@ impl ConflictTopologySplitAdvice {
     pub const fn split_reason(self) -> &'static str {
         if self.operator_override_active {
             "operator_override_baseline"
+        } else if self.deflection_applied() {
+            "bounded_hot_page_deflection"
         } else if self.topology_hot {
             "mvcc_conflict_heat_hot_page"
         } else {
             "no_hot_page_signal"
         }
+    }
+
+    /// Whether this page crossed the stronger pathological-hotspot threshold.
+    #[must_use]
+    pub const fn deflection_active(self) -> bool {
+        self.deflection_status.is_active()
+    }
+
+    /// Whether a bounded split-time deflection credit was consumed.
+    #[must_use]
+    pub const fn deflection_applied(self) -> bool {
+        self.deflection_status.is_applied()
     }
 }
 
@@ -396,6 +492,13 @@ pub fn record_conflict_topology_heat_batch(
         page_state.max_writer_overlap_estimate = page_state
             .max_writer_overlap_estimate
             .max(writer_overlap_estimate);
+        if !page_state.deflection_armed
+            && page_state.heat >= HOT_PAGE_DEFLECTION_HEAT_THRESHOLD
+            && page_state.max_writer_overlap_estimate >= HOT_PAGE_DEFLECTION_OVERLAP_THRESHOLD
+        {
+            page_state.deflection_armed = true;
+            page_state.deflection_credits_remaining = HOT_PAGE_DEFLECTION_BUDGET_PAGES;
+        }
         updated += 1;
     }
     updated
@@ -409,40 +512,83 @@ pub fn conflict_topology_split_advice(
     baseline_target_left_basis_points: usize,
 ) -> ConflictTopologySplitAdvice {
     let mode = conflict_topology_policy_mode();
+    let mut deflection_credits_before = 0;
+    let mut deflection_credits_after = 0;
+    let mut deflection_applied = false;
+
     let page_state = if mode == ConflictTopologyPolicyMode::Baseline {
         ConflictTopologyPageState::default()
     } else {
-        CONFLICT_TOPOLOGY_STATE
+        let mut state = CONFLICT_TOPOLOGY_STATE
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pages
-            .get(&page)
-            .copied()
-            .unwrap_or_default()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(page_state) = state.pages.get_mut(&page) else {
+            return baseline_conflict_topology_split_advice(
+                page,
+                mode,
+                baseline_target_left_basis_points,
+            );
+        };
+        let deflection_active = page_state.deflection_armed
+            && page_state.heat >= HOT_PAGE_DEFLECTION_HEAT_THRESHOLD
+            && page_state.max_writer_overlap_estimate >= HOT_PAGE_DEFLECTION_OVERLAP_THRESHOLD;
+        deflection_credits_before = page_state.deflection_credits_remaining;
+        if mode == ConflictTopologyPolicyMode::Enforced
+            && deflection_active
+            && page_state.deflection_credits_remaining > 0
+        {
+            page_state.deflection_credits_remaining =
+                page_state.deflection_credits_remaining.saturating_sub(1);
+            deflection_applied = true;
+        }
+        deflection_credits_after = page_state.deflection_credits_remaining;
+        *page_state
     };
     let topology_hot = page_state.heat >= CONFLICT_TOPOLOGY_HOT_HEAT_THRESHOLD
         && page_state.max_writer_overlap_estimate >= CONFLICT_TOPOLOGY_HOT_OVERLAP_THRESHOLD;
-    let advised_target_left_basis_points = if topology_hot {
+    let topology_target_left_basis_points = if topology_hot {
         topology_adjusted_target(predicted_hot_side, baseline_target_left_basis_points)
     } else {
         baseline_target_left_basis_points
     };
+    let deflection_active = page_state.deflection_armed
+        && page_state.heat >= HOT_PAGE_DEFLECTION_HEAT_THRESHOLD
+        && page_state.max_writer_overlap_estimate >= HOT_PAGE_DEFLECTION_OVERLAP_THRESHOLD;
+    let advised_target_left_basis_points = if deflection_active {
+        hot_page_deflection_adjusted_target(predicted_hot_side, topology_target_left_basis_points)
+    } else {
+        topology_target_left_basis_points
+    };
     let effective_target_left_basis_points =
-        if mode == ConflictTopologyPolicyMode::Enforced && topology_hot {
+        if mode == ConflictTopologyPolicyMode::Enforced && deflection_applied {
             advised_target_left_basis_points
+        } else if mode == ConflictTopologyPolicyMode::Enforced && topology_hot {
+            topology_target_left_basis_points
         } else {
             baseline_target_left_basis_points
         };
     let applied = effective_target_left_basis_points != baseline_target_left_basis_points;
-    let predicted_overlap_delta = if topology_hot {
-        i64::from(page_state.max_writer_overlap_estimate.max(1))
+    let overlap_estimate = i64::from(page_state.max_writer_overlap_estimate.max(1));
+    let predicted_overlap_delta = if deflection_applied {
+        overlap_estimate * 2
+    } else if topology_hot {
+        overlap_estimate
     } else {
         0
+    };
+    let heat_after = if deflection_applied {
+        page_state
+            .heat
+            .saturating_sub(u64::from(page_state.max_writer_overlap_estimate.max(1)))
+    } else {
+        page_state.heat
     };
 
     ConflictTopologySplitAdvice {
         policy_id: CONFLICT_TOPOLOGY_POLICY_ID,
+        mitigation_policy_id: HOT_PAGE_DEFLECTION_POLICY_ID,
         policy_mode: mode,
+        hot_page_id: page.get(),
         baseline_target_left_basis_points,
         advised_target_left_basis_points,
         effective_target_left_basis_points,
@@ -450,7 +596,71 @@ pub fn conflict_topology_split_advice(
         writer_overlap_estimate: page_state.max_writer_overlap_estimate,
         topology_hot,
         applied,
+        deflection_status: hot_page_deflection_status(
+            mode,
+            deflection_active,
+            deflection_applied,
+            deflection_credits_before,
+        ),
+        deflection_credits_before,
+        deflection_credits_after,
+        budget_ns: HOT_PAGE_DEFLECTION_BUDGET_NS,
+        budget_pages: HOT_PAGE_DEFLECTION_BUDGET_PAGES,
+        publication_generation: 0,
+        heat_before: page_state.heat,
+        heat_after,
+        trigger_reason: hot_page_deflection_trigger_reason(
+            mode,
+            topology_hot,
+            deflection_active,
+            deflection_credits_before,
+        ),
+        migration_outcome: hot_page_deflection_migration_outcome(
+            mode,
+            deflection_active,
+            deflection_applied,
+            deflection_credits_before,
+        ),
+        rollback_reason: hot_page_deflection_rollback_reason(
+            mode,
+            deflection_active,
+            deflection_applied,
+            deflection_credits_before,
+        ),
         predicted_overlap_delta,
+        operator_override_active: mode == ConflictTopologyPolicyMode::Baseline,
+    }
+}
+
+fn baseline_conflict_topology_split_advice(
+    page: PageNumber,
+    mode: ConflictTopologyPolicyMode,
+    baseline_target_left_basis_points: usize,
+) -> ConflictTopologySplitAdvice {
+    ConflictTopologySplitAdvice {
+        policy_id: CONFLICT_TOPOLOGY_POLICY_ID,
+        mitigation_policy_id: HOT_PAGE_DEFLECTION_POLICY_ID,
+        policy_mode: mode,
+        hot_page_id: page.get(),
+        baseline_target_left_basis_points,
+        advised_target_left_basis_points: baseline_target_left_basis_points,
+        effective_target_left_basis_points: baseline_target_left_basis_points,
+        conflict_heat: 0,
+        writer_overlap_estimate: 0,
+        topology_hot: false,
+        applied: false,
+        deflection_status: hot_page_deflection_status(mode, false, false, 0),
+        deflection_credits_before: 0,
+        deflection_credits_after: 0,
+        budget_ns: HOT_PAGE_DEFLECTION_BUDGET_NS,
+        budget_pages: HOT_PAGE_DEFLECTION_BUDGET_PAGES,
+        publication_generation: 0,
+        heat_before: 0,
+        heat_after: 0,
+        trigger_reason: hot_page_deflection_trigger_reason(mode, false, false, 0),
+        migration_outcome: hot_page_deflection_migration_outcome(mode, false, false, 0),
+        rollback_reason: hot_page_deflection_rollback_reason(mode, false, false, 0),
+        predicted_overlap_delta: 0,
         operator_override_active: mode == ConflictTopologyPolicyMode::Baseline,
     }
 }
@@ -464,6 +674,94 @@ fn topology_adjusted_target(predicted_hot_side: &str, baseline: usize) -> usize 
             .saturating_add(CONFLICT_TOPOLOGY_TARGET_SHIFT_BPS)
             .min(8_000),
         _ => 5_000,
+    }
+}
+
+fn hot_page_deflection_adjusted_target(predicted_hot_side: &str, baseline: usize) -> usize {
+    match predicted_hot_side {
+        "left_edge" => baseline
+            .saturating_sub(HOT_PAGE_DEFLECTION_TARGET_SHIFT_BPS)
+            .max(1_500),
+        "right_edge" => baseline
+            .saturating_add(HOT_PAGE_DEFLECTION_TARGET_SHIFT_BPS)
+            .min(9_000),
+        _ => baseline,
+    }
+}
+
+fn hot_page_deflection_trigger_reason(
+    mode: ConflictTopologyPolicyMode,
+    topology_hot: bool,
+    deflection_active: bool,
+    deflection_credits_before: u8,
+) -> &'static str {
+    if mode == ConflictTopologyPolicyMode::Baseline {
+        "operator_override_baseline"
+    } else if deflection_active && deflection_credits_before > 0 {
+        "pathological_hot_page"
+    } else if deflection_active {
+        "pathological_hot_page_budget_exhausted"
+    } else if topology_hot {
+        "below_deflection_threshold"
+    } else {
+        "no_hot_page_signal"
+    }
+}
+
+fn hot_page_deflection_status(
+    mode: ConflictTopologyPolicyMode,
+    deflection_active: bool,
+    deflection_applied: bool,
+    deflection_credits_before: u8,
+) -> HotPageDeflectionStatus {
+    if mode == ConflictTopologyPolicyMode::Baseline {
+        HotPageDeflectionStatus::OperatorOverride
+    } else if deflection_applied {
+        HotPageDeflectionStatus::Applied
+    } else if deflection_active && deflection_credits_before == 0 {
+        HotPageDeflectionStatus::BudgetExhausted
+    } else if deflection_active && mode == ConflictTopologyPolicyMode::Advisory {
+        HotPageDeflectionStatus::AdvisoryOnly
+    } else {
+        HotPageDeflectionStatus::Inactive
+    }
+}
+
+fn hot_page_deflection_migration_outcome(
+    mode: ConflictTopologyPolicyMode,
+    deflection_active: bool,
+    deflection_applied: bool,
+    deflection_credits_before: u8,
+) -> &'static str {
+    if mode == ConflictTopologyPolicyMode::Baseline {
+        "operator_override_baseline"
+    } else if deflection_applied {
+        "split_deflected"
+    } else if deflection_active && deflection_credits_before == 0 {
+        "budget_exhausted"
+    } else if deflection_active && mode == ConflictTopologyPolicyMode::Advisory {
+        "advisory_only"
+    } else {
+        "not_triggered"
+    }
+}
+
+fn hot_page_deflection_rollback_reason(
+    mode: ConflictTopologyPolicyMode,
+    deflection_active: bool,
+    deflection_applied: bool,
+    deflection_credits_before: u8,
+) -> &'static str {
+    if mode == ConflictTopologyPolicyMode::Baseline {
+        "operator_override_baseline"
+    } else if deflection_applied {
+        "none"
+    } else if deflection_active && deflection_credits_before == 0 {
+        "budget_exhausted"
+    } else if deflection_active && mode == ConflictTopologyPolicyMode::Advisory {
+        "advisory_only"
+    } else {
+        "no_hotspot"
     }
 }
 
@@ -1202,6 +1500,85 @@ mod tests {
         assert!(!advice.applied);
         assert_eq!(advice.effective_target_left_basis_points, 6_500);
         assert!(advice.operator_override_active);
+
+        reset_conflict_topology_policy_state();
+        set_conflict_topology_policy_mode(ConflictTopologyPolicyMode::Enforced);
+    }
+
+    #[test]
+    fn hot_page_deflection_synthetic_pathological_hotspot_reduces_projected_overlap() {
+        let _guard = super::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let page = PageNumber::new(45).expect("page");
+        set_conflict_topology_policy_mode(ConflictTopologyPolicyMode::Enforced);
+        reset_conflict_topology_policy_state();
+
+        for _ in 0..64 {
+            record_conflict_topology_heat(page, 1, 4);
+        }
+
+        let first = conflict_topology_split_advice(page, "right_edge", 6_500);
+        assert!(first.topology_hot);
+        assert!(first.deflection_active());
+        assert!(first.deflection_applied());
+        assert_eq!(first.deflection_credits_before, 2);
+        assert_eq!(first.deflection_credits_after, 1);
+        assert_eq!(first.effective_target_left_basis_points, 9_000);
+        assert_eq!(first.trigger_reason, "pathological_hot_page");
+        assert_eq!(first.migration_outcome, "split_deflected");
+        assert_eq!(first.rollback_reason, "none");
+        assert_eq!(first.budget_pages, 2);
+        assert_eq!(first.budget_ns, 0);
+        assert!(first.heat_after < first.heat_before);
+        assert_eq!(first.predicted_overlap_delta, 8);
+
+        let second = conflict_topology_split_advice(page, "right_edge", 6_500);
+        assert!(second.deflection_applied());
+        assert_eq!(second.deflection_credits_before, 1);
+        assert_eq!(second.deflection_credits_after, 0);
+        assert_eq!(second.effective_target_left_basis_points, 9_000);
+
+        let exhausted = conflict_topology_split_advice(page, "right_edge", 6_500);
+        assert!(exhausted.deflection_active());
+        assert!(!exhausted.deflection_applied());
+        assert_eq!(exhausted.deflection_credits_before, 0);
+        assert_eq!(exhausted.deflection_credits_after, 0);
+        assert_eq!(exhausted.effective_target_left_basis_points, 8_000);
+        assert_eq!(
+            exhausted.trigger_reason,
+            "pathological_hot_page_budget_exhausted"
+        );
+        assert_eq!(exhausted.migration_outcome, "budget_exhausted");
+        assert_eq!(exhausted.rollback_reason, "budget_exhausted");
+
+        reset_conflict_topology_policy_state();
+        set_conflict_topology_policy_mode(ConflictTopologyPolicyMode::Enforced);
+    }
+
+    #[test]
+    fn hot_page_deflection_baseline_mode_is_reversible_kill_switch() {
+        let _guard = super::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let page = PageNumber::new(46).expect("page");
+        set_conflict_topology_policy_mode(ConflictTopologyPolicyMode::Enforced);
+        reset_conflict_topology_policy_state();
+
+        for _ in 0..64 {
+            record_conflict_topology_heat(page, 1, 4);
+        }
+
+        set_conflict_topology_policy_mode(ConflictTopologyPolicyMode::Baseline);
+        let advice = conflict_topology_split_advice(page, "right_edge", 6_500);
+
+        assert!(!advice.applied);
+        assert!(!advice.deflection_active());
+        assert_eq!(advice.effective_target_left_basis_points, 6_500);
+        assert!(advice.operator_override_active);
+        assert_eq!(advice.trigger_reason, "operator_override_baseline");
+        assert_eq!(advice.migration_outcome, "operator_override_baseline");
+        assert_eq!(advice.rollback_reason, "operator_override_baseline");
 
         reset_conflict_topology_policy_state();
         set_conflict_topology_policy_mode(ConflictTopologyPolicyMode::Enforced);

@@ -132,7 +132,9 @@ fn no_page_topology_advice(
     let policy_mode = instrumentation::conflict_topology_policy_mode();
     instrumentation::ConflictTopologySplitAdvice {
         policy_id: "btree.conflict_topology_split.v1",
+        mitigation_policy_id: "btree.hot_page_deflection.v1",
         policy_mode,
+        hot_page_id: 0,
         baseline_target_left_basis_points,
         advised_target_left_basis_points: baseline_target_left_basis_points,
         effective_target_left_basis_points: baseline_target_left_basis_points,
@@ -140,6 +142,33 @@ fn no_page_topology_advice(
         writer_overlap_estimate: 0,
         topology_hot: false,
         applied: false,
+        deflection_status: if policy_mode == instrumentation::ConflictTopologyPolicyMode::Baseline {
+            instrumentation::HotPageDeflectionStatus::OperatorOverride
+        } else {
+            instrumentation::HotPageDeflectionStatus::Inactive
+        },
+        deflection_credits_before: 0,
+        deflection_credits_after: 0,
+        budget_ns: 0,
+        budget_pages: 2,
+        publication_generation: 0,
+        heat_before: 0,
+        heat_after: 0,
+        trigger_reason: if policy_mode == instrumentation::ConflictTopologyPolicyMode::Baseline {
+            "operator_override_baseline"
+        } else {
+            "no_hot_page_signal"
+        },
+        migration_outcome: if policy_mode == instrumentation::ConflictTopologyPolicyMode::Baseline {
+            "operator_override_baseline"
+        } else {
+            "not_triggered"
+        },
+        rollback_reason: if policy_mode == instrumentation::ConflictTopologyPolicyMode::Baseline {
+            "operator_override_baseline"
+        } else {
+            "no_hotspot"
+        },
         predicted_overlap_delta: 0,
         operator_override_active: policy_mode
             == instrumentation::ConflictTopologyPolicyMode::Baseline,
@@ -1197,10 +1226,13 @@ fn prepare_leaf_table_local_split<W: PageWriter>(
         overflow_insert_idx = insert_idx,
         total_cells = all_cells.len(),
         predicted_hot_side = split_policy.heat.as_str(),
+        hot_page_id = split_policy.topology_advice.hot_page_id,
         policy_id = split_policy.topology_advice.policy_id,
+        mitigation_policy_id = split_policy.topology_advice.mitigation_policy_id,
         policy_mode = split_policy.topology_advice.policy_mode.as_str(),
         placement_policy = split_policy.topology_advice.placement_policy(),
         split_reason = split_policy.topology_advice.split_reason(),
+        trigger_reason = split_policy.topology_advice.trigger_reason,
         fill_factor = split_policy.target_left_basis_points as u32,
         page_role = "table_leaf",
         predicted_overlap_delta = split_policy.topology_advice.predicted_overlap_delta,
@@ -1209,7 +1241,19 @@ fn prepare_leaf_table_local_split<W: PageWriter>(
         latency_p95_ns = 0_u64,
         operator_override_active = split_policy.topology_advice.operator_override_active,
         conflict_heat = split_policy.topology_advice.conflict_heat,
+        heat_before = split_policy.topology_advice.heat_before,
+        heat_after = split_policy.topology_advice.heat_after,
         writer_overlap_estimate = split_policy.topology_advice.writer_overlap_estimate,
+        deflection_status = split_policy.topology_advice.deflection_status.as_str(),
+        deflection_active = split_policy.topology_advice.deflection_active(),
+        deflection_applied = split_policy.topology_advice.deflection_applied(),
+        deflection_credits_before = split_policy.topology_advice.deflection_credits_before,
+        deflection_credits_after = split_policy.topology_advice.deflection_credits_after,
+        budget_ns = split_policy.topology_advice.budget_ns,
+        budget_pages = split_policy.topology_advice.budget_pages,
+        publication_generation = split_policy.topology_advice.publication_generation,
+        migration_outcome = split_policy.topology_advice.migration_outcome,
+        rollback_reason = split_policy.topology_advice.rollback_reason,
         first_failure_diag = "none",
         target_left_basis_points = split_policy.target_left_basis_points as u32,
         split_idx,
@@ -3197,6 +3241,43 @@ mod tests {
         assert!(
             heated_split > baseline_split,
             "right-edge hot pages should leave more slack on the new right sibling"
+        );
+
+        crate::instrumentation::reset_conflict_topology_policy_state();
+        crate::instrumentation::set_conflict_topology_policy_mode(
+            crate::instrumentation::ConflictTopologyPolicyMode::Enforced,
+        );
+    }
+
+    #[test]
+    fn test_pathological_conflict_heat_deflects_leaf_table_split_once_bounded() {
+        let _guard = crate::instrumentation::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hot_page = pn(45);
+        crate::instrumentation::set_conflict_topology_policy_mode(
+            crate::instrumentation::ConflictTopologyPolicyMode::Enforced,
+        );
+        crate::instrumentation::reset_conflict_topology_policy_state();
+        for _ in 0..64 {
+            crate::instrumentation::record_conflict_topology_heat(hot_page, 1, 4);
+        }
+
+        let first = leaf_table_split_policy_for_page(Some(hot_page), 12, 11);
+        let second = leaf_table_split_policy_for_page(Some(hot_page), 12, 11);
+        let exhausted = leaf_table_split_policy_for_page(Some(hot_page), 12, 11);
+
+        assert!(first.topology_advice.deflection_applied());
+        assert_eq!(first.target_left_basis_points, 9_000);
+        assert_eq!(first.topology_advice.deflection_credits_after, 1);
+        assert!(second.topology_advice.deflection_applied());
+        assert_eq!(second.target_left_basis_points, 9_000);
+        assert_eq!(second.topology_advice.deflection_credits_after, 0);
+        assert!(!exhausted.topology_advice.deflection_applied());
+        assert_eq!(exhausted.target_left_basis_points, 8_000);
+        assert_eq!(
+            exhausted.topology_advice.rollback_reason,
+            "budget_exhausted"
         );
 
         crate::instrumentation::reset_conflict_topology_policy_state();

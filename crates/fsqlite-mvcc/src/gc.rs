@@ -485,6 +485,7 @@ mod tests {
     use std::sync::Arc;
 
     const BEAD_ZCDN: &str = "bd-zcdn";
+    const BEAD_E77H7_1: &str = "bd-e77h7.1";
 
     /// Helper: build a `PageVersion` with the given commit_seq and prev pointer.
     fn make_version(pgno: PageNumber, seq: u64, prev: Option<VersionIdx>) -> PageVersion {
@@ -943,6 +944,100 @@ mod tests {
         assert_eq!(result.queue_remaining, 0);
         assert!(!result.versions_budget_exhausted);
         assert!(!result.pages_budget_exhausted);
+    }
+
+    #[test]
+    fn test_gc_tick_idempotent_under_duplicate_todo_pressure() {
+        // bead_id=bd-e77h7.1: repeated pruning at the same horizon must be a no-op
+        // after the first pass, even when callers enqueue duplicate touched pages.
+        let mut arena = VersionArena::new();
+        let chain_heads = ChainHeadTable::new();
+        let mut todo = GcTodo::new();
+        let pages: Vec<_> = (1_u32..=8)
+            .map(|raw| PageNumber::new(raw).expect("test page number should be valid"))
+            .collect();
+
+        for &pgno in &pages {
+            build_chain_in_table(&mut arena, &chain_heads, pgno, 12);
+        }
+
+        let duplicate_pressure = [8_u32, 1, 8, 3, 5, 3, 2, 7, 6, 4, 1];
+        for raw in duplicate_pressure {
+            todo.enqueue(PageNumber::new(raw).expect("test page number should be valid"));
+        }
+        assert_eq!(
+            todo.len(),
+            pages.len(),
+            "bead_id={BEAD_E77H7_1}: todo queue should suppress duplicate page enqueues"
+        );
+
+        let horizon = CommitSeq::new(7);
+        let first = gc_tick(&mut todo, horizon, &mut arena, &chain_heads);
+        assert_eq!(
+            first.pages_pruned, 8,
+            "bead_id={BEAD_E77H7_1}: first pass should process each distinct page once"
+        );
+        assert_eq!(
+            first.versions_freed, 48,
+            "bead_id={BEAD_E77H7_1}: first pass should prune seq 1..6 from each page"
+        );
+        assert_eq!(first.queue_remaining, 0);
+        assert!(!first.pages_budget_exhausted);
+        assert!(!first.versions_budget_exhausted);
+
+        let pruned_pages: HashSet<u32> = first
+            .pruned_keys
+            .iter()
+            .map(|(pgno, _)| pgno.get())
+            .collect();
+        assert_eq!(
+            pruned_pages.len(),
+            pages.len(),
+            "bead_id={BEAD_E77H7_1}: pruned key diagnostics should cover every touched page"
+        );
+
+        let expected_retained = vec![12, 11, 10, 9, 8, 7];
+        for &pgno in &pages {
+            assert_eq!(
+                collect_chain_commit_seqs(pgno, &arena, &chain_heads),
+                expected_retained,
+                "bead_id={BEAD_E77H7_1}: retained suffix should stay linked for page {}",
+                pgno.get()
+            );
+        }
+
+        for raw in duplicate_pressure.into_iter().rev() {
+            todo.enqueue(PageNumber::new(raw).expect("test page number should be valid"));
+        }
+        assert_eq!(
+            todo.len(),
+            pages.len(),
+            "bead_id={BEAD_E77H7_1}: second todo fill should still deduplicate pages"
+        );
+
+        let second = gc_tick(&mut todo, horizon, &mut arena, &chain_heads);
+        assert_eq!(
+            second.pages_pruned, 8,
+            "bead_id={BEAD_E77H7_1}: second pass should visit the distinct touched pages"
+        );
+        assert_eq!(
+            second.versions_freed, 0,
+            "bead_id={BEAD_E77H7_1}: second pass at same horizon must not double-retire versions"
+        );
+        assert!(
+            second.pruned_keys.is_empty(),
+            "bead_id={BEAD_E77H7_1}: idempotent pass should publish no stale eviction keys"
+        );
+        assert_eq!(second.queue_remaining, 0);
+
+        for &pgno in &pages {
+            assert_eq!(
+                collect_chain_commit_seqs(pgno, &arena, &chain_heads),
+                expected_retained,
+                "bead_id={BEAD_E77H7_1}: idempotent pass must not mutate retained suffix for page {}",
+                pgno.get()
+            );
+        }
     }
 
     #[test]

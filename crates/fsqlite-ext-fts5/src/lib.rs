@@ -1839,13 +1839,15 @@ impl InvertedIndex {
 
     /// Remove a document from the index.
     pub fn remove_document(&mut self, docid: i64) {
-        for postings in self.index.values_mut() {
-            postings.retain(|p| p.docid != docid);
-        }
+        self.index.retain(|_, postings| {
+            postings.retain(|posting| posting.docid != docid);
+            !postings.is_empty()
+        });
         for prefix_index in self.prefix_indexes.values_mut() {
-            for postings in prefix_index.values_mut() {
-                postings.retain(|p| p.docid != docid);
-            }
+            prefix_index.retain(|_, postings| {
+                postings.retain(|posting| posting.docid != docid);
+                !postings.is_empty()
+            });
         }
         self.doc_ids.remove(&docid);
         if let Some(doc_lengths) = self.doc_lengths.as_mut() {
@@ -4620,6 +4622,17 @@ mod tests {
 
     #[allow(dead_code)]
     #[derive(Debug)]
+    struct Fts5PostingPruneStructure {
+        terms_before: Vec<String>,
+        terms_after: Vec<String>,
+        prefix_terms_before: Vec<String>,
+        prefix_terms_after: Vec<String>,
+        remaining_docs_for_alpha: Vec<i64>,
+        remaining_docs_for_world: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
     struct Fts5NotTermStructure {
         query_terms: Vec<String>,
         highlight_terms: Vec<Fts5HighlightTerm>,
@@ -4738,6 +4751,32 @@ mod tests {
             rows: table.all_rows(),
             terms,
         }
+    }
+
+    fn sorted_small_text_terms<'a>(terms: impl Iterator<Item = &'a SmallText>) -> Vec<String> {
+        let mut terms: Vec<String> = terms.map(|term| term.as_str().to_owned()).collect();
+        terms.sort();
+        terms
+    }
+
+    fn indexed_terms(index: &InvertedIndex) -> Vec<String> {
+        sorted_small_text_terms(index.index.keys())
+    }
+
+    fn indexed_prefix_terms(index: &InvertedIndex, prefix_length: usize) -> Vec<String> {
+        index
+            .prefix_indexes
+            .get(&prefix_length)
+            .map_or_else(Vec::new, |prefix_index| {
+                sorted_small_text_terms(prefix_index.keys())
+            })
+    }
+
+    fn posting_docids(postings: &[Posting]) -> Vec<i64> {
+        let mut docids: Vec<i64> = postings.iter().map(|posting| posting.docid).collect();
+        docids.sort_unstable();
+        docids.dedup();
+        docids
     }
 
     #[test]
@@ -5408,6 +5447,87 @@ mod tests {
         assert_eq!(index.total_docs(), 1);
         assert_eq!(index.doc_frequency("hello"), 1);
         assert_eq!(index.doc_frequency("world"), 0);
+    }
+
+    #[test]
+    fn test_inverted_index_remove_document_prunes_empty_buckets() {
+        let mut index = InvertedIndex::with_options(true, &[3, 4], DetailMode::Full);
+        let tok = Unicode61Tokenizer::new();
+
+        index.add_document(1, 0, &tok.tokenize("alpine solo"));
+        index.add_document(2, 0, &tok.tokenize("alpha world"));
+
+        assert!(index.index.contains_key("alpine"));
+        assert!(index.index.contains_key("solo"));
+        assert!(index.prefix_indexes.get(&4).unwrap().contains_key("alpi"));
+        assert!(index.prefix_indexes.get(&3).unwrap().contains_key("sol"));
+
+        index.remove_document(1);
+
+        assert_eq!(index.total_docs(), 1);
+        assert!(!index.index.contains_key("alpine"));
+        assert!(!index.index.contains_key("solo"));
+        assert!(!index.prefix_indexes.get(&4).unwrap().contains_key("alpi"));
+        assert!(!index.prefix_indexes.get(&3).unwrap().contains_key("sol"));
+        assert_eq!(posting_docids(index.get_postings("alpha")), vec![2]);
+        assert_eq!(posting_docids(index.get_postings("world")), vec![2]);
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_posting_prune() {
+        let mut index = InvertedIndex::with_options(true, &[3, 4], DetailMode::Full);
+        let tok = Unicode61Tokenizer::new();
+
+        index.add_document(1, 0, &tok.tokenize("alpine solo"));
+        index.add_document(2, 0, &tok.tokenize("alpha world"));
+        index.add_document(3, 0, &tok.tokenize("world"));
+        let terms_before = indexed_terms(&index);
+        let prefix_terms_before = indexed_prefix_terms(&index, 4);
+
+        index.remove_document(1);
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5PostingPruneStructure {
+                    terms_before,
+                    terms_after: indexed_terms(&index),
+                    prefix_terms_before,
+                    prefix_terms_after: indexed_prefix_terms(&index, 4),
+                    remaining_docs_for_alpha: posting_docids(index.get_postings("alpha")),
+                    remaining_docs_for_world: posting_docids(index.get_postings("world")),
+                }
+            ),
+            r#"Fts5PostingPruneStructure {
+    terms_before: [
+        "alpha",
+        "alpine",
+        "solo",
+        "world",
+    ],
+    terms_after: [
+        "alpha",
+        "world",
+    ],
+    prefix_terms_before: [
+        "alph",
+        "alpi",
+        "solo",
+        "worl",
+    ],
+    prefix_terms_after: [
+        "alph",
+        "worl",
+    ],
+    remaining_docs_for_alpha: [
+        2,
+    ],
+    remaining_docs_for_world: [
+        2,
+        3,
+    ],
+}"#
+        );
     }
 
     #[test]

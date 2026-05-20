@@ -1847,9 +1847,72 @@ impl Iterator for Fts5SegmentTermCursor<'_> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fts5ShadowRows {
     pub data: Vec<Fts5DataRow>,
+    pub idx: Vec<Fts5IdxRow>,
     pub config: Vec<Fts5ConfigRecord>,
     pub content: Vec<Fts5ContentRow>,
     pub docsize: Vec<Fts5DocsizeRow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fts5ShadowOpenReport {
+    pub metadata: Fts5ConfigMetadata,
+    pub averages: Option<Fts5AveragesRecord>,
+    pub structure: Option<Fts5StructureRecord>,
+    pub integrity: Option<Fts5SegmentIntegrityReport>,
+    pub content_row_count: usize,
+    pub docsize_row_count: usize,
+    pub max_seen_rowid: Option<i64>,
+    pub bound_without_rebuild: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Fts5ShadowOpen {
+    pub table: Fts5Table,
+    pub report: Fts5ShadowOpenReport,
+}
+
+impl Fts5ShadowRows {
+    pub fn validate_for_open(&self, column_count: usize) -> Result<Fts5ShadowOpenReport> {
+        let metadata = Fts5ConfigMetadata::decode_rows(&self.config)?;
+        let data = Fts5DataMetadata::decode_rows(&self.data, column_count)?;
+
+        for row in &self.content {
+            if row.values.len() != column_count {
+                return Err(fts5_data_error("content row column count mismatch"));
+            }
+        }
+        for row in &self.docsize {
+            if row.column_token_counts.len() != column_count {
+                return Err(fts5_data_error("docsize row column count mismatch"));
+            }
+        }
+
+        let integrity = if let Some(structure) = data.structure.as_ref()
+            && structure.segment_count() > 0
+        {
+            Some(Fts5SegmentRowSet::new(&self.data, &self.idx).integrity_report(structure)?)
+        } else {
+            None
+        };
+
+        let max_seen_rowid = self
+            .content
+            .iter()
+            .map(|row| row.rowid)
+            .chain(self.docsize.iter().map(|row| row.rowid))
+            .max();
+
+        Ok(Fts5ShadowOpenReport {
+            metadata,
+            averages: data.averages,
+            structure: data.structure,
+            integrity,
+            content_row_count: self.content.len(),
+            docsize_row_count: self.docsize.len(),
+            max_seen_rowid,
+            bound_without_rebuild: true,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5304,6 +5367,26 @@ impl Fts5Table {
             .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()))
     }
 
+    pub fn open_shadow_rows(
+        cx: &Cx,
+        args: &[&str],
+        rows: &Fts5ShadowRows,
+    ) -> Result<Fts5ShadowOpen> {
+        let mut table = Self::connect(cx, args)?;
+        let report = rows.validate_for_open(table.columns.len())?;
+        report.metadata.apply_to_runtime_config(&mut table.config);
+        table.index = InvertedIndex::with_options_and_tokendata(
+            table.config.columnsize_enabled(),
+            &table.prefix_lengths,
+            table.config.detail_mode(),
+            table.config.tokendata_enabled(),
+        );
+        if let Some(rowid) = report.max_seen_rowid {
+            table.next_rowid = rowid.saturating_add(1).max(1);
+        }
+        Ok(Fts5ShadowOpen { table, report })
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.documents.is_empty()
@@ -5659,6 +5742,7 @@ impl Fts5Table {
     pub fn encode_shadow_rows(&self) -> Fts5ShadowRows {
         Fts5ShadowRows {
             data: self.encode_data_rows(),
+            idx: Vec::new(),
             config: self.encode_config_rows(),
             content: self.encode_content_rows(),
             docsize: self.encode_docsize_rows(),
@@ -7069,10 +7153,19 @@ mod tests {
     #[derive(Debug)]
     struct Fts5ShadowRowsStructure {
         data: Vec<(i64, Vec<u8>)>,
+        idx: Vec<Fts5IdxRow>,
         config: Vec<(String, String)>,
         content: Vec<Fts5ContentRow>,
         docsize: Vec<Fts5DocsizeRow>,
         matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5ShadowOpenStructure {
+        report: Fts5ShadowOpenReport,
+        table_empty: bool,
+        next_rowid: i64,
     }
 
     #[allow(dead_code)]
@@ -8632,6 +8725,67 @@ mod tests {
     }
 
     #[test]
+    fn test_fts5_open_shadow_rows_binds_stock_segments_without_rebuild() {
+        let cx = Cx::new();
+        let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+        let (structure, mut data_rows, idx_rows) = sample_lazy_segment_rows();
+        data_rows.insert(
+            0,
+            Fts5DataRow::new(
+                FTS5_AVERAGES_ROWID,
+                Fts5AveragesRecord::new(2, vec![3, 4]).encode(),
+            ),
+        );
+        data_rows.insert(
+            1,
+            Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode()),
+        );
+        let rows = Fts5ShadowRows {
+            data: data_rows,
+            idx: idx_rows,
+            config: base.encode_config_rows(),
+            content: vec![
+                Fts5ContentRow::new(1, vec!["quick brown".to_owned(), "fox".to_owned()]),
+                Fts5ContentRow::new(4, vec!["slow brown".to_owned(), "bear".to_owned()]),
+            ],
+            docsize: vec![
+                Fts5DocsizeRow::new(1, vec![2, 1]),
+                Fts5DocsizeRow::new(4, vec![2, 1]),
+            ],
+        };
+
+        let opened =
+            Fts5Table::open_shadow_rows(&cx, &["fts5", "main", "docs", "title", "body"], &rows)
+                .unwrap();
+        assert!(opened.table.is_empty());
+        assert_eq!(opened.table.next_rowid, 5);
+        assert!(opened.report.bound_without_rebuild);
+        assert_eq!(opened.report.content_row_count, 2);
+        assert_eq!(opened.report.docsize_row_count, 2);
+        assert_eq!(opened.report.integrity.unwrap().term_count, 4);
+    }
+
+    #[test]
+    fn test_fts5_open_shadow_rows_rejects_inconsistent_stock_layout() {
+        let cx = Cx::new();
+        let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+        let rows = Fts5ShadowRows {
+            data: base.encode_data_rows(),
+            idx: Vec::new(),
+            config: base.encode_config_rows(),
+            content: vec![Fts5ContentRow::new(1, vec!["only one column".to_owned()])],
+            docsize: Vec::new(),
+        };
+
+        assert!(
+            Fts5Table::open_shadow_rows(&cx, &["fts5", "main", "docs", "title", "body"], &rows)
+                .expect_err("content rows must match table columns")
+                .to_string()
+                .contains("content row column count")
+        );
+    }
+
+    #[test]
     fn test_fts5_structural_snapshot_shadow_rows() {
         let cx = Cx::new();
         let mut table = Fts5Table::connect(
@@ -8658,6 +8812,7 @@ mod tests {
                 .iter()
                 .map(|row| (row.id, row.block.clone()))
                 .collect(),
+            idx: rows.idx.clone(),
             config: rows
                 .config
                 .iter()
@@ -8693,6 +8848,7 @@ mod tests {
             ],
         ),
     ],
+    idx: [],
     config: [
         (
             "insttoken",
@@ -8728,6 +8884,115 @@ mod tests {
     matches: [
         11,
     ],
+}"#
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_shadow_open_without_rebuild() {
+        let cx = Cx::new();
+        let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+        let (structure, mut data_rows, idx_rows) = sample_lazy_segment_rows();
+        data_rows.insert(
+            0,
+            Fts5DataRow::new(
+                FTS5_AVERAGES_ROWID,
+                Fts5AveragesRecord::new(2, vec![3, 4]).encode(),
+            ),
+        );
+        data_rows.insert(
+            1,
+            Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode()),
+        );
+        let rows = Fts5ShadowRows {
+            data: data_rows,
+            idx: idx_rows,
+            config: base.encode_config_rows(),
+            content: vec![
+                Fts5ContentRow::new(1, vec!["quick brown".to_owned(), "fox".to_owned()]),
+                Fts5ContentRow::new(4, vec!["slow brown".to_owned(), "bear".to_owned()]),
+            ],
+            docsize: vec![
+                Fts5DocsizeRow::new(1, vec![2, 1]),
+                Fts5DocsizeRow::new(4, vec![2, 1]),
+            ],
+        };
+        let opened =
+            Fts5Table::open_shadow_rows(&cx, &["fts5", "main", "docs", "title", "body"], &rows)
+                .unwrap();
+        let snapshot = Fts5ShadowOpenStructure {
+            report: opened.report,
+            table_empty: opened.table.is_empty(),
+            next_rowid: opened.table.next_rowid,
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5ShadowOpenStructure {
+    report: Fts5ShadowOpenReport {
+        metadata: Fts5ConfigMetadata {
+            format_version: 4,
+            page_size: 4050,
+            automerge: 4,
+            usermerge: 4,
+            crisismerge: 16,
+            hash_size: 1048576,
+            delete_merge: 10,
+            rank: None,
+            secure_delete: false,
+            insttoken: false,
+        },
+        averages: Some(
+            Fts5AveragesRecord {
+                total_rows: 2,
+                column_token_totals: [
+                    3,
+                    4,
+                ],
+            },
+        ),
+        structure: Some(
+            Fts5StructureRecord {
+                cookie: 0,
+                write_counter: 2,
+                origin_counter: 0,
+                levels: [
+                    Fts5StructureLevel {
+                        merge_inputs: 0,
+                        segments: [
+                            Fts5StructureSegment {
+                                segid: 5,
+                                pgno_first: 1,
+                                pgno_last: 2,
+                                origin_lower: 0,
+                                origin_upper: 0,
+                                tombstone_page_count: 0,
+                                tombstone_entry_count: 0,
+                                entry_count: 0,
+                            },
+                        ],
+                    },
+                ],
+            },
+        ),
+        integrity: Some(
+            Fts5SegmentIntegrityReport {
+                segment_count: 1,
+                leaf_page_count: 2,
+                idx_row_count: 1,
+                term_count: 4,
+                checksum: 3861481483356166922,
+            },
+        ),
+        content_row_count: 2,
+        docsize_row_count: 2,
+        max_seen_rowid: Some(
+            4,
+        ),
+        bound_without_rebuild: true,
+    },
+    table_empty: true,
+    next_rowid: 5,
 }"#
         );
     }

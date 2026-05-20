@@ -554,31 +554,61 @@ fn emit_upsert_assignments(
     excluded_hidden_rowid_reg: i32,
 ) -> Result<(), CodegenError> {
     for assign in assignments {
-        let col_name = match &assign.target {
-            AssignmentTarget::Column(name) => name.as_str(),
-            AssignmentTarget::ColumnList(_) => {
-                return Err(CodegenError::Unsupported(
-                    "multi-column SET (a, b) = (...) assignment is not yet supported".to_owned(),
-                ));
+        match &assign.target {
+            AssignmentTarget::Column(name) => {
+                let col_idx =
+                    table
+                        .column_index(name)
+                        .ok_or_else(|| CodegenError::ColumnNotFound {
+                            table: table.name.clone(),
+                            column: name.to_owned(),
+                        })?;
+                let dest_reg = target_regs + col_idx as i32;
+                emit_upsert_expr(
+                    b,
+                    &assign.value,
+                    dest_reg,
+                    existing_ctx,
+                    excluded_ctx,
+                    table,
+                    existing_hidden_rowid_reg,
+                    excluded_hidden_rowid_reg,
+                );
             }
-        };
-        let col_idx = table
-            .column_index(col_name)
-            .ok_or_else(|| CodegenError::ColumnNotFound {
-                table: table.name.clone(),
-                column: col_name.to_owned(),
-            })?;
-        let dest_reg = target_regs + col_idx as i32;
-        emit_upsert_expr(
-            b,
-            &assign.value,
-            dest_reg,
-            existing_ctx,
-            excluded_ctx,
-            table,
-            existing_hidden_rowid_reg,
-            excluded_hidden_rowid_reg,
-        );
+            AssignmentTarget::ColumnList(columns) => {
+                let Expr::RowValue(values, _) = &assign.value else {
+                    return Err(CodegenError::Unsupported(
+                        "multi-column SET requires a row-value expression".to_owned(),
+                    ));
+                };
+                if columns.len() != values.len() {
+                    return Err(CodegenError::Unsupported(format!(
+                        "multi-column SET arity mismatch: {} targets, {} values",
+                        columns.len(),
+                        values.len()
+                    )));
+                }
+                for (col_name, value_expr) in columns.iter().zip(values) {
+                    let col_idx = table.column_index(col_name).ok_or_else(|| {
+                        CodegenError::ColumnNotFound {
+                            table: table.name.clone(),
+                            column: col_name.to_owned(),
+                        }
+                    })?;
+                    let dest_reg = target_regs + col_idx as i32;
+                    emit_upsert_expr(
+                        b,
+                        value_expr,
+                        dest_reg,
+                        existing_ctx,
+                        excluded_ctx,
+                        table,
+                        existing_hidden_rowid_reg,
+                        excluded_hidden_rowid_reg,
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -14147,9 +14177,22 @@ fn validate_assignment_target(
                 })
             }
         }
-        AssignmentTarget::ColumnList(_) => Err(CodegenError::Unsupported(
-            "multi-column SET (a, b) = (...) assignment is not yet supported".to_owned(),
-        )),
+        AssignmentTarget::ColumnList(columns) => {
+            if columns.is_empty() {
+                return Err(CodegenError::Unsupported(
+                    "multi-column SET requires at least one target column".to_owned(),
+                ));
+            }
+            for name in columns {
+                if table.column_index(name).is_none() {
+                    return Err(CodegenError::ColumnNotFound {
+                        table: table.name.clone(),
+                        column: name.clone(),
+                    });
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -31239,6 +31282,94 @@ mod tests {
             !opcode_sequence(&prog).contains(&Opcode::Null),
             "target alias in UPSERT DO UPDATE should resolve to the existing row, not emit NULL"
         );
+    }
+
+    #[test]
+    fn test_codegen_upsert_update_column_list_assignment() -> Result<(), String> {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![UpsertClause {
+                target: None,
+                action: UpsertAction::Update {
+                    assignments: vec![Assignment {
+                        target: AssignmentTarget::ColumnList(vec!["a".to_owned(), "b".to_owned()]),
+                        value: Expr::RowValue(
+                            vec![
+                                Expr::Column(ColumnRef::qualified("excluded", "a"), Span::ZERO),
+                                Expr::Literal(Literal::String("updated".to_owned()), Span::ZERO),
+                            ],
+                            Span::ZERO,
+                        ),
+                    }],
+                    where_clause: None,
+                },
+            }],
+            returning: vec![],
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).map_err(|err| format!("{err:?}"))?;
+        let prog = b.finish().map_err(|err| format!("{err:?}"))?;
+
+        if !has_opcodes(
+            &prog,
+            &[
+                Opcode::Copy,
+                Opcode::String8,
+                Opcode::MakeRecord,
+                Opcode::Insert,
+            ],
+        ) {
+            return Err(format!(
+                "UPSERT column-list assignment should copy excluded.a and emit literal b, got {:?}",
+                opcode_sequence(&prog)
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_codegen_upsert_update_column_list_rejects_arity_mismatch() -> Result<(), String> {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![UpsertClause {
+                target: None,
+                action: UpsertAction::Update {
+                    assignments: vec![Assignment {
+                        target: AssignmentTarget::ColumnList(vec!["a".to_owned(), "b".to_owned()]),
+                        value: Expr::RowValue(
+                            vec![Expr::Column(
+                                ColumnRef::qualified("excluded", "a"),
+                                Span::ZERO,
+                            )],
+                            Span::ZERO,
+                        ),
+                    }],
+                    where_clause: None,
+                },
+            }],
+            returning: vec![],
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+
+        match codegen_insert(&mut b, &stmt, &schema, &ctx) {
+            Err(CodegenError::Unsupported(msg)) if msg.contains("arity mismatch") => Ok(()),
+            other => Err(format!("expected column-list arity error, got {other:?}")),
+        }
     }
 
     #[test]

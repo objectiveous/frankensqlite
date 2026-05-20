@@ -3,8 +3,11 @@
 //! This module exposes lightweight process-local counters used by the
 //! `btree_op` tracing lane and bead-level telemetry verification.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
+use fsqlite_types::PageNumber;
 use serde::{Deserialize, Serialize};
 
 /// Supported B-tree operation types for observability.
@@ -216,6 +219,292 @@ static BTREE_PAGE_SPLITS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BTREE_DEPTH_GAUGE: AtomicU64 = AtomicU64::new(0);
 static SWISS_TABLE_PROBES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SWISS_TABLE_LOAD_FACTOR: AtomicU64 = AtomicU64::new(0);
+
+// ── Conflict-topology allocator/split policy (bd-1dp9.6.7.13.2) ──────────
+
+const CONFLICT_TOPOLOGY_POLICY_ID: &str = "btree.conflict_topology_split.v1";
+const CONFLICT_TOPOLOGY_POLICY_ENV: &str = "FSQLITE_CONFLICT_TOPOLOGY_POLICY";
+const CONFLICT_TOPOLOGY_HOT_HEAT_THRESHOLD: u64 = 2;
+const CONFLICT_TOPOLOGY_HOT_OVERLAP_THRESHOLD: u32 = 2;
+const CONFLICT_TOPOLOGY_TARGET_SHIFT_BPS: usize = 1_500;
+
+static CONFLICT_TOPOLOGY_POLICY_MODE: AtomicU64 = AtomicU64::new(2);
+static CONFLICT_TOPOLOGY_POLICY_ENV_APPLIED: AtomicBool = AtomicBool::new(false);
+static CONFLICT_TOPOLOGY_STATE: LazyLock<Mutex<ConflictTopologyState>> =
+    LazyLock::new(|| Mutex::new(ConflictTopologyState::default()));
+
+/// Rollout mode for conflict-topology placement/split policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConflictTopologyPolicyMode {
+    /// Ignore conflict heat and keep the baseline B-tree split policy.
+    Baseline,
+    /// Compute and log what the topology-aware policy would do, but do not apply it.
+    Advisory,
+    /// Apply topology-aware target fill adjustments for hot pages.
+    Enforced,
+}
+
+impl ConflictTopologyPolicyMode {
+    /// Stable log label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Advisory => "advisory",
+            Self::Enforced => "enforced",
+        }
+    }
+
+    const fn to_raw(self) -> u64 {
+        match self {
+            Self::Baseline => 0,
+            Self::Advisory => 1,
+            Self::Enforced => 2,
+        }
+    }
+
+    const fn from_raw(raw: u64) -> Self {
+        match raw {
+            0 => Self::Baseline,
+            1 => Self::Advisory,
+            _ => Self::Enforced,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ConflictTopologyPageState {
+    heat: u64,
+    max_writer_overlap_estimate: u32,
+}
+
+#[derive(Debug, Default)]
+struct ConflictTopologyState {
+    pages: BTreeMap<PageNumber, ConflictTopologyPageState>,
+}
+
+/// Split-policy advice derived from MVCC conflict heat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ConflictTopologySplitAdvice {
+    /// Stable policy identifier for logs and artifacts.
+    pub policy_id: &'static str,
+    /// Current rollout mode.
+    pub policy_mode: ConflictTopologyPolicyMode,
+    /// Baseline split target before topology adjustment.
+    pub baseline_target_left_basis_points: usize,
+    /// Advisory topology-aware target, even when mode is advisory.
+    pub advised_target_left_basis_points: usize,
+    /// Target actually applied to the split.
+    pub effective_target_left_basis_points: usize,
+    /// Conflict heat observed for the page.
+    pub conflict_heat: u64,
+    /// Maximum peer-writer overlap observed for the page.
+    pub writer_overlap_estimate: u32,
+    /// Whether the heat thresholds selected the topology-aware policy.
+    pub topology_hot: bool,
+    /// Whether the effective target differs from baseline.
+    pub applied: bool,
+    /// Positive means the policy predicts fewer future hot-page overlaps.
+    pub predicted_overlap_delta: i64,
+    /// Whether an operator override forced baseline behavior.
+    pub operator_override_active: bool,
+}
+
+impl ConflictTopologySplitAdvice {
+    /// Log label for the chosen placement policy.
+    #[must_use]
+    pub const fn placement_policy(self) -> &'static str {
+        if self.applied {
+            "topology_aware_fill_factor"
+        } else {
+            "baseline"
+        }
+    }
+
+    /// Log label for why the policy did or did not adjust the split.
+    #[must_use]
+    pub const fn split_reason(self) -> &'static str {
+        if self.operator_override_active {
+            "operator_override_baseline"
+        } else if self.topology_hot {
+            "mvcc_conflict_heat_hot_page"
+        } else {
+            "no_hot_page_signal"
+        }
+    }
+}
+
+/// Set the process-local rollout mode for conflict-topology split policy.
+pub fn set_conflict_topology_policy_mode(mode: ConflictTopologyPolicyMode) {
+    CONFLICT_TOPOLOGY_POLICY_ENV_APPLIED.store(true, Ordering::Release);
+    CONFLICT_TOPOLOGY_POLICY_MODE.store(mode.to_raw(), Ordering::Relaxed);
+}
+
+/// Current rollout mode for conflict-topology split policy.
+#[must_use]
+pub fn conflict_topology_policy_mode() -> ConflictTopologyPolicyMode {
+    apply_conflict_topology_policy_env_once();
+    ConflictTopologyPolicyMode::from_raw(CONFLICT_TOPOLOGY_POLICY_MODE.load(Ordering::Relaxed))
+}
+
+/// Whether MVCC should feed conflict heat into the B-tree policy cache.
+#[must_use]
+pub fn conflict_topology_policy_enabled() -> bool {
+    conflict_topology_policy_mode() != ConflictTopologyPolicyMode::Baseline
+}
+
+/// Clear accumulated conflict-topology heat.
+pub fn reset_conflict_topology_policy_state() {
+    *CONFLICT_TOPOLOGY_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = ConflictTopologyState::default();
+}
+
+/// Feed one MVCC conflict-heat observation into the B-tree split policy cache.
+pub fn record_conflict_topology_heat(
+    page: PageNumber,
+    conflict_heat: u64,
+    writer_overlap_estimate: u32,
+) {
+    let _updated = record_conflict_topology_heat_batch(
+        std::iter::once(page),
+        conflict_heat,
+        writer_overlap_estimate,
+    );
+}
+
+/// Feed several MVCC conflict-heat observations under one policy-cache lock.
+///
+/// Returns the number of pages updated.
+#[must_use]
+pub fn record_conflict_topology_heat_batch(
+    pages: impl IntoIterator<Item = PageNumber>,
+    conflict_heat: u64,
+    writer_overlap_estimate: u32,
+) -> usize {
+    if !conflict_topology_policy_enabled() {
+        return 0;
+    }
+    let mut state = CONFLICT_TOPOLOGY_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let conflict_heat = conflict_heat.max(1);
+    let mut updated = 0usize;
+    for page in pages {
+        let page_state = state.pages.entry(page).or_default();
+        page_state.heat = page_state.heat.saturating_add(conflict_heat);
+        page_state.max_writer_overlap_estimate = page_state
+            .max_writer_overlap_estimate
+            .max(writer_overlap_estimate);
+        updated += 1;
+    }
+    updated
+}
+
+/// Return split advice for a page about to split.
+#[must_use]
+pub fn conflict_topology_split_advice(
+    page: PageNumber,
+    predicted_hot_side: &str,
+    baseline_target_left_basis_points: usize,
+) -> ConflictTopologySplitAdvice {
+    let mode = conflict_topology_policy_mode();
+    let page_state = if mode == ConflictTopologyPolicyMode::Baseline {
+        ConflictTopologyPageState::default()
+    } else {
+        CONFLICT_TOPOLOGY_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pages
+            .get(&page)
+            .copied()
+            .unwrap_or_default()
+    };
+    let topology_hot = page_state.heat >= CONFLICT_TOPOLOGY_HOT_HEAT_THRESHOLD
+        && page_state.max_writer_overlap_estimate >= CONFLICT_TOPOLOGY_HOT_OVERLAP_THRESHOLD;
+    let advised_target_left_basis_points = if topology_hot {
+        topology_adjusted_target(predicted_hot_side, baseline_target_left_basis_points)
+    } else {
+        baseline_target_left_basis_points
+    };
+    let effective_target_left_basis_points =
+        if mode == ConflictTopologyPolicyMode::Enforced && topology_hot {
+            advised_target_left_basis_points
+        } else {
+            baseline_target_left_basis_points
+        };
+    let applied = effective_target_left_basis_points != baseline_target_left_basis_points;
+    let predicted_overlap_delta = if topology_hot {
+        i64::from(page_state.max_writer_overlap_estimate.max(1))
+    } else {
+        0
+    };
+
+    ConflictTopologySplitAdvice {
+        policy_id: CONFLICT_TOPOLOGY_POLICY_ID,
+        policy_mode: mode,
+        baseline_target_left_basis_points,
+        advised_target_left_basis_points,
+        effective_target_left_basis_points,
+        conflict_heat: page_state.heat,
+        writer_overlap_estimate: page_state.max_writer_overlap_estimate,
+        topology_hot,
+        applied,
+        predicted_overlap_delta,
+        operator_override_active: mode == ConflictTopologyPolicyMode::Baseline,
+    }
+}
+
+fn topology_adjusted_target(predicted_hot_side: &str, baseline: usize) -> usize {
+    match predicted_hot_side {
+        "left_edge" => baseline
+            .saturating_sub(CONFLICT_TOPOLOGY_TARGET_SHIFT_BPS)
+            .max(2_500),
+        "right_edge" => baseline
+            .saturating_add(CONFLICT_TOPOLOGY_TARGET_SHIFT_BPS)
+            .min(8_000),
+        _ => 5_000,
+    }
+}
+
+fn apply_conflict_topology_policy_env_once() {
+    if CONFLICT_TOPOLOGY_POLICY_ENV_APPLIED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let Ok(raw) = std::env::var(CONFLICT_TOPOLOGY_POLICY_ENV) else {
+        return;
+    };
+    if let Some(mode) = parse_conflict_topology_policy_mode(raw.as_str()) {
+        CONFLICT_TOPOLOGY_POLICY_MODE.store(mode.to_raw(), Ordering::Relaxed);
+    }
+}
+
+fn parse_conflict_topology_policy_mode(raw: &str) -> Option<ConflictTopologyPolicyMode> {
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("baseline")
+        || raw.eq_ignore_ascii_case("off")
+        || raw.eq_ignore_ascii_case("false")
+        || raw == "0"
+    {
+        Some(ConflictTopologyPolicyMode::Baseline)
+    } else if raw.eq_ignore_ascii_case("advisory")
+        || raw.eq_ignore_ascii_case("shadow")
+        || raw == "1"
+    {
+        Some(ConflictTopologyPolicyMode::Advisory)
+    } else if raw.eq_ignore_ascii_case("enforced")
+        || raw.eq_ignore_ascii_case("on")
+        || raw.eq_ignore_ascii_case("true")
+        || raw == "2"
+    {
+        Some(ConflictTopologyPolicyMode::Enforced)
+    } else {
+        None
+    }
+}
 
 // ── Swizzle metrics (bd-3ta.3) ──────────────────────────────────────────────
 
@@ -851,12 +1140,19 @@ pub(crate) static BTREE_METRICS_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
 #[cfg(test)]
+pub(crate) static CONFLICT_TOPOLOGY_POLICY_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+#[cfg(test)]
 mod tests {
     use super::{
-        BtreeOpType, btree_copy_profile_snapshot, btree_leaf_reuse_snapshot,
-        btree_metrics_snapshot, record_conservative_reload_fallback, record_no_split_reuse_hit,
-        record_operation, record_page_header_rebuild, reset_btree_copy_profile,
-        reset_btree_metrics, set_btree_copy_profile_enabled, set_btree_metrics_enabled,
+        BtreeOpType, ConflictTopologyPolicyMode, btree_copy_profile_snapshot,
+        btree_leaf_reuse_snapshot, btree_metrics_snapshot, conflict_topology_split_advice,
+        record_conflict_topology_heat, record_conservative_reload_fallback,
+        record_no_split_reuse_hit, record_operation, record_page_header_rebuild,
+        reset_btree_copy_profile, reset_btree_metrics, reset_conflict_topology_policy_state,
+        set_btree_copy_profile_enabled, set_btree_metrics_enabled,
+        set_conflict_topology_policy_mode,
     };
     use crate::{BtCursor, BtreeCursorOps, MemPageStore};
     use fsqlite_types::PageNumber;
@@ -865,6 +1161,68 @@ mod tests {
 
     const TEST_USABLE: u32 = 4096;
     static COPY_PROFILE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn conflict_topology_advice_applies_hot_right_edge_fill_shift() {
+        let _guard = super::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let page = PageNumber::new(42).expect("page");
+        set_conflict_topology_policy_mode(ConflictTopologyPolicyMode::Enforced);
+        reset_conflict_topology_policy_state();
+
+        record_conflict_topology_heat(page, 2, 3);
+        let advice = conflict_topology_split_advice(page, "right_edge", 6_500);
+
+        assert!(advice.topology_hot);
+        assert!(advice.applied);
+        assert_eq!(advice.policy_mode, ConflictTopologyPolicyMode::Enforced);
+        assert_eq!(advice.effective_target_left_basis_points, 8_000);
+        assert_eq!(advice.placement_policy(), "topology_aware_fill_factor");
+        assert_eq!(advice.predicted_overlap_delta, 3);
+
+        reset_conflict_topology_policy_state();
+        set_conflict_topology_policy_mode(ConflictTopologyPolicyMode::Enforced);
+    }
+
+    #[test]
+    fn conflict_topology_baseline_mode_is_kill_switch() {
+        let _guard = super::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let page = PageNumber::new(43).expect("page");
+        set_conflict_topology_policy_mode(ConflictTopologyPolicyMode::Enforced);
+        reset_conflict_topology_policy_state();
+        record_conflict_topology_heat(page, 10, 8);
+
+        set_conflict_topology_policy_mode(ConflictTopologyPolicyMode::Baseline);
+        let advice = conflict_topology_split_advice(page, "right_edge", 6_500);
+
+        assert_eq!(advice.policy_mode, ConflictTopologyPolicyMode::Baseline);
+        assert!(!advice.applied);
+        assert_eq!(advice.effective_target_left_basis_points, 6_500);
+        assert!(advice.operator_override_active);
+
+        reset_conflict_topology_policy_state();
+        set_conflict_topology_policy_mode(ConflictTopologyPolicyMode::Enforced);
+    }
+
+    #[test]
+    fn conflict_topology_policy_parse_accepts_operator_labels() {
+        assert_eq!(
+            super::parse_conflict_topology_policy_mode("baseline"),
+            Some(ConflictTopologyPolicyMode::Baseline)
+        );
+        assert_eq!(
+            super::parse_conflict_topology_policy_mode("shadow"),
+            Some(ConflictTopologyPolicyMode::Advisory)
+        );
+        assert_eq!(
+            super::parse_conflict_topology_policy_mode("true"),
+            Some(ConflictTopologyPolicyMode::Enforced)
+        );
+        assert_eq!(super::parse_conflict_topology_policy_mode("bogus"), None);
+    }
 
     #[test]
     fn metrics_snapshot_tracks_operation_buckets() {

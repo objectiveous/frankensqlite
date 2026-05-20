@@ -1708,6 +1708,13 @@ pub fn validate_first_committer_wins(
         );
         FcwResult::Clean
     } else {
+        if fsqlite_btree::conflict_topology_policy_enabled() {
+            let _updated = fsqlite_btree::record_conflict_topology_heat_batch(
+                conflicting_pages.iter().copied(),
+                1,
+                2,
+            );
+        }
         tracing::warn!(
             conflicting_page_count = conflicting_pages.len(),
             max_conflicting_seq = max_conflicting_seq.get(),
@@ -2529,7 +2536,9 @@ fn record_prepare_conflict_heat(
     outgoing_edges: &[DiscoveredEdge],
     write_set_pages: &[PageNumber],
 ) {
-    if !conflict_heat_telemetry_enabled() {
+    let telemetry_enabled = conflict_heat_telemetry_enabled();
+    let topology_policy_enabled = fsqlite_btree::conflict_topology_policy_enabled();
+    if !telemetry_enabled && !topology_policy_enabled {
         return;
     }
     let edge_count = incoming_edges.len().saturating_add(outgoing_edges.len());
@@ -2568,6 +2577,20 @@ fn record_prepare_conflict_heat(
 
     let writer_overlap_estimate = u32::try_from(peer_tokens.len()).unwrap_or(u32::MAX);
     let conflict_heat = u64::try_from(edge_count).unwrap_or(u64::MAX);
+    if topology_policy_enabled {
+        let updated = fsqlite_btree::record_conflict_topology_heat_batch(
+            edges.iter().filter_map(|edge| edge.overlap_page),
+            1,
+            writer_overlap_estimate,
+        );
+        if updated == 0 {
+            let _updated = fsqlite_btree::record_conflict_topology_heat_batch(
+                write_set_pages.iter().copied(),
+                conflict_heat.max(1),
+                writer_overlap_estimate,
+            );
+        }
+    }
     let observation = ConflictHeatObservation {
         context: ConflictHeatContext {
             trace_id: "mvcc-ssi-prepare",
@@ -2596,7 +2619,9 @@ fn record_prepare_conflict_heat(
         edge_count,
         "mvcc conflict heat prepare observation"
     );
-    record_conflict_heat_observation(&observation);
+    if telemetry_enabled {
+        record_conflict_heat_observation(&observation);
+    }
 }
 
 /// Commit a concurrent transaction.
@@ -3740,11 +3765,19 @@ mod tests {
         fn drop(&mut self) {
             set_conflict_heat_telemetry_enabled(false);
             reset_conflict_heat_telemetry();
+            fsqlite_btree::reset_conflict_topology_policy_state();
+            fsqlite_btree::set_conflict_topology_policy_mode(
+                fsqlite_btree::ConflictTopologyPolicyMode::Enforced,
+            );
         }
     }
 
     fn enable_conflict_heat_telemetry_for_test() -> ConflictHeatTelemetryGuard {
         reset_conflict_heat_telemetry();
+        fsqlite_btree::reset_conflict_topology_policy_state();
+        fsqlite_btree::set_conflict_topology_policy_mode(
+            fsqlite_btree::ConflictTopologyPolicyMode::Enforced,
+        );
         set_conflict_heat_telemetry_enabled(true);
         ConflictHeatTelemetryGuard
     }
@@ -5683,6 +5716,13 @@ mod tests {
             .find(|page| page.page_no == 10)
             .expect("page 10 should record the outgoing overlap");
         assert_eq!(outgoing_page.conflict_heat, 1);
+
+        let split_advice =
+            fsqlite_btree::conflict_topology_split_advice(test_page(20), "right_edge", 6_500);
+        assert!(split_advice.topology_hot);
+        assert!(split_advice.applied);
+        assert_eq!(split_advice.effective_target_left_basis_points, 8_000);
+        assert_eq!(split_advice.split_reason(), "mvcc_conflict_heat_hot_page");
     }
 
     #[test]

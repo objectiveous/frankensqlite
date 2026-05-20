@@ -6912,6 +6912,75 @@ mod tests {
     }
 
     #[test]
+    fn test_track_q_flat_hash_reinsert_updates_existing_slot_in_place() {
+        let slots = FlatPageSlots::new(64);
+        let page_no = PageNumber::new(42).expect("page number");
+        let original_slot = slots.hash_pgno(page_no.get());
+
+        let inserted = slots
+            .try_insert(page_no, track_q_page_buf(page_no))
+            .expect("initial page insert should stay in flat slots");
+        assert!(inserted, "initial page should be newly inserted");
+        assert_eq!(
+            slots.find_slot(page_no),
+            Some(original_slot),
+            "initial page should occupy its home bucket"
+        );
+        assert_eq!(
+            slots.len(),
+            1,
+            "initial insert should add one resident page"
+        );
+        assert_eq!(
+            slots.admits.load(Ordering::Relaxed),
+            1,
+            "initial insert should count as one flat-slot admission"
+        );
+
+        let mut replacement = track_q_page_buf(page_no);
+        replacement.as_mut_slice()[4] = 0xA5;
+        replacement.as_mut_slice()[PageSize::DEFAULT.as_usize() - 1] = 0x5A;
+
+        let inserted = slots
+            .try_insert(page_no, replacement)
+            .expect("reinserted page should update the resident flat slot");
+        assert!(
+            !inserted,
+            "reinserting the same page should report an in-place update"
+        );
+        assert_eq!(
+            slots.find_slot(page_no),
+            Some(original_slot),
+            "same-page update must not move the flat-slot entry"
+        );
+        assert_eq!(
+            slots.len(),
+            1,
+            "same-page update must not grow flat-slot occupancy"
+        );
+        assert_eq!(
+            slots.admits.load(Ordering::Relaxed),
+            1,
+            "same-page update must not double-count flat-slot admissions"
+        );
+
+        let copy = slots
+            .get_copy(page_no)
+            .expect("updated page should remain readable");
+        assert_eq!(
+            &copy[..4],
+            &page_no.get().to_le_bytes(),
+            "updated page should retain the page-number header"
+        );
+        assert_eq!(copy[4], 0xA5, "updated page body byte should be visible");
+        assert_eq!(
+            copy[PageSize::DEFAULT.as_usize() - 1],
+            0x5A,
+            "updated page tail byte should be visible"
+        );
+    }
+
+    #[test]
     fn test_track_q_flat_hash_forced_probe_collision_chain() {
         let slots = FlatPageSlots::new(64);
         let target_bucket = slots.hash_pgno(PageNumber::ONE.get());

@@ -1886,6 +1886,10 @@ impl TransactionManager {
         self.lock_table
             .release_set(txn.page_locks.drain(), txn.txn_id);
         txn.clear_page_access_tracking();
+        txn.write_set.clear();
+        Arc::make_mut(&mut txn.write_set_data).clear();
+        txn.intent_log.clear();
+        txn.write_keys.clear();
 
         // Release serialized write mutex if held.
         if txn.serialized_write_lock_held {
@@ -3435,6 +3439,10 @@ mod tests {
 
         // Mutex should be released.
         assert!(m.write_mutex().holder().is_none());
+        assert!(txn.write_set.is_empty());
+        assert!(txn.write_set_data.is_empty());
+        assert!(txn.write_set_versions.is_empty());
+        assert!(txn.write_keys.is_empty());
 
         // Version store should have the committed version.
         let snap = Snapshot::new(seq, SchemaEpoch::ZERO);
@@ -3571,6 +3579,10 @@ mod tests {
 
         // Locks should be released.
         assert_eq!(m.lock_table().lock_count(), 0);
+        assert!(txn.write_set.is_empty());
+        assert!(txn.write_set_data.is_empty());
+        assert!(txn.write_set_versions.is_empty());
+        assert!(txn.write_keys.is_empty());
     }
 
     // -----------------------------------------------------------------------

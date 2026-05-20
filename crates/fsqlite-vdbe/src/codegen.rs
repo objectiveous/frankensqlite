@@ -19799,6 +19799,44 @@ mod tests {
         }
     }
 
+    fn first_result_expr(select: &SelectStatement) -> &Expr {
+        let SelectCore::Select { columns, .. } = &select.body.select else {
+            unreachable!("expected SELECT core");
+        };
+        let ResultColumn::Expr { expr, .. } = &columns[0] else {
+            unreachable!("expected expression result column");
+        };
+        expr
+    }
+
+    #[test]
+    fn test_window_spec_placeholder_count_tracks_bounded_rows_frame_and_exclude_ties() {
+        let stmt = select_sql(
+            "SELECT SUM(a) OVER (PARTITION BY ? ORDER BY ? ROWS BETWEEN ? PRECEDING AND ? FOLLOWING EXCLUDE TIES) FROM t",
+        );
+        let Expr::FunctionCall { over: Some(spec), .. } = first_result_expr(&stmt) else {
+            unreachable!("expected window function expression");
+        };
+
+        assert_eq!(count_anon_placeholders_in_window_spec(spec), 4);
+        let frame = spec.frame.as_ref().expect("window frame should exist");
+        assert_eq!(frame.exclude, Some(fsqlite_ast::FrameExclude::Ties));
+    }
+
+    #[test]
+    fn test_window_spec_placeholder_count_ignores_groups_current_row_exclude_group() {
+        let stmt = select_sql(
+            "SELECT SUM(a) OVER (ORDER BY a GROUPS BETWEEN CURRENT ROW AND CURRENT ROW EXCLUDE GROUP) FROM t",
+        );
+        let Expr::FunctionCall { over: Some(spec), .. } = first_result_expr(&stmt) else {
+            unreachable!("expected window function expression");
+        };
+
+        assert_eq!(count_anon_placeholders_in_window_spec(spec), 0);
+        let frame = spec.frame.as_ref().expect("window frame should exist");
+        assert_eq!(frame.exclude, Some(fsqlite_ast::FrameExclude::Group));
+    }
+
     fn lower_name_eq_param(n: u32) -> Box<Expr> {
         Box::new(expr_sql(&format!("lower(name) = ?{n}")))
     }

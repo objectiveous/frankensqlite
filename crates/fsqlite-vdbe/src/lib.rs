@@ -908,6 +908,12 @@ fn peephole_fuse_append_insert(ops: &mut smallvec::SmallVec<[VdbeOp; 64]>) {
 /// that stay on storage cursors plus pure register/control-flow opcodes, which
 /// lets hot prepared table executions skip the `MemDatabase` handoff entirely.
 fn compute_requires_attached_memdb(ops: &[VdbeOp]) -> bool {
+    compute_attached_memdb_requirement_reason(ops).is_some()
+}
+
+/// Return the first conservative reason a finalized program still needs an
+/// attached `MemDatabase`.
+fn compute_attached_memdb_requirement_reason(ops: &[VdbeOp]) -> Option<&'static str> {
     let mut storage_cursor_ids = HashSet::new();
     let mut sorter_cursor_ids = HashSet::new();
 
@@ -943,7 +949,7 @@ fn compute_requires_attached_memdb(ops: &[VdbeOp]) -> bool {
             | Opcode::VColumn
             | Opcode::VNext
             | Opcode::VRename
-            | Opcode::VUpdate => return true,
+            | Opcode::VUpdate => return Some("memdb_or_virtual_table_opcode"),
             Opcode::Rewind
             | Opcode::Last
             | Opcode::Next
@@ -983,13 +989,13 @@ fn compute_requires_attached_memdb(ops: &[VdbeOp]) -> bool {
             | Opcode::FusedAppendInsert
                 if !storage_cursor_ids.contains(&op.p1) && !sorter_cursor_ids.contains(&op.p1) =>
             {
-                return true;
+                return Some("cursor_opcode_without_storage_or_sorter_open");
             }
             _ => {}
         }
     }
 
-    false
+    None
 }
 
 // ── VDBE Program ────────────────────────────────────────────────────────────
@@ -1193,6 +1199,12 @@ impl VdbeProgram {
     /// `MemDatabase` for opcode semantics.
     pub fn requires_attached_memdb(&self) -> bool {
         self.requires_attached_memdb
+    }
+
+    /// Returns the first conservative reason this program still requires an
+    /// attached `MemDatabase`, or `None` for storage-only VDBE programs.
+    pub fn attached_memdb_requirement_reason(&self) -> Option<&'static str> {
+        compute_attached_memdb_requirement_reason(&self.ops)
     }
 
     /// Returns `true` when this program can read historical page versions.

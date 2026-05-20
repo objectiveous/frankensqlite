@@ -57,6 +57,14 @@ fn balance_data(balance: i64) -> PageData {
     data
 }
 
+fn key_range(btree_root: PageNumber, lo: &[u8], hi: &[u8]) -> WitnessKey {
+    WitnessKey::KeyRange {
+        btree_root,
+        lo: lo.to_vec(),
+        hi: hi.to_vec(),
+    }
+}
+
 fn page_key(pgno: u32) -> WitnessKey {
     WitnessKey::Page(PageNumber::new(pgno).unwrap())
 }
@@ -410,6 +418,86 @@ fn ssi_anomaly_phantom_via_registry() {
     assert!(
         result1.is_ok(),
         "bead_id={BEAD_ID} phantom-registry: T1 commits (only outgoing, not a pivot)"
+    );
+}
+
+/// Predicate-read phantom cycle through the real concurrent registry path.
+///
+/// T_scan reads a key range and writes an aggregate page. T_insert reads that
+/// aggregate page and writes a point key inside the range. The scan transaction
+/// has both incoming and outgoing rw-antidependencies, so SSI must abort it as
+/// the pivot before both sides can publish an impossible aggregate.
+#[test]
+fn ssi_predicate_phantom_cycle_aborts_scan_without_mock_edges() {
+    let lock_table = InProcessPageLockTable::new();
+    let commit_index = CommitIndex::new();
+    let mut registry = ConcurrentRegistry::new();
+
+    let index_root = test_page(801);
+    let insert_leaf = test_page(802);
+    let aggregate_page = test_page(803);
+    let scanned_range = key_range(index_root, b"acct:0100", b"acct:0199");
+    let inserted_key = b"acct:0150";
+
+    let scan = registry.begin_concurrent(test_snapshot(10)).unwrap();
+    let insert = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+    {
+        let mut h_scan = registry.get_mut(scan).unwrap();
+        h_scan.record_read_witness(scanned_range);
+        concurrent_write_page(&mut h_scan, &lock_table, scan, aggregate_page, test_data()).unwrap();
+    }
+    {
+        let mut h_insert = registry.get_mut(insert).unwrap();
+        h_insert.record_read(aggregate_page);
+        let (cell_witness, page_witness) =
+            WitnessKey::for_point_write(index_root, inserted_key, insert_leaf);
+        h_insert.record_write_witness(cell_witness);
+        h_insert.record_write_witness(page_witness);
+        concurrent_write_page(&mut h_insert, &lock_table, insert, insert_leaf, test_data())
+            .unwrap();
+    }
+
+    let scan_result = concurrent_commit_with_ssi(
+        &mut registry,
+        &commit_index,
+        &lock_table,
+        scan,
+        CommitSeq::new(11),
+    );
+    assert!(
+        matches!(
+            scan_result,
+            Err((
+                MvccError::BusySnapshot,
+                FcwResult::Abort {
+                    reason: SsiAbortReason::Pivot,
+                },
+            ))
+        ),
+        "bead_id=bd-zoh27 predicate phantom: scan pivot must abort"
+    );
+
+    let insert_result = concurrent_commit_with_ssi(
+        &mut registry,
+        &commit_index,
+        &lock_table,
+        insert,
+        CommitSeq::new(12),
+    );
+    assert!(
+        insert_result.is_ok(),
+        "bead_id=bd-zoh27 predicate phantom: insert must commit after scan abort"
+    );
+    assert_eq!(
+        commit_index.latest(insert_leaf),
+        Some(CommitSeq::new(12)),
+        "bead_id=bd-zoh27 predicate phantom: insert leaf commit must publish"
+    );
+    assert_eq!(
+        commit_index.latest(aggregate_page),
+        None,
+        "bead_id=bd-zoh27 predicate phantom: aborted aggregate must not publish"
     );
 }
 

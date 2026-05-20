@@ -7655,7 +7655,23 @@ fn emit_join_expr(
                 BinaryOp::Or => {
                     b.emit_op(Opcode::Or, left_reg, right_reg, target, P4::None, 0);
                 }
-                _ => {
+                BinaryOp::Divide
+                | BinaryOp::Modulo
+                | BinaryOp::Concat
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::ShiftLeft
+                | BinaryOp::ShiftRight => {
+                    b.emit_op(
+                        binary_op_to_opcode(*op),
+                        right_reg,
+                        left_reg,
+                        target,
+                        P4::None,
+                        0,
+                    );
+                }
+                BinaryOp::Is | BinaryOp::IsNot => {
                     return Err(CodegenError::Unsupported(format!(
                         "binary op {op:?} in JOIN codegen"
                     )));
@@ -29975,6 +29991,27 @@ mod tests {
         if !has_current_date {
             return Err(format!(
                 "JOIN WHERE CURRENT_DATE should emit a date String8 literal, got {:?}",
+                opcode_sequence(&prog)
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_codegen_join_where_divide_expression_emits_arithmetic() -> Result<(), String> {
+        let stmt = select_sql(
+            "SELECT c.name FROM customers c CROSS JOIN orders o WHERE (o.amount / 2) > 10",
+        );
+        let schema = test_schema_with_join_lookup();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).map_err(|err| format!("{err:?}"))?;
+        let prog = b.finish().map_err(|err| format!("{err:?}"))?;
+
+        if !has_opcodes(&prog, &[Opcode::Divide, Opcode::Gt, Opcode::IfNot]) {
+            return Err(format!(
+                "JOIN WHERE arithmetic expression should emit Divide before comparison, got {:?}",
                 opcode_sequence(&prog)
             ));
         }

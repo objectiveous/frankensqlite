@@ -1713,12 +1713,184 @@ mod tests {
         assert_eq!(rowids, sorted, "rows must be in ascending rowid order");
     }
 
+    /// Integration test: simulate a WAL checkpoint that materializes all pages
+    /// with outstanding cell deltas.
+    ///
+    /// This exercises the full checkpoint-materialization flow:
+    /// 1. Multiple transactions write cell deltas to several pages
+    /// 2. Transactions are committed at distinct commit sequences
+    /// 3. `pages_with_deltas()` discovers the dirty pages
+    /// 4. `collect_visible_deltas()` + `materialize_page()` produces valid
+    ///    B-tree pages for each
+    /// 5. `clear_page_deltas()` reclaims the delta memory
+    /// 6. After cleanup, no outstanding deltas remain
     #[test]
-    #[ignore = "requires WAL checkpoint integration (C-TRANSITION)"]
     fn test_checkpoint_materializes_all() {
-        // Test that WAL checkpoint materializes all pages with outstanding
-        // cell deltas and writes them to the main database file.
-        // This requires integration with the checkpoint executor.
-        todo!("integration test: checkpoint triggers materialize_page() for all pages");
+        let log = crate::cell_visibility::CellVisibilityLog::new(1024 * 1024);
+        let btree = fsqlite_types::BtreeRef::Table(fsqlite_types::TableId::new(1));
+
+        // ---------- Phase 1: record deltas across 3 pages via 2 transactions ----------
+
+        let txn1 = TxnToken::new(TxnId::new(1).unwrap(), TxnEpoch::new(0));
+        let txn2 = TxnToken::new(TxnId::new(2).unwrap(), TxnEpoch::new(0));
+
+        let page2 = PageNumber::new(2).unwrap();
+        let page3 = PageNumber::new(3).unwrap();
+        let page4 = PageNumber::new(4).unwrap();
+
+        // Txn1: 3 inserts on page 2, 2 inserts on page 3
+        for i in 0..3 {
+            let cell_key = crate::cell_visibility::CellKey::table_row(btree, 100 + i);
+            let cell_data = create_leaf_table_cell(100 + i, format!("txn1_p2_{i}").as_bytes());
+            log.record_insert(cell_key, page2, cell_data, txn1)
+                .expect("insert should fit budget");
+        }
+        for i in 0..2 {
+            let cell_key = crate::cell_visibility::CellKey::table_row(btree, 200 + i);
+            let cell_data = create_leaf_table_cell(200 + i, format!("txn1_p3_{i}").as_bytes());
+            log.record_insert(cell_key, page3, cell_data, txn1)
+                .expect("insert should fit budget");
+        }
+
+        // Txn2: 4 inserts on page 4, 1 insert on page 2 (overlapping with txn1)
+        for i in 0..4 {
+            let cell_key = crate::cell_visibility::CellKey::table_row(btree, 300 + i);
+            let cell_data = create_leaf_table_cell(300 + i, format!("txn2_p4_{i}").as_bytes());
+            log.record_insert(cell_key, page4, cell_data, txn2)
+                .expect("insert should fit budget");
+        }
+        {
+            let cell_key = crate::cell_visibility::CellKey::table_row(btree, 103);
+            let cell_data = create_leaf_table_cell(103, b"txn2_p2_overlap");
+            log.record_insert(cell_key, page2, cell_data, txn2)
+                .expect("insert should fit budget");
+        }
+
+        // Commit both transactions at different sequences
+        log.commit_txn(txn1, CommitSeq::new(10));
+        log.commit_txn(txn2, CommitSeq::new(20));
+
+        // ---------- Phase 2: discover dirty pages ----------
+
+        let dirty_pages = log.pages_with_deltas();
+        assert!(
+            dirty_pages.len() >= 3,
+            "should have deltas on at least 3 pages, got {}",
+            dirty_pages.len()
+        );
+        assert!(dirty_pages.contains(&page2), "page 2 should have deltas");
+        assert!(dirty_pages.contains(&page3), "page 3 should have deltas");
+        assert!(dirty_pages.contains(&page4), "page 4 should have deltas");
+
+        // ---------- Phase 3: checkpoint-style materialization ----------
+
+        // The snapshot covers both committed transactions.
+        let checkpoint_snapshot = test_snapshot(25);
+
+        // Provide a base page for each dirty page (empty leaf table).
+        let base = create_empty_leaf_table_page();
+
+        // Expected cell counts per page:
+        //   page2: 4 cells (3 from txn1 + 1 from txn2)
+        //   page3: 2 cells (from txn1)
+        //   page4: 4 cells (from txn2)
+        let expected: std::collections::HashMap<PageNumber, u16> =
+            [(page2, 4), (page3, 2), (page4, 4)].into_iter().collect();
+
+        let mut materialized_pages: std::collections::HashMap<PageNumber, MaterializationResult> =
+            std::collections::HashMap::new();
+
+        for &pgno in &dirty_pages {
+            let deltas = log.collect_visible_deltas(pgno, checkpoint_snapshot.high);
+            if deltas.is_empty() {
+                continue;
+            }
+
+            let result = materialize_page(
+                &base,
+                pgno,
+                &deltas,
+                &checkpoint_snapshot,
+                USABLE_SIZE,
+                MaterializationTrigger::Checkpoint,
+            )
+            .unwrap_or_else(|e| {
+                panic!("materialization of page {} failed: {e}", pgno.get());
+            });
+
+            materialized_pages.insert(pgno, result);
+        }
+
+        // Verify we materialized all 3 expected pages.
+        assert_eq!(
+            materialized_pages.len(),
+            3,
+            "checkpoint should materialize exactly 3 pages"
+        );
+
+        for (&pgno, result) in &materialized_pages {
+            let want = expected[&pgno];
+            assert_eq!(
+                result.cell_count,
+                want,
+                "page {} should have {want} cells, got {}",
+                pgno.get(),
+                result.cell_count
+            );
+
+            // Validate the B-tree header on each materialized page.
+            let header = BtreePageHeader::parse(result.page.as_bytes(), 0).unwrap();
+            assert_eq!(header.cell_count, want);
+            assert_eq!(header.page_type, BtreePageType::LeafTable);
+            assert_eq!(
+                header.fragmented_free_bytes, 0,
+                "freshly packed page should have no fragmentation"
+            );
+
+            // Verify cell pointers are in bounds.
+            let pointers = read_cell_pointers(result.page.as_bytes(), &header, 0).unwrap();
+            assert_eq!(pointers.len(), want as usize);
+            for &ptr in &pointers {
+                assert!(
+                    (ptr as usize) < PAGE_SIZE as usize,
+                    "cell pointer {ptr} out of bounds"
+                );
+            }
+
+            // Verify row ordering: rowids must be ascending (B-tree invariant).
+            let payloads = materialized_table_payloads(&result.page).unwrap();
+            let rowids: Vec<i64> = payloads.iter().map(|(r, _)| *r).collect();
+            let mut sorted = rowids.clone();
+            sorted.sort();
+            assert_eq!(
+                rowids,
+                sorted,
+                "page {} rows must be in ascending rowid order",
+                pgno.get()
+            );
+        }
+
+        // ---------- Phase 4: clear deltas and verify cleanup ----------
+
+        // The checkpoint has materialized everything up to commit_seq 25.
+        // Clear deltas for each page.
+        for &pgno in &dirty_pages {
+            log.clear_page_deltas(pgno, CommitSeq::new(25));
+        }
+
+        // After clearing, no page should have outstanding deltas.
+        let remaining = log.pages_with_deltas();
+        assert!(
+            remaining.is_empty(),
+            "all deltas should be cleared after checkpoint; {} pages still dirty",
+            remaining.len()
+        );
+
+        // The global delta count should be zero.
+        assert_eq!(
+            log.delta_count(),
+            0,
+            "global delta count should be 0 after clearing all pages"
+        );
     }
 }

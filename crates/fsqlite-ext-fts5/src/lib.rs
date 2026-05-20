@@ -17,6 +17,7 @@ use fsqlite_func::vtab::{
     VtabRiskLevel,
 };
 use fsqlite_types::cx::Cx;
+use fsqlite_types::serial_type::{read_varint, write_varint};
 use fsqlite_types::value::{SmallText, SqliteValue};
 use smallvec::SmallVec;
 use tracing::debug;
@@ -86,8 +87,12 @@ const FTS5_DEFAULT_AUTOMERGE: i64 = 4;
 const FTS5_DEFAULT_USERMERGE: i64 = 4;
 const FTS5_DEFAULT_CRISISMERGE: i64 = 16;
 const FTS5_MAX_SEGMENT: i64 = 2000;
+const FTS5_MAX_SEGMENT_U64: u64 = 2000;
 const FTS5_DEFAULT_HASHSIZE: i64 = 1024 * 1024;
 const FTS5_DEFAULT_DELETE_AUTOMERGE: i64 = 10;
+pub const FTS5_AVERAGES_ROWID: i64 = 1;
+pub const FTS5_STRUCTURE_ROWID: i64 = 10;
+const FTS5_STRUCTURE_V2_MARKER: [u8; 4] = [0xFF, 0x00, 0x00, 0x01];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fts5ConfigRecord {
@@ -147,8 +152,388 @@ impl Fts5DocsizeRow {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5DataRow {
+    pub id: i64,
+    pub block: Vec<u8>,
+}
+
+impl Fts5DataRow {
+    #[must_use]
+    pub fn new(id: i64, block: Vec<u8>) -> Self {
+        Self { id, block }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5AveragesRecord {
+    pub total_rows: u64,
+    pub column_token_totals: Vec<u64>,
+}
+
+impl Fts5AveragesRecord {
+    #[must_use]
+    pub fn new(total_rows: u64, column_token_totals: Vec<u64>) -> Self {
+        Self {
+            total_rows,
+            column_token_totals,
+        }
+    }
+
+    #[must_use]
+    pub fn from_docsize_rows(
+        total_rows: u64,
+        column_count: usize,
+        rows: &[Fts5DocsizeRow],
+    ) -> Self {
+        let mut column_token_totals = vec![0; column_count];
+        for row in rows {
+            for (column, count) in row
+                .column_token_counts
+                .iter()
+                .copied()
+                .take(column_count)
+                .enumerate()
+            {
+                column_token_totals[column] += u64::from(count);
+            }
+        }
+        Self {
+            total_rows,
+            column_token_totals,
+        }
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        if self.total_rows == 0 && self.column_token_totals.iter().all(|total| *total == 0) {
+            return Vec::new();
+        }
+
+        let mut block = Vec::with_capacity((self.column_token_totals.len() + 1) * 9);
+        fts5_push_varint(&mut block, self.total_rows);
+        for total in &self.column_token_totals {
+            fts5_push_varint(&mut block, *total);
+        }
+        block
+    }
+
+    pub fn decode(block: &[u8], column_count: usize) -> Result<Self> {
+        if block.is_empty() {
+            return Ok(Self {
+                total_rows: 0,
+                column_token_totals: vec![0; column_count],
+            });
+        }
+
+        let mut offset = 0;
+        let total_rows = fts5_read_varint(block, &mut offset, "averages row count")?;
+        let mut column_token_totals = vec![0; column_count];
+        for total in &mut column_token_totals {
+            if offset == block.len() {
+                break;
+            }
+            *total = fts5_read_varint(block, &mut offset, "averages column total")?;
+        }
+        if offset != block.len() {
+            return Err(fts5_data_error(
+                "trailing bytes after averages column totals",
+            ));
+        }
+
+        Ok(Self {
+            total_rows,
+            column_token_totals,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5StructureSegment {
+    pub segid: u32,
+    pub pgno_first: u32,
+    pub pgno_last: u32,
+    pub origin_lower: u64,
+    pub origin_upper: u64,
+    pub tombstone_page_count: u32,
+    pub tombstone_entry_count: u64,
+    pub entry_count: u64,
+}
+
+impl Fts5StructureSegment {
+    #[must_use]
+    pub const fn new(segid: u32, pgno_first: u32, pgno_last: u32) -> Self {
+        Self {
+            segid,
+            pgno_first,
+            pgno_last,
+            origin_lower: 0,
+            origin_upper: 0,
+            tombstone_page_count: 0,
+            tombstone_entry_count: 0,
+            entry_count: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_origin_tracking(
+        mut self,
+        origin_lower: u64,
+        origin_upper: u64,
+        tombstone_page_count: u32,
+        tombstone_entry_count: u64,
+        entry_count: u64,
+    ) -> Self {
+        self.origin_lower = origin_lower;
+        self.origin_upper = origin_upper;
+        self.tombstone_page_count = tombstone_page_count;
+        self.tombstone_entry_count = tombstone_entry_count;
+        self.entry_count = entry_count;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5StructureLevel {
+    pub merge_inputs: u32,
+    pub segments: Vec<Fts5StructureSegment>,
+}
+
+impl Fts5StructureLevel {
+    #[must_use]
+    pub fn new(merge_inputs: u32, segments: Vec<Fts5StructureSegment>) -> Self {
+        Self {
+            merge_inputs,
+            segments,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5StructureRecord {
+    pub cookie: u32,
+    pub write_counter: u64,
+    pub origin_counter: u64,
+    pub levels: Vec<Fts5StructureLevel>,
+}
+
+impl Fts5StructureRecord {
+    #[must_use]
+    pub fn empty_legacy(cookie: u32) -> Self {
+        Self {
+            cookie,
+            write_counter: 0,
+            origin_counter: 0,
+            levels: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn empty_with_origin_tracking(cookie: u32) -> Self {
+        Self {
+            cookie,
+            write_counter: 0,
+            origin_counter: 1,
+            levels: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn segment_count(&self) -> usize {
+        self.levels.iter().map(|level| level.segments.len()).sum()
+    }
+
+    #[must_use]
+    pub fn uses_origin_tracking(&self) -> bool {
+        self.origin_counter > 0
+            || self.levels.iter().any(|level| {
+                level.segments.iter().any(|segment| {
+                    segment.origin_lower != 0
+                        || segment.origin_upper != 0
+                        || segment.tombstone_page_count != 0
+                        || segment.tombstone_entry_count != 0
+                        || segment.entry_count != 0
+                })
+            })
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let use_origin_tracking = self.uses_origin_tracking();
+        let segment_count = self.segment_count();
+        let mut block = Vec::with_capacity(4 + usize::from(use_origin_tracking) * 4 + 27);
+
+        block.extend_from_slice(&self.cookie.to_be_bytes());
+        if use_origin_tracking {
+            block.extend_from_slice(&FTS5_STRUCTURE_V2_MARKER);
+        }
+        fts5_push_varint(
+            &mut block,
+            u64::try_from(self.levels.len()).unwrap_or(u64::MAX),
+        );
+        fts5_push_varint(&mut block, u64::try_from(segment_count).unwrap_or(u64::MAX));
+        fts5_push_varint(&mut block, self.write_counter);
+
+        for level in &self.levels {
+            fts5_push_varint(&mut block, u64::from(level.merge_inputs));
+            fts5_push_varint(&mut block, level.segments.len() as u64);
+            for segment in &level.segments {
+                fts5_push_varint(&mut block, u64::from(segment.segid));
+                fts5_push_varint(&mut block, u64::from(segment.pgno_first));
+                fts5_push_varint(&mut block, u64::from(segment.pgno_last));
+                if use_origin_tracking {
+                    fts5_push_varint(&mut block, segment.origin_lower);
+                    fts5_push_varint(&mut block, segment.origin_upper);
+                    fts5_push_varint(&mut block, u64::from(segment.tombstone_page_count));
+                    fts5_push_varint(&mut block, segment.tombstone_entry_count);
+                    fts5_push_varint(&mut block, segment.entry_count);
+                }
+            }
+        }
+
+        block
+    }
+
+    pub fn decode(block: &[u8]) -> Result<Self> {
+        if block.len() < 4 {
+            return Err(fts5_data_error("structure record missing cookie"));
+        }
+
+        let cookie = u32::from_be_bytes([block[0], block[1], block[2], block[3]]);
+        let mut offset = 4;
+        let use_origin_tracking = block
+            .get(offset..)
+            .is_some_and(|tail| tail.starts_with(&FTS5_STRUCTURE_V2_MARKER));
+        if use_origin_tracking {
+            offset += FTS5_STRUCTURE_V2_MARKER.len();
+        }
+
+        let level_count = fts5_read_bounded_usize(block, &mut offset, "structure level count")?;
+        let mut remaining_segments =
+            fts5_read_bounded_usize(block, &mut offset, "structure segment count")?;
+        let write_counter = fts5_read_varint(block, &mut offset, "structure write counter")?;
+        let mut levels = Vec::with_capacity(level_count);
+        let mut previous_level_merge_inputs = 0;
+        let mut max_origin_upper = 0;
+
+        for level_index in 0..level_count {
+            let merge_inputs = fts5_read_u32(block, &mut offset, "structure merge count")?;
+            let segment_total = fts5_read_bounded_usize(block, &mut offset, "level segment count")?;
+            let merge_inputs_usize = usize::try_from(merge_inputs).unwrap_or(usize::MAX);
+            if segment_total < merge_inputs_usize {
+                return Err(fts5_data_error("level merge count exceeds segment count"));
+            }
+            if remaining_segments < segment_total {
+                return Err(fts5_data_error("structure segment count underflow"));
+            }
+            remaining_segments -= segment_total;
+
+            let mut segments = Vec::with_capacity(segment_total);
+            for _ in 0..segment_total {
+                let segid = fts5_read_u32(block, &mut offset, "segment id")?;
+                let pgno_first = fts5_read_u32(block, &mut offset, "segment first page")?;
+                let pgno_last = fts5_read_u32(block, &mut offset, "segment last page")?;
+                if segid == 0 {
+                    return Err(fts5_data_error("segment id must be non-zero"));
+                }
+                if pgno_first == 0 {
+                    return Err(fts5_data_error("segment first page must be non-zero"));
+                }
+                if pgno_last < pgno_first {
+                    return Err(fts5_data_error("segment last page precedes first page"));
+                }
+
+                let mut segment = Fts5StructureSegment::new(segid, pgno_first, pgno_last);
+                if use_origin_tracking {
+                    segment.origin_lower =
+                        fts5_read_varint(block, &mut offset, "segment origin lower")?;
+                    segment.origin_upper =
+                        fts5_read_varint(block, &mut offset, "segment origin upper")?;
+                    segment.tombstone_page_count =
+                        fts5_read_u32(block, &mut offset, "segment tombstone pages")?;
+                    segment.tombstone_entry_count =
+                        fts5_read_varint(block, &mut offset, "segment tombstone entries")?;
+                    segment.entry_count =
+                        fts5_read_varint(block, &mut offset, "segment entry count")?;
+                    max_origin_upper = max_origin_upper.max(segment.origin_upper);
+                }
+                segments.push(segment);
+            }
+
+            if level_index > 0 && previous_level_merge_inputs > 0 && segments.is_empty() {
+                return Err(fts5_data_error(
+                    "merge level must be followed by a non-empty level",
+                ));
+            }
+            if level_index + 1 == level_count && merge_inputs > 0 {
+                return Err(fts5_data_error("top level cannot have an active merge"));
+            }
+            previous_level_merge_inputs = merge_inputs;
+            levels.push(Fts5StructureLevel {
+                merge_inputs,
+                segments,
+            });
+        }
+
+        if remaining_segments != 0 {
+            return Err(fts5_data_error("structure segment count mismatch"));
+        }
+        if offset != block.len() {
+            return Err(fts5_data_error("trailing bytes after structure record"));
+        }
+
+        Ok(Self {
+            cookie,
+            write_counter,
+            origin_counter: if use_origin_tracking {
+                max_origin_upper.saturating_add(1)
+            } else {
+                0
+            },
+            levels,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5DataMetadata {
+    pub averages: Option<Fts5AveragesRecord>,
+    pub structure: Option<Fts5StructureRecord>,
+}
+
+impl Fts5DataMetadata {
+    pub fn decode_rows(rows: &[Fts5DataRow], column_count: usize) -> Result<Self> {
+        let mut averages = None;
+        let mut structure = None;
+
+        for row in rows {
+            match row.id {
+                FTS5_AVERAGES_ROWID => {
+                    if averages.is_some() {
+                        return Err(fts5_data_error("duplicate averages row"));
+                    }
+                    averages = Some(Fts5AveragesRecord::decode(&row.block, column_count)?);
+                }
+                FTS5_STRUCTURE_ROWID => {
+                    if structure.is_some() {
+                        return Err(fts5_data_error("duplicate structure row"));
+                    }
+                    structure = Some(Fts5StructureRecord::decode(&row.block)?);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            averages,
+            structure,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fts5ShadowRows {
+    pub data: Vec<Fts5DataRow>,
     pub config: Vec<Fts5ConfigRecord>,
     pub content: Vec<Fts5ContentRow>,
     pub docsize: Vec<Fts5DocsizeRow>,
@@ -368,6 +753,39 @@ fn apply_config_metadata_row(metadata: &mut Fts5ConfigMetadata, key: &str, value
         }
         _ => {}
     }
+}
+
+fn fts5_data_error(detail: impl Into<String>) -> FrankenError {
+    FrankenError::function_error(format!("fts5: corrupt %_data record: {}", detail.into()))
+}
+
+fn fts5_push_varint(block: &mut Vec<u8>, value: u64) {
+    let mut buf = [0; 9];
+    let len = write_varint(&mut buf, value);
+    block.extend_from_slice(&buf[..len]);
+}
+
+fn fts5_read_varint(block: &[u8], offset: &mut usize, field: &str) -> Result<u64> {
+    if *offset >= block.len() {
+        return Err(fts5_data_error(format!("missing {field}")));
+    }
+    let (value, len) = read_varint(&block[*offset..])
+        .ok_or_else(|| fts5_data_error(format!("truncated varint for {field}")))?;
+    *offset += len;
+    Ok(value)
+}
+
+fn fts5_read_bounded_usize(block: &[u8], offset: &mut usize, field: &str) -> Result<usize> {
+    let value = fts5_read_varint(block, offset, field)?;
+    if value > FTS5_MAX_SEGMENT_U64 {
+        return Err(fts5_data_error(format!("{field} exceeds FTS5 maximum")));
+    }
+    usize::try_from(value).map_err(|_| fts5_data_error(format!("{field} exceeds usize")))
+}
+
+fn fts5_read_u32(block: &[u8], offset: &mut usize, field: &str) -> Result<u32> {
+    let value = fts5_read_varint(block, offset, field)?;
+    u32::try_from(value).map_err(|_| fts5_data_error(format!("{field} exceeds u32")))
 }
 
 impl Fts5Config {
@@ -3768,8 +4186,33 @@ impl Fts5Table {
     }
 
     #[must_use]
+    pub fn encode_data_rows(&self) -> Vec<Fts5DataRow> {
+        let docsize_rows = self.encode_docsize_rows();
+        let averages = Fts5AveragesRecord::from_docsize_rows(
+            u64::try_from(self.row_count()).unwrap_or(u64::MAX),
+            self.columns.len(),
+            &docsize_rows,
+        );
+        let structure = if self.config.contentless_delete_enabled() {
+            Fts5StructureRecord::empty_with_origin_tracking(0)
+        } else {
+            Fts5StructureRecord::empty_legacy(0)
+        };
+
+        vec![
+            Fts5DataRow::new(FTS5_AVERAGES_ROWID, averages.encode()),
+            Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode()),
+        ]
+    }
+
+    pub fn decode_data_rows(&self, rows: &[Fts5DataRow]) -> Result<Fts5DataMetadata> {
+        Fts5DataMetadata::decode_rows(rows, self.columns.len())
+    }
+
+    #[must_use]
     pub fn encode_shadow_rows(&self) -> Fts5ShadowRows {
         Fts5ShadowRows {
+            data: self.encode_data_rows(),
             config: self.encode_config_rows(),
             content: self.encode_content_rows(),
             docsize: self.encode_docsize_rows(),
@@ -3777,6 +4220,7 @@ impl Fts5Table {
     }
 
     pub fn apply_shadow_rows(&mut self, rows: &Fts5ShadowRows) -> Result<Fts5ConfigMetadata> {
+        self.decode_data_rows(&rows.data)?;
         let metadata = self.apply_config_rows(&rows.config)?;
         if self.config.content_mode() != ContentMode::Contentless || !rows.content.is_empty() {
             self.apply_content_rows(&rows.content);
@@ -5129,7 +5573,18 @@ mod tests {
 
     #[allow(dead_code)]
     #[derive(Debug)]
+    struct Fts5DataRowsStructure {
+        data_blocks: Vec<(i64, Vec<u8>)>,
+        averages: Fts5AveragesRecord,
+        structure: Fts5StructureRecord,
+        prefix_lengths: Vec<usize>,
+        prefix_terms_len2: Vec<String>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
     struct Fts5ShadowRowsStructure {
+        data: Vec<(i64, Vec<u8>)>,
         config: Vec<(String, String)>,
         content: Vec<Fts5ContentRow>,
         docsize: Vec<Fts5DocsizeRow>,
@@ -5626,7 +6081,147 @@ mod tests {
         locale: false,
         tokendata: false,
     },
-            }"#
+}"#
+        );
+    }
+
+    #[test]
+    fn test_fts5_data_averages_record_round_trip() {
+        let averages = Fts5AveragesRecord::new(2, vec![4, 5]);
+        let block = averages.encode();
+        assert_eq!(block, vec![2, 4, 5]);
+        assert_eq!(Fts5AveragesRecord::decode(&block, 2).unwrap(), averages);
+
+        let empty = Fts5AveragesRecord::new(0, vec![0, 0]);
+        assert!(empty.encode().is_empty());
+        assert_eq!(Fts5AveragesRecord::decode(&[], 2).unwrap(), empty);
+    }
+
+    #[test]
+    fn test_fts5_data_structure_record_round_trip_legacy_and_v2() {
+        let legacy = Fts5StructureRecord {
+            cookie: 0x0102_0304,
+            write_counter: 300,
+            origin_counter: 0,
+            levels: vec![
+                Fts5StructureLevel::new(0, vec![Fts5StructureSegment::new(7, 1, 3)]),
+                Fts5StructureLevel::new(0, Vec::new()),
+            ],
+        };
+        let legacy_block = legacy.encode();
+        assert_eq!(
+            legacy_block,
+            vec![1, 2, 3, 4, 2, 1, 0x82, 0x2C, 0, 1, 7, 1, 3, 0, 0]
+        );
+        assert_eq!(Fts5StructureRecord::decode(&legacy_block).unwrap(), legacy);
+
+        let v2 = Fts5StructureRecord {
+            cookie: 9,
+            write_counter: 512,
+            origin_counter: 43,
+            levels: vec![Fts5StructureLevel::new(
+                0,
+                vec![Fts5StructureSegment::new(11, 1, 8).with_origin_tracking(40, 42, 2, 3, 99)],
+            )],
+        };
+        let v2_block = v2.encode();
+        assert_eq!(&v2_block[4..8], &FTS5_STRUCTURE_V2_MARKER);
+        assert_eq!(Fts5StructureRecord::decode(&v2_block).unwrap(), v2);
+    }
+
+    #[test]
+    fn test_fts5_data_records_reject_malformed_input() {
+        let truncated_average = Fts5AveragesRecord::decode(&[1, 2, 0x80], 2)
+            .expect_err("truncated averages varint should fail");
+        assert!(truncated_average.to_string().contains("truncated"));
+
+        let trailing_average = Fts5AveragesRecord::decode(&[1, 2, 3], 1)
+            .expect_err("extra averages varint should fail");
+        assert!(trailing_average.to_string().contains("trailing"));
+
+        let truncated_structure = Fts5StructureRecord::decode(&[0, 0, 0, 0, 0x80])
+            .expect_err("truncated structure varint should fail");
+        assert!(truncated_structure.to_string().contains("truncated"));
+
+        let bad_segment_count = [0, 0, 0, 0, 1, 0, 0, 0, 1, 7, 1, 3];
+        let count_error = Fts5StructureRecord::decode(&bad_segment_count)
+            .expect_err("segment total underflow should fail");
+        assert!(count_error.to_string().contains("segment count"));
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_data_rows_codec() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "docs", "title", "body", "prefix='2 3'"],
+        )
+        .unwrap();
+        table.insert_document(
+            11,
+            &["rust index".to_owned(), "shadow table rows".to_owned()],
+        );
+
+        let data = table.encode_data_rows();
+        let metadata = table.decode_data_rows(&data).unwrap();
+        let snapshot = Fts5DataRowsStructure {
+            data_blocks: data.iter().map(|row| (row.id, row.block.clone())).collect(),
+            averages: metadata.averages.unwrap(),
+            structure: metadata.structure.unwrap(),
+            prefix_lengths: table.prefix_lengths.clone(),
+            prefix_terms_len2: indexed_prefix_terms(&table.index, 2),
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5DataRowsStructure {
+    data_blocks: [
+        (
+            1,
+            [
+                1,
+                2,
+                3,
+            ],
+        ),
+        (
+            10,
+            [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+    ],
+    averages: Fts5AveragesRecord {
+        total_rows: 1,
+        column_token_totals: [
+            2,
+            3,
+        ],
+    },
+    structure: Fts5StructureRecord {
+        cookie: 0,
+        write_counter: 0,
+        origin_counter: 0,
+        levels: [],
+    },
+    prefix_lengths: [
+        2,
+        3,
+    ],
+    prefix_terms_len2: [
+        "in",
+        "ro",
+        "ru",
+        "sh",
+        "ta",
+    ],
+}"#
         );
     }
 
@@ -5753,6 +6348,11 @@ mod tests {
         );
         let rows = table.encode_shadow_rows();
         let snapshot = Fts5ShadowRowsStructure {
+            data: rows
+                .data
+                .iter()
+                .map(|row| (row.id, row.block.clone()))
+                .collect(),
             config: rows
                 .config
                 .iter()
@@ -5766,6 +6366,28 @@ mod tests {
         assert_eq!(
             format!("{snapshot:#?}"),
             r#"Fts5ShadowRowsStructure {
+    data: [
+        (
+            1,
+            [
+                1,
+                2,
+                3,
+            ],
+        ),
+        (
+            10,
+            [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+    ],
     config: [
         (
             "insttoken",

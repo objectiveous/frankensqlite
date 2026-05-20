@@ -221,7 +221,11 @@ fn json_array_length_value(root: &Value, path: Option<&str>) -> Result<Option<us
         Some(path_expr) => resolve_path(root, path_expr)?,
         None => Some(root),
     };
-    Ok(target.and_then(Value::as_array).map(Vec::len))
+    Ok(match target {
+        Some(Value::Array(array)) => Some(array.len()),
+        Some(_) => Some(0),
+        None => None,
+    })
 }
 
 fn json_error_position_blob(input: &[u8]) -> usize {
@@ -312,7 +316,10 @@ pub fn json_double_arrow(input: &str, path: &str) -> Result<SqliteValue> {
     json_extract(input, &[path])
 }
 
-/// Return the array length at root or path, or `None` when target is not an array.
+/// Return the array length at root or path.
+///
+/// Matches SQLite JSON1 semantics: a missing path returns SQL NULL, while an
+/// existing non-array target returns 0.
 pub fn json_array_length(input: &str, path: Option<&str>) -> Result<Option<usize>> {
     let root = parse_json_text(input)?;
     json_array_length_value(&root, path)
@@ -3022,7 +3029,7 @@ mod tests {
     }
 
     #[test]
-    fn test_registered_jsonb_scalar_executes() {
+    fn test_registered_jsonb_scalar_executes() -> Result<()> {
         let mut registry = FunctionRegistry::new();
         register_json_scalars(&mut registry);
         let func = registry
@@ -3032,9 +3039,10 @@ mod tests {
             .invoke(&[SqliteValue::Text(SmallText::from_string(r#"{"a":[1,2]}"#))])
             .expect("jsonb should encode to JSONB");
         let SqliteValue::Blob(blob) = out else {
-            panic!("jsonb should return BLOB");
+            return Err(FrankenError::function_error("jsonb should return BLOB"));
         };
         assert_eq!(json_from_jsonb(&blob).unwrap(), r#"{"a":[1,2]}"#);
+        Ok(())
     }
 
     #[test]
@@ -3055,7 +3063,7 @@ mod tests {
     }
 
     #[test]
-    fn test_registered_jsonb_set_accepts_jsonb_blob_input() {
+    fn test_registered_jsonb_set_accepts_jsonb_blob_input() -> Result<()> {
         let mut registry = FunctionRegistry::new();
         register_json_scalars(&mut registry);
         let func = registry
@@ -3070,13 +3078,14 @@ mod tests {
             ])
             .expect("jsonb_set should accept JSONB blob input");
         let SqliteValue::Blob(blob) = out else {
-            panic!("jsonb_set should return BLOB");
+            return Err(FrankenError::function_error("jsonb_set should return BLOB"));
         };
         assert_eq!(json_from_jsonb(&blob).unwrap(), r#"{"a":1,"b":9}"#);
+        Ok(())
     }
 
     #[test]
-    fn test_registered_json_pretty_accepts_jsonb_blob_input() {
+    fn test_registered_json_pretty_accepts_jsonb_blob_input() -> Result<()> {
         let mut registry = FunctionRegistry::new();
         register_json_scalars(&mut registry);
         let func = registry
@@ -3087,10 +3096,13 @@ mod tests {
             .invoke(&[SqliteValue::Blob(Arc::from(input))])
             .expect("json_pretty should accept JSONB blob input");
         let SqliteValue::Text(pretty) = out else {
-            panic!("json_pretty should return TEXT");
+            return Err(FrankenError::function_error(
+                "json_pretty should return TEXT",
+            ));
         };
         assert!(pretty.contains('\n'));
         assert!(pretty.contains("\"a\""));
+        Ok(())
     }
 
     #[test]
@@ -3361,7 +3373,7 @@ mod tests {
     fn test_json_array_length() {
         assert_eq!(json_array_length("[1,2,3]", None).unwrap(), Some(3));
         assert_eq!(json_array_length("[]", None).unwrap(), Some(0));
-        assert_eq!(json_array_length(r#"{"a":1}"#, None).unwrap(), None);
+        assert_eq!(json_array_length(r#"{"a":1}"#, None).unwrap(), Some(0));
     }
 
     #[test]
@@ -3374,8 +3386,11 @@ mod tests {
 
     #[test]
     fn test_json_array_length_not_array() {
-        assert_eq!(json_array_length(r#"{"a":1}"#, Some("$.a")).unwrap(), None);
-        assert_eq!(json_array_length(r#""text""#, None).unwrap(), None);
+        assert_eq!(
+            json_array_length(r#"{"a":1}"#, Some("$.a")).unwrap(),
+            Some(0)
+        );
+        assert_eq!(json_array_length(r#""text""#, None).unwrap(), Some(0));
     }
 
     #[test]
@@ -4069,7 +4084,7 @@ mod tests {
     fn test_json_array_length_nested_not_array() {
         assert_eq!(
             json_array_length(r#"{"a":"text"}"#, Some("$.a")).unwrap(),
-            None
+            Some(0)
         );
     }
 

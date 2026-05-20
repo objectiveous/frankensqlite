@@ -504,6 +504,19 @@ impl Fts5Tokenizer for Unicode61Tokenizer {
 #[derive(Debug, Default)]
 pub struct AsciiTokenizer;
 
+impl AsciiTokenizer {
+    #[inline]
+    fn normalized_token_char(ch: char) -> Option<char> {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            Some(ch)
+        } else if ch.is_ascii_uppercase() {
+            Some(ch.to_ascii_lowercase())
+        } else {
+            None
+        }
+    }
+}
+
 impl Fts5Tokenizer for AsciiTokenizer {
     fn name(&self) -> &'static str {
         "ascii"
@@ -511,41 +524,42 @@ impl Fts5Tokenizer for AsciiTokenizer {
 
     fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
         let mut token_start = None;
-        let mut current_term = String::new();
-        let mut borrowed_ascii_token = false;
+        let mut token_buf: Option<String> = None;
 
         for (byte_idx, ch) in text.char_indices() {
-            if ch.is_ascii_alphanumeric() {
-                if token_start.is_none() {
+            if let Some(term_ch) = Self::normalized_token_char(ch) {
+                let start = if let Some(start) = token_start {
+                    start
+                } else {
                     token_start = Some(byte_idx);
-                    current_term.clear();
-                    borrowed_ascii_token = true;
+                    token_buf = None;
+                    byte_idx
+                };
+
+                if term_ch != ch {
+                    let buf = token_buf.get_or_insert_with(|| {
+                        let mut folded = String::new();
+                        folded.push_str(&text[start..byte_idx]);
+                        folded
+                    });
+                    buf.push(term_ch);
+                } else if let Some(buf) = token_buf.as_mut() {
+                    buf.push(term_ch);
                 }
-                if borrowed_ascii_token {
-                    if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
-                        continue;
-                    }
-                    borrowed_ascii_token = false;
-                    if let Some(start) = token_start {
-                        current_term.push_str(&text[start..byte_idx]);
-                    }
-                }
-                current_term.push(ch.to_ascii_lowercase());
             } else if let Some(start) = token_start.take() {
-                if borrowed_ascii_token {
+                if let Some(buf) = token_buf.take() {
+                    sink(buf.as_str(), start, byte_idx, false);
+                } else {
                     sink(&text[start..byte_idx], start, byte_idx, false);
-                } else if !current_term.is_empty() {
-                    sink(current_term.as_str(), start, byte_idx, false);
-                    current_term.clear();
                 }
             }
         }
 
         if let Some(start) = token_start {
-            if borrowed_ascii_token {
+            if let Some(buf) = token_buf {
+                sink(buf.as_str(), start, text.len(), false);
+            } else {
                 sink(&text[start..], start, text.len(), false);
-            } else if !current_term.is_empty() {
-                sink(current_term.as_str(), start, text.len(), false);
             }
         }
     }
@@ -4703,6 +4717,16 @@ mod tests {
 
     #[allow(dead_code)]
     #[derive(Debug)]
+    struct Fts5AsciiTokenizerStructure {
+        tokens: Vec<(String, usize, usize)>,
+        terms: Vec<String>,
+        upper_matches: Vec<i64>,
+        lower_matches: Vec<i64>,
+        numeric_matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
     struct Fts5TrigramCaseFoldStructure {
         insensitive_tokens: Vec<(String, usize, usize)>,
         sensitive_terms: Vec<String>,
@@ -5166,6 +5190,103 @@ mod tests {
         let tokens = tok.tokenize("Hello World 123");
         let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
         assert_eq!(terms, vec!["hello", "world", "123"]);
+    }
+
+    #[test]
+    fn test_ascii_tokenizer_lazy_casefold_offsets() {
+        let tok = AsciiTokenizer;
+        let tokens = tok.tokenize("ABCédef 123XYZ");
+        let tokens: Vec<(String, usize, usize)> = tokens
+            .into_iter()
+            .map(|token| (token.term, token.start, token.end))
+            .collect();
+
+        assert_eq!(
+            tokens,
+            vec![
+                ("abc".to_owned(), 0, 3),
+                ("def".to_owned(), 5, 8),
+                ("123xyz".to_owned(), 9, 15),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_ascii_tokenizer_lazy_casefold()
+    -> std::result::Result<(), String>
+    {
+        let tok = AsciiTokenizer;
+        let tokens = tok
+            .tokenize("ABCédef 123XYZ")
+            .into_iter()
+            .map(|token| (token.term, token.start, token.end))
+            .collect();
+
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "ascii_docs", "body", "tokenize='ascii'"],
+        )
+        .map_err(|err| err.to_string())?;
+        table.insert_document(1, &["ABCédef 123XYZ".to_owned()]);
+        table.insert_document(2, &["abc DEF".to_owned()]);
+        let structure = table_structure(&table);
+
+        let mut upper_matches = search_rowids(&table, "ABC")?;
+        upper_matches.sort_unstable();
+        let mut lower_matches = search_rowids(&table, "def")?;
+        lower_matches.sort_unstable();
+        let mut numeric_matches = search_rowids(&table, "123XYZ")?;
+        numeric_matches.sort_unstable();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5AsciiTokenizerStructure {
+                    tokens,
+                    terms: structure.terms.into_iter().map(|term| term.term).collect(),
+                    upper_matches,
+                    lower_matches,
+                    numeric_matches,
+                }
+            ),
+            r#"Fts5AsciiTokenizerStructure {
+    tokens: [
+        (
+            "abc",
+            0,
+            3,
+        ),
+        (
+            "def",
+            5,
+            8,
+        ),
+        (
+            "123xyz",
+            9,
+            15,
+        ),
+    ],
+    terms: [
+        "123xyz",
+        "abc",
+        "def",
+    ],
+    upper_matches: [
+        1,
+        2,
+    ],
+    lower_matches: [
+        1,
+        2,
+    ],
+    numeric_matches: [
+        1,
+    ],
+}"#
+        );
+        Ok(())
     }
 
     #[test]

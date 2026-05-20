@@ -2895,6 +2895,71 @@ mod tests {
     }
 
     #[test]
+    fn test_serialized_stale_deferred_upgrade_releases_baton() {
+        let m = mgr();
+
+        let pgno = PageNumber::new(1).unwrap();
+        let mut seed = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut seed, pgno, test_data(0x01)).unwrap();
+        let seed_commit = m.commit(&mut seed).unwrap();
+
+        let mut reader_then_writer = m.begin(BeginKind::Deferred).unwrap();
+        assert!(
+            !reader_then_writer.snapshot_established,
+            "deferred transaction should not pin a snapshot until first access"
+        );
+        assert_eq!(m.version_guard_registry().active_guard_count(), 1);
+        assert!(m.cached_gc_horizon().is_none());
+
+        assert_eq!(
+            m.read_page(&mut reader_then_writer, pgno),
+            Some(test_data(0x01))
+        );
+        assert!(reader_then_writer.snapshot_established);
+        assert_eq!(reader_then_writer.snapshot.high, seed_commit);
+        assert_eq!(m.cached_gc_horizon(), Some(seed_commit));
+        assert_eq!(m.version_guard_registry().active_guard_count(), 1);
+        assert!(m.write_mutex().holder().is_none());
+
+        let mut later_writer = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(
+            &mut later_writer,
+            PageNumber::new(2).unwrap(),
+            test_data(0x02),
+        )
+        .unwrap();
+        m.commit(&mut later_writer).unwrap();
+
+        let result = m.write_page(
+            &mut reader_then_writer,
+            PageNumber::new(3).unwrap(),
+            test_data(0x03),
+        );
+        assert_eq!(result.unwrap_err(), MvccError::BusySnapshot);
+        assert_eq!(reader_then_writer.state, TransactionState::Active);
+        assert!(
+            !reader_then_writer.serialized_write_lock_held,
+            "stale deferred upgrade must not retain serialized writer exclusion"
+        );
+        assert!(
+            m.write_mutex().holder().is_none(),
+            "BusySnapshot during deferred upgrade must release the writer baton"
+        );
+        assert_eq!(
+            m.cached_gc_horizon(),
+            Some(seed_commit),
+            "the live reader snapshot remains pinned until explicit abort"
+        );
+        assert!(reader_then_writer.has_version_guard());
+        assert_eq!(m.version_guard_registry().active_guard_count(), 1);
+
+        m.abort(&mut reader_then_writer);
+        assert!(m.cached_gc_horizon().is_none());
+        assert_eq!(m.version_guard_registry().active_guard_count(), 0);
+        assert!(m.write_mutex().holder().is_none());
+    }
+
+    #[test]
     fn test_serialized_no_page_lock_needed() {
         let m = mgr();
         let mut txn = m.begin(BeginKind::Immediate).unwrap();

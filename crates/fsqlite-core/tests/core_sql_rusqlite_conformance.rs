@@ -920,6 +920,33 @@ const STRING_FUNCTION_CASES: &[QueryCase] = &[
     },
 ];
 
+const MATH_FUNCTION_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "abs nulls and storage class",
+        sql: "SELECT abs(-42), abs(42), abs(NULL), typeof(abs(-42))",
+    },
+    QueryCase {
+        name: "sqrt pow and power",
+        sql: "SELECT sqrt(144), pow(2, 10), power(3, 4)",
+    },
+    QueryCase {
+        name: "logarithm exact powers",
+        sql: "SELECT log(10), log(2, 8), log2(8), log10(1000), ln(1), exp(0)",
+    },
+    QueryCase {
+        name: "rounding family positive and negative",
+        sql: "SELECT ceil(1.2), ceiling(-1.2), floor(1.8), floor(-1.2), trunc(1.8), trunc(-1.8)",
+    },
+    QueryCase {
+        name: "domain errors become null",
+        sql: "SELECT sqrt(-1), log(-1), ln(0), acos(2), asin(2)",
+    },
+    QueryCase {
+        name: "mod and angle conversion",
+        sql: "SELECT mod(10, 3), mod(10, 0), degrees(0), radians(0)",
+    },
+];
+
 #[test]
 fn select_join_group_by_aggregates_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
@@ -1027,4 +1054,10 @@ fn json1_functions_match_rusqlite() {
 fn string_functions_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new("");
     harness.assert_queries_match("string functions", STRING_FUNCTION_CASES);
+}
+
+#[test]
+fn math_functions_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new("");
+    harness.assert_queries_match("math functions", MATH_FUNCTION_CASES);
 }

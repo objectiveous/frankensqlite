@@ -8286,6 +8286,24 @@ fn codegen_select_aggregate(
 // was removed because the AggColumn.order_by field is not yet supported.
 
 /// Parse result columns to extract aggregate function metadata.
+fn push_bare_aggregate_expr(agg_cols: &mut Vec<AggColumn>, expr: Expr) {
+    agg_cols.push(AggColumn {
+        name: String::new(),
+        num_args: 0,
+        arg_col_index: None,
+        arg_is_rowid: false,
+        distinct: false,
+        arg_expr: None,
+        extra_args: Vec::new(),
+        filter: None,
+        wrapper_expr: None,
+        hidden: false,
+        multi_agg_indices: Vec::new(),
+        bare_expr: Some(Box::new(expr)),
+        collation: None,
+    });
+}
+
 fn parse_aggregate_columns(
     columns: &[ResultColumn],
     table: &TableSchema,
@@ -8436,26 +8454,26 @@ fn parse_aggregate_columns(
             }
             // Bare (non-aggregate) column in an aggregate query without GROUP BY.
             ResultColumn::Expr { expr, .. } => {
-                agg_cols.push(AggColumn {
-                    name: String::new(),
-                    num_args: 0,
-                    arg_col_index: None,
-                    arg_is_rowid: false,
-                    distinct: false,
-                    arg_expr: None,
-                    extra_args: Vec::new(),
-                    filter: None,
-                    wrapper_expr: None,
-                    hidden: false,
-                    multi_agg_indices: Vec::new(),
-                    bare_expr: Some(Box::new(expr.clone())),
-                    collation: None,
-                });
+                push_bare_aggregate_expr(&mut agg_cols, expr.clone());
             }
-            ResultColumn::Star | ResultColumn::TableStar(_) => {
-                return Err(CodegenError::Unsupported(
-                    "SELECT * in aggregate query without GROUP BY is not supported".to_owned(),
-                ));
+            ResultColumn::Star => {
+                for column in &table.columns {
+                    push_bare_aggregate_expr(
+                        &mut agg_cols,
+                        Expr::Column(ColumnRef::bare(column.name.as_str()), Span::ZERO),
+                    );
+                }
+            }
+            ResultColumn::TableStar(name) => {
+                for column in &table.columns {
+                    push_bare_aggregate_expr(
+                        &mut agg_cols,
+                        Expr::Column(
+                            ColumnRef::qualified(name.name.as_str(), column.name.as_str()),
+                            Span::ZERO,
+                        ),
+                    );
+                }
             }
         }
     }
@@ -29126,6 +29144,46 @@ mod tests {
             .find(|op| op.opcode == Opcode::ResultRow)
             .unwrap();
         assert_eq!(rr.p2, 2, "ResultRow should output 2 columns");
+    }
+
+    #[test]
+    fn test_codegen_select_star_with_aggregate_expands_bare_columns() -> Result<(), String> {
+        let stmt = select_sql("SELECT *, COUNT(*) FROM t");
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).map_err(|err| format!("{err:?}"))?;
+        let prog = b.finish().map_err(|err| format!("{err:?}"))?;
+
+        let agg_steps = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::AggStep)
+            .count();
+        if agg_steps != 1 {
+            return Err(format!("expected one COUNT AggStep, got {agg_steps}"));
+        }
+
+        let column_reads = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Column)
+            .count();
+        if column_reads < 2 {
+            return Err(format!(
+                "expected star expansion to read both table columns, got {column_reads}"
+            ));
+        }
+
+        let result_row = prog.ops().iter().find(|op| op.opcode == Opcode::ResultRow);
+        if result_row.is_none_or(|op| op.p2 != 3) {
+            return Err(format!(
+                "expected ResultRow to expose two star columns plus COUNT, got {:?}",
+                result_row.map(|op| op.p2)
+            ));
+        }
+
+        Ok(())
     }
 
     // === Test 26: AVG aggregate ===

@@ -4248,6 +4248,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_same_page_stale_writer_hits_fcw_after_lock_busy_retry() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+        let page = test_page(77);
+
+        let s1 = registry
+            .begin_concurrent(test_snapshot(10))
+            .expect("session 1");
+        let s2 = registry
+            .begin_concurrent(test_snapshot(10))
+            .expect("session 2");
+
+        {
+            let mut h1 = registry.get_mut(s1).expect("handle 1");
+            concurrent_write_page(&mut h1, &lock_table, s1, page, tagged_test_data(1))
+                .expect("s1 write page");
+        }
+
+        {
+            let mut h2 = registry.get_mut(s2).expect("handle 2");
+            let result = concurrent_write_page(&mut h2, &lock_table, s2, page, tagged_test_data(2));
+            assert_eq!(result, Err(MvccError::Busy));
+        }
+
+        let seq1 = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(11),
+        )
+        .expect("s1 commits first");
+        assert_eq!(seq1, CommitSeq::new(11));
+        assert_eq!(commit_index.latest(page), Some(CommitSeq::new(11)));
+
+        {
+            let mut h2 = registry.get_mut(s2).expect("handle 2");
+            concurrent_write_page(&mut h2, &lock_table, s2, page, tagged_test_data(2))
+                .expect("s2 write page after s1 releases lock");
+        }
+
+        let result = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s2,
+            CommitSeq::new(12),
+        );
+        let (err, fcw) = result.expect_err("stale same-page writer must abort");
+        assert_eq!(err, MvccError::BusySnapshot);
+        assert_eq!(
+            fcw,
+            FcwResult::Conflict {
+                conflicting_pages: vec![page],
+                conflicting_commit_seq: CommitSeq::new(11),
+            }
+        );
+        assert_eq!(commit_index.latest(page), Some(CommitSeq::new(11)));
+        assert_eq!(lock_table.lock_count(), 0);
+    }
+
     // -----------------------------------------------------------------------
     // Test 3: First-committer-wins with three concurrent transactions.
     // -----------------------------------------------------------------------

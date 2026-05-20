@@ -180,6 +180,8 @@ pub enum DataflowOperator {
     Project { columns: Vec<usize> },
     /// Consolidate algebraic weights by key and elide zero-weight results.
     ConsolidateByKey { key_columns: Vec<usize> },
+    /// Consolidate algebraic weights by complete row value.
+    ConsolidateRows,
     /// Compute `DeltaLeft JOIN Right`, with the current stream as the delta-left input.
     DeltaJoinLeft {
         stable_right: Vec<WeightedRow>,
@@ -218,6 +220,7 @@ impl DataflowOperator {
                 .map(|row| Ok(WeightedRow::new(row.project(columns)?, row.weight)))
                 .collect(),
             Self::ConsolidateByKey { key_columns } => consolidate_by_key(rows, key_columns),
+            Self::ConsolidateRows => Ok(consolidate_rows(rows.iter().cloned().collect())),
             Self::DeltaJoinLeft {
                 stable_right,
                 key_spec,
@@ -302,7 +305,8 @@ fn index_weighted_rows<'a>(
     Ok(index)
 }
 
-fn consolidate_full_rows(rows: Vec<WeightedRow>) -> Vec<WeightedRow> {
+/// Consolidate identical output rows by algebraic weight, preserving first-seen order.
+pub fn consolidate_rows(rows: Vec<WeightedRow>) -> Vec<WeightedRow> {
     let mut groups: Vec<(Vec<SqliteValue>, i64)> = Vec::new();
     for row in rows {
         if row.is_zero() {
@@ -414,7 +418,7 @@ pub fn delta_join_update(
     let mut joined = delta_join_left(delta_left, stable_right, key_spec)?;
     joined.extend(delta_join_right(stable_left, delta_right, key_spec)?);
     joined.extend(delta_join_left(delta_left, delta_right, key_spec)?);
-    let joined = consolidate_full_rows(joined);
+    let joined = consolidate_rows(joined);
 
     tracing::debug!(
         target: "fsqlite_vdbe::dataflow",
@@ -501,6 +505,22 @@ mod tests {
             vec![WeightedRow::new(vec![int(1)], 7)],
             "key 2 should cancel out and key 1 should retain first-seen ordering"
         );
+    }
+
+    #[test]
+    fn consolidate_rows_operator_preserves_first_row_order_and_elides_zeroes() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::ConsolidateRows]);
+        let rows = vec![
+            WeightedRow::new(vec![int(2), int(20)], 1),
+            WeightedRow::new(vec![int(1), int(10)], 3),
+            WeightedRow::new(vec![int(2), int(20)], -1),
+            WeightedRow::new(vec![int(1), int(10)], 4),
+            WeightedRow::new(vec![int(3), int(30)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(actual, vec![WeightedRow::new(vec![int(1), int(10)], 7)]);
     }
 
     #[test]

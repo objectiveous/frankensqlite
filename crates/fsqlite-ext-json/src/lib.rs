@@ -576,6 +576,12 @@ pub fn json_each(input: &str, path: Option<&str>) -> Result<Vec<JsonTableRow>> {
     json_each_value(&root, path)
 }
 
+/// Table-valued `json_each` over TEXT JSON or JSONB bytes.
+pub fn json_each_blob(input: &[u8], path: Option<&str>) -> Result<Vec<JsonTableRow>> {
+    let root = parse_json_input_blob(input)?;
+    json_each_value(&root, path)
+}
+
 fn json_each_value(root: &Value, path: Option<&str>) -> Result<Vec<JsonTableRow>> {
     let base_path = path.unwrap_or("$");
     let target = match path {
@@ -645,6 +651,12 @@ fn json_each_value(root: &Value, path: Option<&str>) -> Result<Vec<JsonTableRow>
 /// Table-valued `json_tree`: recursively iterate subtree at root or `path`.
 pub fn json_tree(input: &str, path: Option<&str>) -> Result<Vec<JsonTableRow>> {
     let root = parse_json_text(input)?;
+    json_tree_value(&root, path)
+}
+
+/// Table-valued `json_tree` over TEXT JSON or JSONB bytes.
+pub fn json_tree_blob(input: &[u8], path: Option<&str>) -> Result<Vec<JsonTableRow>> {
+    let root = parse_json_input_blob(input)?;
     json_tree_value(&root, path)
 }
 
@@ -2927,6 +2939,43 @@ mod tests {
     use super::*;
     use fsqlite_func::FunctionRegistry;
 
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct JsonTableRowStructure {
+        key: String,
+        value: String,
+        type_name: &'static str,
+        atom: String,
+        id: i64,
+        parent: String,
+        fullkey: String,
+        path: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct JsonTableJsonbStructure {
+        each: Vec<JsonTableRowStructure>,
+        tree: Vec<JsonTableRowStructure>,
+    }
+
+    fn json_value_structure(value: &SqliteValue) -> String {
+        format!("{value:?}")
+    }
+
+    fn json_table_row_structure(row: &JsonTableRow) -> JsonTableRowStructure {
+        JsonTableRowStructure {
+            key: json_value_structure(&row.key),
+            value: json_value_structure(&row.value),
+            type_name: row.type_name,
+            atom: json_value_structure(&row.atom),
+            id: row.id,
+            parent: json_value_structure(&row.parent),
+            fullkey: row.fullkey.clone(),
+            path: row.path.clone(),
+        }
+    }
+
     #[test]
     fn test_register_json_scalars_registers_core_functions() {
         let mut registry = FunctionRegistry::new();
@@ -3677,6 +3726,22 @@ mod tests {
     }
 
     #[test]
+    fn test_json_each_blob_accepts_text_json_and_jsonb() {
+        let text_rows = json_each_blob(br#"{"a":[10,20],"b":30}"#, Some("$.a")).unwrap();
+        let jsonb_input = jsonb(r#"{"a":[10,20],"b":30}"#).unwrap();
+        let jsonb_rows = json_each_blob(&jsonb_input, Some("$.a")).unwrap();
+
+        assert_eq!(jsonb_rows, text_rows);
+        assert_eq!(
+            jsonb_rows
+                .iter()
+                .map(|row| row.value.clone())
+                .collect::<Vec<_>>(),
+            vec![SqliteValue::Integer(10), SqliteValue::Integer(20)]
+        );
+    }
+
+    #[test]
     fn test_json_tree_recursive() {
         let rows = json_tree(r#"{"a":{"b":1}}"#, None).unwrap();
         assert!(rows.iter().any(|row| row.fullkey == "$.a"));
@@ -3695,6 +3760,107 @@ mod tests {
         assert_eq!(row.type_name, "integer");
         assert_eq!(row.atom, SqliteValue::Integer(1));
         assert_eq!(row.path, "$.a");
+    }
+
+    #[test]
+    fn test_json_tree_blob_accepts_jsonb_path() {
+        let jsonb_input = jsonb(r#"{"a":{"b":[1,2]},"c":3}"#).unwrap();
+        let rows = json_tree_blob(&jsonb_input, Some("$.a")).unwrap();
+
+        assert_eq!(rows.first().map(|row| row.fullkey.as_str()), Some("$.a"));
+        assert!(
+            rows.iter()
+                .any(|row| row.fullkey == "$.a.b[1]" && row.value == SqliteValue::Integer(2))
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.fullkey == "$.a.b[1]")
+                .map(|row| row.path.as_str()),
+            Some("$.a.b")
+        );
+    }
+
+    #[test]
+    fn test_json_structural_snapshot_table_functions_jsonb() -> Result<()> {
+        let input = jsonb(r#"{"a":[10,{"b":20}],"c":null}"#)?;
+        let each = json_each_blob(&input, Some("$.a"))?
+            .iter()
+            .map(json_table_row_structure)
+            .collect();
+        let tree = json_tree_blob(&input, Some("$.a"))?
+            .iter()
+            .map(json_table_row_structure)
+            .collect();
+
+        let actual = format!("{:#?}", JsonTableJsonbStructure { each, tree });
+        let expected = r#"JsonTableJsonbStructure {
+    each: [
+        JsonTableRowStructure {
+            key: "Integer(0)",
+            value: "Integer(10)",
+            type_name: "integer",
+            atom: "Integer(10)",
+            id: 1,
+            parent: "Null",
+            fullkey: "$.a[0]",
+            path: "$.a",
+        },
+        JsonTableRowStructure {
+            key: "Integer(1)",
+            value: "Text(\"{\\\"b\\\":20}\")",
+            type_name: "object",
+            atom: "Null",
+            id: 2,
+            parent: "Null",
+            fullkey: "$.a[1]",
+            path: "$.a",
+        },
+    ],
+    tree: [
+        JsonTableRowStructure {
+            key: "Null",
+            value: "Text(\"[10,{\\\"b\\\":20}]\")",
+            type_name: "array",
+            atom: "Null",
+            id: 0,
+            parent: "Null",
+            fullkey: "$.a",
+            path: "$.a",
+        },
+        JsonTableRowStructure {
+            key: "Integer(0)",
+            value: "Integer(10)",
+            type_name: "integer",
+            atom: "Integer(10)",
+            id: 1,
+            parent: "Integer(0)",
+            fullkey: "$.a[0]",
+            path: "$.a",
+        },
+        JsonTableRowStructure {
+            key: "Integer(1)",
+            value: "Text(\"{\\\"b\\\":20}\")",
+            type_name: "object",
+            atom: "Null",
+            id: 2,
+            parent: "Integer(0)",
+            fullkey: "$.a[1]",
+            path: "$.a",
+        },
+        JsonTableRowStructure {
+            key: "Text(\"b\")",
+            value: "Integer(20)",
+            type_name: "integer",
+            atom: "Integer(20)",
+            id: 3,
+            parent: "Integer(2)",
+            fullkey: "$.a[1].b",
+            path: "$.a[1]",
+        },
+    ],
+}"#;
+        assert_eq!(actual, expected);
+        Ok(())
     }
 
     #[test]

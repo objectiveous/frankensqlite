@@ -6906,6 +6906,44 @@ mod tests {
     }
 
     #[test]
+    fn test_snapshot_reuse_primes_cache_after_local_commit_epoch_advances() {
+        let mgr = mgr();
+        let pgno = PageNumber::new(8_021).unwrap();
+
+        let mut writer = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("writer begin should use the primed initial snapshot");
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (1, 0),
+            "initial BEGIN should use the commit-epoch reuse path"
+        );
+        mgr.write_page(&mut writer, pgno, test_data(0x2A))
+            .expect("writer should stage a page");
+        let commit_seq = mgr.commit(&mut writer).expect("writer commit");
+
+        let mut reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("reader begin after local commit should succeed");
+        assert_eq!(
+            reader.snapshot,
+            Snapshot::new(commit_seq, SchemaEpoch::ZERO),
+            "local commit publication should update the cached snapshot epoch"
+        );
+        assert_eq!(
+            mgr.read_page(&mut reader, pgno),
+            Some(test_data(0x2A)),
+            "reader should observe the locally committed page at the reused snapshot"
+        );
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (2, 0),
+            "local commit should prime the cache so the next BEGIN does not reload the seqlock"
+        );
+        mgr.abort(&mut reader);
+    }
+
+    #[test]
     fn test_commit_releases_writer_pinned_chain_immediately_when_horizon_advances() {
         let mgr = mgr();
         let pgno = PageNumber::new(6_785).unwrap();

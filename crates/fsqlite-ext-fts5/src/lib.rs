@@ -3771,6 +3771,11 @@ impl VirtualTable for Fts5Table {
         // UPDATE: validate rowid movement before mutating so conflict failures
         // preserve the old row and its index postings.
         let old_rowid = args[0].to_integer();
+        if self.config.content_mode == ContentMode::Contentless && !self.config.contentless_delete {
+            return Err(FrankenError::function_error(
+                "fts5: cannot update contentless table without contentless_delete=1",
+            ));
+        }
         let new_rowid = if args.len() > 1 && !args[1].is_null() {
             args[1].to_integer()
         } else {
@@ -4600,6 +4605,17 @@ mod tests {
         full_locales: Vec<(i64, usize, String)>,
         reused_auto_rowid: Option<i64>,
         rows_after_auto: Vec<(i64, Vec<String>)>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5ContentlessUpdateStructure {
+        reject_error: String,
+        rows_after_reject: Vec<(i64, Vec<String>)>,
+        matches_after_reject: Vec<i64>,
+        updated_rows: Vec<(i64, Vec<String>)>,
+        updated_old_matches: Vec<i64>,
+        updated_new_matches: Vec<i64>,
     }
 
     #[allow(dead_code)]
@@ -6542,6 +6558,40 @@ mod tests {
     }
 
     #[test]
+    fn test_fts5_contentless_update_rejects_without_toggle() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "content=''"])
+            .map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(9),
+                    SqliteValue::Text(SmallText::from_string("stable token")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+
+        let err = table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Integer(9),
+                    SqliteValue::Integer(9),
+                    SqliteValue::Text(SmallText::from_string("replacement token")),
+                ],
+            )
+            .map_err(|err| err.to_string())
+            .expect_err("contentless update should require contentless_delete=1");
+
+        assert!(err.contains("cannot update contentless table without contentless_delete=1"));
+        assert_eq!(search_rowids(&table, "stable")?, vec![9]);
+        assert!(search_rowids(&table, "replacement")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn test_fts5_structural_snapshot_contentless_unindexed() -> std::result::Result<(), String> {
         let cx = Cx::new();
         let mut table = Fts5Table::connect(
@@ -6612,6 +6662,109 @@ mod tests {
         7,
     ],
     unindexed_matches: [],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_contentless_update_mode() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut reject_table =
+            Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "content=''"])
+                .map_err(|err| err.to_string())?;
+        reject_table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(3),
+                    SqliteValue::Text(SmallText::from_string("old token")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        let reject_error = reject_table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Integer(3),
+                    SqliteValue::Integer(3),
+                    SqliteValue::Text(SmallText::from_string("new token")),
+                ],
+            )
+            .map_err(|err| err.to_string())
+            .expect_err("contentless update should fail without contentless_delete=1");
+
+        let mut update_table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "body",
+                "content=''",
+                "contentless_delete=1",
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        update_table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(4),
+                    SqliteValue::Text(SmallText::from_string("old token")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        update_table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Integer(4),
+                    SqliteValue::Integer(4),
+                    SqliteValue::Text(SmallText::from_string("new token")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5ContentlessUpdateStructure {
+                    reject_error,
+                    rows_after_reject: reject_table.all_rows(),
+                    matches_after_reject: search_rowids(&reject_table, "old OR new")?,
+                    updated_rows: update_table.all_rows(),
+                    updated_old_matches: search_rowids(&update_table, "old")?,
+                    updated_new_matches: search_rowids(&update_table, "new")?,
+                }
+            ),
+            r#"Fts5ContentlessUpdateStructure {
+    reject_error: "fts5: cannot update contentless table without contentless_delete=1",
+    rows_after_reject: [
+        (
+            3,
+            [
+                "",
+            ],
+        ),
+    ],
+    matches_after_reject: [
+        3,
+    ],
+    updated_rows: [
+        (
+            4,
+            [
+                "",
+            ],
+        ),
+    ],
+    updated_old_matches: [],
+    updated_new_matches: [
+        4,
+    ],
 }"#
         );
         Ok(())

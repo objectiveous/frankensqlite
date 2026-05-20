@@ -727,8 +727,8 @@ const PRAGMA_SETUP: &str = "
         score INTEGER DEFAULT 0,
         note TEXT DEFAULT 'new'
     );
-    CREATE UNIQUE INDEX idx_pragma_child_name ON pragma_child(name);
-    CREATE INDEX idx_pragma_child_parent_score ON pragma_child(parent_id, score);
+    CREATE UNIQUE INDEX idx_pragma_child_parent_score_name
+        ON pragma_child(parent_id, score, name);
 ";
 
 const PRAGMA_CASES: &[QueryCase] = &[
@@ -742,7 +742,7 @@ const PRAGMA_CASES: &[QueryCase] = &[
     },
     QueryCase {
         name: "index info preserves indexed column order",
-        sql: "PRAGMA index_info(idx_pragma_child_parent_score)",
+        sql: "PRAGMA index_info(idx_pragma_child_parent_score_name)",
     },
     QueryCase {
         name: "foreign key list exposes referenced table and action",

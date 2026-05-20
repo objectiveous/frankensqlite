@@ -78,6 +78,257 @@ pub struct Fts5Config {
     tokendata: bool,
 }
 
+const FTS5_CONFIG_VERSION: i64 = 4;
+const FTS5_CONFIG_VERSION_SECURE_DELETE: i64 = 5;
+const FTS5_DEFAULT_PAGE_SIZE: i64 = 4050;
+const FTS5_MAX_PAGE_SIZE: i64 = 64 * 1024;
+const FTS5_DEFAULT_AUTOMERGE: i64 = 4;
+const FTS5_DEFAULT_USERMERGE: i64 = 4;
+const FTS5_DEFAULT_CRISISMERGE: i64 = 16;
+const FTS5_MAX_SEGMENT: i64 = 2000;
+const FTS5_DEFAULT_HASHSIZE: i64 = 1024 * 1024;
+const FTS5_DEFAULT_DELETE_AUTOMERGE: i64 = 10;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fts5ConfigRecord {
+    pub key: String,
+    pub value: SqliteValue,
+}
+
+impl Fts5ConfigRecord {
+    #[must_use]
+    pub fn integer(key: impl Into<String>, value: i64) -> Self {
+        Self {
+            key: key.into(),
+            value: SqliteValue::Integer(value),
+        }
+    }
+
+    #[must_use]
+    pub fn text(key: impl Into<String>, value: impl Into<String> + AsRef<str>) -> Self {
+        Self {
+            key: key.into(),
+            value: SqliteValue::Text(SmallText::from_string(value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5ConfigMetadata {
+    pub format_version: i64,
+    pub page_size: i64,
+    pub automerge: i64,
+    pub usermerge: i64,
+    pub crisismerge: i64,
+    pub hash_size: i64,
+    pub delete_merge: i64,
+    pub rank: Option<String>,
+    pub secure_delete: bool,
+    pub insttoken: bool,
+}
+
+impl Default for Fts5ConfigMetadata {
+    fn default() -> Self {
+        Self {
+            format_version: FTS5_CONFIG_VERSION,
+            page_size: FTS5_DEFAULT_PAGE_SIZE,
+            automerge: FTS5_DEFAULT_AUTOMERGE,
+            usermerge: FTS5_DEFAULT_USERMERGE,
+            crisismerge: FTS5_DEFAULT_CRISISMERGE,
+            hash_size: FTS5_DEFAULT_HASHSIZE,
+            delete_merge: FTS5_DEFAULT_DELETE_AUTOMERGE,
+            rank: None,
+            secure_delete: false,
+            insttoken: false,
+        }
+    }
+}
+
+impl Fts5ConfigMetadata {
+    #[must_use]
+    pub fn from_runtime_config(config: Fts5Config) -> Self {
+        Self {
+            secure_delete: config.secure_delete,
+            insttoken: config.insttoken,
+            ..Self::default()
+        }
+    }
+
+    pub fn apply_to_runtime_config(&self, config: &mut Fts5Config) {
+        config.secure_delete = self.secure_delete;
+        config.insttoken = self.insttoken;
+    }
+
+    #[must_use]
+    pub fn encode_rows(&self) -> Vec<Fts5ConfigRecord> {
+        let mut rows = Vec::with_capacity(10);
+
+        push_non_default_integer(
+            &mut rows,
+            "automerge",
+            self.automerge,
+            FTS5_DEFAULT_AUTOMERGE,
+        );
+        push_non_default_integer(
+            &mut rows,
+            "crisismerge",
+            self.crisismerge,
+            FTS5_DEFAULT_CRISISMERGE,
+        );
+        push_non_default_integer(
+            &mut rows,
+            "deletemerge",
+            self.delete_merge,
+            FTS5_DEFAULT_DELETE_AUTOMERGE,
+        );
+        push_non_default_integer(&mut rows, "hashsize", self.hash_size, FTS5_DEFAULT_HASHSIZE);
+        if self.insttoken {
+            rows.push(Fts5ConfigRecord::integer("insttoken", 1));
+        }
+        push_non_default_integer(&mut rows, "pgsz", self.page_size, FTS5_DEFAULT_PAGE_SIZE);
+        if let Some(rank) = self.rank.as_ref() {
+            rows.push(Fts5ConfigRecord::text("rank", rank.clone()));
+        }
+        if self.secure_delete {
+            rows.push(Fts5ConfigRecord::integer("secure-delete", 1));
+        }
+        push_non_default_integer(
+            &mut rows,
+            "usermerge",
+            self.usermerge,
+            FTS5_DEFAULT_USERMERGE,
+        );
+        rows.push(Fts5ConfigRecord::integer("version", self.format_version));
+        rows.sort_by(|left, right| left.key.cmp(&right.key));
+        rows
+    }
+
+    pub fn decode_rows(rows: &[Fts5ConfigRecord]) -> Result<Self> {
+        let mut metadata = Self::default();
+        let mut seen_version = None;
+
+        for row in rows {
+            let key = row.key.trim();
+            if key.eq_ignore_ascii_case("version") {
+                seen_version = config_integer_value(&row.value);
+                continue;
+            }
+            apply_config_metadata_row(&mut metadata, key, &row.value);
+        }
+
+        let Some(version) = seen_version else {
+            return Err(FrankenError::function_error(
+                "fts5: missing version row in %_config",
+            ));
+        };
+        if version != FTS5_CONFIG_VERSION && version != FTS5_CONFIG_VERSION_SECURE_DELETE {
+            return Err(FrankenError::function_error(format!(
+                "invalid fts5 file format (found {version}, expected {FTS5_CONFIG_VERSION} or {FTS5_CONFIG_VERSION_SECURE_DELETE}) - run 'rebuild'"
+            )));
+        }
+
+        metadata.format_version = version;
+        Ok(metadata)
+    }
+}
+
+fn push_non_default_integer(
+    rows: &mut Vec<Fts5ConfigRecord>,
+    key: &'static str,
+    value: i64,
+    default: i64,
+) {
+    if value != default {
+        rows.push(Fts5ConfigRecord::integer(key, value));
+    }
+}
+
+fn config_integer_value(value: &SqliteValue) -> Option<i64> {
+    match value {
+        SqliteValue::Integer(value) => Some(*value),
+        SqliteValue::Text(text) => text.as_str().trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn apply_config_metadata_row(metadata: &mut Fts5ConfigMetadata, key: &str, value: &SqliteValue) {
+    match key.to_ascii_lowercase().as_str() {
+        "pgsz" => {
+            if let Some(page_size) = config_integer_value(value)
+                && (32..=FTS5_MAX_PAGE_SIZE).contains(&page_size)
+            {
+                metadata.page_size = page_size;
+            }
+        }
+        "hashsize" => {
+            if let Some(hash_size) = config_integer_value(value)
+                && hash_size > 0
+            {
+                metadata.hash_size = hash_size;
+            }
+        }
+        "automerge" => {
+            if let Some(mut automerge) = config_integer_value(value)
+                && (0..=64).contains(&automerge)
+            {
+                if automerge == 1 {
+                    automerge = FTS5_DEFAULT_AUTOMERGE;
+                }
+                metadata.automerge = automerge;
+            }
+        }
+        "usermerge" => {
+            if let Some(usermerge) = config_integer_value(value)
+                && (2..=16).contains(&usermerge)
+            {
+                metadata.usermerge = usermerge;
+            }
+        }
+        "crisismerge" => {
+            if let Some(mut crisismerge) = config_integer_value(value)
+                && crisismerge >= 0
+            {
+                if crisismerge <= 1 {
+                    crisismerge = FTS5_DEFAULT_CRISISMERGE;
+                }
+                if crisismerge >= FTS5_MAX_SEGMENT {
+                    crisismerge = FTS5_MAX_SEGMENT - 1;
+                }
+                metadata.crisismerge = crisismerge;
+            }
+        }
+        "deletemerge" => {
+            if let Some(mut delete_merge) = config_integer_value(value) {
+                if delete_merge < 0 {
+                    delete_merge = FTS5_DEFAULT_DELETE_AUTOMERGE;
+                }
+                if delete_merge > 100 {
+                    delete_merge = 0;
+                }
+                metadata.delete_merge = delete_merge;
+            }
+        }
+        "rank" => {
+            metadata.rank = Some(value.to_text());
+        }
+        "secure-delete" => {
+            if let Some(value) = config_integer_value(value)
+                && value >= 0
+            {
+                metadata.secure_delete = value != 0;
+            }
+        }
+        "insttoken" => {
+            if let Some(value) = config_integer_value(value)
+                && value >= 0
+            {
+                metadata.insttoken = value != 0;
+            }
+        }
+        _ => {}
+    }
+}
+
 impl Fts5Config {
     #[must_use]
     pub const fn new(content_mode: ContentMode) -> Self {
@@ -187,6 +438,22 @@ impl Fts5Config {
             }
             _ => false,
         }
+    }
+
+    #[must_use]
+    pub fn config_metadata(self) -> Fts5ConfigMetadata {
+        Fts5ConfigMetadata::from_runtime_config(self)
+    }
+
+    #[must_use]
+    pub fn encode_config_rows(self) -> Vec<Fts5ConfigRecord> {
+        self.config_metadata().encode_rows()
+    }
+
+    pub fn apply_config_rows(&mut self, rows: &[Fts5ConfigRecord]) -> Result<Fts5ConfigMetadata> {
+        let metadata = Fts5ConfigMetadata::decode_rows(rows)?;
+        metadata.apply_to_runtime_config(self);
+        Ok(metadata)
     }
 }
 
@@ -3338,6 +3605,20 @@ impl Fts5Table {
         &mut self.config
     }
 
+    #[must_use]
+    pub fn config_metadata(&self) -> Fts5ConfigMetadata {
+        self.config.config_metadata()
+    }
+
+    #[must_use]
+    pub fn encode_config_rows(&self) -> Vec<Fts5ConfigRecord> {
+        self.config.encode_config_rows()
+    }
+
+    pub fn apply_config_rows(&mut self, rows: &[Fts5ConfigRecord]) -> Result<Fts5ConfigMetadata> {
+        self.config.apply_config_rows(rows)
+    }
+
     /// Get column names.
     #[must_use]
     pub fn columns(&self) -> &[String] {
@@ -4674,6 +4955,14 @@ mod tests {
 
     #[allow(dead_code)]
     #[derive(Debug)]
+    struct Fts5ConfigMetadataStructure {
+        rows: Vec<(String, String)>,
+        decoded: Fts5ConfigMetadata,
+        runtime: Fts5Config,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
     struct Fts5HighlightPrefixStructure {
         parsed_terms: Vec<Fts5HighlightTerm>,
         prefix_highlight: String,
@@ -4985,6 +5274,185 @@ mod tests {
         assert!(!config.apply_control_command("secure-delete=maybe"));
         assert!(!config.apply_control_command("integrity-check=1"));
         assert_eq!(config.delete_action(), DeleteAction::Tombstone);
+    }
+
+    #[test]
+    fn test_fts5_config_rows_default_stock_shape() {
+        let rows = Fts5Config::default().encode_config_rows();
+        assert_eq!(rows, vec![Fts5ConfigRecord::integer("version", 4)]);
+    }
+
+    #[test]
+    fn test_fts5_config_rows_persist_runtime_toggles() {
+        let mut config = Fts5Config::default();
+        assert!(config.apply_control_command("secure-delete=1"));
+        assert!(config.apply_control_command("insttoken=1"));
+
+        assert_eq!(
+            config.encode_config_rows(),
+            vec![
+                Fts5ConfigRecord::integer("insttoken", 1),
+                Fts5ConfigRecord::integer("secure-delete", 1),
+                Fts5ConfigRecord::integer("version", 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_fts5_config_metadata_decodes_stock_rows() {
+        let rows = vec![
+            Fts5ConfigRecord::integer("version", 5),
+            Fts5ConfigRecord::integer("pgsz", 64),
+            Fts5ConfigRecord::integer("hashsize", 2048),
+            Fts5ConfigRecord::integer("automerge", 8),
+            Fts5ConfigRecord::integer("usermerge", 16),
+            Fts5ConfigRecord::integer("crisismerge", 5000),
+            Fts5ConfigRecord::integer("deletemerge", 101),
+            Fts5ConfigRecord::text("rank", "bm25(10.0)"),
+            Fts5ConfigRecord::integer("secure-delete", 2),
+            Fts5ConfigRecord::integer("insttoken", 1),
+            Fts5ConfigRecord::integer("unknown", 99),
+        ];
+
+        let metadata = Fts5ConfigMetadata::decode_rows(&rows).unwrap();
+        assert_eq!(metadata.format_version, 5);
+        assert_eq!(metadata.page_size, 64);
+        assert_eq!(metadata.hash_size, 2048);
+        assert_eq!(metadata.automerge, 8);
+        assert_eq!(metadata.usermerge, 16);
+        assert_eq!(metadata.crisismerge, 1999);
+        assert_eq!(metadata.delete_merge, 0);
+        assert_eq!(metadata.rank.as_deref(), Some("bm25(10.0)"));
+        assert!(metadata.secure_delete);
+        assert!(metadata.insttoken);
+    }
+
+    #[test]
+    fn test_fts5_config_metadata_rejects_missing_or_unknown_version() {
+        let missing = Fts5ConfigMetadata::decode_rows(&[Fts5ConfigRecord::integer("pgsz", 64)])
+            .expect_err("version row is required");
+        assert!(missing.to_string().contains("missing version"));
+
+        let unknown = Fts5ConfigMetadata::decode_rows(&[Fts5ConfigRecord::integer("version", 6)])
+            .expect_err("unknown version should fail");
+        assert!(
+            unknown
+                .to_string()
+                .contains("invalid fts5 file format (found 6")
+        );
+    }
+
+    #[test]
+    fn test_fts5_table_config_row_round_trip() {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        let metadata = table
+            .apply_config_rows(&[
+                Fts5ConfigRecord::integer("secure-delete", 1),
+                Fts5ConfigRecord::integer("insttoken", 1),
+                Fts5ConfigRecord::integer("version", 5),
+            ])
+            .unwrap();
+
+        assert_eq!(metadata.format_version, 5);
+        assert!(table.config().secure_delete_enabled());
+        assert!(table.config().insttoken_enabled());
+        assert_eq!(
+            table.encode_config_rows(),
+            vec![
+                Fts5ConfigRecord::integer("insttoken", 1),
+                Fts5ConfigRecord::integer("secure-delete", 1),
+                Fts5ConfigRecord::integer("version", 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_config_metadata_codec() {
+        let rows = vec![
+            Fts5ConfigRecord::integer("automerge", 1),
+            Fts5ConfigRecord::integer("crisismerge", 0),
+            Fts5ConfigRecord::integer("deletemerge", -1),
+            Fts5ConfigRecord::integer("hashsize", 4096),
+            Fts5ConfigRecord::integer("insttoken", 1),
+            Fts5ConfigRecord::integer("pgsz", 128),
+            Fts5ConfigRecord::text("rank", "bm25(3.0, 1.0)"),
+            Fts5ConfigRecord::integer("secure-delete", 1),
+            Fts5ConfigRecord::integer("usermerge", 8),
+            Fts5ConfigRecord::integer("version", 5),
+        ];
+        let decoded = Fts5ConfigMetadata::decode_rows(&rows).unwrap();
+        let mut runtime = Fts5Config::default();
+        decoded.apply_to_runtime_config(&mut runtime);
+        let snapshot = Fts5ConfigMetadataStructure {
+            rows: decoded
+                .encode_rows()
+                .into_iter()
+                .map(|record| (record.key, record.value.to_text()))
+                .collect(),
+            decoded,
+            runtime,
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5ConfigMetadataStructure {
+    rows: [
+        (
+            "hashsize",
+            "4096",
+        ),
+        (
+            "insttoken",
+            "1",
+        ),
+        (
+            "pgsz",
+            "128",
+        ),
+        (
+            "rank",
+            "bm25(3.0, 1.0)",
+        ),
+        (
+            "secure-delete",
+            "1",
+        ),
+        (
+            "usermerge",
+            "8",
+        ),
+        (
+            "version",
+            "5",
+        ),
+    ],
+    decoded: Fts5ConfigMetadata {
+        format_version: 5,
+        page_size: 128,
+        automerge: 4,
+        usermerge: 8,
+        crisismerge: 16,
+        hash_size: 4096,
+        delete_merge: 10,
+        rank: Some(
+            "bm25(3.0, 1.0)",
+        ),
+        secure_delete: true,
+        insttoken: true,
+    },
+    runtime: Fts5Config {
+        secure_delete: true,
+        content_mode: Stored,
+        contentless_delete: false,
+        contentless_unindexed: false,
+        columnsize: true,
+        detail: Full,
+        insttoken: true,
+        locale: false,
+        tokendata: false,
+    },
+}"#
+        );
     }
 
     #[test]

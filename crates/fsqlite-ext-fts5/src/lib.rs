@@ -760,6 +760,14 @@ fn push_trigram_char(term: &mut String, ch: char, case_sensitive: bool, remove_d
     if case_sensitive {
         term.push(ch);
     } else {
+        push_case_folded_trigram_char(term, ch);
+    }
+}
+
+fn push_case_folded_trigram_char(term: &mut String, ch: char) {
+    if ch.is_ascii() {
+        term.push(ch.to_ascii_lowercase());
+    } else {
         term.extend(ch.to_lowercase());
     }
 }
@@ -4672,6 +4680,16 @@ mod tests {
         short_input_tokens: usize,
         accented_matches: Vec<i64>,
         ascii_matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5TrigramCaseFoldStructure {
+        insensitive_tokens: Vec<(String, usize, usize)>,
+        sensitive_terms: Vec<String>,
+        diacritic_terms: Vec<String>,
+        upper_matches: Vec<i64>,
+        lower_matches: Vec<i64>,
     }
 
     #[allow(dead_code)]
@@ -8964,6 +8982,117 @@ mod tests {
         assert_eq!(tokens[1].term, "abc");
         assert_eq!(tokens[1].start, 2);
         assert_eq!(tokens[1].end, 5);
+    }
+
+    #[test]
+    fn test_trigram_case_fold_fast_path_preserves_unicode_lowercase() {
+        let insensitive = TrigramTokenizer {
+            case_sensitive: false,
+            remove_diacritics: false,
+        };
+        let tokens = insensitive.tokenize("ABCΣ");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].term, "abc");
+        assert_eq!(tokens[0].start, 0);
+        assert_eq!(tokens[0].end, 3);
+        assert_eq!(tokens[1].term, "bcσ");
+        assert_eq!(tokens[1].start, 1);
+        assert_eq!(tokens[1].end, 5);
+
+        let sensitive = TrigramTokenizer {
+            case_sensitive: true,
+            remove_diacritics: false,
+        };
+        let sensitive_terms: Vec<String> = sensitive
+            .tokenize("ABCΣ")
+            .into_iter()
+            .map(|token| token.term)
+            .collect();
+        assert_eq!(sensitive_terms, vec!["ABC", "BCΣ"]);
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_trigram_case_fold() -> std::result::Result<(), String> {
+        let insensitive = TrigramTokenizer {
+            case_sensitive: false,
+            remove_diacritics: false,
+        };
+        let insensitive_tokens = insensitive
+            .tokenize("ABCΣ")
+            .into_iter()
+            .map(|token| (token.term, token.start, token.end))
+            .collect();
+        let sensitive = TrigramTokenizer {
+            case_sensitive: true,
+            remove_diacritics: false,
+        };
+        let sensitive_terms = sensitive
+            .tokenize("ABCΣ")
+            .into_iter()
+            .map(|token| token.term)
+            .collect();
+        let diacritic_terms = TrigramTokenizer {
+            case_sensitive: false,
+            remove_diacritics: true,
+        }
+        .tokenize("ÉAB")
+        .into_iter()
+        .map(|token| token.term)
+        .collect();
+
+        let cx = Cx::new();
+        let mut table =
+            Fts5Table::connect(&cx, &["fts5", "main", "tri", "body", "tokenize='trigram'"])
+                .map_err(|err| err.to_string())?;
+        table.insert_document(1, &["ABCΣ".to_owned()]);
+        table.insert_document(2, &["abcσ".to_owned()]);
+        let mut upper_matches = search_rowids(&table, "ABCΣ")?;
+        upper_matches.sort_unstable();
+        let mut lower_matches = search_rowids(&table, "abcσ")?;
+        lower_matches.sort_unstable();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5TrigramCaseFoldStructure {
+                    insensitive_tokens,
+                    sensitive_terms,
+                    diacritic_terms,
+                    upper_matches,
+                    lower_matches,
+                }
+            ),
+            r#"Fts5TrigramCaseFoldStructure {
+    insensitive_tokens: [
+        (
+            "abc",
+            0,
+            3,
+        ),
+        (
+            "bcσ",
+            1,
+            5,
+        ),
+    ],
+    sensitive_terms: [
+        "ABC",
+        "BCΣ",
+    ],
+    diacritic_terms: [
+        "eab",
+    ],
+    upper_matches: [
+        1,
+        2,
+    ],
+    lower_matches: [
+        1,
+        2,
+    ],
+}"#
+        );
+        Ok(())
     }
 
     #[test]

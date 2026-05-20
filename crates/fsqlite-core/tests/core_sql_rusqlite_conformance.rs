@@ -438,6 +438,46 @@ const DML_CASES: &[QueryCase] = &[
     },
 ];
 
+const ATTACHED_UPDATE_SETUP: &str = "
+    ATTACH DATABASE ':memory:' AS aux;
+
+    CREATE TABLE main_filter (id INTEGER PRIMARY KEY);
+    INSERT INTO main_filter VALUES (1), (3);
+
+    CREATE TABLE aux.t (
+        id INTEGER PRIMARY KEY,
+        value TEXT NOT NULL UNIQUE,
+        qty INTEGER NOT NULL
+    );
+    INSERT INTO aux.t VALUES
+        (1, 'alpha', 10),
+        (2, 'beta', 20),
+        (3, 'gamma', 30);
+";
+
+const ATTACHED_UPDATE_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "attached update returning single row",
+        sql: "UPDATE aux.t SET qty = qty + 1 WHERE id = 1 RETURNING id, value, qty",
+    },
+    QueryCase {
+        name: "attached update returning with main subquery",
+        sql: "UPDATE aux.t SET value = value || '-hit' WHERE id IN (SELECT id FROM main_filter) RETURNING id, value, qty",
+    },
+    QueryCase {
+        name: "attached update with cte materialization",
+        sql: "WITH picked(id) AS (SELECT id FROM main_filter WHERE id <> 1) UPDATE aux.t SET qty = qty + 10 WHERE id IN (SELECT id FROM picked) RETURNING id, qty",
+    },
+    QueryCase {
+        name: "attached update persisted rows",
+        sql: "SELECT id, value, qty FROM aux.t ORDER BY id",
+    },
+    QueryCase {
+        name: "attached update aggregate",
+        sql: "SELECT COUNT(*), SUM(qty), MIN(value), MAX(value) FROM aux.t",
+    },
+];
+
 const ERROR_PATH_SETUP: &str = "
     CREATE TABLE constrained (
         id INTEGER PRIMARY KEY,
@@ -1055,6 +1095,12 @@ fn dml_insert_update_delete_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(DML_SETUP);
     harness.execute_script(DML_SCRIPT);
     harness.assert_queries_match("DML", DML_CASES);
+}
+
+#[test]
+fn attached_update_delegation_matches_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(ATTACHED_UPDATE_SETUP);
+    harness.assert_queries_match("attached UPDATE", ATTACHED_UPDATE_CASES);
 }
 
 #[test]

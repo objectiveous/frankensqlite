@@ -6,7 +6,9 @@ use std::collections::BTreeSet;
 use fsqlite_harness::adversarial_search::CampaignResult;
 use fsqlite_harness::certification_policy::{
     CERTIFICATION_MAX_EVIDENCE_AGE_HOURS, CERTIFICATION_MIN_VERIFICATION_PCT,
-    CERTIFICATION_POLICY_ID, REQUIRED_CERTIFICATION_LANES, canonical_certification_policy,
+    CERTIFICATION_POLICY_ID, CERTIFICATION_POLICY_SCHEMA_VERSION, REQUIRED_CERTIFICATION_LANES,
+    CertificationRatchetBaseline, CertificationRatchetCandidate,
+    canonical_certification_policy, evaluate_certification_ratchets,
 };
 use fsqlite_harness::ci_gate_matrix::{ArtifactEntry, ArtifactKind, ArtifactManifest};
 use fsqlite_harness::confidence_gates::{GateDecision, build_evidence_ledger, evaluate_full};
@@ -227,6 +229,46 @@ fn canonical_policy_exposes_explicit_blocking_gate_and_ratchet_dimensions() {
     assert!(
         policy.ratchets.iter().all(|ratchet| ratchet.blocking),
         "bead_id={BEAD_ID} case=non_blocking_ratchet_present",
+    );
+}
+
+#[test]
+fn certification_ratchet_blocks_required_suite_pass_rate_backslide() {
+    let baseline = CertificationRatchetBaseline {
+        schema_version: CERTIFICATION_POLICY_SCHEMA_VERSION,
+        policy_id: CERTIFICATION_POLICY_ID.to_owned(),
+        global_lower_bound: 1.0,
+        category_lower_bounds: BTreeMap::from([
+            ("Core SQL".to_owned(), 1.0),
+            ("Transactions".to_owned(), 1.0),
+        ]),
+        required_suite_pass_rate_pct: 100.0,
+        traceability_link_coverage_pct: 100.0,
+    };
+    let candidate = CertificationRatchetCandidate {
+        global_lower_bound: 1.0,
+        category_lower_bounds: BTreeMap::from([
+            ("Core SQL".to_owned(), 1.0),
+            ("Transactions".to_owned(), 1.0),
+        ]),
+        required_suite_pass_rate_pct: 83.333_333,
+        traceability_link_coverage_pct: 100.0,
+    };
+
+    let evaluation = evaluate_certification_ratchets(&baseline, &candidate);
+    assert!(
+        !evaluation.passed,
+        "bead_id={BEAD_ID} case=synthetic_suite_backslide_must_block evaluation={evaluation:?}",
+    );
+    assert_eq!(
+        evaluation.regressed_ratchets,
+        vec!["required_suite_pass_rate".to_owned()],
+        "bead_id={BEAD_ID} case=expected_single_suite_regression evaluation={evaluation:?}",
+    );
+    assert!(
+        evaluation.summary.contains("required_suite_pass_rate"),
+        "bead_id={BEAD_ID} case=regression_summary_must_name_backslide summary={}",
+        evaluation.summary,
     );
 }
 

@@ -203,3 +203,27 @@ fn golden_vdbe_fts5_match_bytecode_family() -> Result<(), String> {
 
     Ok(())
 }
+
+#[test]
+fn golden_vdbe_window_rank_bytecode_family() -> Result<(), String> {
+    let row_number_partition = render_bytecode_case(
+        "window_row_number_partition",
+        "SELECT category_id, \
+                ROW_NUMBER() OVER (PARTITION BY category_id ORDER BY score) \
+             FROM events \
+             WHERE score > 10 \
+             ORDER BY category_id",
+    )?;
+    insta::assert_snapshot!("window_row_number_partition", row_number_partition);
+
+    let rank_partition = render_bytecode_case(
+        "window_rank_partition",
+        "SELECT category_id, \
+                RANK() OVER (PARTITION BY category_id ORDER BY score DESC) \
+             FROM events \
+             ORDER BY category_id, score DESC",
+    )?;
+    insta::assert_snapshot!("window_rank_partition", rank_partition);
+
+    Ok(())
+}

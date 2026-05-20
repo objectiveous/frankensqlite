@@ -12,6 +12,46 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-20 - Planner reuse of rowid_equality_term for RowidLookup probe
+
+- Target: `oltp_cost_estimation_hot_paths` planner microbench, point-lookup
+  (`ipk_point_lookup`) and `mixed_compile_mix` shapes, after the two kept
+  planner wins of the same day (commits f43902e2 tracing gate, 83967f4d
+  rowid_range short-circuit). Bead bd-myk2w.
+- Files touched (reverted, uncommitted): `crates/fsqlite-planner/src/lib.rs`
+  `best_access_path_internal`. The candidate captured the
+  `find_rowid_equality_term(..)` result at the top of the function
+  (`rowid_equality_term: Option<&WhereTerm>`) and, for the `RowidLookup` path,
+  built the `AccessPathProbe::RowidEquality` inline from that term instead of
+  re-scanning the WHERE terms inside
+  `extract_access_path_probe_with_rowid_aliases` (whose `RowidLookup` arm calls
+  `find_rowid_equality_term` a second time). Goal: drop the redundant second
+  scan on the dominant point-lookup path.
+- Verification before rejection: `cargo fmt -p fsqlite-planner`,
+  `CARGO_TARGET_DIR=/data/tmp/cc3-target cargo clippy -p fsqlite-planner --lib
+  -- -D warnings` clean; `cargo test -p fsqlite-planner --lib {probe,rowid,
+  access_path}` 13/21/35 pass; bench `selections=` counts byte-identical
+  (behavior-preserving).
+- Evidence (2M iters, bench profile, CARGO_TARGET_DIR=/data/tmp/cc3-target):
+  baseline point median ~95.0 ns (96.79/95.00/93.31), candidate point ~93.8 ns
+  excluding an r1 cold-start outlier (104.12/93.91/91.15/93.76). range and
+  mixed flat within run-to-run noise (range candidate untouched by this change
+  yet read 159-179 vs baseline 148-163; mixed ~97 vs ~96). The r1 outlier also
+  doubled `aggregate_full_scan` (54 vs 32) on a path the change does not touch,
+  confirming warmup noise dominates the signal.
+- Result: rejected and reverted uncommitted. Point-lookup improvement (~2%) is
+  within the ±3-5% noise band of this microbench. `find_rowid_equality_term`
+  finds the matching term at index 0 (one comparison) for these shapes, so the
+  "redundant" second scan is only a couple ns out of ~95 ns. The candidate also
+  duplicated the extractor's `RowidLookup` probe logic inline (two sites
+  producing `RowidEquality` probes) — a maintainability cost not justified by a
+  noise-level gain.
+- Retry only if a profiler attributes a clearly-above-noise share to the second
+  `find_rowid_equality_term` scan (e.g. on much wider WHERE-term lists where the
+  matching equality term is far from index 0), and prefer threading the found
+  term into `extract_access_path_probe_with_rowid_aliases` (single probe-build
+  site) over inlining a duplicate.
+
 ## 2026-05-18 - Dense retained DELETE leaf search candidate
 
 - Target: current `comprehensive-bench --quick --filter update-delete` DELETE

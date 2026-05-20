@@ -1,0 +1,26 @@
+---
+source: crates/fsqlite-vdbe/tests/golden_bytecode_snapshots.rs
+expression: cte_reference
+---
+case: cte_reference_filter
+sql: WITH picked AS (SELECT id FROM categories WHERE name = 'docs') SELECT id, title FROM docs WHERE category_id IN (SELECT id FROM picked)
+status: ok
+registers: 3
+bind_parameters: 0
+requires_attached_memdb: false
+requires_version_store: false
+
+addr  opcode           p1    p2    p3    p4                 p5
+----  ---------------  ----  ----  ----  -----------------  --
+0     Init             0     12    0                        0 
+1     Transaction      0     0     0                        0 
+2     OpenRead         0     2     0     (tbl)docs          0 
+3     Rewind           0     10    0                        0 
+4     Null             0     3     0                        0 
+5     IfNot            3     9     1                        0 
+6     Rowid            0     1     0                        0 
+7     Column           0     2     2                        0 
+8     ResultRow        1     2     0                        0 
+9     Next             0     4     0                        0 
+10    Close            0     0     0                        0 
+11    Halt             0     0     0                        0

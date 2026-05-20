@@ -7,7 +7,7 @@
 //! contentless-unindexed / insttoken / locale blob / tokendata configuration.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::ScalarFunction;
@@ -102,6 +102,7 @@ const FTS5_DATA_HEIGHT_MASK: u64 = (1 << FTS5_DATA_HEIGHT_BITS) - 1;
 const FTS5_DATA_DLI_MASK: u64 = (1 << FTS5_DATA_DLI_BITS) - 1;
 const FTS5_DATA_ID_LIMIT: u64 = 1 << FTS5_DATA_ID_BITS;
 const FTS5_IDX_MAX_BTREE_PAGE: u32 = (1 << FTS5_DATA_PAGE_BITS) - 1;
+const FTS5_MAIN_PREFIX_BYTE: u8 = b'0';
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fts5ConfigRecord {
@@ -1197,6 +1198,349 @@ impl Fts5TombstonePage {
             Fts5DataRowid::Tombstone { segid, hash_pgno }.encode()?,
             self.encode()?,
         ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fts5PendingIndex {
+    Main,
+    Prefix { ordinal: u8, length: usize },
+}
+
+impl Fts5PendingIndex {
+    #[must_use]
+    pub const fn marker(self) -> u8 {
+        match self {
+            Self::Main => FTS5_MAIN_PREFIX_BYTE,
+            Self::Prefix { ordinal, .. } => FTS5_MAIN_PREFIX_BYTE + ordinal + 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Fts5PendingTermKey(Vec<u8>);
+
+impl Fts5PendingTermKey {
+    #[must_use]
+    pub fn new(index: Fts5PendingIndex, term: &str) -> Self {
+        let mut key = Vec::with_capacity(term.len() + 1);
+        key.push(index.marker());
+        key.extend_from_slice(term.as_bytes());
+        Self(key)
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct Fts5PendingDoc {
+    delete: bool,
+    columns: BTreeMap<u32, Vec<u32>>,
+}
+
+impl Fts5PendingDoc {
+    fn push_position(&mut self, column: u32, position: u32) {
+        self.columns.entry(column).or_default().push(position);
+    }
+
+    fn to_poslist(&self) -> Fts5Poslist {
+        Fts5Poslist::new(
+            self.delete,
+            self.columns
+                .iter()
+                .map(|(column, offsets)| Fts5ColumnPositions::new(*column, offsets.clone()))
+                .collect(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5PendingHash {
+    terms: BTreeMap<Fts5PendingTermKey, BTreeMap<u64, Fts5PendingDoc>>,
+    prefix_lengths: Vec<usize>,
+    detail: DetailMode,
+    tokendata: bool,
+    pending_bytes: usize,
+    row_count: usize,
+}
+
+impl Fts5PendingHash {
+    #[must_use]
+    pub fn new(prefix_lengths: &[usize], detail: DetailMode, tokendata: bool) -> Self {
+        let mut prefix_lengths = prefix_lengths.to_vec();
+        prefix_lengths.sort_unstable();
+        prefix_lengths.dedup();
+        Self {
+            terms: BTreeMap::new(),
+            prefix_lengths,
+            detail,
+            tokendata,
+            pending_bytes: 0,
+            row_count: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+    }
+
+    #[must_use]
+    pub const fn pending_bytes(&self) -> usize {
+        self.pending_bytes
+    }
+
+    #[must_use]
+    pub const fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    #[must_use]
+    pub fn term_count(&self) -> usize {
+        self.terms.len()
+    }
+
+    #[must_use]
+    pub fn should_flush(&self, metadata: &Fts5ConfigMetadata) -> bool {
+        usize::try_from(metadata.hash_size).is_ok_and(|limit| self.pending_bytes >= limit)
+    }
+
+    pub fn add_document(
+        &mut self,
+        rowid: i64,
+        column_values: &[String],
+        indexed_columns: &[bool],
+        tokenizer: &dyn Fts5Tokenizer,
+    ) -> Result<()> {
+        let rowid =
+            u64::try_from(rowid).map_err(|_| fts5_data_error("pending rowid is negative"))?;
+        let prefix_lengths = self.prefix_lengths.clone();
+        let detail = self.detail;
+        let tokendata = self.tokendata;
+        self.row_count = self.row_count.saturating_add(1);
+
+        for (column, value) in column_values.iter().enumerate() {
+            if matches!(indexed_columns.get(column), Some(false)) {
+                continue;
+            }
+            let column = u32::try_from(column)
+                .map_err(|_| fts5_data_error("pending column index exceeds u32"))?;
+            let stored_column = if detail == DetailMode::None {
+                0
+            } else {
+                column
+            };
+            let mut position = 0_u32;
+            tokenizer.visit_tokens(value, &mut |term, _start, _end, colocated| {
+                let stored_position = if detail == DetailMode::Full {
+                    position
+                } else {
+                    0
+                };
+                let term = if tokendata {
+                    tokendata_query_key(term)
+                } else {
+                    term
+                };
+                self.push_occurrence(
+                    Fts5PendingTermKey::new(Fts5PendingIndex::Main, term),
+                    rowid,
+                    stored_column,
+                    stored_position,
+                );
+                for (ordinal, prefix_length) in prefix_lengths.iter().copied().enumerate() {
+                    if let Some(prefix) = prefix_slice(term, prefix_length)
+                        && let Ok(ordinal) = u8::try_from(ordinal)
+                    {
+                        self.push_occurrence(
+                            Fts5PendingTermKey::new(
+                                Fts5PendingIndex::Prefix {
+                                    ordinal,
+                                    length: prefix_length,
+                                },
+                                prefix,
+                            ),
+                            rowid,
+                            stored_column,
+                            stored_position,
+                        );
+                    }
+                }
+                if !colocated {
+                    position = position.saturating_add(1);
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    fn push_occurrence(&mut self, key: Fts5PendingTermKey, rowid: u64, column: u32, position: u32) {
+        self.pending_bytes = self
+            .pending_bytes
+            .saturating_add(key.as_bytes().len())
+            .saturating_add(24);
+        self.terms
+            .entry(key)
+            .or_default()
+            .entry(rowid)
+            .or_default()
+            .push_position(column, position);
+    }
+
+    pub fn flush_to_segment(
+        &self,
+        segid: u32,
+        mut structure: Fts5StructureRecord,
+    ) -> Result<Fts5PendingFlush> {
+        if self.is_empty() {
+            return Err(fts5_data_error("cannot flush an empty pending hash"));
+        }
+        let leaf = Fts5SegmentLeaf::decode(&self.to_segment_leaf().encode()?)?;
+        let data_row = leaf.to_data_row(segid, 1)?;
+        let segment = if structure.uses_origin_tracking() {
+            Fts5StructureSegment::new(segid, 1, 1).with_origin_tracking(
+                structure.origin_counter,
+                structure.origin_counter,
+                0,
+                0,
+                u64::try_from(self.row_count).unwrap_or(u64::MAX),
+            )
+        } else {
+            Fts5StructureSegment::new(segid, 1, 1)
+        };
+
+        if structure.levels.is_empty() {
+            structure
+                .levels
+                .push(Fts5StructureLevel::new(0, vec![segment]));
+        } else {
+            structure.levels[0].segments.push(segment);
+        }
+        structure.write_counter = structure.write_counter.saturating_add(1);
+        if structure.uses_origin_tracking() {
+            structure.origin_counter = structure.origin_counter.saturating_add(1);
+        }
+
+        let structure_row = Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode());
+        Ok(Fts5PendingFlush {
+            data_rows: vec![data_row, structure_row],
+            idx_rows: Vec::new(),
+            leaf,
+            structure,
+            pending_bytes: self.pending_bytes,
+        })
+    }
+
+    fn to_segment_leaf(&self) -> Fts5SegmentLeaf {
+        Fts5SegmentLeaf::new(
+            self.terms
+                .iter()
+                .map(|(term, docs)| {
+                    Fts5SegmentTerm::new(
+                        term.as_bytes().to_vec(),
+                        Fts5Doclist::new(
+                            docs.iter()
+                                .map(|(rowid, doc)| Fts5DoclistEntry::new(*rowid, doc.to_poslist()))
+                                .collect(),
+                        ),
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5PendingFlush {
+    pub data_rows: Vec<Fts5DataRow>,
+    pub idx_rows: Vec<Fts5IdxRow>,
+    pub leaf: Fts5SegmentLeaf,
+    pub structure: Fts5StructureRecord,
+    pub pending_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fts5MergeKind {
+    Auto,
+    Crisis,
+    Optimize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fts5MergePlan {
+    pub kind: Fts5MergeKind,
+    pub level: usize,
+    pub segment_count: usize,
+    pub merge_inputs: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fts5MergeScheduler {
+    pub automerge: usize,
+    pub usermerge: usize,
+    pub crisismerge: usize,
+}
+
+impl Fts5MergeScheduler {
+    #[must_use]
+    pub fn from_metadata(metadata: &Fts5ConfigMetadata) -> Self {
+        Self {
+            automerge: usize::try_from(metadata.automerge.max(0)).unwrap_or(0),
+            usermerge: usize::try_from(metadata.usermerge.max(0)).unwrap_or(0),
+            crisismerge: usize::try_from(metadata.crisismerge.max(0)).unwrap_or(0),
+        }
+    }
+
+    #[must_use]
+    pub fn next_plan(&self, structure: &Fts5StructureRecord) -> Option<Fts5MergePlan> {
+        for (level, level_record) in structure.levels.iter().enumerate() {
+            let segment_count = level_record.segments.len();
+            if self.crisismerge > 0 && segment_count >= self.crisismerge {
+                return Some(Fts5MergePlan {
+                    kind: Fts5MergeKind::Crisis,
+                    level,
+                    segment_count,
+                    merge_inputs: u32::try_from(segment_count).unwrap_or(u32::MAX),
+                });
+            }
+        }
+
+        for (level, level_record) in structure.levels.iter().enumerate() {
+            let segment_count = level_record.segments.len();
+            if self.automerge > 0 && segment_count >= self.automerge {
+                return Some(Fts5MergePlan {
+                    kind: Fts5MergeKind::Auto,
+                    level,
+                    segment_count,
+                    merge_inputs: u32::try_from(self.usermerge.min(segment_count))
+                        .unwrap_or(u32::MAX),
+                });
+            }
+        }
+
+        None
+    }
+
+    #[must_use]
+    pub fn optimize_plan(&self, structure: &Fts5StructureRecord) -> Option<Fts5MergePlan> {
+        structure
+            .levels
+            .iter()
+            .enumerate()
+            .max_by_key(|(_level, level_record)| level_record.segments.len())
+            .and_then(|(level, level_record)| {
+                let segment_count = level_record.segments.len();
+                (segment_count > 1).then(|| Fts5MergePlan {
+                    kind: Fts5MergeKind::Optimize,
+                    level,
+                    segment_count,
+                    merge_inputs: u32::try_from(segment_count).unwrap_or(u32::MAX),
+                })
+            })
     }
 }
 
@@ -4943,6 +5287,28 @@ impl Fts5Table {
         Fts5DataMetadata::decode_rows(rows, self.columns.len())
     }
 
+    pub fn build_pending_hash(&self) -> Result<Fts5PendingHash> {
+        let tokenizer = self.create_tokenizer_instance();
+        let mut pending = Fts5PendingHash::new(
+            &self.prefix_lengths,
+            self.config.detail_mode(),
+            self.config.tokendata_enabled(),
+        );
+        for (rowid, values) in self.all_rows() {
+            pending.add_document(rowid, &values, &self.indexed_columns, tokenizer.as_ref())?;
+        }
+        Ok(pending)
+    }
+
+    pub fn flush_pending_segment(
+        &self,
+        segid: u32,
+        structure: Fts5StructureRecord,
+    ) -> Result<Fts5PendingFlush> {
+        self.build_pending_hash()?
+            .flush_to_segment(segid, structure)
+    }
+
     #[must_use]
     pub fn encode_shadow_rows(&self) -> Fts5ShadowRows {
         Fts5ShadowRows {
@@ -6330,6 +6696,19 @@ mod tests {
 
     #[allow(dead_code)]
     #[derive(Debug)]
+    struct Fts5PendingFlushStructure {
+        term_count: usize,
+        pending_bytes: usize,
+        should_flush: bool,
+        data_rowids: Vec<(i64, Fts5DataRowid)>,
+        terms: Vec<Vec<u8>>,
+        structure: Fts5StructureRecord,
+        merge_plan: Option<Fts5MergePlan>,
+        optimize_plan: Option<Fts5MergePlan>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
     struct Fts5ShadowRowsStructure {
         data: Vec<(i64, Vec<u8>)>,
         config: Vec<(String, String)>,
@@ -7340,6 +7719,236 @@ mod tests {
             true,
         ),
     ],
+}"#
+        );
+    }
+
+    #[test]
+    fn test_fts5_pending_hash_flush_creates_segment_and_structure_rows() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "docs", "title", "body", "prefix='2'"],
+        )
+        .unwrap();
+        table.insert_document(7, &["rust fts".to_owned(), "rusty rust".to_owned()]);
+
+        let pending = table.build_pending_hash().unwrap();
+        assert_eq!(pending.row_count(), 1);
+        assert_eq!(pending.term_count(), 5);
+
+        let flush = pending
+            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0))
+            .unwrap();
+        assert_eq!(flush.data_rows.len(), 2);
+        assert_eq!(
+            Fts5DataRowid::decode(flush.data_rows[0].id).unwrap(),
+            Fts5DataRowid::SegmentLeaf { segid: 4, pgno: 1 }
+        );
+        assert_eq!(flush.data_rows[1].id, FTS5_STRUCTURE_ROWID);
+        assert_eq!(
+            Fts5SegmentLeaf::decode(&flush.data_rows[0].block).unwrap(),
+            flush.leaf
+        );
+        assert_eq!(flush.structure.levels[0].segments[0].segid, 4);
+        assert_eq!(flush.structure.write_counter, 1);
+    }
+
+    #[test]
+    fn test_fts5_merge_scheduler_plans_auto_crisis_and_optimize() {
+        let scheduler = Fts5MergeScheduler {
+            automerge: 4,
+            usermerge: 2,
+            crisismerge: 6,
+        };
+        let structure = Fts5StructureRecord {
+            cookie: 0,
+            write_counter: 6,
+            origin_counter: 0,
+            levels: vec![Fts5StructureLevel::new(
+                0,
+                (1..=4)
+                    .map(|segid| Fts5StructureSegment::new(segid, 1, 1))
+                    .collect(),
+            )],
+        };
+
+        assert_eq!(
+            scheduler.next_plan(&structure),
+            Some(Fts5MergePlan {
+                kind: Fts5MergeKind::Auto,
+                level: 0,
+                segment_count: 4,
+                merge_inputs: 2,
+            })
+        );
+        assert_eq!(
+            scheduler.optimize_plan(&structure),
+            Some(Fts5MergePlan {
+                kind: Fts5MergeKind::Optimize,
+                level: 0,
+                segment_count: 4,
+                merge_inputs: 4,
+            })
+        );
+
+        let crisis = Fts5StructureRecord {
+            levels: vec![Fts5StructureLevel::new(
+                0,
+                (1..=6)
+                    .map(|segid| Fts5StructureSegment::new(segid, 1, 1))
+                    .collect(),
+            )],
+            ..structure
+        };
+        assert_eq!(
+            scheduler.next_plan(&crisis).map(|plan| plan.kind),
+            Some(Fts5MergeKind::Crisis)
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_pending_flush_and_merge_scheduler() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "docs", "title", "body", "prefix='2'"],
+        )
+        .unwrap();
+        table.insert_document(7, &["rust fts".to_owned(), "rusty rust".to_owned()]);
+
+        let pending = table.build_pending_hash().unwrap();
+        let mut metadata = Fts5ConfigMetadata::default();
+        metadata.hash_size = 64;
+        let flush = pending
+            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0))
+            .unwrap();
+        let scheduler = Fts5MergeScheduler {
+            automerge: 4,
+            usermerge: 2,
+            crisismerge: 16,
+        };
+        let merge_structure = Fts5StructureRecord {
+            cookie: 0,
+            write_counter: 4,
+            origin_counter: 0,
+            levels: vec![Fts5StructureLevel::new(
+                0,
+                (1..=4)
+                    .map(|segid| Fts5StructureSegment::new(segid, 1, 1))
+                    .collect(),
+            )],
+        };
+        let snapshot = Fts5PendingFlushStructure {
+            term_count: pending.term_count(),
+            pending_bytes: pending.pending_bytes(),
+            should_flush: pending.should_flush(&metadata),
+            data_rowids: flush
+                .data_rows
+                .iter()
+                .map(|row| (row.id, Fts5DataRowid::decode(row.id).unwrap()))
+                .collect(),
+            terms: flush
+                .leaf
+                .terms
+                .iter()
+                .map(|term| term.term.clone())
+                .collect(),
+            structure: flush.structure,
+            merge_plan: scheduler.next_plan(&merge_structure),
+            optimize_plan: scheduler.optimize_plan(&merge_structure),
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5PendingFlushStructure {
+    term_count: 5,
+    pending_bytes: 224,
+    should_flush: true,
+    data_rowids: [
+        (
+            549755813889,
+            SegmentLeaf {
+                segid: 4,
+                pgno: 1,
+            },
+        ),
+        (
+            10,
+            Structure,
+        ),
+    ],
+    terms: [
+        [
+            48,
+            102,
+            116,
+            115,
+        ],
+        [
+            48,
+            114,
+            117,
+            115,
+            116,
+        ],
+        [
+            48,
+            114,
+            117,
+            115,
+            116,
+            121,
+        ],
+        [
+            49,
+            102,
+            116,
+        ],
+        [
+            49,
+            114,
+            117,
+        ],
+    ],
+    structure: Fts5StructureRecord {
+        cookie: 0,
+        write_counter: 1,
+        origin_counter: 0,
+        levels: [
+            Fts5StructureLevel {
+                merge_inputs: 0,
+                segments: [
+                    Fts5StructureSegment {
+                        segid: 4,
+                        pgno_first: 1,
+                        pgno_last: 1,
+                        origin_lower: 0,
+                        origin_upper: 0,
+                        tombstone_page_count: 0,
+                        tombstone_entry_count: 0,
+                        entry_count: 0,
+                    },
+                ],
+            },
+        ],
+    },
+    merge_plan: Some(
+        Fts5MergePlan {
+            kind: Auto,
+            level: 0,
+            segment_count: 4,
+            merge_inputs: 2,
+        },
+    ),
+    optimize_plan: Some(
+        Fts5MergePlan {
+            kind: Optimize,
+            level: 0,
+            segment_count: 4,
+            merge_inputs: 4,
+        },
+    ),
 }"#
         );
     }

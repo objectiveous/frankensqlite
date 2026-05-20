@@ -1678,7 +1678,10 @@ fn best_access_path_internal(
     adaptive_preferred_index: Option<&str>,
     rowid_alias_hints: &[RowidAliasHint],
 ) -> AccessPath {
-    let started = std::time::Instant::now();
+    // Only pay the clock read when an INFO subscriber will consume the
+    // `selection_elapsed_us` diagnostic below. The cost-estimation path is
+    // otherwise allocation- and syscall-free on the per-compile hot loop.
+    let started = tracing::enabled!(tracing::Level::INFO).then(std::time::Instant::now);
     let explicit_indexed_by = match index_hint {
         Some(IndexHint::IndexedBy(index_name)) => Some(index_name.as_str()),
         _ => None,
@@ -1982,64 +1985,75 @@ fn best_access_path_internal(
         rowid_alias_hints,
     );
 
-    let chosen_index = best.index.as_deref().unwrap_or("(none)");
-    let selectivity = match &best.kind {
-        AccessPathKind::IndexScanRange { selectivity }
-        | AccessPathKind::CoveringIndexScan { selectivity } => *selectivity,
-        AccessPathKind::IndexScanEquality | AccessPathKind::RowidLookup => {
-            best.estimated_rows / table.n_rows.max(1) as f64
-        }
-        AccessPathKind::FullTableScan => 1.0,
-    };
-    let metric_index_type = access_path_metric_label(&best.kind);
+    // The index-selection metric counter is a real always-on metric: it must
+    // increment for every planning decision regardless of tracing config.
     let metric_total = increment_index_selection_total(&best.kind);
-    let explicit_hint = match index_hint {
-        Some(IndexHint::IndexedBy(index_name)) => format!("indexed_by:{index_name}"),
-        Some(IndexHint::NotIndexed) => "not_indexed".to_owned(),
-        None => "(none)".to_owned(),
-    };
-    let run_id = std::env::var("RUN_ID").unwrap_or_else(|_| "(none)".to_owned());
-    let trace_id = std::env::var("TRACE_ID")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    let scenario_id = std::env::var("SCENARIO_ID").unwrap_or_else(|_| "(none)".to_owned());
-    let selection_elapsed_us = started.elapsed().as_micros().max(1);
-    let adaptive_hint = adaptive_preferred_index.unwrap_or("(none)");
-    let hint_applied = explicit_hint_applied || adaptive_hint_applied;
-    let span = tracing::info_span!(
-        "index_select",
-        run_id = %run_id,
-        trace_id,
-        scenario_id = %scenario_id,
-        table = %table.name,
-        explicit_hint = %explicit_hint,
-        adaptive_hint = %adaptive_hint,
-        candidates = candidates_considered,
-        partial_pruned = partial_indexes_pruned,
-        hint_filtered = hint_filtered_indexes,
-        skip_scan_candidates
-    );
-    let _span_guard = span.enter();
 
-    tracing::info!(
-        table = %table.name,
-        candidates = candidates_considered,
-        chosen_index = %chosen_index,
-        estimated_selectivity = selectivity,
-        access_path = %access_path_kind_label(&best.kind),
-        estimated_cost = best.estimated_cost,
-        estimated_rows = best.estimated_rows,
-        selection_elapsed_us,
-        run_id = %run_id,
-        trace_id,
-        scenario_id = %scenario_id,
-        index_type = metric_index_type,
-        fsqlite_index_selection_total = metric_total,
-        hint_applied,
-        explicit_hint_missing,
-        "planner.index_select.choice"
-    );
+    // The structured `index_select` span/event below is the only consumer of
+    // three `std::env::var` lookups (each a global env lock + heap String), a
+    // `format!`/`to_owned` hint label, and the `Instant` clock read above.
+    // None of that work is observable unless an INFO subscriber is listening,
+    // so gate it behind a cheap level check. When INFO is enabled the emitted
+    // diagnostics are identical to before.
+    if tracing::enabled!(tracing::Level::INFO) {
+        let chosen_index = best.index.as_deref().unwrap_or("(none)");
+        let selectivity = match &best.kind {
+            AccessPathKind::IndexScanRange { selectivity }
+            | AccessPathKind::CoveringIndexScan { selectivity } => *selectivity,
+            AccessPathKind::IndexScanEquality | AccessPathKind::RowidLookup => {
+                best.estimated_rows / table.n_rows.max(1) as f64
+            }
+            AccessPathKind::FullTableScan => 1.0,
+        };
+        let metric_index_type = access_path_metric_label(&best.kind);
+        let explicit_hint = match index_hint {
+            Some(IndexHint::IndexedBy(index_name)) => format!("indexed_by:{index_name}"),
+            Some(IndexHint::NotIndexed) => "not_indexed".to_owned(),
+            None => "(none)".to_owned(),
+        };
+        let run_id = std::env::var("RUN_ID").unwrap_or_else(|_| "(none)".to_owned());
+        let trace_id = std::env::var("TRACE_ID")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let scenario_id = std::env::var("SCENARIO_ID").unwrap_or_else(|_| "(none)".to_owned());
+        let selection_elapsed_us = started.map_or(1, |start| start.elapsed().as_micros().max(1));
+        let adaptive_hint = adaptive_preferred_index.unwrap_or("(none)");
+        let hint_applied = explicit_hint_applied || adaptive_hint_applied;
+        let span = tracing::info_span!(
+            "index_select",
+            run_id = %run_id,
+            trace_id,
+            scenario_id = %scenario_id,
+            table = %table.name,
+            explicit_hint = %explicit_hint,
+            adaptive_hint = %adaptive_hint,
+            candidates = candidates_considered,
+            partial_pruned = partial_indexes_pruned,
+            hint_filtered = hint_filtered_indexes,
+            skip_scan_candidates
+        );
+        let _span_guard = span.enter();
+
+        tracing::info!(
+            table = %table.name,
+            candidates = candidates_considered,
+            chosen_index = %chosen_index,
+            estimated_selectivity = selectivity,
+            access_path = %access_path_kind_label(&best.kind),
+            estimated_cost = best.estimated_cost,
+            estimated_rows = best.estimated_rows,
+            selection_elapsed_us,
+            run_id = %run_id,
+            trace_id,
+            scenario_id = %scenario_id,
+            index_type = metric_index_type,
+            fsqlite_index_selection_total = metric_total,
+            hint_applied,
+            explicit_hint_missing,
+            "planner.index_select.choice"
+        );
+    }
 
     best
 }

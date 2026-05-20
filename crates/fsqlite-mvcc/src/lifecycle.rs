@@ -1154,10 +1154,6 @@ impl TransactionManager {
         txn.clear_structural_pages();
 
         txn.abort();
-        txn.write_set.clear();
-        Arc::make_mut(&mut txn.write_set_data).clear();
-        txn.intent_log.clear();
-        txn.write_keys.clear();
         self.release_all_resources(txn);
 
         tracing::info!(

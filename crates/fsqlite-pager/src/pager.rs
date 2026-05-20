@@ -9183,12 +9183,10 @@ where
             // but before snapshot publish. WAL frames are durable, commit_seq
             // incremented in-memory, but snapshot plane not yet updated.
             #[cfg(any(test, feature = "fault-injection"))]
-            if !metadata_only_single_connection_fast_path {
-                crate::fault_hooks::maybe_inject_during_phase_c(
-                    publish_update.visible_commit_seq.get(),
-                    publish_update.db_size,
-                )?;
-            }
+            crate::fault_hooks::maybe_inject_during_phase_c(
+                publish_update.visible_commit_seq.get(),
+                publish_update.db_size,
+            )?;
 
             // Phase C2 (outside inner.lock): publish to the shared snapshot
             // plane. In isolated single-connection mode, only metadata needs
@@ -10503,6 +10501,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex, OnceLock};
+
+    static FAULT_HOOK_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     const BEAD_ID: &str = "bd-bca.1";
     const DB300_E3_3_A_BEAD_ID: &str = "bd-db300.5.3.3.1";
@@ -15865,6 +15865,7 @@ mod tests {
     #[test]
     fn test_group_commit_fault_hook_after_flush_before_publish_wakes_waiters_with_error_and_records_context()
      {
+        let _guard = FAULT_HOOK_TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for attempt in 0..32 {
             crate::fault_hooks::clear();
 
@@ -15993,6 +15994,7 @@ mod tests {
     /// Replay: `cargo test -p fsqlite-pager --lib -- test_fault_drop_condvar_notify --nocapture`
     #[test]
     fn test_fault_drop_condvar_notify_waiters_recover_via_timeout() {
+        let _guard = FAULT_HOOK_TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for attempt in 0..32 {
             crate::fault_hooks::clear();
 
@@ -16101,6 +16103,7 @@ mod tests {
     /// Replay: `cargo test -p fsqlite-pager --lib -- test_fault_during_phase_c --nocapture`
     #[test]
     fn test_fault_during_phase_c_returns_error_and_wal_frames_survive() {
+        let _guard = FAULT_HOOK_TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::fault_hooks::clear();
 
         let cx = Cx::new();

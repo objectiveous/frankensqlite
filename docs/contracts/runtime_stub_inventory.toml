@@ -67,17 +67,19 @@ anchor = "INSERT OR REPLACE with UNIQUE constraint"
 resolved_date = "2026-03-06"
 resolved_by = "BrightForge"
 
-[[runtime_stubs]]
+[[resolved_runtime_stubs]]
 stub_id = "RSTUB-0019"
 file = "crates/fsqlite-core/src/connection.rs"
-line = 3664
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
+line = 5103
+kind = "resolved"
+kind_description = "prepared statement schema guard validates schema identity and function registry generation before reuse"
+severity = "resolved"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "_ => Err(FrankenError::NotImplemented("
+closure_strategy = "implemented"
+anchor = "ensure_schema_unchanged_with_prebound_publication"
+resolved_date = "2026-05-20"
+resolved_by = "cod_2"
 
 [[resolved_runtime_stubs]]
 stub_id = "RSTUB-0020"

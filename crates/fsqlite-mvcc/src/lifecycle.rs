@@ -6396,6 +6396,56 @@ mod tests {
     }
 
     #[test]
+    fn test_transaction_guard_blocks_recycling_of_retired_versions_until_abort() {
+        let mgr = mgr();
+        let pgno = PageNumber::new(6_006).expect("valid page number");
+
+        let mut pinned = mgr.begin(BeginKind::Deferred).unwrap();
+        assert!(pinned.has_version_guard());
+        assert!(!pinned.snapshot_established);
+        assert_eq!(mgr.version_guard_registry().active_guard_count(), 1);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut seed, pgno, test_data(0x10)).unwrap();
+        mgr.commit(&mut seed).unwrap();
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut writer, pgno, test_data(0x20)).unwrap();
+        mgr.commit(&mut writer).unwrap();
+
+        assert_eq!(
+            mgr.version_store().chain_length(pgno),
+            1,
+            "superseded version should be pruned from the visible chain"
+        );
+        let pending_while_pinned = mgr.version_store().pending_recycle_count();
+        assert!(
+            pending_while_pinned > 0,
+            "active transaction guard should keep retired slots pending"
+        );
+        assert_eq!(
+            mgr.version_store()
+                .try_recycle_retired_slots(mgr.version_store().current_epoch()),
+            0,
+            "retired slots must not recycle while the transaction guard is pinned"
+        );
+        assert_eq!(
+            mgr.version_store().pending_recycle_count(),
+            pending_while_pinned,
+            "failed recycle attempts must leave pinned retirements queued"
+        );
+
+        mgr.abort(&mut pinned);
+
+        assert_eq!(mgr.version_guard_registry().active_guard_count(), 0);
+        assert_eq!(
+            mgr.version_store().pending_recycle_count(),
+            0,
+            "aborting the pinning transaction should release the guard and drain retired slots"
+        );
+    }
+
+    #[test]
     fn test_version_guard_defer_retire_returns_false_without_guard() {
         let txn = Transaction::new(
             TxnId::new(1).expect("TxnId::new(1) should be valid"),

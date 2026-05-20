@@ -2555,6 +2555,63 @@ mod tests {
     }
 
     #[test]
+    fn test_version_chain_snapshot_visibility_under_concurrent_commit() {
+        let m = mgr();
+        let pgno = PageNumber::new(1_217).unwrap();
+
+        let mut seed = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut seed, pgno, test_data(0x10)).unwrap();
+        let seq1 = m.commit(&mut seed).unwrap();
+        assert!(seq1 > CommitSeq::ZERO);
+
+        let mut pinned_reader = m.begin(BeginKind::Concurrent).unwrap();
+        assert_eq!(
+            pinned_reader.snapshot.high, seq1,
+            "reader must pin the latest committed version at begin"
+        );
+        let first_read = m.read_page(&mut pinned_reader, pgno).unwrap();
+        assert_eq!(first_read.as_bytes()[0], 0x10);
+        assert_eq!(pinned_reader.read_version_for_page(pgno), Some(seq1));
+
+        let mut later_writer = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut later_writer, pgno, test_data(0x20))
+            .unwrap();
+        let seq2 = m.commit(&mut later_writer).unwrap();
+        assert!(seq2 > seq1);
+
+        let pinned_again = m.read_page(&mut pinned_reader, pgno).unwrap();
+        assert_eq!(
+            pinned_again.as_bytes()[0],
+            0x10,
+            "reader snapshot must not see a version committed after begin"
+        );
+        assert_eq!(pinned_reader.read_version_for_page(pgno), Some(seq1));
+
+        let pinned_resolved = m
+            .version_store
+            .resolve_visible_version(pgno, &pinned_reader.snapshot)
+            .expect("pinned snapshot resolves the earlier version");
+        assert_eq!(pinned_resolved.commit_seq, seq1);
+        assert_eq!(pinned_resolved.data.as_bytes()[0], 0x10);
+
+        let mut fresh_reader = m.begin(BeginKind::Concurrent).unwrap();
+        assert!(
+            fresh_reader.snapshot.high >= seq2,
+            "fresh reader must start after the later concurrent commit"
+        );
+        let fresh_read = m.read_page(&mut fresh_reader, pgno).unwrap();
+        assert_eq!(
+            fresh_read.as_bytes()[0],
+            0x20,
+            "fresh snapshot must see the latest committed version"
+        );
+        assert_eq!(fresh_reader.read_version_for_page(pgno), Some(seq2));
+
+        m.abort(&mut pinned_reader);
+        m.abort(&mut fresh_reader);
+    }
+
+    #[test]
     fn test_record_range_scan_tracks_all_pages() {
         let m = mgr();
         let p1 = PageNumber::new(12).unwrap();

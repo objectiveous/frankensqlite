@@ -924,6 +924,7 @@ pub enum Fts5QueryTokenKind {
     Or,
     Not,
     Near,
+    Plus,
     LParen,
     RParen,
     ColumnFilter,
@@ -947,6 +948,7 @@ pub enum Fts5QueryError {
     UnaryNotForbidden,
     InvalidColumnFilter(String),
     InvalidNearSyntax,
+    InvalidPhraseSyntax,
     UnsupportedByDetailMode {
         detail: DetailMode,
         feature: &'static str,
@@ -964,6 +966,7 @@ impl std::fmt::Display for Fts5QueryError {
             }
             Self::InvalidColumnFilter(col) => write!(f, "invalid column filter: {col}"),
             Self::InvalidNearSyntax => write!(f, "invalid NEAR syntax"),
+            Self::InvalidPhraseSyntax => write!(f, "invalid phrase syntax"),
             Self::UnsupportedByDetailMode { detail, feature } => {
                 write!(f, "detail={detail} does not support {feature}")
             }
@@ -1007,6 +1010,15 @@ fn tokenize_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>, 
             tokens.push(Fts5QueryToken {
                 kind: Fts5QueryTokenKind::RParen,
                 lexeme: ")".to_owned(),
+            });
+            continue;
+        }
+
+        if ch == '+' {
+            let _ = chars.next();
+            tokens.push(Fts5QueryToken {
+                kind: Fts5QueryTokenKind::Plus,
+                lexeme: "+".to_owned(),
             });
             continue;
         }
@@ -1312,6 +1324,7 @@ pub enum Fts5Expr {
     Term(String),
     Prefix(String),
     Phrase(Vec<String>),
+    PhrasePrefix(Vec<String>, String),
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
     Not(Box<Self>, Box<Self>),
@@ -1387,9 +1400,88 @@ fn near_operand_from_token(token: &Fts5QueryToken) -> Option<Fts5NearOperand> {
     }
 }
 
+fn append_phrase_token(
+    token: &Fts5QueryToken,
+    words: &mut Vec<String>,
+    prefix: &mut Option<String>,
+) -> std::result::Result<(), Fts5QueryError> {
+    if prefix.is_some() {
+        return Err(Fts5QueryError::InvalidPhraseSyntax);
+    }
+
+    match token.kind {
+        Fts5QueryTokenKind::Term if !token.lexeme.trim().is_empty() => {
+            words.push(token.lexeme.trim().to_owned());
+            Ok(())
+        }
+        Fts5QueryTokenKind::Phrase => {
+            let phrase_words = token
+                .lexeme
+                .split_whitespace()
+                .map(str::to_lowercase)
+                .collect::<Vec<_>>();
+            if phrase_words.is_empty() {
+                return Err(Fts5QueryError::InvalidPhraseSyntax);
+            }
+            words.extend(phrase_words);
+            Ok(())
+        }
+        Fts5QueryTokenKind::Prefix if !token.lexeme.trim().is_empty() => {
+            *prefix = Some(token.lexeme.trim().to_owned());
+            Ok(())
+        }
+        _ => Err(Fts5QueryError::InvalidPhraseSyntax),
+    }
+}
+
+fn parse_phrase_expr(
+    tokens: &[Fts5QueryToken],
+) -> std::result::Result<(Fts5Expr, &[Fts5QueryToken]), Fts5QueryError> {
+    let Some(first) = tokens.first() else {
+        return Err(Fts5QueryError::EmptyQuery);
+    };
+
+    let mut words = Vec::new();
+    let mut prefix = None;
+    append_phrase_token(first, &mut words, &mut prefix)?;
+    let mut rest = &tokens[1..];
+    let mut saw_plus = false;
+
+    while rest
+        .first()
+        .is_some_and(|token| token.kind == Fts5QueryTokenKind::Plus)
+    {
+        saw_plus = true;
+        let Some(next) = rest.get(1) else {
+            return Err(Fts5QueryError::InvalidPhraseSyntax);
+        };
+        append_phrase_token(next, &mut words, &mut prefix)?;
+        rest = &rest[2..];
+    }
+
+    if let Some(prefix) = prefix {
+        if saw_plus {
+            return Ok((Fts5Expr::PhrasePrefix(words, prefix), rest));
+        }
+        return Ok((Fts5Expr::Prefix(prefix), rest));
+    }
+
+    if saw_plus || first.kind == Fts5QueryTokenKind::Phrase {
+        return Ok((Fts5Expr::Phrase(words), rest));
+    }
+
+    let Some(term) = words.into_iter().next() else {
+        return Err(Fts5QueryError::InvalidPhraseSyntax);
+    };
+    Ok((Fts5Expr::Term(term), rest))
+}
+
 /// Build an expression tree from parsed FTS5 query tokens.
 pub fn build_expr(tokens: &[Fts5QueryToken]) -> std::result::Result<Fts5Expr, Fts5QueryError> {
-    let (expr, _rest) = parse_or(tokens)?;
+    let (expr, rest) = parse_or(tokens)?;
+    if !rest.is_empty() {
+        return Err(Fts5QueryError::InvalidPhraseSyntax);
+    }
     Ok(expr)
 }
 
@@ -1442,15 +1534,8 @@ fn parse_primary(
     };
 
     match token.kind {
-        Fts5QueryTokenKind::Term => Ok((Fts5Expr::Term(token.lexeme.clone()), &tokens[1..])),
-        Fts5QueryTokenKind::Prefix => Ok((Fts5Expr::Prefix(token.lexeme.clone()), &tokens[1..])),
-        Fts5QueryTokenKind::Phrase => {
-            let words: Vec<String> = token
-                .lexeme
-                .split_whitespace()
-                .map(str::to_lowercase)
-                .collect();
-            Ok((Fts5Expr::Phrase(words), &tokens[1..]))
+        Fts5QueryTokenKind::Term | Fts5QueryTokenKind::Prefix | Fts5QueryTokenKind::Phrase => {
+            parse_phrase_expr(tokens)
         }
         Fts5QueryTokenKind::LParen => {
             let (expr, rest) = parse_or(&tokens[1..])?;
@@ -2040,6 +2125,15 @@ fn normalize_query_expr_with_tokenizer(expr: Fts5Expr, tokenizer: &dyn Fts5Token
         Fts5Expr::Phrase(words) => {
             Fts5Expr::Phrase(normalize_query_phrase_terms(&words, tokenizer))
         }
+        Fts5Expr::PhrasePrefix(words, prefix) => {
+            let normalized_words = normalize_query_phrase_terms(&words, tokenizer);
+            let terms = tokenize_query_leaf(tokenizer, &prefix);
+            let normalized_prefix = terms
+                .first()
+                .cloned()
+                .unwrap_or_else(|| prefix.to_lowercase());
+            Fts5Expr::PhrasePrefix(normalized_words, normalized_prefix)
+        }
         Fts5Expr::And(left, right) => Fts5Expr::And(
             Box::new(normalize_query_expr_with_tokenizer(*left, tokenizer)),
             Box::new(normalize_query_expr_with_tokenizer(*right, tokenizer)),
@@ -2195,6 +2289,9 @@ fn evaluate_expr_impl(
             difference_sorted(&left_docs, &right_docs)
         }
         Fts5Expr::Near(terms, distance) => evaluate_near(index, terms, *distance, allowed_columns),
+        Fts5Expr::PhrasePrefix(words, prefix) => {
+            evaluate_phrase_prefix(index, words, prefix, allowed_columns)
+        }
         Fts5Expr::ColumnFilter(column_filter, inner) => {
             let Some(filter_spec) = parse_column_filter_spec(column_filter) else {
                 return Vec::new();
@@ -2275,6 +2372,17 @@ fn evaluate_expr_impl(
                     }
                     result.sort_unstable();
                     result
+                }
+                Fts5Expr::PhrasePrefix(words, prefix) => {
+                    let mut docs: Vec<i64> =
+                        phrase_prefix_spans(index, words, prefix, allowed_columns)
+                            .into_iter()
+                            .filter(|span| span.start == 0)
+                            .map(|span| span.docid)
+                            .collect();
+                    docs.sort_unstable();
+                    docs.dedup();
+                    docs
                 }
                 _ => evaluate_expr_impl(index, inner, columns, allowed_columns),
             }
@@ -2366,9 +2474,11 @@ fn validate_column_filters(
             validate_column_filters(inner, columns)
         }
         Fts5Expr::InitialToken(inner) => validate_column_filters(inner, columns),
-        Fts5Expr::Term(_) | Fts5Expr::Prefix(_) | Fts5Expr::Phrase(_) | Fts5Expr::Near(_, _) => {
-            Ok(())
-        }
+        Fts5Expr::Term(_)
+        | Fts5Expr::Prefix(_)
+        | Fts5Expr::Phrase(_)
+        | Fts5Expr::PhrasePrefix(_, _)
+        | Fts5Expr::Near(_, _) => Ok(()),
     }
 }
 
@@ -2381,7 +2491,7 @@ fn validate_detail_mode(
             validate_detail_mode(left, detail)?;
             validate_detail_mode(right, detail)
         }
-        Fts5Expr::Phrase(_) => {
+        Fts5Expr::Phrase(_) | Fts5Expr::PhrasePrefix(_, _) => {
             if detail == DetailMode::Full {
                 Ok(())
             } else {
@@ -2477,6 +2587,78 @@ struct Fts5NearSpan {
     column: u32,
     start: u32,
     end: u32,
+}
+
+fn phrase_prefix_spans(
+    index: &InvertedIndex,
+    words: &[String],
+    prefix: &str,
+    allowed_columns: Option<&[u32]>,
+) -> Vec<Fts5NearSpan> {
+    if words.is_empty() {
+        return near_operand_spans(
+            index,
+            &Fts5NearOperand::Prefix(prefix.to_owned()),
+            allowed_columns,
+        );
+    }
+
+    let mut spans = Vec::new();
+    for first_p in index.get_postings(&words[0]) {
+        if !posting_matches_allowed_columns(first_p.column, allowed_columns) {
+            continue;
+        }
+
+        'positions: for &start_pos in &first_p.positions {
+            for (offset, word) in words.iter().enumerate().skip(1) {
+                #[allow(clippy::cast_possible_truncation)]
+                let target_pos = start_pos + offset as u32;
+                let found = index.get_postings(word).iter().any(|posting| {
+                    posting.docid == first_p.docid
+                        && posting.column == first_p.column
+                        && posting.positions.contains(&target_pos)
+                });
+                if !found {
+                    continue 'positions;
+                }
+            }
+
+            #[allow(clippy::cast_possible_truncation)]
+            let prefix_pos = start_pos + words.len() as u32;
+            let prefix_found = index
+                .get_prefix_postings(prefix)
+                .into_iter()
+                .any(|posting| {
+                    posting.docid == first_p.docid
+                        && posting.column == first_p.column
+                        && posting.positions.contains(&prefix_pos)
+                });
+            if prefix_found {
+                spans.push(Fts5NearSpan {
+                    docid: first_p.docid,
+                    column: first_p.column,
+                    start: start_pos,
+                    end: prefix_pos,
+                });
+            }
+        }
+    }
+    spans
+}
+
+fn evaluate_phrase_prefix(
+    index: &InvertedIndex,
+    words: &[String],
+    prefix: &str,
+    allowed_columns: Option<&[u32]>,
+) -> Vec<i64> {
+    let mut result: Vec<i64> = phrase_prefix_spans(index, words, prefix, allowed_columns)
+        .into_iter()
+        .map(|span| span.docid)
+        .collect();
+    result.sort_unstable();
+    result.dedup();
+    result
 }
 
 fn near_operand_spans(
@@ -3082,6 +3264,11 @@ fn extract_query_terms(expr: &Fts5Expr) -> Vec<String> {
         Fts5Expr::Term(t) => vec![t.clone()],
         Fts5Expr::Prefix(p) => vec![p.clone()],
         Fts5Expr::Phrase(words) => words.clone(),
+        Fts5Expr::PhrasePrefix(words, prefix) => {
+            let mut terms = words.clone();
+            terms.push(prefix.clone());
+            terms
+        }
         Fts5Expr::And(l, r) | Fts5Expr::Or(l, r) | Fts5Expr::Not(l, r) => {
             let mut terms = extract_query_terms(l);
             terms.extend(extract_query_terms(r));
@@ -3903,6 +4090,17 @@ mod tests {
 
     #[allow(dead_code)]
     #[derive(Debug)]
+    struct Fts5PhraseConcatStructure {
+        tokens: Vec<(Fts5QueryTokenKind, String)>,
+        exact_expr: Fts5Expr,
+        prefix_expr: Fts5Expr,
+        exact_matches: Vec<i64>,
+        prefix_matches: Vec<i64>,
+        malformed_error: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
     struct Fts5InsttokenStructure {
         config: Fts5Config,
         columns: Vec<String>,
@@ -4475,6 +4673,21 @@ mod tests {
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].kind, Fts5QueryTokenKind::Prefix);
         assert_eq!(tokens[0].lexeme, "hel");
+    }
+
+    #[test]
+    fn test_fts5_query_phrase_concatenation_tokens() -> std::result::Result<(), String> {
+        let tokens = parse_fts5_query(r#""one two" + three"#).map_err(|err| err.to_string())?;
+        let kinds: Vec<Fts5QueryTokenKind> = tokens.iter().map(|token| token.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                Fts5QueryTokenKind::Phrase,
+                Fts5QueryTokenKind::Plus,
+                Fts5QueryTokenKind::Term,
+            ]
+        );
+        Ok(())
     }
 
     #[test]
@@ -5072,6 +5285,137 @@ mod tests {
         assert_eq!(
             error,
             Fts5QueryError::InvalidColumnFilter("summary".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_table_search_phrase_concatenation() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["one two three".to_owned()]);
+        table.insert_document(2, &["one gap two three".to_owned()]);
+
+        let matches = table
+            .search(r#""one two" + three"#)
+            .map_err(|err| err.to_string())?;
+        assert_eq!(
+            matches
+                .into_iter()
+                .map(|(rowid, _score)| rowid)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_table_search_phrase_concatenation_final_prefix() -> std::result::Result<(), String>
+    {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["one two three".to_owned()]);
+        table.insert_document(2, &["one two throne".to_owned()]);
+        table.insert_document(3, &["one two four".to_owned()]);
+
+        let mut matches = table
+            .search("one + two + thr*")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        assert_eq!(matches, vec![1, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_phrase_concatenation() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["one two three".to_owned()]);
+        table.insert_document(2, &["one gap two three".to_owned()]);
+        table.insert_document(3, &["one two throne".to_owned()]);
+
+        let exact_query = r#""one two" + three"#;
+        let prefix_query = "one + two + thr*";
+        let tokens = parse_fts5_query(exact_query)
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|token| (token.kind, token.lexeme))
+            .collect();
+        let exact_expr = build_expr(&parse_fts5_query(exact_query).map_err(|err| err.to_string())?)
+            .map_err(|err| err.to_string())?;
+        let prefix_expr =
+            build_expr(&parse_fts5_query(prefix_query).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())?;
+        let exact_matches = table
+            .search(exact_query)
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let mut prefix_matches = table
+            .search(prefix_query)
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect::<Vec<_>>();
+        prefix_matches.sort_unstable();
+        let Err(malformed_error) =
+            build_expr(&parse_fts5_query("one +").map_err(|err| err.to_string())?)
+        else {
+            return Err("dangling phrase concatenation should fail".to_owned());
+        };
+        let malformed_error = malformed_error.to_string();
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5PhraseConcatStructure {
+                    tokens,
+                    exact_expr,
+                    prefix_expr,
+                    exact_matches,
+                    prefix_matches,
+                    malformed_error,
+                }
+            ),
+            r#"Fts5PhraseConcatStructure {
+    tokens: [
+        (
+            Phrase,
+            "one two",
+        ),
+        (
+            Plus,
+            "+",
+        ),
+        (
+            Term,
+            "three",
+        ),
+    ],
+    exact_expr: Phrase(
+        [
+            "one",
+            "two",
+            "three",
+        ],
+    ),
+    prefix_expr: PhrasePrefix(
+        [
+            "one",
+            "two",
+        ],
+        "thr",
+    ),
+    exact_matches: [
+        1,
+    ],
+    prefix_matches: [
+        1,
+        3,
+    ],
+    malformed_error: "invalid phrase syntax",
+}"#
         );
         Ok(())
     }
@@ -6937,6 +7281,10 @@ mod tests {
             "invalid NEAR syntax"
         );
         assert_eq!(
+            format!("{}", Fts5QueryError::InvalidPhraseSyntax),
+            "invalid phrase syntax"
+        );
+        assert_eq!(
             format!(
                 "{}",
                 Fts5QueryError::UnsupportedByDetailMode {
@@ -7241,6 +7589,36 @@ mod tests {
         let tokens = parse_fts5_query("a OR b c").unwrap();
         let expr = build_expr(&tokens).unwrap();
         assert!(matches!(expr, Fts5Expr::Or(_, _)));
+    }
+
+    #[test]
+    fn test_build_expr_phrase_concatenation() -> std::result::Result<(), String> {
+        let tokens = parse_fts5_query(r#""one two" + three"#).map_err(|err| err.to_string())?;
+        let expr = build_expr(&tokens).map_err(|err| err.to_string())?;
+        match expr {
+            Fts5Expr::Phrase(words) => {
+                assert_eq!(
+                    words,
+                    vec!["one".to_owned(), "two".to_owned(), "three".to_owned()]
+                );
+            }
+            other => return Err(format!("expected phrase expression, got {other:?}")),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_expr_phrase_concatenation_final_prefix() -> std::result::Result<(), String> {
+        let tokens = parse_fts5_query("one + two + thr*").map_err(|err| err.to_string())?;
+        let expr = build_expr(&tokens).map_err(|err| err.to_string())?;
+        match expr {
+            Fts5Expr::PhrasePrefix(words, prefix) => {
+                assert_eq!(words, vec!["one".to_owned(), "two".to_owned()]);
+                assert_eq!(prefix, "thr");
+            }
+            other => return Err(format!("expected phrase-prefix expression, got {other:?}")),
+        }
+        Ok(())
     }
 
     #[test]

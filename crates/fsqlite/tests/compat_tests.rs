@@ -856,6 +856,51 @@ mod rusqlite_parity {
         }
     }
 
+    fn rusqlite_query_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let column_count = stmt.column_count();
+        stmt.query_map([], |row| {
+            let mut values = Vec::with_capacity(column_count);
+            for idx in 0..column_count {
+                let value = match row.get_ref(idx).unwrap() {
+                    rusqlite::types::ValueRef::Null => "NULL".to_string(),
+                    rusqlite::types::ValueRef::Integer(i) => i.to_string(),
+                    rusqlite::types::ValueRef::Real(f) => format!("{f}"),
+                    rusqlite::types::ValueRef::Text(bytes) => {
+                        String::from_utf8_lossy(bytes).into_owned()
+                    }
+                    rusqlite::types::ValueRef::Blob(bytes) => format!("{bytes:?}"),
+                };
+                values.push(value);
+            }
+            Ok(values)
+        })
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
+    }
+
+    fn franken_query_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
+        conn.query(sql)
+            .unwrap()
+            .iter()
+            .map(|row| row.values().iter().map(sqlite_val_to_string).collect())
+            .collect()
+    }
+
+    fn assert_query_parity(
+        label: &str,
+        rconn: &rusqlite::Connection,
+        fconn: &Connection,
+        sql: &str,
+    ) {
+        assert_parity(
+            label,
+            rusqlite_query_rows(rconn, sql),
+            franken_query_rows(fconn, sql),
+        );
+    }
+
     fn setup_rusqlite() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -1153,6 +1198,49 @@ mod rusqlite_parity {
             .collect();
 
         assert_parity("COALESCE", r, f);
+    }
+
+    #[test]
+    fn parity_compound_select_set_operators() {
+        let rconn = setup_rusqlite();
+        let fconn = setup_franken();
+
+        assert_query_parity(
+            "COMPOUND_UNION_DISTINCT",
+            &rconn,
+            &fconn,
+            "SELECT agent FROM msgs WHERE role = 'user'
+             UNION
+             SELECT agent FROM msgs WHERE content IS NULL
+             ORDER BY agent",
+        );
+        assert_query_parity(
+            "COMPOUND_UNION_ALL_MULTIPLICITY",
+            &rconn,
+            &fconn,
+            "SELECT agent FROM msgs WHERE role = 'user'
+             UNION ALL
+             SELECT agent FROM msgs WHERE agent = 'codex'
+             ORDER BY agent",
+        );
+        assert_query_parity(
+            "COMPOUND_INTERSECT",
+            &rconn,
+            &fconn,
+            "SELECT agent FROM msgs WHERE role = 'user'
+             INTERSECT
+             SELECT agent FROM msgs WHERE content IS NOT NULL
+             ORDER BY agent",
+        );
+        assert_query_parity(
+            "COMPOUND_EXCEPT",
+            &rconn,
+            &fconn,
+            "SELECT agent FROM msgs
+             EXCEPT
+             SELECT agent FROM msgs WHERE content IS NULL
+             ORDER BY agent",
+        );
     }
 
     #[test]

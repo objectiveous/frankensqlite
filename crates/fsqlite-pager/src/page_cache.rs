@@ -7348,6 +7348,120 @@ mod tests {
     }
 
     #[test]
+    fn test_track_q_flat_hash_fast_path_transitions_cold_reset_hidden_tiers() {
+        let mut cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 16, 1);
+        let sharded_page = PageNumber::new(201).expect("sharded transition page");
+        let fast_page = PageNumber::new(202).expect("fast transition page");
+        let replacement_page = PageNumber::new(203).expect("replacement transition page");
+
+        assert!(
+            !cache.is_fast_path_enabled(),
+            "Track Q transition test should start on the sharded flat-cache path"
+        );
+        cache.insert_buffer(sharded_page, track_q_page_buf(sharded_page));
+        let sharded_copy = cache
+            .get_copy(sharded_page)
+            .expect("sharded page should be visible before enabling fast path");
+        assert_track_q_page(sharded_page, &sharded_copy);
+        assert!(
+            cache.flat_slots.contains(sharded_page),
+            "default sharded mode should admit the setup page into flat slots"
+        );
+
+        let started = monotonic_test_clock();
+        cache.enable_fast_path();
+        assert!(
+            cache.is_fast_path_enabled(),
+            "fast path should be enabled after transition"
+        );
+        assert!(
+            cache.get_copy(sharded_page).is_none(),
+            "enabling fast path should cold-reset hidden sharded pages"
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "fast-path enable should leave a cold resident set"
+        );
+
+        cache.insert_buffer(fast_page, track_q_page_buf(fast_page));
+        let fast_copy = cache
+            .get_copy(fast_page)
+            .expect("fast-path page should be visible while fast path is enabled");
+        assert_track_q_page(fast_page, &fast_copy);
+        assert_eq!(
+            cache
+                .fast_array
+                .as_ref()
+                .expect("fast array should exist after enabling fast path")
+                .lock()
+                .len(),
+            1,
+            "fast path should hold exactly the fast setup page"
+        );
+
+        cache.disable_fast_path();
+        assert!(
+            !cache.is_fast_path_enabled(),
+            "fast path should be disabled after transition"
+        );
+        assert!(
+            cache.get_copy(fast_page).is_none(),
+            "disabling fast path should cold-reset hidden fast-array pages"
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "fast-path disable should return to a cold sharded resident set"
+        );
+
+        cache.insert_buffer(replacement_page, track_q_page_buf(replacement_page));
+        let replacement_copy = cache
+            .get_copy(replacement_page)
+            .expect("replacement sharded page should be visible after fast disable");
+        assert_track_q_page(replacement_page, &replacement_copy);
+        assert!(
+            cache.flat_slots.contains(replacement_page),
+            "replacement page should return to the flat-slot tier"
+        );
+
+        cache.enable_fast_path();
+        assert!(
+            cache.get_copy(replacement_page).is_none(),
+            "re-enabling fast path should not resurrect replacement sharded pages"
+        );
+        cache.disable_fast_path();
+        assert!(
+            cache.get_copy(replacement_page).is_none(),
+            "disabling again should keep the re-enabled fast path cold reset"
+        );
+        let elapsed = started.elapsed();
+
+        let metrics = cache.metrics_snapshot();
+        assert_eq!(
+            metrics.cached_pages, 0,
+            "final transition state should have no hidden resident pages"
+        );
+
+        emit_track_q_log(
+            "test_track_q_flat_hash_fast_path_transitions_cold_reset_hidden_tiers",
+            "verify",
+            elapsed,
+            3,
+            metrics.hits,
+            0,
+            metrics.evictions,
+            track_q_hit_rate(metrics.hits, metrics.misses),
+            json!({
+                "transitions": 4,
+                "final_fast_path_enabled": cache.is_fast_path_enabled(),
+                "final_resident_pages": metrics.cached_pages,
+                "evictions": metrics.evictions
+            }),
+        );
+    }
+
+    #[test]
     fn test_track_q_flat_hash_remove_and_reclaim_tombstone_slots() {
         let slots = FlatPageSlots::new(64);
         let target_bucket = slots.hash_pgno(PageNumber::ONE.get());

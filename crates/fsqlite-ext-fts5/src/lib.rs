@@ -2738,12 +2738,54 @@ fn phrase_near_spans(
     spans
 }
 
-fn near_span_distance(left: Fts5NearSpan, right: Fts5NearSpan) -> u32 {
-    if left.end < right.start {
-        right.start - left.end
-    } else {
-        left.start.saturating_sub(right.end)
+fn near_clump_distance(spans: &[Fts5NearSpan]) -> u32 {
+    let (Some(min_end), Some(max_start)) = (
+        spans.iter().map(|span| span.end).min(),
+        spans.iter().map(|span| span.start).max(),
+    ) else {
+        return 0;
+    };
+    max_start.saturating_sub(min_end).saturating_sub(1)
+}
+
+fn find_near_clump(
+    operand_spans: &[Vec<Fts5NearSpan>],
+    operand_order: &[usize],
+    next_order_index: usize,
+    selected: &mut SmallVec<[Fts5NearSpan; 8]>,
+    distance: u32,
+) -> bool {
+    if next_order_index == operand_order.len() {
+        return near_clump_distance(selected) <= distance;
     }
+
+    let Some(anchor_span) = selected.first() else {
+        return false;
+    };
+    let docid = anchor_span.docid;
+    let column = anchor_span.column;
+    let next_operand = operand_order[next_order_index];
+
+    for span in operand_spans[next_operand]
+        .iter()
+        .filter(|span| span.docid == docid && span.column == column)
+    {
+        selected.push(*span);
+        let matches = near_clump_distance(selected) <= distance
+            && find_near_clump(
+                operand_spans,
+                operand_order,
+                next_order_index + 1,
+                selected,
+                distance,
+            );
+        selected.pop();
+        if matches {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn evaluate_near(
@@ -2760,31 +2802,22 @@ fn evaluate_near(
         .iter()
         .map(|operand| near_operand_spans(index, operand, allowed_columns))
         .collect();
-    let Some(first_spans) = operand_spans.first() else {
-        return Vec::new();
-    };
-    if first_spans.is_empty() || operand_spans.iter().any(Vec::is_empty) {
+    if operand_spans.iter().any(Vec::is_empty) {
         return Vec::new();
     }
 
+    let mut operand_order: Vec<usize> = (0..operand_spans.len()).collect();
+    operand_order.sort_by_key(|&operand_index| operand_spans[operand_index].len());
+    let anchor_operand = operand_order[0];
     let mut result = Vec::new();
 
-    for first_span in first_spans {
-        let mut all_near = true;
-        for spans in &operand_spans[1..] {
-            let found = spans.iter().any(|span| {
-                span.docid == first_span.docid
-                    && span.column == first_span.column
-                    && near_span_distance(*first_span, *span) <= distance
-            });
-            if !found {
-                all_near = false;
-                break;
-            }
-        }
-
-        if all_near && !result.contains(&first_span.docid) {
-            result.push(first_span.docid);
+    for anchor_span in &operand_spans[anchor_operand] {
+        let mut selected = SmallVec::new();
+        selected.push(*anchor_span);
+        if find_near_clump(&operand_spans, &operand_order, 1, &mut selected, distance)
+            && !result.contains(&anchor_span.docid)
+        {
+            result.push(anchor_span.docid);
         }
     }
 
@@ -4090,6 +4123,18 @@ mod tests {
 
     #[allow(dead_code)]
     #[derive(Debug)]
+    struct Fts5NearDistanceStructure {
+        adjacent_terms: Vec<i64>,
+        one_gap_terms: Vec<i64>,
+        adjacent_phrases: Vec<i64>,
+        one_gap_phrases: Vec<i64>,
+        reordered_doc_example: Vec<i64>,
+        multi_phrase_doc_example: Vec<i64>,
+        too_tight_doc_example: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
     struct Fts5PhraseConcatStructure {
         tokens: Vec<(Fts5QueryTokenKind, String)>,
         exact_expr: Fts5Expr,
@@ -4212,6 +4257,15 @@ mod tests {
 
     fn near_prefix(prefix: &str) -> Fts5NearOperand {
         Fts5NearOperand::Prefix(prefix.to_owned())
+    }
+
+    fn search_rowids(table: &Fts5Table, query: &str) -> std::result::Result<Vec<i64>, String> {
+        Ok(table
+            .search(query)
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect())
     }
 
     fn table_structure(table: &Fts5Table) -> Fts5TableStructure {
@@ -7065,14 +7119,40 @@ mod tests {
         index.add_document(1, 0, &tok.tokenize("hello world foo bar"));
         // "hello" at pos 0, "world" at pos 4 -> within distance 5
         index.add_document(2, 0, &tok.tokenize("hello a b c world"));
-        // "hello" at pos 0, "world" at pos 6 -> NOT within distance 5
-        index.add_document(3, 0, &tok.tokenize("hello a b c d e world"));
+        // "hello" at pos 0, "world" at pos 7 -> NOT within distance 5
+        index.add_document(3, 0, &tok.tokenize("hello a b c d e f world"));
 
         let expr = Fts5Expr::Near(vec![near_term("hello"), near_term("world")], 5);
         let docs = evaluate_expr(&index, &expr);
         assert!(docs.contains(&1));
         assert!(docs.contains(&2));
         assert!(!docs.contains(&3));
+    }
+
+    #[test]
+    fn test_fts5_near_distance_counts_intervening_terms() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["hello world".to_owned()]);
+        table.insert_document(2, &["hello gap world".to_owned()]);
+        table.insert_document(3, &["hello gap gap world".to_owned()]);
+
+        assert_eq!(search_rowids(&table, "NEAR(hello world, 0)")?, vec![1]);
+        assert_eq!(search_rowids(&table, "NEAR(hello world, 1)")?, vec![1, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_near_distance_counts_phrase_boundaries() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["alpha beta gamma delta".to_owned()]);
+        table.insert_document(2, &["alpha beta gap gamma delta".to_owned()]);
+        table.insert_document(3, &["alpha beta gap gap gamma delta".to_owned()]);
+
+        let adjacent = r#"NEAR("alpha beta" "gamma delta", 0)"#;
+        let one_gap = r#"NEAR("alpha beta" "gamma delta", 1)"#;
+        assert_eq!(search_rowids(&table, adjacent)?, vec![1]);
+        assert_eq!(search_rowids(&table, one_gap)?, vec![1, 2]);
+        Ok(())
     }
 
     #[test]
@@ -7089,7 +7169,7 @@ mod tests {
                 .into_iter()
                 .map(|(rowid, _score)| rowid)
                 .collect::<Vec<_>>(),
-            vec![1]
+            vec![1, 2]
         );
         Ok(())
     }
@@ -7108,7 +7188,7 @@ mod tests {
                 .into_iter()
                 .map(|(rowid, _score)| rowid)
                 .collect::<Vec<_>>(),
-            vec![1]
+            vec![1, 2]
         );
         Ok(())
     }
@@ -7172,6 +7252,7 @@ mod tests {
     distance: 2,
     phrase_matches: [
         1,
+        2,
     ],
     prefix_matches: [
         3,
@@ -7183,6 +7264,68 @@ mod tests {
         "language",
     ],
 }"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_near_distance_clumps() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["hello world".to_owned()]);
+        table.insert_document(2, &["hello gap world".to_owned()]);
+        table.insert_document(3, &["hello gap gap world".to_owned()]);
+        table.insert_document(4, &["alpha beta gamma delta".to_owned()]);
+        table.insert_document(5, &["alpha beta gap gamma delta".to_owned()]);
+        table.insert_document(6, &["a b c d x x x e f x".to_owned()]);
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5NearDistanceStructure {
+                    adjacent_terms: search_rowids(&table, "NEAR(hello world, 0)")?,
+                    one_gap_terms: search_rowids(&table, "NEAR(hello world, 1)")?,
+                    adjacent_phrases: search_rowids(
+                        &table,
+                        r#"NEAR("alpha beta" "gamma delta", 0)"#,
+                    )?,
+                    one_gap_phrases: search_rowids(
+                        &table,
+                        r#"NEAR("alpha beta" "gamma delta", 1)"#,
+                    )?,
+                    reordered_doc_example: search_rowids(&table, "NEAR(e d, 3)")?,
+                    multi_phrase_doc_example: search_rowids(
+                        &table,
+                        r#"NEAR("a b c d" "b c" "e f", 4)"#,
+                    )?,
+                    too_tight_doc_example: search_rowids(
+                        &table,
+                        r#"NEAR("a b c d" "b c" "e f", 3)"#,
+                    )?,
+                }
+            ),
+            r"Fts5NearDistanceStructure {
+    adjacent_terms: [
+        1,
+    ],
+    one_gap_terms: [
+        1,
+        2,
+    ],
+    adjacent_phrases: [
+        4,
+    ],
+    one_gap_phrases: [
+        4,
+        5,
+    ],
+    reordered_doc_example: [
+        6,
+    ],
+    multi_phrase_doc_example: [
+        6,
+    ],
+    too_tight_doc_example: [],
+}"
         );
         Ok(())
     }

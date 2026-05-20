@@ -252,6 +252,45 @@ const CTE_CASES: &[QueryCase] = &[
     },
 ];
 
+const WINDOW_SETUP: &str = "
+    CREATE TABLE compensation (
+        id INTEGER PRIMARY KEY,
+        dept TEXT NOT NULL,
+        employee TEXT NOT NULL,
+        salary INTEGER NOT NULL
+    );
+    INSERT INTO compensation VALUES
+        (1, 'eng', 'Ada', 120),
+        (2, 'eng', 'Bert', 95),
+        (3, 'eng', 'Cara', 120),
+        (4, 'ops', 'Drew', 85),
+        (5, 'ops', 'Eli', 90),
+        (6, 'ops', 'Fay', 85);
+";
+
+const WINDOW_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "row number partition",
+        sql: "SELECT dept, employee, salary, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC, employee) FROM compensation ORDER BY dept, salary DESC, employee",
+    },
+    QueryCase {
+        name: "rank and dense rank ties",
+        sql: "SELECT employee, salary, RANK() OVER (ORDER BY salary DESC), DENSE_RANK() OVER (ORDER BY salary DESC) FROM compensation ORDER BY salary DESC, employee",
+    },
+    QueryCase {
+        name: "running partition aggregate",
+        sql: "SELECT dept, employee, salary, SUM(salary) OVER (PARTITION BY dept ORDER BY employee ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM compensation ORDER BY dept, employee",
+    },
+    QueryCase {
+        name: "sliding frame aggregate",
+        sql: "SELECT id, salary, SUM(salary) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM compensation ORDER BY id",
+    },
+    QueryCase {
+        name: "lag lead defaults",
+        sql: "SELECT id, salary, LAG(salary, 1, -1) OVER (ORDER BY id), LEAD(salary, 1, -1) OVER (ORDER BY id) FROM compensation ORDER BY id",
+    },
+];
+
 #[test]
 fn select_join_group_by_aggregates_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
@@ -272,4 +311,10 @@ fn upsert_conflict_handling_matches_rusqlite() {
 fn cte_queries_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CTE_SETUP);
     harness.assert_queries_match("CTE", CTE_CASES);
+}
+
+#[test]
+fn window_functions_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(WINDOW_SETUP);
+    harness.assert_queries_match("window", WINDOW_CASES);
 }

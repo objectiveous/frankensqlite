@@ -17,6 +17,7 @@ use crate::cell::{
     read_cell_pointers, write_cell_pointers,
 };
 use crate::cursor::PageWriter;
+use crate::instrumentation;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::limits::{BTREE_LEAF_HEADER_SIZE, CELL_POINTER_SIZE};
@@ -122,13 +123,50 @@ impl LeafTableSplitHeat {
 struct LeafTableSplitPolicy {
     heat: LeafTableSplitHeat,
     target_left_basis_points: usize,
+    topology_advice: instrumentation::ConflictTopologySplitAdvice,
 }
 
-fn leaf_table_split_policy(cell_count: usize, overflow_insert_idx: usize) -> LeafTableSplitPolicy {
+fn no_page_topology_advice(
+    baseline_target_left_basis_points: usize,
+) -> instrumentation::ConflictTopologySplitAdvice {
+    let policy_mode = instrumentation::conflict_topology_policy_mode();
+    instrumentation::ConflictTopologySplitAdvice {
+        policy_id: "btree.conflict_topology_split.v1",
+        policy_mode,
+        baseline_target_left_basis_points,
+        advised_target_left_basis_points: baseline_target_left_basis_points,
+        effective_target_left_basis_points: baseline_target_left_basis_points,
+        conflict_heat: 0,
+        writer_overlap_estimate: 0,
+        topology_hot: false,
+        applied: false,
+        predicted_overlap_delta: 0,
+        operator_override_active: policy_mode
+            == instrumentation::ConflictTopologyPolicyMode::Baseline,
+    }
+}
+
+fn leaf_table_split_policy_for_page(
+    page_no: Option<PageNumber>,
+    cell_count: usize,
+    overflow_insert_idx: usize,
+) -> LeafTableSplitPolicy {
     if cell_count < 2 {
+        let baseline_target = LeafTableSplitHeat::Interior.target_left_basis_points();
+        let topology_advice = page_no.map_or_else(
+            || no_page_topology_advice(baseline_target),
+            |page| {
+                instrumentation::conflict_topology_split_advice(
+                    page,
+                    LeafTableSplitHeat::Interior.as_str(),
+                    baseline_target,
+                )
+            },
+        );
         return LeafTableSplitPolicy {
             heat: LeafTableSplitHeat::Interior,
-            target_left_basis_points: LeafTableSplitHeat::Interior.target_left_basis_points(),
+            target_left_basis_points: topology_advice.effective_target_left_basis_points,
+            topology_advice,
         };
     }
 
@@ -141,10 +179,18 @@ fn leaf_table_split_policy(cell_count: usize, overflow_insert_idx: usize) -> Lea
     } else {
         LeafTableSplitHeat::Interior
     };
+    let baseline_target = heat.target_left_basis_points();
+    let topology_advice = page_no.map_or_else(
+        || no_page_topology_advice(baseline_target),
+        |page| {
+            instrumentation::conflict_topology_split_advice(page, heat.as_str(), baseline_target)
+        },
+    );
 
     LeafTableSplitPolicy {
         heat,
-        target_left_basis_points: heat.target_left_basis_points(),
+        target_left_basis_points: topology_advice.effective_target_left_basis_points,
+        topology_advice,
     }
 }
 
@@ -1137,7 +1183,8 @@ fn prepare_leaf_table_local_split<W: PageWriter>(
         });
     }
 
-    let split_policy = leaf_table_split_policy(all_cells.len(), insert_idx);
+    let split_policy =
+        leaf_table_split_policy_for_page(Some(leaf_page_no), all_cells.len(), insert_idx);
     let Some(split_idx) =
         choose_leaf_table_split_index(&all_cells, leaf_offset, 0, usable_size, split_policy)
     else {
@@ -1150,6 +1197,20 @@ fn prepare_leaf_table_local_split<W: PageWriter>(
         overflow_insert_idx = insert_idx,
         total_cells = all_cells.len(),
         predicted_hot_side = split_policy.heat.as_str(),
+        policy_id = split_policy.topology_advice.policy_id,
+        policy_mode = split_policy.topology_advice.policy_mode.as_str(),
+        placement_policy = split_policy.topology_advice.placement_policy(),
+        split_reason = split_policy.topology_advice.split_reason(),
+        fill_factor = split_policy.target_left_basis_points as u32,
+        page_role = "table_leaf",
+        predicted_overlap_delta = split_policy.topology_advice.predicted_overlap_delta,
+        observed_overlap_delta = 0_i64,
+        abort_rate = 0_u64,
+        latency_p95_ns = 0_u64,
+        operator_override_active = split_policy.topology_advice.operator_override_active,
+        conflict_heat = split_policy.topology_advice.conflict_heat,
+        writer_overlap_estimate = split_policy.topology_advice.writer_overlap_estimate,
+        first_failure_diag = "none",
         target_left_basis_points = split_policy.target_left_basis_points as u32,
         split_idx,
         "contention-aware leaf table split policy"
@@ -3061,9 +3122,9 @@ mod tests {
 
     #[test]
     fn test_leaf_table_split_policy_tracks_insert_heat() {
-        let left = leaf_table_split_policy(12, 0);
-        let interior = leaf_table_split_policy(12, 5);
-        let right = leaf_table_split_policy(12, 11);
+        let left = leaf_table_split_policy_for_page(None, 12, 0);
+        let interior = leaf_table_split_policy_for_page(None, 12, 5);
+        let right = leaf_table_split_policy_for_page(None, 12, 11);
 
         assert_eq!(left.heat, LeafTableSplitHeat::LeftEdge);
         assert_eq!(left.target_left_basis_points, 4_500);
@@ -3081,7 +3142,7 @@ mod tests {
             0,
             0,
             USABLE,
-            leaf_table_split_policy(cells.len(), 0),
+            leaf_table_split_policy_for_page(None, cells.len(), 0),
         )
         .expect("left-edge split");
         let interior = choose_leaf_table_split_index(
@@ -3089,7 +3150,7 @@ mod tests {
             0,
             0,
             USABLE,
-            leaf_table_split_policy(cells.len(), cells.len() / 2),
+            leaf_table_split_policy_for_page(None, cells.len(), cells.len() / 2),
         )
         .expect("interior split");
         let right = choose_leaf_table_split_index(
@@ -3097,7 +3158,7 @@ mod tests {
             0,
             0,
             USABLE,
-            leaf_table_split_policy(cells.len(), cells.len() - 1),
+            leaf_table_split_policy_for_page(None, cells.len(), cells.len() - 1),
         )
         .expect("right-edge split");
 
@@ -3108,6 +3169,39 @@ mod tests {
         assert!(
             interior < right,
             "right-hot inserts should keep more slack on the new right page"
+        );
+    }
+
+    #[test]
+    fn test_conflict_heat_adjusts_leaf_table_split_target_for_hot_page() {
+        let _guard = crate::instrumentation::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hot_page = pn(44);
+        crate::instrumentation::set_conflict_topology_policy_mode(
+            crate::instrumentation::ConflictTopologyPolicyMode::Enforced,
+        );
+        crate::instrumentation::reset_conflict_topology_policy_state();
+        crate::instrumentation::record_conflict_topology_heat(hot_page, 3, 4);
+
+        let baseline = leaf_table_split_policy_for_page(None, 12, 11);
+        let heated = leaf_table_split_policy_for_page(Some(hot_page), 12, 11);
+        let cells = fixed_cost_cells(12, 180);
+        let baseline_split =
+            choose_leaf_table_split_index(&cells, 0, 0, USABLE, baseline).expect("baseline split");
+        let heated_split =
+            choose_leaf_table_split_index(&cells, 0, 0, USABLE, heated).expect("heated split");
+
+        assert!(heated.topology_advice.applied);
+        assert_eq!(heated.target_left_basis_points, 8_000);
+        assert!(
+            heated_split > baseline_split,
+            "right-edge hot pages should leave more slack on the new right sibling"
+        );
+
+        crate::instrumentation::reset_conflict_topology_policy_state();
+        crate::instrumentation::set_conflict_topology_policy_mode(
+            crate::instrumentation::ConflictTopologyPolicyMode::Enforced,
         );
     }
 

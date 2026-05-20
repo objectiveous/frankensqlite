@@ -114,6 +114,47 @@ impl Fts5ConfigRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5ContentRow {
+    pub rowid: i64,
+    pub values: Vec<String>,
+}
+
+impl Fts5ContentRow {
+    #[must_use]
+    pub fn new(rowid: i64, values: Vec<String>) -> Self {
+        Self { rowid, values }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5DocsizeRow {
+    pub rowid: i64,
+    pub column_token_counts: Vec<u32>,
+}
+
+impl Fts5DocsizeRow {
+    #[must_use]
+    pub fn new(rowid: i64, column_token_counts: Vec<u32>) -> Self {
+        Self {
+            rowid,
+            column_token_counts,
+        }
+    }
+
+    #[must_use]
+    pub fn total_tokens(&self) -> u32 {
+        self.column_token_counts.iter().copied().sum()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fts5ShadowRows {
+    pub config: Vec<Fts5ConfigRecord>,
+    pub content: Vec<Fts5ContentRow>,
+    pub docsize: Vec<Fts5DocsizeRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fts5ConfigMetadata {
     pub format_version: i64,
     pub page_size: i64,
@@ -2271,6 +2312,33 @@ impl InvertedIndex {
             .map(|posting| u32::try_from(posting.positions.len()).unwrap_or(u32::MAX))
             .sum()
     }
+
+    #[must_use]
+    pub fn docsize_row(&self, docid: i64, column_count: usize) -> Fts5DocsizeRow {
+        let mut counts = vec![0_u32; column_count];
+        for posting in self
+            .index
+            .values()
+            .flat_map(|postings| postings.iter())
+            .filter(|posting| posting.docid == docid)
+        {
+            let Ok(column) = usize::try_from(posting.column) else {
+                continue;
+            };
+            if let Some(count) = counts.get_mut(column) {
+                *count = count
+                    .saturating_add(u32::try_from(posting.positions.len()).unwrap_or(u32::MAX));
+            }
+        }
+        Fts5DocsizeRow::new(docid, counts)
+    }
+
+    pub fn apply_docsize_row(&mut self, row: &Fts5DocsizeRow) {
+        self.doc_ids.insert(row.rowid);
+        if let Some(doc_lengths) = self.doc_lengths.as_mut() {
+            doc_lengths.insert(row.rowid, row.total_tokens());
+        }
+    }
 }
 
 fn append_position_to_postings(postings: &mut PostingList, docid: i64, column: u32, position: u32) {
@@ -3619,6 +3687,104 @@ impl Fts5Table {
         self.config.apply_config_rows(rows)
     }
 
+    #[must_use]
+    pub fn encode_content_rows(&self) -> Vec<Fts5ContentRow> {
+        if self.config.content_mode == ContentMode::Contentless
+            && !self.config.contentless_unindexed
+        {
+            return Vec::new();
+        }
+
+        let mut rows: Vec<Fts5ContentRow> = self
+            .documents
+            .iter()
+            .filter_map(|(rowid, values)| {
+                if self.config.content_mode == ContentMode::Contentless
+                    && values.iter().all(String::is_empty)
+                {
+                    None
+                } else {
+                    Some(Fts5ContentRow::new(*rowid, values.clone()))
+                }
+            })
+            .collect();
+        rows.sort_unstable_by_key(|row| row.rowid);
+        rows
+    }
+
+    #[must_use]
+    pub fn lookup_content_row(&self, rowid: i64) -> Option<Fts5ContentRow> {
+        self.encode_content_rows()
+            .into_iter()
+            .find(|row| row.rowid == rowid)
+    }
+
+    pub fn apply_content_rows(&mut self, rows: &[Fts5ContentRow]) {
+        let rows = rows
+            .iter()
+            .map(|row| (row.rowid, row.values.clone()))
+            .collect();
+        self.rebuild_documents(rows);
+    }
+
+    #[must_use]
+    pub fn encode_docsize_rows(&self) -> Vec<Fts5DocsizeRow> {
+        if !self.config.columnsize_enabled() {
+            return Vec::new();
+        }
+
+        let mut docids: Vec<i64> = self
+            .documents
+            .keys()
+            .copied()
+            .chain(self.index.doc_ids.iter().copied())
+            .collect();
+        docids.sort_unstable();
+        docids.dedup();
+        docids
+            .into_iter()
+            .map(|rowid| self.index.docsize_row(rowid, self.columns.len()))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn lookup_docsize_row(&self, rowid: i64) -> Option<Fts5DocsizeRow> {
+        self.encode_docsize_rows()
+            .into_iter()
+            .find(|row| row.rowid == rowid)
+    }
+
+    pub fn apply_docsize_rows(&mut self, rows: &[Fts5DocsizeRow]) {
+        if !self.config.columnsize_enabled() {
+            return;
+        }
+        if self.index.doc_lengths.is_none() {
+            self.index.doc_lengths = Some(HashMap::new());
+        }
+        for row in rows {
+            self.index.apply_docsize_row(row);
+            self.next_rowid = self.next_rowid.max(row.rowid.saturating_add(1));
+        }
+    }
+
+    #[must_use]
+    pub fn encode_shadow_rows(&self) -> Fts5ShadowRows {
+        Fts5ShadowRows {
+            config: self.encode_config_rows(),
+            content: self.encode_content_rows(),
+            docsize: self.encode_docsize_rows(),
+        }
+    }
+
+    pub fn apply_shadow_rows(&mut self, rows: &Fts5ShadowRows) -> Result<Fts5ConfigMetadata> {
+        let metadata = self.apply_config_rows(&rows.config)?;
+        if self.config.content_mode() != ContentMode::Contentless || !rows.content.is_empty() {
+            self.apply_content_rows(&rows.content);
+        }
+        self.apply_docsize_rows(&rows.docsize);
+        Ok(metadata)
+    }
+
     /// Get column names.
     #[must_use]
     pub fn columns(&self) -> &[String] {
@@ -4963,6 +5129,15 @@ mod tests {
 
     #[allow(dead_code)]
     #[derive(Debug)]
+    struct Fts5ShadowRowsStructure {
+        config: Vec<(String, String)>,
+        content: Vec<Fts5ContentRow>,
+        docsize: Vec<Fts5DocsizeRow>,
+        matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
     struct Fts5HighlightPrefixStructure {
         parsed_terms: Vec<Fts5HighlightTerm>,
         prefix_highlight: String,
@@ -5451,6 +5626,181 @@ mod tests {
         locale: false,
         tokendata: false,
     },
+            }"#
+        );
+    }
+
+    #[test]
+    fn test_fts5_shadow_rows_round_trip_stored_content_and_docsize() {
+        let cx = Cx::new();
+        let mut table =
+            Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+        table.insert_document(
+            7,
+            &["rust guide".to_owned(), "storage backend codec".to_owned()],
+        );
+        table.insert_document(9, &["sqlite notes".to_owned(), "rust fts".to_owned()]);
+
+        let rows = table.encode_shadow_rows();
+        assert_eq!(
+            rows.content,
+            vec![
+                Fts5ContentRow::new(
+                    7,
+                    vec!["rust guide".to_owned(), "storage backend codec".to_owned()]
+                ),
+                Fts5ContentRow::new(9, vec!["sqlite notes".to_owned(), "rust fts".to_owned()]),
+            ]
+        );
+        assert_eq!(
+            rows.docsize,
+            vec![
+                Fts5DocsizeRow::new(7, vec![2, 3]),
+                Fts5DocsizeRow::new(9, vec![2, 2]),
+            ]
+        );
+
+        let mut reopened =
+            Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+        reopened.apply_shadow_rows(&rows).unwrap();
+        let matches: Vec<i64> = reopened
+            .search("rust")
+            .unwrap()
+            .into_iter()
+            .map(|(rowid, _rank)| rowid)
+            .collect();
+        assert_eq!(matches, vec![7, 9]);
+        assert_eq!(
+            reopened.lookup_content_row(7),
+            Some(Fts5ContentRow::new(
+                7,
+                vec!["rust guide".to_owned(), "storage backend codec".to_owned()]
+            ))
+        );
+        assert_eq!(
+            reopened.lookup_docsize_row(7),
+            Some(Fts5DocsizeRow::new(7, vec![2, 3]))
+        );
+    }
+
+    #[test]
+    fn test_fts5_shadow_rows_contentless_emits_docsize_without_content() {
+        let cx = Cx::new();
+        let mut table =
+            Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "content=''"]).unwrap();
+        table.insert_document(3, &["alpha beta gamma".to_owned()]);
+
+        assert!(table.encode_content_rows().is_empty());
+        assert_eq!(
+            table.lookup_docsize_row(3),
+            Some(Fts5DocsizeRow::new(3, vec![3]))
+        );
+        assert_eq!(table.lookup_content_row(3), None);
+    }
+
+    #[test]
+    fn test_fts5_shadow_rows_contentless_unindexed_keeps_only_unindexed_content() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title UNINDEXED",
+                "body",
+                "content=''",
+                "contentless_unindexed=1",
+            ],
+        )
+        .unwrap();
+        table.insert_document(5, &["visible title".to_owned(), "search body".to_owned()]);
+
+        assert_eq!(
+            table.encode_content_rows(),
+            vec![Fts5ContentRow::new(
+                5,
+                vec!["visible title".to_owned(), String::new()]
+            )]
+        );
+        assert_eq!(
+            table.lookup_docsize_row(5),
+            Some(Fts5DocsizeRow::new(5, vec![0, 2]))
+        );
+        assert_eq!(search_rowids(&table, "visible").unwrap(), Vec::<i64>::new());
+        assert_eq!(search_rowids(&table, "search").unwrap(), vec![5]);
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_shadow_rows() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "body",
+                "secure-delete=1",
+                "insttoken=1",
+            ],
+        )
+        .unwrap();
+        table.insert_document(
+            11,
+            &["rust index".to_owned(), "shadow table rows".to_owned()],
+        );
+        let rows = table.encode_shadow_rows();
+        let snapshot = Fts5ShadowRowsStructure {
+            config: rows
+                .config
+                .iter()
+                .map(|record| (record.key.clone(), record.value.to_text()))
+                .collect(),
+            content: rows.content.clone(),
+            docsize: rows.docsize.clone(),
+            matches: search_rowids(&table, "shadow").unwrap(),
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5ShadowRowsStructure {
+    config: [
+        (
+            "insttoken",
+            "1",
+        ),
+        (
+            "secure-delete",
+            "1",
+        ),
+        (
+            "version",
+            "4",
+        ),
+    ],
+    content: [
+        Fts5ContentRow {
+            rowid: 11,
+            values: [
+                "rust index",
+                "shadow table rows",
+            ],
+        },
+    ],
+    docsize: [
+        Fts5DocsizeRow {
+            rowid: 11,
+            column_token_counts: [
+                2,
+                3,
+            ],
+        },
+    ],
+    matches: [
+        11,
+    ],
 }"#
         );
     }

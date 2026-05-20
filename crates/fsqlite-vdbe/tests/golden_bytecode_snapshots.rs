@@ -176,3 +176,30 @@ fn golden_vdbe_select_bytecode_recent_stub_shapes() -> Result<(), String> {
 
     Ok(())
 }
+
+#[test]
+fn golden_vdbe_fts5_match_bytecode_family() -> Result<(), String> {
+    let body_match_with_filter = render_bytecode_case(
+        "fts5_body_match_with_filter",
+        "SELECT id, title, score \
+             FROM docs \
+             WHERE body MATCH ?1 AND category_id = 3 \
+             ORDER BY score DESC",
+    )?;
+    insta::assert_snapshot!(
+        "fts5_body_match_with_filter_ordered",
+        body_match_with_filter
+    );
+
+    let title_match_with_limit = render_bytecode_case(
+        "fts5_title_match_with_limit",
+        "SELECT id, title \
+             FROM docs \
+             WHERE title MATCH 'franken sqlite' \
+             ORDER BY id \
+             LIMIT 5",
+    )?;
+    insta::assert_snapshot!("fts5_title_match_with_limit", title_match_with_limit);
+
+    Ok(())
+}

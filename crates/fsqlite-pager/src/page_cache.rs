@@ -7511,6 +7511,140 @@ mod tests {
     }
 
     #[test]
+    fn test_track_q_flat_hash_concurrent_reader_writer_slot_consistency() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const READERS: usize = 4;
+        const READS_PER_READER: usize = 512;
+        const WRITE_GENERATIONS: u8 = 64;
+
+        fn versioned_page_buf(page_no: PageNumber, generation: u8) -> PageBuf {
+            let mut buf = track_q_page_buf(page_no);
+            let data = buf.as_mut_slice();
+            data[4] = generation;
+            data[5] = generation ^ 0xFF;
+            data[6] = generation.wrapping_add(17);
+            buf
+        }
+
+        fn assert_versioned_page(page_no: PageNumber, data: &[u8]) {
+            assert_track_q_page(page_no, data);
+            let generation = data[4];
+            assert_eq!(
+                data[5],
+                generation ^ 0xFF,
+                "reader saw a torn version complement for page {}",
+                page_no.get()
+            );
+            assert_eq!(
+                data[6],
+                generation.wrapping_add(17),
+                "reader saw a torn version offset for page {}",
+                page_no.get()
+            );
+        }
+
+        let slots = Arc::new(FlatPageSlots::new(64));
+        let page_no = PageNumber::new(117).expect("page number");
+        assert!(
+            slots
+                .try_insert(page_no, versioned_page_buf(page_no, 0))
+                .expect("initial versioned page should stay in flat slots"),
+            "initial versioned page should be newly inserted"
+        );
+        slots.reset_metrics();
+
+        let start_barrier = Arc::new(Barrier::new(READERS + 2));
+        let reader_handles = (0..READERS)
+            .map(|_| {
+                let slots = Arc::clone(&slots);
+                let start_barrier = Arc::clone(&start_barrier);
+                thread::spawn(move || {
+                    start_barrier.wait();
+                    for _ in 0..READS_PER_READER {
+                        let copy = slots
+                            .get_copy(page_no)
+                            .expect("concurrent reader should find the hot slot");
+                        assert_versioned_page(page_no, &copy);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let writer_slots = Arc::clone(&slots);
+        let writer_barrier = Arc::clone(&start_barrier);
+        let writer_handle = thread::spawn(move || {
+            writer_barrier.wait();
+            for generation in 1..=WRITE_GENERATIONS {
+                let inserted = writer_slots
+                    .try_insert(page_no, versioned_page_buf(page_no, generation))
+                    .expect("same-page writer update should stay in the resident flat slot");
+                assert!(
+                    !inserted,
+                    "same-page writer update should replace the slot in place"
+                );
+            }
+        });
+
+        let started = monotonic_test_clock();
+        start_barrier.wait();
+        writer_handle
+            .join()
+            .expect("track q flat-slot writer should not panic");
+        for handle in reader_handles {
+            handle
+                .join()
+                .expect("track q flat-slot reader should not panic");
+        }
+        let elapsed = started.elapsed();
+
+        let final_copy = slots
+            .get_copy(page_no)
+            .expect("hot slot should remain readable after writer completes");
+        assert_versioned_page(page_no, &final_copy);
+        assert_eq!(
+            final_copy[4], WRITE_GENERATIONS,
+            "final slot copy should contain the last writer generation"
+        );
+        assert_eq!(
+            slots.len(),
+            1,
+            "reader/writer churn should keep a single resident slot"
+        );
+        assert_eq!(
+            slots.admits.load(Ordering::Relaxed),
+            0,
+            "same-page updates after metric reset should not count as new admissions"
+        );
+
+        let expected_reader_hits =
+            u64::try_from(READERS * READS_PER_READER).expect("reader hit count fits u64");
+        let hits = slots.hits.load(Ordering::Relaxed);
+        assert!(
+            hits >= expected_reader_hits,
+            "reader/writer test should record at least one hit per reader copy"
+        );
+
+        emit_track_q_log(
+            "test_track_q_flat_hash_concurrent_reader_writer_slot_consistency",
+            "verify",
+            elapsed,
+            1,
+            hits,
+            u64::try_from(track_q_probe_distance(&slots, page_no)).expect("probe distance fits"),
+            0,
+            track_q_hit_rate(hits, slots.misses.load(Ordering::Relaxed)),
+            json!({
+                "readers": READERS,
+                "reads_per_reader": READS_PER_READER,
+                "write_generations": WRITE_GENERATIONS,
+                "resident_pages": slots.len()
+            }),
+        );
+    }
+
+    #[test]
     #[ignore = "benchmark evidence only"]
     fn test_fast_path_vs_sharded_latency_comparison() {
         // Compare latency of fast path vs sharded path for single-thread workload.

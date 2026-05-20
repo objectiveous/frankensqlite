@@ -19163,7 +19163,6 @@ pub fn emit_backfill_key_expr(
 
 #[cfg(test)]
 mod tests {
-    use std::panic::{AssertUnwindSafe, catch_unwind};
     use super::*;
     use crate::ProgramBuilder;
     use crate::engine::{ExecOutcome, MemDatabase, VdbeEngine};
@@ -19177,6 +19176,9 @@ mod tests {
     use fsqlite_func::{FunctionRegistry, register_builtins};
     use fsqlite_parser::parse_first_statement_with_tail;
     use fsqlite_types::opcode::{Opcode, P4};
+    use proptest::prelude::*;
+    use proptest::{prop_oneof, proptest};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     fn test_schema() -> Vec<TableSchema> {
         vec![TableSchema {
@@ -19802,7 +19804,13 @@ mod tests {
 
     fn fuzz_literal() -> impl Strategy<Value = String> {
         prop_oneof![
-            any::<i16>().prop_map(|n| n.to_string()),
+            any::<i16>().prop_map(|n| {
+                if n.is_negative() {
+                    format!("({n})")
+                } else {
+                    n.to_string()
+                }
+            }),
             Just("NULL".to_owned()),
             Just("TRUE".to_owned()),
             Just("FALSE".to_owned()),
@@ -19815,11 +19823,7 @@ mod tests {
 
     fn fuzz_expr(depth: u32) -> BoxedStrategy<String> {
         if depth == 0 {
-            prop_oneof![
-                fuzz_literal(),
-                fuzz_column().prop_map(str::to_owned),
-            ]
-            .boxed()
+            prop_oneof![fuzz_literal(), fuzz_column().prop_map(str::to_owned),].boxed()
         } else {
             prop_oneof![
                 4 => fuzz_expr(0),
@@ -19906,9 +19910,7 @@ mod tests {
         )
             .prop_map(|(func, order_col, partition_col, frame, exclude)| {
                 let over = if let Some(partition_col) = partition_col {
-                    format!(
-                        "PARTITION BY {partition_col} ORDER BY {order_col} {frame}{exclude}"
-                    )
+                    format!("PARTITION BY {partition_col} ORDER BY {order_col} {frame}{exclude}")
                 } else {
                     format!("ORDER BY {order_col} {frame}{exclude}")
                 };
@@ -20004,10 +20006,10 @@ mod tests {
             let Some((statement, tail)) =
                 parse_first_statement_with_tail(&sql).expect("generated SQL should parse without parser panics")
             else {
-                prop_assert!(false, "generator produced no statement: {sql}");
+                prop_assert!(false, "generator produced no statement: {}", sql);
                 return Ok(());
             };
-            prop_assert_eq!(tail, sql.len(), "parser left trailing SQL for generated input: {sql}");
+            prop_assert_eq!(tail, sql.len(), "parser left trailing SQL for generated input: {}", sql);
 
             let result = catch_unwind(AssertUnwindSafe(|| {
                 let mut builder = ProgramBuilder::new();
@@ -20030,7 +20032,7 @@ mod tests {
                 }
             }));
 
-            prop_assert!(result.is_ok(), "parser->vdbe codegen panicked for sql: {sql}");
+            prop_assert!(result.is_ok(), "parser->vdbe codegen panicked for sql: {}", sql);
         }
     }
 

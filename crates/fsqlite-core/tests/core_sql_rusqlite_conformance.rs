@@ -528,6 +528,48 @@ const DDL_CASES: &[QueryCase] = &[
     },
 ];
 
+const TRANSACTION_SETUP: &str = "
+    CREATE TABLE ledger (
+        id INTEGER PRIMARY KEY,
+        label TEXT NOT NULL,
+        amount INTEGER NOT NULL
+    );
+";
+
+const TRANSACTION_SCRIPT: &str = "
+    BEGIN;
+    INSERT INTO ledger(id, label, amount) VALUES
+        (1, 'opening', 100),
+        (2, 'fee', -10);
+    SAVEPOINT adjust;
+    UPDATE ledger SET amount = amount + 50 WHERE id = 1;
+    INSERT INTO ledger(id, label, amount) VALUES (3, 'transient', 999);
+    ROLLBACK TO adjust;
+    RELEASE adjust;
+    INSERT INTO ledger(id, label, amount) VALUES (4, 'settled', 25);
+    COMMIT;
+
+    BEGIN;
+    INSERT INTO ledger(id, label, amount) VALUES (5, 'rolled-back', 500);
+    UPDATE ledger SET amount = amount - 100 WHERE id = 4;
+    ROLLBACK;
+";
+
+const TRANSACTION_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "committed rows survive savepoint rollback",
+        sql: "SELECT id, label, amount FROM ledger ORDER BY id",
+    },
+    QueryCase {
+        name: "rolled back rows absent",
+        sql: "SELECT COUNT(*) FROM ledger WHERE id IN (3, 5)",
+    },
+    QueryCase {
+        name: "aggregate after transaction boundaries",
+        sql: "SELECT COUNT(*), SUM(amount), MIN(amount), MAX(amount) FROM ledger",
+    },
+];
+
 const SUBQUERY_SETUP: &str = "
     CREATE TABLE customers (
         id INTEGER PRIMARY KEY,
@@ -641,6 +683,13 @@ fn error_paths_match_rusqlite() {
 fn ddl_defaults_and_views_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(DDL_SETUP);
     harness.assert_queries_match("DDL/default/view", DDL_CASES);
+}
+
+#[test]
+fn transactions_and_savepoints_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(TRANSACTION_SETUP);
+    harness.execute_script(TRANSACTION_SCRIPT);
+    harness.assert_queries_match("transaction/savepoint", TRANSACTION_CASES);
 }
 
 #[test]

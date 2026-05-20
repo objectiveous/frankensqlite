@@ -28598,6 +28598,57 @@ mod tests {
     }
 
     #[test]
+    fn test_codegen_complex_select_real_path_evidence_stays_storage_only() {
+        let cases = [
+            (
+                "grouped indexed lookup join",
+                grouped_join_count_sum_index_lookup_stmt(),
+                Opcode::SeekGE,
+            ),
+            (
+                "grouped rowid lookup join",
+                grouped_join_count_sum_rowid_lookup_stmt(),
+                Opcode::SeekRowid,
+            ),
+        ];
+
+        for (case_name, stmt, expected_probe) in cases {
+            let schema = test_schema_with_join_lookup();
+            let ctx = CodegenContext::default();
+            let mut b = ProgramBuilder::new();
+            codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+            let prog = b.finish().unwrap();
+
+            assert!(
+                !prog.requires_attached_memdb(),
+                "{case_name} should stay on storage cursors for backend-identity replay evidence; got {:?}",
+                opcode_sequence(&prog)
+            );
+            assert!(
+                prog.ops().iter().any(|op| op.opcode == expected_probe),
+                "{case_name} should retain its direct probe opcode"
+            );
+            assert!(
+                prog.ops()
+                    .iter()
+                    .any(|op| op.opcode == Opcode::SorterInsert),
+                "{case_name} should still use the sorter path for grouped aggregation"
+            );
+            assert!(
+                !prog.ops().iter().any(|op| matches!(
+                    op.opcode,
+                    Opcode::OpenEphemeral
+                        | Opcode::OpenAutoindex
+                        | Opcode::OpenPseudo
+                        | Opcode::OpenDup
+                        | Opcode::ReopenIdx
+                )),
+                "{case_name} should not introduce cursor opcodes that force MemDatabase attachment"
+            );
+        }
+    }
+
+    #[test]
     fn test_codegen_single_join_prefers_collation_matching_lookup_index() {
         let stmt = collation_matching_single_join_lookup_stmt();
         let schema = test_schema_single_join_prefers_collation_matching_lookup();

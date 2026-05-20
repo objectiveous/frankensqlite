@@ -7,6 +7,12 @@ struct QueryCase {
     sql: &'static str,
 }
 
+#[derive(Clone, Copy)]
+struct StatementCase {
+    name: &'static str,
+    sql: &'static str,
+}
+
 struct CoreSqlConformanceHarness {
     franken: Connection,
     sqlite: rusqlite::Connection,
@@ -34,6 +40,23 @@ impl CoreSqlConformanceHarness {
                 "{family} conformance case failed: {} ({})",
                 case.name,
                 case.sql
+            );
+        }
+    }
+
+    fn assert_statement_errors_match(&self, family: &str, cases: &[StatementCase]) {
+        for case in cases {
+            let franken_error = self.franken.execute_batch(case.sql).is_err();
+            let sqlite_error = self.sqlite.execute_batch(case.sql).is_err();
+            assert!(
+                sqlite_error,
+                "{family} conformance case expected rusqlite error: {} ({})",
+                case.name, case.sql
+            );
+            assert_eq!(
+                franken_error, sqlite_error,
+                "{family} conformance case failed: {} ({})",
+                case.name, case.sql
             );
         }
     }
@@ -415,6 +438,50 @@ const DML_CASES: &[QueryCase] = &[
     },
 ];
 
+const ERROR_PATH_SETUP: &str = "
+    CREATE TABLE constrained (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        sku TEXT NOT NULL,
+        qty INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX idx_constrained_sku ON constrained(sku);
+    INSERT INTO constrained(id, name, sku, qty) VALUES
+        (1, 'alpha', 'sku-a', 10),
+        (2, 'beta', 'sku-b', 20);
+";
+
+const ERROR_PATH_CASES: &[StatementCase] = &[
+    StatementCase {
+        name: "duplicate integer primary key",
+        sql: "INSERT INTO constrained(id, name, sku, qty) VALUES (1, 'dupe', 'sku-c', 1)",
+    },
+    StatementCase {
+        name: "duplicate unique index value",
+        sql: "INSERT INTO constrained(id, name, sku, qty) VALUES (3, 'gamma', 'sku-a', 1)",
+    },
+    StatementCase {
+        name: "insert null into not null",
+        sql: "INSERT INTO constrained(id, name, sku, qty) VALUES (4, NULL, 'sku-d', 1)",
+    },
+    StatementCase {
+        name: "insert missing not null column",
+        sql: "INSERT INTO constrained(id, name, sku) VALUES (5, 'missing-qty', 'sku-e')",
+    },
+    StatementCase {
+        name: "update not null column to null",
+        sql: "UPDATE constrained SET name = NULL WHERE id = 1",
+    },
+    StatementCase {
+        name: "unknown table lookup",
+        sql: "SELECT * FROM missing_table",
+    },
+    StatementCase {
+        name: "unknown column lookup",
+        sql: "SELECT missing_column FROM constrained",
+    },
+];
+
 const SUBQUERY_SETUP: &str = "
     CREATE TABLE customers (
         id INTEGER PRIMARY KEY,
@@ -516,6 +583,12 @@ fn dml_insert_update_delete_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(DML_SETUP);
     harness.execute_script(DML_SCRIPT);
     harness.assert_queries_match("DML", DML_CASES);
+}
+
+#[test]
+fn error_paths_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(ERROR_PATH_SETUP);
+    harness.assert_statement_errors_match("error path", ERROR_PATH_CASES);
 }
 
 #[test]

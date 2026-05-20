@@ -3302,11 +3302,12 @@ fn extract_query_terms(expr: &Fts5Expr) -> Vec<String> {
             terms.push(prefix.clone());
             terms
         }
-        Fts5Expr::And(l, r) | Fts5Expr::Or(l, r) | Fts5Expr::Not(l, r) => {
+        Fts5Expr::And(l, r) | Fts5Expr::Or(l, r) => {
             let mut terms = extract_query_terms(l);
             terms.extend(extract_query_terms(r));
             terms
         }
+        Fts5Expr::Not(left, _) => extract_query_terms(left),
         Fts5Expr::Near(operands, _) => operands.iter().flat_map(near_operand_terms).collect(),
         Fts5Expr::ColumnFilter(_, inner) | Fts5Expr::InitialToken(inner) => {
             extract_query_terms(inner)
@@ -3371,11 +3372,12 @@ fn extract_highlight_terms(expr: &Fts5Expr) -> Vec<Fts5HighlightTerm> {
             terms.push(Fts5HighlightTerm::prefix(prefix));
             terms
         }
-        Fts5Expr::And(left, right) | Fts5Expr::Or(left, right) | Fts5Expr::Not(left, right) => {
+        Fts5Expr::And(left, right) | Fts5Expr::Or(left, right) => {
             let mut terms = extract_highlight_terms(left);
             terms.extend(extract_highlight_terms(right));
             terms
         }
+        Fts5Expr::Not(left, _) => extract_highlight_terms(left),
         Fts5Expr::Near(operands, _) => operands.iter().flat_map(near_operand_terms).collect(),
         Fts5Expr::ColumnFilter(_, inner) | Fts5Expr::InitialToken(inner) => {
             extract_highlight_terms(inner)
@@ -3959,24 +3961,35 @@ fn snippet_with_terms(
 // ---------------------------------------------------------------------------
 
 fn fallback_highlight_terms(query: &str) -> Vec<Fts5HighlightTerm> {
-    query
-        .split_whitespace()
-        .filter_map(|raw| {
-            let trimmed = raw
-                .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '(' | ')' | ','))
-                .trim_start_matches('^')
-                .to_ascii_lowercase();
-            let prefix = trimmed.ends_with('*');
-            let term = trimmed.trim_end_matches('*');
-            if term.is_empty() || matches!(term, "and" | "or" | "not" | "near") {
-                None
-            } else if prefix {
-                Some(Fts5HighlightTerm::prefix(term))
-            } else {
-                Some(Fts5HighlightTerm::exact(term))
-            }
-        })
-        .collect()
+    let mut terms = Vec::new();
+    let mut skip_next_leaf = false;
+
+    for raw in query.split_whitespace() {
+        let trimmed = raw
+            .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '(' | ')' | ','))
+            .trim_start_matches('^')
+            .to_ascii_lowercase();
+        let prefix = trimmed.ends_with('*');
+        let term = trimmed.trim_end_matches('*');
+        if term.is_empty() || matches!(term, "and" | "or" | "near") {
+            continue;
+        }
+        if term == "not" {
+            skip_next_leaf = true;
+            continue;
+        }
+        if skip_next_leaf {
+            skip_next_leaf = false;
+            continue;
+        }
+        if prefix {
+            terms.push(Fts5HighlightTerm::prefix(term));
+        } else {
+            terms.push(Fts5HighlightTerm::exact(term));
+        }
+    }
+
+    terms
 }
 
 fn highlight_terms_from_query_text(query: &str) -> Vec<Fts5HighlightTerm> {
@@ -4307,6 +4320,16 @@ mod tests {
         phrase_prefix_snippet: String,
         fallback_prefix_highlight: String,
         exact_highlight: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5NotTermStructure {
+        query_terms: Vec<String>,
+        highlight_terms: Vec<Fts5HighlightTerm>,
+        search_matches: Vec<i64>,
+        positive_highlight: String,
+        fallback_highlight_terms: Vec<Fts5HighlightTerm>,
     }
 
     #[allow(dead_code)]
@@ -7115,6 +7138,86 @@ mod tests {
     exact_highlight: "prefix prevent <b>pre</b>",
 }"#
         );
+    }
+
+    #[test]
+    fn test_fts5_not_terms_are_not_auxiliary_match_terms() -> std::result::Result<(), String> {
+        let expr = build_expr(&parse_fts5_query("rust NOT web").map_err(|err| err.to_string())?)
+            .map_err(|err| err.to_string())?;
+
+        assert_eq!(extract_query_terms(&expr), vec!["rust"]);
+        assert_eq!(
+            extract_highlight_terms(&expr),
+            vec![Fts5HighlightTerm::exact("rust")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_highlight_scalar_func_ignores_not_rhs_terms() {
+        let func = Fts5HighlightFunc;
+        let result = func
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string("rust web sqlite")),
+                SqliteValue::Text(SmallText::from_string("rust NOT web")),
+                SqliteValue::Text(SmallText::from_string("<b>")),
+                SqliteValue::Text(SmallText::from_string("</b>")),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::from_string("<b>rust</b> web sqlite"))
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_not_auxiliary_terms() -> std::result::Result<(), String> {
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["rust systems".to_owned()]);
+        table.insert_document(2, &["rust web".to_owned()]);
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5NotTermStructure {
+                    query_terms: table
+                        .query_terms_for_queries(&["rust NOT web"])
+                        .map_err(|err| err.to_string())?,
+                    highlight_terms: highlight_terms_from_query_text("rust NOT web"),
+                    search_matches: search_rowids(&table, "rust NOT web")?,
+                    positive_highlight: highlight_with_terms(
+                        "rust web sqlite",
+                        &highlight_terms_from_query_text("rust NOT web"),
+                        "<b>",
+                        "</b>",
+                    ),
+                    fallback_highlight_terms: highlight_terms_from_query_text("(rust NOT web"),
+                }
+            ),
+            r#"Fts5NotTermStructure {
+    query_terms: [
+        "rust",
+    ],
+    highlight_terms: [
+        Fts5HighlightTerm {
+            term: "rust",
+            prefix: false,
+        },
+    ],
+    search_matches: [
+        1,
+    ],
+    positive_highlight: "<b>rust</b> web sqlite",
+    fallback_highlight_terms: [
+        Fts5HighlightTerm {
+            term: "rust",
+            prefix: false,
+        },
+    ],
+}"#
+        );
+        Ok(())
     }
 
     #[test]

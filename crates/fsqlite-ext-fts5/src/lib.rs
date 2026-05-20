@@ -3314,6 +3314,75 @@ fn extract_query_terms(expr: &Fts5Expr) -> Vec<String> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fts5HighlightTerm {
+    term: String,
+    prefix: bool,
+}
+
+impl Fts5HighlightTerm {
+    fn exact(term: &str) -> Self {
+        Self {
+            term: term.to_lowercase(),
+            prefix: false,
+        }
+    }
+
+    fn prefix(term: &str) -> Self {
+        Self {
+            term: term.to_lowercase(),
+            prefix: true,
+        }
+    }
+
+    fn matches_token(&self, token: &str) -> bool {
+        if self.prefix {
+            token.starts_with(&self.term)
+        } else {
+            token.eq(self.term.as_str())
+        }
+    }
+}
+
+fn extract_highlight_terms(expr: &Fts5Expr) -> Vec<Fts5HighlightTerm> {
+    fn near_operand_terms(operand: &Fts5NearOperand) -> Vec<Fts5HighlightTerm> {
+        match operand {
+            Fts5NearOperand::Term(term) => vec![Fts5HighlightTerm::exact(term)],
+            Fts5NearOperand::Prefix(prefix) => vec![Fts5HighlightTerm::prefix(prefix)],
+            Fts5NearOperand::Phrase(terms) => terms
+                .iter()
+                .map(|term| Fts5HighlightTerm::exact(term))
+                .collect(),
+        }
+    }
+
+    match expr {
+        Fts5Expr::Term(term) => vec![Fts5HighlightTerm::exact(term)],
+        Fts5Expr::Prefix(prefix) => vec![Fts5HighlightTerm::prefix(prefix)],
+        Fts5Expr::Phrase(words) => words
+            .iter()
+            .map(|term| Fts5HighlightTerm::exact(term))
+            .collect(),
+        Fts5Expr::PhrasePrefix(words, prefix) => {
+            let mut terms: Vec<Fts5HighlightTerm> = words
+                .iter()
+                .map(|term| Fts5HighlightTerm::exact(term))
+                .collect();
+            terms.push(Fts5HighlightTerm::prefix(prefix));
+            terms
+        }
+        Fts5Expr::And(left, right) | Fts5Expr::Or(left, right) | Fts5Expr::Not(left, right) => {
+            let mut terms = extract_highlight_terms(left);
+            terms.extend(extract_highlight_terms(right));
+            terms
+        }
+        Fts5Expr::Near(operands, _) => operands.iter().flat_map(near_operand_terms).collect(),
+        Fts5Expr::ColumnFilter(_, inner) | Fts5Expr::InitialToken(inner) => {
+            extract_highlight_terms(inner)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // VirtualTable implementation
 // ---------------------------------------------------------------------------
@@ -3781,15 +3850,27 @@ impl Fts5Cursor {
 /// markers.
 #[must_use]
 pub fn highlight(text: &str, terms: &[String], open_tag: &str, close_tag: &str) -> String {
+    let highlight_terms: Vec<Fts5HighlightTerm> = terms
+        .iter()
+        .map(|term| Fts5HighlightTerm::exact(term))
+        .collect();
+    highlight_with_terms(text, &highlight_terms, open_tag, close_tag)
+}
+
+fn highlight_with_terms(
+    text: &str,
+    terms: &[Fts5HighlightTerm],
+    open_tag: &str,
+    close_tag: &str,
+) -> String {
     let tokenizer = Unicode61Tokenizer::new();
     let tokens = tokenizer.tokenize(text);
-    let lower_terms: Vec<String> = terms.iter().map(|t| t.to_lowercase()).collect();
 
     let mut result = String::new();
     let mut last_end = 0;
 
     for token in &tokens {
-        if lower_terms.contains(&token.term) {
+        if terms.iter().any(|term| term.matches_token(&token.term)) {
             result.push_str(&text[last_end..token.start]);
             result.push_str(open_tag);
             result.push_str(&text[token.start..token.end]);
@@ -3813,14 +3894,39 @@ pub fn snippet(
     ellipsis: &str,
     max_tokens: usize,
 ) -> String {
+    let highlight_terms: Vec<Fts5HighlightTerm> = terms
+        .iter()
+        .map(|term| Fts5HighlightTerm::exact(term))
+        .collect();
+    snippet_with_terms(
+        text,
+        &highlight_terms,
+        open_tag,
+        close_tag,
+        ellipsis,
+        max_tokens,
+    )
+}
+
+fn snippet_with_terms(
+    text: &str,
+    terms: &[Fts5HighlightTerm],
+    open_tag: &str,
+    close_tag: &str,
+    ellipsis: &str,
+    max_tokens: usize,
+) -> String {
+    if max_tokens == 0 {
+        return String::new();
+    }
+
     let tokenizer = Unicode61Tokenizer::new();
     let tokens = tokenizer.tokenize(text);
-    let lower_terms: Vec<String> = terms.iter().map(|t| t.to_lowercase()).collect();
 
     // Find first matching token position.
     let match_pos = tokens
         .iter()
-        .position(|t| lower_terms.contains(&t.term))
+        .position(|token| terms.iter().any(|term| term.matches_token(&token.term)))
         .unwrap_or(0);
 
     // Calculate window around match.
@@ -3834,12 +3940,11 @@ pub fn snippet(
     }
 
     let window_tokens = &tokens[start..end];
-    if let Some(first) = window_tokens.first() {
-        let last = &window_tokens[window_tokens.len() - 1];
+    if let (Some(first), Some(last)) = (window_tokens.first(), window_tokens.last()) {
         let slice = &text[first.start..last.end];
 
         // Highlight matching terms within the snippet.
-        result.push_str(&highlight(slice, terms, open_tag, close_tag));
+        result.push_str(&highlight_with_terms(slice, terms, open_tag, close_tag));
     }
 
     if end < tokens.len() {
@@ -3853,30 +3958,33 @@ pub fn snippet(
 // Scalar functions for FTS5
 // ---------------------------------------------------------------------------
 
-fn fallback_query_terms(query: &str) -> Vec<String> {
+fn fallback_highlight_terms(query: &str) -> Vec<Fts5HighlightTerm> {
     query
         .split_whitespace()
         .filter_map(|raw| {
             let trimmed = raw
                 .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '(' | ')' | ','))
                 .trim_start_matches('^')
-                .trim_end_matches('*')
                 .to_ascii_lowercase();
-            if trimmed.is_empty() || matches!(trimmed.as_str(), "and" | "or" | "not" | "near") {
+            let prefix = trimmed.ends_with('*');
+            let term = trimmed.trim_end_matches('*');
+            if term.is_empty() || matches!(term, "and" | "or" | "not" | "near") {
                 None
+            } else if prefix {
+                Some(Fts5HighlightTerm::prefix(term))
             } else {
-                Some(trimmed)
+                Some(Fts5HighlightTerm::exact(term))
             }
         })
         .collect()
 }
 
-fn query_terms_from_query_text(query: &str) -> Vec<String> {
+fn highlight_terms_from_query_text(query: &str) -> Vec<Fts5HighlightTerm> {
     parse_fts5_query(query)
         .and_then(|tokens| build_expr(&tokens))
         .map_or_else(
-            |_| fallback_query_terms(query),
-            |expr| extract_query_terms(&expr),
+            |_| fallback_highlight_terms(query),
+            |expr| extract_highlight_terms(&expr),
         )
 }
 
@@ -3893,11 +4001,11 @@ impl ScalarFunction for Fts5HighlightFunc {
         let query = args[1].to_text();
         let open_tag = args[2].to_text();
         let close_tag = args[3].to_text();
-        let terms = query_terms_from_query_text(&query);
+        let terms = highlight_terms_from_query_text(&query);
 
-        Ok(SqliteValue::Text(SmallText::from_string(highlight(
-            &text, &terms, &open_tag, &close_tag,
-        ))))
+        Ok(SqliteValue::Text(SmallText::from_string(
+            highlight_with_terms(&text, &terms, &open_tag, &close_tag),
+        )))
     }
 
     fn num_args(&self) -> i32 {
@@ -3925,11 +4033,11 @@ impl ScalarFunction for Fts5SnippetFunc {
         let close_tag = args[3].to_text();
         let ellipsis = args[4].to_text();
         let max_tokens = usize::try_from(args[5].to_integer()).unwrap_or(0);
-        let terms = query_terms_from_query_text(&query);
+        let terms = highlight_terms_from_query_text(&query);
 
-        Ok(SqliteValue::Text(SmallText::from_string(snippet(
-            &text, &terms, &open_tag, &close_tag, &ellipsis, max_tokens,
-        ))))
+        Ok(SqliteValue::Text(SmallText::from_string(
+            snippet_with_terms(&text, &terms, &open_tag, &close_tag, &ellipsis, max_tokens),
+        )))
     }
 
     fn num_args(&self) -> i32 {
@@ -4189,6 +4297,16 @@ mod tests {
         terms: Vec<String>,
         rows: Vec<(i64, Vec<String>)>,
         matches: Vec<i64>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5HighlightPrefixStructure {
+        parsed_terms: Vec<Fts5HighlightTerm>,
+        prefix_highlight: String,
+        phrase_prefix_snippet: String,
+        fallback_prefix_highlight: String,
+        exact_highlight: String,
     }
 
     #[allow(dead_code)]
@@ -6899,6 +7017,104 @@ mod tests {
             "</b>",
         );
         assert_eq!(result, "the <b>quick</b> brown <b>fox</b>");
+    }
+
+    #[test]
+    fn test_highlight_scalar_func_matches_prefix_query_tokens() {
+        let func = Fts5HighlightFunc;
+        let result = func
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string("pre prefix prevent post")),
+                SqliteValue::Text(SmallText::from_string("pre*")),
+                SqliteValue::Text(SmallText::from_string("<b>")),
+                SqliteValue::Text(SmallText::from_string("</b>")),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::from_string(
+                "<b>pre</b> <b>prefix</b> <b>prevent</b> post"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_snippet_scalar_func_matches_phrase_prefix_query() {
+        let func = Fts5SnippetFunc;
+        let result = func
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string("alpha one two threefold omega")),
+                SqliteValue::Text(SmallText::from_string("one + two + thr*")),
+                SqliteValue::Text(SmallText::from_string("[")),
+                SqliteValue::Text(SmallText::from_string("]")),
+                SqliteValue::Text(SmallText::from_string("...")),
+                SqliteValue::Integer(4),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::from_string("alpha [one] [two] [threefold]..."))
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_highlight_prefix_terms() {
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5HighlightPrefixStructure {
+                    parsed_terms: highlight_terms_from_query_text("one + two + thr*"),
+                    prefix_highlight: highlight_with_terms(
+                        "pre prefix prevent post",
+                        &highlight_terms_from_query_text("pre*"),
+                        "<b>",
+                        "</b>",
+                    ),
+                    phrase_prefix_snippet: snippet_with_terms(
+                        "alpha one two threefold omega",
+                        &highlight_terms_from_query_text("one + two + thr*"),
+                        "[",
+                        "]",
+                        "...",
+                        4,
+                    ),
+                    fallback_prefix_highlight: highlight_with_terms(
+                        "prelude prefix other",
+                        &highlight_terms_from_query_text("(pre*"),
+                        "<i>",
+                        "</i>",
+                    ),
+                    exact_highlight: highlight(
+                        "prefix prevent pre",
+                        &["pre".to_owned()],
+                        "<b>",
+                        "</b>",
+                    ),
+                }
+            ),
+            r#"Fts5HighlightPrefixStructure {
+    parsed_terms: [
+        Fts5HighlightTerm {
+            term: "one",
+            prefix: false,
+        },
+        Fts5HighlightTerm {
+            term: "two",
+            prefix: false,
+        },
+        Fts5HighlightTerm {
+            term: "thr",
+            prefix: true,
+        },
+    ],
+    prefix_highlight: "<b>pre</b> <b>prefix</b> <b>prevent</b> post",
+    phrase_prefix_snippet: "alpha [one] [two] [threefold]...",
+    fallback_prefix_highlight: "<i>prelude</i> <i>prefix</i> other",
+    exact_highlight: "prefix prevent <b>pre</b>",
+}"#
+        );
     }
 
     #[test]

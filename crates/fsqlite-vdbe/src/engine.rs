@@ -30527,6 +30527,125 @@ mod tests {
     }
 
     #[test]
+    fn test_storage_only_nested_loop_join_executes_without_attached_memdb() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let orders_root = 256;
+        let customers_root = 257;
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 0, orders_root, 0, P4::Int(2), 0);
+        b.emit_op(Opcode::OpenWrite, 1, customers_root, 0, P4::Int(2), 0);
+
+        b.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 1, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::String8, 0, 3, 0, P4::Str("ann".to_owned()), 0);
+        b.emit_op(Opcode::MakeRecord, 2, 2, 4, P4::None, 0);
+        b.emit_op(Opcode::Insert, 1, 4, 1, P4::None, 0);
+
+        b.emit_op(Opcode::Integer, 2, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 2, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::String8, 0, 3, 0, P4::Str("bob".to_owned()), 0);
+        b.emit_op(Opcode::MakeRecord, 2, 2, 4, P4::None, 0);
+        b.emit_op(Opcode::Insert, 1, 4, 1, P4::None, 0);
+
+        b.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 1, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 10, 3, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 2, 2, 4, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 4, 1, P4::None, 0);
+
+        b.emit_op(Opcode::Integer, 2, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 2, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 20, 3, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 2, 2, 4, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 4, 1, P4::None, 0);
+
+        b.emit_op(Opcode::Integer, 3, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 1, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 30, 3, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 2, 2, 4, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 4, 1, P4::None, 0);
+
+        let done = b.emit_label();
+        let next_order = b.emit_label();
+        b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
+        let order_body = b.current_addr();
+        b.emit_op(Opcode::Column, 0, 0, 10, P4::None, 0);
+        b.emit_op(Opcode::Column, 0, 1, 11, P4::None, 0);
+
+        b.emit_jump_to_label(Opcode::Rewind, 1, 0, next_order, P4::None, 0);
+        let customer_body = b.current_addr();
+        b.emit_op(Opcode::Column, 1, 0, 12, P4::None, 0);
+        let no_match = b.emit_label();
+        b.emit_jump_to_label(Opcode::Ne, 10, 12, no_match, P4::None, 0);
+        b.emit_op(Opcode::Column, 1, 1, 13, P4::None, 0);
+        b.emit_op(Opcode::SCopy, 11, 14, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 13, 2, 0, P4::None, 0);
+        b.resolve_label(no_match);
+        b.emit_op(
+            Opcode::Next,
+            1,
+            i32::try_from(customer_body).expect("test program address should fit in i32"),
+            0,
+            P4::None,
+            0,
+        );
+
+        b.resolve_label(next_order);
+        b.emit_op(
+            Opcode::Next,
+            0,
+            i32::try_from(order_body).expect("test program address should fit in i32"),
+            0,
+            P4::None,
+            0,
+        );
+        b.resolve_label(done);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        assert!(
+            !prog.requires_attached_memdb(),
+            "pager-backed nested-loop join bytecode must not require an attached MemDatabase"
+        );
+
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.set_transaction(txn);
+        engine.set_reject_mem_fallback(true);
+
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert!(
+            engine.all_cursors_are_txn_backed(),
+            "join scan cursors must stay on txn-backed storage cursors"
+        );
+        let rows: Vec<_> = engine
+            .take_results()
+            .into_iter()
+            .map(|row| row.into_vec())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Text("ann".into()), SqliteValue::Integer(10)],
+                vec![SqliteValue::Text("bob".into()), SqliteValue::Integer(20)],
+                vec![SqliteValue::Text("ann".into()), SqliteValue::Integer(30)],
+            ]
+        );
+        assert!(
+            engine.take_database().is_none(),
+            "the engine should not need an attached MemDatabase for join scans"
+        );
+    }
+
+    #[test]
     fn test_open_read_opcode_with_mem_fallback() {
         // OpenRead via VDBE execution should succeed when MemDatabase has the
         // table, verifying the full cursor lifecycle.

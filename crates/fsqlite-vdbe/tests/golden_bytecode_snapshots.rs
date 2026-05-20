@@ -408,3 +408,23 @@ fn golden_vdbe_upsert_on_conflict_bytecode_family() -> Result<(), String> {
 
     Ok(())
 }
+
+#[test]
+fn golden_vdbe_update_delete_where_bytecode_family() -> Result<(), String> {
+    let update_where = render_statement_bytecode_case(
+        "update_with_where_predicate",
+        "UPDATE docs \
+             SET score = score + 1, title = 'updated' \
+             WHERE category_id = ?1 AND score < ?2",
+    )?;
+    insta::assert_snapshot!("update_with_where_predicate", update_where);
+
+    let delete_where = render_statement_bytecode_case(
+        "delete_with_where_predicate",
+        "DELETE FROM docs \
+             WHERE category_id = ?1 AND score < ?2",
+    )?;
+    insta::assert_snapshot!("delete_with_where_predicate", delete_where);
+
+    Ok(())
+}

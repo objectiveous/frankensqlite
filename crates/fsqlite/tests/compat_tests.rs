@@ -828,6 +828,7 @@ fn multi_row_upsert_with_foreign_keys_uses_fallback_without_failing() {
 /// compare results for parity.
 mod rusqlite_parity {
     use super::*;
+    use fsqlite_func::ScalarFunction;
 
     fn assert_parity(
         label: &str,
@@ -939,6 +940,33 @@ mod rusqlite_parity {
         )
         .unwrap();
         conn
+    }
+
+    struct ForceMatch;
+
+    impl ScalarFunction for ForceMatch {
+        fn invoke(&self, args: &[SqliteValue]) -> fsqlite_error::Result<SqliteValue> {
+            let [pattern, value] = args else {
+                return Err(FrankenError::FunctionError(
+                    "match() expects exactly two arguments".to_owned(),
+                ));
+            };
+            if matches!(pattern, SqliteValue::Null) || matches!(value, SqliteValue::Null) {
+                return Ok(SqliteValue::Null);
+            }
+            let pattern = pattern.to_text();
+            Ok(SqliteValue::Integer(i64::from(
+                pattern == "force-real-path",
+            )))
+        }
+
+        fn num_args(&self) -> i32 {
+            2
+        }
+
+        fn name(&self) -> &str {
+            "match"
+        }
     }
 
     #[test]
@@ -1241,6 +1269,53 @@ mod rusqlite_parity {
              SELECT agent FROM msgs WHERE content IS NULL
              ORDER BY agent",
         );
+    }
+
+    #[test]
+    fn parity_match_udf_uses_registered_scalar_path() {
+        let fconn = setup_franken();
+        fconn.register_scalar_function(ForceMatch);
+
+        assert_query_parity(
+            "MATCH_UDF_REAL_PATH",
+            &rusqlite_with_forced_match(),
+            &fconn,
+            "SELECT id FROM msgs WHERE content MATCH 'force-real-path' ORDER BY id",
+        );
+    }
+
+    #[test]
+    fn parity_prepared_match_udf_uses_registered_scalar_path() {
+        let fconn = setup_franken();
+        fconn.register_scalar_function(ForceMatch);
+
+        let stmt = fconn
+            .prepare("SELECT id FROM msgs WHERE content MATCH ?1 ORDER BY id")
+            .unwrap();
+        let rows = stmt
+            .query_with_params(&[SqliteValue::Text("force-real-path".into())])
+            .unwrap();
+        let ids: Vec<String> = rows
+            .iter()
+            .map(|row| sqlite_val_to_string(row.get(0).unwrap()))
+            .collect();
+        assert_eq!(ids, vec!["1", "2", "3", "5"]);
+    }
+
+    fn rusqlite_with_forced_match() -> rusqlite::Connection {
+        let conn = setup_rusqlite();
+        conn.create_scalar_function(
+            "match",
+            2,
+            rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let pattern = ctx.get::<String>(0)?;
+                let value = ctx.get::<Option<String>>(1)?;
+                Ok(i64::from(pattern == "force-real-path" && value.is_some()))
+            },
+        )
+        .unwrap();
+        conn
     }
 
     #[test]

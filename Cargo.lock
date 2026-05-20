@@ -911,6 +911,7 @@ dependencies = [
  "fsqlite-ext-misc",
  "fsqlite-ext-rtree",
  "fsqlite-ext-session",
+ "fsqlite-func",
  "fsqlite-parser",
  "fsqlite-types",
  "fsqlite-vfs",

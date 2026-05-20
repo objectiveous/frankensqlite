@@ -406,7 +406,7 @@ pub trait Fts5Tokenizer: Send + Sync {
 }
 
 /// Unicode61 tokenizer: splits on non-alphanumeric characters, lowercases.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Unicode61Tokenizer {
     /// Characters to treat as separators (empty = default Unicode categories).
     pub separators: String,
@@ -414,6 +414,16 @@ pub struct Unicode61Tokenizer {
     pub token_chars: String,
     /// Whether to remove diacritics (0=no, 1=non-ASCII, 2=all).
     pub remove_diacritics: u8,
+}
+
+impl Default for Unicode61Tokenizer {
+    fn default() -> Self {
+        Self {
+            separators: String::new(),
+            token_chars: String::new(),
+            remove_diacritics: 1,
+        }
+    }
 }
 
 impl Unicode61Tokenizer {
@@ -3753,6 +3763,14 @@ mod tests {
         let tok = Unicode61Tokenizer::new();
         let tokens = tok.tokenize("café résumé naïve");
         let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
+        assert_eq!(terms, vec!["cafe", "resume", "naive"]);
+    }
+
+    #[test]
+    fn test_unicode61_remove_diacritics_zero_preserves_latin_marks() {
+        let tok = create_tokenizer("unicode61 remove_diacritics 0").unwrap();
+        let tokens = tok.tokenize("café résumé naïve");
+        let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
         assert_eq!(terms, vec!["café", "résumé", "naïve"]);
     }
 
@@ -3816,6 +3834,63 @@ mod tests {
     ],
 }"#
         );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_unicode61_default_diacritics()
+    -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"])
+            .map_err(|err| err.to_string())?;
+        table.insert_document(11, &["café résumé naïve".to_owned()]);
+
+        let structure = table_structure(&table);
+        let ascii_matches = table
+            .search("cafe")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let accent_matches = table
+            .search("résumé")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(rowid, _score)| rowid)
+            .collect();
+        let snapshot = Fts5Unicode61DiacriticsStructure {
+            tokenizer: table.tokenizer_name.clone(),
+            terms: structure.terms.into_iter().map(|term| term.term).collect(),
+            rows: structure.rows,
+            ascii_matches,
+            accent_matches,
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5Unicode61DiacriticsStructure {
+    tokenizer: "unicode61",
+    terms: [
+        "cafe",
+        "naive",
+        "resume",
+    ],
+    rows: [
+        (
+            11,
+            [
+                "café résumé naïve",
+            ],
+        ),
+    ],
+    ascii_matches: [
+        11,
+    ],
+    accent_matches: [
+        11,
+    ],
+}"#
+        );
+        Ok(())
     }
 
     #[test]

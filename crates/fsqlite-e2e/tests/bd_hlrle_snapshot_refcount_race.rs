@@ -25,8 +25,8 @@
 //! - S4: GC horizon advances correctly (no stale snapshot pinning)
 //! - S5: Transaction rollback churn doesn't corrupt refcounts
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use fsqlite::Connection;
@@ -75,7 +75,8 @@ fn s1_rapid_txn_churn_no_panic() {
     stop.store(true, Ordering::Relaxed);
 
     for t in threads {
-        t.join().expect("thread must not panic (snapshot refcount race?)");
+        t.join()
+            .expect("thread must not panic (snapshot refcount race?)");
     }
 
     let total = total_ops.load(Ordering::Relaxed);
@@ -258,8 +259,10 @@ fn s4_file_backed_txn_register_unregister_storm() {
     // Setup schema
     {
         let conn = Connection::open(path_str).expect("open");
-        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, thread_id INTEGER, seq INTEGER)")
-            .expect("create");
+        conn.execute(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, thread_id INTEGER, seq INTEGER)",
+        )
+        .expect("create");
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -306,7 +309,8 @@ fn s4_file_backed_txn_register_unregister_storm() {
     stop.store(true, Ordering::Relaxed);
 
     for t in threads {
-        t.join().expect("thread must not panic (refcount underflow?)");
+        t.join()
+            .expect("thread must not panic (refcount underflow?)");
     }
 
     let committed = total_committed.load(Ordering::Relaxed);
@@ -467,7 +471,5 @@ fn s6_mixed_long_short_txn_lifetimes() {
     let verify = Connection::open(path_str).expect("verify");
     let rows = verify.query("SELECT * FROM kv").expect("count").len();
     assert!(rows > 0, "no data survived mixed txn lifetimes");
-    eprintln!(
-        "S6: {snapshots} long snapshots, {total_written} short writes, {rows} final rows"
-    );
+    eprintln!("S6: {snapshots} long snapshots, {total_written} short writes, {rows} final rows");
 }

@@ -12,8 +12,8 @@
 //! - W7: Data integrity after many small transactions
 //! - W8: Oracle parity after recovery cycle
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use fsqlite::Connection;
@@ -59,9 +59,16 @@ fn w1_basic_wal_recovery() {
     {
         let conn = Connection::open(path_str).expect("reopen");
         let count = get_int(&conn, "SELECT COUNT(*) FROM wal_test").unwrap();
-        assert_eq!(count, 100, "W1: expected 100 rows after recovery, got {count}");
+        assert_eq!(
+            count, 100,
+            "W1: expected 100 rows after recovery, got {count}"
+        );
 
-        let sum_check = get_int(&conn, "SELECT COUNT(*) FROM wal_test WHERE val LIKE 'data_%'").unwrap();
+        let sum_check = get_int(
+            &conn,
+            "SELECT COUNT(*) FROM wal_test WHERE val LIKE 'data_%'",
+        )
+        .unwrap();
         assert_eq!(sum_check, 100, "W1: data corruption detected");
     }
 
@@ -130,11 +137,14 @@ fn w2_repeated_crash_restart() {
         );
 
         // No uncommitted rows should exist
-        let crash_rows = get_int(&conn, "SELECT COUNT(*) FROM cycles WHERE cycle_num = -1").unwrap();
+        let crash_rows =
+            get_int(&conn, "SELECT COUNT(*) FROM cycles WHERE cycle_num = -1").unwrap();
         assert_eq!(crash_rows, 0, "W2: uncommitted crash rows leaked through");
     }
 
-    eprintln!("W2: {total_cycles} crash-restart cycles — all committed data survives, no uncommitted leaks");
+    eprintln!(
+        "W2: {total_cycles} crash-restart cycles — all committed data survives, no uncommitted leaks"
+    );
 }
 
 // ─── W3: Checkpoint doesn't lose data ─────────────────────────────
@@ -229,7 +239,10 @@ fn w4_large_transaction_recovery() {
 
         let sum = get_int(&conn, "SELECT SUM(val) FROM large_txn").unwrap();
         // sum(i*3 for i in 1..=10000) = 3 * 10000*10001/2 = 150_015_000
-        assert_eq!(sum, 150_015_000, "W4: data corruption in large txn recovery");
+        assert_eq!(
+            sum, 150_015_000,
+            "W4: data corruption in large txn recovery"
+        );
     }
 
     eprintln!("W4: 10 large transactions (1000 rows each) — full recovery verified");
@@ -255,7 +268,11 @@ fn w5_interleaved_commit_rollback() {
             conn.execute("BEGIN").expect("begin");
             conn.execute(&format!(
                 "INSERT INTO interleaved VALUES ({id}, '{}')",
-                if round % 2 == 0 { "committed" } else { "rolled_back" }
+                if round % 2 == 0 {
+                    "committed"
+                } else {
+                    "rolled_back"
+                }
             ))
             .expect("insert");
 

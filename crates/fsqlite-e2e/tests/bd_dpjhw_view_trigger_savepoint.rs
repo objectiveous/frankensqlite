@@ -27,7 +27,9 @@ fn csqlite_conn() -> rusqlite::Connection {
 
 fn csqlite_query_count(conn: &rusqlite::Connection, sql: &str) -> usize {
     let mut stmt = conn.prepare(sql).expect("csqlite prepare");
-    stmt.query_map([], |_| Ok(())).expect("csqlite query").count()
+    stmt.query_map([], |_| Ok(()))
+        .expect("csqlite query")
+        .count()
 }
 
 // ─── V1: Basic VIEW + trigger + SAVEPOINT ROLLBACK ──────────────────
@@ -106,7 +108,10 @@ fn v2_view_trigger_savepoint_oracle_parity() {
     .expect("csqlite savepoint cycle");
 
     let c_after = csqlite_query_count(&c, "SELECT * FROM v_log");
-    assert_eq!(c_before, c_after, "csqlite oracle: view count must not change");
+    assert_eq!(
+        c_before, c_after,
+        "csqlite oracle: view count must not change"
+    );
 
     // FrankenSQLite
     let f = open_conn();
@@ -180,7 +185,8 @@ fn v3_nested_savepoint_trigger_view() {
     assert_eq!(mid, 3);
 
     // Rollback outer — both outer and inner inserts should revert
-    conn.execute("ROLLBACK TO sp_outer").expect("rollback outer");
+    conn.execute("ROLLBACK TO sp_outer")
+        .expect("rollback outer");
     conn.execute("RELEASE sp_outer").expect("release outer");
 
     let after = conn.query("SELECT * FROM v_audit").expect("after").len();
@@ -198,12 +204,12 @@ fn v4_update_trigger_view_rollback() {
 
     conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER)")
         .expect("create");
-    conn.execute("CREATE TABLE balance_history (acct_id INTEGER, old_bal INTEGER, new_bal INTEGER)")
-        .expect("create history");
     conn.execute(
-        "CREATE VIEW v_history AS SELECT acct_id, old_bal, new_bal FROM balance_history",
+        "CREATE TABLE balance_history (acct_id INTEGER, old_bal INTEGER, new_bal INTEGER)",
     )
-    .expect("create view");
+    .expect("create history");
+    conn.execute("CREATE VIEW v_history AS SELECT acct_id, old_bal, new_bal FROM balance_history")
+        .expect("create view");
     conn.execute(
         "CREATE TRIGGER t_history AFTER UPDATE ON accounts \
          BEGIN INSERT INTO balance_history VALUES (NEW.id, OLD.balance, NEW.balance); END",
@@ -293,7 +299,8 @@ fn v6_multi_trigger_view_rollback() {
         .expect("create log");
     conn.execute("CREATE TABLE stats (total_orders INTEGER)")
         .expect("create stats");
-    conn.execute("INSERT INTO stats VALUES (0)").expect("seed stats");
+    conn.execute("INSERT INTO stats VALUES (0)")
+        .expect("seed stats");
 
     conn.execute("CREATE VIEW v_log AS SELECT order_id, phase FROM order_log")
         .expect("create view");

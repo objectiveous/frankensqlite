@@ -21,13 +21,15 @@
 //! For the concurrent-open variant, Connection B opens while Connection A
 //! is still writing (before the crash), exercising the recovery fencing path.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use fsqlite::Connection;
 
 fn test_tmpdir() -> tempfile::TempDir {
-    tempfile::tempdir_in(std::env::temp_dir()).or_else(|_| tempfile::tempdir_in(".")).expect("tempdir")
+    tempfile::tempdir_in(std::env::temp_dir())
+        .or_else(|_| tempfile::tempdir_in("."))
+        .expect("tempdir")
 }
 
 fn query_count(conn: &Connection, sql: &str) -> usize {
@@ -283,7 +285,10 @@ fn r4_integrity_check_after_recovery() {
     let check = recovery.query("PRAGMA integrity_check");
     match check {
         Ok(rows) => {
-            assert!(!rows.is_empty(), "integrity_check must return at least one row");
+            assert!(
+                !rows.is_empty(),
+                "integrity_check must return at least one row"
+            );
         }
         Err(e) => {
             // If PRAGMA isn't fully supported, skip gracefully

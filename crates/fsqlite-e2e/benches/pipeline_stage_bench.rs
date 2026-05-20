@@ -35,10 +35,8 @@ fn setup_fsqlite() -> fsqlite::Connection {
 
 fn setup_csqlite() -> rusqlite::Connection {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-        "CREATE TABLE bench (id INTEGER PRIMARY KEY, val INTEGER, label TEXT);",
-    )
-    .unwrap();
+    conn.execute_batch("CREATE TABLE bench (id INTEGER PRIMARY KEY, val INTEGER, label TEXT);")
+        .unwrap();
     conn.execute_batch("BEGIN;").unwrap();
     {
         let mut stmt = conn
@@ -245,17 +243,17 @@ fn bench_insert_single(c: &mut Criterion) {
         let mut counter = 0i64;
         b.iter(|| {
             counter += 1;
-            conn.execute(&format!("INSERT INTO insert_bench VALUES ({counter}, {counter})"))
-                .unwrap();
+            conn.execute(&format!(
+                "INSERT INTO insert_bench VALUES ({counter}, {counter})"
+            ))
+            .unwrap();
         });
     });
 
     group.bench_function("csqlite", |b| {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE insert_bench (id INTEGER PRIMARY KEY, val INTEGER);",
-        )
-        .unwrap();
+        conn.execute_batch("CREATE TABLE insert_bench (id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
         let mut counter = 0i64;
         b.iter(|| {
             counter += 1;

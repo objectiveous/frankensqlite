@@ -142,11 +142,7 @@ fn q2_collision_chain() {
     emit_log(tn, "start", json!({}));
 
     let shard_count = 4usize;
-    let cache = ShardedPageCache::with_max_buffers_and_shards(
-        PageSize::DEFAULT,
-        512,
-        shard_count,
-    );
+    let cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 512, shard_count);
 
     // Insert pages that will hash to the same shard (sequential pages mod shard_count)
     let pages_per_shard = 50u32;
@@ -183,7 +179,11 @@ fn q2_collision_chain() {
         }),
     );
 
-    assert_eq!(found_count, u64::from(total_pages), "[Q2] some pages not found");
+    assert_eq!(
+        found_count,
+        u64::from(total_pages),
+        "[Q2] some pages not found"
+    );
     assert_eq!(mismatches, 0, "[Q2] data corruption in collision chain");
 }
 
@@ -432,10 +432,7 @@ fn q6_concurrent_reads() {
         total_mismatches, 0,
         "[Q6] data corruption under concurrent reads"
     );
-    assert!(
-        total_hits > 0,
-        "[Q6] expected at least some cache hits"
-    );
+    assert!(total_hits > 0, "[Q6] expected at least some cache hits");
 }
 
 // ─── Q7: 10K INSERT E2E oracle comparison ────────────────────────────
@@ -453,9 +450,7 @@ fn q7_e2e_insert_10k_oracle() {
         .execute("CREATE TABLE cache_test (id INTEGER PRIMARY KEY, val INTEGER, label TEXT)")
         .unwrap();
     cconn
-        .execute_batch(
-            "CREATE TABLE cache_test (id INTEGER PRIMARY KEY, val INTEGER, label TEXT);",
-        )
+        .execute_batch("CREATE TABLE cache_test (id INTEGER PRIMARY KEY, val INTEGER, label TEXT);")
         .unwrap();
 
     let insert_start = Instant::now();
@@ -554,8 +549,10 @@ fn q8_e2e_concurrent_writers() {
     // Setup: create table on a fresh connection
     {
         let conn = fsqlite::Connection::open(&path_str).unwrap();
-        conn.execute("CREATE TABLE writers (tid INTEGER, seq INTEGER, val INTEGER, PRIMARY KEY (tid, seq))")
-            .unwrap();
+        conn.execute(
+            "CREATE TABLE writers (tid INTEGER, seq INTEGER, val INTEGER, PRIMARY KEY (tid, seq))",
+        )
+        .unwrap();
     }
 
     let barrier = Arc::new(Barrier::new(thread_count));
@@ -583,9 +580,7 @@ fn q8_e2e_concurrent_writers() {
                         for s in seq..end {
                             let val = tid as i64 * 10000 + s;
                             if conn
-                                .execute(&format!(
-                                    "INSERT INTO writers VALUES ({tid}, {s}, {val})"
-                                ))
+                                .execute(&format!("INSERT INTO writers VALUES ({tid}, {s}, {val})"))
                                 .is_err()
                             {
                                 batch_ok = false;
@@ -628,9 +623,7 @@ fn q8_e2e_concurrent_writers() {
 
     // Verify: open fresh connection, count rows, check no duplicates
     let verify_conn = fsqlite::Connection::open(&path_str).unwrap();
-    let count_rows = verify_conn
-        .query("SELECT COUNT(*) FROM writers")
-        .unwrap();
+    let count_rows = verify_conn.query("SELECT COUNT(*) FROM writers").unwrap();
     let actual_count = match &count_rows[0].values()[0] {
         fsqlite_types::value::SqliteValue::Integer(n) => *n,
         other => panic!("unexpected count: {other:?}"),

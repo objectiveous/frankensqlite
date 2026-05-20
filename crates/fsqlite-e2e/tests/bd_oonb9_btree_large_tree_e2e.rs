@@ -13,8 +13,8 @@
 //! - L6: Multi-table large tree interaction
 //! - L7: Concurrent insert/delete on large tree
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use fsqlite::Connection;
@@ -127,10 +127,7 @@ fn l2_insert_then_delete_half() {
 
     // Cross-connection check
     let reader = Connection::open(path_str).expect("reader");
-    assert_eq!(
-        get_int(&reader, "SELECT COUNT(*) FROM tree").unwrap(),
-        2500
-    );
+    assert_eq!(get_int(&reader, "SELECT COUNT(*) FROM tree").unwrap(), 2500);
 
     eprintln!("L2: insert 5000, delete 2500 evens — tree integrity verified");
 }
@@ -207,10 +204,8 @@ fn l4_secondary_index_consistency() {
     conn.execute("BEGIN").expect("begin");
     for i in 1..=3000 {
         let key = format!("key_{:05}", i % 100);
-        conn.execute(&format!(
-            "INSERT INTO idx_tbl VALUES ({i}, '{key}', {i})"
-        ))
-        .expect("insert");
+        conn.execute(&format!("INSERT INTO idx_tbl VALUES ({i}, '{key}', {i})"))
+            .expect("insert");
     }
     conn.execute("COMMIT").expect("commit");
 
@@ -236,7 +231,10 @@ fn l4_secondary_index_consistency() {
         .expect("delete via index");
 
     let after_delete = get_int(&conn, "SELECT COUNT(*) FROM idx_tbl").unwrap();
-    assert_eq!(after_delete, 2970, "L4: should have 2970 after deleting key_00000");
+    assert_eq!(
+        after_delete, 2970,
+        "L4: should have 2970 after deleting key_00000"
+    );
 
     // Verify index still consistent
     let zero_count = get_int(
@@ -288,11 +286,7 @@ fn l5_insert_delete_reinsert_cycles() {
     assert_eq!(final_count, 250);
 
     // All remaining rows should be from cycle 9
-    let cycle_check = get_int(
-        &conn,
-        "SELECT COUNT(*) FROM cycling WHERE cycle = 9",
-    )
-    .unwrap();
+    let cycle_check = get_int(&conn, "SELECT COUNT(*) FROM cycling WHERE cycle = 9").unwrap();
     assert_eq!(cycle_check, 250, "L5: remaining rows should all be cycle 9");
 
     eprintln!("L5: 10 insert/delete/reinsert cycles — tree integrity maintained");
@@ -407,8 +401,7 @@ fn l7_concurrent_insert_delete_large_tree() {
         let mut deleted = 0u64;
         while !del_stop.load(Ordering::Relaxed) {
             if conn.execute("BEGIN").is_ok() {
-                conn.execute("DELETE FROM contended WHERE id > 5000")
-                    .ok();
+                conn.execute("DELETE FROM contended WHERE id > 5000").ok();
                 if conn.execute("COMMIT").is_ok() {
                     deleted += 1;
                 } else {
@@ -427,11 +420,7 @@ fn l7_concurrent_insert_delete_large_tree() {
 
     // Verify original 1000 rows survive
     let verify = Connection::open(path_str).expect("verify");
-    let original = get_int(
-        &verify,
-        "SELECT COUNT(*) FROM contended WHERE id <= 1000",
-    )
-    .unwrap();
+    let original = get_int(&verify, "SELECT COUNT(*) FROM contended WHERE id <= 1000").unwrap();
     assert_eq!(
         original, 1000,
         "L7: original 1000 rows damaged by concurrent ops"

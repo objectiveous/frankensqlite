@@ -23,8 +23,8 @@
 //! - S4: View + trigger interaction under concurrent DDL
 //! - S5: Schema cache coherence after concurrent DDL storm
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use fsqlite::Connection;
@@ -348,11 +348,9 @@ fn s5_schema_coherence_after_storm() {
                     // Query via view
                     conn.query(&format!("SELECT * FROM v_{name}")).ok();
                     // Drop view
-                    conn.execute(&format!("DROP VIEW IF EXISTS v_{name}"))
-                        .ok();
+                    conn.execute(&format!("DROP VIEW IF EXISTS v_{name}")).ok();
                     // Drop table
-                    conn.execute(&format!("DROP TABLE IF EXISTS {name}"))
-                        .ok();
+                    conn.execute(&format!("DROP TABLE IF EXISTS {name}")).ok();
                     ops += 1;
                 }
                 td.fetch_add(ops, Ordering::Relaxed);

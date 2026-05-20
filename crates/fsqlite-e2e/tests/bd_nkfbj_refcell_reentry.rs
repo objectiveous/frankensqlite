@@ -180,7 +180,9 @@ fn t5_nested_trigger_chain() {
     conn.execute("INSERT INTO messages VALUES (1, 'hello')")
         .expect("nested trigger chain should not panic");
 
-    let rows = conn.query("SELECT total_msgs FROM stats").expect("query stats");
+    let rows = conn
+        .query("SELECT total_msgs FROM stats")
+        .expect("query stats");
     assert_eq!(rows.len(), 1);
 }
 
@@ -217,10 +219,8 @@ fn t6_multi_row_insert_trigger_per_row() {
 fn t7_trigger_updates_same_table() {
     let conn = open_conn();
 
-    conn.execute(
-        "CREATE TABLE counters (id INTEGER PRIMARY KEY, val INTEGER, last_update TEXT)",
-    )
-    .expect("create counters");
+    conn.execute("CREATE TABLE counters (id INTEGER PRIMARY KEY, val INTEGER, last_update TEXT)")
+        .expect("create counters");
 
     // AFTER UPDATE trigger that updates a different column of the same row.
     // This is the most dangerous re-entrancy case: same table, same RefCell path.
@@ -291,10 +291,8 @@ fn t8_mam_rust_118_send_message_scenario() {
     // The send_message operation: INSERT into messages fires both triggers.
     // Trigger 1: UPDATE conversations (same MemDatabase borrow path)
     // Trigger 2: INSERT read_receipts (another MemDatabase borrow path)
-    conn.execute(
-        "INSERT INTO messages VALUES (1, 1, 'alice', 'Hello!', '2026-01-15T10:00:00')",
-    )
-    .expect("send_message must not panic (mam_rust #118)");
+    conn.execute("INSERT INTO messages VALUES (1, 1, 'alice', 'Hello!', '2026-01-15T10:00:00')")
+        .expect("send_message must not panic (mam_rust #118)");
 
     // Verify all side effects
     let conv = conn
@@ -308,10 +306,8 @@ fn t8_mam_rust_118_send_message_scenario() {
     assert_eq!(receipts.len(), 1, "self-read receipt must exist");
 
     // Send a second message to verify repeated trigger firing
-    conn.execute(
-        "INSERT INTO messages VALUES (2, 1, 'bob', 'Hi Alice!', '2026-01-15T10:01:00')",
-    )
-    .expect("second send_message must not panic");
+    conn.execute("INSERT INTO messages VALUES (2, 1, 'bob', 'Hi Alice!', '2026-01-15T10:01:00')")
+        .expect("second send_message must not panic");
 
     let conv2 = conn
         .query("SELECT msg_count FROM conversations WHERE id = 1")
@@ -548,9 +544,7 @@ fn t14_two_conn_schema_change_then_trigger() {
         .execute("INSERT INTO data (id, val) VALUES (2, 'after-alter')")
         .expect("conn1 insert after conn2 ALTER should not panic");
 
-    let rows = conn1
-        .query("SELECT COUNT(*) FROM log")
-        .expect("query log");
+    let rows = conn1.query("SELECT COUNT(*) FROM log").expect("query log");
     assert_eq!(rows.len(), 1);
 }
 
@@ -694,7 +688,8 @@ fn t17_full_doctor_repair_then_send_message() {
         .expect("drop trigger 2");
     conn.execute("DROP TABLE read_receipts").expect("drop rr");
     conn.execute("DROP TABLE messages").expect("drop msgs");
-    conn.execute("DROP TABLE conversations").expect("drop convs");
+    conn.execute("DROP TABLE conversations")
+        .expect("drop convs");
 
     // Recreate with identical schema (normalize = schema is canonical)
     conn.execute(

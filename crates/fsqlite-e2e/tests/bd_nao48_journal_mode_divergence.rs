@@ -39,14 +39,8 @@ fn j1_journal_mode_returns_value() {
     let rows = conn
         .query("PRAGMA journal_mode")
         .expect("journal_mode query");
-    assert!(
-        !rows.is_empty(),
-        "PRAGMA journal_mode returned no rows"
-    );
-    eprintln!(
-        "J1: PRAGMA journal_mode returned {} row(s)",
-        rows.len()
-    );
+    assert!(!rows.is_empty(), "PRAGMA journal_mode returned no rows");
+    eprintln!("J1: PRAGMA journal_mode returned {} row(s)", rows.len());
 }
 
 // ─── J2: WAL-mode concurrent read+write ────────────────────────────
@@ -90,7 +84,10 @@ fn j2_concurrent_read_write() {
         "reader should see at least 100 rows after concurrent write"
     );
 
-    eprintln!("J2: concurrent read+write works, reader sees {} rows", r_rows_after.len());
+    eprintln!(
+        "J2: concurrent read+write works, reader sees {} rows",
+        r_rows_after.len()
+    );
 }
 
 // ─── J3: Multiple readers during write ─────────────────────────────

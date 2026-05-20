@@ -56,22 +56,22 @@ fn s1_integer_size_boundaries() {
         1,
         -1,
         127,
-        -128,           // i8 boundaries
+        -128, // i8 boundaries
         128,
         -129,
         32767,
-        -32768,         // i16 boundaries
+        -32768, // i16 boundaries
         32768,
         -32769,
         8388607,
-        -8388608,       // i24 boundaries
+        -8388608, // i24 boundaries
         2147483647,
-        -2147483648,    // i32 boundaries
+        -2147483648, // i32 boundaries
         2147483648,
         -2147483649,
         140737488355327, // i48 boundary
         i64::MAX,
-        i64::MIN,       // i64 boundaries
+        i64::MIN, // i64 boundaries
     ];
 
     f.execute("BEGIN").expect("f begin");
@@ -88,11 +88,9 @@ fn s1_integer_size_boundaries() {
         let id = (i + 1) as i64;
         let f_val = get_int(&f, &format!("SELECT val FROM ints WHERE id = {id}"));
         let c_val: i64 = c
-            .query_row(
-                &format!("SELECT val FROM ints WHERE id = {id}"),
-                [],
-                |r| r.get(0),
-            )
+            .query_row(&format!("SELECT val FROM ints WHERE id = {id}"), [], |r| {
+                r.get(0)
+            })
             .expect("c query");
 
         assert_eq!(
@@ -103,7 +101,10 @@ fn s1_integer_size_boundaries() {
         assert_eq!(f_val, Some(expected), "S1: id={id} roundtrip failed");
     }
 
-    eprintln!("S1: {} integer boundary values roundtrip correctly", values.len());
+    eprintln!(
+        "S1: {} integer boundary values roundtrip correctly",
+        values.len()
+    );
 }
 
 // ─── S2: Mixed NULLs and non-NULLs ───────────────────────────────
@@ -136,7 +137,10 @@ fn s2_mixed_nulls() {
         ("SELECT COUNT(*) FROM nulls WHERE b IS NULL", "b-null"),
         ("SELECT COUNT(*) FROM nulls WHERE c IS NULL", "c-null"),
         ("SELECT COUNT(*) FROM nulls WHERE d IS NULL", "d-null"),
-        ("SELECT COUNT(*) FROM nulls WHERE a IS NOT NULL", "a-notnull"),
+        (
+            "SELECT COUNT(*) FROM nulls WHERE a IS NOT NULL",
+            "a-notnull",
+        ),
     ];
 
     for (sql, label) in &null_checks {
@@ -159,9 +163,7 @@ fn s3_wide_table() {
     let conn = Connection::open(path_str).expect("open");
 
     // Create table with 100 INTEGER columns
-    let cols: Vec<String> = (0..100)
-        .map(|i| format!("c{i} INTEGER"))
-        .collect();
+    let cols: Vec<String> = (0..100).map(|i| format!("c{i} INTEGER")).collect();
     let ddl = format!(
         "CREATE TABLE wide (id INTEGER PRIMARY KEY, {})",
         cols.join(", ")
@@ -170,14 +172,13 @@ fn s3_wide_table() {
 
     // Insert a row with all 100 columns set
     let vals: Vec<String> = (0..100).map(|i| format!("{}", i * 7)).collect();
-    let insert = format!(
-        "INSERT INTO wide VALUES (1, {})",
-        vals.join(", ")
-    );
+    let insert = format!("INSERT INTO wide VALUES (1, {})", vals.join(", "));
     conn.execute(&insert).expect("insert wide");
 
     // Read back and verify
-    let rows = conn.query("SELECT * FROM wide WHERE id = 1").expect("query");
+    let rows = conn
+        .query("SELECT * FROM wide WHERE id = 1")
+        .expect("query");
     assert_eq!(rows.len(), 1, "S3: should have 1 row");
 
     let row = &rows[0];
@@ -206,7 +207,8 @@ fn s4_large_integer_sequence() {
     let dir = test_tmpdir();
     let (f, c) = setup_pair(&dir, "s4");
 
-    let ddl = "CREATE TABLE seq (id INTEGER PRIMARY KEY, small INTEGER, medium INTEGER, big INTEGER)";
+    let ddl =
+        "CREATE TABLE seq (id INTEGER PRIMARY KEY, small INTEGER, medium INTEGER, big INTEGER)";
     f.execute(ddl).expect("f create");
     c.execute_batch(ddl).expect("c create");
 
@@ -236,7 +238,10 @@ fn s4_large_integer_sequence() {
             .prepare(sql)
             .ok()
             .and_then(|mut s| s.query_row([], |r| r.get(0)).ok());
-        assert_eq!(f_val, c_val, "S4: mismatch for {sql} — f={f_val:?}, c={c_val:?}");
+        assert_eq!(
+            f_val, c_val,
+            "S4: mismatch for {sql} — f={f_val:?}, c={c_val:?}"
+        );
     }
 
     eprintln!("S4: 10K rows with mixed integer sizes — oracle parity");
@@ -285,7 +290,9 @@ fn s5_real_precision() {
                     "S5: id={id} precision loss: got {v}, expected {expected}"
                 );
             }
-            Some(SqliteValue::Integer(v)) if expected == 0.0 || expected == 1.0 || expected == -1.0 => {
+            Some(SqliteValue::Integer(v))
+                if expected == 0.0 || expected == 1.0 || expected == -1.0 =>
+            {
                 let v_f = *v as f64;
                 assert!(
                     (v_f - expected).abs() < 1e-10,
@@ -346,7 +353,10 @@ fn s6_text_encoding_edges() {
         );
     }
 
-    eprintln!("S6: {} text encoding edge cases — oracle parity", test_strings.len());
+    eprintln!(
+        "S6: {} text encoding edge cases — oracle parity",
+        test_strings.len()
+    );
 }
 
 // ─── S7: BLOB roundtrip ──────────────────────────────────────────
@@ -406,5 +416,8 @@ fn s7_blob_roundtrip() {
         );
     }
 
-    eprintln!("S7: {} blob roundtrip values — oracle parity", test_blobs.len());
+    eprintln!(
+        "S7: {} blob roundtrip values — oracle parity",
+        test_blobs.len()
+    );
 }

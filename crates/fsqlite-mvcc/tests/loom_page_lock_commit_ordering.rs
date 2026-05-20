@@ -27,8 +27,8 @@
 
 #[cfg(loom)]
 mod loom_tests {
-    use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use loom::sync::Arc;
+    use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use loom::thread;
 
     /// Model of a single page slot in the commit pipeline.
@@ -159,9 +159,9 @@ mod loom_tests {
                     m.data_written.store(1, Ordering::Relaxed);
                     m.fsync_done.store(true, Ordering::Release);
                     m.commit_idx.store(1, Ordering::Release);
-                    let _ = m
-                        .page_lock
-                        .compare_exchange(txn, 0, Ordering::AcqRel, Ordering::Relaxed);
+                    let _ =
+                        m.page_lock
+                            .compare_exchange(txn, 0, Ordering::AcqRel, Ordering::Relaxed);
                 }
             });
 
@@ -177,9 +177,9 @@ mod loom_tests {
                     m.data_written.store(2, Ordering::Relaxed);
                     m.fsync_done.store(true, Ordering::Release);
                     m.commit_idx.store(2, Ordering::Release);
-                    let _ = m
-                        .page_lock
-                        .compare_exchange(txn, 0, Ordering::AcqRel, Ordering::Relaxed);
+                    let _ =
+                        m.page_lock
+                            .compare_exchange(txn, 0, Ordering::AcqRel, Ordering::Relaxed);
                 }
             });
 
@@ -336,10 +336,7 @@ mod loom_tests {
                          but fsync_done=false"
                     );
                     let d = r_data.load(Ordering::Acquire);
-                    assert!(
-                        d > 0,
-                        "INVARIANT VIOLATION: saw commit but data_written=0"
-                    );
+                    assert!(d > 0, "INVARIANT VIOLATION: saw commit but data_written=0");
                 }
             });
 
@@ -383,10 +380,7 @@ mod loom_tests {
                     let val = w2_data.load(Ordering::Relaxed);
                     // val can be 0 (w1 hasn't written yet) or 42 (w1 wrote)
                     // but NOT any other value — no torn reads.
-                    assert!(
-                        val == 0 || val == 42,
-                        "unexpected data value: {val}"
-                    );
+                    assert!(val == 0 || val == 42, "unexpected data value: {val}");
                     let _ = w2_lock.compare_exchange(2, 0, Ordering::AcqRel, Ordering::Relaxed);
                 }
             });
@@ -403,8 +397,8 @@ mod loom_tests {
 
 #[cfg(not(loom))]
 mod std_tests {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 
     /// Smoke test: correct ordering works under std atomics.
     #[test]

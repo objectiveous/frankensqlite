@@ -44,10 +44,8 @@ fn seed_table(conn: &Connection, table: &str, n: usize) {
     .expect("create");
     conn.execute("BEGIN").expect("begin");
     for i in 1..=n {
-        conn.execute(&format!(
-            "INSERT INTO {table} VALUES ({i}, {i}, 'tag_{i}')"
-        ))
-        .expect("seed");
+        conn.execute(&format!("INSERT INTO {table} VALUES ({i}, {i}, 'tag_{i}')"))
+            .expect("seed");
     }
     conn.execute("COMMIT").expect("commit");
 }
@@ -118,11 +116,21 @@ fn u2_batch_update_with_filter() {
     // Verify odd rows retain original values
     let odd_sum = get_int(&conn, "SELECT SUM(val) FROM data WHERE id % 2 = 1");
     // Sum of 1,3,5,...,999 = 250_000
-    assert_eq!(odd_sum, Some(250_000), "U2: odd rows should retain original values");
+    assert_eq!(
+        odd_sum,
+        Some(250_000),
+        "U2: odd rows should retain original values"
+    );
 
     // Verify even rows all have -1
-    let even_check = count_rows(&conn, "SELECT * FROM data WHERE id % 2 = 0 AND val = -1 AND tag = 'even'");
-    assert_eq!(even_check, 500, "U2: all even rows should have val=-1, tag='even'");
+    let even_check = count_rows(
+        &conn,
+        "SELECT * FROM data WHERE id % 2 = 0 AND val = -1 AND tag = 'even'",
+    );
+    assert_eq!(
+        even_check, 500,
+        "U2: all even rows should have val=-1, tag='even'"
+    );
 
     eprintln!("U2: filtered UPDATE — 500 even rows updated, 500 odd untouched");
 }
@@ -139,9 +147,12 @@ fn u3_update_arithmetic_expression() {
     seed_table(&conn, "data", 1000);
 
     // Multiple chained updates
-    conn.execute("UPDATE data SET val = val + 10").expect("add 10");
-    conn.execute("UPDATE data SET val = val * 3").expect("multiply 3");
-    conn.execute("UPDATE data SET val = val - 5").expect("subtract 5");
+    conn.execute("UPDATE data SET val = val + 10")
+        .expect("add 10");
+    conn.execute("UPDATE data SET val = val * 3")
+        .expect("multiply 3");
+    conn.execute("UPDATE data SET val = val - 5")
+        .expect("subtract 5");
 
     // val_final = (val_orig + 10) * 3 - 5
     // For id=1: (1+10)*3-5 = 28
@@ -150,11 +161,19 @@ fn u3_update_arithmetic_expression() {
 
     // For id=100: (100+10)*3-5 = 325
     let row100 = get_int(&conn, "SELECT val FROM data WHERE id = 100");
-    assert_eq!(row100, Some(325), "U3: row 100 should be (100+10)*3-5 = 325");
+    assert_eq!(
+        row100,
+        Some(325),
+        "U3: row 100 should be (100+10)*3-5 = 325"
+    );
 
     // For id=1000: (1000+10)*3-5 = 3025
     let row1000 = get_int(&conn, "SELECT val FROM data WHERE id = 1000");
-    assert_eq!(row1000, Some(3025), "U3: row 1000 should be (1000+10)*3-5 = 3025");
+    assert_eq!(
+        row1000,
+        Some(3025),
+        "U3: row 1000 should be (1000+10)*3-5 = 3025"
+    );
 
     eprintln!("U3: chained arithmetic UPDATE verified");
 }
@@ -267,7 +286,10 @@ fn d3_delete_all_rows() {
 
     // Table should still exist (not dropped)
     let reinsert = conn.execute("INSERT INTO data VALUES (1, 1, 'reinserted')");
-    assert!(reinsert.is_ok(), "D3: should be able to INSERT after DELETE all");
+    assert!(
+        reinsert.is_ok(),
+        "D3: should be able to INSERT after DELETE all"
+    );
 
     assert_eq!(count_rows(&conn, "SELECT * FROM data"), 1);
 
@@ -356,9 +378,7 @@ fn m1_interleaved_operations_oracle() {
         "M1: modified count diverges — fsqlite={f_mod}, csqlite={c_mod}"
     );
 
-    eprintln!(
-        "M1: oracle parity — {f_count} rows, sum={f_sum}, modified={f_mod}"
-    );
+    eprintln!("M1: oracle parity — {f_count} rows, sum={f_sum}, modified={f_mod}");
 }
 
 // ─── M2: Concurrent UPDATE+DELETE from separate connections ───────
@@ -385,10 +405,8 @@ fn m2_concurrent_update_delete() {
         while !u_stop.load(std::sync::atomic::Ordering::Relaxed) {
             let target = (ops % 1000) + 1;
             if conn.execute("BEGIN").is_ok() {
-                conn.execute(&format!(
-                    "UPDATE data SET val = {ops} WHERE id = {target}"
-                ))
-                .ok();
+                conn.execute(&format!("UPDATE data SET val = {ops} WHERE id = {target}"))
+                    .ok();
                 if conn.execute("COMMIT").is_err() {
                     conn.execute("ROLLBACK").ok();
                 }
@@ -460,8 +478,10 @@ fn m3_update_delete_rollback() {
 
     // Transaction with UPDATE + DELETE, then ROLLBACK
     conn.execute("BEGIN").expect("begin");
-    conn.execute("UPDATE data SET val = 999999").expect("update");
-    conn.execute("DELETE FROM data WHERE id > 50").expect("delete");
+    conn.execute("UPDATE data SET val = 999999")
+        .expect("update");
+    conn.execute("DELETE FROM data WHERE id > 50")
+        .expect("delete");
 
     // Inside txn: should see modifications
     let txn_count = count_rows(&conn, "SELECT * FROM data");
@@ -473,7 +493,10 @@ fn m3_update_delete_rollback() {
     let after_sum = get_int(&conn, "SELECT SUM(val) FROM data").unwrap();
     let after_count = count_rows(&conn, "SELECT * FROM data");
 
-    assert_eq!(after_count, orig_count, "M3: rollback should restore row count");
+    assert_eq!(
+        after_count, orig_count,
+        "M3: rollback should restore row count"
+    );
     assert_eq!(after_sum, orig_sum, "M3: rollback should restore SUM(val)");
 
     eprintln!("M3: UPDATE+DELETE+ROLLBACK — original state fully restored");
@@ -508,14 +531,20 @@ fn m4_delete_then_insert_space_reuse() {
 
     // Full table again
     let final_count = count_rows(&conn, "SELECT * FROM data");
-    assert_eq!(final_count, 5000, "M4: should have 5000 rows after reinsert");
+    assert_eq!(
+        final_count, 5000,
+        "M4: should have 5000 rows after reinsert"
+    );
 
     // Verify reinserted data
     let reinserted = count_rows(&conn, "SELECT * FROM data WHERE tag = 'reinserted'");
     assert_eq!(reinserted, 4900, "M4: 4900 should be reinserted");
 
     // Verify original data preserved
-    let original = count_rows(&conn, "SELECT * FROM data WHERE id <= 100 AND tag != 'reinserted'");
+    let original = count_rows(
+        &conn,
+        "SELECT * FROM data WHERE id <= 100 AND tag != 'reinserted'",
+    );
     assert_eq!(original, 100, "M4: original 100 rows should be preserved");
 
     // Cross-connection check

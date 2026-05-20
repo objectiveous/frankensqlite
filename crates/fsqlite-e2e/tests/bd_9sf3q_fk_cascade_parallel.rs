@@ -16,8 +16,8 @@
 //! - F4: FK SET NULL under concurrent child inserts
 //! - F5: Rapid parent delete/reinsert with child references
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use fsqlite::Connection;
@@ -32,10 +32,8 @@ fn test_tmpdir() -> tempfile::TempDir {
 
 fn setup_fk_schema(conn: &Connection) {
     conn.execute("PRAGMA foreign_keys = ON").expect("fk on");
-    conn.execute(
-        "CREATE TABLE parents (id INTEGER PRIMARY KEY, name TEXT)",
-    )
-    .expect("create parents");
+    conn.execute("CREATE TABLE parents (id INTEGER PRIMARY KEY, name TEXT)")
+        .expect("create parents");
     conn.execute(
         "CREATE TABLE children (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parents(id) ON DELETE CASCADE, val TEXT)",
     )
@@ -228,15 +226,11 @@ fn f2_multi_level_cascade() {
                     .is_ok()
                 {
                     let l2id = l1id * 100;
-                    conn.execute(&format!(
-                        "INSERT INTO l2 VALUES ({l2id}, {l1id}, 'new_l2')"
-                    ))
-                    .ok();
+                    conn.execute(&format!("INSERT INTO l2 VALUES ({l2id}, {l1id}, 'new_l2')"))
+                        .ok();
                     let l3id = l2id * 100;
-                    conn.execute(&format!(
-                        "INSERT INTO l3 VALUES ({l3id}, {l2id}, 'new_l3')"
-                    ))
-                    .ok();
+                    conn.execute(&format!("INSERT INTO l3 VALUES ({l3id}, {l2id}, 'new_l3')"))
+                        .ok();
                 }
                 if conn.execute("COMMIT").is_err() {
                     conn.execute("ROLLBACK").ok();
@@ -304,8 +298,7 @@ fn f3_cascade_same_parent_contention() {
                     // Occasionally delete the parent (cascade) then re-add
                     if local_ops % 50 == 0 {
                         if conn.execute("BEGIN").is_ok() {
-                            conn.execute("DELETE FROM parents WHERE id = 1")
-                                .ok();
+                            conn.execute("DELETE FROM parents WHERE id = 1").ok();
                             conn.execute("INSERT OR IGNORE INTO parents VALUES (1, 'hot_parent')")
                                 .ok();
                             if conn.execute("COMMIT").is_err() {
@@ -324,7 +317,8 @@ fn f3_cascade_same_parent_contention() {
     stop.store(true, Ordering::Relaxed);
 
     for t in threads {
-        t.join().expect("thread must not panic during FK contention");
+        t.join()
+            .expect("thread must not panic during FK contention");
     }
 
     let ops = total_ops.load(Ordering::Relaxed);
@@ -425,7 +419,10 @@ fn f4_fk_set_null_concurrent_inserts() {
     let verify = Connection::open(path_str).expect("verify");
     verify.execute("PRAGMA foreign_keys = ON").ok();
     let fk_ok = verify_fk_integrity(&verify);
-    assert!(fk_ok, "FK VIOLATED: SET NULL concurrent inserts left violations");
+    assert!(
+        fk_ok,
+        "FK VIOLATED: SET NULL concurrent inserts left violations"
+    );
     eprintln!("F4: {inserted} inserts, {deleted} SET NULL cycles, FK OK");
 }
 

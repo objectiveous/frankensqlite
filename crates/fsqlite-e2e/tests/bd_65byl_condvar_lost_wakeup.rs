@@ -33,8 +33,8 @@
 //! - W3: Many waiters for same page — all wake up when holder releases
 //! - W4: Mixed page locks with cross-page notification
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use fsqlite::Connection;
@@ -218,7 +218,9 @@ fn w3_readers_dont_starve() {
             if conn.execute("BEGIN").is_ok() {
                 let id = (writes % 100) + 1;
                 if conn
-                    .execute(&format!("UPDATE data SET val = 'v{writes}' WHERE id = {id}"))
+                    .execute(&format!(
+                        "UPDATE data SET val = 'v{writes}' WHERE id = {id}"
+                    ))
                     .is_ok()
                     && conn.execute("COMMIT").is_ok()
                 {
@@ -330,7 +332,8 @@ fn w4_cross_table_concurrent_updates() {
     stop.store(true, Ordering::Relaxed);
 
     for t in threads {
-        t.join().expect("thread must not hang — cross-page wakeup issue?");
+        t.join()
+            .expect("thread must not hang — cross-page wakeup issue?");
     }
 
     let ops = total_ops.load(Ordering::Relaxed);

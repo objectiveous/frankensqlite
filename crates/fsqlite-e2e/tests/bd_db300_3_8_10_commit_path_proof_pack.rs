@@ -30,8 +30,7 @@ use std::sync::{Arc, Barrier};
 use std::time::Instant;
 
 const BEAD_ID: &str = "bd-db300.3.8.10";
-const REPLAY_CMD: &str =
-    "cargo test -p fsqlite-e2e --test bd_db300_3_8_10_commit_path_proof_pack -- --nocapture --test-threads=1";
+const REPLAY_CMD: &str = "cargo test -p fsqlite-e2e --test bd_db300_3_8_10_commit_path_proof_pack -- --nocapture --test-threads=1";
 
 fn emit_log(test_name: &str, phase: &str, data: serde_json::Value) {
     eprintln!(
@@ -108,7 +107,10 @@ fn p1_crash_recovery_round_trip() {
         }),
     );
 
-    assert_eq!(count, 500, "[P1] expected 500 rows after reopen, got {count}");
+    assert_eq!(
+        count, 500,
+        "[P1] expected 500 rows after reopen, got {count}"
+    );
     assert_eq!(c_count, 500, "[P1] csqlite also sees 500 rows");
 }
 
@@ -232,16 +234,12 @@ fn p3_fair_wakeup_multi_writer() {
                         }
                         let val = tid as i64 * 100_000 + seq as i64;
                         if conn
-                            .execute(&format!(
-                                "INSERT INTO p3 VALUES ({tid}, {seq}, {val})"
-                            ))
+                            .execute(&format!("INSERT INTO p3 VALUES ({tid}, {seq}, {val})"))
                             .is_err()
                         {
                             let _ = conn.execute("ROLLBACK");
                             retries += 1;
-                            std::thread::sleep(std::time::Duration::from_millis(
-                                1 + (attempt % 5),
-                            ));
+                            std::thread::sleep(std::time::Duration::from_millis(1 + (attempt % 5)));
                             if attempt >= max_retries {
                                 panic!("thread {tid} exceeded retries at seq={seq}");
                             }
@@ -419,9 +417,7 @@ fn p5_wal_commit_ordering() {
 
     // Reopen and verify ordering
     let conn = fsqlite::Connection::open(path_str).unwrap();
-    let rows = conn
-        .query("SELECT seq, ts FROM p5 ORDER BY seq")
-        .unwrap();
+    let rows = conn.query("SELECT seq, ts FROM p5 ORDER BY seq").unwrap();
 
     let cconn = rusqlite::Connection::open(path_str).unwrap();
     let c_rows: Vec<(i64, String)> = {
@@ -538,11 +534,14 @@ fn p7_savepoint_commit_crash_cycle() {
             .unwrap();
 
         conn.execute("SAVEPOINT sp1").unwrap();
-        conn.execute("INSERT INTO p7 VALUES (1, 'sp1_row')").unwrap();
+        conn.execute("INSERT INTO p7 VALUES (1, 'sp1_row')")
+            .unwrap();
         conn.execute("SAVEPOINT sp2").unwrap();
-        conn.execute("INSERT INTO p7 VALUES (2, 'sp2_row')").unwrap();
+        conn.execute("INSERT INTO p7 VALUES (2, 'sp2_row')")
+            .unwrap();
         conn.execute("RELEASE sp2").unwrap();
-        conn.execute("INSERT INTO p7 VALUES (3, 'after_sp2')").unwrap();
+        conn.execute("INSERT INTO p7 VALUES (3, 'after_sp2')")
+            .unwrap();
         conn.execute("RELEASE sp1").unwrap();
 
         // Additional committed data
@@ -575,7 +574,11 @@ fn p7_savepoint_commit_crash_cycle() {
         }),
     );
 
-    assert_eq!(ids, vec![1, 2, 3, 4], "[P7] all savepoint + post rows present");
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 4],
+        "[P7] all savepoint + post rows present"
+    );
     assert_eq!(c_count, 4, "[P7] oracle sees 4 rows");
 }
 
@@ -602,11 +605,7 @@ fn p8_evidence_pack_structured_log() {
     }
     let schema_ns = schema_start.elapsed().as_nanos() as u64;
 
-    emit_log(
-        tn,
-        "phase_schema",
-        json!({"schema_creation_ns": schema_ns}),
-    );
+    emit_log(tn, "phase_schema", json!({"schema_creation_ns": schema_ns}));
 
     // Phase 2: Bulk write
     let write_start = Instant::now();
@@ -650,9 +649,7 @@ fn p8_evidence_pack_structured_log() {
     };
 
     let cat_counts = conn
-        .query(
-            "SELECT category, COUNT(*) FROM evidence GROUP BY category ORDER BY category",
-        )
+        .query("SELECT category, COUNT(*) FROM evidence GROUP BY category ORDER BY category")
         .unwrap();
     let verify_ns = verify_start.elapsed().as_nanos() as u64;
 

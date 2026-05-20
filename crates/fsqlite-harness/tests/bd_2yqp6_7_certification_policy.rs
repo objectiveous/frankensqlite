@@ -6,9 +6,9 @@ use std::collections::BTreeSet;
 use fsqlite_harness::adversarial_search::CampaignResult;
 use fsqlite_harness::certification_policy::{
     CERTIFICATION_MAX_EVIDENCE_AGE_HOURS, CERTIFICATION_MIN_VERIFICATION_PCT,
-    CERTIFICATION_POLICY_ID, CERTIFICATION_POLICY_SCHEMA_VERSION, REQUIRED_CERTIFICATION_LANES,
-    CertificationRatchetBaseline, CertificationRatchetCandidate,
-    canonical_certification_policy, evaluate_certification_ratchets,
+    CERTIFICATION_POLICY_ID, CERTIFICATION_POLICY_SCHEMA_VERSION, CertificationRatchetBaseline,
+    CertificationRatchetCandidate, REQUIRED_CERTIFICATION_LANES, canonical_certification_policy,
+    evaluate_certification_ratchets,
 };
 use fsqlite_harness::ci_gate_matrix::{ArtifactEntry, ArtifactKind, ArtifactManifest};
 use fsqlite_harness::confidence_gates::{GateDecision, build_evidence_ledger, evaluate_full};
@@ -184,7 +184,11 @@ fn canonical_policy_matches_track_g_requirements() {
 fn canonical_policy_exposes_explicit_blocking_gate_and_ratchet_dimensions() {
     let policy = canonical_certification_policy();
 
-    let gate_ids: BTreeSet<_> = policy.gates.iter().map(|gate| gate.gate_id.as_str()).collect();
+    let gate_ids: BTreeSet<_> = policy
+        .gates
+        .iter()
+        .map(|gate| gate.gate_id.as_str())
+        .collect();
     for required_gate in [
         "declared_surface_parity",
         "verification_contract",

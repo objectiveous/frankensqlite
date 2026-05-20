@@ -23,8 +23,8 @@
 //! - D2: Orphaned entries are cleaned up correctly
 //! - D3: Concurrent drain + acquire/release storm
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use fsqlite::Connection;
@@ -207,7 +207,8 @@ fn d3_rapid_connection_churn() {
     stop.store(true, Ordering::Relaxed);
 
     for t in threads {
-        t.join().expect("thread must not deadlock during connection churn");
+        t.join()
+            .expect("thread must not deadlock during connection churn");
     }
 
     let ops = total_ops.load(Ordering::Relaxed);
@@ -309,7 +310,5 @@ fn d4_drain_under_sustained_write_pressure() {
         rows, committed as usize,
         "row count mismatch: {rows} visible vs {committed} committed"
     );
-    eprintln!(
-        "D4: {committed} writes, {churn_cycles} churn cycles, {rows} final rows"
-    );
+    eprintln!("D4: {committed} writes, {churn_cycles} churn cycles, {rows} final rows");
 }

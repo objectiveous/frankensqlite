@@ -19,8 +19,8 @@
 //! - C4: No lost commits under high concurrency (every committed row is visible)
 //! - C5: Rapid commit + read interleaving doesn't produce stale reads
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use fsqlite::Connection;
@@ -63,9 +63,7 @@ fn c1_concurrent_commits_no_panic() {
                     if conn.execute("BEGIN").is_ok() {
                         let id = tid as u64 * 1_000_000 + seq;
                         if conn
-                            .execute(&format!(
-                                "INSERT INTO log VALUES ({id}, {tid}, {seq})"
-                            ))
+                            .execute(&format!("INSERT INTO log VALUES ({id}, {tid}, {seq})"))
                             .is_ok()
                         {
                             if conn.execute("COMMIT").is_ok() {
@@ -88,7 +86,8 @@ fn c1_concurrent_commits_no_panic() {
     stop.store(true, Ordering::Relaxed);
 
     for t in threads {
-        t.join().expect("thread must not panic during concurrent commits");
+        t.join()
+            .expect("thread must not panic during concurrent commits");
     }
 
     let commits = total_commits.load(Ordering::Relaxed);

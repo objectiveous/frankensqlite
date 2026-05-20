@@ -10,8 +10,8 @@
 //! - P4: Reader isolation (reader process sees consistent snapshot)
 //! - P5: Many-process storm (4 processes read/write concurrently)
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use fsqlite::Connection;
@@ -154,9 +154,7 @@ fn p2_concurrent_connection_writers() {
         "P2: phantom rows! actual={actual} >> committed={total_expected}"
     );
 
-    eprintln!(
-        "P2: 4 concurrent writers — total={total_expected}, per-process={per_process:?}"
-    );
+    eprintln!("P2: 4 concurrent writers — total={total_expected}, per-process={per_process:?}");
 }
 
 // ─── P3: Crash simulation — drop connection mid-transaction ───────
@@ -185,10 +183,8 @@ fn p3_crash_simulation_recovery() {
         let conn = Connection::open(path_str).expect("crash open");
         conn.execute("BEGIN").expect("begin");
         for i in 51..=100 {
-            conn.execute(&format!(
-                "INSERT INTO critical VALUES ({i}, 'uncommitted')"
-            ))
-            .expect("insert uncommitted");
+            conn.execute(&format!("INSERT INTO critical VALUES ({i}, 'uncommitted')"))
+                .expect("insert uncommitted");
         }
         // DROP without COMMIT — simulates process crash
     }
@@ -202,10 +198,7 @@ fn p3_crash_simulation_recovery() {
             "P3: after crash, only committed rows should survive, got {count}"
         );
 
-        let uncommitted = count_rows(
-            &conn,
-            "SELECT * FROM critical WHERE phase = 'uncommitted'",
-        );
+        let uncommitted = count_rows(&conn, "SELECT * FROM critical WHERE phase = 'uncommitted'");
         assert_eq!(
             uncommitted, 0,
             "P3: uncommitted rows should not survive crash"
@@ -266,7 +259,9 @@ fn p4_reader_isolation() {
         "P4: reader sees unexpected balance {val}"
     );
 
-    eprintln!("P4: reader isolation — balance={during_write:?} during write, {after_commit:?} after commit");
+    eprintln!(
+        "P4: reader isolation — balance={during_write:?} during write, {after_commit:?} after commit"
+    );
 }
 
 // ─── P5: Multi-connection storm ───────────────────────────────────
@@ -301,9 +296,7 @@ fn p5_multi_connection_storm() {
                     if conn.execute("BEGIN").is_ok() {
                         // Insert
                         let ins_ok = conn
-                            .execute(&format!(
-                                "INSERT INTO storm VALUES ({id}, {cid}, {seq})"
-                            ))
+                            .execute(&format!("INSERT INTO storm VALUES ({id}, {cid}, {seq})"))
                             .is_ok();
 
                         // Also read (mixed workload)

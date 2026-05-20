@@ -22,8 +22,8 @@
 //! - T5: Trigger that modifies same table (recursive trigger) + savepoint
 //! - T6: Multiple triggers on same event + savepoint nesting
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use fsqlite::Connection;
@@ -106,7 +106,8 @@ fn t2_nested_triggers_nested_savepoints() {
         .expect("create b");
     conn.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, b_id INTEGER, val TEXT)")
         .expect("create c");
-    conn.execute("CREATE TABLE log (msg TEXT)").expect("create log");
+    conn.execute("CREATE TABLE log (msg TEXT)")
+        .expect("create log");
 
     // Trigger chain: INSERT a → INSERT b → INSERT c → INSERT log
     conn.execute(
@@ -127,25 +128,29 @@ fn t2_nested_triggers_nested_savepoints() {
 
     // Outer savepoint
     conn.execute("SAVEPOINT sp_outer").expect("outer sp");
-    conn.execute("INSERT INTO a VALUES (1, 'outer')").expect("insert outer");
+    conn.execute("INSERT INTO a VALUES (1, 'outer')")
+        .expect("insert outer");
 
     // Inner savepoint
     conn.execute("SAVEPOINT sp_inner").expect("inner sp");
-    conn.execute("INSERT INTO a VALUES (2, 'inner')").expect("insert inner");
+    conn.execute("INSERT INTO a VALUES (2, 'inner')")
+        .expect("insert inner");
 
     // Verify chain fired
     let log_count = conn.query("SELECT * FROM log").expect("log").len();
     assert_eq!(log_count, 2, "both trigger chains should have fired");
 
     // Rollback inner
-    conn.execute("ROLLBACK TO sp_inner").expect("rollback inner");
+    conn.execute("ROLLBACK TO sp_inner")
+        .expect("rollback inner");
     conn.execute("RELEASE sp_inner").expect("release inner");
 
     let log_after_inner = conn.query("SELECT * FROM log").expect("log").len();
     assert_eq!(log_after_inner, 1, "inner chain should be rolled back");
 
     // Rollback outer
-    conn.execute("ROLLBACK TO sp_outer").expect("rollback outer");
+    conn.execute("ROLLBACK TO sp_outer")
+        .expect("rollback outer");
     conn.execute("RELEASE sp_outer").expect("release outer");
 
     let log_after_outer = conn.query("SELECT * FROM log").expect("log").len();
@@ -231,10 +236,7 @@ fn t3_concurrent_trigger_contention() {
     // Verify data integrity
     let verify = Connection::open(path_str).expect("verify");
     let events = verify.query("SELECT * FROM events").expect("events").len();
-    let log_entries = verify
-        .query("SELECT * FROM event_log")
-        .expect("log")
-        .len();
+    let log_entries = verify.query("SELECT * FROM event_log").expect("log").len();
 
     // Each event should have exactly one log entry (trigger fired correctly)
     assert_eq!(
@@ -278,14 +280,8 @@ fn t4_before_after_trigger_savepoint() {
     conn.execute("UPDATE items SET status = 'inactive' WHERE id = 1")
         .expect("update");
 
-    assert_eq!(
-        conn.query("SELECT * FROM pre_log").expect("pre").len(),
-        1
-    );
-    assert_eq!(
-        conn.query("SELECT * FROM post_log").expect("post").len(),
-        1
-    );
+    assert_eq!(conn.query("SELECT * FROM pre_log").expect("pre").len(), 1);
+    assert_eq!(conn.query("SELECT * FROM post_log").expect("post").len(), 1);
 
     conn.execute("ROLLBACK TO sp").expect("rollback");
     conn.execute("RELEASE sp").expect("release");
@@ -371,9 +367,9 @@ fn t5_concurrent_trigger_savepoint_storm() {
                             .is_ok()
                         {
                             // Check if balance would go negative
-                            if let Ok(rows) = conn.query(&format!(
-                                "SELECT balance FROM accounts WHERE id = {from}"
-                            )) {
+                            if let Ok(rows) = conn
+                                .query(&format!("SELECT balance FROM accounts WHERE id = {from}"))
+                            {
                                 if !rows.is_empty() {
                                     conn.execute("RELEASE sp").ok();
                                 } else {
@@ -424,8 +420,10 @@ fn t6_multi_trigger_savepoint_nesting() {
         .expect("create products");
     conn.execute("CREATE TABLE inventory (product_id INTEGER, qty INTEGER)")
         .expect("create inventory");
-    conn.execute("CREATE TABLE price_history (product_id INTEGER, old_price INTEGER, new_price INTEGER)")
-        .expect("create history");
+    conn.execute(
+        "CREATE TABLE price_history (product_id INTEGER, old_price INTEGER, new_price INTEGER)",
+    )
+    .expect("create history");
 
     conn.execute(
         "CREATE TRIGGER t_new_product AFTER INSERT ON products \
@@ -444,10 +442,7 @@ fn t6_multi_trigger_savepoint_nesting() {
     conn.execute("SAVEPOINT sp1").expect("sp1");
     conn.execute("INSERT INTO products VALUES (1, 'Widget', 100)")
         .expect("insert p1");
-    assert_eq!(
-        conn.query("SELECT * FROM inventory").expect("inv").len(),
-        1
-    );
+    assert_eq!(conn.query("SELECT * FROM inventory").expect("inv").len(), 1);
 
     conn.execute("SAVEPOINT sp2").expect("sp2");
     conn.execute("INSERT INTO products VALUES (2, 'Gadget', 200)")
@@ -455,10 +450,7 @@ fn t6_multi_trigger_savepoint_nesting() {
     conn.execute("UPDATE products SET price = 150 WHERE id = 1")
         .expect("update p1");
 
-    assert_eq!(
-        conn.query("SELECT * FROM inventory").expect("inv").len(),
-        2
-    );
+    assert_eq!(conn.query("SELECT * FROM inventory").expect("inv").len(), 2);
     assert_eq!(
         conn.query("SELECT * FROM price_history")
             .expect("hist")

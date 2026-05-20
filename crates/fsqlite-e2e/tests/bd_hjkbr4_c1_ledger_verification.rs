@@ -27,15 +27,14 @@
 #![allow(clippy::cast_precision_loss)]
 
 use fsqlite_pager::{
-    pager_commit_profile_snapshot, reset_pager_commit_profile, set_pager_commit_profile_enabled,
-    PagerCommitProfileSnapshot,
+    PagerCommitProfileSnapshot, pager_commit_profile_snapshot, reset_pager_commit_profile,
+    set_pager_commit_profile_enabled,
 };
 use serde_json::json;
 use std::time::Instant;
 
 const BEAD_ID: &str = "bd-hjkbr.4";
-const REPLAY_CMD: &str =
-    "cargo test -p fsqlite-e2e --test bd_hjkbr4_c1_ledger_verification -- --nocapture --test-threads=1";
+const REPLAY_CMD: &str = "cargo test -p fsqlite-e2e --test bd_hjkbr4_c1_ledger_verification -- --nocapture --test-threads=1";
 
 fn emit_log(test_name: &str, phase: &str, data: serde_json::Value) {
     eprintln!(
@@ -399,8 +398,7 @@ fn l7_multi_table_commit_profile() {
     conn.execute("BEGIN").unwrap();
     conn.execute("UPDATE l7a SET name = 'updated_' || id WHERE id < 50")
         .unwrap();
-    conn.execute("DELETE FROM l7b WHERE ref_id >= 150")
-        .unwrap();
+    conn.execute("DELETE FROM l7b WHERE ref_id >= 150").unwrap();
     conn.execute("COMMIT").unwrap();
 
     let snap = pager_commit_profile_snapshot();

@@ -63,9 +63,8 @@ fn seed_employees(f: &Connection, c: &rusqlite::Connection) {
 
     f.execute("BEGIN").expect("f begin");
     for (id, name, dept, salary, mgr) in &rows {
-        let sql = format!(
-            "INSERT INTO employees VALUES ({id}, '{name}', '{dept}', {salary}, {mgr})"
-        );
+        let sql =
+            format!("INSERT INTO employees VALUES ({id}, '{name}', '{dept}', {salary}, {mgr})");
         f.execute(&sql).expect("f insert");
         c.execute(&sql, []).expect("c insert");
     }
@@ -79,10 +78,18 @@ fn seed_orders(f: &Connection, c: &rusqlite::Connection) {
 
     f.execute("BEGIN").expect("f begin");
     let data = [
-        (1, 2, 5000, 1), (2, 2, 7000, 2), (3, 5, 3000, 1),
-        (4, 5, 4500, 2), (5, 9, 6000, 1), (6, 3, 12000, 1),
-        (7, 3, 8000, 2), (8, 4, 3500, 1), (9, 8, 9000, 2),
-        (10, 1, 15000, 1), (11, 1, 11000, 2), (12, 4, 4200, 2),
+        (1, 2, 5000, 1),
+        (2, 2, 7000, 2),
+        (3, 5, 3000, 1),
+        (4, 5, 4500, 2),
+        (5, 9, 6000, 1),
+        (6, 3, 12000, 1),
+        (7, 3, 8000, 2),
+        (8, 4, 3500, 1),
+        (9, 8, 9000, 2),
+        (10, 1, 15000, 1),
+        (11, 1, 11000, 2),
+        (12, 4, 4200, 2),
     ];
     for (id, emp_id, amount, quarter) in &data {
         let sql = format!("INSERT INTO orders VALUES ({id}, {emp_id}, {amount}, {quarter})");
@@ -179,7 +186,10 @@ fn q2_multi_level_cte() {
         assert_eq!(f_cnt, *c_cnt, "Q2: count mismatch at row {i} dept={c_dept}");
     }
 
-    eprintln!("Q2: multi-level CTE with cross-join — {} rows, oracle parity", f_rows.len());
+    eprintln!(
+        "Q2: multi-level CTE with cross-join — {} rows, oracle parity",
+        f_rows.len()
+    );
 }
 
 // ─── Q3: Window function with PARTITION BY ───────────────────────
@@ -200,7 +210,13 @@ fn q3_window_partition_by() {
     let f_rows = f.query(sql).expect("f query");
     let mut c_stmt = c.prepare(sql).expect("c prepare");
     let c_rows: Vec<(i64, String, i64)> = c_stmt
-        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(2)?, r.get::<_, i64>(4)?)))
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })
         .expect("c query")
         .filter_map(|r| r.ok())
         .collect();
@@ -217,7 +233,10 @@ fn q3_window_partition_by() {
             _ => -1,
         };
         assert_eq!(f_id, *c_id, "Q3: id mismatch at row {i}");
-        assert_eq!(f_rank, *c_rank, "Q3: rank mismatch at row {i} dept={c_dept}");
+        assert_eq!(
+            f_rank, *c_rank,
+            "Q3: rank mismatch at row {i} dept={c_dept}"
+        );
     }
 
     eprintln!("Q3: RANK() OVER (PARTITION BY dept) — oracle parity");
@@ -239,8 +258,11 @@ fn q4_compound_select() {
                      UNION ALL \
                      SELECT dept, 'low' FROM employees WHERE salary < 80000";
     let f_count = f.query(sql_union).expect("f query").len();
-    let c_count: i64 = c.query_row(
-        &format!("SELECT COUNT(*) FROM ({sql_union})"), [], |r| r.get(0)).expect("c count");
+    let c_count: i64 = c
+        .query_row(&format!("SELECT COUNT(*) FROM ({sql_union})"), [], |r| {
+            r.get(0)
+        })
+        .expect("c count");
     assert_eq!(f_count as i64, c_count, "Q4: UNION ALL count mismatch");
 
     // INTERSECT
@@ -248,8 +270,13 @@ fn q4_compound_select() {
                          INTERSECT \
                          SELECT dept FROM employees WHERE salary < 110000";
     let f_isect = f.query(sql_intersect).expect("f intersect").len();
-    let c_isect: i64 = c.query_row(
-        &format!("SELECT COUNT(*) FROM ({sql_intersect})"), [], |r| r.get(0)).expect("c isect");
+    let c_isect: i64 = c
+        .query_row(
+            &format!("SELECT COUNT(*) FROM ({sql_intersect})"),
+            [],
+            |r| r.get(0),
+        )
+        .expect("c isect");
     assert_eq!(f_isect as i64, c_isect, "Q4: INTERSECT count mismatch");
 
     // EXCEPT
@@ -257,8 +284,11 @@ fn q4_compound_select() {
                       EXCEPT \
                       SELECT dept FROM employees WHERE salary > 100000";
     let f_except = f.query(sql_except).expect("f except").len();
-    let c_except: i64 = c.query_row(
-        &format!("SELECT COUNT(*) FROM ({sql_except})"), [], |r| r.get(0)).expect("c except");
+    let c_except: i64 = c
+        .query_row(&format!("SELECT COUNT(*) FROM ({sql_except})"), [], |r| {
+            r.get(0)
+        })
+        .expect("c except");
     assert_eq!(f_except as i64, c_except, "Q4: EXCEPT count mismatch");
 
     eprintln!("Q4: UNION ALL/INTERSECT/EXCEPT — oracle parity");
@@ -332,8 +362,11 @@ fn q6_exists_not_exists() {
                       WHERE EXISTS (SELECT 1 FROM orders o WHERE o.emp_id = e.id) \
                       ORDER BY id";
     let f_exists = f.query(sql_exists).expect("f exists");
-    let c_exists: i64 = c.query_row(
-        &format!("SELECT COUNT(*) FROM ({sql_exists})"), [], |r| r.get(0)).expect("c exists");
+    let c_exists: i64 = c
+        .query_row(&format!("SELECT COUNT(*) FROM ({sql_exists})"), [], |r| {
+            r.get(0)
+        })
+        .expect("c exists");
     assert_eq!(f_exists.len() as i64, c_exists, "Q6: EXISTS count mismatch");
 
     // Employees with NO orders
@@ -341,17 +374,25 @@ fn q6_exists_not_exists() {
                    WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.emp_id = e.id) \
                    ORDER BY id";
     let f_not = f.query(sql_not).expect("f not exists");
-    let c_not: i64 = c.query_row(
-        &format!("SELECT COUNT(*) FROM ({sql_not})"), [], |r| r.get(0)).expect("c not");
+    let c_not: i64 = c
+        .query_row(&format!("SELECT COUNT(*) FROM ({sql_not})"), [], |r| {
+            r.get(0)
+        })
+        .expect("c not");
     assert_eq!(f_not.len() as i64, c_not, "Q6: NOT EXISTS count mismatch");
 
     // Total should be 10
     assert_eq!(
-        f_exists.len() + f_not.len(), 10,
+        f_exists.len() + f_not.len(),
+        10,
         "Q6: EXISTS + NOT EXISTS should cover all employees"
     );
 
-    eprintln!("Q6: EXISTS={}, NOT EXISTS={} — oracle parity", f_exists.len(), f_not.len());
+    eprintln!(
+        "Q6: EXISTS={}, NOT EXISTS={} — oracle parity",
+        f_exists.len(),
+        f_not.len()
+    );
 }
 
 // ─── Q7: CASE with nested subqueries ─────────────────────────────
@@ -519,9 +560,18 @@ fn q10_derived_table_aggregation() {
         .filter_map(|r| r.ok())
         .collect();
 
-    assert_eq!(f_rows.len(), c_rows.len(), "Q10: row count mismatch f={} c={}", f_rows.len(), c_rows.len());
+    assert_eq!(
+        f_rows.len(),
+        c_rows.len(),
+        "Q10: row count mismatch f={} c={}",
+        f_rows.len(),
+        c_rows.len()
+    );
 
-    eprintln!("Q10: derived table + above-average filter — {} rows, oracle parity", f_rows.len());
+    eprintln!(
+        "Q10: derived table + above-average filter — {} rows, oracle parity",
+        f_rows.len()
+    );
 }
 
 // ─── Q11: INSERT...SELECT with complex source ────────────────────
@@ -639,7 +689,10 @@ fn q13_delete_with_subquery() {
 
     let f_remaining = get_int(&f, "SELECT COUNT(*) FROM orders").unwrap();
     let c_remaining = c_get_int(&c, "SELECT COUNT(*) FROM orders").unwrap();
-    assert_eq!(f_remaining, c_remaining, "Q13: remaining order count mismatch");
+    assert_eq!(
+        f_remaining, c_remaining,
+        "Q13: remaining order count mismatch"
+    );
 
     let f_sum = get_int(&f, "SELECT SUM(amount) FROM orders").unwrap();
     let c_sum = c_get_int(&c, "SELECT SUM(amount) FROM orders").unwrap();
@@ -706,11 +759,23 @@ fn q15_multiple_aggregates_distinct() {
                FROM orders";
 
     let f_rows = f.query(sql).expect("f query");
-    let c_total: i64 = c.query_row("SELECT COUNT(*) FROM orders", [], |r| r.get(0)).unwrap();
-    let c_distinct: i64 = c.query_row("SELECT COUNT(DISTINCT emp_id) FROM orders", [], |r| r.get(0)).unwrap();
-    let c_sum: i64 = c.query_row("SELECT SUM(amount) FROM orders", [], |r| r.get(0)).unwrap();
-    let c_min: i64 = c.query_row("SELECT MIN(amount) FROM orders", [], |r| r.get(0)).unwrap();
-    let c_max: i64 = c.query_row("SELECT MAX(amount) FROM orders", [], |r| r.get(0)).unwrap();
+    let c_total: i64 = c
+        .query_row("SELECT COUNT(*) FROM orders", [], |r| r.get(0))
+        .unwrap();
+    let c_distinct: i64 = c
+        .query_row("SELECT COUNT(DISTINCT emp_id) FROM orders", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let c_sum: i64 = c
+        .query_row("SELECT SUM(amount) FROM orders", [], |r| r.get(0))
+        .unwrap();
+    let c_min: i64 = c
+        .query_row("SELECT MIN(amount) FROM orders", [], |r| r.get(0))
+        .unwrap();
+    let c_max: i64 = c
+        .query_row("SELECT MAX(amount) FROM orders", [], |r| r.get(0))
+        .unwrap();
 
     let f_total = match f_rows[0].get(0) {
         Some(SqliteValue::Integer(v)) => *v,

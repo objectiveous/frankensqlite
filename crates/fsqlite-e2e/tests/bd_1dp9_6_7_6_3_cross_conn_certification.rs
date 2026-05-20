@@ -13,8 +13,8 @@
 //! - B2: Multiple databases on same connection set (isolation)
 //! - S1: Stale reader after writer commits (snapshot advancement)
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use fsqlite::Connection;
@@ -63,7 +63,10 @@ fn v1_cross_connection_visibility() {
     // Reader connection (opened AFTER commit) must see all 50 rows
     let reader = Connection::open(path_str).expect("reader open");
     let rows = count_rows(&reader, "SELECT * FROM items");
-    assert_eq!(rows, 50, "V1: reader should see all 50 committed rows, got {rows}");
+    assert_eq!(
+        rows, 50,
+        "V1: reader should see all 50 committed rows, got {rows}"
+    );
 
     // Writer adds more
     writer.execute("BEGIN").expect("begin2");
@@ -378,14 +381,8 @@ fn p1_restart_recovery() {
         );
 
         // Verify specific rows
-        let phase1 = count_rows(
-            &conn,
-            "SELECT * FROM persist WHERE data LIKE '%phase1%'",
-        );
-        let phase2 = count_rows(
-            &conn,
-            "SELECT * FROM persist WHERE data LIKE '%phase2%'",
-        );
+        let phase1 = count_rows(&conn, "SELECT * FROM persist WHERE data LIKE '%phase1%'");
+        let phase2 = count_rows(&conn, "SELECT * FROM persist WHERE data LIKE '%phase2%'");
         assert_eq!(phase1, 100, "P1: phase1 rows corrupted");
         assert_eq!(phase2, 100, "P1: phase2 rows corrupted");
     }
@@ -441,9 +438,7 @@ fn p2_repeated_open_close_accumulation() {
         "P2: final count {total} != expected {expected_total}"
     );
 
-    eprintln!(
-        "P2: {total_rounds} open/close cycles, {expected_total} rows accumulated correctly"
-    );
+    eprintln!("P2: {total_rounds} open/close cycles, {expected_total} rows accumulated correctly");
 }
 
 // ─── B1: Backend identity — file-backed consistency ───────────────
@@ -611,7 +606,9 @@ fn s1_stale_reader_snapshot_advancement() {
     for generation in 1..=10 {
         let writer = Connection::open(path_str).expect("writer open");
         writer
-            .execute(&format!("UPDATE evolving SET gen = {generation} WHERE id = 1"))
+            .execute(&format!(
+                "UPDATE evolving SET gen = {generation} WHERE id = 1"
+            ))
             .expect("update");
     }
 
@@ -661,9 +658,7 @@ fn c1_concurrent_writers_no_data_loss() {
                     let id = tid * 1_000_000 + seq;
                     if conn.execute("BEGIN").is_ok() {
                         if conn
-                            .execute(&format!(
-                                "INSERT INTO writes VALUES ({id}, {tid})"
-                            ))
+                            .execute(&format!("INSERT INTO writes VALUES ({id}, {tid})"))
                             .is_ok()
                         {
                             if conn.execute("COMMIT").is_ok() {

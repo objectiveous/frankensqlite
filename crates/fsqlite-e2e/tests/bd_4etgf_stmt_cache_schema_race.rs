@@ -21,8 +21,8 @@
 //! - E4: CREATE TABLE with same name after DROP (schema recycling)
 //! - E5: Concurrent DDL from multiple connections
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use fsqlite::Connection;
@@ -233,9 +233,7 @@ fn e3_drop_table_while_inserting() {
     let cycles = ddl.join().expect("DDL must not panic");
 
     // The key assertion: no panics/crashes from stale cache entries
-    eprintln!(
-        "E3: {inserted} inserts, {table_missing} table-missing errors, {cycles} DDL cycles"
-    );
+    eprintln!("E3: {inserted} inserts, {table_missing} table-missing errors, {cycles} DDL cycles");
 }
 
 // ─── E4: Schema recycling — CREATE after DROP with same name ───────
@@ -261,8 +259,10 @@ fn e4_schema_recycling() {
         // Insert data
         conn.execute("BEGIN").expect("begin");
         for i in 1..=10 {
-            conn.execute(&format!("INSERT INTO recycled (id, a) VALUES ({i}, 'r{round}')"))
-                .expect("insert");
+            conn.execute(&format!(
+                "INSERT INTO recycled (id, a) VALUES ({i}, 'r{round}')"
+            ))
+            .expect("insert");
         }
         conn.execute("COMMIT").expect("commit");
 
@@ -322,8 +322,7 @@ fn e5_concurrent_ddl_storm() {
                         ))
                         .ok();
                         conn.query(&format!("SELECT * FROM {tname}")).ok();
-                        conn.execute(&format!("DROP TABLE IF EXISTS {tname}"))
-                            .ok();
+                        conn.execute(&format!("DROP TABLE IF EXISTS {tname}")).ok();
                         local_ops += 1;
                     }
 

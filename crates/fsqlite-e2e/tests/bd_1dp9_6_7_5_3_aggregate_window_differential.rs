@@ -36,10 +36,7 @@ fn get_int(conn: &Connection, sql: &str) -> Option<i64> {
     }
 }
 
-fn setup_oracle_pair(
-    dir: &tempfile::TempDir,
-    name: &str,
-) -> (Connection, rusqlite::Connection) {
+fn setup_oracle_pair(dir: &tempfile::TempDir, name: &str) -> (Connection, rusqlite::Connection) {
     let f_path = dir.path().join(format!("{name}_f.db"));
     let c_path = dir.path().join(format!("{name}_c.db"));
 
@@ -272,7 +269,10 @@ fn a4_multiple_aggregates() {
         );
     }
 
-    eprintln!("A4: multiple aggregates — oracle parity on {} groups", f_rows.len());
+    eprintln!(
+        "A4: multiple aggregates — oracle parity on {} groups",
+        f_rows.len()
+    );
 }
 
 // ─── A5: Aggregate over empty groups ──────────────────────────────
@@ -499,10 +499,14 @@ fn i1_insert_select_basic() {
     seed_both(&f, &c);
 
     // Create destination tables
-    f.execute("CREATE TABLE sales_copy (id INTEGER PRIMARY KEY, dept TEXT, amount INTEGER, qty INTEGER)")
-        .expect("f create copy");
-    c.execute_batch("CREATE TABLE sales_copy (id INTEGER PRIMARY KEY, dept TEXT, amount INTEGER, qty INTEGER)")
-        .expect("c create copy");
+    f.execute(
+        "CREATE TABLE sales_copy (id INTEGER PRIMARY KEY, dept TEXT, amount INTEGER, qty INTEGER)",
+    )
+    .expect("f create copy");
+    c.execute_batch(
+        "CREATE TABLE sales_copy (id INTEGER PRIMARY KEY, dept TEXT, amount INTEGER, qty INTEGER)",
+    )
+    .expect("c create copy");
 
     // INSERT...SELECT
     f.execute("INSERT INTO sales_copy SELECT * FROM sales")
@@ -527,16 +531,24 @@ fn i2_insert_select_aggregates() {
     // Create summary table
     f.execute("CREATE TABLE dept_summary (dept TEXT PRIMARY KEY, total INTEGER, cnt INTEGER)")
         .expect("f create summary");
-    c.execute_batch("CREATE TABLE dept_summary (dept TEXT PRIMARY KEY, total INTEGER, cnt INTEGER)")
-        .expect("c create summary");
+    c.execute_batch(
+        "CREATE TABLE dept_summary (dept TEXT PRIMARY KEY, total INTEGER, cnt INTEGER)",
+    )
+    .expect("c create summary");
 
     // INSERT...SELECT with GROUP BY
-    let insert_agg = "INSERT INTO dept_summary SELECT dept, SUM(amount), COUNT(*) FROM sales GROUP BY dept";
+    let insert_agg =
+        "INSERT INTO dept_summary SELECT dept, SUM(amount), COUNT(*) FROM sales GROUP BY dept";
     f.execute(insert_agg).expect("f insert-agg");
     c.execute_batch(insert_agg).expect("c insert-agg");
 
     compare_int_query(&f, &c, "SELECT COUNT(*) FROM dept_summary", "I2-count");
-    compare_int_query(&f, &c, "SELECT SUM(total) FROM dept_summary", "I2-sum-total");
+    compare_int_query(
+        &f,
+        &c,
+        "SELECT SUM(total) FROM dept_summary",
+        "I2-sum-total",
+    );
     compare_int_query(&f, &c, "SELECT SUM(cnt) FROM dept_summary", "I2-sum-cnt");
 
     eprintln!("I2: INSERT...SELECT with aggregates — oracle parity confirmed");
@@ -556,7 +568,8 @@ fn i3_insert_select_cross_table() {
     c.execute_batch(setup).expect("c create hv");
 
     // INSERT...SELECT with WHERE filter
-    let insert_sql = "INSERT INTO high_value SELECT id, dept, amount FROM sales WHERE amount >= 200";
+    let insert_sql =
+        "INSERT INTO high_value SELECT id, dept, amount FROM sales WHERE amount >= 200";
     f.execute(insert_sql).expect("f insert-select");
     c.execute_batch(insert_sql).expect("c insert-select");
 
@@ -598,8 +611,7 @@ fn i4_insert_select_with_join() {
     c.execute_batch(result_setup).expect("c create result");
 
     // INSERT...SELECT with JOIN
-    let insert_join =
-        "INSERT INTO over_budget \
+    let insert_join = "INSERT INTO over_budget \
          SELECT s.dept, SUM(s.amount), b.budget \
          FROM sales s JOIN dept_budget b ON s.dept = b.dept \
          GROUP BY s.dept \

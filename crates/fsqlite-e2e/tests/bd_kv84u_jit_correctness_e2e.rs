@@ -134,7 +134,10 @@ fn j3_hot_update_loop() {
     }
 
     let val2 = get_int(&conn, "SELECT val FROM counter WHERE id = 1").unwrap();
-    assert_eq!(val2, 200, "J3: counter should be 200 after 50 more +2 updates");
+    assert_eq!(
+        val2, 200,
+        "J3: counter should be 200 after 50 more +2 updates"
+    );
 
     eprintln!("J3: 150 hot UPDATEs — cumulative correctness verified");
 }
@@ -171,11 +174,8 @@ fn j4_mixed_dml_hot_loop() {
 
         // DELETE old rounds (keep last 5)
         if round >= 5 {
-            conn.execute(&format!(
-                "DELETE FROM mixed WHERE round < {}",
-                round - 4
-            ))
-            .expect("delete");
+            conn.execute(&format!("DELETE FROM mixed WHERE round < {}", round - 4))
+                .expect("delete");
         }
 
         conn.execute("COMMIT").expect("commit");

@@ -25,8 +25,8 @@
 // available when the feature is enabled. We test via the public
 // InProcessPageLockTable interface which routes to flat-combining when enabled.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use fsqlite_mvcc::core_types::InProcessPageLockTable;

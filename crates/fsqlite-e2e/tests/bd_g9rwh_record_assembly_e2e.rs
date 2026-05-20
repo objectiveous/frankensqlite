@@ -30,10 +30,7 @@ fn get_int(conn: &Connection, sql: &str) -> Option<i64> {
     }
 }
 
-fn setup_pair(
-    dir: &tempfile::TempDir,
-    name: &str,
-) -> (Connection, rusqlite::Connection) {
+fn setup_pair(dir: &tempfile::TempDir, name: &str) -> (Connection, rusqlite::Connection) {
     let f_path = dir.path().join(format!("{name}_f.db"));
     let c_path = dir.path().join(format!("{name}_c.db"));
     let f = Connection::open(f_path.to_str().expect("path")).expect("fsqlite open");
@@ -65,7 +62,10 @@ fn h1_insert_10k_oracle() {
     let c_count: i64 = c
         .query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(f_count, c_count, "H1: count mismatch f={f_count}, c={c_count}");
+    assert_eq!(
+        f_count, c_count,
+        "H1: count mismatch f={f_count}, c={c_count}"
+    );
     assert_eq!(f_count, 10_000);
 
     // Compare sums
@@ -180,7 +180,10 @@ fn h3_mixed_type_columns() {
         assert_eq!(f_int, c_row.1, "H3: integer col mismatch for id={f_id}");
     }
 
-    eprintln!("H3: mixed type columns — oracle parity on {} rows", f_rows.len());
+    eprintln!(
+        "H3: mixed type columns — oracle parity on {} rows",
+        f_rows.len()
+    );
 }
 
 // ─── H4: Large TEXT/BLOB payloads ─────────────────────────────────
@@ -291,7 +294,10 @@ fn h6_insert_or_replace() {
 
     // Replace even-id rows
     for i in (2..=100).step_by(2) {
-        let sql = format!("INSERT OR REPLACE INTO upsert VALUES ({i}, {}, 'replaced')", i * 100);
+        let sql = format!(
+            "INSERT OR REPLACE INTO upsert VALUES ({i}, {}, 'replaced')",
+            i * 100
+        );
         f.execute(&sql).expect("f replace");
         c.execute(&sql, []).expect("c replace");
     }
@@ -305,11 +311,7 @@ fn h6_insert_or_replace() {
     assert_eq!(f_count, 100);
 
     // Check replaced rows
-    let f_replaced = get_int(
-        &f,
-        "SELECT COUNT(*) FROM upsert WHERE tag = 'replaced'",
-    )
-    .unwrap();
+    let f_replaced = get_int(&f, "SELECT COUNT(*) FROM upsert WHERE tag = 'replaced'").unwrap();
     let c_replaced: i64 = c
         .query_row(
             "SELECT COUNT(*) FROM upsert WHERE tag = 'replaced'",
@@ -343,11 +345,16 @@ fn h7_roundtrip_type_fidelity() {
         .expect("create");
 
     // Insert various types via SQL (no parameters)
-    conn.execute("INSERT INTO types VALUES (1, 42)").expect("int");
-    conn.execute("INSERT INTO types VALUES (2, 3.14)").expect("real");
-    conn.execute("INSERT INTO types VALUES (3, 'text')").expect("text");
-    conn.execute("INSERT INTO types VALUES (4, X'CAFE')").expect("blob");
-    conn.execute("INSERT INTO types VALUES (5, NULL)").expect("null");
+    conn.execute("INSERT INTO types VALUES (1, 42)")
+        .expect("int");
+    conn.execute("INSERT INTO types VALUES (2, 3.14)")
+        .expect("real");
+    conn.execute("INSERT INTO types VALUES (3, 'text')")
+        .expect("text");
+    conn.execute("INSERT INTO types VALUES (4, X'CAFE')")
+        .expect("blob");
+    conn.execute("INSERT INTO types VALUES (5, NULL)")
+        .expect("null");
 
     let rows = conn
         .query("SELECT id, val, typeof(val) FROM types ORDER BY id")

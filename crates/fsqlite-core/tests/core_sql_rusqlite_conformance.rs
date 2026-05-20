@@ -482,6 +482,52 @@ const ERROR_PATH_CASES: &[StatementCase] = &[
     },
 ];
 
+const DDL_SETUP: &str = "
+    CREATE TABLE accounts (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        tier TEXT DEFAULT 'free',
+        score INTEGER DEFAULT 0
+    );
+    CREATE INDEX idx_accounts_tier ON accounts(tier);
+    INSERT INTO accounts(id, name) VALUES
+        (1, 'Ada'),
+        (2, 'Bert');
+    INSERT INTO accounts(id, name, tier, score) VALUES
+        (3, 'Cara', 'pro', 20),
+        (4, 'Drew', 'free', 5),
+        (5, 'Eli', 'enterprise', 50);
+
+    ALTER TABLE accounts ADD COLUMN active INTEGER DEFAULT 1;
+    UPDATE accounts SET active = 0 WHERE id = 2;
+    CREATE VIEW active_accounts AS
+        SELECT id, name, tier, score FROM accounts WHERE active = 1;
+";
+
+const DDL_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "defaults and altered column values",
+        sql: "SELECT id, name, tier, score, active FROM accounts ORDER BY id",
+    },
+    QueryCase {
+        name: "grouping after ddl defaults",
+        sql: "SELECT tier, COUNT(*), SUM(score) FROM accounts GROUP BY tier ORDER BY tier",
+    },
+    QueryCase {
+        name: "view projection and filter",
+        sql: "SELECT name, tier, score FROM active_accounts ORDER BY score DESC, name",
+    },
+    QueryCase {
+        name: "index schema registration",
+        sql:
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = 'idx_accounts_tier'",
+    },
+    QueryCase {
+        name: "view schema registration",
+        sql: "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'view' AND name = 'active_accounts'",
+    },
+];
+
 const SUBQUERY_SETUP: &str = "
     CREATE TABLE customers (
         id INTEGER PRIMARY KEY,
@@ -589,6 +635,12 @@ fn dml_insert_update_delete_match_rusqlite() {
 fn error_paths_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(ERROR_PATH_SETUP);
     harness.assert_statement_errors_match("error path", ERROR_PATH_CASES);
+}
+
+#[test]
+fn ddl_defaults_and_views_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(DDL_SETUP);
+    harness.assert_queries_match("DDL/default/view", DDL_CASES);
 }
 
 #[test]

@@ -4262,7 +4262,7 @@ static FSQLITE_JIT_CACHE_CAPACITY: AtomicU64 = AtomicU64::new(128);
 #[derive(Debug, Clone)]
 struct JitCacheEntry {
     code_size_bytes: u64,
-    compiled_program: CompiledProgram,
+    compiled_program: Arc<CompiledProgram>,
 }
 
 #[derive(Debug, Default)]
@@ -5041,7 +5041,7 @@ enum JitDecision {
     CacheHit {
         plan_hash: u64,
         code_size_bytes: u64,
-        compiled_program: CompiledProgram,
+        compiled_program: Arc<CompiledProgram>,
     },
     UnsupportedCached {
         plan_hash: u64,
@@ -5051,7 +5051,7 @@ enum JitDecision {
         compile_time_us: u64,
         code_size_bytes: u64,
         evicted_plan_hash: Option<u64>,
-        compiled_program: CompiledProgram,
+        compiled_program: Arc<CompiledProgram>,
     },
     CompileFailed {
         plan_hash: u64,
@@ -5238,13 +5238,17 @@ fn maybe_trigger_jit(program: &VdbeProgram) -> JitDecision {
     if runtime.is_unsupported_plan(plan_hash) {
         return JitDecision::UnsupportedCached { plan_hash };
     }
-    if let Some(entry) = runtime.cache.get(&plan_hash).cloned() {
+    if let Some((code_size_bytes, compiled_program)) = runtime
+        .cache
+        .get(&plan_hash)
+        .map(|entry| (entry.code_size_bytes, Arc::clone(&entry.compiled_program)))
+    {
         FSQLITE_JIT_CACHE_HITS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
         runtime.touch_lru(plan_hash);
         return JitDecision::CacheHit {
             plan_hash,
-            code_size_bytes: entry.code_size_bytes,
-            compiled_program: entry.compiled_program,
+            code_size_bytes,
+            compiled_program,
         };
     }
 
@@ -5255,11 +5259,12 @@ fn maybe_trigger_jit(program: &VdbeProgram) -> JitDecision {
             FSQLITE_JIT_COMPILATIONS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
             let compile_time_us =
                 u64::try_from(compile_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            let compiled_program = Arc::new(compiled_program);
             let evicted_plan_hash = runtime.insert_cache(
                 plan_hash,
                 JitCacheEntry {
                     code_size_bytes,
-                    compiled_program: compiled_program.clone(),
+                    compiled_program: Arc::clone(&compiled_program),
                 },
                 cache_capacity,
             );
@@ -7696,7 +7701,7 @@ impl VdbeEngine {
 
         if let Some(compiled_program) = compiled_program {
             let outcome = self.execute_compiled_program(
-                &compiled_program,
+                compiled_program.as_ref(),
                 borrowed_bindings,
                 collect_vdbe_metrics,
                 &mut row_handler,
@@ -30100,6 +30105,48 @@ mod tests {
         set_vdbe_jit_enabled(prev_enabled);
         let _ = set_vdbe_jit_hot_threshold(prev_threshold);
         let _ = set_vdbe_jit_cache_capacity(prev_capacity);
+    }
+
+    #[test]
+    fn test_jit_cache_hit_arc_clone_microbench() {
+        let value_sources = (0..24).map(InsertValueSource::Binding).collect::<Vec<_>>();
+        let compiled = CompiledProgram::SimpleInsert(SimpleInsertTemplate {
+            cursor_id: 0,
+            root_page: 2,
+            num_cols: i32::try_from(value_sources.len()).expect("test value count fits i32"),
+            value_sources,
+            affinity: Some("BBBBBBBBBBBBBBBBBBBBBBBB".to_owned()),
+            record_p4: P4::None,
+            record_builder: CompiledRecordBuilder::Generic,
+            insert_flags: 2,
+        });
+        let shared = Arc::new(compiled.clone());
+        let iterations = 50_000_u64;
+
+        let direct_started = Instant::now();
+        let mut direct_acc = 0_u64;
+        for _ in 0..iterations {
+            let cloned = std::hint::black_box(compiled.clone());
+            direct_acc = direct_acc.wrapping_add(estimate_compiled_program_size(&cloned));
+        }
+        let direct_clone_ns = direct_started.elapsed().as_nanos();
+
+        let arc_started = Instant::now();
+        let mut arc_acc = 0_usize;
+        for _ in 0..iterations {
+            let cloned = std::hint::black_box(Arc::clone(&shared));
+            arc_acc = arc_acc.wrapping_add(Arc::strong_count(&cloned));
+        }
+        let arc_clone_ns = arc_started.elapsed().as_nanos();
+
+        std::hint::black_box((direct_acc, arc_acc));
+        eprintln!(
+            "bd-db300.2 jit cache-hit clone microbench: iterations={iterations}, deep_clone_ns={direct_clone_ns}, arc_clone_ns={arc_clone_ns}, template_size_bytes={}",
+            estimate_compiled_program_size(shared.as_ref())
+        );
+        assert!(direct_acc > 0);
+        assert!(arc_acc > 0);
+        assert_eq!(Arc::strong_count(&shared), 1);
     }
 
     #[test]

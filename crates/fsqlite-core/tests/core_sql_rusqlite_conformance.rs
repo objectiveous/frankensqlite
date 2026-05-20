@@ -609,6 +609,38 @@ const ATTACHED_CREATE_VIEW_CASES: &[QueryCase] = &[
     },
 ];
 
+const ATTACHED_VACUUM_SETUP: &str = "
+    ATTACH DATABASE ':memory:' AS aux;
+
+    CREATE TABLE aux.items (
+        id INTEGER PRIMARY KEY,
+        value TEXT NOT NULL,
+        qty INTEGER NOT NULL
+    );
+    INSERT INTO aux.items VALUES
+        (1, 'alpha', 10),
+        (2, 'beta', 20),
+        (3, 'gamma', 30);
+    DELETE FROM aux.items WHERE id = 2;
+
+    VACUUM aux;
+";
+
+const ATTACHED_VACUUM_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "attached vacuum preserves live rows",
+        sql: "SELECT id, value, qty FROM aux.items ORDER BY id",
+    },
+    QueryCase {
+        name: "attached vacuum preserves schema row",
+        sql: "SELECT type, name FROM aux.sqlite_master WHERE name = 'items'",
+    },
+    QueryCase {
+        name: "attached vacuum aggregate",
+        sql: "SELECT COUNT(*), SUM(qty), MIN(value), MAX(value) FROM aux.items",
+    },
+];
+
 const ERROR_PATH_SETUP: &str = "
     CREATE TABLE constrained (
         id INTEGER PRIMARY KEY,
@@ -1251,6 +1283,12 @@ fn attached_drop_delegation_matches_rusqlite() {
 fn attached_create_view_delegation_matches_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(ATTACHED_CREATE_VIEW_SETUP);
     harness.assert_queries_match("attached CREATE VIEW", ATTACHED_CREATE_VIEW_CASES);
+}
+
+#[test]
+fn attached_vacuum_delegation_matches_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(ATTACHED_VACUUM_SETUP);
+    harness.assert_queries_match("attached VACUUM", ATTACHED_VACUUM_CASES);
 }
 
 #[test]

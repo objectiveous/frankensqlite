@@ -10505,6 +10505,7 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock};
 
     const BEAD_ID: &str = "bd-bca.1";
+    const DB300_E3_3_A_BEAD_ID: &str = "bd-db300.5.3.3.1";
     const TRACK_U_BEAD_ID: &str = "bd-c9pxw";
     const CHECKPOINT_DECOUPLING_BEAD_ID: &str = "bd-1dp9.6.7.9.2";
     const COMMIT_SERVICE_POLICY_BEAD_ID: &str = "bd-1dp9.6.7.9.4";
@@ -22608,6 +22609,76 @@ mod tests {
             reader.get_page(&cx, p).unwrap().as_ref()[0],
             0x22,
             "bead_id={BEAD_ID} case=single_connection_commit_and_retain_release_preserves_committed_visibility"
+        );
+    }
+
+    #[test]
+    fn test_committed_snapshot_retained_reader_arc_survives_publication_swap() {
+        init_publication_test_tracing();
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+        let shared_connection_count = Arc::new(AtomicUsize::new(2));
+        pager.bind_shared_connection_count(Arc::clone(&shared_connection_count));
+
+        let first_page = {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, page, &vec![0x33; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+            page
+        };
+
+        let retained = pager.committed_snapshot();
+        let retained_commit_seq = retained.commit_seq;
+        let retained_db_size = retained.db_size;
+        assert_eq!(
+            Arc::strong_count(&retained),
+            2,
+            "bead_id={DB300_E3_3_A_BEAD_ID} case=retained_snapshot_starts_shared_with_publication_slot"
+        );
+
+        let second_page = {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, page, &vec![0x44; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+            page
+        };
+
+        let latest = pager.committed_snapshot();
+        assert!(
+            latest.commit_seq > retained_commit_seq,
+            "bead_id={DB300_E3_3_A_BEAD_ID} case=latest_snapshot_advances_after_swap"
+        );
+        assert!(
+            latest.db_size > retained_db_size,
+            "bead_id={DB300_E3_3_A_BEAD_ID} case=latest_snapshot_reflects_second_allocation"
+        );
+        assert_eq!(
+            retained.commit_seq, retained_commit_seq,
+            "bead_id={DB300_E3_3_A_BEAD_ID} case=retained_snapshot_commit_seq_remains_stable"
+        );
+        assert_eq!(
+            retained.db_size, retained_db_size,
+            "bead_id={DB300_E3_3_A_BEAD_ID} case=retained_snapshot_db_size_remains_stable"
+        );
+        assert_eq!(
+            Arc::strong_count(&retained),
+            1,
+            "bead_id={DB300_E3_3_A_BEAD_ID} case=old_snapshot_slot_released_after_swap"
+        );
+
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            reader.get_page(&cx, first_page).unwrap().as_ref()[0],
+            0x33,
+            "bead_id={DB300_E3_3_A_BEAD_ID} case=first_page_still_visible"
+        );
+        assert_eq!(
+            reader.get_page(&cx, second_page).unwrap().as_ref()[0],
+            0x44,
+            "bead_id={DB300_E3_3_A_BEAD_ID} case=second_page_visible_after_swap"
         );
     }
 

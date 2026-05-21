@@ -203,6 +203,8 @@ pub enum DataflowOperator {
     },
     /// Keep rows whose text column starts with the configured prefix.
     FilterTextPrefix { column: usize, prefix: String },
+    /// Keep rows whose text column ends with the configured suffix.
+    FilterTextSuffix { column: usize, suffix: String },
     /// Keep rows where an integer column lies in an inclusive range.
     FilterIntegerBetween {
         column: usize,
@@ -296,6 +298,7 @@ impl DataflowOperator {
             Self::FilterInSet { column, values } => filter_in_set(rows, *column, values),
             Self::FilterNotInSet { column, values } => filter_not_in_set(rows, *column, values),
             Self::FilterTextPrefix { column, prefix } => filter_text_prefix(rows, *column, prefix),
+            Self::FilterTextSuffix { column, suffix } => filter_text_suffix(rows, *column, suffix),
             Self::FilterIntegerBetween {
                 column,
                 lower,
@@ -523,6 +526,26 @@ fn filter_text_prefix(
     rows.iter()
         .filter_map(|row| match row.values.get(column) {
             Some(SqliteValue::Text(candidate)) if candidate.as_str().starts_with(prefix) => {
+                Some(Ok(row.clone()))
+            }
+            Some(SqliteValue::Text(_)) => None,
+            Some(_) => Some(Err(DataflowError::PredicateValueNotText { column })),
+            None => Some(Err(DataflowError::ColumnOutOfBounds {
+                column,
+                width: row.width(),
+            })),
+        })
+        .collect()
+}
+
+fn filter_text_suffix(
+    rows: &[WeightedRow],
+    column: usize,
+    suffix: &str,
+) -> DataflowResult<Vec<WeightedRow>> {
+    rows.iter()
+        .filter_map(|row| match row.values.get(column) {
+            Some(SqliteValue::Text(candidate)) if candidate.as_str().ends_with(suffix) => {
                 Some(Ok(row.clone()))
             }
             Some(SqliteValue::Text(_)) => None,
@@ -1184,6 +1207,85 @@ mod tests {
         let err = automaton
             .execute(&[WeightedRow::insert(vec![int(1), text("alpha")])])
             .expect_err("invalid text-prefix predicate column should fail");
+
+        assert_eq!(
+            err,
+            DataflowError::ColumnOutOfBounds {
+                column: 2,
+                width: 2
+            }
+        );
+    }
+
+    #[test]
+    fn filter_text_suffix_keeps_matching_weighted_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterTextSuffix {
+            column: 1,
+            suffix: "ta".to_owned(),
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), text("alpha")], 7),
+            WeightedRow::new(vec![int(2), text("beta")], -2),
+            WeightedRow::new(vec![int(3), text("delta")], 4),
+            WeightedRow::new(vec![int(4), text("zeta")], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(2), text("beta")], -2),
+                WeightedRow::new(vec![int(3), text("delta")], 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_text_suffix_empty_suffix_keeps_all_non_zero_text_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterTextSuffix {
+            column: 1,
+            suffix: String::new(),
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), text("alpha")], 7),
+            WeightedRow::new(vec![int(2), text("beta")], -2),
+            WeightedRow::new(vec![int(3), text("gamma")], 0),
+        ];
+
+        assert_eq!(
+            automaton.execute(&rows).expect("dataflow should execute"),
+            vec![
+                WeightedRow::new(vec![int(1), text("alpha")], 7),
+                WeightedRow::new(vec![int(2), text("beta")], -2),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_text_suffix_rejects_non_text_values() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterTextSuffix {
+            column: 1,
+            suffix: "ta".to_owned(),
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), int(2)])])
+            .expect_err("non-text predicate input should fail");
+
+        assert_eq!(err, DataflowError::PredicateValueNotText { column: 1 });
+    }
+
+    #[test]
+    fn filter_text_suffix_rejects_out_of_bounds_columns() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterTextSuffix {
+            column: 2,
+            suffix: "ta".to_owned(),
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), text("beta")])])
+            .expect_err("invalid text-suffix predicate column should fail");
 
         assert_eq!(
             err,

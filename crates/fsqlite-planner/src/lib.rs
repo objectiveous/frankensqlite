@@ -5866,6 +5866,34 @@ mod tests {
     // ===================================================================
 
     #[test]
+    fn access_path_metric_label_maps_every_kind() {
+        // The bare metric/tracing label for each access path (no selectivity),
+        // used in cost-estimate tracing and differential-plan fingerprints. It
+        // is only ever used as a value, never directly asserted per variant, so
+        // a wrong label would silently break observability.
+        assert_eq!(
+            access_path_metric_label(&AccessPathKind::FullTableScan),
+            "full_table_scan"
+        );
+        assert_eq!(
+            access_path_metric_label(&AccessPathKind::IndexScanRange { selectivity: 0.1 }),
+            "index_scan_range"
+        );
+        assert_eq!(
+            access_path_metric_label(&AccessPathKind::IndexScanEquality),
+            "index_scan_equality"
+        );
+        assert_eq!(
+            access_path_metric_label(&AccessPathKind::CoveringIndexScan { selectivity: 0.1 }),
+            "covering_index_scan"
+        );
+        assert_eq!(
+            access_path_metric_label(&AccessPathKind::RowidLookup),
+            "rowid_lookup"
+        );
+    }
+
+    #[test]
     fn test_estimate_cost_ext_exact_page_costs_at_zero_rows() {
         // At n_rows == 0 every per-row term vanishes, leaving the closed-form
         // page-level cost for each access path. test_estimate_cost_ext_zero_rows_

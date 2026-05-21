@@ -461,6 +461,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn can_transition_to_covers_full_temperature_matrix() {
+        use PageTemperature::{Cold, Cooling, Hot};
+        // Complete the 3x3 transition matrix. temperature_state_machine_
+        // transitions_match_design_contract covers Hot->Cooling, Cooling->Cold,
+        // Cold->Hot, and the Hot->Cold rejection; the self-transitions,
+        // Cooling->Hot, and the Cold->Cooling rejection were unpinned.
+
+        // Self-transitions are always allowed (idempotent re-assertion of state).
+        assert!(Hot.can_transition_to(Hot));
+        assert!(Cooling.can_transition_to(Cooling));
+        assert!(Cold.can_transition_to(Cold));
+
+        // The remaining allowed edges.
+        assert!(Hot.can_transition_to(Cooling));
+        assert!(Cooling.can_transition_to(Hot));
+        assert!(Cooling.can_transition_to(Cold));
+        assert!(Cold.can_transition_to(Hot));
+
+        // The two forbidden edges: Hot cannot skip straight to Cold, and Cold
+        // cannot reheat directly to Cooling.
+        assert!(!Hot.can_transition_to(Cold));
+        assert!(!Cold.can_transition_to(Cooling));
+
+        // transition() surfaces the precise error for the previously-unpinned
+        // Cold->Cooling rejection.
+        assert_eq!(
+            Cold.transition(Cooling)
+                .expect_err("cold_to_cooling must be invalid"),
+            SwizzleError::InvalidTemperatureTransition {
+                from: Cold,
+                to: Cooling,
+            }
+        );
+    }
+
     // ── SwizzleRegistry tests (bd-3ta.3) ────────────────────────────────
 
     const BEAD_REGISTRY: &str = "bd-3ta.3";

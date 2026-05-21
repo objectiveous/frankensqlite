@@ -409,6 +409,29 @@ const MATCH_CASES: &[MatchCase] = &[
     },
 ];
 
+const IMPLICIT_AND_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "two adjacent bare terms",
+        query: "rust search",
+    },
+    MatchCase {
+        name: "three adjacent bare terms",
+        query: "rust sqlite search",
+    },
+    MatchCase {
+        name: "adjacent column filters",
+        query: "title:rust body:search",
+    },
+    MatchCase {
+        name: "adjacent column filter and body term",
+        query: "title:rust body:writers",
+    },
+    MatchCase {
+        name: "column filter followed by implicit union term",
+        query: "title:rust sqlite",
+    },
+];
+
 const CASE_FOLDING_CASES: &[MatchCase] = &[
     MatchCase {
         name: "uppercase bare term",
@@ -1661,6 +1684,21 @@ fn match_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "MATCH conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn implicit_and_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in IMPLICIT_AND_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "implicit AND conformance case failed: {} ({})",
             case.name,
             case.query
         );

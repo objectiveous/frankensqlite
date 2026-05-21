@@ -6013,6 +6013,51 @@ mod tests {
     }
 
     #[test]
+    fn test_order_joins_preserves_source_order_on_equal_cost_ties() {
+        // Equal-cost tables must keep their source order in BOTH branches: the
+        // greedy path uses a stable sort, and the exhaustive path scores the
+        // identity permutation first with a strict-less update, so no equal-cost
+        // permutation can displace it. (Documented "stable keeps ties in source
+        // order" contract; existing tests only exercise distinct costs.)
+
+        // Exhaustive branch (N <= JOIN_ORDER_EXHAUSTIVE_LIMIT = 4).
+        let exhaustive = vec![
+            stats_ref("e0", 100, 5_000, true),
+            stats_ref("e1", 100, 5_000, true),
+            stats_ref("e2", 100, 5_000, true),
+        ];
+        assert_eq!(
+            order_join_inputs_with_hints(&exhaustive),
+            vec![0, 1, 2],
+            "equal-cost tables keep source order (exhaustive branch)"
+        );
+
+        // Greedy branch (N > 4, stable sort).
+        let greedy = vec![
+            stats_ref("g0", 100, 5_000, true),
+            stats_ref("g1", 100, 5_000, true),
+            stats_ref("g2", 100, 5_000, true),
+            stats_ref("g3", 100, 5_000, true),
+            stats_ref("g4", 100, 5_000, true),
+        ];
+        assert_eq!(
+            order_join_inputs_with_hints(&greedy),
+            vec![0, 1, 2, 3, 4],
+            "equal-cost tables keep source order (greedy branch)"
+        );
+
+        // Deterministic: repeated calls yield identical permutations.
+        assert_eq!(
+            order_join_inputs_with_hints(&exhaustive),
+            order_join_inputs_with_hints(&exhaustive)
+        );
+        assert_eq!(
+            order_join_inputs_with_hints(&greedy),
+            order_join_inputs_with_hints(&greedy)
+        );
+    }
+
+    #[test]
     fn test_order_joins_from_table_stats_derives_has_stats() {
         // TableRefWithStats::from_table_stats should mark Analyze-sourced
         // entries as has_stats=true, Heuristic as false.

@@ -477,6 +477,25 @@ mod tests {
     }
 
     #[test]
+    fn partition_lower_and_upper_count_pivot_equal_elements_correctly() {
+        // partition_functions checks the partition invariant but not the exact
+        // returned count, nor the lower-vs-upper boundary: partition_lower sends
+        // pivot-equal elements to the upper side (strictly <), while
+        // partition_upper keeps them on the lower side (<=). With three 5s and a
+        // lone 8, lower counts only {3,1} and upper counts everything but 8.
+        let mut lower = vec![5, 3, 8, 5, 1, 5];
+        assert_eq!(partition_lower(&mut lower, 5), 2, "only 3 and 1 are strictly < 5");
+
+        let mut upper = vec![5, 3, 8, 5, 1, 5];
+        assert_eq!(partition_upper(&mut upper, 5), 5, "everything except the lone 8 is <= 5");
+
+        // Edge cases on partition_lower: all-below, none-below, and empty.
+        assert_eq!(partition_lower(&mut vec![1, 2, 3], 5), 3);
+        assert_eq!(partition_lower(&mut vec![5, 6, 7], 5), 0);
+        assert_eq!(partition_lower(&mut Vec::<i32>::new(), 5), 0);
+    }
+
+    #[test]
     fn cracking_preserves_permutation_and_answers_every_range() {
         // Database cracking only REORGANIZES the column; after any sequence of
         // queries it must stay a permutation of the original (no element lost

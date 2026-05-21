@@ -13872,10 +13872,33 @@ mod tests {
         );
         assert_eq!(metadata.integrity, VtabIntegrityPolicy::ShadowAware);
 
-        assert!(Fts5Table::shadow_table_policy("docs", "docs_data").is_shadow());
-        assert!(Fts5Table::shadow_table_policy("docs", "docs_idx").is_shadow());
-        assert!(Fts5Table::shadow_table_policy("docs", "docs_config").is_shadow());
-        assert!(!Fts5Table::shadow_table_policy("docs", "docs_segments").is_shadow());
+        for shadow_name in [
+            "docs_data",
+            "docs_idx",
+            "docs_config",
+            "docs_content",
+            "docs_docsize",
+        ] {
+            let policy = Fts5Table::shadow_table_policy("docs", shadow_name);
+            assert!(policy.is_shadow(), "{shadow_name} should be FTS5-owned");
+            assert!(
+                !policy.allows_direct_dml(),
+                "{shadow_name} should reject user-authored DML"
+            );
+            assert!(
+                !policy.allows_schema_ddl(),
+                "{shadow_name} should reject user-authored DDL/trigger changes"
+            );
+            assert!(
+                policy.allows_module_internal_write(),
+                "{shadow_name} should allow FTS5-owned internal writes"
+            );
+        }
+
+        let ordinary_policy = Fts5Table::shadow_table_policy("docs", "docs_segments");
+        assert!(!ordinary_policy.is_shadow());
+        assert!(ordinary_policy.allows_direct_dml());
+        assert!(ordinary_policy.allows_schema_ddl());
         assert!(!Fts5Table::shadow_table_policy("docs", "other_data").is_shadow());
     }
 

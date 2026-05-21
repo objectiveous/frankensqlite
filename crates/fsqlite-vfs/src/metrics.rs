@@ -760,4 +760,67 @@ mod tests {
         assert!(s.contains("4096"), "missing read byte count");
         assert!(s.contains("8192"), "missing write byte count");
     }
+
+    #[test]
+    fn metrics_snapshot_debug_and_clone() {
+        let snap = MetricsSnapshot {
+            read_ops: 42,
+            write_ops: 7,
+            ..MetricsSnapshot::default()
+        };
+        let cloned = snap.clone();
+        assert_eq!(snap, cloned);
+        let dbg = format!("{snap:?}");
+        assert!(dbg.contains("MetricsSnapshot"));
+        assert!(dbg.contains("read_ops"));
+        assert!(dbg.contains("42"));
+    }
+
+    #[test]
+    fn total_ops_excludes_byte_counters() {
+        let snap = MetricsSnapshot {
+            read_ops: 0,
+            write_ops: 0,
+            sync_ops: 0,
+            lock_ops: 0,
+            unlock_ops: 0,
+            truncate_ops: 0,
+            close_ops: 0,
+            file_size_ops: 0,
+            read_bytes_total: 999_999,
+            write_bytes_total: 888_888,
+        };
+        assert_eq!(snap.total_ops(), 0, "byte counters must not inflate total_ops");
+    }
+
+    #[test]
+    fn tracing_file_delegates_shm_barrier() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let (file, _) = vfs
+            .open(
+                &cx,
+                Some(Path::new("barrier.db")),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
+            )
+            .unwrap();
+        let traced = TracingFile::new(file, "barrier.db");
+        traced.shm_barrier();
+    }
+
+    #[test]
+    fn tracing_file_delegates_set_busy_timeout() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let (file, _) = vfs
+            .open(
+                &cx,
+                Some(Path::new("busy.db")),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
+            )
+            .unwrap();
+        let mut traced = TracingFile::new(file, "busy.db");
+        traced.set_busy_timeout_ms(5000);
+        traced.set_busy_timeout_ms(0);
+    }
 }

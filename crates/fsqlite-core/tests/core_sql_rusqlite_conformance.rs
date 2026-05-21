@@ -185,6 +185,37 @@ const SELECT_JOIN_GROUP_AGGREGATE_CASES: &[QueryCase] = &[
     },
 ];
 
+const AGGREGATE_EDGE_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "empty input aggregate identities",
+        sql: "SELECT COUNT(*), COUNT(qty), SUM(qty), AVG(qty), MIN(qty), MAX(qty) FROM sales WHERE qty > 1000",
+    },
+    QueryCase {
+        name: "left join aggregate null skipping",
+        sql: "SELECT COUNT(*), COUNT(ret.qty), SUM(ret.qty), COALESCE(SUM(ret.qty), 0) FROM sales s LEFT JOIN returns ret ON ret.sale_id = s.id",
+    },
+    QueryCase {
+        name: "distinct aggregate per group",
+        sql: "SELECT product_id, COUNT(*), COUNT(DISTINCT store_id), SUM(DISTINCT qty) FROM sales GROUP BY product_id ORDER BY product_id",
+    },
+    QueryCase {
+        name: "aggregate filter on whole table",
+        sql: "SELECT COUNT(*) FILTER (WHERE qty >= 10), SUM(qty) FILTER (WHERE sale_date >= '2025-03-01') FROM sales",
+    },
+    QueryCase {
+        name: "aggregate filter per joined group",
+        sql: "SELECT st.region_id, COUNT(*) FILTER (WHERE s.qty >= 10), SUM(s.qty) FILTER (WHERE p.name = 'Bolt') FROM stores st JOIN sales s ON s.store_id = st.id JOIN products p ON p.id = s.product_id GROUP BY st.region_id ORDER BY st.region_id",
+    },
+    QueryCase {
+        name: "having with distinct aggregate alias",
+        sql: "SELECT st.name, COUNT(DISTINCT s.product_id) AS product_count, SUM(s.qty) AS total_qty FROM stores st LEFT JOIN sales s ON s.store_id = st.id GROUP BY st.name HAVING product_count >= 2 OR total_qty IS NULL ORDER BY st.name",
+    },
+    QueryCase {
+        name: "case expression inside aggregate",
+        sql: "SELECT SUM(CASE WHEN qty >= 10 THEN qty END), COUNT(CASE WHEN qty < 10 THEN 1 END) FROM sales",
+    },
+];
+
 const UPSERT_SETUP: &str = "
     CREATE TABLE kv (
         id INTEGER PRIMARY KEY,
@@ -1270,6 +1301,12 @@ fn select_join_group_by_aggregates_match_rusqlite() {
         "SELECT/JOIN/GROUP BY/aggregate",
         SELECT_JOIN_GROUP_AGGREGATE_CASES,
     );
+}
+
+#[test]
+fn aggregate_edge_cases_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
+    harness.assert_queries_match("aggregate edge", AGGREGATE_EDGE_CASES);
 }
 
 #[test]

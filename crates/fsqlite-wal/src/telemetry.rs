@@ -756,4 +756,61 @@ mod tests {
         };
         obs.on_event(&event);
     }
+
+    #[test]
+    fn event_serialize_produces_valid_json() {
+        let event = WalTelemetryEvent::FrameAppended {
+            frame_count: 2,
+            bytes_written: 8240,
+            is_commit: true,
+            timestamp_ns: 42,
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert!(json.contains("FrameAppended"));
+        assert!(json.contains("8240"));
+        assert!(json.contains("true"));
+    }
+
+    #[test]
+    fn kind_str_covers_all_ten_variants() {
+        let events = all_event_variants();
+        assert_eq!(events.len(), 10, "all_event_variants must cover 10 variants");
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind_str()).collect();
+        let unique: std::collections::HashSet<&str> = kinds.iter().copied().collect();
+        assert_eq!(unique.len(), 10, "all kind_str values must be distinct");
+    }
+
+    #[test]
+    fn wal_telemetry_snapshot_debug_and_serialize() {
+        let _guard = crate::group_commit::GLOBAL_CONSOLIDATION_METRICS_TEST_LOCK
+            .lock()
+            .expect("lock");
+        let _reset = ResetTelemetryGlobals;
+        crate::metrics::GLOBAL_WAL_METRICS.reset();
+        crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS.reset();
+        crate::metrics::GLOBAL_WAL_RECOVERY_METRICS.reset();
+        crate::metrics::GLOBAL_GROUP_COMMIT_METRICS.reset();
+        crate::group_commit::GLOBAL_CONSOLIDATION_METRICS.reset();
+
+        let snap = wal_telemetry_snapshot();
+        let dbg = format!("{snap:?}");
+        assert!(dbg.contains("WalTelemetrySnapshot"));
+        let json = serde_json::to_string(&snap).expect("serialize snapshot");
+        assert!(json.contains("wal"));
+        assert!(json.contains("fec_repair"));
+    }
+
+    #[test]
+    fn ring_buffer_drain_single_event() {
+        let rb = WalTelemetryRingBuffer::new(8);
+        let event = WalTelemetryEvent::WalReset {
+            new_checkpoint_seq: 99,
+            timestamp_ns: 1,
+        };
+        rb.on_event(&event);
+        assert_eq!(rb.len(), 1);
+        let drained = rb.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0], event);
+    }
 }

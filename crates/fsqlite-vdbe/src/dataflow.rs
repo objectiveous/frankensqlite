@@ -213,6 +213,8 @@ pub enum DataflowOperator {
     },
     /// Keep rows whose blob column starts with the configured byte prefix.
     FilterBlobPrefix { column: usize, prefix: Vec<u8> },
+    /// Keep rows whose blob column ends with the configured byte suffix.
+    FilterBlobSuffix { column: usize, suffix: Vec<u8> },
     /// Keep rows whose text column starts with the configured prefix.
     FilterTextPrefix { column: usize, prefix: String },
     /// Keep rows whose text column ends with the configured suffix.
@@ -350,6 +352,7 @@ impl DataflowOperator {
             Self::FilterInSet { column, values } => filter_in_set(rows, *column, values),
             Self::FilterNotInSet { column, values } => filter_not_in_set(rows, *column, values),
             Self::FilterBlobPrefix { column, prefix } => filter_blob_prefix(rows, *column, prefix),
+            Self::FilterBlobSuffix { column, suffix } => filter_blob_suffix(rows, *column, suffix),
             Self::FilterTextPrefix { column, prefix } => filter_text_prefix(rows, *column, prefix),
             Self::FilterTextSuffix { column, suffix } => filter_text_suffix(rows, *column, suffix),
             Self::FilterTextContains { column, needle } => {
@@ -634,6 +637,26 @@ fn filter_blob_prefix(
     rows.iter()
         .filter_map(|row| match row.values.get(column) {
             Some(SqliteValue::Blob(candidate)) if candidate.starts_with(prefix) => {
+                Some(Ok(row.clone()))
+            }
+            Some(SqliteValue::Blob(_)) => None,
+            Some(_) => Some(Err(DataflowError::PredicateValueNotBlob { column })),
+            None => Some(Err(DataflowError::ColumnOutOfBounds {
+                column,
+                width: row.width(),
+            })),
+        })
+        .collect()
+}
+
+fn filter_blob_suffix(
+    rows: &[WeightedRow],
+    column: usize,
+    suffix: &[u8],
+) -> DataflowResult<Vec<WeightedRow>> {
+    rows.iter()
+        .filter_map(|row| match row.values.get(column) {
+            Some(SqliteValue::Blob(candidate)) if candidate.ends_with(suffix) => {
                 Some(Ok(row.clone()))
             }
             Some(SqliteValue::Blob(_)) => None,
@@ -1540,6 +1563,86 @@ mod tests {
         let err = automaton
             .execute(&[WeightedRow::insert(vec![int(1), blob(&[0xCA])])])
             .expect_err("invalid blob-prefix predicate column should fail");
+
+        assert_eq!(
+            err,
+            DataflowError::ColumnOutOfBounds {
+                column: 2,
+                width: 2
+            }
+        );
+    }
+
+    #[test]
+    fn filter_blob_suffix_keeps_matching_weighted_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterBlobSuffix {
+            column: 1,
+            suffix: vec![0xFE, 0xED],
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), blob(&[0xFE])], 7),
+            WeightedRow::new(vec![int(2), blob(&[0xCA, 0xFE, 0xED])], -2),
+            WeightedRow::new(vec![int(3), blob(&[0x00, 0xFE, 0xED])], 4),
+            WeightedRow::new(vec![int(4), blob(&[0xFE, 0xED, 0x00])], 5),
+            WeightedRow::new(vec![int(5), blob(&[0x01, 0xFE, 0xED])], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(2), blob(&[0xCA, 0xFE, 0xED])], -2),
+                WeightedRow::new(vec![int(3), blob(&[0x00, 0xFE, 0xED])], 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_blob_suffix_empty_suffix_keeps_all_non_zero_blob_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterBlobSuffix {
+            column: 1,
+            suffix: Vec::new(),
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), blob(&[1, 2])], 7),
+            WeightedRow::new(vec![int(2), blob(&[])], -2),
+            WeightedRow::new(vec![int(3), blob(&[3])], 0),
+        ];
+
+        assert_eq!(
+            automaton.execute(&rows).expect("dataflow should execute"),
+            vec![
+                WeightedRow::new(vec![int(1), blob(&[1, 2])], 7),
+                WeightedRow::new(vec![int(2), blob(&[])], -2),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_blob_suffix_rejects_non_blob_values() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterBlobSuffix {
+            column: 1,
+            suffix: vec![0xFE],
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), text("feed")])])
+            .expect_err("non-blob predicate input should fail");
+
+        assert_eq!(err, DataflowError::PredicateValueNotBlob { column: 1 });
+    }
+
+    #[test]
+    fn filter_blob_suffix_rejects_out_of_bounds_columns() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterBlobSuffix {
+            column: 2,
+            suffix: vec![0xFE],
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), blob(&[0xFE])])])
+            .expect_err("invalid blob-suffix predicate column should fail");
 
         assert_eq!(
             err,

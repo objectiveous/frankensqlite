@@ -5986,6 +5986,34 @@ mod tests {
     }
 
     #[test]
+    fn test_order_indices_to_names() {
+        // order_indices_to_names applies a permutation of indices to a tables
+        // slice, producing the named permutation.
+        let tables = vec![
+            table_stats("a", 1, 1),
+            table_stats("b", 1, 1),
+            table_stats("c", 1, 1),
+        ];
+        // Empty order -> empty vec.
+        assert!(order_indices_to_names(&[], &tables).is_empty());
+        // Identity preserves the table order.
+        assert_eq!(
+            order_indices_to_names(&[0, 1, 2], &tables),
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+        );
+        // A non-trivial permutation reorders the names accordingly.
+        assert_eq!(
+            order_indices_to_names(&[2, 0, 1], &tables),
+            vec!["c".to_owned(), "a".to_owned(), "b".to_owned()]
+        );
+        // A single-element permutation yields just that table's name.
+        assert_eq!(
+            order_indices_to_names(&[1], &tables),
+            vec!["b".to_owned()]
+        );
+    }
+
+    #[test]
     fn test_normalize_plan_cache_capacity_floors_at_one() {
         // A requested plan-cache capacity is clamped to a non-zero value: 0
         // becomes 1 (no zero-capacity cache), positive values pass through.

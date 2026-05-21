@@ -781,6 +781,28 @@ mod tests {
     }
 
     #[test]
+    fn test_ptrmap_page_for_header_and_first_ptrmap_page_have_no_entry() {
+        // test_ptrmap_page_for_given_pgno_boundaries covers a regular page, a
+        // group-final page, a next-group page, and a high pointer-map page (822).
+        // The two low-page edges are still unpinned: page 1 (the database header,
+        // raw < 3 -- pointer-map entries begin at page 3) and page 2 (which is
+        // itself the first pointer-map page) both lack a pointer-map entry, via
+        // two different guards.
+        let p1 = PageNumber::new(1).unwrap();
+        let p2 = PageNumber::new(2).unwrap();
+
+        // Page 1 is the database header (raw < 3 guard): no pointer-map entry.
+        assert!(ptrmap_page_for(p1, 4096, 4096).is_none());
+        assert!(ptrmap_entry_offset(p1, 4096, 4096).is_none());
+
+        // Page 2 is the first pointer-map page (is_ptrmap_page guard), so it has
+        // no entry of its own.
+        assert!(is_ptrmap_page(p2, 4096, 4096));
+        assert!(ptrmap_page_for(p2, 4096, 4096).is_none());
+        assert!(ptrmap_entry_offset(p2, 4096, 4096).is_none());
+    }
+
+    #[test]
     fn test_ptrmap_pending_byte_page_collision() {
         // For 1024 byte pages, the pending byte page is 1_048_577.
         // It falls exactly on what would normally be a pointer map page.

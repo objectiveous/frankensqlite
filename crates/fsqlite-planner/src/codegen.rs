@@ -2289,6 +2289,47 @@ mod tests {
         assert_eq!(extract_rowid_bind(None), None);
     }
 
+    #[test]
+    fn test_result_column_count_expands_stars() {
+        let table = TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo {
+                    name: "a".to_owned(),
+                    affinity: 'd',
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "b".to_owned(),
+                    affinity: 'b',
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "c".to_owned(),
+                    affinity: 'c',
+                    default_value: None,
+                },
+            ],
+            indexes: vec![],
+        };
+        let expr = || ResultColumn::Expr {
+            expr: Expr::Literal(Literal::Integer(1), Span::ZERO),
+            alias: None,
+        };
+
+        assert_eq!(result_column_count(&[], &table), 0);
+        assert_eq!(result_column_count(&[expr(), expr()], &table), 2);
+        // `*` expands to the table's column count (3); each Expr adds 1.
+        assert_eq!(result_column_count(&[ResultColumn::Star], &table), 3);
+        assert_eq!(result_column_count(&[ResultColumn::Star, expr()], &table), 4);
+        // Each star expands independently.
+        assert_eq!(
+            result_column_count(&[ResultColumn::Star, ResultColumn::Star], &table),
+            6
+        );
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),

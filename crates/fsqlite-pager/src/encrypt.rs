@@ -961,4 +961,39 @@ mod tests {
         let enc = PageEncryptor::new(&TEST_DEK, db_id);
         assert_eq!(enc.database_id(), db_id);
     }
+
+    #[test]
+    fn argon2_params_debug_and_clone() {
+        let p = Argon2Params { m_cost: 1024, t_cost: 2, p_cost: 1 };
+        let dbg = format!("{p:?}");
+        assert!(dbg.contains("Argon2Params"));
+        assert!(dbg.contains("1024"));
+        let cloned = p.clone();
+        assert_eq!(cloned.m_cost, 1024);
+        assert_eq!(cloned.t_cost, 2);
+        assert_eq!(cloned.p_cost, 1);
+    }
+
+    #[test]
+    fn encrypt_error_implements_std_error() {
+        let e: &dyn std::error::Error = &EncryptError::AuthenticationFailed;
+        assert!(e.source().is_none());
+        assert!(!e.to_string().is_empty());
+    }
+
+    #[test]
+    fn database_id_debug_format() {
+        let id = DatabaseId::from_bytes([0xAB; DATABASE_ID_SIZE]);
+        let dbg = format!("{id:?}");
+        assert!(dbg.contains("DatabaseId"));
+    }
+
+    #[test]
+    fn encryption_reserved_bytes_equals_nonce_plus_tag() {
+        assert_eq!(
+            usize::from(ENCRYPTION_RESERVED_BYTES),
+            NONCE_SIZE + TAG_SIZE,
+            "reserved must be exactly nonce + tag"
+        );
+    }
 }

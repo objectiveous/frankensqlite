@@ -8359,6 +8359,70 @@ mod tests {
     }
 
     #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_uncommitted_delta_out_of_horizon()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4269;
+        let payload = vec![b'u'; 133];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        let seed_seq = mgr.commit(&mut seed).expect("seed commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                txn.token(),
+            )
+            .expect("logical insert should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("base page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![(rowid, payload.clone())],
+            "transaction-local reads must materialize their own logical writes"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(seed_seq),
+            "own uncommitted synthetic deltas must not advance the committed read witness"
+        );
+
+        let logical_seq = mgr.commit(&mut txn).expect("logical commit");
+        assert!(logical_seq > seed_seq);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(rowid, payload)]
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(logical_seq),
+            "fresh reads should witness the committed logical delta after publish"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_read_page_with_cell_deltas_hides_post_snapshot_commit() -> fsqlite_error::Result<()> {
         use crate::cell_visibility::CellKey;
         use fsqlite_types::{BtreeRef, TableId};

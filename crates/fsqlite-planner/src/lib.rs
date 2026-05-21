@@ -6099,6 +6099,26 @@ mod tests {
     }
 
     #[test]
+    fn test_is_plan_cache_empty_and_clear_on_fresh_planner() {
+        // A freshly-constructed QueryPlanner has an empty plan cache (owned
+        // state, no globals), custom capacities are empty initially, capacity 0
+        // is clamped to 1 but still empty, and clear_plan_cache is idempotent
+        // on an already-empty cache.
+        let p = QueryPlanner::new();
+        assert!(p.is_plan_cache_empty());
+
+        let p2 = QueryPlanner::with_plan_cache_capacity(8);
+        assert!(p2.is_plan_cache_empty());
+
+        let p3 = QueryPlanner::with_plan_cache_capacity(0);
+        assert!(p3.is_plan_cache_empty());
+
+        let mut p4 = QueryPlanner::new();
+        p4.clear_plan_cache();
+        assert!(p4.is_plan_cache_empty());
+    }
+
+    #[test]
     fn test_normalize_plan_cache_capacity_floors_at_one() {
         // A requested plan-cache capacity is clamped to a non-zero value: 0
         // becomes 1 (no zero-capacity cache), positive values pass through.

@@ -1288,6 +1288,43 @@ mod tests {
     }
 
     #[test]
+    fn test_read_interior_left_child_parses_be_and_rejects_corruption() {
+        // Interior cells begin with a 4-byte big-endian left-child page number.
+        let mut page = vec![0u8; 16];
+        page[0..4].copy_from_slice(&42u32.to_be_bytes());
+        assert_eq!(
+            CellRef::read_interior_left_child(&page, 0).unwrap(),
+            PageNumber::new(42).unwrap()
+        );
+
+        // Big-endian byte order, read at a non-zero offset.
+        page[8..12].copy_from_slice(&256u32.to_be_bytes()); // 0x0000_0100
+        assert_eq!(
+            CellRef::read_interior_left_child(&page, 8).unwrap(),
+            PageNumber::new(256).unwrap()
+        );
+
+        // A zero left-child pointer is corruption (page 0 is not a valid pgno).
+        assert!(matches!(
+            CellRef::read_interior_left_child(&[0u8; 4], 0),
+            Err(FrankenError::DatabaseCorrupt { .. })
+        ));
+
+        // Reading past the end of the page is rejected (cell_offset + 4 > len).
+        assert!(matches!(
+            CellRef::read_interior_left_child(&[0u8, 0, 0], 0),
+            Err(FrankenError::DatabaseCorrupt { .. })
+        ));
+        assert!(
+            matches!(
+                CellRef::read_interior_left_child(&page, 13), // 13 + 4 = 17 > 16
+                Err(FrankenError::DatabaseCorrupt { .. })
+            ),
+            "offset too close to the end must be rejected"
+        );
+    }
+
+    #[test]
     fn test_parse_leaf_index_cell_no_overflow() {
         // Leaf index cell: [payload_size varint] [payload]
         let mut page = vec![0u8; 4096];

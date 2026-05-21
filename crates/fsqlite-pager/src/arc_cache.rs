@@ -3997,4 +3997,52 @@ mod tests {
         let cloned = snap.clone();
         assert_eq!(cloned.hits, 1);
     }
+
+    #[test]
+    fn arc_cache_inner_fresh_state_accessors() {
+        let inner = ArcCacheInner::new(128, 1024 * 1024);
+        assert_eq!(inner.capacity(), 128);
+        assert_eq!(inner.max_bytes(), 1024 * 1024);
+        assert_eq!(inner.len(), 0);
+        assert!(inner.is_empty());
+        assert_eq!(inner.total_bytes(), 0);
+        assert_eq!(inner.p(), 0);
+        assert_eq!(inner.t1_len(), 0);
+        assert_eq!(inner.t2_len(), 0);
+        assert_eq!(inner.b1_len(), 0);
+        assert_eq!(inner.b2_len(), 0);
+        assert_eq!(inner.capacity_overflow_events(), 0);
+    }
+
+    #[test]
+    fn cached_page_new_stores_fields_and_byte_size() {
+        let k = key(7, 3);
+        let data = fsqlite_types::PageData::zeroed(4096);
+        let page = CachedPage::new(k, data, 0xDEAD_BEEF, Some(42));
+        assert_eq!(page.key, k);
+        assert_eq!(page.xxh3, 0xDEAD_BEEF);
+        assert_eq!(page.wal_frame, Some(42));
+        assert_eq!(page.byte_size, 4096);
+        assert!(!page.is_pinned());
+    }
+
+    #[test]
+    fn arc_cache_new_creates_sharded_instance() {
+        let cache = ArcCache::new(256, 2 * 1024 * 1024);
+        assert!(cache.get(&key(1, 0)).is_none());
+        let snap = cache.resident_pages_snapshot();
+        assert_eq!(snap, Some(0));
+    }
+
+    #[test]
+    fn arc_cache_inner_reset_metrics_clears_counters() {
+        let mut inner = ArcCacheInner::new(64, 512 * 1024);
+        let snap_before = inner.metrics_snapshot();
+        assert_eq!(snap_before.hits, 0);
+        assert_eq!(snap_before.misses, 0);
+        inner.reset_metrics();
+        let snap_after = inner.metrics_snapshot();
+        assert_eq!(snap_after.hits, 0);
+        assert_eq!(snap_after.admits, 0);
+    }
 }

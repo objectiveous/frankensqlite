@@ -1661,6 +1661,34 @@ mod tests {
         assert!(!explain.contains("GROUP BY"), "rowset has no grouping:\n{explain}");
     }
 
+    #[test]
+    fn differential_plan_compiles_global_aggregate_shape() {
+        // An aggregate with no GROUP BY is a whole-stream (global) aggregate -- a
+        // distinct DifferentialPlanMode that had no compile or explain coverage
+        // (existing tests cover only RowSet and GroupedAggregate).
+        let select = parse_select("SELECT COUNT(*) AS total FROM orders");
+
+        let plan = compile_differential_view_plan(&select).expect("global aggregate should compile");
+        assert_eq!(plan.mode, DifferentialPlanMode::GlobalAggregate);
+        assert!(plan.group_by.is_empty(), "a global aggregate has no grouping keys");
+        assert_eq!(plan.sources.len(), 1);
+        assert_eq!(plan.sources[0].binding, "orders");
+        assert_eq!(
+            plan.outputs,
+            vec![DifferentialOutput::Aggregate {
+                aggregate: DifferentialAggregate::CountRows,
+                alias: Some("total".to_owned()),
+            }]
+        );
+
+        // Explain renders the global-aggregate header and emits the aggregate.
+        let explain = explain_differential_view_plan(&select).expect("should compile");
+        assert!(explain.contains("DIFFERENTIAL global_aggregate"), "explain:\n{explain}");
+        assert!(explain.contains("SOURCE orders AS orders"));
+        assert!(explain.contains("EMIT COUNT(*) AS total"));
+        assert!(!explain.contains("GROUP BY"), "global aggregate has no grouping:\n{explain}");
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
 

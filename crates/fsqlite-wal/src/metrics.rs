@@ -740,4 +740,124 @@ mod tests {
         let r = WalRecoveryCounters::default();
         assert_eq!(r.snapshot().recovery_frames_total, 0);
     }
+
+    // ── Group commit metrics ──
+
+    #[test]
+    fn group_commit_recording() {
+        let g = GroupCommitMetrics::new();
+        g.record_group_commit(5, 2000);
+        g.record_group_commit(3, 1500);
+        let snap = g.snapshot();
+        assert_eq!(snap.group_commits_total, 2);
+        assert_eq!(snap.group_commit_size_sum, 8);
+        assert_eq!(snap.commit_latency_us_total, 3500);
+    }
+
+    #[test]
+    fn group_commit_submission_and_fsync_counting() {
+        let g = GroupCommitMetrics::new();
+        for _ in 0..10 {
+            g.record_submission();
+        }
+        g.record_fsync1();
+        g.record_fsync2();
+        g.record_fsync1();
+        g.record_fsync2();
+        let snap = g.snapshot();
+        assert_eq!(snap.submissions_total, 10);
+        assert_eq!(snap.fsync1_total, 2);
+        assert_eq!(snap.fsync2_total, 2);
+    }
+
+    #[test]
+    fn group_commit_conflict_counting() {
+        let g = GroupCommitMetrics::new();
+        g.record_fcw_conflict();
+        g.record_fcw_conflict();
+        g.record_ssi_conflict();
+        g.record_shutdown_rejection();
+        let snap = g.snapshot();
+        assert_eq!(snap.fcw_conflicts_total, 2);
+        assert_eq!(snap.ssi_conflicts_total, 1);
+        assert_eq!(snap.shutdown_rejections_total, 1);
+    }
+
+    #[test]
+    fn group_commit_snapshot_derived_metrics() {
+        let g = GroupCommitMetrics::new();
+        g.record_group_commit(8, 4000);
+        g.record_group_commit(4, 2000);
+        let snap = g.snapshot();
+        assert_eq!(snap.avg_group_size(), 6);
+        assert_eq!(snap.avg_commit_latency_us(), 3000);
+    }
+
+    #[test]
+    fn group_commit_fsync_reduction_ratio() {
+        let g = GroupCommitMetrics::new();
+        for _ in 0..20 {
+            g.record_submission();
+        }
+        g.record_fsync1();
+        g.record_fsync2();
+        g.record_fsync1();
+        g.record_fsync2();
+        let snap = g.snapshot();
+        assert_eq!(snap.fsync_reduction_ratio(), 5);
+    }
+
+    #[test]
+    fn group_commit_zero_division_safety() {
+        let g = GroupCommitMetrics::new();
+        let snap = g.snapshot();
+        assert_eq!(snap.avg_group_size(), 0);
+        assert_eq!(snap.avg_commit_latency_us(), 0);
+        assert_eq!(snap.fsync_reduction_ratio(), 0);
+    }
+
+    #[test]
+    fn group_commit_reset() {
+        let g = GroupCommitMetrics::new();
+        g.record_group_commit(5, 1000);
+        g.record_submission();
+        g.record_fsync1();
+        g.record_fsync2();
+        g.record_fcw_conflict();
+        g.record_ssi_conflict();
+        g.record_shutdown_rejection();
+        g.reset();
+        let snap = g.snapshot();
+        assert_eq!(snap.group_commits_total, 0);
+        assert_eq!(snap.group_commit_size_sum, 0);
+        assert_eq!(snap.submissions_total, 0);
+        assert_eq!(snap.commit_latency_us_total, 0);
+        assert_eq!(snap.fsync1_total, 0);
+        assert_eq!(snap.fsync2_total, 0);
+        assert_eq!(snap.fcw_conflicts_total, 0);
+        assert_eq!(snap.ssi_conflicts_total, 0);
+        assert_eq!(snap.shutdown_rejections_total, 0);
+    }
+
+    #[test]
+    fn group_commit_display() {
+        let g = GroupCommitMetrics::new();
+        g.record_group_commit(3, 900);
+        g.record_submission();
+        g.record_fcw_conflict();
+        let s = g.snapshot().to_string();
+        assert!(s.contains("group_commits=1"));
+        assert!(s.contains("size_sum=3"));
+        assert!(s.contains("submissions=1"));
+        assert!(s.contains("latency_us=900"));
+        assert!(s.contains("fcw_conflicts=1"));
+        assert!(s.contains("ssi_conflicts=0"));
+        assert!(s.contains("shutdown_rejections=0"));
+    }
+
+    #[test]
+    fn group_commit_default() {
+        let g = GroupCommitMetrics::default();
+        assert_eq!(g.snapshot().group_commits_total, 0);
+    }
 }

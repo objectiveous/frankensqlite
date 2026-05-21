@@ -191,6 +191,12 @@ pub enum DataflowOperator {
         column: usize,
         values: Vec<SqliteValue>,
     },
+    /// Keep rows where an integer column lies in an inclusive range.
+    FilterIntegerBetween {
+        column: usize,
+        lower: i64,
+        upper: i64,
+    },
     /// Keep rows where an integer column satisfies the comparison.
     FilterIntegerCompare {
         column: usize,
@@ -276,6 +282,11 @@ impl DataflowOperator {
                 })
                 .collect(),
             Self::FilterInSet { column, values } => filter_in_set(rows, *column, values),
+            Self::FilterIntegerBetween {
+                column,
+                lower,
+                upper,
+            } => filter_integer_between(rows, *column, *lower, *upper),
             Self::FilterIntegerCompare { column, op, value } => {
                 filter_integer_compare(rows, *column, *op, *value)
             }
@@ -463,6 +474,27 @@ fn filter_in_set(
                 Some(Ok(row.clone()))
             }
             Some(_) => None,
+            None => Some(Err(DataflowError::ColumnOutOfBounds {
+                column,
+                width: row.width(),
+            })),
+        })
+        .collect()
+}
+
+fn filter_integer_between(
+    rows: &[WeightedRow],
+    column: usize,
+    lower: i64,
+    upper: i64,
+) -> DataflowResult<Vec<WeightedRow>> {
+    rows.iter()
+        .filter_map(|row| match row.values.get(column) {
+            Some(SqliteValue::Integer(candidate)) if lower <= *candidate && *candidate <= upper => {
+                Some(Ok(row.clone()))
+            }
+            Some(SqliteValue::Integer(_)) => None,
+            Some(_) => Some(Err(DataflowError::PredicateValueNotInteger { column })),
             None => Some(Err(DataflowError::ColumnOutOfBounds {
                 column,
                 width: row.width(),
@@ -950,6 +982,88 @@ mod tests {
         let err = automaton
             .execute(&[WeightedRow::insert(vec![int(1), int(2)])])
             .expect_err("invalid in-set predicate column should fail");
+
+        assert_eq!(
+            err,
+            DataflowError::ColumnOutOfBounds {
+                column: 2,
+                width: 2
+            }
+        );
+    }
+
+    #[test]
+    fn filter_integer_between_keeps_matching_weighted_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterIntegerBetween {
+            column: 1,
+            lower: 10,
+            upper: 20,
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), int(9)], 3),
+            WeightedRow::new(vec![int(2), int(10)], -2),
+            WeightedRow::new(vec![int(3), int(15)], 4),
+            WeightedRow::new(vec![int(4), int(20)], 5),
+            WeightedRow::new(vec![int(5), int(21)], 6),
+            WeightedRow::new(vec![int(6), int(15)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(2), int(10)], -2),
+                WeightedRow::new(vec![int(3), int(15)], 4),
+                WeightedRow::new(vec![int(4), int(20)], 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_integer_between_inverted_range_matches_no_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterIntegerBetween {
+            column: 1,
+            lower: 20,
+            upper: 10,
+        }]);
+        let rows = vec![WeightedRow::new(vec![int(1), int(15)], 3)];
+
+        assert_eq!(
+            automaton.execute(&rows).expect("dataflow should execute"),
+            Vec::<WeightedRow>::new()
+        );
+    }
+
+    #[test]
+    fn filter_integer_between_rejects_non_integer_values() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterIntegerBetween {
+            column: 1,
+            lower: 10,
+            upper: 20,
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![
+                int(1),
+                SqliteValue::Text("15".into()),
+            ])])
+            .expect_err("non-integer predicate input should fail");
+
+        assert_eq!(err, DataflowError::PredicateValueNotInteger { column: 1 });
+    }
+
+    #[test]
+    fn filter_integer_between_rejects_out_of_bounds_columns() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterIntegerBetween {
+            column: 2,
+            lower: 10,
+            upper: 20,
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), int(2)])])
+            .expect_err("invalid between predicate column should fail");
 
         assert_eq!(
             err,

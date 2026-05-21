@@ -1008,6 +1008,33 @@ const BOOLEAN_LOGIC_PRECEDENCE_CASES: &[QueryCase] = &[
     },
 ];
 
+const NUMERIC_COERCION_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "integer arithmetic with null propagation",
+        sql: "SELECT id, a + b, a - b, a * b, a / NULLIF(b, 0), a % NULLIF(b, 0) FROM expr_rows ORDER BY id",
+    },
+    QueryCase {
+        name: "text numeric coercion literals",
+        sql: "SELECT '12' + 3, '12.5' * 2, 'abc' + 4, typeof('12' + 3), typeof('12.5' * 2)",
+    },
+    QueryCase {
+        name: "unary plus minus expressions",
+        sql: "SELECT id, +a, -a, -(a + COALESCE(b, 0)), typeof(+a) FROM expr_rows ORDER BY id",
+    },
+    QueryCase {
+        name: "concatenation coerces numbers and propagates null",
+        sql: "SELECT id, a || ':' || IFNULL(label, 'none'), label || a, a || NULL FROM expr_rows ORDER BY id",
+    },
+    QueryCase {
+        name: "arithmetic expression in where predicate",
+        sql: "SELECT id FROM expr_rows WHERE (a + COALESCE(b, 0)) >= 10 ORDER BY id",
+    },
+    QueryCase {
+        name: "mixed integer real division storage classes",
+        sql: "SELECT 5 / 2, 5 / 2.0, 5.0 / 2, 7 % 3, typeof(5 / 2), typeof(5 / 2.0)",
+    },
+];
+
 const DISTINCT_ORDER_LIMIT_CASES: &[QueryCase] = &[
     QueryCase {
         name: "distinct nullable text ordering",
@@ -1569,6 +1596,12 @@ fn boolean_logic_precedence_edges_match_rusqlite() {
         "boolean logic precedence edge",
         BOOLEAN_LOGIC_PRECEDENCE_CASES,
     );
+}
+
+#[test]
+fn numeric_coercion_expression_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
+    harness.assert_queries_match("numeric coercion edge", NUMERIC_COERCION_CASES);
 }
 
 #[test]

@@ -429,4 +429,56 @@ mod tests {
         assert_eq!(records[2].point, "wal_append_busy_countdown");
         assert_eq!(records[3].point, "wal_crash_header_truncate");
     }
+
+    #[test]
+    fn test_fault_hook_arm_clone_and_eq() {
+        let a = FaultHookArm::new("r1", "s1", "inv");
+        let b = a.clone();
+        assert_eq!(a, b);
+        let c = FaultHookArm::new("r1", "s1", "other");
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_unarmed_hooks_are_noop_from_fresh_state() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        assert!(maybe_inject_after_append(0, 1).is_ok());
+        assert!(maybe_inject_sync_failure(0, SyncFlags::FULL).is_ok());
+        assert!(maybe_inject_append_busy(0, 1).is_ok());
+        assert!(maybe_inject_crash_header_truncate(0, 1).is_ok());
+        assert!(take_records().is_empty());
+    }
+
+    #[test]
+    fn test_append_busy_countdown_one_fires_immediately() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_append_busy_countdown(arm("busy"), 1);
+        let err = maybe_inject_append_busy(0, 5);
+        assert!(err.is_err());
+        assert!(matches!(err.unwrap_err(), FrankenError::Busy));
+        let records = take_records();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].detail.contains("submitted_frames=5"));
+    }
+
+    #[test]
+    fn test_fault_injection_record_fields() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_after_append(FaultHookArm::new("run-x", "scen-y", "fam-z"));
+        let _ = maybe_inject_after_append(42, 7);
+        let records = take_records();
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        assert_eq!(r.run_id, "run-x");
+        assert_eq!(r.scenario_id, "scen-y");
+        assert_eq!(r.invariant_family, "fam-z");
+        assert_eq!(r.point, "wal_after_append");
+        assert!(r.trigger_seq > 0);
+    }
 }

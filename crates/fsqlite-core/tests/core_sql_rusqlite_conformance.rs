@@ -2442,6 +2442,43 @@ const MATH_FUNCTION_CASES: &[QueryCase] = &[
     },
 ];
 
+const ROUND_SCALAR_SETUP: &str = "
+    CREATE TABLE round_values (
+        id INTEGER PRIMARY KEY,
+        val REAL,
+        places INTEGER
+    );
+    INSERT INTO round_values (id, val, places) VALUES
+        (1, 3.14159, 2),
+        (2, 2.5, 0),
+        (3, -2.5, 0),
+        (4, 12.75, 1),
+        (5, NULL, 2);
+";
+
+const ROUND_SCALAR_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "default precision and half away from zero ties",
+        sql: "SELECT round(3.14159), round(2.5), round(3.5), round(-2.5), round(-3.5)",
+    },
+    QueryCase {
+        name: "explicit precision",
+        sql: "SELECT round(3.14159, 2), round(3.14159, 4), round(12.75, 1)",
+    },
+    QueryCase {
+        name: "precision clamping and null precision",
+        sql: "SELECT round(1.2345, -2), round(1.2345, 40), round(123.4, NULL)",
+    },
+    QueryCase {
+        name: "text coercion and null input",
+        sql: "SELECT round('12.75', 1), round('abc', 1), round(NULL), typeof(round(NULL))",
+    },
+    QueryCase {
+        name: "column driven round",
+        sql: "SELECT id, round(val), round(val, places), typeof(round(val, places)) FROM round_values ORDER BY id",
+    },
+];
+
 const PATTERN_SETUP: &str = "
     CREATE TABLE patterns (
         id INTEGER PRIMARY KEY,
@@ -2943,6 +2980,12 @@ fn format_quote_scalar_edges_match_rusqlite() {
 fn math_functions_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new("");
     harness.assert_queries_match("math functions", MATH_FUNCTION_CASES);
+}
+
+#[test]
+fn round_scalar_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(ROUND_SCALAR_SETUP);
+    harness.assert_queries_match("round scalar edge", ROUND_SCALAR_CASES);
 }
 
 #[test]

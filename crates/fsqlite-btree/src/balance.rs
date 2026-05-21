@@ -3608,6 +3608,53 @@ mod tests {
         );
     }
 
+    // -- page_required_bytes / page_fits tests --
+
+    #[test]
+    fn test_page_required_bytes_and_page_fits_formula() {
+        // page_required_bytes = header_offset + page header + 2 bytes per cell
+        // pointer + the sum of cell payload lengths; page_fits compares that
+        // total (<=) against the usable page size. These two helpers gate every
+        // split/rebalance "does this set of cells fit" decision, so pin the
+        // arithmetic, the leaf-vs-interior header difference, and the boundary.
+        let cells: Vec<GatheredCell> = (0..3)
+            .map(|_| GatheredCell {
+                data: vec![0u8; 10],
+                size: 10,
+            })
+            .collect();
+        let payload = 30usize; // 3 cells * 10 payload bytes
+        let ptrs = 3 * usize::from(CELL_POINTER_SIZE); // 3 * 2 = 6
+        let leaf_hdr = usize::from(BtreePageType::LeafTable.header_size());
+        let interior_hdr = usize::from(BtreePageType::InteriorTable.header_size());
+
+        // Leaf table page, no page-1 header offset.
+        let leaf = page_required_bytes(&cells, BtreePageType::LeafTable, 0).unwrap();
+        assert_eq!(leaf, leaf_hdr + ptrs + payload);
+
+        // Interior table page uses a larger page header; the cells are identical,
+        // so the only difference from the leaf total is the header size.
+        let interior = page_required_bytes(&cells, BtreePageType::InteriorTable, 0).unwrap();
+        assert_eq!(interior, interior_hdr + ptrs + payload);
+        assert_eq!(interior - leaf, interior_hdr - leaf_hdr);
+
+        // The 100-byte page-1 database-header offset is added on top.
+        let with_offset = page_required_bytes(&cells, BtreePageType::LeafTable, 100).unwrap();
+        assert_eq!(with_offset, leaf + 100);
+
+        // An empty cell list reduces to just header_offset + the page header.
+        assert_eq!(
+            page_required_bytes(&[], BtreePageType::LeafTable, 0).unwrap(),
+            leaf_hdr
+        );
+
+        // page_fits is the `<=` comparison against usable: an exact fit passes,
+        // one byte short fails.
+        let exact = u32::try_from(leaf).unwrap();
+        assert!(page_fits(&cells, BtreePageType::LeafTable, 0, exact));
+        assert!(!page_fits(&cells, BtreePageType::LeafTable, 0, exact - 1));
+    }
+
     // -- compute_distribution tests --
 
     #[test]

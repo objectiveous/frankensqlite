@@ -1687,6 +1687,36 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_fill_factor_env_flag_parses_operator_labels() {
+        // Affirmative operator labels enable adaptive control (case- and
+        // whitespace-insensitive).
+        for raw in ["on", "ON", "true", "True", "1", "enforced", "  enforced  "] {
+            assert_eq!(
+                super::parse_adaptive_fill_factor_flag(raw),
+                Some(true),
+                "{raw:?} should enable"
+            );
+        }
+        // Kill-switch / negative labels disable it.
+        for raw in ["off", "OFF", "false", "False", "0", "baseline", "  baseline  "] {
+            assert_eq!(
+                super::parse_adaptive_fill_factor_flag(raw),
+                Some(false),
+                "{raw:?} should disable"
+            );
+        }
+        // Unrecognized values are ignored (None => leave the current setting untouched),
+        // including the topology mode's "2"/"advisory"/"shadow" which are not flags here.
+        for raw in ["", "yes", "2", "advisory", "shadow", "maybe", "enable"] {
+            assert_eq!(
+                super::parse_adaptive_fill_factor_flag(raw),
+                None,
+                "{raw:?} should be ignored"
+            );
+        }
+    }
+
+    #[test]
     fn conflict_topology_advice_applies_hot_right_edge_fill_shift() {
         let _guard = super::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
             .lock()

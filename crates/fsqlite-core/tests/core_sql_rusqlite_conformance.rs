@@ -1450,6 +1450,61 @@ const SCALAR_NULL_COMPARISON_CASES: &[QueryCase] = &[
     },
 ];
 
+const BETWEEN_IN_PREDICATE_SETUP: &str = "
+    CREATE TABLE predicate_rows (
+        id INTEGER PRIMARY KEY,
+        n INTEGER,
+        lo INTEGER,
+        hi INTEGER,
+        txt TEXT
+    );
+    CREATE TABLE predicate_filter (
+        value INTEGER
+    );
+
+    INSERT INTO predicate_rows VALUES
+        (1, 5, 1, 10, 'alpha'),
+        (2, 10, 5, 8, 'Beta'),
+        (3, 7, NULL, 9, 'delta'),
+        (4, NULL, 0, 99, 'omega'),
+        (5, 12, 20, 30, NULL);
+    INSERT INTO predicate_filter VALUES
+        (5),
+        (7),
+        (NULL);
+";
+
+const BETWEEN_IN_PREDICATE_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "between column bounds and reversed bounds",
+        sql: "SELECT id, n BETWEEN lo AND hi, n NOT BETWEEN lo AND hi, n BETWEEN hi AND lo FROM predicate_rows ORDER BY id",
+    },
+    QueryCase {
+        name: "between expression bounds in where predicate",
+        sql: "SELECT id FROM predicate_rows WHERE n BETWEEN COALESCE(lo, n) AND COALESCE(hi, n) ORDER BY id",
+    },
+    QueryCase {
+        name: "empty in list truth table",
+        sql: "SELECT id, n IN (), n NOT IN (), NULL IN (), NULL NOT IN () FROM predicate_rows ORDER BY id",
+    },
+    QueryCase {
+        name: "in subquery containing null",
+        sql: "SELECT id, n IN (SELECT value FROM predicate_filter), n NOT IN (SELECT value FROM predicate_filter) FROM predicate_rows ORDER BY id",
+    },
+    QueryCase {
+        name: "in values subquery",
+        sql: "SELECT id FROM predicate_rows WHERE n IN (VALUES (5), (7), (NULL)) ORDER BY id",
+    },
+    QueryCase {
+        name: "in expression list",
+        sql: "SELECT id FROM predicate_rows WHERE n IN (lo, hi, lo + hi) ORDER BY id",
+    },
+    QueryCase {
+        name: "text between binary and nocase collation",
+        sql: "SELECT id, txt BETWEEN 'alpha' AND 'delta', txt COLLATE NOCASE BETWEEN 'alpha' AND 'delta' FROM predicate_rows ORDER BY id",
+    },
+];
+
 const BOOLEAN_LOGIC_PRECEDENCE_CASES: &[QueryCase] = &[
     QueryCase {
         name: "literal three valued truth table",
@@ -2280,6 +2335,12 @@ fn case_and_null_logic_match_rusqlite() {
 fn scalar_null_comparison_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
     harness.assert_queries_match("scalar NULL/comparison edge", SCALAR_NULL_COMPARISON_CASES);
+}
+
+#[test]
+fn between_and_in_predicate_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(BETWEEN_IN_PREDICATE_SETUP);
+    harness.assert_queries_match("BETWEEN/IN predicate edge", BETWEEN_IN_PREDICATE_CASES);
 }
 
 #[test]

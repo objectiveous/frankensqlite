@@ -7135,7 +7135,6 @@ impl VirtualTable for Fts5Table {
                 "fts5 update referenced a missing rowid".to_owned(),
             ));
         }
-        self.delete_document(old_rowid);
 
         let column_args = match args.get(2..) {
             Some(values) => values,
@@ -7145,6 +7144,7 @@ impl VirtualTable for Fts5Table {
             values: col_values,
             locales,
         } = self.decode_column_values(column_args)?;
+        self.delete_document(old_rowid);
         let tokenizer = self.create_tokenizer_instance();
         self.store_document_with_tokenizer_and_locales(
             new_rowid,
@@ -8083,6 +8083,17 @@ mod tests {
         full_locales: Vec<(i64, usize, String)>,
         reused_auto_rowid: Option<i64>,
         rows_after_auto: Vec<(i64, Vec<String>)>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Fts5UpdateFailureCleanupStructure {
+        error: String,
+        rows_after_error: Vec<(i64, Vec<String>)>,
+        old_matches: Vec<i64>,
+        replacement_matches: Vec<i64>,
+        locales_after_error: Vec<(i64, usize, String)>,
+        committed_rows: Vec<(i64, Vec<String>)>,
     }
 
     #[allow(dead_code)]
@@ -13929,6 +13940,122 @@ mod tests {
             2,
             [
                 "auto after rollback",
+            ],
+        ),
+    ],
+}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_update_decode_failure_preserves_existing_row() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"])
+            .map_err(|err| err.to_string())?;
+
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text(SmallText::from_string("stable old token")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        let err = table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Integer(1),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Blob(encode_fts5_locale_blob("tr_TR", "replacement token").into()),
+                ],
+            )
+            .expect_err("locale blob update should fail when locale=0");
+
+        assert!(
+            err.to_string().contains("fts5_locale() requires locale=1"),
+            "unexpected update failure: {err}"
+        );
+        assert_eq!(
+            table.all_rows(),
+            vec![(1, vec!["stable old token".to_owned()])]
+        );
+        assert_eq!(search_rowids(&table, "stable")?, vec![1]);
+        assert!(search_rowids(&table, "replacement")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_update_failure_cleanup() -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"])
+            .map_err(|err| err.to_string())?;
+
+        table.begin(&cx).map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text(SmallText::from_string("stable old token")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        table.savepoint(&cx, 1).map_err(|err| err.to_string())?;
+        let error = table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Integer(1),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Blob(encode_fts5_locale_blob("tr_TR", "replacement token").into()),
+                ],
+            )
+            .expect_err("decode failure must not mutate the old row")
+            .to_string();
+        let rows_after_error = table.all_rows();
+        let old_matches = search_rowids(&table, "stable")?;
+        let replacement_matches = search_rowids(&table, "replacement")?;
+        let locales_after_error = table.all_locales();
+        table.release(&cx, 1).map_err(|err| err.to_string())?;
+        table.commit(&cx).map_err(|err| err.to_string())?;
+
+        assert_eq!(
+            format!(
+                "{:#?}",
+                Fts5UpdateFailureCleanupStructure {
+                    error,
+                    rows_after_error,
+                    old_matches,
+                    replacement_matches,
+                    locales_after_error,
+                    committed_rows: table.all_rows(),
+                }
+            ),
+            r#"Fts5UpdateFailureCleanupStructure {
+    error: "fts5_locale() requires locale=1",
+    rows_after_error: [
+        (
+            1,
+            [
+                "stable old token",
+            ],
+        ),
+    ],
+    old_matches: [
+        1,
+    ],
+    replacement_matches: [],
+    locales_after_error: [],
+    committed_rows: [
+        (
+            1,
+            [
+                "stable old token",
             ],
         ),
     ],

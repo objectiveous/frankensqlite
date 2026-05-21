@@ -8020,6 +8020,68 @@ mod tests {
     }
 
     #[test]
+    fn test_cell_delta_commit_busy_releases_partial_locks() {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let free_pgno = PageNumber::new(2).expect("valid page");
+        let blocked_pgno = PageNumber::new(3).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+
+        let mut blocker = mgr.begin(BeginKind::Concurrent).expect("blocker begin");
+        mgr.write_page(&mut blocker, blocked_pgno, test_data(0x44))
+            .expect("blocker should acquire the later page lock");
+        assert_eq!(mgr.lock_table().holder(blocked_pgno), Some(blocker.txn_id));
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).expect("writer begin");
+        let writer_token = writer.token();
+        mgr.cell_log()
+            .record_insert(
+                CellKey::table_row(btree, 20),
+                free_pgno,
+                leaf_table_cell(20, &[b'f'; 8]),
+                writer_token,
+            )
+            .expect("free page logical insert should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                CellKey::table_row(btree, 21),
+                blocked_pgno,
+                leaf_table_cell(21, &[b'b'; 8]),
+                writer_token,
+            )
+            .expect("blocked page logical insert should fit budget");
+
+        let err = mgr
+            .commit(&mut writer)
+            .expect_err("later page lock conflict should abort the logical commit");
+        assert_eq!(err, MvccError::Busy);
+        assert_eq!(writer.state, TransactionState::Aborted);
+        assert!(
+            writer.page_locks.is_empty(),
+            "abort should clear the partially acquired logical commit lock set"
+        );
+        assert_eq!(
+            mgr.lock_table().holder(free_pgno),
+            None,
+            "abort should release the earlier page lock acquired before Busy"
+        );
+        assert_eq!(
+            mgr.lock_table().holder(blocked_pgno),
+            Some(blocker.txn_id),
+            "failed writer must not disturb the conflicting writer's lock"
+        );
+        assert_eq!(
+            mgr.cell_log().txn_delta_count(writer_token),
+            0,
+            "aborted logical commit should roll back its cell deltas"
+        );
+
+        mgr.abort(&mut blocker);
+    }
+
+    #[test]
     fn test_serialized_cell_delta_only_commit_requires_writer_exclusion() {
         use crate::cell_visibility::CellKey;
         use fsqlite_types::{BtreeRef, TableId};

@@ -1273,4 +1273,47 @@ mod tests {
         assert!(matches!(result, CommitResult::Committed { .. }));
         assert_eq!(coord.current_epoch(), 1);
     }
+
+    #[test]
+    fn test_group_commit_batch_accessors() {
+        let batch = GroupCommitBatch::new(4);
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
+        assert!(!batch.is_full());
+    }
+
+    #[test]
+    fn test_fsync_barriers_default_equals_new() {
+        let a = FsyncBarriers::new();
+        let b = FsyncBarriers::default();
+        assert_eq!(a.fsync1_complete, b.fsync1_complete);
+        assert_eq!(a.fsync2_complete, b.fsync2_complete);
+        assert!(!a.all_complete());
+    }
+
+    #[test]
+    fn test_commit_index_record_and_conflict_check() {
+        let mut idx = CommitIndex::new();
+        let p1 = PageNumber::new(1).unwrap();
+        let p2 = PageNumber::new(2).unwrap();
+        let p3 = PageNumber::new(3).unwrap();
+
+        idx.record_commit(&[p1, p2], CommitSeq::new(5));
+        idx.record_commit(&[p2, p3], CommitSeq::new(10));
+
+        let conflicts = idx.check_conflicts(&[p1, p2, p3], CommitSeq::new(7));
+        assert!(conflicts.contains(&p2), "p2 modified at seq 10 > 7");
+        assert!(conflicts.contains(&p3), "p3 modified at seq 10 > 7");
+        assert!(!conflicts.contains(&p1), "p1 last modified at seq 5 <= 7");
+
+        assert!(idx.check_conflicts(&[p1, p2], CommitSeq::new(10)).is_empty());
+    }
+
+    #[test]
+    fn test_commit_index_default_equals_new() {
+        let a = CommitIndex::new();
+        let b = CommitIndex::default();
+        assert!(a.check_conflicts(&[PageNumber::new(1).unwrap()], CommitSeq::ZERO).is_empty());
+        assert!(b.check_conflicts(&[PageNumber::new(1).unwrap()], CommitSeq::ZERO).is_empty());
+    }
 }

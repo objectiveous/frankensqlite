@@ -5767,6 +5767,49 @@ mod tests {
         assert!((cost - expected).abs() < 1e-10);
     }
 
+    #[test]
+    fn test_cost_ranks_covering_index_below_non_covering_range_scan() {
+        // A covering index avoids the per-match table dereference, so for the
+        // same selectivity/pages it must cost strictly less than a non-covering
+        // range scan — by exactly the table-access term (sel * table_pages) it
+        // skips. The existing tests check each formula in isolation; this pins
+        // the cross-kind ordering that makes the planner prefer covering indexes.
+        let sel = 0.1;
+        let range = estimate_cost(&AccessPathKind::IndexScanRange { selectivity: sel }, 200, 50);
+        let covering =
+            estimate_cost(&AccessPathKind::CoveringIndexScan { selectivity: sel }, 200, 50);
+        assert!(
+            covering < range,
+            "covering index must rank below a range scan: {covering} vs {range}"
+        );
+        // The gap is exactly the avoided table-access term: sel * table_pages.
+        assert!(
+            ((range - covering) - sel * 200.0).abs() < 1e-9,
+            "covering/range gap should equal sel*table_pages (= {}), got {}",
+            sel * 200.0,
+            range - covering
+        );
+
+        // With a row count, the covering scan also pays the cheaper per-row term
+        // (decode only, not decode + dereference), so its advantage widens.
+        let range_r =
+            estimate_cost_ext(&AccessPathKind::IndexScanRange { selectivity: sel }, 200, 50, 1_000);
+        let covering_r = estimate_cost_ext(
+            &AccessPathKind::CoveringIndexScan { selectivity: sel },
+            200,
+            50,
+            1_000,
+        );
+        assert!(
+            covering_r < range_r,
+            "covering must stay cheaper once rows are counted: {covering_r} vs {range_r}"
+        );
+        assert!(
+            (range_r - covering_r) > (range - covering),
+            "per-row terms must widen the covering advantage"
+        );
+    }
+
     // ===================================================================
     // PLANNER-2: estimate_cost_ext should react monotonically to n_rows
     // ===================================================================

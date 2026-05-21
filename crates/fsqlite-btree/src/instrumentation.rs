@@ -1744,6 +1744,30 @@ mod tests {
     }
 
     #[test]
+    fn conflict_topology_policy_mode_labels_and_raw_round_trip() {
+        // as_str labels (pub) plus the to_raw/from_raw codec that stashes the
+        // mode in a u64 atomic. as_str was never directly asserted, and
+        // from_raw's out-of-range catch-all (-> Enforced) guards a corrupt
+        // stored value.
+        use crate::ConflictTopologyPolicyMode::{Advisory, Baseline, Enforced};
+
+        assert_eq!(Baseline.as_str(), "baseline");
+        assert_eq!(Advisory.as_str(), "advisory");
+        assert_eq!(Enforced.as_str(), "enforced");
+
+        // Exact raw codes and a clean round-trip for every variant.
+        assert_eq!(Baseline.to_raw(), 0);
+        assert_eq!(Advisory.to_raw(), 1);
+        assert_eq!(Enforced.to_raw(), 2);
+        for mode in [Baseline, Advisory, Enforced] {
+            assert_eq!(ConflictTopologyPolicyMode::from_raw(mode.to_raw()), mode);
+        }
+
+        // from_raw maps any out-of-range value to Enforced (defensive default).
+        assert_eq!(ConflictTopologyPolicyMode::from_raw(99), Enforced);
+    }
+
+    #[test]
     fn conflict_topology_advice_applies_hot_right_edge_fill_shift() {
         let _guard = super::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
             .lock()

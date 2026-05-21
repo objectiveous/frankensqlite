@@ -768,6 +768,39 @@ const MULTIPLE_MATCH_CASES: &[MultiMatchCase] = &[
     },
 ];
 
+const MULTIPLE_MATCH_BOOLEAN_CASES: &[MultiMatchCase] = &[
+    MultiMatchCase {
+        name: "prefix and bare term",
+        left_query: "search*",
+        right_query: "rust",
+    },
+    MultiMatchCase {
+        name: "phrase and column prefix",
+        left_query: r#""full text""#,
+        right_query: "body:prefix",
+    },
+    MultiMatchCase {
+        name: "title disjunction and body term",
+        left_query: "title:rust OR title:sqlite",
+        right_query: "body:writers",
+    },
+    MultiMatchCase {
+        name: "empty intersection",
+        left_query: "rust",
+        right_query: "bread",
+    },
+    MultiMatchCase {
+        name: "grouped boolean intersection",
+        left_query: "(rust OR bread)",
+        right_query: "(sqlite OR cooking)",
+    },
+    MultiMatchCase {
+        name: "column filter with body disjunction",
+        left_query: "title:rust",
+        right_query: "body:search OR body:writers",
+    },
+];
+
 const NO_RESULT_CASES: &[MatchCase] = &[
     MatchCase {
         name: "absent term",
@@ -1991,6 +2024,22 @@ fn multiple_match_constraints_match_rusqlite_reference() {
             harness.franken_multiple_match_rowids(case.left_query, case.right_query),
             harness.sqlite_multiple_match_rowids(case.left_query, case.right_query),
             "multiple MATCH conformance case failed: {} ({} AND {})",
+            case.name,
+            case.left_query,
+            case.right_query
+        );
+    }
+}
+
+#[test]
+fn multiple_match_boolean_constraints_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in MULTIPLE_MATCH_BOOLEAN_CASES {
+        assert_eq!(
+            harness.franken_multiple_match_rowids(case.left_query, case.right_query),
+            harness.sqlite_multiple_match_rowids(case.left_query, case.right_query),
+            "multiple MATCH boolean conformance case failed: {} ({} / {})",
             case.name,
             case.left_query,
             case.right_query

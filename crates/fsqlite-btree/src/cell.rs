@@ -1614,6 +1614,44 @@ mod tests {
     }
 
     #[test]
+    fn test_cell_on_page_size_fast_index_cells_have_no_rowid() {
+        use fsqlite_types::serial_type::write_varint;
+        // Index cells (leaf or interior) carry a payload_size varint + payload
+        // but NO rowid, unlike table cells. Interior-index cells additionally
+        // have the 4-byte left-child prefix. The existing fast-size tests cover
+        // only leaf-table; pin the two index paths, cross-checked against the
+        // CellRef-based size. payload_size 10 is far below the index max-local
+        // threshold (~1002 at usable=4096), so the whole payload stays local.
+        let usable: u32 = 4096;
+
+        // Leaf-index cell: payload_size varint + payload, no child pointer.
+        let mut page = vec![0u8; 4096];
+        let off = 50;
+        let ps_len = write_varint(&mut page[off..], 10u64); // payload_size = 10
+        let cell = CellRef::parse(&page, off, BtreePageType::LeafIndex, usable).unwrap();
+        let expected = crate::payload::cell_on_page_size(&cell, off);
+        let fast = cell_on_page_size_fast(&page, off, BtreePageType::LeafIndex, usable).unwrap();
+        assert_eq!(fast, expected);
+        assert_eq!(fast, ps_len + 10, "leaf-index size = payload_size varint + payload");
+
+        // Interior-index cell: 4-byte left child + payload_size varint + payload.
+        let mut page = vec![0u8; 4096];
+        let off = 50;
+        page[off..off + 4].copy_from_slice(&9u32.to_be_bytes());
+        let ps_len = write_varint(&mut page[off + 4..], 10u64);
+        let cell = CellRef::parse(&page, off, BtreePageType::InteriorIndex, usable).unwrap();
+        let expected = crate::payload::cell_on_page_size(&cell, off);
+        let fast =
+            cell_on_page_size_fast(&page, off, BtreePageType::InteriorIndex, usable).unwrap();
+        assert_eq!(fast, expected);
+        assert_eq!(
+            fast,
+            4 + ps_len + 10,
+            "interior-index size = child pointer + payload_size varint + payload"
+        );
+    }
+
+    #[test]
     fn test_cell_on_page_size_fast_matches_cellref_leaf_table_with_overflow() {
         let mut page = vec![0u8; 4096];
         let cell_offset = 0;

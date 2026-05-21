@@ -9331,6 +9331,18 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_skip_scan_leading_distinct() {
+        // (n_pages / SKIP_SCAN_PAGES_PER_LEADING_DISTINCT=8).max(1): proportional
+        // to the page count, floored at 1.
+        let idx = |n_pages: u64| index_info("idx", "t", &["a", "b"], false, n_pages);
+        assert_eq!(estimate_skip_scan_leading_distinct(&idx(0)), 1); // floor
+        assert_eq!(estimate_skip_scan_leading_distinct(&idx(7)), 1); // 7/8 = 0 -> 1
+        assert_eq!(estimate_skip_scan_leading_distinct(&idx(8)), 1); // 8/8 = 1
+        assert_eq!(estimate_skip_scan_leading_distinct(&idx(24)), 3); // 24/8 = 3
+        assert_eq!(estimate_skip_scan_leading_distinct(&idx(80)), 10); // 80/8 = 10
+    }
+
+    #[test]
     fn test_estimate_pairwise_hash_join_cost_left_deep_accumulation() {
         // Left-deep hash-join cost model: each join step charges build+probe
         // (scanning both inputs, written as min+max which equals their sum) and

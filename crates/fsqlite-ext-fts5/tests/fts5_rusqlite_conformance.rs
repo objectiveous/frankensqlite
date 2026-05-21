@@ -283,6 +283,33 @@ const MULTIPLE_MATCH_CASES: &[MultiMatchCase] = &[
     },
 ];
 
+const NO_RESULT_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "absent term",
+        query: "wal",
+    },
+    MatchCase {
+        name: "absent phrase",
+        query: r#""rust cooking""#,
+    },
+    MatchCase {
+        name: "absent prefix",
+        query: "zz*",
+    },
+    MatchCase {
+        name: "column filter excludes body-only term",
+        query: "title:bread",
+    },
+    MatchCase {
+        name: "initial-token term appears only later",
+        query: "^writers",
+    },
+    MatchCase {
+        name: "near terms never co-occur",
+        query: "NEAR(rust bread, 1)",
+    },
+];
+
 const BOOLEAN_PRECEDENCE_CASES: &[MatchCase] = &[
     MatchCase {
         name: "and binds tighter than or",
@@ -1134,6 +1161,21 @@ fn full_scan_rows_match_rusqlite_reference() {
         harness.sqlite_full_scan_rows(),
         "full-scan rowid and column conformance failed"
     );
+}
+
+#[test]
+fn no_result_match_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in NO_RESULT_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "no-result MATCH conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
 }
 
 #[test]

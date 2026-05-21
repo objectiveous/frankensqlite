@@ -1504,6 +1504,37 @@ const EMPTY_REPLACEMENT_CASES: &[MatchCase] = &[
     },
 ];
 
+const REPEATED_REPLACEMENT_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "original term removed",
+        query: "full",
+    },
+    MatchCase {
+        name: "intermediate title term removed",
+        query: "temporary",
+    },
+    MatchCase {
+        name: "intermediate body term removed",
+        query: "transient",
+    },
+    MatchCase {
+        name: "final title term indexed",
+        query: "final",
+    },
+    MatchCase {
+        name: "final body term indexed",
+        query: "durable",
+    },
+    MatchCase {
+        name: "final phrase indexed",
+        query: r#""durable token""#,
+    },
+    MatchCase {
+        name: "other sqlite rows retained",
+        query: "sqlite",
+    },
+];
+
 const REINSERT_ROWID_CASES: &[MatchCase] = &[
     MatchCase {
         name: "old rowid term removed",
@@ -2922,6 +2953,39 @@ fn empty_replacement_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "empty-replacement MATCH conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn repeated_replacement_queries_match_rusqlite_reference() {
+    let mut harness = Fts5ConformanceHarness::new(&[]);
+    harness.insert_or_replace_doc(Doc {
+        rowid: 2,
+        title: "Temporary row",
+        body: "transient token one",
+    });
+    harness.insert_or_replace_doc(Doc {
+        rowid: 2,
+        title: "Final row",
+        body: "durable token two",
+    });
+
+    let mut franken_rows = harness.franken_full_scan_rows();
+    franken_rows.sort_by_key(|row| row.0);
+    assert_eq!(
+        franken_rows,
+        harness.sqlite_full_scan_rows(),
+        "repeated-replacement full-scan conformance failed"
+    );
+
+    for case in REPEATED_REPLACEMENT_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "repeated-replacement MATCH conformance case failed: {} ({})",
             case.name,
             case.query
         );

@@ -2652,4 +2652,73 @@ mod tests {
             "re-accessed pages should be promotable to MAIN after readmission"
         );
     }
+
+    #[test]
+    fn config_with_limits_small_equals_capacity() {
+        let config = S3FifoConfig::with_limits(5, 5, 2, 1);
+        assert_eq!(config.small_capacity(), 5);
+        assert_eq!(config.main_capacity(), 0);
+        assert_eq!(config.ghost_capacity(), 2);
+    }
+
+    #[test]
+    fn insert_already_resident_returns_already_resident_event() {
+        let mut fifo = S3Fifo::with_config(S3FifoConfig::with_limits(4, 2, 2, 1));
+        let _ = fifo.insert(pg(1));
+        let events = fifo.insert(pg(1));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            S3FifoEvent::AlreadyResident {
+                page_id,
+                queue: QueueKind::Small,
+            } if *page_id == pg(1)
+        )));
+        assert_eq!(fifo.resident_len(), 1);
+    }
+
+    #[test]
+    fn access_unknown_page_returns_false() {
+        let mut fifo = S3Fifo::new(10);
+        assert!(!fifo.access(pg(99)));
+    }
+
+    #[test]
+    fn resident_and_ghost_len_track_inserts_and_evictions() {
+        let mut fifo = S3Fifo::with_config(S3FifoConfig::with_limits(2, 1, 1, 1));
+        assert_eq!(fifo.resident_len(), 0);
+        assert_eq!(fifo.ghost_len(), 0);
+
+        let _ = fifo.insert(pg(1));
+        assert_eq!(fifo.resident_len(), 1);
+
+        let _ = fifo.insert(pg(2));
+        assert_eq!(fifo.resident_len(), 2);
+        assert_eq!(fifo.ghost_len(), 0);
+
+        let _ = fifo.insert(pg(3));
+        assert!(fifo.resident_len() <= 2);
+        assert!(fifo.ghost_len() >= 1);
+    }
+
+    #[test]
+    fn rollout_gate_reset_clears_bad_streak_and_sets_policy() {
+        let baseline = RolloutMetrics::new(100_000, 1_000);
+        let bad = RolloutMetrics::new(106_000, 1_000);
+        let mut gate = S3FifoRolloutGate::default();
+
+        let _ = gate.evaluate_window(baseline, bad);
+        let _ = gate.evaluate_window(baseline, bad);
+        assert_eq!(gate.consecutive_bad_windows(), 2);
+
+        gate.reset(RolloutPolicy::S3Fifo);
+        assert_eq!(gate.consecutive_bad_windows(), 0);
+        assert_eq!(gate.active_policy(), RolloutPolicy::S3Fifo);
+    }
+
+    #[test]
+    fn rollout_metrics_accessors() {
+        let m = RolloutMetrics::new(42_000, 750);
+        assert_eq!(m.miss_rate_ppm(), 42_000);
+        assert_eq!(m.p99_read_latency_micros(), 750);
+    }
 }

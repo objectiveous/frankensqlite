@@ -192,6 +192,11 @@ pub enum DataflowOperator {
         op: IntegerComparison,
         value: i64,
     },
+    /// Keep rows whose column nullness matches the requested predicate.
+    FilterNull {
+        column: usize,
+        predicate: NullPredicate,
+    },
     /// Keep only the requested columns, preserving row weight.
     Project { columns: Vec<usize> },
     /// Keep rows whose algebraic weight matches the requested sign.
@@ -268,6 +273,7 @@ impl DataflowOperator {
             Self::FilterIntegerCompare { column, op, value } => {
                 filter_integer_compare(rows, *column, *op, *value)
             }
+            Self::FilterNull { column, predicate } => filter_null(rows, *column, *predicate),
             Self::Project { columns } => rows
                 .iter()
                 .map(|row| Ok(WeightedRow::new(row.project(columns)?, row.weight)))
@@ -335,6 +341,24 @@ impl IntegerComparison {
             Self::LessOrEqual => candidate <= threshold,
             Self::GreaterThan => candidate > threshold,
             Self::GreaterOrEqual => candidate >= threshold,
+        }
+    }
+}
+
+/// Null predicate used by dataflow filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullPredicate {
+    /// Match `NULL` values.
+    IsNull,
+    /// Match non-`NULL` values.
+    IsNotNull,
+}
+
+impl NullPredicate {
+    fn matches(self, value: &SqliteValue) -> bool {
+        match self {
+            Self::IsNull => matches!(value, SqliteValue::Null),
+            Self::IsNotNull => !matches!(value, SqliteValue::Null),
         }
     }
 }
@@ -435,6 +459,23 @@ fn filter_integer_compare(
             }
             Some(SqliteValue::Integer(_)) => None,
             Some(_) => Some(Err(DataflowError::PredicateValueNotInteger { column })),
+            None => Some(Err(DataflowError::ColumnOutOfBounds {
+                column,
+                width: row.width(),
+            })),
+        })
+        .collect()
+}
+
+fn filter_null(
+    rows: &[WeightedRow],
+    column: usize,
+    predicate: NullPredicate,
+) -> DataflowResult<Vec<WeightedRow>> {
+    rows.iter()
+        .filter_map(|row| match row.values.get(column) {
+            Some(value) if predicate.matches(value) => Some(Ok(row.clone())),
+            Some(_) => None,
             None => Some(Err(DataflowError::ColumnOutOfBounds {
                 column,
                 width: row.width(),
@@ -799,8 +840,8 @@ pub fn delta_join_update(
 mod tests {
     use super::{
         DataflowAutomaton, DataflowError, DataflowOperator, IntegerComparison, JoinKeySpec,
-        WeightSign, WeightedRow, delta_join_left, delta_join_right, delta_join_update,
-        scale_weights, set_weights, threshold_positive,
+        NullPredicate, WeightSign, WeightedRow, delta_join_left, delta_join_right,
+        delta_join_update, scale_weights, set_weights, threshold_positive,
     };
     use fsqlite_types::SqliteValue;
 
@@ -901,6 +942,52 @@ mod tests {
         let err = automaton
             .execute(&[WeightedRow::insert(vec![int(1), int(2)])])
             .expect_err("invalid predicate column should fail");
+
+        assert_eq!(
+            err,
+            DataflowError::ColumnOutOfBounds {
+                column: 2,
+                width: 2
+            }
+        );
+    }
+
+    #[test]
+    fn filter_null_keeps_matching_weighted_rows() {
+        let is_null = DataflowAutomaton::new(vec![DataflowOperator::FilterNull {
+            column: 1,
+            predicate: NullPredicate::IsNull,
+        }]);
+        let is_not_null = DataflowAutomaton::new(vec![DataflowOperator::FilterNull {
+            column: 1,
+            predicate: NullPredicate::IsNotNull,
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), SqliteValue::Null], 3),
+            WeightedRow::new(vec![int(2), int(20)], -2),
+            WeightedRow::new(vec![int(3), SqliteValue::Null], 0),
+        ];
+
+        assert_eq!(
+            is_null.execute(&rows).expect("is-null stream"),
+            vec![WeightedRow::new(vec![int(1), SqliteValue::Null], 3)]
+        );
+        assert_eq!(
+            is_not_null.execute(&rows).expect("is-not-null stream"),
+            vec![WeightedRow::new(vec![int(2), int(20)], -2)]
+        );
+    }
+
+    #[test]
+    fn filter_null_rejects_out_of_bounds_columns() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterNull {
+            column: 2,
+            predicate: NullPredicate::IsNull,
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), int(2)])])
+            .expect_err("invalid null predicate column should fail");
 
         assert_eq!(
             err,

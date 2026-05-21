@@ -6601,6 +6601,26 @@ mod tests {
     }
 
     #[test]
+    fn test_is_rowid_column_ignores_table_qualifier() {
+        // is_rowid_column delegates to is_rowid_alias_name on the column part:
+        // rowid / _rowid_ / oid (case-insensitive) -> true; others -> false. The
+        // table qualifier on the WhereColumn is ignored.
+        let wc = |table: Option<&str>, column: &str| WhereColumn {
+            table: table.map(str::to_owned),
+            column: column.to_owned(),
+        };
+        assert!(is_rowid_column(&wc(None, "rowid")));
+        assert!(is_rowid_column(&wc(None, "ROWID")));
+        assert!(is_rowid_column(&wc(None, "_rowid_")));
+        assert!(is_rowid_column(&wc(None, "oid")));
+        assert!(!is_rowid_column(&wc(None, "id")));
+        assert!(!is_rowid_column(&wc(None, "row_id")));
+        // The table qualifier is ignored; only the column name decides.
+        assert!(is_rowid_column(&wc(Some("t"), "rowid")));
+        assert!(!is_rowid_column(&wc(Some("t"), "id")));
+    }
+
+    #[test]
     fn test_qualifier_matches_table() {
         // A qualifier matches by table name or by alias, case-insensitively.
         // Table name, no alias.

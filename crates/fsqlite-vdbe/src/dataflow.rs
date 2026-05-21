@@ -338,6 +338,8 @@ pub enum DataflowOperator {
     },
     /// Consolidate algebraic weights by complete row value.
     ConsolidateRows,
+    /// Consolidate identical rows, then collapse surviving weights to their sign.
+    ConsolidateWeightSigns,
     /// Multiply every row weight by `factor`, eliding zero-weight output rows.
     ScaleWeight { factor: i64 },
     /// Reverse every row's algebraic delta polarity.
@@ -496,6 +498,7 @@ impl DataflowOperator {
                 value_column,
             } => average_integer_by_key(rows, key_columns, *value_column),
             Self::ConsolidateRows => Ok(consolidate_rows(rows.iter().cloned().collect())),
+            Self::ConsolidateWeightSigns => Ok(consolidate_weight_signs(rows)),
             Self::ScaleWeight { factor } => Ok(scale_weights(rows, *factor)),
             Self::NegateWeight => Ok(negate_weights(rows)),
             Self::NormalizeWeightSign => Ok(normalize_weight_sign(rows)),
@@ -1478,6 +1481,11 @@ pub fn consolidate_rows(rows: Vec<WeightedRow>) -> Vec<WeightedRow> {
         .into_iter()
         .filter_map(|(values, weight)| (weight != 0).then(|| WeightedRow::new(values, weight)))
         .collect()
+}
+
+/// Consolidate identical rows, then collapse surviving weights to their sign.
+pub fn consolidate_weight_signs(rows: &[WeightedRow]) -> Vec<WeightedRow> {
+    normalize_weight_sign(&consolidate_rows(rows.to_vec()))
 }
 
 /// Multiply row weights by an algebraic factor, preserving row order and values.
@@ -4128,6 +4136,42 @@ mod tests {
         let actual = automaton.execute(&rows).expect("dataflow should execute");
 
         assert_eq!(actual, vec![WeightedRow::new(vec![int(1), int(10)], 7)]);
+    }
+
+    #[test]
+    fn consolidate_weight_signs_consolidates_and_normalizes_survivors() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::ConsolidateWeightSigns]);
+        let rows = vec![
+            WeightedRow::new(vec![int(2), int(20)], 1),
+            WeightedRow::new(vec![int(1), int(10)], 3),
+            WeightedRow::new(vec![int(2), int(20)], -1),
+            WeightedRow::new(vec![int(1), int(10)], -7),
+            WeightedRow::new(vec![int(3), int(30)], 4),
+            WeightedRow::new(vec![int(4), int(40)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::delete(vec![int(1), int(10)]),
+                WeightedRow::insert(vec![int(3), int(30)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn consolidate_weight_signs_empty_after_cancellation() {
+        let rows = vec![
+            WeightedRow::new(vec![int(1)], 9),
+            WeightedRow::new(vec![int(1)], -9),
+            WeightedRow::new(vec![int(2)], 0),
+        ];
+
+        let actual = super::consolidate_weight_signs(&rows);
+
+        assert_eq!(actual, Vec::<WeightedRow>::new());
     }
 
     #[test]

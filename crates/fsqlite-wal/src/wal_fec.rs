@@ -4373,4 +4373,69 @@ mod tests {
         assert_eq!(config.queue_capacity, 64);
         assert_eq!(config.per_symbol_delay, Duration::ZERO);
     }
+
+    #[test]
+    fn wal_fec_group_id_display_hash_eq() {
+        use std::collections::HashSet;
+        let a = WalFecGroupId { wal_salt1: 1, wal_salt2: 2, end_frame_no: 10 };
+        let b = WalFecGroupId { wal_salt1: 1, wal_salt2: 2, end_frame_no: 11 };
+        assert_ne!(a, b);
+        let copied = a;
+        assert_eq!(copied, a);
+        let display = format!("{a}");
+        assert_eq!(display, "(1, 2, 10)");
+        let mut set = HashSet::new();
+        set.insert(a);
+        set.insert(b);
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn wal_fec_recovery_fallback_reason_all_variants() {
+        let variants = [
+            (WalFecRecoveryFallbackReason::MissingSidecarGroup, "missing_sidecar_group"),
+            (WalFecRecoveryFallbackReason::SidecarUnreadable, "sidecar_unreadable"),
+            (WalFecRecoveryFallbackReason::SaltMismatch, "salt_mismatch"),
+            (WalFecRecoveryFallbackReason::InsufficientSymbols, "insufficient_symbols"),
+            (WalFecRecoveryFallbackReason::DecodeFailed, "decode_failed"),
+            (WalFecRecoveryFallbackReason::DecodedPayloadMismatch, "decoded_payload_mismatch"),
+            (WalFecRecoveryFallbackReason::RecoveryDisabled, "recovery_disabled"),
+        ];
+        for (v, code) in &variants {
+            assert_eq!(v.reason_code(), *code);
+            let copied = *v;
+            assert_eq!(copied, *v);
+        }
+        let dbg = format!("{:?}", WalFecRecoveryFallbackReason::SaltMismatch);
+        assert!(dbg.contains("SaltMismatch"));
+    }
+
+    #[test]
+    fn wal_fec_repair_severity_bucket_as_str_and_from_str() {
+        assert_eq!(WalFecRepairSeverityBucket::One.as_str(), "1");
+        assert_eq!(WalFecRepairSeverityBucket::TwoToFive.as_str(), "2-5");
+        assert_eq!(WalFecRepairSeverityBucket::SixToTen.as_str(), "6-10");
+        assert_eq!(WalFecRepairSeverityBucket::ElevenPlus.as_str(), "11+");
+        assert_eq!("1".parse::<WalFecRepairSeverityBucket>().unwrap(), WalFecRepairSeverityBucket::One);
+        assert_eq!("two-to-five".parse::<WalFecRepairSeverityBucket>().unwrap(), WalFecRepairSeverityBucket::TwoToFive);
+        assert!("invalid".parse::<WalFecRepairSeverityBucket>().is_err());
+    }
+
+    #[test]
+    fn wal_fec_repair_source_all_variants_debug_copy_eq() {
+        let variants = [
+            WalFecRepairSource::WalFrame,
+            WalFecRepairSource::RaptorQSymbol,
+            WalFecRepairSource::DbFileReadback,
+        ];
+        for (i, v) in variants.iter().enumerate() {
+            let copied = *v;
+            assert_eq!(copied, *v);
+            for (j, w) in variants.iter().enumerate() {
+                assert_eq!(i == j, v == w);
+            }
+        }
+        let dbg = format!("{:?}", WalFecRepairSource::RaptorQSymbol);
+        assert!(dbg.contains("RaptorQSymbol"));
+    }
 }

@@ -9153,6 +9153,62 @@ mod tests {
     }
 
     #[test]
+    fn test_read_page_with_cell_deltas_skips_replay_for_staged_full_page()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let committed_row = 4267;
+        let local_row = 4268;
+        let committed_key = CellKey::table_row(btree, committed_row);
+        let local_key = CellKey::table_row(btree, local_row);
+        let committed_payload = vec![b'm'; 165];
+        let local_payload = vec![b'n'; 166];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut logical = mgr.begin(BeginKind::Concurrent).expect("logical begin");
+        mgr.cell_log()
+            .record_insert(
+                committed_key,
+                pgno,
+                leaf_table_cell(committed_row, &committed_payload),
+                logical.token(),
+            )
+            .expect("committed logical insert should fit budget");
+        mgr.commit(&mut logical).expect("logical insert commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        let staged_page = test_data(0x9a);
+        mgr.write_page(&mut txn, pgno, staged_page.clone())
+            .expect("stage full-page write");
+        mgr.cell_log()
+            .record_insert(
+                local_key,
+                pgno,
+                leaf_table_cell(local_row, &local_payload),
+                txn.token(),
+            )
+            .expect("local logical insert should fit budget");
+
+        let page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("staged page should be visible");
+        assert_eq!(
+            page, staged_page,
+            "a staged full-page write-set image must bypass committed and local cell-delta replay"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_read_page_with_cell_deltas_replays_same_txn_delete_then_insert()
     -> fsqlite_error::Result<()> {
         use crate::cell_visibility::CellKey;

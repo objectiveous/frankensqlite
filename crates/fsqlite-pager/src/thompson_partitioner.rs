@@ -421,4 +421,39 @@ mod tests {
             "arm 8 (heavily rewarded) must beat arm 0 (heavily penalized)"
         );
     }
+
+    #[test]
+    fn beta_arm_new_initializes_uniform_prior() {
+        let arm = BetaArm::new(0.42);
+        assert!((arm.arm_ratio - 0.42).abs() < f64::EPSILON);
+        assert_eq!(arm.alpha.load(Ordering::Relaxed), 1);
+        assert_eq!(arm.beta.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn splitmix64_next_f64_open_stays_in_unit_interval() {
+        let mut rng = SplitMix64::new(0xCAFE);
+        for i in 0..1_000 {
+            let v = rng.next_f64_open();
+            assert!(v > 0.0 && v < 1.0, "sample {i}: {v} not in (0,1)");
+        }
+    }
+
+    #[test]
+    fn splitmix64_next_normal_mean_near_zero() {
+        let mut rng = SplitMix64::new(999);
+        let n = 10_000;
+        let sum: f64 = (0..n).map(|_| rng.next_normal()).sum();
+        let mean = sum / n as f64;
+        assert!(
+            mean.abs() < 0.1,
+            "normal mean {mean} too far from 0 over {n} samples"
+        );
+    }
+
+    #[test]
+    fn tick_returns_false_on_first_call() {
+        let p = ThompsonPartitioner::new();
+        assert!(!p.tick(), "first tick must not trigger resample");
+    }
 }

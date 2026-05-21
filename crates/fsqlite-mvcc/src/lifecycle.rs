@@ -8423,6 +8423,82 @@ mod tests {
     }
 
     #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_update_out_of_horizon() -> fsqlite_error::Result<()>
+    {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4270;
+        let original_payload = vec![b'o'; 134];
+        let updated_payload = vec![b'v'; 135];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut inserter = mgr.begin(BeginKind::Concurrent).expect("inserter begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &original_payload),
+                inserter.token(),
+            )
+            .expect("logical insert should fit budget");
+        let insert_seq = mgr.commit(&mut inserter).expect("insert commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_update(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &updated_payload),
+                txn.token(),
+            )
+            .expect("logical update should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("inserted page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![(rowid, updated_payload.clone())],
+            "transaction-local reads must materialize their own logical updates"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(insert_seq),
+            "own uncommitted updates must preserve the last committed read witness"
+        );
+
+        let update_seq = mgr.commit(&mut txn).expect("update commit");
+        assert!(update_seq > insert_seq);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(rowid, updated_payload)]
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(update_seq),
+            "fresh reads should witness the committed update horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_read_page_with_cell_deltas_hides_post_snapshot_commit() -> fsqlite_error::Result<()> {
         use crate::cell_visibility::CellKey;
         use fsqlite_types::{BtreeRef, TableId};

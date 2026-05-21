@@ -619,4 +619,89 @@ mod tests {
         assert_eq!(n, 4);
         assert_eq!(&buf, b"test");
     }
+
+    #[test]
+    fn vfs_metrics_default_equals_new() {
+        let d = VfsMetrics::default();
+        let n = VfsMetrics::new();
+        assert_eq!(d.total_ops(), n.total_ops());
+        assert_eq!(
+            d.read_bytes_total.load(Ordering::Relaxed),
+            n.read_bytes_total.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            d.write_bytes_total.load(Ordering::Relaxed),
+            n.write_bytes_total.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn snapshot_captures_byte_counters() {
+        let m = VfsMetrics::new();
+        m.read_bytes_total.store(12345, Ordering::Relaxed);
+        m.write_bytes_total.store(67890, Ordering::Relaxed);
+        let snap = m.snapshot();
+        assert_eq!(snap.read_bytes_total, 12345);
+        assert_eq!(snap.write_bytes_total, 67890);
+    }
+
+    #[test]
+    fn tracing_file_delegates_sector_size_and_device_characteristics() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let (file, _) = vfs
+            .open(
+                &cx,
+                Some(Path::new("delegate.db")),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
+            )
+            .unwrap();
+
+        let inner_sector = file.sector_size();
+        let inner_devchar = file.device_characteristics();
+
+        let traced = TracingFile::new(file, "delegate.db");
+        assert_eq!(traced.sector_size(), inner_sector);
+        assert_eq!(traced.device_characteristics(), inner_devchar);
+    }
+
+    #[test]
+    fn tracing_file_delegates_check_reserved_lock() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let (file, _) = vfs
+            .open(
+                &cx,
+                Some(Path::new("reserved.db")),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
+            )
+            .unwrap();
+
+        let traced = TracingFile::new(file, "reserved.db");
+        let reserved = traced.check_reserved_lock(&cx).unwrap();
+        assert!(!reserved);
+    }
+
+    #[test]
+    fn metrics_snapshot_display_contains_all_op_types() {
+        let snap = MetricsSnapshot {
+            read_ops: 1,
+            write_ops: 2,
+            sync_ops: 3,
+            lock_ops: 4,
+            unlock_ops: 5,
+            truncate_ops: 6,
+            close_ops: 7,
+            file_size_ops: 8,
+            read_bytes_total: 100,
+            write_bytes_total: 200,
+        };
+        let s = format!("{snap}");
+        assert!(s.contains("sync: 3"), "missing sync");
+        assert!(s.contains("lock: 4"), "missing lock");
+        assert!(s.contains("unlock: 5"), "missing unlock");
+        assert!(s.contains("truncate: 6"), "missing truncate");
+        assert!(s.contains("close: 7"), "missing close");
+        assert!(s.contains("file_size: 8"), "missing file_size");
+    }
 }

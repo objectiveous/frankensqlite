@@ -2254,6 +2254,48 @@ const STRING_SCALAR_EDGE_CASES: &[QueryCase] = &[
     },
 ];
 
+const TRIM_SCALAR_SETUP: &str = "
+    CREATE TABLE trim_values (
+        id INTEGER PRIMARY KEY,
+        raw,
+        cut
+    );
+    INSERT INTO trim_values (id, raw, cut) VALUES
+        (1, '  alpha  ', ' '),
+        (2, char(9) || 'tab' || char(9), char(9)),
+        (3, 'xyxmiddleyxx', 'xy'),
+        (4, 12321, '12'),
+        (5, '', 'x'),
+        (6, NULL, 'x');
+";
+
+const TRIM_SCALAR_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "default trim removes spaces only",
+        sql: "SELECT trim('  padded  '), ltrim('  padded'), rtrim('padded  '), length(trim(char(9) || 'x' || char(9)))",
+    },
+    QueryCase {
+        name: "custom tab trim character set",
+        sql: "SELECT length(trim(char(9) || 'x' || char(9), char(9))), length(ltrim(char(9) || 'x', char(9))), length(rtrim('x' || char(9), char(9)))",
+    },
+    QueryCase {
+        name: "empty and multi-character trim sets",
+        sql: "SELECT trim('abc', ''), ltrim('abc', ''), rtrim('abc', ''), trim('xyxabcxy', 'xy')",
+    },
+    QueryCase {
+        name: "numeric coercion and storage class",
+        sql: "SELECT trim(12321, '12'), ltrim(12321, '12'), rtrim(12321, '12'), typeof(trim(12321, '12'))",
+    },
+    QueryCase {
+        name: "null argument propagation",
+        sql: "SELECT trim(NULL), ltrim(NULL, 'x'), rtrim(NULL, 'x'), typeof(trim(NULL, 'x'))",
+    },
+    QueryCase {
+        name: "column driven trim functions",
+        sql: "SELECT id, length(trim(raw)), length(trim(raw, cut)), length(ltrim(raw, cut)), length(rtrim(raw, cut)), typeof(trim(raw, cut)) FROM trim_values ORDER BY id",
+    },
+];
+
 const LENGTH_INSTR_NUL_SETUP: &str = "
     CREATE TABLE length_instr_values (
         id INTEGER PRIMARY KEY,
@@ -3185,6 +3227,12 @@ fn substr_scalar_edges_match_rusqlite() {
 fn string_scalar_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
     harness.assert_queries_match("string scalar edge", STRING_SCALAR_EDGE_CASES);
+}
+
+#[test]
+fn trim_scalar_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(TRIM_SCALAR_SETUP);
+    harness.assert_queries_match("trim scalar edge", TRIM_SCALAR_CASES);
 }
 
 #[test]

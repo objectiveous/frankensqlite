@@ -6094,6 +6094,46 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_column_literal_comparison_orients_column_left() {
+        // normalize_column_literal_comparison puts the column on the left: a
+        // column-OP-literal comparison keeps its op, while literal-OP-column
+        // reverses the op (5 < x becomes x > 5). A non-comparison op and a
+        // column-column comparison normalize to None.
+        let col = |n: &str| Box::new(Expr::Column(ColumnRef::bare(n), Span::ZERO));
+        let lit = |n: i64| Box::new(Expr::Literal(Literal::Integer(n), Span::ZERO));
+        let bin = |l: Box<Expr>, op: AstBinaryOp, r: Box<Expr>| Expr::BinaryOp {
+            left: l,
+            op,
+            right: r,
+            span: Span::ZERO,
+        };
+
+        // x > 5 -> column x, op Gt, literal 5.
+        let n =
+            normalize_column_literal_comparison(&bin(col("x"), AstBinaryOp::Gt, lit(5))).unwrap();
+        assert_eq!(n.column.column, "x");
+        assert!(matches!(n.op, AstBinaryOp::Gt));
+        assert!(matches!(n.literal, Literal::Integer(5)));
+
+        // 5 < x -> column x, op reversed to Gt, literal 5.
+        let n =
+            normalize_column_literal_comparison(&bin(lit(5), AstBinaryOp::Lt, col("x"))).unwrap();
+        assert_eq!(n.column.column, "x");
+        assert!(matches!(n.op, AstBinaryOp::Gt));
+        assert!(matches!(n.literal, Literal::Integer(5)));
+
+        // A non-comparison op (Add) normalizes to None.
+        assert!(
+            normalize_column_literal_comparison(&bin(col("x"), AstBinaryOp::Add, lit(5))).is_none()
+        );
+        // A column-column comparison (no literal) normalizes to None.
+        assert!(
+            normalize_column_literal_comparison(&bin(col("x"), AstBinaryOp::Eq, col("y")))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn test_expr_implies_partial_predicate() {
         // A query predicate implies a partial-index predicate when it is
         // structurally identical, when it guarantees the column non-null for an

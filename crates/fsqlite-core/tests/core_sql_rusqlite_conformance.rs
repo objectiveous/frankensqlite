@@ -379,6 +379,33 @@ const CTE_CASES: &[QueryCase] = &[
     },
 ];
 
+const VALUES_CLAUSE_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "single literal values row",
+        sql: "VALUES (1, 'alpha', NULL)",
+    },
+    QueryCase {
+        name: "multi row mixed storage values",
+        sql: "VALUES (1, 'one'), (2, 'two'), (3, NULL)",
+    },
+    QueryCase {
+        name: "expressions inside values rows",
+        sql: "VALUES (1 + 2, upper('ab'), typeof(NULL)), (5 / 2, lower('CD'), typeof(3.5))",
+    },
+    QueryCase {
+        name: "values backed cte explicit columns",
+        sql: "WITH incoming(id, label) AS (VALUES (2, 'beta'), (1, 'alpha'), (3, NULL)) SELECT id, label FROM incoming ORDER BY id",
+    },
+    QueryCase {
+        name: "aggregate over values rows",
+        sql: "WITH nums(n) AS (VALUES (1), (2), (2), (NULL)) SELECT COUNT(*), COUNT(n), SUM(n), COUNT(DISTINCT n) FROM nums",
+    },
+    QueryCase {
+        name: "join values output to table",
+        sql: "WITH ids(id) AS (VALUES (1), (3), (99)) SELECT c.name FROM ids JOIN customers c ON c.id = ids.id ORDER BY c.name",
+    },
+];
+
 const WINDOW_SETUP: &str = "
     CREATE TABLE compensation (
         id INTEGER PRIMARY KEY,
@@ -1659,6 +1686,12 @@ fn with_upsert_returning_matches_rusqlite() {
 fn cte_queries_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CTE_SETUP);
     harness.assert_queries_match("CTE", CTE_CASES);
+}
+
+#[test]
+fn values_clause_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(SUBQUERY_SETUP);
+    harness.assert_queries_match("VALUES clause edge", VALUES_CLAUSE_CASES);
 }
 
 #[test]

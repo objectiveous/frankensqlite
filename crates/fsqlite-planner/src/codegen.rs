@@ -2602,6 +2602,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_codegen_select_column_eq_emits_filtered_scan() {
+        // SELECT a FROM t WHERE b = ?1 -> a full scan with an equality filter on
+        // b (the non-rowid column-eq path), distinct from a plain full scan.
+        let stmt = simple_select(&["a"], "t", Some(col_eq_param("b", 1)));
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Loads the bind param, opens the table, reads the filter column and
+        // skips non-matching rows (Ne), then emits matches and iterates.
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Variable,
+                Opcode::OpenRead,
+                Opcode::Rewind,
+                Opcode::Column,
+                Opcode::Ne,
+                Opcode::ResultRow,
+                Opcode::Next,
+                Opcode::Halt,
+            ]
+        ));
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),

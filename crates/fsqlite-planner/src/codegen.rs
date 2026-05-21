@@ -3630,6 +3630,71 @@ mod tests {
         assert_eq!(mr.p2, 2); // ALL columns, not just the changed one.
     }
 
+    #[test]
+    fn test_codegen_update_notexists_jump_skips_insert_to_close() {
+        // UPDATE t SET b = ?1 WHERE rowid = ?2 performs a read-modify-write:
+        // NotExists guards the whole block, so when the rowid is absent the jump
+        // must skip past the Insert (the REPLACE that writes the row back) and
+        // land on Close. Otherwise a missing-rowid UPDATE would silently insert a
+        // phantom row. `test_codegen_update_by_rowid` only checks the opcode
+        // subsequence + MakeRecord arity; this pins the guard's jump target.
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+                time_travel: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("b".to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(2)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        let notexists = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::NotExists)
+            .expect("NotExists op present");
+        let insert = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Insert)
+            .expect("Insert (REPLACE write-back) op present");
+        let close = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Close)
+            .expect("Close op present");
+
+        // The write-back Insert sits strictly between the guard and Close, so it
+        // is part of the span the NotExists branch hops over.
+        assert!(notexists < insert, "NotExists must precede the write-back Insert");
+        assert!(insert < close, "the write-back Insert must precede Close");
+
+        // NotExists jumps to Close when the rowid is absent, skipping the Insert.
+        assert_eq!(
+            usize::try_from(ops[notexists].p2).unwrap(),
+            close,
+            "NotExists must jump to Close (skipping the write-back Insert) when the rowid is absent"
+        );
+    }
+
     // === Test 4: DELETE by rowid ===
     #[test]
     fn test_codegen_delete_by_rowid() {

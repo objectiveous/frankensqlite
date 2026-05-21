@@ -2177,6 +2177,53 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_comparison_expr_shape_and_is_nulleq_flag() {
+        // emit_comparison_expr evaluates both operands into temps, then a
+        // comparison opcode jumps to set dest=1, falling through to dest=0 via a
+        // Goto. IS / IS NOT additionally set the NULLEQ flag (p5=0x80) so that
+        // NULL IS NULL compares true. Neither the emitted shape nor the flag was
+        // directly asserted (binary_op_to_opcode only checks Is -> Eq).
+        let lit = |n: i64| Expr::Literal(Literal::Integer(n), Span::ZERO);
+
+        // `3 < 5`: eval, eval, Lt(jump), Integer 0, Goto, Integer 1.
+        let mut b = ProgramBuilder::new();
+        let dest = b.alloc_reg();
+        emit_comparison_expr(&mut b, &lit(3), AstBinaryOp::Lt, &lit(5), dest).unwrap();
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let prog = b.finish().unwrap();
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Integer, // left operand
+                Opcode::Integer, // right operand
+                Opcode::Lt,      // comparison jump
+                Opcode::Integer, // false branch -> 0
+                Opcode::Goto,
+                Opcode::Integer, // true branch -> 1
+            ]
+        ));
+        let lt = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Lt)
+            .expect("Lt present");
+        assert_eq!(lt.p5, 0, "a plain comparison carries no NULLEQ flag");
+
+        // `3 IS 5`: maps to Eq with the NULLEQ flag set (0x80).
+        let mut b2 = ProgramBuilder::new();
+        let d2 = b2.alloc_reg();
+        emit_comparison_expr(&mut b2, &lit(3), AstBinaryOp::Is, &lit(5), d2).unwrap();
+        b2.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let prog2 = b2.finish().unwrap();
+        let eq = prog2
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Eq)
+            .expect("Eq present");
+        assert_eq!(eq.p5, 0x80, "IS uses the NULLEQ flag so NULL IS NULL is true");
+    }
+
+    #[test]
     fn test_binary_op_to_opcode_and_is_comparison_classification() {
         use AstBinaryOp as B;
 

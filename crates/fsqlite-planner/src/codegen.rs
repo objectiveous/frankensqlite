@@ -2121,6 +2121,38 @@ mod tests {
         assert!(schema.index_for_column("id").is_none());
     }
 
+    #[test]
+    fn test_type_to_affinity_follows_sqlite_rules() {
+        // SQLite affinity determination is a case-insensitive substring scan in
+        // precedence order: INT->'D', {CHAR,CLOB,TEXT,VARCHAR}->'B',
+        // {BLOB, no type}->'A', {REAL,FLOA,DOUB}->'E', else NUMERIC 'C'.
+        assert_eq!(type_to_affinity("INTEGER"), 'D');
+        assert_eq!(type_to_affinity("int"), 'D');
+        assert_eq!(type_to_affinity("BIGINT"), 'D');
+        assert_eq!(type_to_affinity("TINYINT"), 'D');
+        // SQLite quirk: anything containing "INT" gets INTEGER affinity ("POINT").
+        assert_eq!(type_to_affinity("POINT"), 'D');
+
+        assert_eq!(type_to_affinity("TEXT"), 'B');
+        assert_eq!(type_to_affinity("VARCHAR(255)"), 'B');
+        assert_eq!(type_to_affinity("CHARACTER(20)"), 'B');
+        assert_eq!(type_to_affinity("CLOB"), 'B');
+
+        // BLOB or a missing declared type yields no affinity ('A').
+        assert_eq!(type_to_affinity("BLOB"), 'A');
+        assert_eq!(type_to_affinity(""), 'A');
+
+        assert_eq!(type_to_affinity("REAL"), 'E');
+        assert_eq!(type_to_affinity("DOUBLE PRECISION"), 'E');
+        assert_eq!(type_to_affinity("FLOAT"), 'E');
+
+        // Everything else falls through to NUMERIC.
+        assert_eq!(type_to_affinity("NUMERIC"), 'C');
+        assert_eq!(type_to_affinity("DECIMAL(10,2)"), 'C');
+        assert_eq!(type_to_affinity("BOOLEAN"), 'C');
+        assert_eq!(type_to_affinity("DATETIME"), 'C');
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),

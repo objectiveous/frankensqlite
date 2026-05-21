@@ -2500,6 +2500,23 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_single_table_select_source_name_resolves_table_and_rejects_subquery() {
+        // A bare table source yields its name.
+        let from = from_table("users");
+        assert_eq!(single_table_select_source_name(&from.source).unwrap(), "users");
+
+        // A subquery FROM source is not a single-table source -> Unsupported.
+        let subquery = TableOrSubquery::Subquery {
+            query: Box::new(star_select("x")),
+            alias: None,
+        };
+        assert!(matches!(
+            single_table_select_source_name(&subquery),
+            Err(CodegenError::Unsupported(_))
+        ));
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),

@@ -897,4 +897,98 @@ mod tests {
         assert_eq!(result.plan.mode, CheckpointMode::Full);
         assert!(result.plan.completes_checkpoint());
     }
+
+    #[test]
+    fn test_checkpoint_execution_result_clone_eq_debug() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        populate_wal(&mut wal, &cx, 2);
+
+        let state = CheckpointState {
+            total_frames: 2,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+        let mut target = RecordingTarget::new();
+        let result = execute_checkpoint(&cx, &mut wal, CheckpointMode::Passive, state, &mut target)
+            .expect("checkpoint");
+
+        let cloned = result.clone();
+        assert_eq!(result, cloned);
+        let dbg = format!("{result:?}");
+        assert!(dbg.contains("CheckpointExecutionResult"));
+        assert!(dbg.contains("frames_backfilled"));
+    }
+
+    #[test]
+    fn test_passive_syncs_exactly_once() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        populate_wal(&mut wal, &cx, 3);
+
+        let state = CheckpointState {
+            total_frames: 3,
+            backfilled_frames: 0,
+            oldest_reader_frame: Some(2),
+        };
+        let mut target = RecordingTarget::new();
+        execute_checkpoint(&cx, &mut wal, CheckpointMode::Passive, state, &mut target)
+            .expect("checkpoint");
+
+        assert_eq!(target.sync_count, 1, "partial passive should sync exactly once");
+    }
+
+    #[test]
+    fn test_full_complete_syncs_twice_for_truncate() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        populate_wal(&mut wal, &cx, 3);
+
+        let state = CheckpointState {
+            total_frames: 3,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+        let mut target = RecordingTarget::new();
+        execute_checkpoint(&cx, &mut wal, CheckpointMode::Full, state, &mut target)
+            .expect("checkpoint");
+
+        assert_eq!(
+            target.sync_count, 2,
+            "full complete with db_size truncate should sync twice"
+        );
+    }
+
+    #[test]
+    fn test_pages_written_in_ascending_order() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        wal.append_frame(&cx, 5, &sample_page(5), 0).expect("append");
+        wal.append_frame(&cx, 2, &sample_page(2), 0).expect("append");
+        wal.append_frame(&cx, 8, &sample_page(8), 0).expect("append");
+        wal.append_frame(&cx, 1, &sample_page(1), 4).expect("append commit");
+
+        let state = CheckpointState {
+            total_frames: 4,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+        let mut target = RecordingTarget::new();
+        execute_checkpoint(&cx, &mut wal, CheckpointMode::Passive, state, &mut target)
+            .expect("checkpoint");
+
+        let page_nums: Vec<u32> = target.pages.iter().map(|(pn, _)| pn.get()).collect();
+        let mut sorted = page_nums.clone();
+        sorted.sort_unstable();
+        assert_eq!(page_nums, sorted, "pages must be written in ascending order");
+    }
 }

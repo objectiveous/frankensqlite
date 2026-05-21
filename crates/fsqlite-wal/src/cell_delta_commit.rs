@@ -620,6 +620,69 @@ mod tests {
     }
 
     #[test]
+    fn test_compression_ratio_zero_frames_returns_one() {
+        let sub = MixedFrameSubmission::new(test_txn_id(), CommitSeq::new(1));
+        let stats = MixedCommitStats::calculate(&sub, 4096);
+        assert_eq!(stats.full_page_frames, 0);
+        assert_eq!(stats.cell_delta_frames, 0);
+        assert!((stats.compression_ratio(4096) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_mixed_commit_stats_default_all_zero() {
+        let stats = MixedCommitStats::default();
+        assert_eq!(stats.full_page_frames, 0);
+        assert_eq!(stats.cell_delta_frames, 0);
+        assert_eq!(stats.full_page_bytes, 0);
+        assert_eq!(stats.cell_delta_bytes, 0);
+        assert_eq!(stats.bytes_saved, 0);
+    }
+
+    #[test]
+    fn test_build_cell_delta_frames_empty_iterator() {
+        let frames = build_cell_delta_frames(
+            std::iter::empty(),
+            CommitSeq::new(1),
+            test_txn_id(),
+        );
+        assert!(frames.is_empty());
+    }
+
+    #[test]
+    fn test_cell_delta_descriptor_update_factory() {
+        let desc = CellDeltaDescriptor::update(
+            test_page_number(),
+            test_key_digest(),
+            vec![0xCC; 50],
+        );
+        assert_eq!(desc.op, CellOp::Update);
+        assert_eq!(desc.cell_data.len(), 50);
+        assert_eq!(desc.page_number, test_page_number());
+    }
+
+    #[test]
+    fn test_mark_commit_on_empty_full_pages_is_noop() {
+        let mut sub = MixedFrameSubmission::new(test_txn_id(), CommitSeq::new(1));
+        sub.add_cell_delta(CellDeltaWalFrame::new(
+            test_page_number(),
+            test_key_digest(),
+            CellOp::Insert,
+            CommitSeq::new(1),
+            test_txn_id(),
+            vec![1],
+        ));
+        sub.mark_commit(50);
+        assert!(sub.full_page_frames.is_empty());
+    }
+
+    #[test]
+    fn test_serialize_mixed_frames_empty_submission() {
+        let sub = MixedFrameSubmission::new(test_txn_id(), CommitSeq::new(1));
+        let buf = serialize_mixed_frames(&sub, 4096).unwrap();
+        assert!(buf.is_empty());
+    }
+
+    #[test]
     fn test_cell_only_commit() {
         let mut sub = MixedFrameSubmission::new(test_txn_id(), CommitSeq::new(100));
 

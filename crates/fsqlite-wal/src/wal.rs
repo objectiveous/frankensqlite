@@ -4135,4 +4135,74 @@ mod tests {
             wal_reopened.close(&cx).expect("close");
         }
     }
+
+    #[test]
+    fn wal_generation_identity_from_header_and_eq() {
+        let header = WalHeader {
+            magic: WAL_MAGIC_LE,
+            format_version: WAL_FORMAT_VERSION,
+            page_size: PAGE_SIZE,
+            checkpoint_seq: 7,
+            salts: test_salts(),
+            checksum: SqliteWalChecksum(0, 0),
+            db_size: 0,
+        };
+        let identity = WalGenerationIdentity::from_header(&header);
+        assert_eq!(identity.checkpoint_seq, 7);
+        assert_eq!(identity.salts, test_salts());
+        let copied = identity;
+        assert_eq!(copied, identity);
+        let other = WalGenerationIdentity {
+            checkpoint_seq: 8,
+            salts: test_salts(),
+        };
+        assert_ne!(identity, other);
+        let dbg = format!("{identity:?}");
+        assert!(dbg.contains("WalGenerationIdentity"));
+    }
+
+    #[test]
+    fn wal_append_frame_ref_debug_clone_copy() {
+        let data = [0xABu8; 16];
+        let frame = WalAppendFrameRef {
+            page_number: 3,
+            page_data: &data,
+            db_size_if_commit: 10,
+        };
+        let copied = frame;
+        assert_eq!(copied.page_number, 3);
+        assert_eq!(copied.db_size_if_commit, 10);
+        assert_eq!(copied.page_data[0], 0xAB);
+        let cloned = frame.clone();
+        assert_eq!(cloned.page_number, frame.page_number);
+        let dbg = format!("{frame:?}");
+        assert!(dbg.contains("WalAppendFrameRef"));
+    }
+
+    #[test]
+    fn wal_file_generation_identity_matches_create_params() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        let identity = wal.generation_identity();
+        assert_eq!(identity.checkpoint_seq, 0);
+        assert_eq!(identity.salts, test_salts());
+        wal.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn wal_file_page_size_and_frame_count_after_create() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        assert_eq!(wal.page_size(), PAGE_SIZE as usize);
+        assert_eq!(wal.frame_count(), 0);
+        assert!(wal.last_commit_frame().is_none());
+        wal.append_frame(&cx, 1, &sample_page(1), 5).expect("append");
+        assert_eq!(wal.frame_count(), 1);
+        assert_eq!(wal.last_commit_frame(), Some(0));
+        wal.close(&cx).expect("close");
+    }
 }

@@ -1582,4 +1582,71 @@ mod tests {
         assert!(saga.is_cancelled());
         assert!(!saga.is_published());
     }
+
+    #[test]
+    fn test_bucket_for_space_amp_exact_boundaries() {
+        assert_eq!(CompactionMdpState::bucket_for_space_amp(0.0), 0);
+        assert_eq!(CompactionMdpState::bucket_for_space_amp(1.499_999), 0);
+        assert_eq!(CompactionMdpState::bucket_for_space_amp(1.5), 1);
+        assert_eq!(CompactionMdpState::bucket_for_space_amp(1.999_999), 1);
+        assert_eq!(CompactionMdpState::bucket_for_space_amp(2.0), 2);
+        assert_eq!(CompactionMdpState::bucket_for_space_amp(2.999_999), 2);
+        assert_eq!(CompactionMdpState::bucket_for_space_amp(3.0), 3);
+        assert_eq!(CompactionMdpState::bucket_for_space_amp(100.0), 3);
+    }
+
+    #[test]
+    fn test_native_recovery_default_equals_new() {
+        let from_new = NativeRecovery::new();
+        let from_default = NativeRecovery::default();
+        assert!(from_new.root_manifest.is_none());
+        assert!(from_default.root_manifest.is_none());
+        assert_eq!(from_new.recovered_tip(), CommitSeq::ZERO);
+        assert_eq!(from_default.recovered_tip(), CommitSeq::ZERO);
+        assert!(!from_new.has_violations());
+        assert!(!from_default.has_violations());
+    }
+
+    #[test]
+    fn test_compaction_policy_default_equals_new() {
+        let from_new = CompactionPolicy::new();
+        let from_default = CompactionPolicy::default();
+        assert!(from_new.evidence_ledger().is_empty());
+        assert!(from_default.evidence_ledger().is_empty());
+        let probe = CompactionMdpState {
+            space_amp_bucket: 2,
+            read_regime: 0,
+            write_regime: 0,
+            compaction_debt: 0,
+        };
+        assert_eq!(from_new.recommend(&probe), from_default.recommend(&probe));
+    }
+
+    #[test]
+    fn test_compaction_summary_full_lifecycle_with_retire() {
+        let old = vec![
+            make_segment(0x01, &[0x10, 0x20], 2000),
+            make_segment(0x02, &[0x30], 1000),
+        ];
+        let mut saga = CompactionSaga::new(old, 3.0);
+
+        saga.mark(vec![make_oid(0x10), make_oid(0x30)]);
+        saga.compact(vec![make_segment(0x03, &[0x10, 0x30], 1500)]);
+        saga.mark_segments_synced();
+        saga.mark_locator_synced();
+        saga.publish();
+        saga.register_reader_leases(Vec::new());
+        let retired = saga.retire();
+        assert_eq!(retired.len(), 2);
+
+        let summary = saga.summary();
+        assert_eq!(summary.live_objects, 2);
+        assert_eq!(summary.dead_objects, 1);
+        assert_eq!(summary.old_segments, 2);
+        assert_eq!(summary.new_segments, 1);
+        assert_eq!(summary.retired_segments, 2);
+        assert!(summary.published);
+        assert!(!summary.cancelled);
+        assert!((summary.space_amp_before - 3.0).abs() < f64::EPSILON);
+    }
 }

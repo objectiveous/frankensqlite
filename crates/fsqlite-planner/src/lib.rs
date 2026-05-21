@@ -6099,6 +6099,32 @@ mod tests {
     }
 
     #[test]
+    fn test_invalidate_plan_cache_if_schema_cookie_changed_tracks_cookie() {
+        // Tracks the latest schema cookie on every call and clears the cache
+        // when the new cookie differs from the cached one. With an empty cache
+        // we directly observe the cookie tracking; the clear-on-change effect
+        // on an already-empty cache is a no-op but the cookie transitions are.
+        let mut p = QueryPlanner::new();
+        assert_eq!(p.cached_schema_cookie, None);
+        assert!(p.is_plan_cache_empty());
+
+        // First call seeds the cookie without clearing (no prior cookie).
+        p.invalidate_plan_cache_if_schema_cookie_changed(5);
+        assert_eq!(p.cached_schema_cookie, Some(5));
+        assert!(p.is_plan_cache_empty());
+
+        // Same cookie -> no change (the is_some_and predicate is false).
+        p.invalidate_plan_cache_if_schema_cookie_changed(5);
+        assert_eq!(p.cached_schema_cookie, Some(5));
+
+        // Different cookie -> cache cleared (still empty here) and cookie
+        // updated to the new value.
+        p.invalidate_plan_cache_if_schema_cookie_changed(7);
+        assert_eq!(p.cached_schema_cookie, Some(7));
+        assert!(p.is_plan_cache_empty());
+    }
+
+    #[test]
     fn test_is_plan_cache_empty_and_clear_on_fresh_planner() {
         // A freshly-constructed QueryPlanner has an empty plan cache (owned
         // state, no globals), custom capacities are empty initially, capacity 0

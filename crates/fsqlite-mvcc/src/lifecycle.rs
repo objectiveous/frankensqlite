@@ -27,6 +27,7 @@ use crate::cache_aligned::{logical_now_epoch_secs, logical_now_millis};
 use crate::cell_visibility::CellVisibilityLog;
 use crate::core_types::{
     CommitIndex, InProcessPageLockTable, Transaction, TransactionMode, TransactionState,
+    WriteVersionEntry,
 };
 use crate::ebr::{GLOBAL_EBR_METRICS, VersionGuardRegistry, VersionGuardTicket};
 use crate::invariants::{SerializedWriteMutex, TxnManager, VersionStore};
@@ -408,6 +409,9 @@ pub struct Savepoint {
         Arc<HashMap<PageNumber, PageData, fsqlite_types::PageNumberBuildHasher>>,
     /// Number of pages in write_set when savepoint was created.
     pub write_set_len: usize,
+    /// Snapshot of per-page write-version evidence at savepoint creation.
+    pub write_set_versions_snapshot:
+        HashMap<PageNumber, WriteVersionEntry, fsqlite_types::PageNumberBuildHasher>,
     /// Snapshot of structural page tracking at savepoint creation.
     pub structural_pages_snapshot: HashSet<PageNumber>,
     /// Number of intent-log entries at savepoint creation.
@@ -1182,6 +1186,7 @@ impl TransactionManager {
             name: name.to_owned(),
             write_set_snapshot: txn.write_set_data.clone(),
             write_set_len: txn.write_set.len(),
+            write_set_versions_snapshot: txn.write_set_versions.clone(),
             structural_pages_snapshot: txn.structural_pages.clone(),
             intent_log_len: txn.intent_log.len(),
             cell_delta_len: self.cell_log.txn_delta_count(txn.token()),
@@ -1210,8 +1215,7 @@ impl TransactionManager {
 
         // Truncate the write_set page list to savepoint length.
         txn.write_set.truncate(savepoint.write_set_len);
-        txn.write_set_versions
-            .retain(|pgno, _| txn.write_set_data.contains_key(pgno));
+        txn.write_set_versions = savepoint.write_set_versions_snapshot.clone();
         txn.structural_pages = savepoint.structural_pages_snapshot.clone();
         txn.intent_log.truncate(savepoint.intent_log_len);
 
@@ -3766,6 +3770,40 @@ mod tests {
         assert!(
             txn.write_version_for_page(p2).is_none(),
             "savepoint rollback must prune write-version entries for removed pages"
+        );
+    }
+
+    #[test]
+    fn test_rollback_to_savepoint_restores_logical_write_version_tracking() {
+        let m = mgr();
+        let mut txn = m.begin(BeginKind::Concurrent).unwrap();
+        let pre_savepoint_page = PageNumber::new(1).unwrap();
+        let post_savepoint_page = PageNumber::new(2).unwrap();
+
+        txn.write_set.push(pre_savepoint_page);
+        txn.record_page_write(pre_savepoint_page, Some(CommitSeq::new(7)));
+        let sp = m.savepoint(&txn, "sp_logical_tracking");
+
+        txn.write_set.push(post_savepoint_page);
+        txn.record_page_write(post_savepoint_page, Some(CommitSeq::new(8)));
+
+        assert!(
+            !txn.write_set_data.contains_key(&pre_savepoint_page),
+            "logical writes should not require full-page write_set_data"
+        );
+        assert!(txn.write_version_for_page(pre_savepoint_page).is_some());
+        assert!(txn.write_version_for_page(post_savepoint_page).is_some());
+
+        m.rollback_to_savepoint(&mut txn, &sp);
+
+        let restored_entry = txn
+            .write_version_for_page(pre_savepoint_page)
+            .expect("pre-savepoint logical write tracking must survive rollback");
+        assert_eq!(restored_entry.old_version, Some(CommitSeq::new(7)));
+        assert_eq!(restored_entry.new_version, None);
+        assert!(
+            txn.write_version_for_page(post_savepoint_page).is_none(),
+            "post-savepoint logical write tracking must be pruned"
         );
     }
 

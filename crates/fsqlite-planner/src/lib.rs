@@ -5927,6 +5927,21 @@ mod tests {
     }
 
     #[test]
+    fn test_has_join_predicate_detects_equi_join_either_orientation() {
+        // has_join_predicate finds an equi-join column predicate between two
+        // tables in either argument order, case-insensitively; absent or
+        // unrelated tables yield false.
+        let terms = [join_term("a", "x", "b", "y")]; // a.x = b.y
+
+        assert!(has_join_predicate("a", "b", &terms));
+        assert!(has_join_predicate("b", "a", &terms), "either argument order");
+        assert!(has_join_predicate("A", "B", &terms), "case-insensitive");
+        assert!(!has_join_predicate("a", "c", &terms), "no predicate to c");
+        assert!(!has_join_predicate("c", "d", &terms));
+        assert!(!has_join_predicate("a", "b", &[]), "no terms -> no predicate");
+    }
+
+    #[test]
     fn test_cross_join_allowed_enforces_right_after_left_ordering() {
         // For a cross-join pair (A, B), B may only be placed after A in the join
         // order. cross_join_allowed enforces this case-insensitively; candidates

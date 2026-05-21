@@ -188,6 +188,7 @@ const UNICODE61_CODE_TOKEN_OPTIONS: &[&str] = &[r#"tokenize="unicode61 tokenchar
 const UNICODE61_SEPARATOR_OPTIONS: &[&str] = &[r#"tokenize="unicode61 separators '_.'""#];
 const UNINDEXED_COLUMN_SPECS: &[&str] = &["title", "body UNINDEXED"];
 const CONTENTLESS_OPTIONS: &[&str] = &["content=''"];
+const PREFIX_INDEX_OPTIONS: &[&str] = &["prefix='2 3'"];
 const PORTER_OPTIONS: &[&str] = &["tokenize='porter'"];
 const TRIGRAM_OPTIONS: &[&str] = &["tokenize='trigram'"];
 
@@ -319,6 +320,29 @@ const CONTENTLESS_CASES: &[MatchCase] = &[
     MatchCase {
         name: "contentless prefix",
         query: "compat*",
+    },
+];
+
+const PREFIX_INDEX_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "two-character prefix",
+        query: "se*",
+    },
+    MatchCase {
+        name: "three-character prefix",
+        query: "rus*",
+    },
+    MatchCase {
+        name: "phrase final prefix",
+        query: "full + tex*",
+    },
+    MatchCase {
+        name: "column prefix",
+        query: "title:sq*",
+    },
+    MatchCase {
+        name: "near prefix",
+        query: "NEAR(rust compat*, 4)",
     },
 ];
 
@@ -670,6 +694,21 @@ fn contentless_tables_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "contentless table conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn prefix_index_options_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::with_docs(PREFIX_INDEX_OPTIONS, DOCS);
+
+    for case in PREFIX_INDEX_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "prefix-index option conformance case failed: {} ({})",
             case.name,
             case.query
         );

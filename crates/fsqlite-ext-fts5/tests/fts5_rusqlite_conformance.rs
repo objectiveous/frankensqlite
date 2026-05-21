@@ -1599,6 +1599,41 @@ const COLUMN_MIGRATION_REPLACEMENT_CASES: &[MatchCase] = &[
     },
 ];
 
+const DELETE_REPLACE_TERM_REUSE_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "deleted row unique term removed",
+        query: "empowers",
+    },
+    MatchCase {
+        name: "replaced row old title term removed",
+        query: "title:fts",
+    },
+    MatchCase {
+        name: "replaced row old body term removed",
+        query: "body:prefix",
+    },
+    MatchCase {
+        name: "reused title term indexed on replacement",
+        query: "title:rust",
+    },
+    MatchCase {
+        name: "reused body term indexed on replacement",
+        query: "body:language",
+    },
+    MatchCase {
+        name: "reused phrase indexed on replacement",
+        query: r#""rust language""#,
+    },
+    MatchCase {
+        name: "retained title sqlite rows",
+        query: "title:sqlite",
+    },
+    MatchCase {
+        name: "retained search rows after delete and replace",
+        query: "search",
+    },
+];
+
 const REINSERT_ROWID_CASES: &[MatchCase] = &[
     MatchCase {
         name: "old rowid term removed",
@@ -3106,6 +3141,35 @@ fn column_migration_replacement_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "column-migration replacement MATCH conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn delete_replace_term_reuse_queries_match_rusqlite_reference() {
+    let mut harness = Fts5ConformanceHarness::new(&[]);
+    harness.delete_doc(1);
+    harness.insert_or_replace_doc(Doc {
+        rowid: 2,
+        title: "Rust search",
+        body: "rust language moved marker",
+    });
+
+    let mut franken_rows = harness.franken_full_scan_rows();
+    franken_rows.sort_by_key(|row| row.0);
+    assert_eq!(
+        franken_rows,
+        harness.sqlite_full_scan_rows(),
+        "delete-replace term-reuse full-scan conformance failed"
+    );
+
+    for case in DELETE_REPLACE_TERM_REUSE_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "delete-replace term-reuse MATCH conformance case failed: {} ({})",
             case.name,
             case.query
         );

@@ -8726,6 +8726,73 @@ mod tests {
     }
 
     #[test]
+    fn test_read_page_with_cell_deltas_replays_same_txn_delete_then_update()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4255;
+        let original_payload = vec![b'm'; 143];
+        let replacement_payload = vec![b'n'; 144];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut inserter = mgr.begin(BeginKind::Concurrent).expect("inserter begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &original_payload),
+                inserter.token(),
+            )
+            .expect("logical insert should fit budget");
+        mgr.commit(&mut inserter).expect("insert commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_delete(cell_key, pgno, txn.token())
+            .expect("logical delete should fit budget");
+        mgr.cell_log()
+            .record_update(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &replacement_payload),
+                txn.token(),
+            )
+            .expect("logical update should fit budget");
+
+        let page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&page)?,
+            vec![(rowid, replacement_payload.clone())],
+            "transaction-local reads must replay delete-then-update as replacement"
+        );
+
+        mgr.commit(&mut txn).expect("combined logical commit");
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let committed_page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&committed_page)?,
+            vec![(rowid, replacement_payload)],
+            "committed reads must preserve the delete-then-update ordering"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_read_page_with_cell_deltas_hides_other_uncommitted_delta() -> fsqlite_error::Result<()>
     {
         use crate::cell_visibility::CellKey;

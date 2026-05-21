@@ -161,6 +161,24 @@ const PORTER_DOCS: &[Doc] = &[
     },
 ];
 
+const PORTER_UNICODE61_DOCS: &[Doc] = &[
+    Doc {
+        rowid: 1,
+        title: "Accent running",
+        body: "résumés running cafés",
+    },
+    Doc {
+        rowid: 2,
+        title: "Plain run",
+        body: "resume run cafe",
+    },
+    Doc {
+        rowid: 3,
+        title: "Runner note",
+        body: "runner cafeteria",
+    },
+];
+
 const TRIGRAM_DOCS: &[Doc] = &[
     Doc {
         rowid: 1,
@@ -286,6 +304,7 @@ const PREFIX_INDEX_OPTIONS: &[&str] = &["prefix='2 3'"];
 const DETAIL_COLUMN_OPTIONS: &[&str] = &["detail=column"];
 const DETAIL_NONE_OPTIONS: &[&str] = &["detail=none"];
 const PORTER_OPTIONS: &[&str] = &["tokenize='porter'"];
+const PORTER_UNICODE61_OPTIONS: &[&str] = &["tokenize='porter unicode61 remove_diacritics 2'"];
 const TRIGRAM_OPTIONS: &[&str] = &["tokenize='trigram'"];
 const TRIGRAM_CASE_SENSITIVE_OPTIONS: &[&str] = &["tokenize='trigram case_sensitive 1'"];
 const TRIGRAM_REMOVE_DIACRITICS_OPTIONS: &[&str] = &["tokenize='trigram remove_diacritics 1'"];
@@ -457,6 +476,33 @@ const ASCII_TOKENIZER_CASES: &[MatchCase] = &[
     MatchCase {
         name: "ascii title column filter",
         query: "title:ascii",
+    },
+];
+
+const PORTER_UNICODE61_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "porter strips plural after unicode61 diacritic removal",
+        query: "resume",
+    },
+    MatchCase {
+        name: "accented query normalizes through porter unicode61",
+        query: "résumé",
+    },
+    MatchCase {
+        name: "porter stems running to run",
+        query: "run",
+    },
+    MatchCase {
+        name: "porter phrase after diacritic removal",
+        query: r#""resume run""#,
+    },
+    MatchCase {
+        name: "porter strips plural cafe token",
+        query: "cafe",
+    },
+    MatchCase {
+        name: "porter title column filter",
+        query: "title:run",
     },
 ];
 
@@ -1408,6 +1454,22 @@ fn ascii_tokenizer_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "ascii tokenizer conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn porter_unicode61_queries_match_rusqlite_reference() {
+    let harness =
+        Fts5ConformanceHarness::with_docs(PORTER_UNICODE61_OPTIONS, PORTER_UNICODE61_DOCS);
+
+    for case in PORTER_UNICODE61_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "porter unicode61 tokenizer conformance case failed: {} ({})",
             case.name,
             case.query
         );

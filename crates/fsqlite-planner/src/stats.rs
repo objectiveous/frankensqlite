@@ -538,6 +538,63 @@ mod tests {
     }
 
     #[test]
+    fn test_histogram_equality_and_range_estimates_multi_bucket() {
+        // Two equi-depth buckets with distinct densities so equality estimates
+        // (count / ndv) differ per bucket and range estimates span both.
+        let hist = Histogram {
+            buckets: vec![
+                HistogramBucket {
+                    lower: SqliteValue::Integer(0),
+                    upper: SqliteValue::Integer(99),
+                    count: 100,
+                    ndv: 10,
+                },
+                HistogramBucket {
+                    lower: SqliteValue::Integer(100),
+                    upper: SqliteValue::Integer(199),
+                    count: 200,
+                    ndv: 50,
+                },
+            ],
+        };
+        let total = 300.0;
+        let iv = SqliteValue::Integer;
+
+        // Equality: uniform within bucket = count / ndv (boundaries included).
+        assert!((hist.estimate_equality_rows(&iv(50)) - 10.0).abs() < f64::EPSILON); // A: 100/10
+        assert!((hist.estimate_equality_rows(&iv(0)) - 10.0).abs() < f64::EPSILON); // A lower
+        assert!((hist.estimate_equality_rows(&iv(99)) - 10.0).abs() < f64::EPSILON); // A upper
+        assert!((hist.estimate_equality_rows(&iv(100)) - 4.0).abs() < f64::EPSILON); // B: 200/50
+        assert!((hist.estimate_equality_rows(&iv(150)) - 4.0).abs() < f64::EPSILON);
+        // Out of histogram range -> minimal-selectivity fallback of 1.0 row.
+        assert!((hist.estimate_equality_rows(&iv(10_000)) - 1.0).abs() < f64::EPSILON);
+
+        // Range endpoints: below all rows -> 0; at/above all rows -> total.
+        assert!((hist.estimate_less_than_rows(&iv(-100)) - 0.0).abs() < f64::EPSILON);
+        assert!((hist.estimate_less_than_rows(&iv(10_000)) - total).abs() < f64::EPSILON);
+        assert!((hist.estimate_greater_than_rows(&iv(10_000)) - 0.0).abs() < f64::EPSILON);
+        assert!((hist.estimate_greater_than_rows(&iv(-100)) - total).abs() < f64::EPSILON);
+
+        // less_than is monotonic non-decreasing across the domain.
+        let lt_lo = hist.estimate_less_than_rows(&iv(-100));
+        let lt_a = hist.estimate_less_than_rows(&iv(50));
+        let lt_b = hist.estimate_less_than_rows(&iv(150));
+        let lt_hi = hist.estimate_less_than_rows(&iv(10_000));
+        assert!(
+            lt_lo <= lt_a && lt_a <= lt_b && lt_b <= lt_hi,
+            "less_than must be monotonic: {lt_lo} <= {lt_a} <= {lt_b} <= {lt_hi}"
+        );
+
+        // Every estimate stays within [0, total].
+        for n in [-100_i64, 0, 50, 99, 100, 150, 199, 10_000] {
+            let lt = hist.estimate_less_than_rows(&iv(n));
+            let gt = hist.estimate_greater_than_rows(&iv(n));
+            assert!((0.0..=total).contains(&lt), "less_than({n})={lt} out of [0,{total}]");
+            assert!((0.0..=total).contains(&gt), "greater_than({n})={gt} out of [0,{total}]");
+        }
+    }
+
+    #[test]
     fn test_selectivity_defaults() {
         let stats = ColumnStats {
             table_row_count: 1000,

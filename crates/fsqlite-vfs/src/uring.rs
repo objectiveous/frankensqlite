@@ -1399,4 +1399,42 @@ mod tests {
         assert!(vfs.runtime.is_disabled());
         assert!(!vfs.is_available());
     }
+
+    #[test]
+    fn io_uring_runtime_status_clone_eq_debug() {
+        let vfs = IoUringVfs::new();
+        let snap = vfs.status_snapshot();
+        let cloned = snap.clone();
+        assert_eq!(cloned, snap);
+        let dbg = format!("{snap:?}");
+        assert!(dbg.contains("IoUringRuntimeStatus"));
+        assert!(dbg.contains(snap.backend));
+    }
+
+    #[test]
+    fn io_uring_vfs_default_equals_new() {
+        let from_new = IoUringVfs::new();
+        let from_default = IoUringVfs::default();
+        assert_eq!(from_new.name(), from_default.name());
+        assert_eq!(from_new.status(), from_default.status());
+    }
+
+    #[test]
+    fn io_uring_vfs_status_snapshot_fresh_fields() {
+        let vfs = IoUringVfs::new();
+        let snap = vfs.status_snapshot();
+        assert!(!snap.backend.is_empty());
+        assert!(!snap.disabled);
+        assert!(snap.disable_reason.is_none());
+        assert!(!snap.initial_status.is_empty());
+        assert!(!snap.status.is_empty());
+    }
+
+    #[test]
+    fn io_uring_vfs_status_contains_backend() {
+        let vfs = IoUringVfs::new();
+        let status = vfs.status();
+        let snap = vfs.status_snapshot();
+        assert!(status.contains(snap.backend));
+    }
 }

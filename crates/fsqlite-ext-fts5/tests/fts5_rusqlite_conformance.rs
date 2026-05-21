@@ -795,6 +795,33 @@ const NO_RESULT_CASES: &[MatchCase] = &[
     },
 ];
 
+const NO_RESULT_BOOLEAN_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "disjoint bare terms",
+        query: "rust AND bread",
+    },
+    MatchCase {
+        name: "disjoint column filters",
+        query: "title:rust AND body:prefix",
+    },
+    MatchCase {
+        name: "overconstrained column filters",
+        query: "title:sqlite AND body:writers AND body:search",
+    },
+    MatchCase {
+        name: "self exclusion",
+        query: "rust NOT rust",
+    },
+    MatchCase {
+        name: "grouped self exclusion",
+        query: "(rust OR sqlite) NOT (rust OR sqlite)",
+    },
+    MatchCase {
+        name: "near terms in disjoint rows",
+        query: "NEAR(search cooking, 10)",
+    },
+];
+
 const BOOLEAN_PRECEDENCE_CASES: &[MatchCase] = &[
     MatchCase {
         name: "and binds tighter than or",
@@ -1991,6 +2018,21 @@ fn no_result_match_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "no-result MATCH conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn no_result_boolean_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in NO_RESULT_BOOLEAN_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "no-result boolean conformance case failed: {} ({})",
             case.name,
             case.query
         );

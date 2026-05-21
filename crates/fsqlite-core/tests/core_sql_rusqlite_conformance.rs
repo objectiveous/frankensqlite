@@ -318,6 +318,53 @@ const AGGREGATE_EDGE_CASES: &[QueryCase] = &[
     },
 ];
 
+const GROUP_CONCAT_SETUP: &str = "
+    CREATE TABLE concat_groups (
+        grp TEXT PRIMARY KEY
+    );
+    CREATE TABLE concat_items (
+        id INTEGER PRIMARY KEY,
+        grp TEXT,
+        label TEXT,
+        amount INTEGER,
+        ord INTEGER
+    );
+    INSERT INTO concat_groups (grp) VALUES ('A'), ('B'), ('C');
+    INSERT INTO concat_items (id, grp, label, amount, ord) VALUES
+        (1, 'A', 'red', 10, 2),
+        (2, 'A', 'blue', 20, 1),
+        (3, 'A', NULL, 30, 3),
+        (4, 'B', 'green', NULL, 1),
+        (5, 'B', 'yellow', 40, 2);
+";
+
+const GROUP_CONCAT_SEPARATOR_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "default separator skips null inputs",
+        sql: "SELECT grp, group_concat(label) FROM concat_items GROUP BY grp ORDER BY grp",
+    },
+    QueryCase {
+        name: "custom separator skips null inputs",
+        sql: "SELECT grp, group_concat(label, '|') FROM concat_items GROUP BY grp ORDER BY grp",
+    },
+    QueryCase {
+        name: "left join empty group returns null",
+        sql: "SELECT g.grp, group_concat(i.label, ':') FROM concat_groups AS g LEFT JOIN concat_items AS i USING (grp) GROUP BY g.grp ORDER BY g.grp",
+    },
+    QueryCase {
+        name: "numeric values are coerced to text",
+        sql: "SELECT grp, group_concat(amount, '/') FROM concat_items GROUP BY grp ORDER BY grp",
+    },
+    QueryCase {
+        name: "empty input aggregate result",
+        sql: "SELECT group_concat(label), group_concat(label, '|') FROM concat_items WHERE 0",
+    },
+    QueryCase {
+        name: "ordered subquery input",
+        sql: "SELECT grp, group_concat(label, ',') FROM (SELECT grp, label FROM concat_items WHERE label IS NOT NULL ORDER BY grp, ord DESC) GROUP BY grp ORDER BY grp",
+    },
+];
+
 const HAVING_AGGREGATE_ORDER_CASES: &[QueryCase] = &[
     QueryCase {
         name: "having without group by over single aggregate group",
@@ -2279,6 +2326,12 @@ fn join_using_and_natural_edges_match_rusqlite() {
 fn aggregate_edge_cases_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
     harness.assert_queries_match("aggregate edge", AGGREGATE_EDGE_CASES);
+}
+
+#[test]
+fn group_concat_separator_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(GROUP_CONCAT_SETUP);
+    harness.assert_queries_match("group_concat separator edge", GROUP_CONCAT_SEPARATOR_CASES);
 }
 
 #[test]

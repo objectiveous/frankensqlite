@@ -147,7 +147,45 @@ const TRIGRAM_DOCS: &[Doc] = &[
     },
 ];
 
+const UNICODE61_CODE_TOKEN_DOCS: &[Doc] = &[
+    Doc {
+        rowid: 1,
+        title: "Code symbols",
+        body: "Call my_function in AuthController.ts for endpoint/v1",
+    },
+    Doc {
+        rowid: 2,
+        title: "Split code words",
+        body: "Call my function in AuthController ts for endpoint v1",
+    },
+    Doc {
+        rowid: 3,
+        title: "Other identifier",
+        body: "Use handler_name in Router.js",
+    },
+];
+
+const UNICODE61_SEPARATOR_DOCS: &[Doc] = &[
+    Doc {
+        rowid: 1,
+        title: "Delimited tags",
+        body: "alpha.beta_gamma",
+    },
+    Doc {
+        rowid: 2,
+        title: "Undelimited tag",
+        body: "alphabetagamma",
+    },
+    Doc {
+        rowid: 3,
+        title: "Only alpha",
+        body: "alpha",
+    },
+];
+
 const UNICODE61_DIACRITIC_OPTIONS: &[&str] = &["tokenize='unicode61 remove_diacritics 2'"];
+const UNICODE61_CODE_TOKEN_OPTIONS: &[&str] = &[r#"tokenize="unicode61 tokenchars '-_./:@#$%'""#];
+const UNICODE61_SEPARATOR_OPTIONS: &[&str] = &[r#"tokenize="unicode61 separators '_.'""#];
 const PORTER_OPTIONS: &[&str] = &["tokenize='porter'"];
 const TRIGRAM_OPTIONS: &[&str] = &["tokenize='trigram'"];
 
@@ -233,6 +271,10 @@ const AUXILIARY_CASES: &[AuxiliaryCase] = &[
         name: "prefix term",
         query: "search*",
     },
+    AuxiliaryCase {
+        name: "boolean terms",
+        query: "rust AND sqlite",
+    },
 ];
 
 const TOKENIZER_CASES: &[TokenizerCase] = &[
@@ -253,6 +295,18 @@ const TOKENIZER_CASES: &[TokenizerCase] = &[
         options: TRIGRAM_OPTIONS,
         docs: TRIGRAM_DOCS,
         query: "abc",
+    },
+    TokenizerCase {
+        name: "unicode61 tokenchars keep code symbols",
+        options: UNICODE61_CODE_TOKEN_OPTIONS,
+        docs: UNICODE61_CODE_TOKEN_DOCS,
+        query: r#""AuthController.ts""#,
+    },
+    TokenizerCase {
+        name: "unicode61 separators split punctuation",
+        options: UNICODE61_SEPARATOR_OPTIONS,
+        docs: UNICODE61_SEPARATOR_DOCS,
+        query: r#""beta gamma""#,
     },
 ];
 

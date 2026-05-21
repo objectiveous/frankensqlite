@@ -209,6 +209,12 @@ pub enum DataflowOperator {
     FilterTextContains { column: usize, needle: String },
     /// Keep rows whose text column does not contain the configured substring.
     FilterTextNotContains { column: usize, needle: String },
+    /// Keep rows whose text column length lies in an inclusive character range.
+    FilterTextLengthBetween {
+        column: usize,
+        lower: usize,
+        upper: usize,
+    },
     /// Keep rows where an integer column lies in an inclusive range.
     FilterIntegerBetween {
         column: usize,
@@ -315,6 +321,11 @@ impl DataflowOperator {
             Self::FilterTextNotContains { column, needle } => {
                 filter_text_not_contains(rows, *column, needle)
             }
+            Self::FilterTextLengthBetween {
+                column,
+                lower,
+                upper,
+            } => filter_text_length_between(rows, *column, *lower, *upper),
             Self::FilterIntegerBetween {
                 column,
                 lower,
@@ -607,6 +618,29 @@ fn filter_text_not_contains(
     rows.iter()
         .filter_map(|row| match row.values.get(column) {
             Some(SqliteValue::Text(candidate)) if !candidate.as_str().contains(needle) => {
+                Some(Ok(row.clone()))
+            }
+            Some(SqliteValue::Text(_)) => None,
+            Some(_) => Some(Err(DataflowError::PredicateValueNotText { column })),
+            None => Some(Err(DataflowError::ColumnOutOfBounds {
+                column,
+                width: row.width(),
+            })),
+        })
+        .collect()
+}
+
+fn filter_text_length_between(
+    rows: &[WeightedRow],
+    column: usize,
+    lower: usize,
+    upper: usize,
+) -> DataflowResult<Vec<WeightedRow>> {
+    rows.iter()
+        .filter_map(|row| match row.values.get(column) {
+            Some(SqliteValue::Text(candidate))
+                if (lower..=upper).contains(&candidate.chars().count()) =>
+            {
                 Some(Ok(row.clone()))
             }
             Some(SqliteValue::Text(_)) => None,
@@ -1520,6 +1554,105 @@ mod tests {
         let err = automaton
             .execute(&[WeightedRow::insert(vec![int(1), text("beta")])])
             .expect_err("invalid text-not-contains predicate column should fail");
+
+        assert_eq!(
+            err,
+            DataflowError::ColumnOutOfBounds {
+                column: 2,
+                width: 2
+            }
+        );
+    }
+
+    #[test]
+    fn filter_text_length_between_keeps_matching_weighted_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterTextLengthBetween {
+            column: 1,
+            lower: 3,
+            upper: 4,
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), text("at")], 7),
+            WeightedRow::new(vec![int(2), text("cat")], -2),
+            WeightedRow::new(vec![int(3), text("echo")], 4),
+            WeightedRow::new(vec![int(4), text("alpha")], 5),
+            WeightedRow::new(vec![int(5), text("sun")], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(2), text("cat")], -2),
+                WeightedRow::new(vec![int(3), text("echo")], 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_text_length_between_counts_unicode_scalar_values() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterTextLengthBetween {
+            column: 1,
+            lower: 4,
+            upper: 4,
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), text("echo")], 3),
+            WeightedRow::new(vec![int(2), text("\u{e9}cho")], -2),
+            WeightedRow::new(vec![int(3), text("\u{e9}chos")], 5),
+        ];
+
+        assert_eq!(
+            automaton.execute(&rows).expect("dataflow should execute"),
+            vec![
+                WeightedRow::new(vec![int(1), text("echo")], 3),
+                WeightedRow::new(vec![int(2), text("\u{e9}cho")], -2),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_text_length_between_inverted_range_matches_no_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterTextLengthBetween {
+            column: 1,
+            lower: 5,
+            upper: 3,
+        }]);
+        let rows = vec![WeightedRow::new(vec![int(1), text("echo")], 3)];
+
+        assert_eq!(
+            automaton.execute(&rows).expect("dataflow should execute"),
+            Vec::<WeightedRow>::new()
+        );
+    }
+
+    #[test]
+    fn filter_text_length_between_rejects_non_text_values() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterTextLengthBetween {
+            column: 1,
+            lower: 3,
+            upper: 4,
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), int(4)])])
+            .expect_err("non-text predicate input should fail");
+
+        assert_eq!(err, DataflowError::PredicateValueNotText { column: 1 });
+    }
+
+    #[test]
+    fn filter_text_length_between_rejects_out_of_bounds_columns() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterTextLengthBetween {
+            column: 2,
+            lower: 3,
+            upper: 4,
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), text("echo")])])
+            .expect_err("invalid text-length predicate column should fail");
 
         assert_eq!(
             err,

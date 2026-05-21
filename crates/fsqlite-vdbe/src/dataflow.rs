@@ -186,6 +186,11 @@ impl DataflowAutomaton {
 pub enum DataflowOperator {
     /// Keep only rows where `column == value`.
     FilterEq { column: usize, value: SqliteValue },
+    /// Keep rows whose column value appears in the configured set.
+    FilterInSet {
+        column: usize,
+        values: Vec<SqliteValue>,
+    },
     /// Keep rows where an integer column satisfies the comparison.
     FilterIntegerCompare {
         column: usize,
@@ -270,6 +275,7 @@ impl DataflowOperator {
                     })),
                 })
                 .collect(),
+            Self::FilterInSet { column, values } => filter_in_set(rows, *column, values),
             Self::FilterIntegerCompare { column, op, value } => {
                 filter_integer_compare(rows, *column, *op, *value)
             }
@@ -442,6 +448,25 @@ fn append_literal_column(rows: &[WeightedRow], value: &SqliteValue) -> Vec<Weigh
             let mut values = row.values.clone();
             values.push(value.clone());
             Some(WeightedRow::new(values, row.weight))
+        })
+        .collect()
+}
+
+fn filter_in_set(
+    rows: &[WeightedRow],
+    column: usize,
+    values: &[SqliteValue],
+) -> DataflowResult<Vec<WeightedRow>> {
+    rows.iter()
+        .filter_map(|row| match row.values.get(column) {
+            Some(candidate) if values.iter().any(|value| value == candidate) => {
+                Some(Ok(row.clone()))
+            }
+            Some(_) => None,
+            None => Some(Err(DataflowError::ColumnOutOfBounds {
+                column,
+                width: row.width(),
+            })),
         })
         .collect()
 }
@@ -887,6 +912,50 @@ mod tests {
             DataflowError::SchemaChanged {
                 expected_width: 2,
                 actual_width: 3
+            }
+        );
+    }
+
+    #[test]
+    fn filter_in_set_keeps_matching_weighted_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterInSet {
+            column: 1,
+            values: vec![int(3), int(5)],
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), int(2)], 7),
+            WeightedRow::new(vec![int(2), int(3)], -2),
+            WeightedRow::new(vec![int(3), int(5)], 4),
+            WeightedRow::new(vec![int(4), int(5)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(2), int(3)], -2),
+                WeightedRow::new(vec![int(3), int(5)], 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_in_set_rejects_out_of_bounds_columns() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterInSet {
+            column: 2,
+            values: vec![int(3)],
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), int(2)])])
+            .expect_err("invalid in-set predicate column should fail");
+
+        assert_eq!(
+            err,
+            DataflowError::ColumnOutOfBounds {
+                column: 2,
+                width: 2
             }
         );
     }

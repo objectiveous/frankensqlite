@@ -2224,6 +2224,25 @@ mod tests {
     }
 
     #[test]
+    fn test_is_rowid_ref_recognizes_aliases_case_insensitively() {
+        // is_rowid_ref accepts the three rowid aliases (rowid, _rowid_, oid)
+        // case-insensitively and rejects everything else. It is exercised
+        // indirectly via SELECT codegen but never asserted as a predicate.
+        for name in ["rowid", "ROWID", "RowId", "_rowid_", "_ROWID_", "oid", "OID"] {
+            assert!(
+                is_rowid_ref(&ColumnRef::bare(name)),
+                "{name} should be a rowid alias"
+            );
+        }
+        for name in ["id", "row_id", "rowid2", "oids", "_rowid", "rowi", ""] {
+            assert!(
+                !is_rowid_ref(&ColumnRef::bare(name)),
+                "{name} should NOT be a rowid alias"
+            );
+        }
+    }
+
+    #[test]
     fn test_binary_op_to_opcode_and_is_comparison_classification() {
         use AstBinaryOp as B;
 

@@ -1094,6 +1094,41 @@ const INVALID_QUERY_CASES: &[MatchCase] = &[
     },
 ];
 
+const INVALID_SYNTAX_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "dangling and operator",
+        query: "rust AND",
+    },
+    MatchCase {
+        name: "dangling or operator",
+        query: "rust OR",
+    },
+    MatchCase {
+        name: "dangling not operator",
+        query: "rust NOT",
+    },
+    MatchCase {
+        name: "near missing distance",
+        query: "NEAR(rust sqlite,)",
+    },
+    MatchCase {
+        name: "near non-integer distance",
+        query: "NEAR(rust sqlite, x)",
+    },
+    MatchCase {
+        name: "empty column filter body",
+        query: "title:",
+    },
+    MatchCase {
+        name: "unknown column in braced set",
+        query: "{title missing}:rust",
+    },
+    MatchCase {
+        name: "dangling phrase concatenation",
+        query: "rust +",
+    },
+];
+
 const BM25_CASES: &[RankingCase] = &[
     RankingCase {
         name: "single term frequency",
@@ -2172,6 +2207,21 @@ fn invalid_match_queries_error_like_rusqlite_reference() {
             harness.franken_match_is_error(case.query),
             harness.sqlite_match_is_error(case.query),
             "invalid MATCH query conformance failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn invalid_match_syntax_errors_like_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in INVALID_SYNTAX_CASES {
+        assert_eq!(
+            harness.franken_match_is_error(case.query),
+            harness.sqlite_match_is_error(case.query),
+            "invalid MATCH syntax conformance failed: {} ({})",
             case.name,
             case.query
         );

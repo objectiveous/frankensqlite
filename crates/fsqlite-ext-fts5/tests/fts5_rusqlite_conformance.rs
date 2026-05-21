@@ -79,6 +79,29 @@ const DOCS: &[Doc] = &[
     },
 ];
 
+const PHRASE_CONCAT_DOCS: &[Doc] = &[
+    Doc {
+        rowid: 1,
+        title: "one two three",
+        body: "plain body",
+    },
+    Doc {
+        rowid: 2,
+        title: "one gap two three",
+        body: "one two threefold",
+    },
+    Doc {
+        rowid: 3,
+        title: "one two throne",
+        body: "one two four",
+    },
+    Doc {
+        rowid: 4,
+        title: "plain title",
+        body: "one gap two three",
+    },
+];
+
 const BM25_DOCS: &[Doc] = &[
     Doc {
         rowid: 1,
@@ -796,6 +819,29 @@ const PHRASE_PREFIX_NEAR_CASES: &[MatchCase] = &[
     MatchCase {
         name: "near phrase and term",
         query: r#"NEAR("full text" prefix, 3)"#,
+    },
+];
+
+const PHRASE_CONCAT_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "tight bare terms",
+        query: "one+two",
+    },
+    MatchCase {
+        name: "quoted phrase plus bare term",
+        query: r#""one two" + three"#,
+    },
+    MatchCase {
+        name: "multi-part final prefix",
+        query: "one + two + thr*",
+    },
+    MatchCase {
+        name: "title column tight phrase",
+        query: "title:one+two",
+    },
+    MatchCase {
+        name: "body column tight phrase",
+        query: "body:one+two",
     },
 ];
 
@@ -1818,6 +1864,21 @@ fn phrase_prefix_near_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "phrase/prefix/NEAR conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn phrase_concatenation_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::with_docs(&[], PHRASE_CONCAT_DOCS);
+
+    for case in PHRASE_CONCAT_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "phrase concatenation conformance case failed: {} ({})",
             case.name,
             case.query
         );

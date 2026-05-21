@@ -615,6 +615,78 @@ mod tests {
         assert!((sel - 0.333).abs() < 0.001);
     }
 
+    #[test]
+    fn test_estimate_selectivity_operator_dispatch_and_null_handling() {
+        // test_selectivity_defaults only covers Eq + Gt; this covers the rest of
+        // the no-histogram dispatch (Ne/Lt/Le/Ge), NULL handling, empty/all-NULL
+        // edges, and the algebraic relationships between operators.
+        let base = ColumnStats {
+            table_row_count: 1000,
+            null_count: 0,
+            ndv: 100,
+            min_value: Some(SqliteValue::Integer(0)),
+            max_value: Some(SqliteValue::Integer(1000)),
+            avg_width: 8.0,
+            histogram: None,
+        };
+        let v = SqliteValue::Integer(50);
+        let sel = |stats: &ColumnStats, op: Operator| stats.estimate_selectivity(&op, &v);
+
+        let eq = sel(&base, Operator::Eq);
+        let ne = sel(&base, Operator::Ne);
+        let lt = sel(&base, Operator::Lt);
+        let gt = sel(&base, Operator::Gt);
+        let le = sel(&base, Operator::Le);
+        let ge = sel(&base, Operator::Ge);
+        assert!((eq - 0.01).abs() < 1e-9, "Eq = 1/ndv = 0.01, got {eq}");
+        assert!((lt - gt).abs() < 1e-12, "Lt and Gt share the 1/3 default");
+        assert!((lt - 1.0 / 3.0).abs() < 1e-9, "Lt = 1/3 default, got {lt}");
+        // Eq and Ne partition the non-NULL space: with no NULLs they sum to 1.0.
+        assert!(
+            (eq + ne - 1.0).abs() < 1e-9,
+            "Eq + Ne should be 1.0 with no NULLs, got {}",
+            eq + ne
+        );
+        // Closed endpoints add the equality mass: Le = Lt + Eq, Ge = Gt + Eq.
+        assert!(((le - lt) - eq).abs() < 1e-9, "Le - Lt should equal Eq");
+        assert!(((ge - gt) - eq).abs() < 1e-9, "Ge - Gt should equal Eq");
+
+        // NULLs shrink the non-NULL base: equality selectivity drops and Eq+Ne
+        // sums to the non-NULL fraction rather than 1.0.
+        let with_nulls = ColumnStats { null_count: 200, ..base.clone() };
+        let eq_n = sel(&with_nulls, Operator::Eq);
+        let ne_n = sel(&with_nulls, Operator::Ne);
+        assert!(
+            (eq_n - 0.008).abs() < 1e-9,
+            "Eq with 200/1000 NULLs = (800/100)/1000 = 0.008, got {eq_n}"
+        );
+        assert!(
+            (eq_n + ne_n - 0.8).abs() < 1e-9,
+            "Eq+Ne should equal the non-NULL fraction 0.8, got {}",
+            eq_n + ne_n
+        );
+
+        // Edge cases: empty table and an all-NULL column yield zero selectivity
+        // for every operator. Every estimate stays a valid probability in [0,1].
+        let empty = ColumnStats { table_row_count: 0, ..base.clone() };
+        let all_null = ColumnStats { table_row_count: 500, null_count: 500, ..base.clone() };
+        for op in [
+            Operator::Eq,
+            Operator::Ne,
+            Operator::Lt,
+            Operator::Le,
+            Operator::Gt,
+            Operator::Ge,
+        ] {
+            assert!(sel(&empty, op).abs() < f64::EPSILON, "empty table -> 0 selectivity");
+            assert!(sel(&all_null, op).abs() < f64::EPSILON, "all-NULL -> 0 selectivity");
+            for stats in [&base, &with_nulls] {
+                let s = sel(stats, op);
+                assert!((0.0..=1.0).contains(&s), "selectivity {s} out of [0,1]");
+            }
+        }
+    }
+
     // ── Cardinality estimation with sampling fallback (bd-1as.1) ──
 
     #[test]

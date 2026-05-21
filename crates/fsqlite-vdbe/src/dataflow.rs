@@ -283,6 +283,12 @@ pub enum DataflowOperator {
         op: FloatComparison,
         value: SqliteValue,
     },
+    /// Keep rows where a floating-point column lies in an inclusive range.
+    FilterFloatBetween {
+        column: usize,
+        lower: SqliteValue,
+        upper: SqliteValue,
+    },
     /// Keep rows where an integer column satisfies the comparison.
     FilterIntegerCompare {
         column: usize,
@@ -433,6 +439,11 @@ impl DataflowOperator {
             Self::FilterFloatCompare { column, op, value } => {
                 filter_float_compare(rows, *column, *op, value)
             }
+            Self::FilterFloatBetween {
+                column,
+                lower,
+                upper,
+            } => filter_float_between(rows, *column, lower, upper),
             Self::FilterIntegerCompare { column, op, value } => {
                 filter_integer_compare(rows, *column, *op, *value)
             }
@@ -1133,6 +1144,34 @@ fn filter_float_compare(
     rows.iter()
         .filter_map(|row| match row.values.get(column) {
             Some(SqliteValue::Float(candidate)) if op.matches(*candidate, *threshold) => {
+                Some(Ok(row.clone()))
+            }
+            Some(SqliteValue::Float(_)) => None,
+            Some(_) => Some(Err(DataflowError::PredicateValueNotFloat { column })),
+            None => Some(Err(DataflowError::ColumnOutOfBounds {
+                column,
+                width: row.width(),
+            })),
+        })
+        .collect()
+}
+
+fn filter_float_between(
+    rows: &[WeightedRow],
+    column: usize,
+    lower: &SqliteValue,
+    upper: &SqliteValue,
+) -> DataflowResult<Vec<WeightedRow>> {
+    let SqliteValue::Float(lower) = lower else {
+        return Err(DataflowError::PredicateValueNotFloat { column });
+    };
+    let SqliteValue::Float(upper) = upper else {
+        return Err(DataflowError::PredicateValueNotFloat { column });
+    };
+
+    rows.iter()
+        .filter_map(|row| match row.values.get(column) {
+            Some(SqliteValue::Float(candidate)) if lower <= candidate && candidate <= upper => {
                 Some(Ok(row.clone()))
             }
             Some(SqliteValue::Float(_)) => None,
@@ -3528,6 +3567,119 @@ mod tests {
         let err = automaton
             .execute(&[WeightedRow::insert(vec![int(1), SqliteValue::Float(2.0)])])
             .expect_err("invalid real comparison predicate column should fail");
+
+        assert_eq!(
+            err,
+            DataflowError::ColumnOutOfBounds {
+                column: 2,
+                width: 2
+            }
+        );
+    }
+
+    #[test]
+    fn filter_float_between_keeps_matching_weighted_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterFloatBetween {
+            column: 1,
+            lower: SqliteValue::Float(-1.0),
+            upper: SqliteValue::Float(2.0),
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), SqliteValue::Float(-2.0)], 3),
+            WeightedRow::new(vec![int(2), SqliteValue::Float(-1.0)], -2),
+            WeightedRow::new(vec![int(3), SqliteValue::Float(0.0)], 4),
+            WeightedRow::new(vec![int(4), SqliteValue::Float(2.0)], 5),
+            WeightedRow::new(vec![int(5), SqliteValue::Float(f64::INFINITY)], 6),
+            WeightedRow::new(vec![int(6), SqliteValue::Float(f64::NAN)], 7),
+            WeightedRow::new(vec![int(7), SqliteValue::Float(1.5)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(2), SqliteValue::Float(-1.0)], -2),
+                WeightedRow::new(vec![int(3), SqliteValue::Float(0.0)], 4),
+                WeightedRow::new(vec![int(4), SqliteValue::Float(2.0)], 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_float_between_inverted_range_matches_no_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterFloatBetween {
+            column: 1,
+            lower: SqliteValue::Float(3.0),
+            upper: SqliteValue::Float(1.0),
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), SqliteValue::Float(1.5)], 3),
+            WeightedRow::new(vec![int(2), SqliteValue::Float(2.0)], -2),
+        ];
+
+        assert_eq!(
+            automaton.execute(&rows).expect("dataflow should execute"),
+            Vec::<WeightedRow>::new()
+        );
+    }
+
+    #[test]
+    fn filter_float_between_nan_bound_matches_no_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterFloatBetween {
+            column: 1,
+            lower: SqliteValue::Float(f64::NAN),
+            upper: SqliteValue::Float(2.0),
+        }]);
+        let rows = vec![WeightedRow::new(vec![int(1), SqliteValue::Float(1.5)], 3)];
+
+        assert_eq!(
+            automaton.execute(&rows).expect("dataflow should execute"),
+            Vec::<WeightedRow>::new()
+        );
+    }
+
+    #[test]
+    fn filter_float_between_rejects_non_float_values() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterFloatBetween {
+            column: 1,
+            lower: SqliteValue::Float(1.0),
+            upper: SqliteValue::Float(2.0),
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), int(2)])])
+            .expect_err("non-float predicate input should fail");
+
+        assert_eq!(err, DataflowError::PredicateValueNotFloat { column: 1 });
+    }
+
+    #[test]
+    fn filter_float_between_rejects_non_float_bounds() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterFloatBetween {
+            column: 1,
+            lower: int(1),
+            upper: SqliteValue::Float(2.0),
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), SqliteValue::Float(1.5)])])
+            .expect_err("non-float range bound should fail");
+
+        assert_eq!(err, DataflowError::PredicateValueNotFloat { column: 1 });
+    }
+
+    #[test]
+    fn filter_float_between_rejects_out_of_bounds_columns() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterFloatBetween {
+            column: 2,
+            lower: SqliteValue::Float(1.0),
+            upper: SqliteValue::Float(2.0),
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), SqliteValue::Float(1.5)])])
+            .expect_err("invalid real-range predicate column should fail");
 
         assert_eq!(
             err,

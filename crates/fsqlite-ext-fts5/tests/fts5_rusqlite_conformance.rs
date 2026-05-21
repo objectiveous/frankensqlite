@@ -260,6 +260,33 @@ const MATCH_CASES: &[MatchCase] = &[
     },
 ];
 
+const CASE_FOLDING_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "uppercase bare term",
+        query: "RUST",
+    },
+    MatchCase {
+        name: "mixed-case implicit column union",
+        query: "Sqlite",
+    },
+    MatchCase {
+        name: "uppercase phrase",
+        query: r#""FULL TEXT""#,
+    },
+    MatchCase {
+        name: "mixed-case prefix",
+        query: "Sea*",
+    },
+    MatchCase {
+        name: "uppercase column filter",
+        query: "title:RUST",
+    },
+    MatchCase {
+        name: "uppercase boolean expression",
+        query: "RUST AND SQLITE",
+    },
+];
+
 const MULTIPLE_MATCH_CASES: &[MultiMatchCase] = &[
     MultiMatchCase {
         name: "intersect bare terms",
@@ -1130,6 +1157,21 @@ fn match_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "MATCH conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn case_folding_match_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in CASE_FOLDING_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "case-folding MATCH conformance case failed: {} ({})",
             case.name,
             case.query
         );

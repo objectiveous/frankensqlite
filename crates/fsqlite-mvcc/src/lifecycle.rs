@@ -9029,6 +9029,130 @@ mod tests {
     }
 
     #[test]
+    fn test_read_page_with_cell_deltas_replays_same_txn_multi_page_isolation()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let page_a = PageNumber::new(2).expect("valid page");
+        let page_b = PageNumber::new(3).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4263;
+        let row_b = 4264;
+        let row_c = 4265;
+        let row_d = 4266;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let key_d = CellKey::table_row(btree, row_d);
+        let a_original = vec![b'g'; 160];
+        let b_original = vec![b'h'; 161];
+        let a_updated = vec![b'i'; 162];
+        let c_inserted = vec![b'k'; 163];
+        let d_inserted = vec![b'l'; 164];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, page_a, empty_leaf_table_page())
+            .expect("seed page a");
+        mgr.write_page(&mut seed, page_b, empty_leaf_table_page())
+            .expect("seed page b");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut bootstrap = mgr.begin(BeginKind::Concurrent).expect("bootstrap begin");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                page_a,
+                leaf_table_cell(row_a, &a_original),
+                bootstrap.token(),
+            )
+            .expect("row a insert should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_b,
+                page_b,
+                leaf_table_cell(row_b, &b_original),
+                bootstrap.token(),
+            )
+            .expect("row b insert should fit budget");
+        mgr.commit(&mut bootstrap).expect("bootstrap commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_update(
+                key_a,
+                page_a,
+                leaf_table_cell(row_a, &a_updated),
+                txn.token(),
+            )
+            .expect("row a update should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_c,
+                page_a,
+                leaf_table_cell(row_c, &c_inserted),
+                txn.token(),
+            )
+            .expect("row c insert should fit budget");
+        mgr.cell_log()
+            .record_delete(key_b, page_b, txn.token())
+            .expect("row b delete should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_d,
+                page_b,
+                leaf_table_cell(row_d, &d_inserted),
+                txn.token(),
+            )
+            .expect("row d insert should fit budget");
+
+        let expected_a = vec![(row_a, a_updated.clone()), (row_c, c_inserted.clone())];
+        let expected_b = vec![(row_d, d_inserted.clone())];
+
+        let txn_page_a = mgr
+            .read_page_with_cell_deltas(&mut txn, page_a, PageSize::DEFAULT.get())?
+            .expect("page a should be visible");
+        assert_eq!(
+            materialized_table_payloads(&txn_page_a)?,
+            expected_a,
+            "transaction-local page-a read must ignore page-b deltas"
+        );
+
+        let txn_page_b = mgr
+            .read_page_with_cell_deltas(&mut txn, page_b, PageSize::DEFAULT.get())?
+            .expect("page b should be visible");
+        assert_eq!(
+            materialized_table_payloads(&txn_page_b)?,
+            expected_b,
+            "transaction-local page-b read must ignore page-a deltas"
+        );
+
+        mgr.commit(&mut txn).expect("combined logical commit");
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let committed_page_a = mgr
+            .read_page_with_cell_deltas(&mut reader, page_a, PageSize::DEFAULT.get())?
+            .expect("committed page a should be visible");
+        assert_eq!(
+            materialized_table_payloads(&committed_page_a)?,
+            vec![(row_a, a_updated), (row_c, c_inserted)],
+            "committed page-a read must preserve page-local delta isolation"
+        );
+
+        let committed_page_b = mgr
+            .read_page_with_cell_deltas(&mut reader, page_b, PageSize::DEFAULT.get())?
+            .expect("committed page b should be visible");
+        assert_eq!(
+            materialized_table_payloads(&committed_page_b)?,
+            vec![(row_d, d_inserted)],
+            "committed page-b read must preserve page-local delta isolation"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_read_page_with_cell_deltas_replays_same_txn_delete_then_insert()
     -> fsqlite_error::Result<()> {
         use crate::cell_visibility::CellKey;

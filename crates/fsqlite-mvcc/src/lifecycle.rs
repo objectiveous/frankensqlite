@@ -839,6 +839,13 @@ impl TransactionManager {
             .map(|delta| delta.commit_seq)
             .max()
             .unwrap_or(txn.snapshot.high);
+        if let Some(committed_high) = deltas
+            .iter()
+            .filter_map(|delta| (delta.commit_seq <= txn.snapshot.high).then_some(delta.commit_seq))
+            .max()
+        {
+            txn.record_page_read(pgno, committed_high);
+        }
         let materialized_snapshot = Snapshot::new(materialized_high, txn.snapshot.schema_epoch);
         let result = materialize_page(
             &base_page,
@@ -8229,6 +8236,52 @@ mod tests {
             .expect("page should be visible");
 
         assert_eq!(materialized_table_payloads(&page)?, vec![(rowid, payload)]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_page_with_cell_deltas_tracks_materialized_commit_horizon()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4243;
+        let payload = vec![b'h'; 131];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        let seed_seq = mgr.commit(&mut seed).expect("seed commit");
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).expect("writer begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                writer.token(),
+            )
+            .expect("logical insert should fit budget");
+        writer.write_set.push(pgno);
+        let logical_seq = mgr.commit(&mut writer).expect("logical commit");
+        assert!(logical_seq > seed_seq);
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("page should be visible");
+
+        assert_eq!(materialized_table_payloads(&page)?, vec![(rowid, payload)]);
+        assert_eq!(
+            reader.read_version_for_page(pgno),
+            Some(logical_seq),
+            "logical reads must witness the committed delta horizon, not just the base page"
+        );
 
         Ok(())
     }

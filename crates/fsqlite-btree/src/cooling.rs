@@ -431,6 +431,28 @@ mod tests {
     }
 
     #[test]
+    fn access_page_is_noop_for_unregistered_and_does_not_reheat_cold() {
+        // re_heat_on_access pins the COOLING -> HOT re-heat; this pins the other
+        // two access_page behaviors: an unregistered page is a safe no-op (not
+        // implicitly registered), and a COLD page is not re-heated (only COOLING
+        // re-heats).
+        let csm = CoolingStateMachine::new(CoolingConfig::default());
+
+        // Accessing an unregistered page does not register it; tracked count
+        // stays zero and the page has no temperature.
+        csm.access_page(999);
+        assert_eq!(csm.tracked_count(), 0);
+        assert_eq!(csm.temperature(999), None);
+
+        // A registered-but-COLD page is not re-heated by an access: only a
+        // COOLING page re-heats, so it stays COLD.
+        csm.register_page(1);
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Cold));
+        csm.access_page(1);
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Cold));
+    }
+
+    #[test]
     fn pinned_root_never_cools() {
         let csm = CoolingStateMachine::new(CoolingConfig::default());
         csm.pin_root(1);

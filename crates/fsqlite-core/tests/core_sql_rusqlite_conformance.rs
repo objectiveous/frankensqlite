@@ -805,6 +805,57 @@ const DDL_CASES: &[QueryCase] = &[
     },
 ];
 
+const ROWID_IDENTIFIER_SETUP: &str = r#"
+    CREATE TABLE rowid_items (
+        name TEXT NOT NULL,
+        qty INTEGER NOT NULL
+    );
+    INSERT INTO rowid_items(rowid, name, qty) VALUES
+        (5, 'five', 50),
+        (2, 'two', 20),
+        (9, 'nine', 90);
+
+    CREATE TABLE rowid_alias_items (
+        id INTEGER PRIMARY KEY,
+        label TEXT NOT NULL
+    );
+    INSERT INTO rowid_alias_items(id, label) VALUES
+        (3, 'three'),
+        (1, 'one');
+
+    CREATE TABLE quoted_names (
+        "select" TEXT NOT NULL,
+        "from" INTEGER NOT NULL,
+        "Mixed Name" TEXT NOT NULL
+    );
+    INSERT INTO quoted_names("select", "from", "Mixed Name") VALUES
+        ('alpha', 2, 'A'),
+        ('beta', 1, 'B');
+"#;
+
+const ROWID_IDENTIFIER_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "implicit rowid aliases project identically",
+        sql: "SELECT rowid, _rowid_, oid, name FROM rowid_items ORDER BY rowid",
+    },
+    QueryCase {
+        name: "integer primary key aliases rowid",
+        sql: "SELECT rowid, id, label FROM rowid_alias_items ORDER BY rowid",
+    },
+    QueryCase {
+        name: "rowid predicates and descending order",
+        sql: "SELECT rowid, name FROM rowid_items WHERE rowid IN (2, 9) ORDER BY rowid DESC",
+    },
+    QueryCase {
+        name: "quoted reserved word identifiers",
+        sql: "SELECT \"select\", \"from\", \"Mixed Name\" FROM quoted_names ORDER BY \"from\"",
+    },
+    QueryCase {
+        name: "qualified quoted identifier expressions",
+        sql: "SELECT q.\"select\" || ':' || q.\"Mixed Name\" FROM quoted_names AS q ORDER BY q.\"select\"",
+    },
+];
+
 const TRANSACTION_SETUP: &str = "
     CREATE TABLE ledger (
         id INTEGER PRIMARY KEY,
@@ -1583,6 +1634,12 @@ fn error_paths_match_rusqlite() {
 fn ddl_defaults_and_views_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(DDL_SETUP);
     harness.assert_queries_match("DDL/default/view", DDL_CASES);
+}
+
+#[test]
+fn rowid_and_quoted_identifier_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(ROWID_IDENTIFIER_SETUP);
+    harness.assert_queries_match("rowid/quoted identifier edge", ROWID_IDENTIFIER_CASES);
 }
 
 #[test]

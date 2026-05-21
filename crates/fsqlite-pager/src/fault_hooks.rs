@@ -179,3 +179,117 @@ fn record_trigger(
     );
     state.records.push(record);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    fn arm(point: &str) -> FaultHookArm {
+        FaultHookArm::new(format!("test-{point}"), format!("scenario-{point}"), "unit")
+    }
+
+    #[test]
+    fn test_clear_resets_all_armed_hooks_and_records() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_after_flush_before_publish(arm("flush"));
+        arm_during_phase_c(arm("phase_c"));
+        arm_drop_condvar_notify(arm("condvar"));
+        let _ = maybe_inject_after_flush_before_publish(1, 1, 1);
+        assert_eq!(take_records().len(), 1);
+
+        clear();
+        assert!(
+            maybe_inject_after_flush_before_publish(1, 1, 1).is_ok(),
+            "cleared flush hook must not fire"
+        );
+        assert!(
+            maybe_inject_during_phase_c(1, 1).is_ok(),
+            "cleared phase_c hook must not fire"
+        );
+        assert!(
+            !maybe_inject_drop_condvar_notify(1),
+            "cleared condvar hook must not fire"
+        );
+        assert!(take_records().is_empty(), "clear must reset records");
+    }
+
+    #[test]
+    fn test_armed_hook_fires_once_then_disarms() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_during_phase_c(arm("phase_c"));
+        let err = maybe_inject_during_phase_c(42, 10);
+        assert!(err.is_err(), "armed hook should return Err on first call");
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("fault_inject:during_phase_c"),
+        );
+
+        assert!(
+            maybe_inject_during_phase_c(43, 11).is_ok(),
+            "disarmed hook must not fire on second call"
+        );
+    }
+
+    #[test]
+    fn test_drop_condvar_notify_returns_true_once() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_drop_condvar_notify(arm("condvar"));
+        assert!(maybe_inject_drop_condvar_notify(1), "first call fires");
+        assert!(
+            !maybe_inject_drop_condvar_notify(2),
+            "second call does not fire"
+        );
+    }
+
+    #[test]
+    fn test_records_capture_trigger_details() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_after_flush_before_publish(FaultHookArm::new("run-1", "scen-1", "inv-1"));
+        let _ = maybe_inject_after_flush_before_publish(7, 3, 12);
+
+        arm_during_phase_c(FaultHookArm::new("run-2", "scen-2", "inv-2"));
+        let _ = maybe_inject_during_phase_c(99, 50);
+
+        let records = take_records();
+        assert_eq!(records.len(), 2);
+
+        assert_eq!(records[0].point, "after_flush_before_publish");
+        assert_eq!(records[0].run_id, "run-1");
+        assert!(records[0].detail.contains("flush_epoch=7"));
+        assert!(records[0].detail.contains("batch_count=3"));
+        assert!(records[0].detail.contains("frame_count=12"));
+
+        assert_eq!(records[1].point, "during_phase_c");
+        assert_eq!(records[1].run_id, "run-2");
+        assert!(records[1].detail.contains("commit_seq=99"));
+        assert!(records[1].detail.contains("db_size=50"));
+
+        assert_eq!(records[0].trigger_seq, 1);
+        assert_eq!(records[1].trigger_seq, 2);
+    }
+
+    #[test]
+    fn test_take_records_drains_and_is_empty_after() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_drop_condvar_notify(arm("condvar"));
+        let _ = maybe_inject_drop_condvar_notify(1);
+
+        let first = take_records();
+        assert_eq!(first.len(), 1);
+        let second = take_records();
+        assert!(second.is_empty(), "take_records must drain");
+    }
+}

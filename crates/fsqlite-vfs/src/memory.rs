@@ -2278,4 +2278,106 @@ mod tests {
             "bead_id={VFS_BEAD} case=delete_then_access_is_gone"
         );
     }
+
+    #[test]
+    fn test_vfs_contract_file_size_tracks_writes_and_truncates() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let path = Path::new("size_track.db");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+
+        assert_eq!(file.file_size(&cx).unwrap(), 0, "empty file");
+
+        file.write(&cx, &[0xAA; 100], 0).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 100, "after 100-byte write at 0");
+
+        file.write(&cx, &[0xBB; 50], 200).unwrap();
+        assert_eq!(
+            file.file_size(&cx).unwrap(),
+            250,
+            "sparse write at 200 extends file to 250"
+        );
+
+        file.truncate(&cx, 80).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 80, "truncate to 80");
+
+        file.truncate(&cx, 0).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 0, "truncate to 0");
+    }
+
+    #[test]
+    fn test_vfs_contract_read_beyond_eof_zeros_remainder() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let path = Path::new("read_eof.db");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+
+        file.write(&cx, &[0xCC; 10], 0).unwrap();
+
+        let mut buf = [0xFF_u8; 20];
+        let n = file.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(n, 10, "short read returns actual bytes read");
+        assert_eq!(&buf[..10], &[0xCC; 10], "data portion correct");
+        assert!(
+            buf[10..].iter().all(|&b| b == 0),
+            "remainder zeroed on short read"
+        );
+
+        let mut buf2 = [0xFF_u8; 10];
+        let n2 = file.read(&cx, &mut buf2, 100).unwrap();
+        assert_eq!(n2, 0, "read entirely past EOF returns 0 bytes");
+        assert!(
+            buf2.iter().all(|&b| b == 0),
+            "buffer zeroed when read past EOF"
+        );
+    }
+
+    #[test]
+    fn test_vfs_contract_sparse_write_fills_gap_with_zeros() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let path = Path::new("sparse.db");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+
+        file.write(&cx, &[0xDD; 4], 100).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 104);
+
+        let mut buf = [0xFF_u8; 104];
+        let n = file.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(n, 104);
+        assert!(
+            buf[..100].iter().all(|&b| b == 0),
+            "gap before sparse write must be zeros"
+        );
+        assert_eq!(&buf[100..], &[0xDD; 4], "sparse-written data intact");
+    }
+
+    #[test]
+    fn test_vfs_contract_two_handles_share_state() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let path = Path::new("shared.db");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+
+        let (mut f1, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        f1.write(&cx, &[0x11; 16], 0).unwrap();
+
+        let (f2, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let mut buf = [0u8; 16];
+        let n = f2.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(n, 16);
+        assert_eq!(
+            &buf, &[0x11; 16],
+            "second handle sees first handle's writes"
+        );
+
+        assert_eq!(
+            f2.file_size(&cx).unwrap(),
+            16,
+            "second handle reports correct file size"
+        );
+    }
 }

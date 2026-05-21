@@ -5927,6 +5927,55 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_or_disjunction_as_in_list() {
+        // a = 1 OR a = 2 OR a = 3 classifies as an IN-list on column a with 3
+        // disjuncts. Mixed columns, a single (non-OR) equality, and a non-
+        // equality disjunct all decline.
+        let col = |n: &str| Box::new(Expr::Column(ColumnRef::bare(n), Span::ZERO));
+        let lit = |n: i64| Box::new(Expr::Literal(Literal::Integer(n), Span::ZERO));
+        let eqc = |c: &str, n: i64| Expr::BinaryOp {
+            left: col(c),
+            op: AstBinaryOp::Eq,
+            right: lit(n),
+            span: Span::ZERO,
+        };
+        let or = |l: Expr, r: Expr| Expr::BinaryOp {
+            left: Box::new(l),
+            op: AstBinaryOp::Or,
+            right: Box::new(r),
+            span: Span::ZERO,
+        };
+
+        // a = 1 OR a = 2 OR a = 3 -> IN-list on a, 3 disjuncts.
+        let three = or(eqc("a", 1), or(eqc("a", 2), eqc("a", 3)));
+        assert_eq!(
+            classify_or_disjunction_as_in_list(&three),
+            Some((
+                WhereColumn {
+                    table: None,
+                    column: "a".to_owned()
+                },
+                3
+            ))
+        );
+
+        // Mixed columns decline.
+        assert!(classify_or_disjunction_as_in_list(&or(eqc("a", 1), eqc("b", 2))).is_none());
+
+        // A single equality (no OR) has too few disjuncts.
+        assert!(classify_or_disjunction_as_in_list(&eqc("a", 1)).is_none());
+
+        // A non-equality disjunct declines.
+        let gt = Expr::BinaryOp {
+            left: col("a"),
+            op: AstBinaryOp::Gt,
+            right: lit(2),
+            span: Span::ZERO,
+        };
+        assert!(classify_or_disjunction_as_in_list(&or(eqc("a", 1), gt)).is_none());
+    }
+
+    #[test]
     fn test_extract_comparison_operand_returns_other_side_of_column_comparison() {
         // extract_comparison_operand returns the non-column side of a binary
         // comparison: a column on the left yields the right operand and vice

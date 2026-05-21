@@ -5927,6 +5927,38 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_comparison_operand_returns_other_side_of_column_comparison() {
+        // extract_comparison_operand returns the non-column side of a binary
+        // comparison: a column on the left yields the right operand and vice
+        // versa; with no column operand (or a non-BinaryOp) it yields None.
+        let col = |n: &str| Box::new(Expr::Column(ColumnRef::bare(n), Span::ZERO));
+        let lit = |n: i64| Box::new(Expr::Literal(Literal::Integer(n), Span::ZERO));
+        let binop = |l: Box<Expr>, r: Box<Expr>| Expr::BinaryOp {
+            left: l,
+            op: AstBinaryOp::Eq,
+            right: r,
+            span: Span::ZERO,
+        };
+
+        // x = 5 -> the literal 5 (column on the left).
+        assert!(matches!(
+            extract_comparison_operand(&binop(col("x"), lit(5))),
+            Some(Expr::Literal(Literal::Integer(5), _))
+        ));
+        // 5 = x -> the literal 5 (column on the right).
+        assert!(matches!(
+            extract_comparison_operand(&binop(lit(5), col("x"))),
+            Some(Expr::Literal(Literal::Integer(5), _))
+        ));
+        // No column operand -> None.
+        assert!(extract_comparison_operand(&binop(lit(5), lit(6))).is_none());
+        // Not a binary op -> None.
+        assert!(
+            extract_comparison_operand(&Expr::Literal(Literal::Integer(1), Span::ZERO)).is_none()
+        );
+    }
+
+    #[test]
     fn test_extract_where_column_preserves_qualifier_and_rejects_non_columns() {
         // extract_where_column lifts a column reference into a WhereColumn,
         // preserving the table qualifier, and returns None for anything that is

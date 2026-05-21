@@ -5927,6 +5927,39 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_conjuncts_flattens_and_tree_regardless_of_nesting() {
+        // collect_conjuncts recursively splits on AND (both sides), so any AND
+        // tree flattens to its leaves no matter how it is nested; a non-AND
+        // expression yields a single conjunct.
+        let leaf = |n: i64| Expr::Literal(Literal::Integer(n), Span::ZERO);
+        let and = |l: Expr, r: Expr| Expr::BinaryOp {
+            left: Box::new(l),
+            op: AstBinaryOp::And,
+            right: Box::new(r),
+            span: Span::ZERO,
+        };
+        let count = |e: &Expr| {
+            let mut v = Vec::new();
+            collect_conjuncts(e, &mut v);
+            v.len()
+        };
+
+        // A non-AND expression is a single conjunct.
+        assert_eq!(count(&leaf(1)), 1);
+        // a AND b -> 2.
+        assert_eq!(count(&and(leaf(1), leaf(2))), 2);
+        // Right-nested a AND (b AND c) -> 3.
+        assert_eq!(count(&and(leaf(1), and(leaf(2), leaf(3)))), 3);
+        // Left-nested (a AND b) AND c -> 3.
+        assert_eq!(count(&and(and(leaf(1), leaf(2)), leaf(3))), 3);
+        // Balanced (a AND b) AND (c AND d) -> 4.
+        assert_eq!(
+            count(&and(and(leaf(1), leaf(2)), and(leaf(3), leaf(4)))),
+            4
+        );
+    }
+
+    #[test]
     fn test_classify_or_disjunction_as_in_list() {
         // a = 1 OR a = 2 OR a = 3 classifies as an IN-list on column a with 3
         // disjuncts. Mixed columns, a single (non-OR) equality, and a non-

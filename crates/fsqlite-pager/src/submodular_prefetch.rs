@@ -471,4 +471,44 @@ mod tests {
             "with no prior selection, gain should equal hit_prob, got {gain}"
         );
     }
+
+    #[test]
+    fn candidate_debug_copy_partial_eq() {
+        let a = c(5, 0.8, 3);
+        let b = a;
+        assert_eq!(a, b, "Copy must produce equal value");
+        let cloned = a.clone();
+        assert_eq!(a, cloned, "Clone must produce equal value");
+        let dbg = format!("{a:?}");
+        assert!(dbg.contains("Candidate"));
+        assert!(dbg.contains("hit_prob"));
+        assert!(dbg.contains("cacheline_group"));
+    }
+
+    #[test]
+    fn clamp01_boundary_values() {
+        assert!((clamp01(0.0)).abs() < 1e-15);
+        assert!((clamp01(1.0) - 1.0).abs() < 1e-15);
+        assert!((clamp01(f64::NEG_INFINITY)).abs() < 1e-15);
+        assert!((clamp01(f64::INFINITY) - 1.0).abs() < 1e-15);
+        assert!((clamp01(0.5) - 0.5).abs() < 1e-15);
+    }
+
+    #[test]
+    fn objective_same_group_penalty_exact() {
+        let sel = [c(1, 0.8, 0), c(2, 0.6, 0)];
+        let val = objective(&sel, 0.25);
+        let expected = (0.8 + 0.6) - 0.25 * (0.8 * 0.6);
+        assert!(
+            (val - expected).abs() < 1e-12,
+            "expected {expected}, got {val}"
+        );
+    }
+
+    #[test]
+    fn greedy_select_tiebreak_first_occurrence() {
+        let cands = vec![c(10, 0.5, 1), c(20, 0.5, 2), c(30, 0.5, 3)];
+        let picked = greedy_select(&cands, 1, 0.0);
+        assert_eq!(picked, vec![pn(10)], "tied candidates: first occurrence wins");
+    }
 }

@@ -6076,6 +6076,34 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_qualified_column_requires_qualifier_and_canonicalizes() {
+        // extract_qualified_column requires a table-qualified column and lower-
+        // cases both the table and the column; bare columns and non-columns
+        // yield None. (Distinct from extract_where_column, which accepts bare
+        // columns and preserves case.)
+        let qualified = Expr::Column(ColumnRef::qualified("T", "Col"), Span::ZERO);
+        assert_eq!(
+            extract_qualified_column(&qualified),
+            Some(ColumnKey {
+                table: "t".to_owned(),
+                column: "col".to_owned()
+            })
+        );
+
+        // A bare (unqualified) column has no table -> None.
+        assert_eq!(
+            extract_qualified_column(&Expr::Column(ColumnRef::bare("x"), Span::ZERO)),
+            None
+        );
+
+        // A non-column expression -> None.
+        assert_eq!(
+            extract_qualified_column(&Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            None
+        );
+    }
+
+    #[test]
     fn test_extract_where_column_preserves_qualifier_and_rejects_non_columns() {
         // extract_where_column lifts a column reference into a WhereColumn,
         // preserving the table qualifier, and returns None for anything that is

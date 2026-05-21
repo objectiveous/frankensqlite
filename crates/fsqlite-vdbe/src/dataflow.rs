@@ -185,6 +185,8 @@ pub enum DataflowOperator {
     Project { columns: Vec<usize> },
     /// Keep rows whose algebraic weight matches the requested sign.
     FilterWeightSign { sign: WeightSign },
+    /// Append a constant payload value to each row, preserving row weight.
+    AppendLiteral { value: SqliteValue },
     /// Consolidate algebraic weights by key and elide zero-weight results.
     ConsolidateByKey { key_columns: Vec<usize> },
     /// Emit one materialized `COUNT(*)` row per key.
@@ -255,6 +257,7 @@ impl DataflowOperator {
                 .map(|row| Ok(WeightedRow::new(row.project(columns)?, row.weight)))
                 .collect(),
             Self::FilterWeightSign { sign } => Ok(filter_weight_sign(rows, *sign)),
+            Self::AppendLiteral { value } => Ok(append_literal_column(rows, value)),
             Self::ConsolidateByKey { key_columns } => consolidate_by_key(rows, key_columns),
             Self::CountByKey { key_columns } => count_by_key(rows, key_columns),
             Self::SumIntegerByKey {
@@ -361,6 +364,19 @@ fn filter_weight_sign(rows: &[WeightedRow], sign: WeightSign) -> Vec<WeightedRow
             (WeightSign::Positive, weight) if weight > 0 => Some(row.clone()),
             (WeightSign::Negative, weight) if weight < 0 => Some(row.clone()),
             _ => None,
+        })
+        .collect()
+}
+
+fn append_literal_column(rows: &[WeightedRow], value: &SqliteValue) -> Vec<WeightedRow> {
+    rows.iter()
+        .filter_map(|row| {
+            if row.is_zero() {
+                return None;
+            }
+            let mut values = row.values.clone();
+            values.push(value.clone());
+            Some(WeightedRow::new(values, row.weight))
         })
         .collect()
 }
@@ -781,6 +797,27 @@ mod tests {
         assert_eq!(
             negative.execute(&rows).expect("negative stream"),
             vec![WeightedRow::new(vec![int(2)], -2)]
+        );
+    }
+
+    #[test]
+    fn append_literal_column_preserves_weights_and_elides_zeroes() {
+        let automaton =
+            DataflowAutomaton::new(vec![DataflowOperator::AppendLiteral { value: int(99) }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1)], 3),
+            WeightedRow::new(vec![int(2)], -2),
+            WeightedRow::new(vec![int(3)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(1), int(99)], 3),
+                WeightedRow::new(vec![int(2), int(99)], -2),
+            ]
         );
     }
 

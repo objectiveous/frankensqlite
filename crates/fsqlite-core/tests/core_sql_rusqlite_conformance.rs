@@ -2184,6 +2184,49 @@ const STRING_FUNCTION_CASES: &[QueryCase] = &[
     },
 ];
 
+const REPLACE_SCALAR_SETUP: &str = "
+    CREATE TABLE replace_values (
+        id INTEGER PRIMARY KEY,
+        raw,
+        needle,
+        replacement
+    );
+    INSERT INTO replace_values (id, raw, needle, replacement) VALUES
+        (1, 'banana', 'na', ''),
+        (2, 'aaaa', 'aa', 'b'),
+        (3, 'Case', 'C', 'x'),
+        (4, 12121, '12', 'x'),
+        (5, '', '', 'z'),
+        (6, NULL, 'a', 'b');
+";
+
+const REPLACE_SCALAR_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "non recursive overlapping replacements",
+        sql: "SELECT replace('aaaa', 'aa', 'b'), replace('aaa', 'a', 'bb'), replace('aaaa', 'a', 'aa')",
+    },
+    QueryCase {
+        name: "empty needle leaves input unchanged",
+        sql: "SELECT replace('abc', '', 'x'), replace('', '', 'x'), typeof(replace('abc', '', 'x'))",
+    },
+    QueryCase {
+        name: "deletion and case sensitive matching",
+        sql: "SELECT replace('banana', 'na', ''), replace('Case', 'c', 'x'), replace('Case', 'C', 'x')",
+    },
+    QueryCase {
+        name: "numeric coercion and storage class",
+        sql: "SELECT replace(12121, '12', 'x'), replace(-12012, '12', 'x'), typeof(replace(12121, '12', 'x'))",
+    },
+    QueryCase {
+        name: "null argument propagation",
+        sql: "SELECT replace(NULL, 'a', 'b'), replace('abc', NULL, 'x'), replace('abc', 'a', NULL), typeof(replace(NULL, 'a', 'b'))",
+    },
+    QueryCase {
+        name: "column driven replace",
+        sql: "SELECT id, replace(raw, needle, replacement), typeof(replace(raw, needle, replacement)) FROM replace_values ORDER BY id",
+    },
+];
+
 const SUBSTR_SCALAR_SETUP: &str = "
     CREATE TABLE substr_values (
         id INTEGER PRIMARY KEY,
@@ -3215,6 +3258,12 @@ fn json1_functions_match_rusqlite() {
 fn string_functions_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new("");
     harness.assert_queries_match("string functions", STRING_FUNCTION_CASES);
+}
+
+#[test]
+fn replace_scalar_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(REPLACE_SCALAR_SETUP);
+    harness.assert_queries_match("replace scalar edge", REPLACE_SCALAR_CASES);
 }
 
 #[test]

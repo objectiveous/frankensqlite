@@ -5986,6 +5986,31 @@ mod tests {
     }
 
     #[test]
+    fn test_ordered_subset_preserves_join_order() {
+        // ordered_subset keeps only the selected tables but in join_order's
+        // order (not the set's), and ignores selected tables absent from the
+        // join order.
+        let order: Vec<String> = ["c", "a", "b", "d"].iter().map(|s| (*s).to_owned()).collect();
+
+        let sel: HashSet<String> = ["a", "d"].iter().map(|s| (*s).to_owned()).collect();
+        assert_eq!(
+            ordered_subset(&order, &sel),
+            vec!["a".to_owned(), "d".to_owned()] // join-order order, not set order
+        );
+
+        // Selecting everything returns the join order unchanged.
+        let all: HashSet<String> = ["a", "b", "c", "d"].iter().map(|s| (*s).to_owned()).collect();
+        assert_eq!(ordered_subset(&order, &all), order);
+
+        // An empty selection yields nothing.
+        assert!(ordered_subset(&order, &HashSet::new()).is_empty());
+
+        // A selected table absent from the join order is ignored.
+        let extra: HashSet<String> = ["a", "x"].iter().map(|s| (*s).to_owned()).collect();
+        assert_eq!(ordered_subset(&order, &extra), vec!["a".to_owned()]);
+    }
+
+    #[test]
     fn test_cross_join_allowed_enforces_right_after_left_ordering() {
         // For a cross-join pair (A, B), B may only be placed after A in the join
         // order. cross_join_allowed enforces this case-insensitively; candidates

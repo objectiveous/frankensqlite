@@ -1479,6 +1479,36 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_leaf_table_rowid_decodes_rowid_after_payload_size_varint() {
+        use fsqlite_types::serial_type::write_varint;
+
+        // Single-byte payload_size + single-byte rowid.
+        let mut page = vec![0u8; 64];
+        page[10] = 5; // payload_size varint (value < 128 -> 1 byte)
+        page[11] = 42; // rowid varint
+        assert_eq!(CellRef::parse_leaf_table_rowid(&page, 10).unwrap(), 42);
+
+        // Multi-byte payload_size: parse must skip the whole varint to find the rowid.
+        let mut page = vec![0u8; 64];
+        let off = 4;
+        let n = write_varint(&mut page[off..], 200u64); // payload_size = 200 (2-byte varint)
+        let _ = write_varint(&mut page[off + n..], 7u64); // rowid = 7
+        assert_eq!(CellRef::parse_leaf_table_rowid(&page, off).unwrap(), 7);
+
+        // Multi-byte rowid is decoded fully.
+        let mut page = vec![0u8; 64];
+        let n = write_varint(&mut page[0..], 5u64); // payload_size = 5
+        let _ = write_varint(&mut page[n..], 300u64); // rowid = 300 (2-byte varint)
+        assert_eq!(CellRef::parse_leaf_table_rowid(&page, 0).unwrap(), 300);
+
+        // A large rowid round-trips through the varint decode.
+        let mut page = vec![0u8; 64];
+        let n = write_varint(&mut page[0..], 1u64);
+        let _ = write_varint(&mut page[n..], 1_000_000_000u64);
+        assert_eq!(CellRef::parse_leaf_table_rowid(&page, 0).unwrap(), 1_000_000_000);
+    }
+
+    #[test]
     fn test_cellref_parse_reports_out_of_range_offset() {
         let page = vec![0u8; 16];
         let err = CellRef::parse(&page, 17, BtreePageType::LeafTable, 4096).unwrap_err();

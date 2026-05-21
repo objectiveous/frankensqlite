@@ -1375,4 +1375,48 @@ mod tests {
         assert!(a.check_conflicts(&[PageNumber::new(1).unwrap()], CommitSeq::ZERO).is_empty());
         assert!(b.check_conflicts(&[PageNumber::new(1).unwrap()], CommitSeq::ZERO).is_empty());
     }
+
+    #[test]
+    fn commit_submission_debug_clone() {
+        let sub = make_submission(&[1, 2, 3], 0, 0xAA);
+        let cloned = sub.clone();
+        assert_eq!(cloned.capsule_digest, sub.capsule_digest);
+        assert_eq!(cloned.write_set_pages.len(), 3);
+        assert_eq!(cloned.begin_seq, CommitSeq::new(0));
+        let dbg = format!("{sub:?}");
+        assert!(dbg.contains("CommitSubmission"));
+    }
+
+    #[test]
+    fn commit_result_all_variants_debug_clone_eq() {
+        let committed = CommitResult::Committed { commit_seq: CommitSeq::new(5), commit_time_unix_ns: 1_000 };
+        let fcw = CommitResult::ConflictFcw { conflicting_pages: vec![PageNumber::new(1).unwrap()] };
+        let ssi = CommitResult::ConflictSsi;
+        let shutdown = CommitResult::ShuttingDown;
+        assert_eq!(committed.clone(), committed);
+        assert_eq!(fcw.clone(), fcw);
+        assert_eq!(ssi.clone(), ssi);
+        assert_eq!(shutdown.clone(), shutdown);
+        assert_ne!(committed, fcw);
+        assert_ne!(ssi, shutdown);
+        let dbg = format!("{committed:?}");
+        assert!(dbg.contains("Committed"));
+    }
+
+    #[test]
+    fn write_coordinator_accessors_on_fresh_instance() {
+        let coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::new(10), 8);
+        assert_eq!(coord.mode(), OperatingMode::Native);
+        assert_eq!(coord.commit_seq_tip(), CommitSeq::new(10));
+        assert_eq!(coord.pending_count(), 0);
+        assert_eq!(coord.current_epoch(), 0);
+    }
+
+    #[test]
+    fn group_commit_batch_empty_boundary() {
+        let batch = GroupCommitBatch::new(4);
+        assert_eq!(batch.len(), 0);
+        assert!(batch.is_empty());
+        assert!(!batch.is_full());
+    }
 }

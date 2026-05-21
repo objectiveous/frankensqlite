@@ -429,6 +429,29 @@ const DETAIL_NONE_CASES: &[MatchCase] = &[
     },
 ];
 
+const MUTATION_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "deleted row old term",
+        query: "bread",
+    },
+    MatchCase {
+        name: "replaced row removed term",
+        query: "full",
+    },
+    MatchCase {
+        name: "replaced row new term",
+        query: "bytecode",
+    },
+    MatchCase {
+        name: "inserted row new term",
+        query: "mutation",
+    },
+    MatchCase {
+        name: "retained term after mutations",
+        query: "sqlite",
+    },
+];
+
 const INVALID_QUERY_CASES: &[MatchCase] = &[
     MatchCase {
         name: "empty query",
@@ -580,6 +603,24 @@ impl Fts5ConformanceHarness {
         }
 
         Self { franken, sqlite }
+    }
+
+    fn insert_or_replace_doc(&mut self, doc: Doc) {
+        let columns = vec![doc.title.to_owned(), doc.body.to_owned()];
+        self.franken.insert_document(doc.rowid, &columns);
+        self.sqlite
+            .execute(
+                "INSERT OR REPLACE INTO docs(rowid, title, body) VALUES (?1, ?2, ?3)",
+                (doc.rowid, doc.title, doc.body),
+            )
+            .expect("insert or replace rusqlite FTS5 row");
+    }
+
+    fn delete_doc(&mut self, rowid: i64) {
+        self.franken.delete_document(rowid);
+        self.sqlite
+            .execute("DELETE FROM docs WHERE rowid = ?1", [rowid])
+            .expect("delete rusqlite FTS5 row");
     }
 
     fn franken_match_rowids(&self, query: &str) -> Vec<i64> {
@@ -850,6 +891,32 @@ fn detail_mode_queries_match_rusqlite_reference() {
             detail_none.franken_match_rowids(case.query),
             detail_none.sqlite_match_rowids(case.query),
             "detail=none conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn mutation_queries_match_rusqlite_reference() {
+    let mut harness = Fts5ConformanceHarness::new(&[]);
+    harness.delete_doc(4);
+    harness.insert_or_replace_doc(Doc {
+        rowid: 2,
+        title: "Planner notes",
+        body: "query planner builds bytecode search paths",
+    });
+    harness.insert_or_replace_doc(Doc {
+        rowid: 6,
+        title: "Fresh rust",
+        body: "fresh rust token for mutation search",
+    });
+
+    for case in MUTATION_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "mutation conformance case failed: {} ({})",
             case.name,
             case.query
         );

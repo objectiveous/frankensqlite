@@ -1007,6 +1007,81 @@ const ERROR_PATH_CASES: &[StatementCase] = &[
     },
 ];
 
+const CHECK_CONSTRAINT_SETUP: &str = "
+    CREATE TABLE checked_items (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL CHECK(name <> ''),
+        qty INTEGER CHECK(qty >= 0),
+        price INTEGER NOT NULL,
+        discount INTEGER NOT NULL DEFAULT 0,
+        CHECK(discount >= 0 AND price >= discount),
+        CHECK(qty IS NULL OR qty <= 100)
+    );
+
+    INSERT INTO checked_items(id, name, qty, price, discount) VALUES
+        (1, 'alpha', 10, 100, 0),
+        (2, 'beta', NULL, 50, 5);
+";
+
+const CHECK_CONSTRAINT_SCRIPT: &str = "
+    INSERT INTO checked_items(id, name, qty, price, discount)
+        VALUES (3, 'gamma', 0, 25, 25);
+    INSERT OR IGNORE INTO checked_items(id, name, qty, price, discount)
+        VALUES (4, 'bad-qty', -1, 10, 0);
+    INSERT OR IGNORE INTO checked_items(id, name, qty, price, discount)
+        VALUES (5, 'bad-upper-bound', 101, 10, 0);
+    INSERT OR IGNORE INTO checked_items(id, name, qty, price, discount)
+        VALUES (6, 'bad-price', 1, 5, 10);
+    UPDATE checked_items
+        SET qty = 15, discount = 10
+        WHERE id = 1;
+    UPDATE OR IGNORE checked_items
+        SET price = 1, discount = 9
+        WHERE id = 3;
+";
+
+const CHECK_CONSTRAINT_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "final checked rows",
+        sql: "SELECT id, name, qty, price, discount FROM checked_items ORDER BY id",
+    },
+    QueryCase {
+        name: "ignored check violations did not insert",
+        sql: "SELECT COUNT(*) FROM checked_items WHERE id IN (4, 5, 6)",
+    },
+    QueryCase {
+        name: "null passes check and aggregates remain stable",
+        sql: "SELECT COUNT(*), COUNT(qty), SUM(qty), SUM(price - discount) FROM checked_items",
+    },
+    QueryCase {
+        name: "table checks hold after ignored update",
+        sql: "SELECT id, qty IS NULL, price >= discount FROM checked_items ORDER BY id",
+    },
+];
+
+const CHECK_CONSTRAINT_ERROR_CASES: &[StatementCase] = &[
+    StatementCase {
+        name: "insert violates column check",
+        sql: "INSERT INTO checked_items(id, name, qty, price, discount) VALUES (7, 'negative', -1, 10, 0)",
+    },
+    StatementCase {
+        name: "insert violates text check",
+        sql: "INSERT INTO checked_items(id, name, qty, price, discount) VALUES (8, '', 1, 10, 0)",
+    },
+    StatementCase {
+        name: "insert violates table check",
+        sql: "INSERT INTO checked_items(id, name, qty, price, discount) VALUES (9, 'over-discount', 1, 10, 20)",
+    },
+    StatementCase {
+        name: "update violates upper bound check",
+        sql: "UPDATE checked_items SET qty = 101 WHERE id = 1",
+    },
+    StatementCase {
+        name: "update violates multi-column check",
+        sql: "UPDATE checked_items SET discount = price + 1 WHERE id = 2",
+    },
+];
+
 const DDL_SETUP: &str = "
     CREATE TABLE accounts (
         id INTEGER PRIMARY KEY,
@@ -2081,6 +2156,14 @@ fn attached_vacuum_delegation_matches_rusqlite() {
 fn error_paths_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(ERROR_PATH_SETUP);
     harness.assert_statement_errors_match("error path", ERROR_PATH_CASES);
+}
+
+#[test]
+fn check_constraint_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CHECK_CONSTRAINT_SETUP);
+    harness.execute_script(CHECK_CONSTRAINT_SCRIPT);
+    harness.assert_queries_match("CHECK constraint edge", CHECK_CONSTRAINT_CASES);
+    harness.assert_statement_errors_match("CHECK constraint edge", CHECK_CONSTRAINT_ERROR_CASES);
 }
 
 #[test]

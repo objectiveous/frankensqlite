@@ -6094,6 +6094,55 @@ mod tests {
     }
 
     #[test]
+    fn test_expr_implies_partial_predicate() {
+        // A query predicate implies a partial-index predicate when it is
+        // structurally identical, when it guarantees the column non-null for an
+        // IS NOT NULL index predicate, or when its column-literal comparison
+        // logically implies the predicate's (x > 10 implies x > 5, not vice versa).
+        let col = |n: &str| Box::new(Expr::Column(ColumnRef::bare(n), Span::ZERO));
+        let lit = |n: i64| Box::new(Expr::Literal(Literal::Integer(n), Span::ZERO));
+        let cmp = |c: &str, op: AstBinaryOp, n: i64| Expr::BinaryOp {
+            left: col(c),
+            op,
+            right: lit(n),
+            span: Span::ZERO,
+        };
+
+        // Structural identity implies trivially.
+        assert!(expr_implies_partial_predicate(
+            &cmp("x", AstBinaryOp::Eq, 5),
+            &cmp("x", AstBinaryOp::Eq, 5)
+        ));
+
+        // x > 10 implies x > 5; the reverse does not.
+        assert!(expr_implies_partial_predicate(
+            &cmp("x", AstBinaryOp::Gt, 10),
+            &cmp("x", AstBinaryOp::Gt, 5)
+        ));
+        assert!(!expr_implies_partial_predicate(
+            &cmp("x", AstBinaryOp::Gt, 5),
+            &cmp("x", AstBinaryOp::Gt, 10)
+        ));
+
+        // x = 5 implies the partial-index predicate x IS NOT NULL.
+        let is_not_null = Expr::IsNull {
+            expr: col("x"),
+            not: true,
+            span: Span::ZERO,
+        };
+        assert!(expr_implies_partial_predicate(
+            &cmp("x", AstBinaryOp::Eq, 5),
+            &is_not_null
+        ));
+
+        // Different columns do not imply.
+        assert!(!expr_implies_partial_predicate(
+            &cmp("x", AstBinaryOp::Eq, 5),
+            &cmp("y", AstBinaryOp::Eq, 3)
+        ));
+    }
+
+    #[test]
     fn test_compare_partial_index_literals_handles_cross_type_numerics() {
         use std::cmp::Ordering;
         let int = Literal::Integer;

@@ -9537,6 +9537,93 @@ mod tests {
     }
 
     #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_insert_delete_pinned_after_other_insert()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4308;
+        let row_b = 4309;
+        let row_c = 4310;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let a_other = vec![b'3'; 192];
+        let b_other = vec![b'4'; 193];
+        let a_own = vec![b'5'; 194];
+        let c_own = vec![b'6'; 195];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        let committed_seq = mgr.commit(&mut seed).expect("seed commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        assert_eq!(
+            txn.snapshot.high, committed_seq,
+            "transaction must pin the empty page before the later insert commits"
+        );
+
+        let mut other = mgr.begin(BeginKind::Concurrent).expect("other begin");
+        mgr.cell_log()
+            .record_insert(key_a, pgno, leaf_table_cell(row_a, &a_other), other.token())
+            .expect("other row a insert should fit budget");
+        mgr.cell_log()
+            .record_insert(key_b, pgno, leaf_table_cell(row_b, &b_other), other.token())
+            .expect("other row b insert should fit budget");
+        let other_seq = mgr.commit(&mut other).expect("other batch commit");
+        assert!(other_seq > committed_seq);
+
+        mgr.cell_log()
+            .record_insert(key_a, pgno, leaf_table_cell(row_a, &a_own), txn.token())
+            .expect("own row a insert should fit budget");
+        mgr.cell_log()
+            .record_delete(key_a, pgno, txn.token())
+            .expect("own row a delete should fit budget");
+        mgr.cell_log()
+            .record_insert(key_c, pgno, leaf_table_cell(row_c, &c_own), txn.token())
+            .expect("own row c insert should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![(row_c, c_own.clone())],
+            "own insert/delete final state must not reveal a hidden post-snapshot insert of the same key"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(committed_seq),
+            "own insert/delete and hidden post-snapshot inserts must leave the witness at the pinned horizon"
+        );
+
+        mgr.abort(&mut txn);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(row_a, a_other), (row_b, b_other)],
+            "fresh readers must see the later committed insert batch after abort"
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(other_seq),
+            "fresh readers should witness the later committed insert horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_read_page_with_cell_deltas_keeps_other_uncommitted_writes_out_of_horizon()
     -> fsqlite_error::Result<()> {
         use crate::cell_visibility::CellKey;

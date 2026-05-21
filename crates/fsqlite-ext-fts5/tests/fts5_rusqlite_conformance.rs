@@ -822,6 +822,29 @@ const PHRASE_PREFIX_NEAR_CASES: &[MatchCase] = &[
     },
 ];
 
+const NEAR_DEFAULT_COLUMN_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "default near distance",
+        query: "NEAR(rust sqlite)",
+    },
+    MatchCase {
+        name: "near phrase and term default distance",
+        query: r#"NEAR("full text" search)"#,
+    },
+    MatchCase {
+        name: "title-filtered near",
+        query: "title:NEAR(rust sqlite)",
+    },
+    MatchCase {
+        name: "body-filtered near",
+        query: "body:NEAR(sqlite search)",
+    },
+    MatchCase {
+        name: "three operand near explicit distance",
+        query: "NEAR(rust sqlite search, 6)",
+    },
+];
+
 const PHRASE_CONCAT_CASES: &[MatchCase] = &[
     MatchCase {
         name: "tight bare terms",
@@ -1887,6 +1910,21 @@ fn phrase_prefix_near_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "phrase/prefix/NEAR conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn near_default_and_column_filter_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in NEAR_DEFAULT_COLUMN_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "NEAR default/column-filter conformance case failed: {} ({})",
             case.name,
             case.query
         );

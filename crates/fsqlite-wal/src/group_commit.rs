@@ -2533,4 +2533,73 @@ mod tests {
             assert!(snap.hist_wal_append.max >= 59);
         });
     }
+
+    #[test]
+    fn transaction_conflict_snapshot_debug_clone_copy_eq() {
+        let a = TransactionConflictSnapshot {
+            generation: WalGenerationIdentity::default(),
+            last_commit_frame: Some(42),
+            commit_count: 7,
+        };
+        let copied = a;
+        assert_eq!(copied, a);
+        let b = TransactionConflictSnapshot {
+            generation: WalGenerationIdentity::default(),
+            last_commit_frame: None,
+            commit_count: 7,
+        };
+        assert_ne!(a, b);
+        let dbg = format!("{a:?}");
+        assert!(dbg.contains("TransactionConflictSnapshot"));
+    }
+
+    #[test]
+    fn transaction_frame_batch_context_default_and_eq() {
+        let def = TransactionFrameBatchContext::default();
+        assert_eq!(def.batch_id, 0);
+        assert_eq!(def.lane_id, 0);
+        assert_eq!(def.staged_frame_count, 0);
+        assert_eq!(def.staging_elapsed_ns, 0);
+        let other = TransactionFrameBatchContext {
+            batch_id: 1, lane_id: 3, staged_frame_count: 10, staging_elapsed_ns: 500,
+        };
+        assert_ne!(def, other);
+        let copied = other;
+        assert_eq!(copied, other);
+        let dbg = format!("{def:?}");
+        assert!(dbg.contains("TransactionFrameBatchContext"));
+    }
+
+    #[test]
+    fn consolidation_phase_and_submit_outcome_all_variants() {
+        let phases = [ConsolidationPhase::Filling, ConsolidationPhase::Flushing, ConsolidationPhase::Complete];
+        for (i, p) in phases.iter().enumerate() {
+            let copied = *p;
+            assert_eq!(copied, *p);
+            for (j, q) in phases.iter().enumerate() {
+                assert_eq!(i == j, p == q);
+            }
+        }
+        assert_ne!(SubmitOutcome::Flusher, SubmitOutcome::Waiter);
+        let copied = SubmitOutcome::Flusher;
+        assert_eq!(copied, SubmitOutcome::Flusher);
+        let dbg = format!("{:?}", SubmitOutcome::Waiter);
+        assert!(dbg.contains("Waiter"));
+    }
+
+    #[test]
+    fn transaction_frame_batch_builders() {
+        let frame = FrameSubmission { page_number: 5, page_data: vec![0u8; 16], db_size_if_commit: 0 };
+        let batch = TransactionFrameBatch::new(vec![frame.clone()])
+            .with_conflict_snapshot(vec![5, 10], None)
+            .with_context(TransactionFrameBatchContext {
+                batch_id: 99, lane_id: 2, staged_frame_count: 1, staging_elapsed_ns: 100,
+            });
+        assert_eq!(batch.frame_count(), 1);
+        assert!(!batch.has_commit_frame());
+        assert_eq!(batch.conflict_pages, vec![5, 10]);
+        assert!(batch.conflict_snapshot.is_none());
+        assert_eq!(batch.context.batch_id, 99);
+        assert_eq!(batch.context.lane_id, 2);
+    }
 }

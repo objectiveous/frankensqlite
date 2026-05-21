@@ -443,6 +443,31 @@ mod tests {
     }
 
     #[test]
+    fn evict_page_distinguishes_unregistered_from_already_cold() {
+        // cannot_evict_hot_page / cannot_evict_pinned_root pin the HOT and
+        // pinned rejections; the COLD and unregistered rejections (distinct
+        // messages) were not pinned by message.
+        let csm = CoolingStateMachine::new(CoolingConfig::default());
+
+        // A page that was never registered.
+        assert_eq!(csm.evict_page(99).unwrap_err(), "page not registered");
+
+        // A freshly-registered page is COLD; evicting it reports the distinct
+        // already-cold reason rather than "page not registered".
+        csm.register_page(1);
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Cold));
+        assert_eq!(csm.evict_page(1).unwrap_err(), "page is already COLD");
+
+        // After a full load -> cool -> evict cycle the page is COLD again, so a
+        // second evict reports already-cold instead of succeeding twice.
+        csm.load_page(1, 0x1000);
+        csm.run_cooling_scan();
+        csm.evict_page(1).expect("a cooling page should evict");
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Cold));
+        assert_eq!(csm.evict_page(1).unwrap_err(), "page is already COLD");
+    }
+
+    #[test]
     fn cooling_tracker_counts_frame_addr_and_multi_page_scan() {
         let csm = CoolingStateMachine::new(CoolingConfig::default());
 

@@ -1644,6 +1644,37 @@ mod tests {
     }
 
     #[test]
+    fn differential_source_from_qualified_name_resolves_binding_and_schema() {
+        // from_qualified_name is only used inside compile_differential_view_plan,
+        // never asserted directly. The binding defaults to the alias when given,
+        // otherwise the (unqualified) table name; schema and table are carried
+        // from the QualifiedName.
+
+        // With an explicit alias, the binding is the alias.
+        let aliased =
+            DifferentialSource::from_qualified_name(&QualifiedName::bare("users"), Some("u"));
+        assert_eq!(aliased.binding, "u");
+        assert_eq!(aliased.table, "users");
+        assert_eq!(aliased.schema, None);
+
+        // Without an alias, the binding falls back to the table name.
+        let no_alias = DifferentialSource::from_qualified_name(&QualifiedName::bare("users"), None);
+        assert_eq!(no_alias.binding, "users");
+
+        // A schema-qualified name carries its schema through; the binding still
+        // falls back to the table name when no alias is given.
+        let qualified = QualifiedName {
+            schema: Some("main".to_owned()),
+            name: "users".to_owned(),
+        };
+        let src = DifferentialSource::from_qualified_name(&qualified, None);
+        assert_eq!(src.schema, Some("main".to_owned()));
+        assert_eq!(src.table, "users");
+        assert_eq!(src.binding, "users");
+        assert_eq!(src.display_name(), "main.users");
+    }
+
+    #[test]
     fn explain_differential_plan_renders_single_table_rowset_shape() {
         // Companion to the grouped-aggregate explain test: the RowSet (single
         // table, filters, projection) explain rendering was untested.

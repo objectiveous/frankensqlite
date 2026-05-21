@@ -8490,6 +8490,54 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_agm_upper_bound_triangle_and_guards() {
+        // The AGM (Atserias-Grohe-Marx) fractional-cover bound on worst-case join
+        // output. The textbook case is the triangle query R(A,B) |><| S(B,C) |><|
+        // T(A,C): every variable has degree 2, so each relation's exponent is
+        // max(1/2, 1/2) = 1/2 and the bound is (N_R * N_S * N_T)^(1/2). With all
+        // three relations at N=100 rows this is 100^(3/2) = 1000 -- the classic
+        // sub-N^3 bound. estimate_agm_upper_bound has no direct unit test (only
+        // indirect coverage through best_access_path).
+        let triangle = TrieHypergraph {
+            relation_variables: vec![vec![0, 1], vec![1, 2], vec![0, 2]],
+            variable_count: 3,
+            arity: 2,
+        };
+        let component = vec!["R".to_owned(), "S".to_owned(), "T".to_owned()];
+        let mut rows: HashMap<String, f64> = HashMap::new();
+        rows.insert("R".to_owned(), 100.0);
+        rows.insert("S".to_owned(), 100.0);
+        rows.insert("T".to_owned(), 100.0);
+
+        let bound = estimate_agm_upper_bound(&component, &rows, &triangle).unwrap();
+        assert!(
+            (bound - 1000.0).abs() < 1e-6,
+            "triangle bound should be 100^1.5 = 1000, got {bound}"
+        );
+
+        // A component whose length does not match the relation count is rejected.
+        let two = vec!["R".to_owned(), "S".to_owned()];
+        assert!(estimate_agm_upper_bound(&two, &rows, &triangle).is_none());
+
+        // An empty hypergraph (variable_count == 0) is rejected.
+        let empty_hg = TrieHypergraph {
+            relation_variables: vec![],
+            variable_count: 0,
+            arity: 0,
+        };
+        let empty_component: Vec<String> = vec![];
+        assert!(estimate_agm_upper_bound(&empty_component, &rows, &empty_hg).is_none());
+
+        // Missing row counts default to 1 and the bound is floored at 1.0.
+        let no_rows: HashMap<String, f64> = HashMap::new();
+        let floored = estimate_agm_upper_bound(&component, &no_rows, &triangle).unwrap();
+        assert!(
+            (floored - 1.0).abs() < 1e-9,
+            "missing row counts default to 1 -> bound 1.0, got {floored}"
+        );
+    }
+
+    #[test]
     fn test_best_access_path_skip_scan_on_low_cardinality_leading_column() {
         let table = TableStats {
             name: "users".to_owned(),

@@ -683,4 +683,38 @@ mod tests {
         assert_eq!(ev.tracked(), 1, "second forget must be no-op");
         assert!(ev.e_value(pn(2)).is_some(), "other page unaffected");
     }
+
+    #[test]
+    fn with_rates_custom_and_accessors() {
+        let ev = EValueEvictor::with_rates(2.0, 0.5);
+        assert!((ev.r_hit() - 2.0).abs() < f64::EPSILON);
+        assert!((ev.r_tick() - 0.5).abs() < f64::EPSILON);
+        assert_eq!(ev.tracked(), 0);
+    }
+
+    #[test]
+    fn constants_sanity() {
+        assert!(DEFAULT_R_HIT > 1.0);
+        assert!(DEFAULT_R_TICK > 0.0 && DEFAULT_R_TICK < 1.0);
+        assert!(DEFAULT_INITIAL_E > 0.0);
+        assert!(E_VALUE_FLOOR > 0.0);
+        assert!(E_VALUE_CEIL > E_VALUE_FLOOR);
+        assert!(DEFAULT_TICK_INTERVAL > 0);
+    }
+
+    #[test]
+    fn ville_pvalue_untracked_returns_one() {
+        let ev = EValueEvictor::new();
+        let pv = ev.ville_pvalue(pn(99));
+        assert!((pv - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn tick_n_large_drives_toward_floor() {
+        let ev = EValueEvictor::new();
+        ev.record_access(pn(1));
+        ev.tick_n(10_000);
+        let e = ev.e_value(pn(1)).expect("still tracked");
+        assert!(e <= E_VALUE_FLOOR + f64::EPSILON);
+    }
 }

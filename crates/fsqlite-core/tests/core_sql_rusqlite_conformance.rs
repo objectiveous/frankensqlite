@@ -888,6 +888,33 @@ const COMPOUND_CASES: &[QueryCase] = &[
     },
 ];
 
+const COMPOUND_EDGE_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "union distinct deduplicates null rows",
+        sql: "SELECT NULL AS value UNION SELECT NULL UNION SELECT 1 ORDER BY value",
+    },
+    QueryCase {
+        name: "multi column union distinct",
+        sql: "SELECT group_name, value FROM left_values WHERE value >= 3 UNION SELECT group_name, value FROM right_values WHERE value <= 4 ORDER BY group_name, value",
+    },
+    QueryCase {
+        name: "union all ordinal order limit offset",
+        sql: "SELECT group_name, value FROM left_values UNION ALL SELECT group_name, value FROM right_values ORDER BY 2 DESC, 1 LIMIT 5 OFFSET 1",
+    },
+    QueryCase {
+        name: "intersect after projection expression",
+        sql: "SELECT value % 2 AS parity FROM left_values INTERSECT SELECT value % 2 FROM right_values ORDER BY parity",
+    },
+    QueryCase {
+        name: "except with filtered right arm",
+        sql: "SELECT value FROM left_values EXCEPT SELECT value FROM right_values WHERE group_name = 'b' ORDER BY value",
+    },
+    QueryCase {
+        name: "compound subquery filtering",
+        sql: "SELECT value FROM (SELECT value FROM left_values UNION ALL SELECT value FROM right_values) WHERE value % 2 = 0 ORDER BY value",
+    },
+];
+
 const CASE_NULL_SETUP: &str = "
     CREATE TABLE expr_rows (
         id INTEGER PRIMARY KEY,
@@ -1434,6 +1461,12 @@ fn transactions_and_savepoints_match_rusqlite() {
 fn compound_selects_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(COMPOUND_SETUP);
     harness.assert_queries_match("compound SELECT", COMPOUND_CASES);
+}
+
+#[test]
+fn compound_select_edge_cases_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(COMPOUND_SETUP);
+    harness.assert_queries_match("compound SELECT edge", COMPOUND_EDGE_CASES);
 }
 
 #[test]

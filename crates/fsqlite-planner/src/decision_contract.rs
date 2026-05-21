@@ -829,6 +829,54 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_calibration_boundaries_and_well_calibrated() {
+        // Existing tests cover clearly under/over/zero estimates; this covers
+        // the well-calibrated band, the exact (strict) high threshold, and a
+        // non-positive estimate.
+
+        // Perfect calibration: ratio 1.0 -> not miscalibrated, no alert.
+        let perfect = compute_calibration(50.0, 50).unwrap();
+        assert!((perfect.ratio - 1.0).abs() < 1e-9);
+        assert!(!perfect.miscalibrated);
+        assert!(perfect.alert.is_none());
+
+        // Inside the (0.2, 5.0) band: well-calibrated.
+        let mid = compute_calibration(100.0, 50).unwrap(); // ratio 0.5
+        assert!(!mid.miscalibrated && mid.alert.is_none());
+
+        // The high threshold is checked with strict `> 5.0`, so a ratio of
+        // exactly 5.0 stays well-calibrated.
+        let at_high = compute_calibration(20.0, 100).unwrap(); // ratio 5.0
+        assert!((at_high.ratio - 5.0).abs() < 1e-9);
+        assert!(
+            !at_high.miscalibrated,
+            "ratio == 5.0 should be well-calibrated under a strict > check"
+        );
+
+        // Just past the high threshold -> Underestimate alert.
+        let over_high = compute_calibration(20.0, 101).unwrap(); // ratio 5.05
+        assert!(over_high.miscalibrated);
+        assert!(matches!(
+            over_high.alert,
+            Some(MiscalibrationAlert::Underestimate { .. })
+        ));
+
+        // Clearly below the low threshold -> Overestimate alert.
+        let under_low = compute_calibration(100.0, 10).unwrap(); // ratio 0.1
+        assert!(under_low.miscalibrated);
+        assert!(matches!(
+            under_low.alert,
+            Some(MiscalibrationAlert::Overestimate { .. })
+        ));
+
+        // A non-positive estimate yields no meaningful ratio.
+        assert!(
+            compute_calibration(-5.0, 100).is_none(),
+            "negative estimate -> None"
+        );
+    }
+
+    #[test]
     fn decision_log_chain_integrity() {
         let tables = sample_tables();
         let indexes = sample_indexes();

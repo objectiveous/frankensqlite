@@ -699,4 +699,67 @@ mod tests {
         assert!(sub.has_cell_deltas());
         assert!(!sub.has_full_pages());
     }
+
+    #[test]
+    fn test_estimated_size_empty_returns_zero() {
+        let sub = MixedFrameSubmission::new(test_txn_id(), CommitSeq::new(1));
+        assert_eq!(sub.estimated_size(4096), 0);
+        assert_eq!(sub.estimated_size(0), 0);
+    }
+
+    #[test]
+    fn test_full_page_frame_fields_and_debug() {
+        let frame = FullPageFrame {
+            page_number: test_page_number(),
+            page_data: vec![0xAB; 4096],
+            db_size_if_commit: 55,
+        };
+        assert_eq!(frame.page_number, test_page_number());
+        assert_eq!(frame.page_data.len(), 4096);
+        assert_eq!(frame.db_size_if_commit, 55);
+
+        let cloned = frame.clone();
+        assert_eq!(cloned.page_number, frame.page_number);
+        assert_eq!(cloned.db_size_if_commit, frame.db_size_if_commit);
+
+        let dbg = format!("{frame:?}");
+        assert!(dbg.contains("FullPageFrame"));
+    }
+
+    #[test]
+    fn test_build_cell_delta_frames_preserves_key_digest() {
+        let digest_a = [0xAA; 16];
+        let digest_b = [0xBB; 16];
+        let descs = vec![
+            CellDeltaDescriptor::insert(
+                PageNumber::new(5).unwrap(),
+                digest_a,
+                vec![1, 2],
+            ),
+            CellDeltaDescriptor::delete(PageNumber::new(6).unwrap(), digest_b),
+        ];
+        let frames =
+            build_cell_delta_frames(descs.into_iter(), CommitSeq::new(10), test_txn_id());
+        assert_eq!(frames[0].cell_key_digest, digest_a);
+        assert_eq!(frames[1].cell_key_digest, digest_b);
+    }
+
+    #[test]
+    fn test_compression_ratio_cell_only_below_one() {
+        let mut sub = MixedFrameSubmission::new(test_txn_id(), CommitSeq::new(1));
+        sub.add_cell_delta(CellDeltaWalFrame::new(
+            test_page_number(),
+            test_key_digest(),
+            CellOp::Insert,
+            CommitSeq::new(1),
+            test_txn_id(),
+            vec![0u8; 80],
+        ));
+        let stats = MixedCommitStats::calculate(&sub, 4096);
+        assert_eq!(stats.full_page_frames, 0);
+        assert_eq!(stats.cell_delta_frames, 1);
+        let ratio = stats.compression_ratio(4096);
+        assert!(ratio < 1.0, "cell-only ratio should be < 1.0, got {ratio}");
+        assert!(ratio > 0.0, "ratio should be positive, got {ratio}");
+    }
 }

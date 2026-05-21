@@ -875,6 +875,41 @@ const NO_RESULT_CASES: &[MatchCase] = &[
     },
 ];
 
+const EMPTY_TABLE_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "bare term",
+        query: "rust",
+    },
+    MatchCase {
+        name: "phrase",
+        query: r#""full text""#,
+    },
+    MatchCase {
+        name: "prefix",
+        query: "search*",
+    },
+    MatchCase {
+        name: "column filter",
+        query: "title:sqlite",
+    },
+    MatchCase {
+        name: "boolean expression",
+        query: "rust OR sqlite",
+    },
+    MatchCase {
+        name: "near expression",
+        query: "NEAR(rust sqlite, 5)",
+    },
+    MatchCase {
+        name: "initial token anchor",
+        query: "body:^rust",
+    },
+    MatchCase {
+        name: "braced column set",
+        query: "{title body}:search",
+    },
+];
+
 const NO_RESULT_BOOLEAN_CASES: &[MatchCase] = &[
     MatchCase {
         name: "disjoint bare terms",
@@ -2272,6 +2307,28 @@ fn full_scan_rows_match_rusqlite_reference() {
         harness.sqlite_full_scan_rows(),
         "full-scan rowid and column conformance failed"
     );
+}
+
+#[test]
+fn empty_table_match_queries_match_rusqlite_reference() {
+    let empty_docs: &[Doc] = &[];
+    let harness = Fts5ConformanceHarness::with_docs(&[], empty_docs);
+
+    assert_eq!(
+        harness.franken_full_scan_rows(),
+        harness.sqlite_full_scan_rows(),
+        "empty-table full-scan conformance failed"
+    );
+
+    for case in EMPTY_TABLE_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "empty-table MATCH conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
 }
 
 #[test]

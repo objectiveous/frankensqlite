@@ -1310,6 +1310,65 @@ mod tests {
     }
 
     #[test]
+    fn commit_result_debug_clone_eq_all_variants() {
+        let committed = CommitResult::Committed {
+            commit_seq: CommitSeq::new(1),
+            commit_time_unix_ns: 42,
+        };
+        let dbg = format!("{committed:?}");
+        assert!(dbg.contains("Committed"));
+        assert_eq!(committed.clone(), committed);
+
+        let fcw = CommitResult::ConflictFcw {
+            conflicting_pages: vec![PageNumber::new(5).unwrap()],
+        };
+        assert_eq!(fcw.clone(), fcw);
+        assert_ne!(fcw, committed);
+
+        let ssi = CommitResult::ConflictSsi;
+        assert_eq!(ssi.clone(), ssi);
+
+        let shutdown = CommitResult::ShuttingDown;
+        assert_eq!(shutdown.clone(), shutdown);
+        assert_ne!(ssi, shutdown);
+    }
+
+    #[test]
+    fn commit_submission_debug_and_clone() {
+        let sub = make_submission(&[1, 2], 5, 7);
+        let dbg = format!("{sub:?}");
+        assert!(dbg.contains("CommitSubmission"));
+        let cloned = sub.clone();
+        assert_eq!(cloned.write_set_pages.len(), 2);
+        assert_eq!(cloned.begin_seq, CommitSeq::new(5));
+        assert_eq!(cloned.capsule_digest, [7u8; 32]);
+    }
+
+    #[test]
+    fn fsync_barriers_debug_clone_copy() {
+        let mut b = FsyncBarriers::new();
+        b.fsync1_complete = true;
+        let dbg = format!("{b:?}");
+        assert!(dbg.contains("FsyncBarriers"));
+        let copied = b;
+        assert_eq!(copied, b);
+        assert!(copied.fsync1_complete);
+        assert!(!copied.fsync2_complete);
+    }
+
+    #[test]
+    fn group_commit_batch_is_full_at_max() {
+        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 3);
+        let base = 1_000_000_u64;
+        for i in 0..3u8 {
+            let sub = make_submission(&[u32::from(i) + 1], 0, i);
+            coord.submit(sub, base + u64::from(i)).unwrap();
+        }
+        assert!(coord.batch.is_full());
+        assert_eq!(coord.batch.len(), 3);
+    }
+
+    #[test]
     fn test_commit_index_default_equals_new() {
         let a = CommitIndex::new();
         let b = CommitIndex::default();

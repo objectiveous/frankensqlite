@@ -5866,6 +5866,39 @@ mod tests {
     // ===================================================================
 
     #[test]
+    fn test_estimate_cost_ext_exact_page_costs_at_zero_rows() {
+        // At n_rows == 0 every per-row term vanishes, leaving the closed-form
+        // page-level cost for each access path. test_estimate_cost_ext_zero_rows_
+        // matches_legacy only checks FullTableScan and IndexScanEquality; pin the
+        // exact log2-based formulas for the remaining variants too. Power-of-two
+        // page counts keep the logs exact: ip=16 -> log2=4, tp=64 -> log2=6.
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        let (ip, tp) = (16u64, 64u64);
+
+        // Full scan == table page count.
+        assert!(approx(estimate_cost_ext(&AccessPathKind::FullTableScan, tp, ip, 0), 64.0));
+        // Rowid lookup == log2(table pages); no index term.
+        assert!(approx(estimate_cost_ext(&AccessPathKind::RowidLookup, tp, ip, 0), 6.0));
+        // Index equality == log2(index pages) + log2(table pages).
+        assert!(approx(estimate_cost_ext(&AccessPathKind::IndexScanEquality, tp, ip, 0), 10.0));
+
+        // Range scan == log2(ip) + sel*ip + sel*tp = 4 + 8 + 32.
+        let range = estimate_cost_ext(&AccessPathKind::IndexScanRange { selectivity: 0.5 }, tp, ip, 0);
+        assert!(approx(range, 44.0), "range page cost, got {range}");
+
+        // Covering scan omits the table-page (row dereference) term:
+        // log2(ip) + sel*ip = 4 + 8, with no sel*tp.
+        let covering =
+            estimate_cost_ext(&AccessPathKind::CoveringIndexScan { selectivity: 0.5 }, tp, ip, 0);
+        assert!(approx(covering, 12.0), "covering page cost, got {covering}");
+
+        // The structural difference is exactly the avoided table dereference,
+        // sel*tp = 0.5*64 = 32 -- the reason a covering scan ranks below a range
+        // scan over the same index.
+        assert!(approx(range - covering, 0.5 * 64.0));
+    }
+
+    #[test]
     fn test_estimate_cost_ext_zero_rows_matches_legacy() {
         // With n_rows == 0 the ext function must match the legacy formulas.
         let legacy = estimate_cost(&AccessPathKind::FullTableScan, 1000, 0);

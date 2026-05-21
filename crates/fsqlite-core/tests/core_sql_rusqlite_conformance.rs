@@ -2702,6 +2702,33 @@ const PATTERN_CASES: &[QueryCase] = &[
     },
 ];
 
+const PATTERN_SCALAR_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "like scalar ascii case folding",
+        sql: "SELECT like('he%', 'hello'), like('HE%', 'hello'), like('he%', 'shell'), like('he_', 'he_')",
+    },
+    QueryCase {
+        name: "like scalar escape handling",
+        sql: "SELECT like('he!_%', 'he_lo', '!'), like('he!%%', 'he%llo', '!'), like('he!!%', 'he!lp', '!')",
+    },
+    QueryCase {
+        name: "like scalar null propagation",
+        sql: "SELECT like(NULL, 'abc'), like('a%', NULL), like('a%', 'abc', NULL), typeof(like(NULL, 'abc'))",
+    },
+    QueryCase {
+        name: "glob scalar wildcards and ranges",
+        sql: "SELECT glob('he*', 'hello'), glob('HE*', 'hello'), glob('he?lo', 'hello'), glob('h[ae]llo', 'hello'), glob('*[0-9]', 'abc5')",
+    },
+    QueryCase {
+        name: "glob scalar null propagation",
+        sql: "SELECT glob(NULL, 'abc'), glob('a*', NULL), typeof(glob(NULL, 'abc'))",
+    },
+    QueryCase {
+        name: "column driven scalar pattern functions",
+        sql: "SELECT id, like('he%', name), like('he!_%', name, '!'), glob('he*', name), glob('HE*', name) FROM patterns ORDER BY id",
+    },
+];
+
 const REGEXP_ERROR_CASES: &[StatementCase] = &[
     StatementCase {
         name: "regexp without registered function",
@@ -3186,4 +3213,10 @@ fn pattern_matching_functions_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(PATTERN_SETUP);
     harness.assert_queries_match("LIKE/GLOB", PATTERN_CASES);
     harness.assert_statement_errors_match("REGEXP", REGEXP_ERROR_CASES);
+}
+
+#[test]
+fn pattern_scalar_functions_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(PATTERN_SETUP);
+    harness.assert_queries_match("LIKE/GLOB scalar function", PATTERN_SCALAR_CASES);
 }

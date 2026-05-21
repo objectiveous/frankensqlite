@@ -1380,6 +1380,29 @@ const SUBQUERY_CASES: &[QueryCase] = &[
     },
 ];
 
+const SCALAR_SUBQUERY_EDGE_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "scalar subquery row and empty result",
+        sql: "SELECT (SELECT amount FROM orders ORDER BY amount DESC LIMIT 1), (SELECT amount FROM orders WHERE amount > 999)",
+    },
+    QueryCase {
+        name: "correlated scalar count",
+        sql: "SELECT c.name, (SELECT COUNT(*) FROM orders o WHERE o.customer_id = c.id) AS order_count FROM customers c ORDER BY c.id",
+    },
+    QueryCase {
+        name: "exists ignores null projection",
+        sql: "SELECT name FROM customers c WHERE EXISTS (SELECT NULL FROM orders o WHERE o.customer_id = c.id AND o.status = 'pending') ORDER BY name",
+    },
+    QueryCase {
+        name: "not in subquery without nulls",
+        sql: "SELECT name FROM customers WHERE id NOT IN (SELECT customer_id FROM orders WHERE status = 'cancelled') ORDER BY name",
+    },
+    QueryCase {
+        name: "scalar subquery in predicate",
+        sql: "SELECT name FROM customers WHERE tier = (SELECT tier FROM customers WHERE name = 'Ada') ORDER BY name",
+    },
+];
+
 const PRAGMA_SETUP: &str = "
     PRAGMA foreign_keys = ON;
     PRAGMA user_version = 123;
@@ -1943,6 +1966,12 @@ fn order_by_nulls_placement_edges_match_rusqlite() {
 fn subqueries_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(SUBQUERY_SETUP);
     harness.assert_queries_match("subquery", SUBQUERY_CASES);
+}
+
+#[test]
+fn scalar_subquery_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(SUBQUERY_SETUP);
+    harness.assert_queries_match("scalar subquery edge", SCALAR_SUBQUERY_EDGE_CASES);
 }
 
 #[test]

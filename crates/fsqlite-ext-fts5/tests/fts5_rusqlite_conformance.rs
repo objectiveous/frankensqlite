@@ -490,6 +490,37 @@ const DEFAULT_SEPARATOR_CASES: &[MatchCase] = &[
     },
 ];
 
+const UNICODE61_TOKENCHAR_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "underscore token stays intact",
+        query: "my_function",
+    },
+    MatchCase {
+        name: "dotted identifier stays intact",
+        query: r#""AuthController.ts""#,
+    },
+    MatchCase {
+        name: "slash token stays intact",
+        query: r#""endpoint/v1""#,
+    },
+    MatchCase {
+        name: "plain split token remains searchable",
+        query: "endpoint",
+    },
+    MatchCase {
+        name: "body column code token",
+        query: r#"body:"my_function""#,
+    },
+    MatchCase {
+        name: "dotted router token",
+        query: r#""Router.js""#,
+    },
+    MatchCase {
+        name: "prefix over code token",
+        query: "Auth*",
+    },
+];
+
 const ASCII_TOKENIZER_CASES: &[MatchCase] = &[
     MatchCase {
         name: "ascii case folds uppercase body",
@@ -1574,6 +1605,22 @@ fn default_unicode61_separator_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "default unicode61 separator conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn unicode61_tokenchar_queries_match_rusqlite_reference() {
+    let harness =
+        Fts5ConformanceHarness::with_docs(UNICODE61_CODE_TOKEN_OPTIONS, UNICODE61_CODE_TOKEN_DOCS);
+
+    for case in UNICODE61_TOKENCHAR_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "unicode61 tokenchars conformance case failed: {} ({})",
             case.name,
             case.query
         );

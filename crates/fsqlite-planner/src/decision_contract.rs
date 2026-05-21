@@ -1143,6 +1143,26 @@ mod tests {
     }
 
     #[test]
+    fn access_path_kind_label_formats_selectivity_to_three_decimals() {
+        // access_path_kind_labels only checks the prefix for the parameterized
+        // variants; this pins the exact (sel={:.3}) formatting: three decimal
+        // places with trailing-zero padding, for both Range and Covering scans.
+        assert_eq!(
+            access_path_kind_label(&AccessPathKind::IndexScanRange { selectivity: 0.5 }),
+            "index_scan_range(sel=0.500)"
+        );
+        assert_eq!(
+            access_path_kind_label(&AccessPathKind::CoveringIndexScan { selectivity: 0.25 }),
+            "covering_index_scan(sel=0.250)"
+        );
+        // A value with more than three decimals is rounded to three.
+        assert_eq!(
+            access_path_kind_label(&AccessPathKind::IndexScanRange { selectivity: 0.12345 }),
+            "index_scan_range(sel=0.123)"
+        );
+    }
+
+    #[test]
     fn table_stats_summary_from() {
         let ts = TableStats {
             name: "foo".to_owned(),

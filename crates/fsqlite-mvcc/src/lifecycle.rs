@@ -3937,6 +3937,48 @@ mod tests {
     }
 
     #[test]
+    fn test_rollback_to_savepoint_rewrite_retained_lock_readds_commit_page() {
+        let m = mgr();
+        let mut txn = m.begin(BeginKind::Concurrent).unwrap();
+        let p1 = PageNumber::new(1).unwrap();
+        let p2 = PageNumber::new(2).unwrap();
+
+        m.write_page(&mut txn, p1, test_data(0x01)).unwrap();
+        let sp = m.savepoint(&txn, "sp_rewrite");
+        m.write_page(&mut txn, p2, test_data(0x02)).unwrap();
+        assert!(txn.page_locks.contains(&p2));
+
+        m.rollback_to_savepoint(&mut txn, &sp);
+        assert!(
+            txn.page_locks.contains(&p2),
+            "ROLLBACK TO keeps locks for pages written after the savepoint"
+        );
+        assert!(
+            !txn.write_set.contains(&p2),
+            "rolled-back page must be absent from the pending write set before rewrite"
+        );
+        assert!(!txn.write_set_data.contains_key(&p2));
+
+        let rewritten = test_data(0x33);
+        m.write_page(&mut txn, p2, rewritten.clone()).unwrap();
+        assert!(
+            txn.write_set.contains(&p2),
+            "rewriting a retained-lock page must re-add it to the pending write set"
+        );
+        assert!(txn.write_set_data.contains_key(&p2));
+
+        let commit_seq = m.commit(&mut txn).unwrap();
+        assert!(commit_seq > CommitSeq::ZERO);
+
+        let mut reader = m.begin(BeginKind::Concurrent).unwrap();
+        let read_back = m
+            .read_page(&mut reader, p2)
+            .expect("rewritten page must be published");
+        assert_eq!(read_back.as_bytes(), rewritten.as_bytes());
+        m.abort(&mut reader);
+    }
+
+    #[test]
     fn test_rollback_to_savepoint_keeps_witnesses() {
         let m = mgr();
         let mut txn = m.begin(BeginKind::Concurrent).unwrap();

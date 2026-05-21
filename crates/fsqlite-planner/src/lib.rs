@@ -6117,6 +6117,39 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_disjuncts_flattens_or_tree_regardless_of_nesting() {
+        // Symmetric pair to test_collect_conjuncts: collect_disjuncts recurses
+        // on OR (both sides), so any OR tree flattens to its leaves regardless
+        // of nesting; a non-OR expression yields a single disjunct.
+        let leaf = |n: i64| Expr::Literal(Literal::Integer(n), Span::ZERO);
+        let or = |l: Expr, r: Expr| Expr::BinaryOp {
+            left: Box::new(l),
+            op: AstBinaryOp::Or,
+            right: Box::new(r),
+            span: Span::ZERO,
+        };
+        let count = |e: &Expr| {
+            let mut v = Vec::new();
+            collect_disjuncts(e, &mut v);
+            v.len()
+        };
+
+        // A non-OR expression is a single disjunct.
+        assert_eq!(count(&leaf(1)), 1);
+        // a OR b -> 2.
+        assert_eq!(count(&or(leaf(1), leaf(2))), 2);
+        // Right-nested a OR (b OR c) -> 3.
+        assert_eq!(count(&or(leaf(1), or(leaf(2), leaf(3)))), 3);
+        // Left-nested (a OR b) OR c -> 3.
+        assert_eq!(count(&or(or(leaf(1), leaf(2)), leaf(3))), 3);
+        // Balanced (a OR b) OR (c OR d) -> 4.
+        assert_eq!(
+            count(&or(or(leaf(1), leaf(2)), or(leaf(3), leaf(4)))),
+            4
+        );
+    }
+
+    #[test]
     fn test_collect_conjuncts_flattens_and_tree_regardless_of_nesting() {
         // collect_conjuncts recursively splits on AND (both sides), so any AND
         // tree flattens to its leaves no matter how it is nested; a non-AND

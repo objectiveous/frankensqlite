@@ -2210,6 +2210,44 @@ const CONCAT_SCALAR_CASES: &[QueryCase] = &[
     },
 ];
 
+const SOUNDEX_SCALAR_SETUP: &str = "
+    CREATE TABLE soundex_values (
+        id INTEGER PRIMARY KEY,
+        name TEXT,
+        code INTEGER
+    );
+    INSERT INTO soundex_values (id, name, code) VALUES
+        (1, 'Robert', 123),
+        (2, 'Rupert', 456),
+        (3, 'Ashcraft', 789),
+        (4, '', 0),
+        (5, NULL, NULL),
+        (6, '1234', 321);
+";
+
+const SOUNDEX_SCALAR_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "canonical soundex examples",
+        sql: "SELECT soundex('Robert'), soundex('Rupert'), soundex('Ashcraft'), soundex('Tymczak')",
+    },
+    QueryCase {
+        name: "empty null and non alpha inputs",
+        sql: "SELECT soundex(''), soundex(NULL), soundex('1234'), soundex('---')",
+    },
+    QueryCase {
+        name: "duplicate codes and separators",
+        sql: "SELECT soundex('Pfister'), soundex('Honeyman'), soundex('Van-Deusen'), soundex('van deusen')",
+    },
+    QueryCase {
+        name: "numeric coercion",
+        sql: "SELECT soundex(123), soundex(3.14), soundex(-7)",
+    },
+    QueryCase {
+        name: "column driven soundex",
+        sql: "SELECT id, soundex(name), soundex(code) FROM soundex_values ORDER BY id",
+    },
+];
+
 const CHAR_UNICODE_SETUP: &str = "
     CREATE TABLE char_unicode_values (
         id INTEGER PRIMARY KEY,
@@ -2869,6 +2907,12 @@ fn string_scalar_edges_match_rusqlite() {
 fn concat_scalar_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CONCAT_SCALAR_SETUP);
     harness.assert_queries_match("concat scalar edge", CONCAT_SCALAR_CASES);
+}
+
+#[test]
+fn soundex_scalar_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(SOUNDEX_SCALAR_SETUP);
+    harness.assert_queries_match("soundex scalar edge", SOUNDEX_SCALAR_CASES);
 }
 
 #[test]

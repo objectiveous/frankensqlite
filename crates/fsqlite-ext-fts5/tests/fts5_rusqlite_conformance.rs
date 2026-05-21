@@ -25,6 +25,14 @@ struct MultiMatchCase {
     right_query: &'static str,
 }
 
+#[derive(Clone, Copy)]
+struct RowidWindowCase {
+    name: &'static str,
+    query: &'static str,
+    limit: usize,
+    offset: usize,
+}
+
 struct TokenizerCase {
     name: &'static str,
     options: &'static [&'static str],
@@ -801,6 +809,45 @@ const MULTIPLE_MATCH_BOOLEAN_CASES: &[MultiMatchCase] = &[
     },
 ];
 
+const ROWID_WINDOW_CASES: &[RowidWindowCase] = &[
+    RowidWindowCase {
+        name: "first two search matches",
+        query: "search",
+        limit: 2,
+        offset: 0,
+    },
+    RowidWindowCase {
+        name: "middle rust window",
+        query: "rust",
+        limit: 2,
+        offset: 1,
+    },
+    RowidWindowCase {
+        name: "offset consumes prefix results",
+        query: "sqlite OR search",
+        limit: 2,
+        offset: 2,
+    },
+    RowidWindowCase {
+        name: "column filter window",
+        query: "body:search",
+        limit: 3,
+        offset: 1,
+    },
+    RowidWindowCase {
+        name: "boolean window past first row",
+        query: "rust OR cooking",
+        limit: 4,
+        offset: 1,
+    },
+    RowidWindowCase {
+        name: "window past result count",
+        query: "sqlite",
+        limit: 2,
+        offset: 10,
+    },
+];
+
 const NO_RESULT_CASES: &[MatchCase] = &[
     MatchCase {
         name: "absent term",
@@ -1483,6 +1530,30 @@ impl Fts5ConformanceHarness {
             .expect("read rusqlite FTS5 rowids")
     }
 
+    fn franken_match_rowid_window(&self, case: RowidWindowCase) -> Vec<i64> {
+        self.franken_match_rowids(case.query)
+            .into_iter()
+            .skip(case.offset)
+            .take(case.limit)
+            .collect()
+    }
+
+    fn sqlite_match_rowid_window(&self, case: RowidWindowCase) -> Vec<i64> {
+        let mut stmt = self
+            .sqlite
+            .prepare(
+                "SELECT rowid FROM docs WHERE docs MATCH ?1 \
+                 ORDER BY rowid LIMIT ?2 OFFSET ?3",
+            )
+            .expect("prepare rusqlite FTS5 MATCH window query");
+        stmt.query_map((case.query, case.limit as i64, case.offset as i64), |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("query rusqlite FTS5 rowid window")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("read rusqlite FTS5 rowid window")
+    }
+
     fn franken_multiple_match_rowids(&self, left_query: &str, right_query: &str) -> Vec<i64> {
         let cx = Cx::new();
         let mut cursor = self.franken.open().expect("open FrankenSQLite FTS5 cursor");
@@ -2105,6 +2176,23 @@ fn multiple_match_boolean_constraints_match_rusqlite_reference() {
             case.name,
             case.left_query,
             case.right_query
+        );
+    }
+}
+
+#[test]
+fn rowid_window_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in ROWID_WINDOW_CASES {
+        assert_eq!(
+            harness.franken_match_rowid_window(*case),
+            harness.sqlite_match_rowid_window(*case),
+            "rowid window conformance case failed: {} ({}, limit {}, offset {})",
+            case.name,
+            case.query,
+            case.limit,
+            case.offset
         );
     }
 }

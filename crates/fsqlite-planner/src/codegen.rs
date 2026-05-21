@@ -2974,6 +2974,73 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_expr_arithmetic_and_unary_ops() {
+        // emit_expr lowers a non-comparison BinaryOp to the matching arithmetic
+        // opcode (left into dest, right into a temp), and the four unary ops to:
+        // Negate -> multiply by -1, Plus -> no-op, Not -> Not, BitNot -> BitNot.
+        let lit = |n: i64| Box::new(Expr::Literal(Literal::Integer(n), Span::ZERO));
+        let prog_of = |expr: Expr| {
+            let mut b = ProgramBuilder::new();
+            let reg = b.alloc_reg();
+            emit_expr(&mut b, &expr, reg).unwrap();
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.finish().unwrap()
+        };
+
+        // 3 + 5 -> Integer, Integer, Add.
+        let add = prog_of(Expr::BinaryOp {
+            left: lit(3),
+            op: AstBinaryOp::Add,
+            right: lit(5),
+            span: Span::ZERO,
+        });
+        assert!(has_opcodes(&add, &[Opcode::Integer, Opcode::Integer, Opcode::Add]));
+
+        // -3 -> operand, Integer(-1), Multiply (negation lowers to x * -1).
+        let neg = prog_of(Expr::UnaryOp {
+            op: AstUnaryOp::Negate,
+            expr: lit(3),
+            span: Span::ZERO,
+        });
+        assert!(has_opcodes(
+            &neg,
+            &[Opcode::Integer, Opcode::Integer, Opcode::Multiply]
+        ));
+
+        // NOT x -> Not; ~x -> BitNot.
+        let not = prog_of(Expr::UnaryOp {
+            op: AstUnaryOp::Not,
+            expr: lit(3),
+            span: Span::ZERO,
+        });
+        assert!(not.ops().iter().any(|o| o.opcode == Opcode::Not));
+        let bitnot = prog_of(Expr::UnaryOp {
+            op: AstUnaryOp::BitNot,
+            expr: lit(3),
+            span: Span::ZERO,
+        });
+        assert!(bitnot.ops().iter().any(|o| o.opcode == Opcode::BitNot));
+
+        // Unary plus is a no-op: only the operand (one Integer) plus the Halt.
+        let plus = prog_of(Expr::UnaryOp {
+            op: AstUnaryOp::Plus,
+            expr: lit(3),
+            span: Span::ZERO,
+        });
+        let non_halt: Vec<Opcode> = plus
+            .ops()
+            .iter()
+            .map(|o| o.opcode)
+            .filter(|&o| o != Opcode::Halt)
+            .collect();
+        assert_eq!(
+            non_halt,
+            vec![Opcode::Integer],
+            "unary plus emits only the operand"
+        );
+    }
+
+    #[test]
     fn test_emit_expr_large_integer_literal_uses_int64_opcode() {
         let mut b = ProgramBuilder::new();
         let reg = b.alloc_reg();

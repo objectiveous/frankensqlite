@@ -419,4 +419,31 @@ mod tests {
         let idx = LearnedIndex::build(&keys, LearnedIndexConfig::default());
         assert_eq!(idx.lookup(u64::MAX), None);
     }
+
+    #[test]
+    fn nonuniform_all_present_findable_and_in_range_gaps_absent() {
+        // Quadratic keys produce growing gaps; the error-bounded search must
+        // still resolve every present key, and reject keys that fall *inside*
+        // the range (between consecutive squares) rather than only out-of-range.
+        let keys: Vec<u64> = (0..300u64).map(|i| i * i).collect();
+        let idx = LearnedIndex::build(&keys, LearnedIndexConfig { max_error: 16 });
+
+        for (pos, &k) in keys.iter().enumerate() {
+            assert_eq!(idx.lookup(k), Some(pos), "present key {k} must be found at {pos}");
+        }
+
+        // For i >= 2, i*i - 1 is never a perfect square, so it is an in-range
+        // gap that must resolve to None (not a false positive).
+        for &k in &keys[2..60] {
+            assert_eq!(idx.lookup(k - 1), None, "in-gap key {} must be absent", k - 1);
+        }
+
+        // A small clustered set with an obvious interior gap.
+        let clustered = vec![0u64, 1, 2, 1000, 1001, 1002];
+        let idx2 = LearnedIndex::build(&clustered, LearnedIndexConfig { max_error: 4 });
+        for (pos, &k) in clustered.iter().enumerate() {
+            assert_eq!(idx2.lookup(k), Some(pos));
+        }
+        assert_eq!(idx2.lookup(500), None, "a key in the large interior gap is absent");
+    }
 }

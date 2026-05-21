@@ -215,6 +215,29 @@ const UNICODE61_SEPARATOR_DOCS: &[Doc] = &[
     },
 ];
 
+const UNICODE61_DEFAULT_SEPARATOR_DOCS: &[Doc] = &[
+    Doc {
+        rowid: 1,
+        title: "Dot separated",
+        body: "alpha.beta gamma",
+    },
+    Doc {
+        rowid: 2,
+        title: "Hyphen separated",
+        body: "alpha beta-gamma",
+    },
+    Doc {
+        rowid: 3,
+        title: "Underscore separated",
+        body: "alpha_beta delta",
+    },
+    Doc {
+        rowid: 4,
+        title: "Joined token",
+        body: "alphabeta gamma",
+    },
+];
+
 const UNICODE61_DIACRITIC_OPTIONS: &[&str] = &["tokenize='unicode61 remove_diacritics 2'"];
 const UNICODE61_CODE_TOKEN_OPTIONS: &[&str] = &[r#"tokenize="unicode61 tokenchars '-_./:@#$%'""#];
 const UNICODE61_SEPARATOR_OPTIONS: &[&str] = &[r#"tokenize="unicode61 separators '_.'""#];
@@ -311,6 +334,29 @@ const DEFAULT_DIACRITIC_CASES: &[MatchCase] = &[
     MatchCase {
         name: "accented prefix matches plain token",
         query: "résum*",
+    },
+];
+
+const DEFAULT_SEPARATOR_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "dot separator exposes right token",
+        query: "beta",
+    },
+    MatchCase {
+        name: "underscore separator exposes both tokens",
+        query: "alpha AND delta",
+    },
+    MatchCase {
+        name: "hyphen separator supports adjacent phrase",
+        query: r#""beta gamma""#,
+    },
+    MatchCase {
+        name: "body column phrase over punctuation",
+        query: r#"body:"alpha beta""#,
+    },
+    MatchCase {
+        name: "prefix includes joined and split tokens",
+        query: "alph*",
     },
 ];
 
@@ -1214,6 +1260,21 @@ fn default_unicode61_diacritic_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "default unicode61 diacritic conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn default_unicode61_separator_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::with_docs(&[], UNICODE61_DEFAULT_SEPARATOR_DOCS);
+
+    for case in DEFAULT_SEPARATOR_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "default unicode61 separator conformance case failed: {} ({})",
             case.name,
             case.query
         );

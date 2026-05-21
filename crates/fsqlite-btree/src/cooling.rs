@@ -600,4 +600,29 @@ mod tests {
         csm.evict_page(1).expect("a cooling page evicts");
         assert_eq!(csm.frame_addr(1), None);
     }
+
+    #[test]
+    fn temperature_counts_buckets_pages_by_thermal_state() {
+        // temperature_counts is only exercised via the Debug impl; pin that it
+        // tallies one page into each of hot/cooling/cold and that the buckets
+        // sum to the tracked count. Set up one page per state.
+        let csm = CoolingStateMachine::new(CoolingConfig::default());
+        csm.register_page(1);
+        csm.register_page(2);
+        csm.register_page(3); // stays COLD (never loaded)
+
+        csm.load_page(1, 0x1000); // -> HOT
+        csm.load_page(2, 0x2000); // -> HOT
+        csm.run_cooling_scan(); // pages 1 and 2 -> COOLING
+        csm.load_page(1, 0x1000); // re-heat page 1 -> HOT, leaving page 2 COOLING
+
+        let counts = csm.temperature_counts();
+        assert_eq!(counts.hot, 1);
+        assert_eq!(counts.cooling, 1);
+        assert_eq!(counts.cold, 1);
+        assert_eq!(
+            counts.hot + counts.cooling + counts.cold,
+            csm.tracked_count()
+        );
+    }
 }

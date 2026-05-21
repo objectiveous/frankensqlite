@@ -512,6 +512,35 @@ mod tests {
     }
 
     #[test]
+    fn test_trunk_parse_rejects_over_capacity_and_skips_zero_entries() {
+        // A trunk page whose declared leaf_count exceeds what the page can hold
+        // is corruption. A 16-byte page holds max (16/4 - 2) = 2 leaf entries.
+        let mut over = vec![0u8; 16];
+        over[4..8].copy_from_slice(&3u32.to_be_bytes()); // claims 3 > 2
+        assert!(
+            matches!(
+                FreelistTrunk::parse(&over),
+                Err(FrankenError::DatabaseCorrupt { .. })
+            ),
+            "leaf_count over capacity must be rejected"
+        );
+
+        // Zero page-number entries in the leaf array are defensively skipped: a
+        // valid DB never stores them, and parse must never surface page 0.
+        let mut page = vec![0u8; 4096];
+        page[0..4].copy_from_slice(&0u32.to_be_bytes()); // no next trunk
+        page[4..8].copy_from_slice(&3u32.to_be_bytes()); // 3 declared entries
+        page[8..12].copy_from_slice(&20u32.to_be_bytes());
+        page[12..16].copy_from_slice(&0u32.to_be_bytes()); // zero -> skipped
+        page[16..20].copy_from_slice(&40u32.to_be_bytes());
+        let parsed = FreelistTrunk::parse(&page).unwrap();
+        assert!(parsed.next_trunk.is_none());
+        assert_eq!(parsed.leaf_pages.len(), 2, "zero entry must be skipped");
+        assert_eq!(parsed.leaf_pages[0].get(), 20);
+        assert_eq!(parsed.leaf_pages[1].get(), 40);
+    }
+
+    #[test]
     fn test_freelist_allocate_from_free() {
         let mut fl = Freelist::with_pages(
             vec![PageNumber::new(10).unwrap(), PageNumber::new(20).unwrap()],

@@ -2544,6 +2544,27 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_codegen_error_display_messages() {
+        assert_eq!(
+            CodegenError::TableNotFound("users".to_owned()).to_string(),
+            "table not found: users"
+        );
+        // The message names the column before the table.
+        assert_eq!(
+            CodegenError::ColumnNotFound {
+                table: "t".to_owned(),
+                column: "c".to_owned(),
+            }
+            .to_string(),
+            "column c not found in table t"
+        );
+        assert_eq!(
+            CodegenError::Unsupported("DISTINCT".to_owned()).to_string(),
+            "unsupported: DISTINCT"
+        );
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),

@@ -981,6 +981,33 @@ const SCALAR_NULL_COMPARISON_CASES: &[QueryCase] = &[
     },
 ];
 
+const BOOLEAN_LOGIC_PRECEDENCE_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "literal three valued truth table",
+        sql: "SELECT NULL AND 0, NULL AND 1, NULL OR 0, NULL OR 1, NOT NULL, NOT 0, NOT 5",
+    },
+    QueryCase {
+        name: "null predicate conjunctions",
+        sql: "SELECT id, a IS NOT NULL AND b IS NOT NULL, a IS NULL OR b IS NULL, NOT (a IS NULL OR b IS NULL) FROM expr_rows ORDER BY id",
+    },
+    QueryCase {
+        name: "not comparison precedence",
+        sql: "SELECT id, NOT a = b, NOT (a = b), (NOT a) = b FROM expr_rows ORDER BY id",
+    },
+    QueryCase {
+        name: "grouped where predicate",
+        sql: "SELECT id FROM expr_rows WHERE NOT (a > 3 AND b > 3) OR (label IS NULL AND a < b) ORDER BY id",
+    },
+    QueryCase {
+        name: "mixed comparison boolean projections",
+        sql: "SELECT id, (a > 3) AND (label = 'high'), (a < b) OR (label IS NULL), (a = b) OR NULL FROM expr_rows ORDER BY id",
+    },
+    QueryCase {
+        name: "truthy columns in case and iif",
+        sql: "SELECT id, CASE WHEN a AND b THEN 'both' WHEN a OR b THEN 'either' ELSE 'neither' END, IIF(a > b, 'gt', 'not-gt') FROM expr_rows ORDER BY id",
+    },
+];
+
 const DISTINCT_ORDER_LIMIT_CASES: &[QueryCase] = &[
     QueryCase {
         name: "distinct nullable text ordering",
@@ -1533,6 +1560,15 @@ fn case_and_null_logic_match_rusqlite() {
 fn scalar_null_comparison_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
     harness.assert_queries_match("scalar NULL/comparison edge", SCALAR_NULL_COMPARISON_CASES);
+}
+
+#[test]
+fn boolean_logic_precedence_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
+    harness.assert_queries_match(
+        "boolean logic precedence edge",
+        BOOLEAN_LOGIC_PRECEDENCE_CASES,
+    );
 }
 
 #[test]

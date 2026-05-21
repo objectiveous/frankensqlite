@@ -213,6 +213,8 @@ pub enum DataflowOperator {
     ScaleWeight { factor: i64 },
     /// Keep rows with positive accumulated weight as set membership.
     ThresholdPositive,
+    /// Append each row's algebraic weight as an integer payload column for emission.
+    AppendWeightColumn,
     /// Compute `DeltaLeft JOIN Right`, with the current stream as the delta-left input.
     DeltaJoinLeft {
         stable_right: Vec<WeightedRow>,
@@ -271,6 +273,7 @@ impl DataflowOperator {
             Self::ConsolidateRows => Ok(consolidate_rows(rows.iter().cloned().collect())),
             Self::ScaleWeight { factor } => Ok(scale_weights(rows, *factor)),
             Self::ThresholdPositive => Ok(threshold_positive(rows)),
+            Self::AppendWeightColumn => Ok(append_weight_column(rows)),
             Self::DeltaJoinLeft {
                 stable_right,
                 key_spec,
@@ -560,6 +563,20 @@ pub fn threshold_positive(rows: &[WeightedRow]) -> Vec<WeightedRow> {
     consolidate_rows(rows.to_vec())
         .into_iter()
         .filter_map(|row| (row.weight > 0).then(|| WeightedRow::insert(row.values)))
+        .collect()
+}
+
+/// Materialize algebraic weights into payload rows for downstream delta emission.
+pub fn append_weight_column(rows: &[WeightedRow]) -> Vec<WeightedRow> {
+    rows.iter()
+        .filter_map(|row| {
+            if row.is_zero() {
+                return None;
+            }
+            let mut values = row.values.clone();
+            values.push(SqliteValue::Integer(row.weight));
+            Some(WeightedRow::insert(values))
+        })
         .collect()
 }
 
@@ -1016,6 +1033,26 @@ mod tests {
         let actual = automaton.execute(&rows).expect("dataflow should execute");
 
         assert_eq!(actual, vec![WeightedRow::insert(vec![int(1)])]);
+    }
+
+    #[test]
+    fn append_weight_column_materializes_delta_weights_for_emission() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::AppendWeightColumn]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), int(10)], 3),
+            WeightedRow::new(vec![int(2), int(20)], -2),
+            WeightedRow::new(vec![int(3), int(30)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::insert(vec![int(1), int(10), int(3)]),
+                WeightedRow::insert(vec![int(2), int(20), int(-2)]),
+            ]
+        );
     }
 
     #[test]

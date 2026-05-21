@@ -614,6 +614,33 @@ const TRIGRAM_CASE_SENSITIVE_CASES: &[MatchCase] = &[
     },
 ];
 
+const TRIGRAM_REMOVE_DIACRITIC_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "plain query matches accented trigram",
+        query: "abc",
+    },
+    MatchCase {
+        name: "accented query matches plain trigram",
+        query: "ábC",
+    },
+    MatchCase {
+        name: "accented leading trigram normalizes",
+        query: "éab",
+    },
+    MatchCase {
+        name: "multi-trigram term after diacritic removal",
+        query: "sigma",
+    },
+    MatchCase {
+        name: "title column multi-trigram term",
+        query: "title:accent",
+    },
+    MatchCase {
+        name: "body column accented trigram",
+        query: "body:éab",
+    },
+];
+
 const MULTIPLE_MATCH_CASES: &[MultiMatchCase] = &[
     MultiMatchCase {
         name: "intersect bare terms",
@@ -1611,6 +1638,24 @@ fn trigram_case_sensitive_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "trigram case-sensitive conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn trigram_remove_diacritic_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::with_docs(
+        TRIGRAM_REMOVE_DIACRITICS_OPTIONS,
+        TRIGRAM_DIACRITIC_DOCS,
+    );
+
+    for case in TRIGRAM_REMOVE_DIACRITIC_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "trigram remove-diacritic conformance case failed: {} ({})",
             case.name,
             case.query
         );

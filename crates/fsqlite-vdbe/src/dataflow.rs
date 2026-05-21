@@ -342,6 +342,8 @@ pub enum DataflowOperator {
     ScaleWeight { factor: i64 },
     /// Reverse every row's algebraic delta polarity.
     NegateWeight,
+    /// Collapse every non-zero row weight to its algebraic sign.
+    NormalizeWeightSign,
     /// Rewrite every non-zero input row to a fixed output weight.
     SetWeight { weight: i64 },
     /// Keep rows with positive accumulated weight as set membership.
@@ -488,6 +490,7 @@ impl DataflowOperator {
             Self::ConsolidateRows => Ok(consolidate_rows(rows.iter().cloned().collect())),
             Self::ScaleWeight { factor } => Ok(scale_weights(rows, *factor)),
             Self::NegateWeight => Ok(negate_weights(rows)),
+            Self::NormalizeWeightSign => Ok(normalize_weight_sign(rows)),
             Self::SetWeight { weight } => Ok(set_weights(rows, *weight)),
             Self::ThresholdPositive => Ok(threshold_positive(rows)),
             Self::AppendWeightColumn => Ok(append_weight_column(rows)),
@@ -1482,6 +1485,22 @@ pub fn scale_weights(rows: &[WeightedRow], factor: i64) -> Vec<WeightedRow> {
 /// Reverse row weights while preserving row order and values.
 pub fn negate_weights(rows: &[WeightedRow]) -> Vec<WeightedRow> {
     scale_weights(rows, -1)
+}
+
+/// Collapse non-zero row weights to `+1` or `-1`, preserving polarity and values.
+pub fn normalize_weight_sign(rows: &[WeightedRow]) -> Vec<WeightedRow> {
+    rows.iter()
+        .filter_map(|row| {
+            let weight = if row.weight > 0 {
+                1
+            } else if row.weight < 0 {
+                -1
+            } else {
+                return None;
+            };
+            Some(WeightedRow::new(row.values.clone(), weight))
+        })
+        .collect()
 }
 
 /// Rewrite non-zero input rows to a fixed algebraic weight.
@@ -4302,6 +4321,35 @@ mod tests {
         let actual = super::negate_weights(&rows);
 
         assert_eq!(actual, vec![WeightedRow::new(vec![int(1)], i64::MAX)]);
+    }
+
+    #[test]
+    fn normalize_weight_sign_operator_collapses_magnitude_and_preserves_polarity() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::NormalizeWeightSign]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), int(10)], i64::MAX),
+            WeightedRow::new(vec![int(2), int(20)], -7),
+            WeightedRow::new(vec![int(3), int(30)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::insert(vec![int(1), int(10)]),
+                WeightedRow::delete(vec![int(2), int(20)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_weight_sign_handles_minimum_weight_without_overflow() {
+        let rows = vec![WeightedRow::new(vec![int(1)], i64::MIN)];
+
+        let actual = super::normalize_weight_sign(&rows);
+
+        assert_eq!(actual, vec![WeightedRow::delete(vec![int(1)])]);
     }
 
     #[test]

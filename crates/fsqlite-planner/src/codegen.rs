@@ -2328,6 +2328,17 @@ mod tests {
             result_column_count(&[ResultColumn::Star, ResultColumn::Star], &table),
             6
         );
+
+        // `t.*` (TableStar) expands exactly like `*` and composes with a plain
+        // star and with an expr. This variant was not previously constructed by
+        // the test, even though result_column_count handles it identically.
+        let table_star = || ResultColumn::TableStar(QualifiedName::bare("t"));
+        assert_eq!(result_column_count(&[table_star()], &table), 3);
+        assert_eq!(
+            result_column_count(&[table_star(), ResultColumn::Star], &table),
+            6
+        );
+        assert_eq!(result_column_count(&[table_star(), expr()], &table), 4);
     }
 
     #[test]

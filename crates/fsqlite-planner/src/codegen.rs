@@ -2176,6 +2176,47 @@ mod tests {
         assert_eq!(codes.len(), 5, "OE conflict codes must be distinct");
     }
 
+    #[test]
+    fn test_binary_op_to_opcode_and_is_comparison_classification() {
+        use AstBinaryOp as B;
+
+        // Arithmetic / bitwise / logical / concat map directly...
+        assert_eq!(binary_op_to_opcode(B::Add), Opcode::Add);
+        assert_eq!(binary_op_to_opcode(B::Subtract), Opcode::Subtract);
+        assert_eq!(binary_op_to_opcode(B::Multiply), Opcode::Multiply);
+        assert_eq!(binary_op_to_opcode(B::Divide), Opcode::Divide);
+        // ...with one rename: Modulo -> Remainder.
+        assert_eq!(binary_op_to_opcode(B::Modulo), Opcode::Remainder);
+        assert_eq!(binary_op_to_opcode(B::Concat), Opcode::Concat);
+        assert_eq!(binary_op_to_opcode(B::BitAnd), Opcode::BitAnd);
+        assert_eq!(binary_op_to_opcode(B::BitOr), Opcode::BitOr);
+        assert_eq!(binary_op_to_opcode(B::ShiftLeft), Opcode::ShiftLeft);
+        assert_eq!(binary_op_to_opcode(B::ShiftRight), Opcode::ShiftRight);
+        assert_eq!(binary_op_to_opcode(B::And), Opcode::And);
+        assert_eq!(binary_op_to_opcode(B::Or), Opcode::Or);
+
+        // Comparisons; IS / IS NOT collapse onto Eq / Ne at the opcode level.
+        assert_eq!(binary_op_to_opcode(B::Eq), Opcode::Eq);
+        assert_eq!(binary_op_to_opcode(B::Is), Opcode::Eq);
+        assert_eq!(binary_op_to_opcode(B::Ne), Opcode::Ne);
+        assert_eq!(binary_op_to_opcode(B::IsNot), Opcode::Ne);
+        assert_eq!(binary_op_to_opcode(B::Lt), Opcode::Lt);
+        assert_eq!(binary_op_to_opcode(B::Le), Opcode::Le);
+        assert_eq!(binary_op_to_opcode(B::Gt), Opcode::Gt);
+        assert_eq!(binary_op_to_opcode(B::Ge), Opcode::Ge);
+
+        // is_comparison_op: the six relational ops plus IS / IS NOT, nothing else.
+        for op in [B::Eq, B::Ne, B::Lt, B::Le, B::Gt, B::Ge, B::Is, B::IsNot] {
+            assert!(is_comparison_op(op), "{op:?} is a comparison");
+        }
+        for op in [
+            B::Add, B::Subtract, B::Multiply, B::Divide, B::Modulo, B::Concat, B::BitAnd, B::BitOr,
+            B::ShiftLeft, B::ShiftRight, B::And, B::Or,
+        ] {
+            assert!(!is_comparison_op(op), "{op:?} is not a comparison");
+        }
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),

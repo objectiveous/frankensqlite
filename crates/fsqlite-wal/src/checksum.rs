@@ -3058,4 +3058,64 @@ mod tests {
         let i2 = integrity_hash_xxh3_128(data);
         assert_eq!(i1, i2, "integrity_hash must be deterministic");
     }
+
+    #[test]
+    fn integrity_check_report_ok_and_sqlite_messages() {
+        let report = IntegrityCheckReport::ok(10);
+        assert!(report.is_ok());
+        assert_eq!(report.pages_checked, 10);
+        assert_eq!(report.sqlite_messages(), vec!["ok"]);
+    }
+
+    #[test]
+    fn integrity_check_report_with_issues() {
+        let mut report = IntegrityCheckReport::ok(5);
+        report.push(IntegrityCheckLevel::Page, Some(3), "bad page");
+        report.push(IntegrityCheckLevel::Schema, None, "schema err");
+        assert!(!report.is_ok());
+        assert_eq!(report.issues.len(), 2);
+        let msgs = report.sqlite_messages();
+        assert_eq!(msgs, vec!["bad page", "schema err"]);
+        assert_eq!(report.issues[0].level, IntegrityCheckLevel::Page);
+        assert_eq!(report.issues[1].page_number, None);
+    }
+
+    #[test]
+    fn checksum_failure_kind_all_variants_copy_eq() {
+        let variants = [
+            ChecksumFailureKind::WalFrameChecksumMismatch,
+            ChecksumFailureKind::Xxh3PageChecksumMismatch,
+            ChecksumFailureKind::Crc32cSymbolMismatch,
+            ChecksumFailureKind::DbFileCorruption,
+        ];
+        for (i, v) in variants.iter().enumerate() {
+            let copied = *v;
+            assert_eq!(copied, *v);
+            for (j, w) in variants.iter().enumerate() {
+                assert_eq!(i == j, v == w);
+            }
+        }
+        let dbg = format!("{:?}", ChecksumFailureKind::Crc32cSymbolMismatch);
+        assert!(dbg.contains("Crc32cSymbolMismatch"));
+    }
+
+    #[test]
+    fn integrity_check_level_all_variants_copy_eq() {
+        let variants = [
+            IntegrityCheckLevel::Page,
+            IntegrityCheckLevel::BtreeStructural,
+            IntegrityCheckLevel::RecordFormat,
+            IntegrityCheckLevel::CrossReference,
+            IntegrityCheckLevel::Schema,
+        ];
+        for (i, v) in variants.iter().enumerate() {
+            let copied = *v;
+            assert_eq!(copied, *v);
+            for (j, w) in variants.iter().enumerate() {
+                assert_eq!(i == j, v == w);
+            }
+        }
+        let dbg = format!("{:?}", IntegrityCheckLevel::BtreeStructural);
+        assert!(dbg.contains("BtreeStructural"));
+    }
 }

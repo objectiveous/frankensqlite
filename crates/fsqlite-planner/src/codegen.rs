@@ -2217,6 +2217,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_extract_column_eq_bind_symmetry_and_rowid_exclusion() {
+        let bin = |left: Expr, right: Expr| Expr::BinaryOp {
+            left: Box::new(left),
+            op: AstBinaryOp::Eq,
+            right: Box::new(right),
+            span: Span::ZERO,
+        };
+        let col = |name: &str| Expr::Column(ColumnRef::bare(name), Span::ZERO);
+
+        // `name = ?2` -> ("name", 2).
+        let e = bin(col("name"), placeholder(2));
+        assert_eq!(extract_column_eq_bind(Some(&e)), Some(("name".to_owned(), 2)));
+
+        // Symmetric form `?3 = age` -> ("age", 3).
+        let e = bin(placeholder(3), col("age"));
+        assert_eq!(extract_column_eq_bind(Some(&e)), Some(("age".to_owned(), 3)));
+
+        // rowid columns are excluded (they take a separate seek path) -> None.
+        let e = bin(col("rowid"), placeholder(1));
+        assert_eq!(extract_column_eq_bind(Some(&e)), None);
+
+        // A non-bind right-hand side (`name = age`) -> None.
+        let e = bin(col("name"), col("age"));
+        assert_eq!(extract_column_eq_bind(Some(&e)), None);
+
+        // A non-equality operator (`name < ?1`) -> None.
+        let lt = Expr::BinaryOp {
+            left: Box::new(col("name")),
+            op: AstBinaryOp::Lt,
+            right: Box::new(placeholder(1)),
+            span: Span::ZERO,
+        };
+        assert_eq!(extract_column_eq_bind(Some(&lt)), None);
+
+        // No WHERE clause -> None.
+        assert_eq!(extract_column_eq_bind(None), None);
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),

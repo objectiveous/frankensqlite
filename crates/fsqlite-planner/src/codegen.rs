@@ -3041,6 +3041,41 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_expr_cast_threads_affinity_char_into_cast_op_p2() {
+        // CAST(expr AS type) emits a Cast op whose p2 is the affinity
+        // character's byte value (type_to_affinity applied to the type name).
+        // type_to_affinity is unit-tested, but its wire-up into the emitted Cast
+        // op was not.
+        let cast_p2 = |type_name: &str| -> i32 {
+            let mut b = ProgramBuilder::new();
+            let reg = b.alloc_reg();
+            let expr = Expr::Cast {
+                expr: Box::new(Expr::Literal(Literal::Integer(3), Span::ZERO)),
+                type_name: fsqlite_ast::TypeName {
+                    name: type_name.to_owned(),
+                    arg1: None,
+                    arg2: None,
+                },
+                span: Span::ZERO,
+            };
+            emit_expr(&mut b, &expr, reg).unwrap();
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            let prog = b.finish().unwrap();
+            prog.ops()
+                .iter()
+                .find(|o| o.opcode == Opcode::Cast)
+                .expect("Cast op present")
+                .p2
+        };
+
+        // Affinity char codes: A=Blob(65), B=Text(66), D=Integer(68), E=Real(69).
+        assert_eq!(cast_p2("INTEGER"), i32::from(b'D'));
+        assert_eq!(cast_p2("TEXT"), i32::from(b'B'));
+        assert_eq!(cast_p2("REAL"), i32::from(b'E'));
+        assert_eq!(cast_p2("BLOB"), i32::from(b'A'));
+    }
+
+    #[test]
     fn test_emit_expr_large_integer_literal_uses_int64_opcode() {
         let mut b = ProgramBuilder::new();
         let reg = b.alloc_reg();

@@ -3191,6 +3191,51 @@ mod tests {
     }
 
     #[test]
+    fn test_leaf_table_split_heat_classifies_edge_window_boundaries() {
+        // page_no=None keeps this purely deterministic (no topology/global state):
+        // heat is decided solely by `edge_window = cell_count.div_ceil(4)`.
+        let heat = |cells: usize, idx: usize| leaf_table_split_policy_for_page(None, cells, idx).heat;
+
+        // cell_count = 8 -> edge_window = 2. Left:[0,1] Interior:[2..=5] Right:[6,7].
+        assert_eq!(heat(8, 0), LeafTableSplitHeat::LeftEdge);
+        assert_eq!(heat(8, 1), LeafTableSplitHeat::LeftEdge);
+        assert_eq!(heat(8, 2), LeafTableSplitHeat::Interior, "left/interior boundary");
+        assert_eq!(heat(8, 5), LeafTableSplitHeat::Interior);
+        assert_eq!(heat(8, 6), LeafTableSplitHeat::RightEdge, "interior/right boundary");
+        assert_eq!(heat(8, 7), LeafTableSplitHeat::RightEdge);
+
+        // cell_count = 4 -> edge_window = 1. Left:[0] Interior:[1,2] Right:[3].
+        assert_eq!(heat(4, 0), LeafTableSplitHeat::LeftEdge);
+        assert_eq!(heat(4, 1), LeafTableSplitHeat::Interior);
+        assert_eq!(heat(4, 3), LeafTableSplitHeat::RightEdge);
+
+        // cell_count = 2 -> edge_window = 1, no interior band: idx 0 left, idx 1 right.
+        assert_eq!(heat(2, 0), LeafTableSplitHeat::LeftEdge);
+        assert_eq!(heat(2, 1), LeafTableSplitHeat::RightEdge);
+
+        // Degenerate pages (< 2 cells) take the early branch and are always Interior.
+        assert_eq!(heat(1, 0), LeafTableSplitHeat::Interior);
+        assert_eq!(heat(0, 0), LeafTableSplitHeat::Interior);
+
+        // An out-of-range insert position is clamped to the last cell (right edge).
+        assert_eq!(heat(8, 99), LeafTableSplitHeat::RightEdge, "clamped to cell_count-1");
+
+        // With page_no=None the effective target is the heat class's baseline fill factor.
+        assert_eq!(
+            leaf_table_split_policy_for_page(None, 8, 0).target_left_basis_points,
+            4_500
+        );
+        assert_eq!(
+            leaf_table_split_policy_for_page(None, 8, 3).target_left_basis_points,
+            5_500
+        );
+        assert_eq!(
+            leaf_table_split_policy_for_page(None, 8, 7).target_left_basis_points,
+            6_500
+        );
+    }
+
+    #[test]
     fn test_choose_leaf_table_split_index_biases_space_toward_predicted_hot_side() {
         let cells = fixed_cost_cells(12, 180);
         let left = choose_leaf_table_split_index(

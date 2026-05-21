@@ -282,6 +282,10 @@ const HAVING_AGGREGATE_ORDER_CASES: &[QueryCase] = &[
         sql: "SELECT product_id, SUM(qty) AS total_qty FROM sales GROUP BY product_id HAVING total_qty >= 10 ORDER BY total_qty DESC, product_id",
     },
     QueryCase {
+        name: "aggregate aliases in range having",
+        sql: "SELECT product_id, MIN(qty) AS min_qty, MAX(qty) AS max_qty FROM sales GROUP BY product_id HAVING max_qty > min_qty ORDER BY product_id",
+    },
+    QueryCase {
         name: "aggregate expressions in order by",
         sql: "SELECT store_id, COUNT(*) AS sale_count, SUM(qty) AS total_qty FROM sales GROUP BY store_id ORDER BY SUM(qty) DESC, COUNT(*) DESC, store_id",
     },

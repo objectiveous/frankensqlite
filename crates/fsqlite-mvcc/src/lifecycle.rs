@@ -8362,6 +8362,79 @@ mod tests {
     }
 
     #[test]
+    fn test_read_page_with_cell_deltas_hides_post_snapshot_update() -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4249;
+        let original_payload = vec![b'a'; 126];
+        let updated_payload = vec![b'z'; 134];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut inserter = mgr.begin(BeginKind::Concurrent).expect("inserter begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &original_payload),
+                inserter.token(),
+            )
+            .expect("logical insert should fit budget");
+        mgr.commit(&mut inserter).expect("insert commit");
+
+        let mut old_reader = mgr.begin(BeginKind::Concurrent).expect("old reader begin");
+        let old_page_before = mgr
+            .read_page_with_cell_deltas(&mut old_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("inserted row should be visible");
+        assert_eq!(
+            materialized_table_payloads(&old_page_before)?,
+            vec![(rowid, original_payload.clone())]
+        );
+
+        let mut updater = mgr.begin(BeginKind::Concurrent).expect("updater begin");
+        mgr.cell_log()
+            .record_update(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &updated_payload),
+                updater.token(),
+            )
+            .expect("logical update should fit budget");
+        mgr.commit(&mut updater).expect("update commit");
+
+        let old_page_after = mgr
+            .read_page_with_cell_deltas(&mut old_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("old snapshot should still see the base page");
+        assert_eq!(
+            materialized_table_payloads(&old_page_after)?,
+            vec![(rowid, original_payload)],
+            "reader snapshot must hide logical updates published after it began"
+        );
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh snapshot should see the base page");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(rowid, updated_payload)],
+            "fresh snapshot must see the committed logical update"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_read_page_with_cell_deltas_materializes_own_uncommitted_delta()
     -> fsqlite_error::Result<()> {
         use crate::cell_visibility::CellKey;

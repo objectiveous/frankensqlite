@@ -1505,4 +1505,81 @@ mod tests {
 
         assert_eq!(policy.evidence_ledger().len(), 2);
     }
+
+    #[test]
+    fn test_compaction_phase_display() {
+        assert_eq!(format!("{}", CompactionPhase::Mark), "mark");
+        assert_eq!(format!("{}", CompactionPhase::Compact), "compact");
+        assert_eq!(format!("{}", CompactionPhase::Publish), "publish");
+        assert_eq!(format!("{}", CompactionPhase::Retire), "retire");
+    }
+
+    #[test]
+    fn test_recovery_has_violations_and_recovered_tip() {
+        let mut recovery = NativeRecovery::new();
+        assert!(!recovery.has_violations());
+        assert_eq!(recovery.recovered_tip(), CommitSeq::ZERO);
+
+        let manifest = RootManifest {
+            ecs_epoch: 1,
+            latest_checkpoint: None,
+            manifest: ManifestSegment::new(Vec::new()),
+        };
+        recovery.load_root_manifest(manifest);
+
+        let markers = vec![make_marker(1, 0x01), make_marker(2, 0x02)];
+        recovery.replay_markers(&markers, |oid| {
+            if oid == make_oid(0x02) {
+                CapsuleDecodeOutcome::Failed {
+                    reason: "corrupt".into(),
+                }
+            } else {
+                CapsuleDecodeOutcome::Systematic
+            }
+        });
+
+        assert!(recovery.has_violations());
+        assert_eq!(recovery.recovered_tip(), CommitSeq::new(2));
+    }
+
+    #[test]
+    fn test_retirable_segments_empty_before_publish() {
+        let saga = CompactionSaga::new(
+            vec![make_segment(0x10, &[0x20, 0x21], 1000)],
+            2.5,
+        );
+        assert!(saga.retirable_segments().is_empty());
+        assert!(!saga.is_published());
+    }
+
+    #[test]
+    fn test_cancel_after_publish_requires_rollback() {
+        let old_segs = vec![make_segment(0x10, &[0x20], 500)];
+        let mut saga = CompactionSaga::new(old_segs, 2.0);
+
+        saga.mark(vec![make_oid(0x20)]);
+        saga.compact(vec![make_segment(0x30, &[0x20], 400)]);
+        saga.mark_segments_synced();
+        saga.mark_locator_synced();
+        assert!(saga.publish());
+        assert!(saga.is_published());
+
+        let compensation = saga.cancel();
+        assert_eq!(compensation, CompactionCompensation::RollbackRequired);
+        assert!(saga.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancel_before_publish_discards_temp_segments() {
+        let old_segs = vec![make_segment(0x10, &[0x20], 500)];
+        let mut saga = CompactionSaga::new(old_segs, 2.0);
+
+        saga.mark(vec![make_oid(0x20)]);
+        saga.compact(vec![make_segment(0x30, &[0x20], 400)]);
+
+        let compensation = saga.cancel();
+        assert_eq!(compensation, CompactionCompensation::TempSegmentsDiscarded);
+        assert!(saga.is_cancelled());
+        assert!(!saga.is_published());
+    }
 }

@@ -431,6 +431,58 @@ mod tests {
     }
 
     #[test]
+    fn test_write_overflow_chain_multi_page_structure() {
+        // usable=20 -> 16 data bytes per page. 50 bytes needs ceil(50/16) = 4
+        // pages. The roundtrip test checks reassembled data; this pins the chain
+        // structure the writer builds (page count, next pointers, split, tail).
+        let usable = 20u32;
+        let data: Vec<u8> = (0u8..50).collect();
+        let mut pages: HashMap<u32, Vec<u8>> = HashMap::new();
+        let mut next_page = 100u32;
+
+        let first = write_overflow_chain(
+            &data,
+            usable,
+            usable,
+            &mut || {
+                let pgno = PageNumber::new(next_page).unwrap();
+                next_page += 1;
+                Ok(pgno)
+            },
+            &mut |pgno, d| {
+                pages.insert(pgno.get(), d.to_vec());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        // Exactly 4 pages allocated (100..=103); the head is the first page.
+        assert_eq!(first.get(), 100);
+        assert_eq!(pages.len(), 4);
+
+        let next_of =
+            |p: u32| u32::from_be_bytes([pages[&p][0], pages[&p][1], pages[&p][2], pages[&p][3]]);
+        // Chain linkage: 100 -> 101 -> 102 -> 103 -> 0.
+        assert_eq!(next_of(100), 101);
+        assert_eq!(next_of(101), 102);
+        assert_eq!(next_of(102), 103);
+        assert_eq!(next_of(103), 0, "the last page terminates the chain");
+
+        // Data is split 16/16/16/2 and reassembles to the original.
+        let mut reassembled = Vec::new();
+        for (p, len) in [(100u32, 16usize), (101, 16), (102, 16), (103, 2)] {
+            reassembled.extend_from_slice(&pages[&p][4..4 + len]);
+        }
+        assert_eq!(reassembled, data);
+
+        // The last page's unused tail (after the 4-byte header + 2 data bytes) is
+        // zero-padded out to the full page size.
+        let last = &pages[&103];
+        assert_eq!(last.len(), 20);
+        assert!(last[6..].iter().all(|&b| b == 0), "the tail must be zero-padded");
+    }
+
+    #[test]
     fn test_overflow_chain_premature_end() {
         // Use small pages so one overflow page can't satisfy the full payload.
         let usable = 20u32; // 16 bytes of data per overflow page.

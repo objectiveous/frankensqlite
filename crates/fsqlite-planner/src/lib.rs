@@ -6518,6 +6518,30 @@ mod tests {
     }
 
     #[test]
+    fn test_lookup_table_index_hint() {
+        // Lookup canonicalizes the requested table name to lowercase via
+        // canonical_table_key; the map keys must already be canonical.
+        let mut hints: std::collections::BTreeMap<String, IndexHint> =
+            std::collections::BTreeMap::new();
+        hints.insert("users".to_owned(), IndexHint::NotIndexed);
+
+        // Hit by exact canonical key.
+        assert!(matches!(
+            lookup_table_index_hint("users", Some(&hints)),
+            Some(IndexHint::NotIndexed)
+        ));
+        // Hit by case-insensitive lookup (USERS canonicalizes to users).
+        assert!(matches!(
+            lookup_table_index_hint("USERS", Some(&hints)),
+            Some(IndexHint::NotIndexed)
+        ));
+        // Miss: a table name not in the map.
+        assert!(lookup_table_index_hint("other", Some(&hints)).is_none());
+        // No hints map at all -> None.
+        assert!(lookup_table_index_hint("users", None).is_none());
+    }
+
+    #[test]
     fn test_qualifier_matches_table() {
         // A qualifier matches by table name or by alias, case-insensitively.
         // Table name, no alias.

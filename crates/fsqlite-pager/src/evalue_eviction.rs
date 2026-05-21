@@ -595,4 +595,44 @@ mod tests {
         // which overflows, so we expect the CEIL.
         assert!(e >= E_VALUE_CEIL * 0.99, "expected clamped CEIL, got {e}");
     }
+
+    #[test]
+    fn clear_removes_all_tracked_pages() {
+        let ev = EValueEvictor::new();
+        for i in 1..=5 {
+            ev.record_access(pn(i));
+        }
+        assert_eq!(ev.tracked(), 5);
+        ev.clear();
+        assert_eq!(ev.tracked(), 0);
+        for i in 1..=5 {
+            assert!(ev.e_value(pn(i)).is_none());
+        }
+    }
+
+    #[test]
+    fn tick_n_zero_is_noop() {
+        let ev = EValueEvictor::with_rates(2.0, 0.5);
+        let p = pn(1);
+        ev.record_access(p);
+        let before = ev.e_value(p).unwrap();
+        ev.tick_n(0);
+        let after = ev.e_value(p).unwrap();
+        assert!((before - after).abs() < 1e-12);
+    }
+
+    #[test]
+    fn default_equals_new() {
+        let d = EValueEvictor::default();
+        let n = EValueEvictor::new();
+        assert!((d.r_hit() - n.r_hit()).abs() < 1e-12);
+        assert!((d.r_tick() - n.r_tick()).abs() < 1e-12);
+        assert_eq!(d.tracked(), n.tracked());
+    }
+
+    #[test]
+    fn choose_victim_empty_candidates_returns_none() {
+        let ev = EValueEvictor::new();
+        assert!(ev.choose_victim(&[]).is_none());
+    }
 }

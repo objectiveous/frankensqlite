@@ -8287,6 +8287,78 @@ mod tests {
     }
 
     #[test]
+    fn test_read_page_with_cell_deltas_keeps_pinned_snapshot_horizon() -> fsqlite_error::Result<()>
+    {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4244;
+        let payload = vec![b'p'; 132];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        let seed_seq = mgr.commit(&mut seed).expect("seed commit");
+
+        let mut pinned_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("pinned reader begin");
+        assert_eq!(
+            pinned_reader.snapshot.high, seed_seq,
+            "reader must pin its snapshot before the later logical commit"
+        );
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).expect("writer begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                writer.token(),
+            )
+            .expect("logical insert should fit budget");
+        writer.write_set.push(pgno);
+        let logical_seq = mgr.commit(&mut writer).expect("logical commit");
+        assert!(logical_seq > pinned_reader.snapshot.high);
+
+        let old_page = mgr
+            .read_page_with_cell_deltas(&mut pinned_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("base page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&old_page)?,
+            Vec::<(i64, Vec<u8>)>::new(),
+            "pinned reader must not materialize a logical commit after its snapshot"
+        );
+        assert_eq!(
+            pinned_reader.read_version_for_page(pgno),
+            Some(seed_seq),
+            "post-snapshot logical commits must not advance the pinned read witness"
+        );
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(rowid, payload)]
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(logical_seq),
+            "fresh logical reads should witness the committed delta horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_read_page_with_cell_deltas_hides_post_snapshot_commit() -> fsqlite_error::Result<()> {
         use crate::cell_visibility::CellKey;
         use fsqlite_types::{BtreeRef, TableId};

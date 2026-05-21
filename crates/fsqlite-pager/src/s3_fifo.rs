@@ -2825,4 +2825,42 @@ mod tests {
             "required_consecutive_bad_windows=0 must clamp to 1, so one bad window triggers fallback"
         );
     }
+
+    #[test]
+    fn s3_fifo_config_new_capacity_split() {
+        let cfg = S3FifoConfig::new(100);
+        assert_eq!(cfg.capacity(), 100);
+        assert_eq!(cfg.small_capacity(), 10);
+        assert_eq!(cfg.main_capacity(), 90);
+        assert_eq!(cfg.ghost_capacity(), 10);
+        let small = S3FifoConfig::new(1);
+        assert_eq!(small.small_capacity(), 1);
+        assert_eq!(small.main_capacity(), 0);
+    }
+
+    #[test]
+    fn s3_fifo_config_with_limits_explicit() {
+        let cfg = S3FifoConfig::with_limits(50, 15, 20, 3);
+        assert_eq!(cfg.capacity(), 50);
+        assert_eq!(cfg.small_capacity(), 15);
+        assert_eq!(cfg.main_capacity(), 35);
+        assert_eq!(cfg.ghost_capacity(), 20);
+        assert_eq!(cfg.max_reinsert(), 3);
+    }
+
+    #[test]
+    fn rollout_metrics_accessors() {
+        let m = RolloutMetrics::new(5000, 250);
+        assert_eq!(m.miss_rate_ppm(), 5000);
+        assert_eq!(m.p99_read_latency_micros(), 250);
+    }
+
+    #[test]
+    fn rollout_gate_default_and_active_policy() {
+        let gate = S3FifoRolloutGate::default();
+        assert_eq!(gate.active_policy(), RolloutPolicy::S3Fifo);
+        assert_eq!(gate.consecutive_bad_windows(), 0);
+        let dbg = format!("{gate:?}");
+        assert!(dbg.contains("S3FifoRolloutGate"));
+    }
 }

@@ -6099,6 +6099,33 @@ mod tests {
     }
 
     #[test]
+    fn test_lookup_hot_plan_cache_and_clear() {
+        // On a fresh planner the hot cache is empty; any lookup misses without
+        // setting needs_lru_touch. Seeding just the key (no plan) makes a
+        // matching lookup still return None but trigger the needs_lru_touch
+        // side effect because the key matched. A non-matching lookup leaves
+        // needs_lru_touch alone. clear_hot_plan_cache zeroes all three fields.
+        let mut p = QueryPlanner::new();
+        assert!(p.lookup_hot_plan_cache(42).is_none());
+        assert!(!p.hot_plan_cache_needs_lru_touch);
+
+        // Seed the key only; plan stays None.
+        p.hot_plan_cache_key = Some(42);
+        assert!(p.lookup_hot_plan_cache(42).is_none()); // plan is None
+        assert!(p.hot_plan_cache_needs_lru_touch); // side effect: key matched
+
+        // A non-matching lookup does not touch the side-effect flag.
+        assert!(p.lookup_hot_plan_cache(99).is_none());
+        assert!(p.hot_plan_cache_needs_lru_touch); // unchanged
+
+        // clear_hot_plan_cache zeroes all three hot-cache fields.
+        p.clear_hot_plan_cache();
+        assert!(p.hot_plan_cache_key.is_none());
+        assert!(p.hot_plan_cache_plan.is_none());
+        assert!(!p.hot_plan_cache_needs_lru_touch);
+    }
+
+    #[test]
     fn test_invalidate_plan_cache_if_schema_cookie_changed_tracks_cookie() {
         // Tracks the latest schema cookie on every call and clears the cache
         // when the new cookie differs from the cached one. With an empty cache

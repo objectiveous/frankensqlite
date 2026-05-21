@@ -1689,6 +1689,35 @@ mod tests {
         assert!(!explain.contains("GROUP BY"), "global aggregate has no grouping:\n{explain}");
     }
 
+    #[test]
+    fn differential_plan_compiles_sum_and_rejects_unsupported_aggregate() {
+        // SUM(column) is the other supported aggregate; pin its compile + explain.
+        let select = parse_select("SELECT SUM(amount) AS total FROM orders");
+        let plan = compile_differential_view_plan(&select).expect("SUM should compile");
+        assert_eq!(plan.mode, DifferentialPlanMode::GlobalAggregate);
+        assert_eq!(
+            plan.outputs,
+            vec![DifferentialOutput::Aggregate {
+                aggregate: DifferentialAggregate::Sum {
+                    column: DifferentialColumn {
+                        binding: "orders".to_owned(),
+                        column: "amount".to_owned(),
+                    },
+                },
+                alias: Some("total".to_owned()),
+            }]
+        );
+        let explain = explain_differential_view_plan(&select).expect("should compile");
+        assert!(explain.contains("EMIT SUM(orders.amount) AS total"), "explain:\n{explain}");
+
+        // AVG is not a supported differential aggregate -> fails closed.
+        let avg = parse_select("SELECT AVG(amount) FROM orders");
+        assert!(matches!(
+            compile_differential_view_plan(&avg),
+            Err(DifferentialPlanError::UnsupportedAggregate { .. })
+        ));
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
 

@@ -291,6 +291,29 @@ mod tests {
     }
 
     #[test]
+    fn test_swiss_index_get_mut_clear_and_insert_returns_old() {
+        let mut map: SwissIndex<&str, i32> = SwissIndex::new();
+
+        // insert returns the previously stored value (None on first insert).
+        assert_eq!(map.insert("k", 1), None);
+        assert_eq!(map.insert("k", 2), Some(1));
+        assert_eq!(map.get("k"), Some(&2));
+
+        // get_mut mutates the stored value in place; absent keys yield None.
+        *map.get_mut("k").unwrap() += 40;
+        assert_eq!(map.get("k"), Some(&42));
+        assert!(map.get_mut("absent").is_none());
+
+        // clear empties the map.
+        map.insert("k2", 7);
+        assert_eq!(map.len(), 2);
+        map.clear();
+        assert!(map.is_empty());
+        assert_eq!(map.len(), 0);
+        assert!(map.get("k").is_none());
+    }
+
+    #[test]
     fn test_swiss_index_capacity_and_load_factor() {
         let mut map = SwissIndex::with_capacity(100);
         assert_eq!(map.load_factor_milli(), 0);

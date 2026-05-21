@@ -8569,6 +8569,102 @@ mod tests {
     }
 
     #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_mixed_batch_out_of_horizon()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4281;
+        let row_b = 4282;
+        let row_c = 4283;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let a_original = vec![b'm'; 149];
+        let b_original = vec![b'n'; 150];
+        let a_updated = vec![b'o'; 151];
+        let c_inserted = vec![b'p'; 152];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut bootstrap = mgr.begin(BeginKind::Concurrent).expect("bootstrap begin");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_original),
+                bootstrap.token(),
+            )
+            .expect("row a insert should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_b,
+                pgno,
+                leaf_table_cell(row_b, &b_original),
+                bootstrap.token(),
+            )
+            .expect("row b insert should fit budget");
+        let committed_seq = mgr.commit(&mut bootstrap).expect("bootstrap commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_update(key_a, pgno, leaf_table_cell(row_a, &a_updated), txn.token())
+            .expect("row a update should fit budget");
+        mgr.cell_log()
+            .record_delete(key_b, pgno, txn.token())
+            .expect("row b delete should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_c,
+                pgno,
+                leaf_table_cell(row_c, &c_inserted),
+                txn.token(),
+            )
+            .expect("row c insert should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![(row_a, a_updated.clone()), (row_c, c_inserted.clone())],
+            "transaction-local reads must materialize their own mixed logical batch"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(committed_seq),
+            "own uncommitted mixed batches must preserve the last committed read witness"
+        );
+
+        let batch_seq = mgr.commit(&mut txn).expect("mixed batch commit");
+        assert!(batch_seq > committed_seq);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(row_a, a_updated), (row_c, c_inserted)]
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(batch_seq),
+            "fresh reads should witness the committed mixed-batch horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_read_page_with_cell_deltas_keeps_other_uncommitted_writes_out_of_horizon()
     -> fsqlite_error::Result<()> {
         use crate::cell_visibility::CellKey;

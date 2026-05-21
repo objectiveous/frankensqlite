@@ -322,6 +322,29 @@ const CONTENTLESS_CASES: &[MatchCase] = &[
     },
 ];
 
+const INVALID_QUERY_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "empty query",
+        query: "",
+    },
+    MatchCase {
+        name: "unclosed phrase",
+        query: r#""rust"#,
+    },
+    MatchCase {
+        name: "unbalanced parenthesis",
+        query: "(rust",
+    },
+    MatchCase {
+        name: "unary not",
+        query: "NOT rust",
+    },
+    MatchCase {
+        name: "unknown column filter",
+        query: "summary:rust",
+    },
+];
+
 const BM25_CASES: &[RankingCase] = &[
     RankingCase {
         name: "single term frequency",
@@ -455,6 +478,22 @@ impl Fts5ConformanceHarness {
             .expect("query rusqlite FTS5 rowids")
             .collect::<std::result::Result<Vec<_>, _>>()
             .expect("read rusqlite FTS5 rowids")
+    }
+
+    fn franken_match_is_error(&self, query: &str) -> bool {
+        self.franken.search(query).is_err()
+    }
+
+    fn sqlite_match_is_error(&self, query: &str) -> bool {
+        let mut stmt = self
+            .sqlite
+            .prepare("SELECT rowid FROM docs WHERE docs MATCH ?1 ORDER BY rowid")
+            .expect("prepare rusqlite FTS5 MATCH error query");
+        let mapped = stmt.query_map([query], |row| row.get::<_, i64>(0));
+        match mapped {
+            Ok(rows) => rows.collect::<std::result::Result<Vec<_>, _>>().is_err(),
+            Err(_) => true,
+        }
     }
 
     fn franken_ranked_rowids(&self, query: &str) -> Vec<i64> {
@@ -631,6 +670,21 @@ fn contentless_tables_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "contentless table conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn invalid_match_queries_error_like_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in INVALID_QUERY_CASES {
+        assert_eq!(
+            harness.franken_match_is_error(case.query),
+            harness.sqlite_match_is_error(case.query),
+            "invalid MATCH query conformance failed: {} ({})",
             case.name,
             case.query
         );

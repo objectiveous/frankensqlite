@@ -435,4 +435,40 @@ mod tests {
             "same group should pay penalty: {gain_same} vs {gain_diff}"
         );
     }
+
+    #[test]
+    fn objective_cross_group_pairs_no_penalty() {
+        let sel = [c(1, 0.8, 0), c(2, 0.7, 1)];
+        let val = objective(&sel, 1.0);
+        assert!(
+            (val - 1.5).abs() < 1e-12,
+            "different groups: penalty term should be zero, got {val}"
+        );
+    }
+
+    #[test]
+    fn greedy_select_budget_one_picks_highest() {
+        let cands = vec![c(3, 0.3, 0), c(7, 0.99, 1), c(5, 0.5, 2)];
+        let picked = greedy_select(&cands, 1, 0.25);
+        assert_eq!(picked, vec![pn(7)]);
+    }
+
+    #[test]
+    fn candidate_new_clamps_and_stores_fields() {
+        let cand = Candidate::new(pn(42), 0.75, 8);
+        assert_eq!(cand.page, pn(42));
+        assert!((cand.hit_prob - 0.75).abs() < 1e-12);
+        assert_eq!(cand.cacheline_group, 8);
+    }
+
+    #[test]
+    fn expected_gain_empty_selected_equals_hit_prob() {
+        let empty: Vec<Candidate> = Vec::new();
+        let cand = c(1, 0.65, 0);
+        let gain = expected_gain(&empty, &cand, 0.5);
+        assert!(
+            (gain - 0.65).abs() < 1e-12,
+            "with no prior selection, gain should equal hit_prob, got {gain}"
+        );
+    }
 }

@@ -242,6 +242,8 @@ pub enum DataflowOperator {
     FilterFloatFinite { column: usize },
     /// Keep rows whose floating-point column is NaN or infinite.
     FilterFloatNonFinite { column: usize },
+    /// Keep rows whose floating-point column matches the requested sign.
+    FilterFloatSign { column: usize, sign: FloatSign },
     /// Keep rows where an integer column satisfies the comparison.
     FilterIntegerCompare {
         column: usize,
@@ -358,6 +360,7 @@ impl DataflowOperator {
             } => filter_integer_not_between(rows, *column, *lower, *upper),
             Self::FilterFloatFinite { column } => filter_float_finite(rows, *column),
             Self::FilterFloatNonFinite { column } => filter_float_non_finite(rows, *column),
+            Self::FilterFloatSign { column, sign } => filter_float_sign(rows, *column, *sign),
             Self::FilterIntegerCompare { column, op, value } => {
                 filter_integer_compare(rows, *column, *op, *value)
             }
@@ -429,6 +432,27 @@ impl IntegerComparison {
             Self::LessOrEqual => candidate <= threshold,
             Self::GreaterThan => candidate > threshold,
             Self::GreaterOrEqual => candidate >= threshold,
+        }
+    }
+}
+
+/// Floating-point sign predicate used by dataflow filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatSign {
+    /// Positive finite values and positive infinity.
+    Positive,
+    /// Negative finite values and negative infinity.
+    Negative,
+    /// Both `+0.0` and `-0.0`.
+    Zero,
+}
+
+impl FloatSign {
+    fn matches(self, candidate: f64) -> bool {
+        match self {
+            Self::Positive => candidate > 0.0,
+            Self::Negative => candidate < 0.0,
+            Self::Zero => candidate == 0.0,
         }
     }
 }
@@ -759,6 +783,26 @@ fn filter_float_non_finite(
     rows.iter()
         .filter_map(|row| match row.values.get(column) {
             Some(SqliteValue::Float(candidate)) if !candidate.is_finite() => Some(Ok(row.clone())),
+            Some(SqliteValue::Float(_)) => None,
+            Some(_) => Some(Err(DataflowError::PredicateValueNotFloat { column })),
+            None => Some(Err(DataflowError::ColumnOutOfBounds {
+                column,
+                width: row.width(),
+            })),
+        })
+        .collect()
+}
+
+fn filter_float_sign(
+    rows: &[WeightedRow],
+    column: usize,
+    sign: FloatSign,
+) -> DataflowResult<Vec<WeightedRow>> {
+    rows.iter()
+        .filter_map(|row| match row.values.get(column) {
+            Some(SqliteValue::Float(candidate)) if sign.matches(*candidate) => {
+                Some(Ok(row.clone()))
+            }
             Some(SqliteValue::Float(_)) => None,
             Some(_) => Some(Err(DataflowError::PredicateValueNotFloat { column })),
             None => Some(Err(DataflowError::ColumnOutOfBounds {
@@ -2121,6 +2165,95 @@ mod tests {
         let err = automaton
             .execute(&[WeightedRow::insert(vec![int(1), SqliteValue::Float(1.5)])])
             .expect_err("invalid non-finite-float predicate column should fail");
+
+        assert_eq!(
+            err,
+            DataflowError::ColumnOutOfBounds {
+                column: 2,
+                width: 2
+            }
+        );
+    }
+
+    #[test]
+    fn filter_float_sign_splits_positive_negative_and_zero_real_rows() {
+        let rows = vec![
+            WeightedRow::new(vec![int(1), SqliteValue::Float(3.5)], 7),
+            WeightedRow::new(vec![int(2), SqliteValue::Float(f64::INFINITY)], -2),
+            WeightedRow::new(vec![int(3), SqliteValue::Float(-2.25)], 4),
+            WeightedRow::new(vec![int(4), SqliteValue::Float(f64::NEG_INFINITY)], -5),
+            WeightedRow::new(vec![int(5), SqliteValue::Float(0.0)], 6),
+            WeightedRow::new(vec![int(6), SqliteValue::Float(-0.0)], -7),
+            WeightedRow::new(vec![int(7), SqliteValue::Float(f64::NAN)], 8),
+            WeightedRow::new(vec![int(8), SqliteValue::Float(1.0)], 0),
+        ];
+
+        let positives = DataflowAutomaton::new(vec![DataflowOperator::FilterFloatSign {
+            column: 1,
+            sign: FloatSign::Positive,
+        }])
+        .execute(&rows)
+        .expect("positive sign filter should execute");
+        let negatives = DataflowAutomaton::new(vec![DataflowOperator::FilterFloatSign {
+            column: 1,
+            sign: FloatSign::Negative,
+        }])
+        .execute(&rows)
+        .expect("negative sign filter should execute");
+        let zeroes = DataflowAutomaton::new(vec![DataflowOperator::FilterFloatSign {
+            column: 1,
+            sign: FloatSign::Zero,
+        }])
+        .execute(&rows)
+        .expect("zero sign filter should execute");
+
+        assert_eq!(
+            positives,
+            vec![
+                WeightedRow::new(vec![int(1), SqliteValue::Float(3.5)], 7),
+                WeightedRow::new(vec![int(2), SqliteValue::Float(f64::INFINITY)], -2),
+            ]
+        );
+        assert_eq!(
+            negatives,
+            vec![
+                WeightedRow::new(vec![int(3), SqliteValue::Float(-2.25)], 4),
+                WeightedRow::new(vec![int(4), SqliteValue::Float(f64::NEG_INFINITY)], -5),
+            ]
+        );
+        assert_eq!(
+            zeroes,
+            vec![
+                WeightedRow::new(vec![int(5), SqliteValue::Float(0.0)], 6),
+                WeightedRow::new(vec![int(6), SqliteValue::Float(-0.0)], -7),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_float_sign_rejects_non_float_values() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterFloatSign {
+            column: 1,
+            sign: FloatSign::Positive,
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), int(2)])])
+            .expect_err("non-float predicate input should fail");
+
+        assert_eq!(err, DataflowError::PredicateValueNotFloat { column: 1 });
+    }
+
+    #[test]
+    fn filter_float_sign_rejects_out_of_bounds_columns() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterFloatSign {
+            column: 2,
+            sign: FloatSign::Zero,
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), SqliteValue::Float(1.5)])])
+            .expect_err("invalid real-sign predicate column should fail");
 
         assert_eq!(
             err,

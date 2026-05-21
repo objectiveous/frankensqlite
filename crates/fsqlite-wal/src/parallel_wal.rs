@@ -2866,4 +2866,72 @@ mod tests {
         let segments = list_segments(&db_path).expect("list should succeed");
         assert!(segments.is_empty());
     }
+
+    #[test]
+    fn parallel_wal_config_default_values() {
+        let cfg = ParallelWalConfig::default();
+        assert_eq!(cfg.slot_count, DEFAULT_BUFFER_SLOT_COUNT);
+        assert_eq!(cfg.epoch_interval_ms, 10);
+        assert_eq!(cfg.buffer_capacity_bytes, 4 * 1024 * 1024);
+        let copied = cfg;
+        assert_eq!(copied.epoch_interval_ms, cfg.epoch_interval_ms);
+        let dbg = format!("{cfg:?}");
+        assert!(dbg.contains("ParallelWalConfig"));
+    }
+
+    #[test]
+    fn parallel_wal_fallback_reason_all_variants_debug_copy_eq() {
+        let variants = [
+            ParallelWalFallbackReason::OperatorForced,
+            ParallelWalFallbackReason::LaneOverflow,
+            ParallelWalFallbackReason::CertificateGap,
+            ParallelWalFallbackReason::CertificateChecksumMismatch,
+            ParallelWalFallbackReason::PublicationMismatch,
+            ParallelWalFallbackReason::RecoveryGap,
+            ParallelWalFallbackReason::CheckpointConflict,
+            ParallelWalFallbackReason::ControllerEvidenceLost,
+        ];
+        for (i, v) in variants.iter().enumerate() {
+            let copied = *v;
+            assert_eq!(copied, *v);
+            for (j, w) in variants.iter().enumerate() {
+                assert_eq!(i == j, v == w);
+            }
+        }
+        let dbg = format!("{:?}", ParallelWalFallbackReason::CertificateGap);
+        assert!(dbg.contains("CertificateGap"));
+    }
+
+    #[test]
+    fn parallel_wal_control_surface_default_and_eq() {
+        let def = ParallelWalControlSurface::default();
+        assert_eq!(def.mode, ParallelWalOperatingMode::Auto);
+        assert!(def.lane_count_override.is_none());
+        assert!(def.helper_lane_budget.is_none());
+        assert!(def.max_parallel_commit_bytes.is_none());
+        assert!(def.max_flush_delay_ms.is_none());
+        assert!(def.shadow_compare_sampling_per_mille.is_none());
+        let other = ParallelWalControlSurface {
+            mode: ParallelWalOperatingMode::Conservative,
+            ..ParallelWalControlSurface::default()
+        };
+        assert_ne!(def, other);
+        let dbg = format!("{def:?}");
+        assert!(dbg.contains("ParallelWalControlSurface"));
+    }
+
+    #[test]
+    fn parallel_wal_ordered_residue_and_shadow_verdict_defaults() {
+        let residue = ParallelWalOrderedResidue::default();
+        assert_eq!(residue, ParallelWalOrderedResidue::CommitCertificateThenPublish);
+        let copied = residue;
+        assert_eq!(copied, residue);
+
+        let verdict = ParallelWalShadowVerdict::default();
+        assert_eq!(verdict, ParallelWalShadowVerdict::NotRun);
+        assert_ne!(verdict, ParallelWalShadowVerdict::Clean);
+        assert_ne!(ParallelWalShadowVerdict::Clean, ParallelWalShadowVerdict::Diverged);
+        let dbg = format!("{verdict:?}");
+        assert!(dbg.contains("NotRun"));
+    }
 }

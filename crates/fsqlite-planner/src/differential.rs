@@ -1590,6 +1590,59 @@ mod tests {
         assert!(explain.contains("EMIT COUNT(*) AS n_orders"));
     }
 
+    #[test]
+    fn differential_display_and_explain_labels_are_well_formed() {
+        // These pure formatters are only exercised indirectly via explain_text;
+        // pin their exact rendering directly.
+        let col = DifferentialColumn {
+            binding: "t".to_owned(),
+            column: "x".to_owned(),
+        };
+        assert_eq!(col.to_string(), "t.x");
+
+        assert_eq!(DifferentialAggregate::CountRows.to_string(), "COUNT(*)");
+        assert_eq!(
+            DifferentialAggregate::Sum { column: col.clone() }.to_string(),
+            "SUM(t.x)"
+        );
+
+        // Source display_name: schema-qualified vs bare.
+        let qualified = DifferentialSource {
+            schema: Some("main".to_owned()),
+            table: "users".to_owned(),
+            binding: "u".to_owned(),
+        };
+        assert_eq!(qualified.display_name(), "main.users");
+        let bare = DifferentialSource {
+            schema: None,
+            table: "users".to_owned(),
+            binding: "u".to_owned(),
+        };
+        assert_eq!(bare.display_name(), "users");
+
+        // Output explain_label: alias appends " AS <alias>", otherwise bare.
+        let col_out = DifferentialOutput::Column {
+            column: col.clone(),
+            alias: None,
+        };
+        assert_eq!(col_out.explain_label(), "t.x");
+        let col_aliased = DifferentialOutput::Column {
+            column: col.clone(),
+            alias: Some("xx".to_owned()),
+        };
+        assert_eq!(col_aliased.explain_label(), "t.x AS xx");
+        let agg_out = DifferentialOutput::Aggregate {
+            aggregate: DifferentialAggregate::CountRows,
+            alias: Some("n".to_owned()),
+        };
+        assert_eq!(agg_out.explain_label(), "COUNT(*) AS n");
+        let agg_bare = DifferentialOutput::Aggregate {
+            aggregate: DifferentialAggregate::Sum { column: col },
+            alias: None,
+        };
+        assert_eq!(agg_bare.explain_label(), "SUM(t.x)");
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
 

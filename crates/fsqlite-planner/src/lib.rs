@@ -5927,6 +5927,43 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_where_column_preserves_qualifier_and_rejects_non_columns() {
+        // extract_where_column lifts a column reference into a WhereColumn,
+        // preserving the table qualifier, and returns None for anything that is
+        // not a bare column expression.
+        let bare = Expr::Column(ColumnRef::bare("x"), Span::ZERO);
+        assert_eq!(
+            extract_where_column(&bare),
+            Some(WhereColumn {
+                table: None,
+                column: "x".to_owned()
+            })
+        );
+
+        let qualified = Expr::Column(ColumnRef::qualified("t", "x"), Span::ZERO);
+        assert_eq!(
+            extract_where_column(&qualified),
+            Some(WhereColumn {
+                table: Some("t".to_owned()),
+                column: "x".to_owned()
+            })
+        );
+
+        // Non-column expressions yield None.
+        assert_eq!(
+            extract_where_column(&Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            None
+        );
+        let binop = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("x"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        assert_eq!(extract_where_column(&binop), None);
+    }
+
+    #[test]
     fn test_expr_guarantees_non_null_for_matching_column() {
         // expr_guarantees_non_null reports whether a WHERE expression proves the
         // given column is non-NULL: an explicit IS NOT NULL, or a comparison to a

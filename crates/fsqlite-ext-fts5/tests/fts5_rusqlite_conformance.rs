@@ -245,6 +245,29 @@ const MATCH_CASES: &[MatchCase] = &[
     },
 ];
 
+const BOOLEAN_PRECEDENCE_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "and binds tighter than or",
+        query: "rust OR sqlite AND cooking",
+    },
+    MatchCase {
+        name: "parenthesized or with and",
+        query: "(rust OR sqlite) AND search",
+    },
+    MatchCase {
+        name: "and with parenthesized or",
+        query: "rust AND (sqlite OR bread)",
+    },
+    MatchCase {
+        name: "parenthesized left operand with binary not",
+        query: "(rust OR bread) NOT cooking",
+    },
+    MatchCase {
+        name: "near expression with or",
+        query: "NEAR(rust sqlite, 3) OR bread",
+    },
+];
+
 const PHRASE_PREFIX_NEAR_CASES: &[MatchCase] = &[
     MatchCase {
         name: "quoted phrase",
@@ -712,6 +735,21 @@ fn match_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "MATCH conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn boolean_precedence_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in BOOLEAN_PRECEDENCE_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "boolean precedence conformance case failed: {} ({})",
             case.name,
             case.query
         );

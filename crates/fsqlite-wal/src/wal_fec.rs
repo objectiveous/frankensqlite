@@ -4438,4 +4438,60 @@ mod tests {
         let dbg = format!("{:?}", WalFecRepairSource::RaptorQSymbol);
         assert!(dbg.contains("RaptorQSymbol"));
     }
+
+    #[test]
+    fn wal_fec_repair_pipeline_config_default_and_copy() {
+        let cfg = WalFecRepairPipelineConfig::default();
+        assert_eq!(cfg.queue_capacity, 64);
+        assert_eq!(cfg.per_symbol_delay, Duration::ZERO);
+        let copied = cfg;
+        assert_eq!(copied, cfg);
+        let dbg = format!("{cfg:?}");
+        assert!(dbg.contains("WalFecRepairPipelineConfig"));
+    }
+
+    #[test]
+    fn wal_fec_repair_pipeline_stats_default_all_zero() {
+        let stats = WalFecRepairPipelineStats::default();
+        assert_eq!(stats.pending_jobs, 0);
+        assert_eq!(stats.completed_jobs, 0);
+        assert_eq!(stats.failed_jobs, 0);
+        assert_eq!(stats.canceled_jobs, 0);
+        assert_eq!(stats.max_pending_jobs, 0);
+        let copied = stats;
+        assert_eq!(copied, stats);
+    }
+
+    #[test]
+    fn wal_frame_candidate_clone_eq_debug() {
+        let c = WalFrameCandidate { frame_no: 7, page_data: vec![0xAB; 16] };
+        let cloned = c.clone();
+        assert_eq!(cloned, c);
+        assert_eq!(c.frame_no, 7);
+        assert_eq!(c.page_data.len(), 16);
+        let dbg = format!("{c:?}");
+        assert!(dbg.contains("WalFrameCandidate"));
+    }
+
+    #[test]
+    fn wal_fec_decode_proof_clone_eq_debug() {
+        let proof = WalFecDecodeProof {
+            group_id: WalFecGroupId::new(1, 4),
+            required_symbols: 4,
+            available_symbols: 6,
+            validated_source_symbols: 4,
+            validated_repair_symbols: 2,
+            corruption_observations: 0,
+            decode_attempted: true,
+            decode_succeeded: true,
+            recovered_frame_nos: vec![1, 2, 3, 4],
+            fallback_reason: None,
+        };
+        let cloned = proof.clone();
+        assert_eq!(cloned, proof);
+        assert!(proof.decode_succeeded);
+        assert_eq!(proof.recovered_frame_nos.len(), 4);
+        let dbg = format!("{proof:?}");
+        assert!(dbg.contains("WalFecDecodeProof"));
+    }
 }

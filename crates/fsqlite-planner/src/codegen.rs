@@ -2451,6 +2451,55 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_expand_insert_values_row_places_values_and_fills_defaults() {
+        let lit = |n: i64| Expr::Literal(Literal::Integer(n), Span::ZERO);
+        let table = TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo {
+                    name: "a".to_owned(),
+                    affinity: 'd',
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "b".to_owned(),
+                    affinity: 'd',
+                    default_value: Some("99".to_owned()),
+                },
+                ColumnInfo {
+                    name: "c".to_owned(),
+                    affinity: 'd',
+                    default_value: None,
+                },
+            ],
+            indexes: vec![],
+        };
+
+        // No column list -> values pass through unchanged.
+        let passed = expand_insert_values_row(&[lit(1), lit(2), lit(3)], &[], &table).unwrap();
+        assert_eq!(passed.len(), 3);
+        assert!(matches!(passed[0], Expr::Literal(Literal::Integer(1), _)));
+        assert!(matches!(passed[2], Expr::Literal(Literal::Integer(3), _)));
+
+        // INSERT INTO t(c, a) VALUES (10, 20): values land at their TARGET
+        // positions (a=20, c=10); the omitted column b takes its DEFAULT (99).
+        let expanded =
+            expand_insert_values_row(&[lit(10), lit(20)], &["c".to_owned(), "a".to_owned()], &table)
+                .unwrap();
+        assert_eq!(expanded.len(), 3);
+        assert!(matches!(expanded[0], Expr::Literal(Literal::Integer(20), _)), "a = 20");
+        assert!(matches!(expanded[1], Expr::Literal(Literal::Integer(99), _)), "b = default 99");
+        assert!(matches!(expanded[2], Expr::Literal(Literal::Integer(10), _)), "c = 10");
+
+        // A value/column count mismatch -> Unsupported.
+        assert!(matches!(
+            expand_insert_values_row(&[lit(1)], &["a".to_owned(), "b".to_owned()], &table),
+            Err(CodegenError::Unsupported(_))
+        ));
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),

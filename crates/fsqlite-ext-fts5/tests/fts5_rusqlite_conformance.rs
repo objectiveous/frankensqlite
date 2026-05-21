@@ -1147,6 +1147,21 @@ const AUXILIARY_CASES: &[AuxiliaryCase] = &[
     },
 ];
 
+const AUXILIARY_COMPLEX_CASES: &[AuxiliaryCase] = &[
+    AuxiliaryCase {
+        name: "binary not positive terms only",
+        query: "rust NOT sqlite",
+    },
+    AuxiliaryCase {
+        name: "boolean or terms",
+        query: "rust OR bread",
+    },
+    AuxiliaryCase {
+        name: "adjacent column filters",
+        query: "title:rust body:writers",
+    },
+];
+
 const TOKENIZER_CASES: &[TokenizerCase] = &[
     TokenizerCase {
         name: "unicode61 remove_diacritics",
@@ -2245,6 +2260,30 @@ fn rank_column_matches_rusqlite_reference() {
             &sqlite,
             format_args!("trailing rank column {} ({})", case.name, case.query),
         );
+    }
+}
+
+#[test]
+fn complex_highlight_and_snippet_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in AUXILIARY_COMPLEX_CASES {
+        for column in [0, 1] {
+            assert_eq!(
+                harness.franken_highlight_rows(case.query, column),
+                harness.sqlite_highlight_rows(case.query, column),
+                "complex highlight conformance case failed: {} ({}, column {column})",
+                case.name,
+                case.query
+            );
+            assert_eq!(
+                harness.franken_snippet_rows(case.query, column),
+                harness.sqlite_snippet_rows(case.query, column),
+                "complex snippet conformance case failed: {} ({}, column {column})",
+                case.name,
+                case.query
+            );
+        }
     }
 }
 

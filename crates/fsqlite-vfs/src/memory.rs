@@ -2433,4 +2433,64 @@ mod tests {
         assert_eq!(snap.growth_events, 0);
         assert_eq!(snap.peak_reserved_bytes, 0);
     }
+
+    #[test]
+    fn memory_vfs_config_default_values() {
+        let cfg = MemoryVfsConfig::default();
+        assert_eq!(cfg.initial_reserve_bytes, 0);
+        assert_eq!(cfg.growth_chunk_bytes, WASM_LINEAR_MEMORY_PAGE_BYTES);
+        assert!(cfg.max_bytes.is_none());
+    }
+
+    #[test]
+    fn usage_snapshot_computed_methods_with_data() {
+        let snap = MemoryVfsUsageSnapshot {
+            file_bytes: 100,
+            file_reserved_bytes: 200,
+            shm_bytes: 50,
+            shm_reserved_bytes: 80,
+            peak_reserved_bytes: 300,
+            growth_events: 3,
+            file_count: 2,
+            shm_region_count: 1,
+            initial_reserve_bytes: 0,
+            growth_chunk_bytes: 65536,
+            max_bytes: Some(1_000_000),
+        };
+        assert_eq!(snap.live_bytes(), 150);
+        assert_eq!(snap.reserved_bytes(), 280);
+        assert_eq!(snap.fragmentation_bytes(), 130);
+    }
+
+    #[test]
+    fn usage_snapshot_debug_clone_copy_eq() {
+        let a = MemoryVfsUsageSnapshot {
+            file_bytes: 10, file_reserved_bytes: 20,
+            shm_bytes: 5, shm_reserved_bytes: 8,
+            peak_reserved_bytes: 28, growth_events: 1,
+            file_count: 1, shm_region_count: 0,
+            initial_reserve_bytes: 0, growth_chunk_bytes: 65536,
+            max_bytes: None,
+        };
+        let copied = a;
+        assert_eq!(copied, a);
+        let b = MemoryVfsUsageSnapshot { file_bytes: 99, ..a };
+        assert_ne!(a, b);
+        let dbg = format!("{a:?}");
+        assert!(dbg.contains("MemoryVfsUsageSnapshot"));
+    }
+
+    #[test]
+    fn memory_vfs_with_config_respects_settings() {
+        let cfg = MemoryVfsConfig {
+            initial_reserve_bytes: 4096,
+            growth_chunk_bytes: 8192,
+            max_bytes: Some(1_048_576),
+        };
+        let vfs = MemoryVfs::with_config(cfg);
+        let snap = vfs.usage_snapshot();
+        assert_eq!(snap.initial_reserve_bytes, 4096);
+        assert_eq!(snap.growth_chunk_bytes, 8192);
+        assert_eq!(snap.max_bytes, Some(1_048_576));
+    }
 }

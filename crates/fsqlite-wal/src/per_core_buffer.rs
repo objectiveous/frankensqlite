@@ -1706,6 +1706,54 @@ fn pool_append_batch_to_core_works() {
 }
 
 #[test]
+fn overflow_policy_debug_clone_copy_eq() {
+    let a = OverflowPolicy::BlockWriter;
+    let b = OverflowPolicy::AllocateOverflow;
+    assert_ne!(a, b);
+    let copied = a;
+    assert_eq!(copied, a);
+    let dbg = format!("{a:?}");
+    assert!(dbg.contains("BlockWriter"));
+    let dbg_b = format!("{b:?}");
+    assert!(dbg_b.contains("AllocateOverflow"));
+}
+
+#[test]
+fn append_outcome_debug_clone_copy_eq() {
+    let variants = [AppendOutcome::Appended, AppendOutcome::QueuedOverflow, AppendOutcome::Blocked];
+    for v in &variants {
+        let copied = *v;
+        assert_eq!(copied, *v);
+    }
+    let dbg = format!("{:?}", AppendOutcome::QueuedOverflow);
+    assert!(dbg.contains("QueuedOverflow"));
+    assert_ne!(AppendOutcome::Appended, AppendOutcome::Blocked);
+}
+
+#[test]
+fn fallback_decision_debug_clone_copy_eq() {
+    let a = FallbackDecision::ContinueParallel;
+    let b = FallbackDecision::ForceSerializedDrain;
+    assert_ne!(a, b);
+    let copied = a;
+    assert_eq!(copied, a);
+    let dbg = format!("{b:?}");
+    assert!(dbg.contains("ForceSerializedDrain"));
+}
+
+#[test]
+fn wal_record_debug_and_clone() {
+    let r = make_record(0, 5, 32);
+    let dbg = format!("{r:?}");
+    assert!(dbg.contains("WalRecord"));
+    let cloned = r.clone();
+    assert_eq!(cloned.epoch, r.epoch);
+    assert_eq!(cloned.page_id, r.page_id);
+    assert_eq!(cloned.before_image.len(), r.before_image.len());
+    assert_eq!(cloned.after_image, r.after_image);
+}
+
+#[test]
 fn epoch_coordinator_mark_and_query_durable_epoch() {
     let coord = EpochOrderCoordinator::new(2, BufferConfig::default(), EpochConfig::default());
     assert_eq!(coord.durable_epoch(), None);

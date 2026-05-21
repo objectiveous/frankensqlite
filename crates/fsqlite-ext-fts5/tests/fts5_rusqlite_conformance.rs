@@ -1568,6 +1568,37 @@ const REPEATED_REPLACEMENT_CASES: &[MatchCase] = &[
     },
 ];
 
+const COLUMN_MIGRATION_REPLACEMENT_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "new title term indexed",
+        query: "title:migrated",
+    },
+    MatchCase {
+        name: "new body term indexed",
+        query: "body:moved",
+    },
+    MatchCase {
+        name: "old title term removed from replaced row",
+        query: "title:fts",
+    },
+    MatchCase {
+        name: "old body term removed from replaced row",
+        query: "body:prefix",
+    },
+    MatchCase {
+        name: "other title sqlite rows retained",
+        query: "title:sqlite",
+    },
+    MatchCase {
+        name: "other search rows retained",
+        query: "search",
+    },
+    MatchCase {
+        name: "new migrated phrase indexed",
+        query: r#""moved column""#,
+    },
+];
+
 const REINSERT_ROWID_CASES: &[MatchCase] = &[
     MatchCase {
         name: "old rowid term removed",
@@ -3047,6 +3078,34 @@ fn repeated_replacement_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "repeated-replacement MATCH conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn column_migration_replacement_queries_match_rusqlite_reference() {
+    let mut harness = Fts5ConformanceHarness::new(&[]);
+    harness.insert_or_replace_doc(Doc {
+        rowid: 2,
+        title: "Migrated title",
+        body: "moved column marker",
+    });
+
+    let mut franken_rows = harness.franken_full_scan_rows();
+    franken_rows.sort_by_key(|row| row.0);
+    assert_eq!(
+        franken_rows,
+        harness.sqlite_full_scan_rows(),
+        "column-migration replacement full-scan conformance failed"
+    );
+
+    for case in COLUMN_MIGRATION_REPLACEMENT_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "column-migration replacement MATCH conformance case failed: {} ({})",
             case.name,
             case.query
         );

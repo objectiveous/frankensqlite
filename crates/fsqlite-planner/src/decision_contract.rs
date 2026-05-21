@@ -1132,6 +1132,38 @@ mod tests {
     }
 
     #[test]
+    fn query_by_time_range_filters_inclusively() {
+        // query_by_time_range had no direct test. Its window is inclusive at
+        // both ends. record_plan stamps the system clock, so overwrite the
+        // recorded timestamps to fixed values to make the window deterministic.
+        let tables = sample_tables();
+        let indexes = sample_indexes();
+        let plan = sample_plan();
+        let mut log = DecisionLog::new();
+        for _ in 0..3 {
+            log.record_plan("SELECT 1", &tables, &indexes, 0, None, 0, &plan, 1, false);
+        }
+        log.decisions[0].timestamp_epoch_secs = 100;
+        log.decisions[1].timestamp_epoch_secs = 200;
+        log.decisions[2].timestamp_epoch_secs = 300;
+
+        // A window covering only the middle stamp returns exactly that decision.
+        let mid = log.query_by_time_range(150, 250);
+        assert_eq!(mid.len(), 1);
+        assert_eq!(mid[0].timestamp_epoch_secs, 200);
+
+        // Inclusive upper/lower bounds: [200, 300] includes both 200 and 300.
+        assert_eq!(log.query_by_time_range(200, 300).len(), 2);
+
+        // The full span returns all three; a disjoint window returns none.
+        assert_eq!(log.query_by_time_range(100, 300).len(), 3);
+        assert!(log.query_by_time_range(400, 500).is_empty());
+
+        // A zero-width window on an exact stamp still matches (inclusive).
+        assert_eq!(log.query_by_time_range(200, 200).len(), 1);
+    }
+
+    #[test]
     fn decision_log_get_and_query() {
         let tables = sample_tables();
         let indexes = sample_indexes();

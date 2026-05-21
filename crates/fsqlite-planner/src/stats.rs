@@ -641,6 +641,37 @@ mod tests {
     }
 
     #[test]
+    fn test_interpolate_position_text_and_blob_branches() {
+        // The existing interpolate_position test covers Integer/Float/mixed; the
+        // Text and Blob branches (which interpolate via the base-256 byte
+        // fraction and have their own degenerate-range guards) were untested.
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
+
+        // Text: linear position via the base-256 fraction of the bytes. With
+        // ASCII 'A'(65), 'B'(66), 'C'(67), B sits halfway between A and C.
+        let t = |s: &str| SqliteValue::from(s);
+        assert!(approx(interpolate_position(&t("A"), &t("C"), &t("B")), 0.5));
+        assert!(approx(interpolate_position(&t("A"), &t("C"), &t("A")), 0.0));
+        assert!(approx(interpolate_position(&t("A"), &t("C"), &t("C")), 1.0));
+        // Out-of-range values clamp to [0, 1].
+        assert!(approx(interpolate_position(&t("A"), &t("C"), &t("@")), 0.0)); // '@'=64 < min
+        assert!(approx(interpolate_position(&t("A"), &t("C"), &t("D")), 1.0)); // 'D'=68 > max
+        // A reversed or empty text range carries no information -> 0.5.
+        assert!(approx(interpolate_position(&t("C"), &t("A"), &t("B")), 0.5));
+        assert!(approx(interpolate_position(&t("B"), &t("B"), &t("B")), 0.5));
+
+        // Blob: same base-256 interpolation, but the bytes can be arbitrary.
+        let b = |bytes: &[u8]| SqliteValue::from(bytes);
+        assert!(approx(interpolate_position(&b(&[0x00]), &b(&[0x80]), &b(&[0x40])), 0.5));
+        // A reversed blob range -> 0.5.
+        assert!(approx(interpolate_position(&b(&[0x80]), &b(&[0x00]), &b(&[0x40])), 0.5));
+        // Distinct blobs (max > min lexically) whose 8-byte base-256 encodings
+        // collide because trailing zero bytes are ignored hit the inner
+        // zero-range guard -> 0.5.
+        assert!(approx(interpolate_position(&b(&[0x01]), &b(&[0x01, 0x00]), &b(&[0x01])), 0.5));
+    }
+
+    #[test]
     fn test_histogram_equality_and_range_estimates_multi_bucket() {
         // Two equi-depth buckets with distinct densities so equality estimates
         // (count / ndv) differ per bucket and range estimates span both.

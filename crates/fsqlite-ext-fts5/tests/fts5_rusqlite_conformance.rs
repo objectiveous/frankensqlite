@@ -197,6 +197,29 @@ const TRIGRAM_DOCS: &[Doc] = &[
     },
 ];
 
+const TRIGRAM_MATCH_DOCS: &[Doc] = &[
+    Doc {
+        rowid: 1,
+        title: "Needle start",
+        body: "abcdef ghi",
+    },
+    Doc {
+        rowid: 2,
+        title: "Embedded upper",
+        body: "zzABCyy",
+    },
+    Doc {
+        rowid: 3,
+        title: "Overlap tail",
+        body: "bcdefg",
+    },
+    Doc {
+        rowid: 4,
+        title: "Short body",
+        body: "ab",
+    },
+];
+
 const TRIGRAM_DIACRITIC_DOCS: &[Doc] = &[
     Doc {
         rowid: 1,
@@ -503,6 +526,37 @@ const PORTER_UNICODE61_CASES: &[MatchCase] = &[
     MatchCase {
         name: "porter title column filter",
         query: "title:run",
+    },
+];
+
+const TRIGRAM_MATCH_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "case-folded three-character term",
+        query: "abc",
+    },
+    MatchCase {
+        name: "overlapping three-character term",
+        query: "bcd",
+    },
+    MatchCase {
+        name: "multi-trigram term requires every trigram",
+        query: "abcdef",
+    },
+    MatchCase {
+        name: "quoted multi-trigram phrase",
+        query: r#""bcdef""#,
+    },
+    MatchCase {
+        name: "title column multi-trigram term",
+        query: "title:needle",
+    },
+    MatchCase {
+        name: "body column suffix term",
+        query: "body:ghi",
+    },
+    MatchCase {
+        name: "leading context multi-trigram term",
+        query: "zzabc",
     },
 ];
 
@@ -1470,6 +1524,21 @@ fn porter_unicode61_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "porter unicode61 tokenizer conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn trigram_match_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::with_docs(TRIGRAM_OPTIONS, TRIGRAM_MATCH_DOCS);
+
+    for case in TRIGRAM_MATCH_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "trigram MATCH conformance case failed: {} ({})",
             case.name,
             case.query
         );

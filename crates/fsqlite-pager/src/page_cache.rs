@@ -7922,4 +7922,116 @@ mod tests {
              fast path should be at least 1.2x faster, got {speedup:.2}x"
         );
     }
+
+    // -- Pure-logic snapshot/metric type tests --
+
+    #[test]
+    fn lightweight_snapshot_total_accesses() {
+        let snap = PageCacheLightweightSnapshot {
+            hits: 75,
+            misses: 25,
+            ..PageCacheLightweightSnapshot::default()
+        };
+        assert_eq!(snap.total_accesses(), 100);
+    }
+
+    #[test]
+    fn lightweight_snapshot_hit_rate_zero_accesses() {
+        let snap = PageCacheLightweightSnapshot::default();
+        assert!((snap.hit_rate_percent() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn lightweight_snapshot_hit_rate_percent() {
+        let snap = PageCacheLightweightSnapshot {
+            hits: 80,
+            misses: 20,
+            ..PageCacheLightweightSnapshot::default()
+        };
+        assert!((snap.hit_rate_percent() - 80.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn metrics_snapshot_total_accesses() {
+        let snap = PageCacheMetricsSnapshot {
+            hits: 50,
+            misses: 50,
+            ..PageCacheMetricsSnapshot::default()
+        };
+        assert_eq!(snap.total_accesses(), 100);
+    }
+
+    #[test]
+    fn metrics_snapshot_hit_rate_zero() {
+        let snap = PageCacheMetricsSnapshot::default();
+        assert!((snap.hit_rate_percent() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn metrics_snapshot_hit_rate_100() {
+        let snap = PageCacheMetricsSnapshot {
+            hits: 100,
+            misses: 0,
+            ..PageCacheMetricsSnapshot::default()
+        };
+        assert!((snap.hit_rate_percent() - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn metrics_snapshot_efficiency_snapshot_preserves_fields() {
+        let snap = PageCacheMetricsSnapshot {
+            hits: 42,
+            misses: 8,
+            admits: 20,
+            evictions: 10,
+            cached_pages: 15,
+            pool_capacity: 100,
+            dirty_ratio_pct: 30,
+            t1_size: 5,
+            t2_size: 10,
+            b1_size: 3,
+            b2_size: 2,
+            p_target: 50,
+            mvcc_multi_version_pages: 1,
+        };
+        let eff = snap.efficiency_snapshot();
+        assert_eq!(eff.hits, 42);
+        assert_eq!(eff.misses, 8);
+        assert_eq!(eff.admits, 20);
+        assert_eq!(eff.evictions, 10);
+        assert_eq!(eff.cached_pages, 15);
+        assert_eq!(eff.pool_capacity, 100);
+        assert_eq!(eff.dirty_ratio_pct, 30);
+        assert_eq!(eff.t1_size, 5);
+        assert_eq!(eff.t2_size, 10);
+        assert_eq!(eff.mvcc_multi_version_pages, 1);
+    }
+
+    #[test]
+    fn queue_kind_as_str_covers_all_variants() {
+        assert_eq!(PageCacheQueueKind::T1.as_str(), "t1");
+        assert_eq!(PageCacheQueueKind::T2.as_str(), "t2");
+        assert_eq!(PageCacheQueueKind::B1.as_str(), "b1");
+        assert_eq!(PageCacheQueueKind::B2.as_str(), "b2");
+    }
+
+    #[test]
+    fn eviction_policy_default_is_arbitrary() {
+        assert_eq!(
+            PageCacheEvictionPolicy::default(),
+            PageCacheEvictionPolicy::Arbitrary
+        );
+    }
+
+    #[test]
+    fn resolve_page_buffer_max_explicit_overrides_default() {
+        let explicit = resolve_page_buffer_max(Some(42));
+        assert_eq!(explicit, 42);
+    }
+
+    #[test]
+    fn resolve_page_buffer_max_none_uses_default() {
+        let default_val = resolve_page_buffer_max(None);
+        assert!(default_val > 0);
+    }
 }

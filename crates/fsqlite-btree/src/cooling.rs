@@ -572,4 +572,32 @@ mod tests {
         assert!(csm.evict_page(1).is_ok());
         assert!(csm.evict_page(3).is_err());
     }
+
+    #[test]
+    fn frame_addr_is_none_for_cold_and_unregistered_pages() {
+        // frame_addr reports the address only for Hot/Cooling pages. The
+        // cooling_tracker test only checks the Hot case; this pins the None
+        // branches and that eviction clears the frame address.
+        let csm = CoolingStateMachine::new(CoolingConfig::default());
+
+        // Unregistered page: no frame address.
+        assert_eq!(csm.frame_addr(99), None);
+
+        // Freshly registered page is COLD -> no frame address yet.
+        csm.register_page(1);
+        assert_eq!(csm.frame_addr(1), None);
+
+        // Loaded page is HOT -> reports its frame address.
+        csm.load_page(1, 0x1000);
+        assert_eq!(csm.frame_addr(1), Some(0x1000));
+
+        // Still reported while COOLING (the frame stays resident).
+        csm.run_cooling_scan();
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Cooling));
+        assert_eq!(csm.frame_addr(1), Some(0x1000));
+
+        // After eviction (COOLING -> COLD) the frame address is cleared.
+        csm.evict_page(1).expect("a cooling page evicts");
+        assert_eq!(csm.frame_addr(1), None);
+    }
 }

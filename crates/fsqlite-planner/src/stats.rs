@@ -825,6 +825,45 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_cardinality_empty_table_and_ndv_only_for_equality() {
+        // Empty table -> zero estimate with heuristic provenance.
+        let empty = ColumnStats {
+            table_row_count: 0,
+            ndv: 100,
+            ..ColumnStats::default()
+        };
+        let est = empty.estimate_cardinality(&Operator::Eq, &SqliteValue::Integer(1), None);
+        assert!(est.estimated_rows.abs() < f64::EPSILON);
+        assert!(est.selectivity.abs() < f64::EPSILON);
+        assert_eq!(est.method, EstimationMethod::Heuristic);
+
+        // With NDV but no histogram/sample, the NDV fallback is wired ONLY for
+        // equality. A range operator with the same stats falls through to the
+        // default heuristic instead of using NDV.
+        let stats = ColumnStats {
+            table_row_count: 1000,
+            ndv: 50,
+            ..ColumnStats::default()
+        };
+        let eq = stats.estimate_cardinality(&Operator::Eq, &SqliteValue::Integer(1), None);
+        assert_eq!(eq.method, EstimationMethod::Ndv, "equality uses NDV");
+        let lt = stats.estimate_cardinality(&Operator::Lt, &SqliteValue::Integer(1), None);
+        assert_eq!(
+            lt.method,
+            EstimationMethod::Heuristic,
+            "a range op falls to the heuristic, not NDV"
+        );
+
+        // Across methods, estimated_rows is exactly selectivity * row_count.
+        for est in [&eq, &lt] {
+            assert!(
+                est.selectivity.mul_add(-1000.0, est.estimated_rows).abs() < 1e-6,
+                "estimated_rows must equal selectivity * row_count"
+            );
+        }
+    }
+
+    #[test]
     fn test_cardinality_estimate_heuristic_fallback() {
         let stats = ColumnStats {
             table_row_count: 1000,

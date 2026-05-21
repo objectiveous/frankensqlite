@@ -1168,6 +1168,37 @@ const COLUMN_FILTER_SET_CASES: &[MatchCase] = &[
     },
 ];
 
+const NEGATIVE_COLUMN_BOOLEAN_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "bare term excluding title column",
+        query: "rust NOT title:rust",
+    },
+    MatchCase {
+        name: "bare term excluding body column",
+        query: "search NOT body:search",
+    },
+    MatchCase {
+        name: "column term excluding another column",
+        query: "title:rust NOT body:writers",
+    },
+    MatchCase {
+        name: "grouped union excluding body column",
+        query: "(rust OR sqlite) NOT body:search",
+    },
+    MatchCase {
+        name: "braced column set excluding title column",
+        query: "{title body}:sqlite NOT title:rust",
+    },
+    MatchCase {
+        name: "negative title filter with body term",
+        query: "-title:rust AND body:search",
+    },
+    MatchCase {
+        name: "negative braced filter with disjunction",
+        query: "-{title}:search AND (rust OR sqlite)",
+    },
+];
+
 const UNINDEXED_COLUMN_CASES: &[MatchCase] = &[
     MatchCase {
         name: "unindexed column filter",
@@ -2417,6 +2448,21 @@ fn column_filter_set_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "column-filter set conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn negative_column_boolean_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in NEGATIVE_COLUMN_BOOLEAN_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "negative column boolean conformance case failed: {} ({})",
             case.name,
             case.query
         );

@@ -1427,6 +1427,33 @@ const MUTATION_CASES: &[MatchCase] = &[
     },
 ];
 
+const REINSERT_ROWID_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "old rowid term removed",
+        query: "compatibility",
+    },
+    MatchCase {
+        name: "old rowid body term removed",
+        query: "writers",
+    },
+    MatchCase {
+        name: "new title term indexed",
+        query: "reborn",
+    },
+    MatchCase {
+        name: "new body term indexed",
+        query: "renewed",
+    },
+    MatchCase {
+        name: "new phrase indexed",
+        query: r#""phrase token""#,
+    },
+    MatchCase {
+        name: "new column-filtered term indexed",
+        query: "title:rowid",
+    },
+];
+
 const DELETE_ALL_CASES: &[MatchCase] = &[
     MatchCase {
         name: "deleted title term",
@@ -2767,6 +2794,35 @@ fn mutation_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "mutation conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn reinsert_same_rowid_queries_match_rusqlite_reference() {
+    let mut harness = Fts5ConformanceHarness::new(&[]);
+    harness.delete_doc(3);
+    harness.insert_or_replace_doc(Doc {
+        rowid: 3,
+        title: "Reborn rowid",
+        body: "renewed phrase token marker",
+    });
+
+    let mut franken_rows = harness.franken_full_scan_rows();
+    franken_rows.sort_by_key(|row| row.0);
+    assert_eq!(
+        franken_rows,
+        harness.sqlite_full_scan_rows(),
+        "reinsert-rowid full-scan conformance failed"
+    );
+
+    for case in REINSERT_ROWID_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "reinsert-rowid MATCH conformance case failed: {} ({})",
             case.name,
             case.query
         );

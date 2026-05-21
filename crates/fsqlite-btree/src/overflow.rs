@@ -499,4 +499,62 @@ mod tests {
 
         assert!(matches!(result, Err(FrankenError::TooBig)));
     }
+
+    #[test]
+    fn test_read_overflow_chain_prefix_reads_only_needed_pages() {
+        // usable=16 -> 12 payload bytes per overflow page. Local holds 5 bytes,
+        // then a 3-page chain (10 -> 11 -> 12) holds 36 more = 41 total. Payload
+        // bytes are the sequence 0..41 so positions are self-checking.
+        let usable = 16u32;
+        let local: Vec<u8> = (0u8..5).collect();
+        let mk_page = |next: u32, data: &[u8]| {
+            let mut p = next.to_be_bytes().to_vec();
+            p.extend_from_slice(data);
+            p
+        };
+        let mut store: HashMap<u32, Vec<u8>> = HashMap::new();
+        store.insert(10, mk_page(11, &(5u8..17).collect::<Vec<u8>>()));
+        store.insert(11, mk_page(12, &(17u8..29).collect::<Vec<u8>>()));
+        store.insert(12, mk_page(0, &(29u8..41).collect::<Vec<u8>>()));
+
+        let reads = std::cell::Cell::new(0usize);
+        let mut read = |pg: PageNumber| -> Result<Vec<u8>> {
+            reads.set(reads.get() + 1);
+            store
+                .get(&pg.get())
+                .cloned()
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!("missing page {}", pg.get()),
+                })
+        };
+        let pg10 = PageNumber::new(10).unwrap();
+        let full: Vec<u8> = (0u8..41).collect();
+
+        // Full read reassembles the whole payload, visiting all 3 overflow pages.
+        reads.set(0);
+        let got = read_overflow_chain(&local, pg10, 41, usable, &mut read).unwrap();
+        assert_eq!(got, full);
+        assert_eq!(reads.get(), 3, "full read visits the entire chain");
+
+        // A prefix ending inside the first overflow page reads ONLY that page.
+        reads.set(0);
+        let mut out = Vec::new();
+        read_overflow_chain_prefix_into(&local, pg10, 41, usable, 10, &mut read, &mut out).unwrap();
+        assert_eq!(out, (0u8..10).collect::<Vec<u8>>());
+        assert_eq!(reads.get(), 1, "prefix should stop after the first overflow page");
+
+        // A prefix wholly within the local data reads no overflow pages at all.
+        reads.set(0);
+        out.clear();
+        read_overflow_chain_prefix_into(&local, pg10, 41, usable, 3, &mut read, &mut out).unwrap();
+        assert_eq!(out, vec![0u8, 1, 2]);
+        assert_eq!(reads.get(), 0, "local-only prefix touches no overflow pages");
+
+        // A zero-length prefix yields an empty result and reads nothing.
+        reads.set(0);
+        out.clear();
+        read_overflow_chain_prefix_into(&local, pg10, 41, usable, 0, &mut read, &mut out).unwrap();
+        assert!(out.is_empty());
+        assert_eq!(reads.get(), 0);
+    }
 }

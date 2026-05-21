@@ -2630,6 +2630,43 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_codegen_select_values_emits_one_resultrow_per_row() {
+        let lit = |n: i64| Expr::Literal(Literal::Integer(n), Span::ZERO);
+        let values = |rows: Vec<Vec<Expr>>| SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Values(rows),
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let schema: Vec<TableSchema> = vec![];
+        let ctx = CodegenContext::default();
+
+        // VALUES (1,2), (3,4) -> one ResultRow per row, no table cursor.
+        let stmt = values(vec![vec![lit(1), lit(2)], vec![lit(3), lit(4)]]);
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let resultrows = prog.ops().iter().filter(|op| op.opcode == Opcode::ResultRow).count();
+        assert_eq!(resultrows, 2, "one ResultRow per VALUES row");
+        assert!(
+            prog.ops().iter().all(|op| op.opcode != Opcode::OpenRead),
+            "VALUES has no table cursor"
+        );
+        assert!(has_opcodes(&prog, &[Opcode::ResultRow, Opcode::Halt]));
+
+        // Rows with mismatched arity are rejected.
+        let bad = values(vec![vec![lit(1)], vec![lit(1), lit(2)]]);
+        let mut b2 = ProgramBuilder::new();
+        assert!(matches!(
+            codegen_select(&mut b2, &bad, &schema, &ctx),
+            Err(CodegenError::Unsupported(_))
+        ));
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),

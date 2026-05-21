@@ -1615,4 +1615,140 @@ mod tests {
             "rollback should restore the mock allocator to its initial state"
         );
     }
+
+    #[test]
+    fn test_checkpoint_mode_default_is_passive() {
+        assert_eq!(CheckpointMode::default(), CheckpointMode::Passive);
+    }
+
+    #[test]
+    fn test_journal_mode_default_is_delete() {
+        assert_eq!(JournalMode::default(), JournalMode::Delete);
+    }
+
+    #[test]
+    fn test_wal_publication_snapshot_authoritative_when_index_full() {
+        let snap = WalPublicationSnapshot {
+            publication_seq: 1,
+            generation: WalGenerationIdentity::default(),
+            last_commit_frame: Some(10),
+            commit_count: 5,
+            latest_frame_entries: 10,
+            index_is_partial: false,
+        };
+        assert!(
+            snap.lookup_contract_is_authoritative(),
+            "full index must be authoritative"
+        );
+    }
+
+    #[test]
+    fn test_wal_publication_snapshot_not_authoritative_when_partial() {
+        let snap = WalPublicationSnapshot {
+            publication_seq: 1,
+            generation: WalGenerationIdentity::default(),
+            last_commit_frame: None,
+            commit_count: 0,
+            latest_frame_entries: 0,
+            index_is_partial: true,
+        };
+        assert!(
+            !snap.lookup_contract_is_authoritative(),
+            "partial index must not be authoritative"
+        );
+    }
+
+    #[test]
+    fn test_prepared_wal_frame_batch_frame_count_and_page_size() {
+        let batch = PreparedWalFrameBatch {
+            frame_size: 4120,
+            page_data_offset: 24,
+            big_endian_checksum: false,
+            frame_metas: vec![
+                PreparedWalFrameMeta { page_number: 1, db_size_if_commit: 0 },
+                PreparedWalFrameMeta { page_number: 2, db_size_if_commit: 10 },
+            ],
+            checksum_transforms: Vec::new(),
+            frame_bytes: vec![0u8; 4120 * 2],
+            last_commit_frame_offset: Some(4120),
+            finalized_for: None,
+            finalized_running_checksum: None,
+        };
+        assert_eq!(batch.frame_count(), 2);
+        assert_eq!(batch.page_size(), 4096);
+    }
+
+    #[test]
+    fn test_prepared_wal_frame_batch_set_db_size_clears_finalized() {
+        let mut batch = PreparedWalFrameBatch {
+            frame_size: 32,
+            page_data_offset: 8,
+            big_endian_checksum: false,
+            frame_metas: vec![
+                PreparedWalFrameMeta { page_number: 1, db_size_if_commit: 0 },
+            ],
+            checksum_transforms: Vec::new(),
+            frame_bytes: vec![0u8; 32],
+            last_commit_frame_offset: None,
+            finalized_for: Some(PreparedWalFinalizationState {
+                checkpoint_seq: 1,
+                salt1: 0xAA,
+                salt2: 0xBB,
+                start_frame_index: 0,
+                seed: PreparedWalChecksumSeed::default(),
+            }),
+            finalized_running_checksum: Some(PreparedWalChecksumSeed { s1: 1, s2: 2 }),
+        };
+
+        batch.set_db_size_if_commit(0, 42);
+
+        assert_eq!(batch.frame_metas[0].db_size_if_commit, 42);
+        assert!(
+            batch.finalized_for.is_none(),
+            "set_db_size_if_commit must invalidate finalized_for"
+        );
+        assert!(
+            batch.finalized_running_checksum.is_none(),
+            "set_db_size_if_commit must invalidate finalized_running_checksum"
+        );
+        let db_bytes = &batch.frame_bytes[4..8];
+        assert_eq!(u32::from_be_bytes(db_bytes.try_into().unwrap()), 42);
+    }
+
+    #[test]
+    fn test_mock_release_savepoint_unknown_name_returns_error() {
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let mut txn = pager.begin(&cx, TransactionMode::Deferred).unwrap();
+
+        let result = txn.release_savepoint(&cx, "nonexistent");
+        assert!(result.is_err(), "releasing unknown savepoint must fail");
+    }
+
+    #[test]
+    fn test_memory_mock_savepoint_rollback_restores_pages() {
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let p1 = PageNumber::new(1).unwrap();
+        let page_size = fsqlite_types::PageSize::default().as_usize();
+        let mut data_a = vec![0u8; page_size];
+        data_a[0] = 0xAA;
+        txn.write_page(&cx, p1, &data_a).unwrap();
+
+        txn.savepoint(&cx, "sp1").unwrap();
+
+        let mut data_b = vec![0u8; page_size];
+        data_b[0] = 0xBB;
+        txn.write_page(&cx, p1, &data_b).unwrap();
+        assert_eq!(txn.get_page(&cx, p1).unwrap().as_bytes()[0], 0xBB);
+
+        txn.rollback_to_savepoint(&cx, "sp1").unwrap();
+        assert_eq!(
+            txn.get_page(&cx, p1).unwrap().as_bytes()[0],
+            0xAA,
+            "rollback_to_savepoint must restore page state"
+        );
+    }
 }

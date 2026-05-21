@@ -1643,6 +1643,24 @@ mod tests {
         assert_eq!(agg_bare.explain_label(), "SUM(t.x)");
     }
 
+    #[test]
+    fn explain_differential_plan_renders_single_table_rowset_shape() {
+        // Companion to the grouped-aggregate explain test: the RowSet (single
+        // table, filters, projection) explain rendering was untested.
+        let select =
+            parse_select("SELECT id, name FROM users WHERE status = 'paid' AND tenant_id = 7");
+        let explain = explain_differential_view_plan(&select).expect("rowset shape should compile");
+        assert!(explain.contains("DIFFERENTIAL row_set"), "explain:\n{explain}");
+        assert!(explain.contains("SOURCE users AS users"));
+        assert!(explain.contains("EMIT users.id"));
+        assert!(explain.contains("EMIT users.name"));
+        assert!(explain.contains("FILTER users.status = 'paid'"));
+        assert!(explain.contains("FILTER users.tenant_id"));
+        // A RowSet plan has no join or grouping.
+        assert!(!explain.contains("JOIN"), "rowset has no join:\n{explain}");
+        assert!(!explain.contains("GROUP BY"), "rowset has no grouping:\n{explain}");
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
 

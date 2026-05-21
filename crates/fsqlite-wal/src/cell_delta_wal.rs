@@ -1138,4 +1138,47 @@ mod tests {
         let deserialized = CellDeltaWalFrame::deserialize(&serialized).unwrap();
         assert_eq!(deserialized.cell_data.len(), CELL_DELTA_MAX_DATA_SIZE);
     }
+
+    #[test]
+    fn cell_op_debug_clone_copy_eq() {
+        let ops = [CellOp::Insert, CellOp::Update, CellOp::Delete];
+        for op in &ops {
+            let copied = *op;
+            assert_eq!(copied, *op);
+        }
+        assert_ne!(CellOp::Insert, CellOp::Delete);
+        let dbg = format!("{:?}", CellOp::Update);
+        assert!(dbg.contains("Update"));
+    }
+
+    #[test]
+    fn wal_recovery_summary_debug_and_clone() {
+        let mut s = WalRecoverySummary::default();
+        s.full_page_frames = 10;
+        s.cell_delta_frames = 5;
+        s.checksum_errors = 1;
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("WalRecoverySummary"));
+        let cloned = s.clone();
+        assert_eq!(cloned.full_page_frames, 10);
+        assert_eq!(cloned.cell_delta_frames, 5);
+        assert_eq!(cloned.checksum_errors, 1);
+    }
+
+    #[test]
+    fn cell_op_from_byte_rejects_zero_and_max() {
+        assert!(CellOp::from_byte(0).is_none());
+        assert!(CellOp::from_byte(4).is_none());
+        assert!(CellOp::from_byte(u8::MAX).is_none());
+        assert_eq!(CellOp::from_byte(1), Some(CellOp::Insert));
+        assert_eq!(CellOp::from_byte(3), Some(CellOp::Delete));
+    }
+
+    #[test]
+    fn wal_recovery_summary_log_does_not_panic() {
+        let mut s = WalRecoverySummary::default();
+        s.full_page_frames = 100;
+        s.cell_data_bytes = 4096;
+        s.log_summary();
+    }
 }

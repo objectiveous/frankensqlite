@@ -954,6 +954,33 @@ const CASE_NULL_CASES: &[QueryCase] = &[
     },
 ];
 
+const SCALAR_NULL_COMPARISON_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "is and is not null predicates",
+        sql: "SELECT id, a IS b, a IS NOT b, a IS NULL, b IS NOT NULL FROM expr_rows ORDER BY id",
+    },
+    QueryCase {
+        name: "between three valued logic",
+        sql: "SELECT id, a BETWEEN 3 AND 10, a NOT BETWEEN 3 AND 10, a BETWEEN b AND 10 FROM expr_rows ORDER BY id",
+    },
+    QueryCase {
+        name: "in list null semantics",
+        sql: "SELECT id, a IN (5, 10, NULL), a NOT IN (5, 10, NULL), label IN ('high', NULL) FROM expr_rows ORDER BY id",
+    },
+    QueryCase {
+        name: "in subquery and not in subquery",
+        sql: "SELECT id, a IN (SELECT b FROM expr_rows WHERE b IS NOT NULL), a NOT IN (SELECT b FROM expr_rows WHERE b IS NOT NULL) FROM expr_rows ORDER BY id",
+    },
+    QueryCase {
+        name: "ifnull and nullif projections",
+        sql: "SELECT id, IFNULL(label, 'fallback'), NULLIF(a, b), NULLIF(label, 'high') FROM expr_rows ORDER BY id",
+    },
+    QueryCase {
+        name: "null scalar constants",
+        sql: "SELECT NULL = NULL, NULL != NULL, NULL IS NULL, NULL IS NOT NULL, 1 IS NOT NULL, '' IS NOT NULL",
+    },
+];
+
 const SUBQUERY_SETUP: &str = "
     CREATE TABLE customers (
         id INTEGER PRIMARY KEY,
@@ -1473,6 +1500,12 @@ fn compound_select_edge_cases_match_rusqlite() {
 fn case_and_null_logic_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
     harness.assert_queries_match("CASE/null logic", CASE_NULL_CASES);
+}
+
+#[test]
+fn scalar_null_comparison_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
+    harness.assert_queries_match("scalar NULL/comparison edge", SCALAR_NULL_COMPARISON_CASES);
 }
 
 #[test]

@@ -2751,6 +2751,70 @@ mod tests {
     }
 
     #[test]
+    fn queue_kind_and_location_debug_clone_copy_eq() {
+        let variants = [QueueKind::Small, QueueKind::Main, QueueKind::Ghost];
+        for v in &variants {
+            let copied = *v;
+            assert_eq!(copied, *v);
+        }
+        assert_ne!(QueueKind::Small, QueueKind::Main);
+        let dbg = format!("{:?}", QueueKind::Ghost);
+        assert!(dbg.contains("Ghost"));
+
+        let loc = QueueLocation { kind: QueueKind::Small };
+        let loc2 = loc;
+        assert_eq!(loc, loc2);
+        let dbg_loc = format!("{loc:?}");
+        assert!(dbg_loc.contains("QueueLocation"));
+    }
+
+    #[test]
+    fn s3_fifo_event_debug_clone_copy_eq_all_variants() {
+        let pg1 = pg(1);
+        let events = [
+            S3FifoEvent::Inserted(pg1),
+            S3FifoEvent::AlreadyResident { page_id: pg1, queue: QueueKind::Small },
+            S3FifoEvent::GhostReadmission(pg1),
+            S3FifoEvent::PromotedToMain(pg1),
+            S3FifoEvent::EvictedFromSmallToGhost(pg1),
+            S3FifoEvent::ReinsertedInMain { page_id: pg1, reinsert_count: 2 },
+            S3FifoEvent::EvictedFromMain(pg1),
+            S3FifoEvent::GhostTrimmed(pg1),
+            S3FifoEvent::AdaptiveSplitChanged { old_small_capacity: 5, new_small_capacity: 10 },
+        ];
+        for e in &events {
+            let copied = *e;
+            assert_eq!(copied, *e);
+        }
+        let dbg = format!("{:?}", S3FifoEvent::GhostReadmission(pg1));
+        assert!(dbg.contains("GhostReadmission"));
+        assert_ne!(S3FifoEvent::Inserted(pg1), S3FifoEvent::EvictedFromMain(pg1));
+    }
+
+    #[test]
+    fn rollout_policy_debug_clone_copy_eq() {
+        let a = RolloutPolicy::Arc;
+        let b = RolloutPolicy::S3Fifo;
+        assert_ne!(a, b);
+        let copied = a;
+        assert_eq!(copied, a);
+        let dbg = format!("{b:?}");
+        assert!(dbg.contains("S3Fifo"));
+    }
+
+    #[test]
+    fn rollout_decision_debug_clone_copy_eq() {
+        let variants = [RolloutDecision::KeepArc, RolloutDecision::KeepS3Fifo, RolloutDecision::FallbackToArc];
+        for v in &variants {
+            let copied = *v;
+            assert_eq!(copied, *v);
+        }
+        assert_ne!(RolloutDecision::KeepArc, RolloutDecision::FallbackToArc);
+        let dbg = format!("{:?}", RolloutDecision::KeepS3Fifo);
+        assert!(dbg.contains("KeepS3Fifo"));
+    }
+
+    #[test]
     fn rollout_gate_new_clamps_zero_required_windows_to_one() {
         let baseline = RolloutMetrics::new(100_000, 1_000);
         let bad = RolloutMetrics::new(200_000, 1_000);

@@ -222,3 +222,143 @@ fn fault_error(point: &str, arm: &FaultHookArm) -> FrankenError {
         arm.run_id, arm.scenario_id, arm.invariant_family
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    fn arm(point: &str) -> FaultHookArm {
+        FaultHookArm::new(format!("test-{point}"), format!("scenario-{point}"), "unit")
+    }
+
+    #[test]
+    fn test_clear_resets_all_armed_hooks_and_records() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_after_append(arm("append"));
+        arm_sync_failure(arm("sync"));
+        arm_append_busy_countdown(arm("busy"), 1);
+        arm_crash_header_truncate(arm("crash"));
+        let _ = maybe_inject_after_append(0, 1);
+        assert_eq!(take_records().len(), 1);
+
+        clear();
+        assert!(maybe_inject_after_append(0, 1).is_ok());
+        assert!(maybe_inject_sync_failure(0, SyncFlags::NORMAL).is_ok());
+        assert!(maybe_inject_append_busy(0, 1).is_ok());
+        assert!(maybe_inject_crash_header_truncate(0, 1).is_ok());
+        assert!(take_records().is_empty());
+    }
+
+    #[test]
+    fn test_after_append_fires_once_then_disarms() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_after_append(arm("append"));
+        let err = maybe_inject_after_append(5, 3);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("fault_inject:wal_after_append"));
+
+        assert!(maybe_inject_after_append(8, 2).is_ok());
+    }
+
+    #[test]
+    fn test_sync_failure_fires_once_then_disarms() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_sync_failure(arm("sync"));
+        let err = maybe_inject_sync_failure(10, SyncFlags::FULL);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("fault_inject:wal_sync_failure"));
+
+        assert!(maybe_inject_sync_failure(10, SyncFlags::FULL).is_ok());
+    }
+
+    #[test]
+    fn test_append_busy_countdown_fires_on_nth_invocation() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_append_busy_countdown(arm("busy"), 3);
+        assert!(maybe_inject_append_busy(0, 1).is_ok(), "1st call should not fire");
+        assert!(maybe_inject_append_busy(1, 1).is_ok(), "2nd call should not fire");
+        let err = maybe_inject_append_busy(2, 1);
+        assert!(err.is_err(), "3rd call should fire");
+        assert!(matches!(err.unwrap_err(), FrankenError::Busy));
+
+        assert!(maybe_inject_append_busy(3, 1).is_ok(), "disarmed after fire");
+    }
+
+    #[test]
+    fn test_append_busy_countdown_minimum_one() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_append_busy_countdown(arm("busy"), 0);
+        let err = maybe_inject_append_busy(0, 1);
+        assert!(err.is_err(), "countdown of 0 should clamp to 1 and fire immediately");
+    }
+
+    #[test]
+    fn test_crash_header_truncate_fires_once() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_crash_header_truncate(arm("crash"));
+        let err = maybe_inject_crash_header_truncate(4, 2);
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("fault_inject:wal_crash_header_truncate"),
+        );
+
+        assert!(maybe_inject_crash_header_truncate(4, 3).is_ok());
+    }
+
+    #[test]
+    fn test_records_capture_trigger_details() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_after_append(FaultHookArm::new("run-a", "scen-a", "inv-a"));
+        let _ = maybe_inject_after_append(7, 3);
+
+        arm_sync_failure(FaultHookArm::new("run-b", "scen-b", "inv-b"));
+        let _ = maybe_inject_sync_failure(12, SyncFlags::FULL);
+
+        let records = take_records();
+        assert_eq!(records.len(), 2);
+
+        assert_eq!(records[0].point, "wal_after_append");
+        assert_eq!(records[0].run_id, "run-a");
+        assert!(records[0].detail.contains("frame_count_before=7"));
+        assert!(records[0].detail.contains("appended_frames=3"));
+
+        assert_eq!(records[1].point, "wal_sync_failure");
+        assert_eq!(records[1].run_id, "run-b");
+        assert!(records[1].detail.contains("frame_count_before=12"));
+
+        assert_eq!(records[0].trigger_seq, 1);
+        assert_eq!(records[1].trigger_seq, 2);
+    }
+
+    #[test]
+    fn test_take_records_drains_and_is_empty_after() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_after_append(arm("append"));
+        let _ = maybe_inject_after_append(0, 1);
+
+        let first = take_records();
+        assert_eq!(first.len(), 1);
+        let second = take_records();
+        assert!(second.is_empty());
+    }
+}

@@ -3168,6 +3168,20 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_expr_unsupported_expr_returns_error() {
+        // emit_expr handles literals, placeholders, binary/unary ops, IsNull,
+        // Cast, FunctionCall, Case, and Collate; everything else hits the
+        // catch-all and returns Unsupported. A bare column reference is only
+        // emittable in a cursor/scan context (via emit_column_reads), not as a
+        // free expression, so emit_expr rejects it.
+        let mut b = ProgramBuilder::new();
+        let reg = b.alloc_reg();
+        let err = emit_expr(&mut b, &Expr::Column(ColumnRef::bare("x"), Span::ZERO), reg)
+            .expect_err("a free column reference is not emittable by emit_expr");
+        assert!(matches!(err, CodegenError::Unsupported(_)));
+    }
+
+    #[test]
     fn test_emit_expr_large_integer_literal_uses_int64_opcode() {
         let mut b = ProgramBuilder::new();
         let reg = b.alloc_reg();

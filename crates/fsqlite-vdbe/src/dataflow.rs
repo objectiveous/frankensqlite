@@ -197,6 +197,11 @@ pub enum DataflowOperator {
         key_columns: Vec<usize>,
         value_column: usize,
     },
+    /// Emit one materialized integer `MAX(value_column)` row per key.
+    MaxIntegerByKey {
+        key_columns: Vec<usize>,
+        value_column: usize,
+    },
     /// Consolidate algebraic weights by complete row value.
     ConsolidateRows,
     /// Multiply every row weight by `factor`, eliding zero-weight output rows.
@@ -250,6 +255,10 @@ impl DataflowOperator {
                 key_columns,
                 value_column,
             } => min_integer_by_key(rows, key_columns, *value_column),
+            Self::MaxIntegerByKey {
+                key_columns,
+                value_column,
+            } => max_integer_by_key(rows, key_columns, *value_column),
             Self::ConsolidateRows => Ok(consolidate_rows(rows.iter().cloned().collect())),
             Self::ScaleWeight { factor } => Ok(scale_weights(rows, *factor)),
             Self::ThresholdPositive => Ok(threshold_positive(rows)),
@@ -403,6 +412,34 @@ fn min_integer_by_key(
         .into_iter()
         .map(|(mut values, min_value)| {
             values.push(SqliteValue::Integer(min_value));
+            WeightedRow::insert(values)
+        })
+        .collect())
+}
+
+fn max_integer_by_key(
+    rows: &[WeightedRow],
+    key_columns: &[usize],
+    value_column: usize,
+) -> DataflowResult<Vec<WeightedRow>> {
+    let mut groups: Vec<(Vec<SqliteValue>, i64)> = Vec::new();
+    for row in rows {
+        if row.weight <= 0 {
+            continue;
+        }
+        let key = row.project(key_columns)?;
+        let value = integer_value_at(row, value_column)?;
+        if let Some((_, max_value)) = groups.iter_mut().find(|(candidate, _)| *candidate == key) {
+            *max_value = (*max_value).max(value);
+        } else {
+            groups.push((key, value));
+        }
+    }
+
+    Ok(groups
+        .into_iter()
+        .map(|(mut values, max_value)| {
+            values.push(SqliteValue::Integer(max_value));
             WeightedRow::insert(values)
         })
         .collect())
@@ -774,6 +811,45 @@ mod tests {
     #[test]
     fn min_integer_by_key_rejects_non_integer_values() {
         let automaton = DataflowAutomaton::new(vec![DataflowOperator::MinIntegerByKey {
+            key_columns: vec![0],
+            value_column: 1,
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), SqliteValue::Float(1.5)])])
+            .expect_err("non-integer aggregate input should fail");
+
+        assert_eq!(err, DataflowError::AggregateValueNotInteger { column: 1 });
+    }
+
+    #[test]
+    fn max_integer_by_key_appends_maximum_for_positive_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::MaxIntegerByKey {
+            key_columns: vec![0],
+            value_column: 1,
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(2), int(20)], 1),
+            WeightedRow::new(vec![int(1), int(10)], 1),
+            WeightedRow::new(vec![int(2), int(7)], 1),
+            WeightedRow::new(vec![int(1), int(30)], -1),
+            WeightedRow::new(vec![int(3), int(30)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::insert(vec![int(2), int(20)]),
+                WeightedRow::insert(vec![int(1), int(10)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn max_integer_by_key_rejects_non_integer_values() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::MaxIntegerByKey {
             key_columns: vec![0],
             value_column: 1,
         }]);

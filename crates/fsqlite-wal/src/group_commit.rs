@@ -2602,4 +2602,47 @@ mod tests {
         assert_eq!(batch.context.batch_id, 99);
         assert_eq!(batch.context.lane_id, 2);
     }
+
+    #[test]
+    fn group_commit_config_default_copy_debug() {
+        let cfg = GroupCommitConfig::default();
+        let copied = cfg;
+        assert_eq!(copied.max_group_size, 64);
+        assert_eq!(copied.max_group_delay, Duration::from_millis(1));
+        assert_eq!(copied.max_group_delay_ceiling, Duration::from_millis(10));
+        let dbg = format!("{cfg:?}");
+        assert!(dbg.contains("GroupCommitConfig"));
+    }
+
+    #[test]
+    fn frame_submission_debug_clone() {
+        let fs = FrameSubmission { page_number: 42, page_data: vec![0xAB; 8], db_size_if_commit: 0 };
+        let cloned = fs.clone();
+        assert_eq!(cloned.page_number, 42);
+        assert_eq!(cloned.page_data.len(), 8);
+        assert_eq!(cloned.db_size_if_commit, 0);
+        let dbg = format!("{fs:?}");
+        assert!(dbg.contains("FrameSubmission"));
+    }
+
+    #[test]
+    fn phase_percentiles_default_copy_eq() {
+        let pp = PhasePercentiles::default();
+        let copied = pp;
+        assert_eq!(copied, pp);
+        assert_eq!(pp.p50, 0);
+        assert_eq!(pp.p99, 0);
+        assert_eq!(pp.max, 0);
+        assert_eq!(pp.count, 0);
+    }
+
+    #[test]
+    fn wake_reason_snapshot_default_total_zero() {
+        let ws = WakeReasonSnapshot::default();
+        assert_eq!(ws.total(), 0);
+        let copied = ws;
+        assert_eq!(copied, ws);
+        let dbg = format!("{ws:?}");
+        assert!(dbg.contains("WakeReasonSnapshot"));
+    }
 }

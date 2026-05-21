@@ -751,7 +751,7 @@ impl Fts5ConformanceHarness {
             .expect("read rusqlite FTS5 weighted BM25 rowids")
     }
 
-    fn franken_highlight_body_rows(&self, query: &str) -> Vec<(i64, String)> {
+    fn franken_highlight_rows(&self, query: &str, column: usize) -> Vec<(i64, String)> {
         let func = Fts5HighlightFunc;
         let mut rows: Vec<(i64, String)> = self
             .franken
@@ -759,9 +759,10 @@ impl Fts5ConformanceHarness {
             .expect("FrankenSQLite FTS5 rows for highlight")
             .into_iter()
             .map(|(rowid, _score, columns)| {
+                let text = columns.get(column).cloned().unwrap_or_default();
                 let highlighted = func
                     .invoke(&[
-                        SqliteValue::Text(SmallText::from_string(columns[1].clone())),
+                        SqliteValue::Text(SmallText::from_string(text)),
                         SqliteValue::Text(SmallText::from_string(query.to_owned())),
                         SqliteValue::Text(SmallText::from_string("<b>".to_owned())),
                         SqliteValue::Text(SmallText::from_string("</b>".to_owned())),
@@ -774,13 +775,14 @@ impl Fts5ConformanceHarness {
         rows
     }
 
-    fn sqlite_highlight_body_rows(&self, query: &str) -> Vec<(i64, String)> {
+    fn sqlite_highlight_rows(&self, query: &str, column: usize) -> Vec<(i64, String)> {
+        let sql = format!(
+            "SELECT rowid, highlight(docs, {column}, '<b>', '</b>') \
+             FROM docs WHERE docs MATCH ?1 ORDER BY rowid"
+        );
         let mut stmt = self
             .sqlite
-            .prepare(
-                "SELECT rowid, highlight(docs, 1, '<b>', '</b>') \
-                 FROM docs WHERE docs MATCH ?1 ORDER BY rowid",
-            )
+            .prepare(&sql)
             .expect("prepare rusqlite FTS5 highlight query");
         stmt.query_map([query], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
@@ -790,7 +792,7 @@ impl Fts5ConformanceHarness {
         .expect("read rusqlite FTS5 highlight rows")
     }
 
-    fn franken_snippet_body_rows(&self, query: &str) -> Vec<(i64, String)> {
+    fn franken_snippet_rows(&self, query: &str, column: usize) -> Vec<(i64, String)> {
         let func = Fts5SnippetFunc;
         let mut rows: Vec<(i64, String)> = self
             .franken
@@ -798,9 +800,10 @@ impl Fts5ConformanceHarness {
             .expect("FrankenSQLite FTS5 rows for snippet")
             .into_iter()
             .map(|(rowid, _score, columns)| {
+                let text = columns.get(column).cloned().unwrap_or_default();
                 let snippet = func
                     .invoke(&[
-                        SqliteValue::Text(SmallText::from_string(columns[1].clone())),
+                        SqliteValue::Text(SmallText::from_string(text)),
                         SqliteValue::Text(SmallText::from_string(query.to_owned())),
                         SqliteValue::Text(SmallText::from_string("[".to_owned())),
                         SqliteValue::Text(SmallText::from_string("]".to_owned())),
@@ -815,13 +818,14 @@ impl Fts5ConformanceHarness {
         rows
     }
 
-    fn sqlite_snippet_body_rows(&self, query: &str) -> Vec<(i64, String)> {
+    fn sqlite_snippet_rows(&self, query: &str, column: usize) -> Vec<(i64, String)> {
+        let sql = format!(
+            "SELECT rowid, snippet(docs, {column}, '[', ']', '...', 64) \
+             FROM docs WHERE docs MATCH ?1 ORDER BY rowid"
+        );
         let mut stmt = self
             .sqlite
-            .prepare(
-                "SELECT rowid, snippet(docs, 1, '[', ']', '...', 64) \
-                 FROM docs WHERE docs MATCH ?1 ORDER BY rowid",
-            )
+            .prepare(&sql)
             .expect("prepare rusqlite FTS5 snippet query");
         stmt.query_map([query], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
@@ -1091,19 +1095,21 @@ fn highlight_and_snippet_match_rusqlite_reference() {
     let harness = Fts5ConformanceHarness::new(&[]);
 
     for case in AUXILIARY_CASES {
-        assert_eq!(
-            harness.franken_highlight_body_rows(case.query),
-            harness.sqlite_highlight_body_rows(case.query),
-            "highlight conformance case failed: {} ({})",
-            case.name,
-            case.query
-        );
-        assert_eq!(
-            harness.franken_snippet_body_rows(case.query),
-            harness.sqlite_snippet_body_rows(case.query),
-            "snippet conformance case failed: {} ({})",
-            case.name,
-            case.query
-        );
+        for column in [0, 1] {
+            assert_eq!(
+                harness.franken_highlight_rows(case.query, column),
+                harness.sqlite_highlight_rows(case.query, column),
+                "highlight conformance case failed: {} ({}, column {column})",
+                case.name,
+                case.query
+            );
+            assert_eq!(
+                harness.franken_snippet_rows(case.query, column),
+                harness.sqlite_snippet_rows(case.query, column),
+                "snippet conformance case failed: {} ({}, column {column})",
+                case.name,
+                case.query
+            );
+        }
     }
 }

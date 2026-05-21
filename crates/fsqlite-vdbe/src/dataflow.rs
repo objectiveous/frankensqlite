@@ -231,6 +231,12 @@ pub enum DataflowOperator {
         lower: usize,
         upper: usize,
     },
+    /// Keep rows whose blob column byte length lies outside an inclusive range.
+    FilterBlobLengthNotBetween {
+        column: usize,
+        lower: usize,
+        upper: usize,
+    },
     /// Keep rows whose text column length lies outside an inclusive character range.
     FilterTextLengthNotBetween {
         column: usize,
@@ -359,6 +365,11 @@ impl DataflowOperator {
                 lower,
                 upper,
             } => filter_blob_length_between(rows, *column, *lower, *upper),
+            Self::FilterBlobLengthNotBetween {
+                column,
+                lower,
+                upper,
+            } => filter_blob_length_not_between(rows, *column, *lower, *upper),
             Self::FilterTextLengthNotBetween {
                 column,
                 lower,
@@ -724,6 +735,29 @@ fn filter_blob_length_between(
     rows.iter()
         .filter_map(|row| match row.values.get(column) {
             Some(SqliteValue::Blob(candidate)) if (lower..=upper).contains(&candidate.len()) => {
+                Some(Ok(row.clone()))
+            }
+            Some(SqliteValue::Blob(_)) => None,
+            Some(_) => Some(Err(DataflowError::PredicateValueNotBlob { column })),
+            None => Some(Err(DataflowError::ColumnOutOfBounds {
+                column,
+                width: row.width(),
+            })),
+        })
+        .collect()
+}
+
+fn filter_blob_length_not_between(
+    rows: &[WeightedRow],
+    column: usize,
+    lower: usize,
+    upper: usize,
+) -> DataflowResult<Vec<WeightedRow>> {
+    rows.iter()
+        .filter_map(|row| match row.values.get(column) {
+            Some(SqliteValue::Blob(candidate))
+                if candidate.len() < lower || upper < candidate.len() =>
+            {
                 Some(Ok(row.clone()))
             }
             Some(SqliteValue::Blob(_)) => None,
@@ -1889,6 +1923,94 @@ mod tests {
         let err = automaton
             .execute(&[WeightedRow::insert(vec![int(1), blob(&[1, 2])])])
             .expect_err("invalid blob-length predicate column should fail");
+
+        assert_eq!(
+            err,
+            DataflowError::ColumnOutOfBounds {
+                column: 2,
+                width: 2
+            }
+        );
+    }
+
+    #[test]
+    fn filter_blob_length_not_between_keeps_outside_weighted_rows() {
+        let automaton =
+            DataflowAutomaton::new(vec![DataflowOperator::FilterBlobLengthNotBetween {
+                column: 1,
+                lower: 2,
+                upper: 4,
+            }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), blob(&[1])], 7),
+            WeightedRow::new(vec![int(2), blob(&[1, 2])], -2),
+            WeightedRow::new(vec![int(3), blob(&[1, 2, 3, 4])], 4),
+            WeightedRow::new(vec![int(4), blob(&[1, 2, 3, 4, 5])], 5),
+            WeightedRow::new(vec![int(5), blob(&[9])], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(1), blob(&[1])], 7),
+                WeightedRow::new(vec![int(4), blob(&[1, 2, 3, 4, 5])], 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_blob_length_not_between_inverted_range_keeps_all_non_zero_blob_rows() {
+        let automaton =
+            DataflowAutomaton::new(vec![DataflowOperator::FilterBlobLengthNotBetween {
+                column: 1,
+                lower: 5,
+                upper: 3,
+            }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), blob(&[1, 2])], 3),
+            WeightedRow::new(vec![int(2), blob(&[1, 2, 3, 4])], -4),
+            WeightedRow::new(vec![int(3), blob(&[])], 0),
+        ];
+
+        assert_eq!(
+            automaton.execute(&rows).expect("dataflow should execute"),
+            vec![
+                WeightedRow::new(vec![int(1), blob(&[1, 2])], 3),
+                WeightedRow::new(vec![int(2), blob(&[1, 2, 3, 4])], -4),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_blob_length_not_between_rejects_non_blob_values() {
+        let automaton =
+            DataflowAutomaton::new(vec![DataflowOperator::FilterBlobLengthNotBetween {
+                column: 1,
+                lower: 2,
+                upper: 4,
+            }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), text("blob")])])
+            .expect_err("non-blob predicate input should fail");
+
+        assert_eq!(err, DataflowError::PredicateValueNotBlob { column: 1 });
+    }
+
+    #[test]
+    fn filter_blob_length_not_between_rejects_out_of_bounds_columns() {
+        let automaton =
+            DataflowAutomaton::new(vec![DataflowOperator::FilterBlobLengthNotBetween {
+                column: 2,
+                lower: 2,
+                upper: 4,
+            }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), blob(&[1, 2])])])
+            .expect_err("invalid blob-length anti-range predicate column should fail");
 
         assert_eq!(
             err,

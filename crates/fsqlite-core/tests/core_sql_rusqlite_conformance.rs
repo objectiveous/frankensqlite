@@ -2479,6 +2479,43 @@ const ROUND_SCALAR_CASES: &[QueryCase] = &[
     },
 ];
 
+const SIGN_SCALAR_SETUP: &str = "
+    CREATE TABLE sign_values (
+        id INTEGER PRIMARY KEY,
+        val,
+        txt TEXT
+    );
+    INSERT INTO sign_values (id, val, txt) VALUES
+        (1, -2.5, '-7.2'),
+        (2, 0, '0'),
+        (3, 3.5, '  5  '),
+        (4, NULL, 'abc'),
+        (5, -0.0, NULL);
+";
+
+const SIGN_SCALAR_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "numeric signs and storage class",
+        sql: "SELECT sign(-2.5), sign(0), sign(3.5), sign(-0.0), sign(NULL), typeof(sign(3.5))",
+    },
+    QueryCase {
+        name: "numeric text coercion",
+        sql: "SELECT sign('  5  '), sign('-7.2'), sign('0'), sign('1e500'), sign('-1e500')",
+    },
+    QueryCase {
+        name: "non numeric text returns null",
+        sql: "SELECT sign('abc'), sign(''), sign('   '), sign('NaN'), sign('inf'), sign('-inf')",
+    },
+    QueryCase {
+        name: "blob and null inputs",
+        sql: "SELECT sign(X'0102'), sign(NULL), typeof(sign(X'0102')), typeof(sign(NULL))",
+    },
+    QueryCase {
+        name: "column driven sign",
+        sql: "SELECT id, sign(val), sign(txt), typeof(sign(val)), typeof(sign(txt)) FROM sign_values ORDER BY id",
+    },
+];
+
 const PATTERN_SETUP: &str = "
     CREATE TABLE patterns (
         id INTEGER PRIMARY KEY,
@@ -2986,6 +3023,12 @@ fn math_functions_match_rusqlite() {
 fn round_scalar_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(ROUND_SCALAR_SETUP);
     harness.assert_queries_match("round scalar edge", ROUND_SCALAR_CASES);
+}
+
+#[test]
+fn sign_scalar_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(SIGN_SCALAR_SETUP);
+    harness.assert_queries_match("sign scalar edge", SIGN_SCALAR_CASES);
 }
 
 #[test]

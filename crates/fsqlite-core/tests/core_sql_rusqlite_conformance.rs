@@ -1082,6 +1082,84 @@ const CHECK_CONSTRAINT_ERROR_CASES: &[StatementCase] = &[
     },
 ];
 
+const FOREIGN_KEY_ACTION_SETUP: &str = "
+    PRAGMA foreign_keys = ON;
+
+    CREATE TABLE fk_parent (
+        id INTEGER PRIMARY KEY,
+        code TEXT NOT NULL UNIQUE
+    );
+    CREATE TABLE fk_child_cascade (
+        id INTEGER PRIMARY KEY,
+        parent_id INTEGER REFERENCES fk_parent(id) ON DELETE CASCADE,
+        label TEXT NOT NULL
+    );
+    CREATE TABLE fk_child_setnull (
+        id INTEGER PRIMARY KEY,
+        parent_id INTEGER REFERENCES fk_parent(id) ON DELETE SET NULL,
+        label TEXT NOT NULL
+    );
+    CREATE TABLE fk_child_restrict (
+        id INTEGER PRIMARY KEY,
+        parent_id INTEGER REFERENCES fk_parent(id) ON DELETE RESTRICT,
+        label TEXT NOT NULL
+    );
+
+    INSERT INTO fk_parent VALUES
+        (1, 'cascade'),
+        (2, 'set-null'),
+        (3, 'restrict'),
+        (4, 'survive');
+    INSERT INTO fk_child_cascade VALUES
+        (10, 1, 'cascade-a'),
+        (11, 1, 'cascade-b'),
+        (12, 4, 'survivor');
+    INSERT INTO fk_child_setnull VALUES
+        (20, 2, 'set-null-a'),
+        (21, 4, 'survivor');
+    INSERT INTO fk_child_restrict VALUES
+        (30, 3, 'restrict-a');
+";
+
+const FOREIGN_KEY_ACTION_SCRIPT: &str = "
+    DELETE FROM fk_parent WHERE id = 1;
+    DELETE FROM fk_parent WHERE id = 2;
+";
+
+const FOREIGN_KEY_ACTION_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "parent rows after cascade and set null deletes",
+        sql: "SELECT id, code FROM fk_parent ORDER BY id",
+    },
+    QueryCase {
+        name: "cascade child rows removed",
+        sql: "SELECT id, parent_id, label FROM fk_child_cascade ORDER BY id",
+    },
+    QueryCase {
+        name: "set null child rows retained",
+        sql: "SELECT id, parent_id, label FROM fk_child_setnull ORDER BY id",
+    },
+    QueryCase {
+        name: "restrict child rows retained",
+        sql: "SELECT id, parent_id, label FROM fk_child_restrict ORDER BY id",
+    },
+    QueryCase {
+        name: "foreign key check remains clean",
+        sql: "PRAGMA foreign_key_check",
+    },
+];
+
+const FOREIGN_KEY_ACTION_ERROR_CASES: &[StatementCase] = &[
+    StatementCase {
+        name: "insert missing parent is rejected",
+        sql: "INSERT INTO fk_child_cascade(id, parent_id, label) VALUES (13, 99, 'missing-parent')",
+    },
+    StatementCase {
+        name: "restrict delete is rejected",
+        sql: "DELETE FROM fk_parent WHERE id = 3",
+    },
+];
+
 const DDL_SETUP: &str = "
     CREATE TABLE accounts (
         id INTEGER PRIMARY KEY,
@@ -2278,6 +2356,15 @@ fn check_constraint_edges_match_rusqlite() {
     harness.execute_script(CHECK_CONSTRAINT_SCRIPT);
     harness.assert_queries_match("CHECK constraint edge", CHECK_CONSTRAINT_CASES);
     harness.assert_statement_errors_match("CHECK constraint edge", CHECK_CONSTRAINT_ERROR_CASES);
+}
+
+#[test]
+fn foreign_key_action_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(FOREIGN_KEY_ACTION_SETUP);
+    harness.execute_script(FOREIGN_KEY_ACTION_SCRIPT);
+    harness.assert_queries_match("FOREIGN KEY action edge", FOREIGN_KEY_ACTION_CASES);
+    harness
+        .assert_statement_errors_match("FOREIGN KEY action edge", FOREIGN_KEY_ACTION_ERROR_CASES);
 }
 
 #[test]

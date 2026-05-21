@@ -6094,6 +6094,25 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_range_probe_for_column() {
+        // For the leading column, an equality term yields an Equality probe and
+        // a range term (x > 5) yields a Range probe; terms on other columns (or
+        // no terms) yield no probe.
+        match extract_range_probe_for_column(&[eq_term_value("x", 5)], "x") {
+            Some(AccessPathProbe::Equality { column, .. }) => assert_eq!(column, "x"),
+            _ => panic!("expected an Equality probe"),
+        }
+        assert!(matches!(
+            extract_range_probe_for_column(&[range_term("x")], "x"),
+            Some(AccessPathProbe::Range { .. })
+        ));
+        // A term on a different column yields nothing for the leading column.
+        assert!(extract_range_probe_for_column(&[eq_term_value("y", 5)], "x").is_none());
+        // No terms -> no probe.
+        assert!(extract_range_probe_for_column(&[], "x").is_none());
+    }
+
+    #[test]
     fn test_extract_in_list_probe() {
         // x IN (1, 2, 3) yields an InList probe carrying the column and its
         // values; an empty list, NOT IN, and a non-IN expression all yield None.

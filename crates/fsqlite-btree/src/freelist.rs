@@ -821,4 +821,50 @@ mod tests {
         let invalid_bt = [5, 0, 0, 0, 0];
         assert!(PtrMapEntry::decode(&invalid_bt).is_err());
     }
+
+    #[test]
+    fn test_ptrmap_layout_self_consistency_across_a_page_range() {
+        // 512-byte pages, no reserved bytes: 102 entries/ptrmap-page, group=103,
+        // so ptrmap pages fall at 2, 105, 208, ... The pending-byte page (~2M)
+        // is far outside this range, giving a clean periodic layout. Existing
+        // ptrmap tests use 4096-byte pages (group=820 -> only page 2 in range),
+        // so the multi-group periodicity and cross-function consistency are
+        // unexercised. Sweep the range and check the functions agree.
+        let usable = 512u32;
+        let page_size = 512u32;
+        assert_eq!(ptrmap_entries_per_page(usable), 102);
+        let group = ptrmap_group_size(usable);
+        assert_eq!(group, 103);
+
+        for raw in 2u32..=250 {
+            let pg = PageNumber::new(raw).unwrap();
+            let is_map = is_ptrmap_page(pg, usable, page_size);
+            // Ptrmap pages sit exactly at the periodic positions 2, 2+G, 2+2G...
+            assert_eq!(is_map, (raw - 2) % group == 0, "is_ptrmap_page wrong at {raw}");
+
+            match ptrmap_page_for(pg, usable, page_size) {
+                None => {
+                    // Only ptrmap pages themselves (and pages < 3) lack a parent map.
+                    assert!(is_map || raw < 3, "page {raw} unexpectedly has no ptrmap page");
+                }
+                Some(q) => {
+                    assert!(!is_map, "ptrmap page {raw} must not map to another");
+                    assert!(
+                        is_ptrmap_page(q, usable, page_size),
+                        "page {raw} maps to non-ptrmap {q:?}"
+                    );
+                    assert!(q.get() < raw, "ptrmap page {q:?} must precede {raw}");
+                    assert!(raw - q.get() <= group, "page {raw} lies outside its group {q:?}");
+                    // The entry is densely packed and fits on the ptrmap page.
+                    let off = ptrmap_entry_offset(pg, usable, page_size).expect("entry offset");
+                    assert_eq!(
+                        off,
+                        (raw - q.get() - 1) * PTRMAP_ENTRY_SIZE_BYTES,
+                        "entry offset wrong at {raw}"
+                    );
+                    assert!(off < usable, "entry offset {off} past usable {usable}");
+                }
+            }
+        }
+    }
 }

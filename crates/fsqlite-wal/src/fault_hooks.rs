@@ -361,4 +361,72 @@ mod tests {
         let second = take_records();
         assert!(second.is_empty());
     }
+
+    #[test]
+    fn test_rearming_overwrites_previous_arm() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_after_append(FaultHookArm::new("first", "s1", "i1"));
+        arm_after_append(FaultHookArm::new("second", "s2", "i2"));
+
+        let _ = maybe_inject_after_append(0, 1);
+        let records = take_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].run_id, "second");
+    }
+
+    #[test]
+    fn test_trigger_seq_monotonic_across_drain_cycles() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_after_append(arm("a"));
+        let _ = maybe_inject_after_append(0, 1);
+        let r1 = take_records();
+
+        arm_sync_failure(arm("s"));
+        let _ = maybe_inject_sync_failure(0, SyncFlags::NORMAL);
+        let r2 = take_records();
+
+        assert!(r2[0].trigger_seq > r1[0].trigger_seq);
+    }
+
+    #[test]
+    fn test_crash_header_truncate_record_detail() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_crash_header_truncate(FaultHookArm::new("r", "s", "i"));
+        let _ = maybe_inject_crash_header_truncate(100, 7);
+
+        let records = take_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].point, "wal_crash_header_truncate");
+        assert!(records[0].detail.contains("old_frame_count=100"));
+        assert!(records[0].detail.contains("new_checkpoint_seq=7"));
+    }
+
+    #[test]
+    fn test_all_four_hooks_fire_independently() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_after_append(arm("append"));
+        arm_sync_failure(arm("sync"));
+        arm_append_busy_countdown(arm("busy"), 1);
+        arm_crash_header_truncate(arm("crash"));
+
+        assert!(maybe_inject_after_append(0, 1).is_err());
+        assert!(maybe_inject_sync_failure(0, SyncFlags::NORMAL).is_err());
+        assert!(maybe_inject_append_busy(0, 1).is_err());
+        assert!(maybe_inject_crash_header_truncate(0, 1).is_err());
+
+        let records = take_records();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].point, "wal_after_append");
+        assert_eq!(records[1].point, "wal_sync_failure");
+        assert_eq!(records[2].point, "wal_append_busy_countdown");
+        assert_eq!(records[3].point, "wal_crash_header_truncate");
+    }
 }

@@ -2565,6 +2565,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_codegen_select_no_from_emits_resultrow_without_cursor() {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Literal(Literal::Integer(1), Span::ZERO),
+                        alias: None,
+                    }],
+                    from: None,
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let schema: Vec<TableSchema> = vec![];
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // A no-FROM SELECT evaluates the expression and emits ResultRow + Halt...
+        assert!(has_opcodes(&prog, &[Opcode::Integer, Opcode::ResultRow, Opcode::Halt]));
+        // ...and never opens a table cursor.
+        assert!(
+            prog.ops().iter().all(|op| op.opcode != Opcode::OpenRead),
+            "a no-FROM SELECT must not open a read cursor"
+        );
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),

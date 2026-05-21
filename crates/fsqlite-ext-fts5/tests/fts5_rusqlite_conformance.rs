@@ -1028,6 +1028,41 @@ const COLUMN_FILTER_INITIAL_CASES: &[MatchCase] = &[
     },
 ];
 
+const INITIAL_TOKEN_ANCHOR_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "body initial token",
+        query: "body:^sqlite",
+    },
+    MatchCase {
+        name: "title initial token",
+        query: "title:^search",
+    },
+    MatchCase {
+        name: "body initial token across multiple rows",
+        query: "body:^rust",
+    },
+    MatchCase {
+        name: "initial token combined with bare term",
+        query: "^rust AND sqlite",
+    },
+    MatchCase {
+        name: "column initial token combined with body term",
+        query: "title:^rust AND body:search",
+    },
+    MatchCase {
+        name: "disjunctive column anchors",
+        query: "body:^sqlite OR title:^cooking",
+    },
+    MatchCase {
+        name: "anchored body phrase",
+        query: r#"^"rust language""#,
+    },
+    MatchCase {
+        name: "column-filtered anchored phrase",
+        query: r#"body:^"rust and""#,
+    },
+];
+
 const COLUMN_FILTER_SET_CASES: &[MatchCase] = &[
     MatchCase {
         name: "negative braced column set",
@@ -2214,6 +2249,21 @@ fn column_filter_and_initial_token_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "column-filter/initial-token conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn initial_token_anchor_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in INITIAL_TOKEN_ANCHOR_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "initial-token anchor conformance case failed: {} ({})",
             case.name,
             case.query
         );

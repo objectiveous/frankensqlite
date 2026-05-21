@@ -950,6 +950,26 @@ mod tests {
     }
 
     #[test]
+    fn test_ptrmap_entry_decode_rejects_short_input_and_invalid_type_code() {
+        // test_ptrmap_type_parent_semantics covers the parent-value guards
+        // (root/free must be 0, btree/overflow must be nonzero), but not the two
+        // structural guards in decode: a buffer shorter than PTRMAP_ENTRY_SIZE_
+        // BYTES, and a type code outside the valid 1..=5 range.
+
+        // Fewer than 5 bytes is rejected as "too small".
+        assert!(PtrMapEntry::decode(&[]).is_err());
+        assert!(PtrMapEntry::decode(&[1, 0, 0, 0]).is_err()); // 4 bytes
+
+        // Type code 0 and 6 are outside the valid 1..=5 range.
+        assert!(PtrMapEntry::decode(&[0, 0, 0, 0, 0]).is_err());
+        assert!(PtrMapEntry::decode(&[6, 0, 0, 0, 1]).is_err());
+
+        // Sanity: well-formed entries at the type-code range boundaries decode.
+        assert!(PtrMapEntry::decode(&[1, 0, 0, 0, 0]).is_ok()); // RootPage, parent 0
+        assert!(PtrMapEntry::decode(&[5, 0, 0, 0, 1]).is_ok()); // Btree, parent 1
+    }
+
+    #[test]
     fn test_ptrmap_layout_self_consistency_across_a_page_range() {
         // 512-byte pages, no reserved bytes: 102 entries/ptrmap-page, group=103,
         // so ptrmap pages fall at 2, 105, 208, ... The pending-byte page (~2M)

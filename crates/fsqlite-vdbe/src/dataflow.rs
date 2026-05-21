@@ -192,6 +192,11 @@ pub enum DataflowOperator {
         key_columns: Vec<usize>,
         value_column: usize,
     },
+    /// Emit one materialized integer `MIN(value_column)` row per key.
+    MinIntegerByKey {
+        key_columns: Vec<usize>,
+        value_column: usize,
+    },
     /// Consolidate algebraic weights by complete row value.
     ConsolidateRows,
     /// Multiply every row weight by `factor`, eliding zero-weight output rows.
@@ -241,6 +246,10 @@ impl DataflowOperator {
                 key_columns,
                 value_column,
             } => sum_integer_by_key(rows, key_columns, *value_column),
+            Self::MinIntegerByKey {
+                key_columns,
+                value_column,
+            } => min_integer_by_key(rows, key_columns, *value_column),
             Self::ConsolidateRows => Ok(consolidate_rows(rows.iter().cloned().collect())),
             Self::ScaleWeight { factor } => Ok(scale_weights(rows, *factor)),
             Self::ThresholdPositive => Ok(threshold_positive(rows)),
@@ -350,20 +359,7 @@ fn sum_integer_by_key(
             continue;
         }
         let key = row.project(key_columns)?;
-        let value = match row.values.get(value_column) {
-            Some(SqliteValue::Integer(value)) => *value,
-            Some(_) => {
-                return Err(DataflowError::AggregateValueNotInteger {
-                    column: value_column,
-                });
-            }
-            None => {
-                return Err(DataflowError::ColumnOutOfBounds {
-                    column: value_column,
-                    width: row.width(),
-                });
-            }
-        };
+        let value = integer_value_at(row, value_column)?;
         let weighted_value = value.saturating_mul(row.weight);
         if let Some((_, sum)) = groups.iter_mut().find(|(candidate, _)| *candidate == key) {
             *sum = sum.saturating_add(weighted_value);
@@ -382,6 +378,47 @@ fn sum_integer_by_key(
             Some(WeightedRow::insert(values))
         })
         .collect())
+}
+
+fn min_integer_by_key(
+    rows: &[WeightedRow],
+    key_columns: &[usize],
+    value_column: usize,
+) -> DataflowResult<Vec<WeightedRow>> {
+    let mut groups: Vec<(Vec<SqliteValue>, i64)> = Vec::new();
+    for row in rows {
+        if row.weight <= 0 {
+            continue;
+        }
+        let key = row.project(key_columns)?;
+        let value = integer_value_at(row, value_column)?;
+        if let Some((_, min_value)) = groups.iter_mut().find(|(candidate, _)| *candidate == key) {
+            *min_value = (*min_value).min(value);
+        } else {
+            groups.push((key, value));
+        }
+    }
+
+    Ok(groups
+        .into_iter()
+        .map(|(mut values, min_value)| {
+            values.push(SqliteValue::Integer(min_value));
+            WeightedRow::insert(values)
+        })
+        .collect())
+}
+
+fn integer_value_at(row: &WeightedRow, value_column: usize) -> DataflowResult<i64> {
+    match row.values.get(value_column) {
+        Some(SqliteValue::Integer(value)) => Ok(*value),
+        Some(_) => Err(DataflowError::AggregateValueNotInteger {
+            column: value_column,
+        }),
+        None => Err(DataflowError::ColumnOutOfBounds {
+            column: value_column,
+            width: row.width(),
+        }),
+    }
 }
 
 fn index_weighted_rows<'a>(
@@ -698,6 +735,45 @@ mod tests {
     #[test]
     fn sum_integer_by_key_rejects_non_integer_values() {
         let automaton = DataflowAutomaton::new(vec![DataflowOperator::SumIntegerByKey {
+            key_columns: vec![0],
+            value_column: 1,
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), SqliteValue::Float(1.5)])])
+            .expect_err("non-integer aggregate input should fail");
+
+        assert_eq!(err, DataflowError::AggregateValueNotInteger { column: 1 });
+    }
+
+    #[test]
+    fn min_integer_by_key_appends_minimum_for_positive_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::MinIntegerByKey {
+            key_columns: vec![0],
+            value_column: 1,
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(2), int(20)], 1),
+            WeightedRow::new(vec![int(1), int(10)], 1),
+            WeightedRow::new(vec![int(2), int(7)], 1),
+            WeightedRow::new(vec![int(1), int(3)], -1),
+            WeightedRow::new(vec![int(3), int(30)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::insert(vec![int(2), int(7)]),
+                WeightedRow::insert(vec![int(1), int(10)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn min_integer_by_key_rejects_non_integer_values() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::MinIntegerByKey {
             key_columns: vec![0],
             value_column: 1,
         }]);

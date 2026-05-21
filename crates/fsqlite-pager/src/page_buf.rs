@@ -787,4 +787,47 @@ mod tests {
         assert_eq!(buf.as_slice()[0], 0xFE);
         assert_eq!(buf.as_slice()[2047], 0xED);
     }
+
+    #[test]
+    fn test_metrics_snapshot_debug_clone_copy() {
+        let snap = PageBufPoolMetricsSnapshot {
+            page_buffer_pool_hits: 10,
+            page_buffer_pool_misses: 3,
+        };
+        let dbg = format!("{snap:?}");
+        assert!(dbg.contains("PageBufPoolMetricsSnapshot"));
+        let copied = snap;
+        assert_eq!(copied, snap);
+        let cloned = snap.clone();
+        assert_eq!(cloned.page_buffer_pool_hits, 10);
+    }
+
+    #[test]
+    fn test_pool_available_tracks_idle_buffers() {
+        let pool = PageBufPool::new(PageSize::DEFAULT, 4);
+        assert_eq!(pool.available(), 0);
+        let buf = pool.acquire().unwrap();
+        assert_eq!(pool.available(), 0);
+        drop(buf);
+        assert_eq!(pool.available(), 1);
+    }
+
+    #[test]
+    fn test_pool_per_instance_metrics_snapshot() {
+        let pool = PageBufPool::new(PageSize::DEFAULT, 8);
+        let snap0 = pool.metrics_snapshot();
+        assert_eq!(snap0.page_buffer_pool_hits, 0);
+        assert_eq!(snap0.page_buffer_pool_misses, 0);
+        let _b1 = pool.acquire().unwrap();
+        let snap1 = pool.metrics_snapshot();
+        assert_eq!(snap1.page_buffer_pool_misses, 1);
+    }
+
+    #[test]
+    fn test_reset_global_pool_metrics() {
+        reset_page_buffer_pool_metrics();
+        let before = page_buffer_pool_metrics_snapshot();
+        assert_eq!(before.page_buffer_pool_hits, 0);
+        assert_eq!(before.page_buffer_pool_misses, 0);
+    }
 }

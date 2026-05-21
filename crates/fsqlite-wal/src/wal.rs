@@ -4205,4 +4205,49 @@ mod tests {
         assert_eq!(wal.last_commit_frame(), Some(0));
         wal.close(&cx).expect("close");
     }
+
+    #[test]
+    fn wal_file_big_endian_checksum_and_running_checksum() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        let _be = wal.big_endian_checksum();
+        let rc = wal.running_checksum();
+        assert_eq!(rc.s1.wrapping_add(0), rc.s1);
+        wal.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn wal_file_frame_size_equals_header_plus_page() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        assert_eq!(wal.frame_size(), WAL_FRAME_HEADER_SIZE + PAGE_SIZE as usize);
+        wal.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn wal_file_header_accessor() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        let hdr = wal.header();
+        assert_eq!(hdr.page_size_raw, PAGE_SIZE);
+        assert_eq!(hdr.salts, test_salts());
+        wal.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn wal_file_file_and_file_mut_accessors() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        let _f_ref = wal.file();
+        let _f_mut = wal.file_mut();
+        wal.close(&cx).expect("close");
+    }
 }

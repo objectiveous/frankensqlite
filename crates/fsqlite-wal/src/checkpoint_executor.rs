@@ -991,4 +991,67 @@ mod tests {
         sorted.sort_unstable();
         assert_eq!(page_nums, sorted, "pages must be written in ascending order");
     }
+
+    #[test]
+    fn checkpoint_execution_result_clone_eq_debug() {
+        let plan = plan_checkpoint(
+            CheckpointMode::Passive,
+            CheckpointState { total_frames: 4, backfilled_frames: 0, oldest_reader_frame: None },
+        );
+        let result = CheckpointExecutionResult {
+            plan,
+            frames_backfilled: 4,
+            db_size_pages: Some(10),
+            wal_was_reset: false,
+        };
+        let cloned = result.clone();
+        assert_eq!(cloned, result);
+        let dbg = format!("{result:?}");
+        assert!(dbg.contains("CheckpointExecutionResult"));
+    }
+
+    #[test]
+    fn checkpoint_execution_result_ne_on_different_fields() {
+        let plan = plan_checkpoint(
+            CheckpointMode::Passive,
+            CheckpointState { total_frames: 1, backfilled_frames: 0, oldest_reader_frame: None },
+        );
+        let a = CheckpointExecutionResult {
+            plan: plan.clone(),
+            frames_backfilled: 1,
+            db_size_pages: Some(1),
+            wal_was_reset: false,
+        };
+        let b = CheckpointExecutionResult {
+            plan,
+            frames_backfilled: 2,
+            db_size_pages: Some(1),
+            wal_was_reset: false,
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn checkpoint_target_default_read_page_returns_none() {
+        let target = RecordingTarget::new();
+        let cx = test_cx();
+        let page = PageNumber::new(1).expect("valid");
+        let mut buf = [0u8; 4096];
+        let result = target.read_page_if_supported(&cx, page, &mut buf).expect("ok");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn empty_wal_passive_yields_zero_backfilled() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        let state = CheckpointState { total_frames: 0, backfilled_frames: 0, oldest_reader_frame: None };
+        let mut target = RecordingTarget::new();
+        let result = execute_checkpoint(&cx, &mut wal, CheckpointMode::Passive, state, &mut target)
+            .expect("checkpoint");
+        assert_eq!(result.frames_backfilled, 0);
+        assert!(!result.wal_was_reset);
+    }
 }

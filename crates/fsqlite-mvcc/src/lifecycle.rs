@@ -8927,6 +8927,108 @@ mod tests {
     }
 
     #[test]
+    fn test_read_page_with_cell_deltas_replays_same_txn_interleaved_rows()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4260;
+        let row_b = 4261;
+        let row_c = 4262;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let a_original = vec![b'a'; 154];
+        let b_original = vec![b'b'; 155];
+        let a_first = vec![b'c'; 156];
+        let a_final = vec![b'd'; 157];
+        let b_reinserted = vec![b'e'; 158];
+        let c_inserted = vec![b'f'; 159];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut bootstrap = mgr.begin(BeginKind::Concurrent).expect("bootstrap begin");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_original),
+                bootstrap.token(),
+            )
+            .expect("row a insert should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_b,
+                pgno,
+                leaf_table_cell(row_b, &b_original),
+                bootstrap.token(),
+            )
+            .expect("row b insert should fit budget");
+        mgr.commit(&mut bootstrap).expect("bootstrap commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_update(key_a, pgno, leaf_table_cell(row_a, &a_first), txn.token())
+            .expect("row a first update should fit budget");
+        mgr.cell_log()
+            .record_delete(key_b, pgno, txn.token())
+            .expect("row b delete should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_c,
+                pgno,
+                leaf_table_cell(row_c, &c_inserted),
+                txn.token(),
+            )
+            .expect("row c insert should fit budget");
+        mgr.cell_log()
+            .record_update(key_a, pgno, leaf_table_cell(row_a, &a_final), txn.token())
+            .expect("row a final update should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_b,
+                pgno,
+                leaf_table_cell(row_b, &b_reinserted),
+                txn.token(),
+            )
+            .expect("row b reinsert should fit budget");
+        mgr.cell_log()
+            .record_delete(key_c, pgno, txn.token())
+            .expect("row c delete should fit budget");
+
+        let expected = vec![(row_a, a_final.clone()), (row_b, b_reinserted.clone())];
+
+        let page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&page)?,
+            expected,
+            "transaction-local reads must replay interleaved per-row deltas independently"
+        );
+
+        mgr.commit(&mut txn).expect("combined logical commit");
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let committed_page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&committed_page)?,
+            vec![(row_a, a_final), (row_b, b_reinserted)],
+            "committed reads must preserve interleaved per-row ordering"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_read_page_with_cell_deltas_replays_same_txn_delete_then_insert()
     -> fsqlite_error::Result<()> {
         use crate::cell_visibility::CellKey;

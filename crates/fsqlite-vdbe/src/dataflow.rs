@@ -239,6 +239,8 @@ pub enum DataflowOperator {
         lower: usize,
         upper: usize,
     },
+    /// Keep rows whose blob column byte length equals the configured length.
+    FilterBlobLengthExact { column: usize, length: usize },
     /// Keep rows whose blob column byte length lies outside an inclusive range.
     FilterBlobLengthNotBetween {
         column: usize,
@@ -381,6 +383,9 @@ impl DataflowOperator {
                 lower,
                 upper,
             } => filter_blob_length_between(rows, *column, *lower, *upper),
+            Self::FilterBlobLengthExact { column, length } => {
+                filter_blob_length_exact(rows, *column, *length)
+            }
             Self::FilterBlobLengthNotBetween {
                 column,
                 lower,
@@ -838,6 +843,26 @@ fn filter_blob_length_between(
     rows.iter()
         .filter_map(|row| match row.values.get(column) {
             Some(SqliteValue::Blob(candidate)) if (lower..=upper).contains(&candidate.len()) => {
+                Some(Ok(row.clone()))
+            }
+            Some(SqliteValue::Blob(_)) => None,
+            Some(_) => Some(Err(DataflowError::PredicateValueNotBlob { column })),
+            None => Some(Err(DataflowError::ColumnOutOfBounds {
+                column,
+                width: row.width(),
+            })),
+        })
+        .collect()
+}
+
+fn filter_blob_length_exact(
+    rows: &[WeightedRow],
+    column: usize,
+    length: usize,
+) -> DataflowResult<Vec<WeightedRow>> {
+    rows.iter()
+        .filter_map(|row| match row.values.get(column) {
+            Some(SqliteValue::Blob(candidate)) if candidate.len() == length => {
                 Some(Ok(row.clone()))
             }
             Some(SqliteValue::Blob(_)) => None,
@@ -2342,6 +2367,83 @@ mod tests {
         let err = automaton
             .execute(&[WeightedRow::insert(vec![int(1), blob(&[1, 2])])])
             .expect_err("invalid blob-length predicate column should fail");
+
+        assert_eq!(
+            err,
+            DataflowError::ColumnOutOfBounds {
+                column: 2,
+                width: 2
+            }
+        );
+    }
+
+    #[test]
+    fn filter_blob_length_exact_keeps_matching_weighted_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterBlobLengthExact {
+            column: 1,
+            length: 2,
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), blob(&[0xAA])], 7),
+            WeightedRow::new(vec![int(2), blob(&[0xAA, 0xBB])], -2),
+            WeightedRow::new(vec![int(3), blob(&[])], 4),
+            WeightedRow::new(vec![int(4), blob(&[0x00, 0x01])], 5),
+            WeightedRow::new(vec![int(5), blob(&[0xCC, 0xDD])], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(2), blob(&[0xAA, 0xBB])], -2),
+                WeightedRow::new(vec![int(4), blob(&[0x00, 0x01])], 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_blob_length_exact_matches_empty_blob_length() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterBlobLengthExact {
+            column: 1,
+            length: 0,
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), blob(&[1, 2])], 7),
+            WeightedRow::new(vec![int(2), blob(&[])], -2),
+            WeightedRow::new(vec![int(3), blob(&[])], 0),
+        ];
+
+        assert_eq!(
+            automaton.execute(&rows).expect("dataflow should execute"),
+            vec![WeightedRow::new(vec![int(2), blob(&[])], -2)]
+        );
+    }
+
+    #[test]
+    fn filter_blob_length_exact_rejects_non_blob_values() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterBlobLengthExact {
+            column: 1,
+            length: 2,
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), text("aa")])])
+            .expect_err("non-blob predicate input should fail");
+
+        assert_eq!(err, DataflowError::PredicateValueNotBlob { column: 1 });
+    }
+
+    #[test]
+    fn filter_blob_length_exact_rejects_out_of_bounds_columns() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterBlobLengthExact {
+            column: 2,
+            length: 1,
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), blob(&[0xAA])])])
+            .expect_err("invalid blob-length-exact predicate column should fail");
 
         assert_eq!(
             err,

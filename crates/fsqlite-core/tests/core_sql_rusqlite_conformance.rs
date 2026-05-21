@@ -770,6 +770,15 @@ const DML_CASES: &[QueryCase] = &[
     },
 ];
 
+const CHANGE_TRACKING_SETUP: &str = "
+    CREATE TABLE change_tracking (
+        id INTEGER PRIMARY KEY,
+        label TEXT UNIQUE
+    );
+";
+
+const CHANGE_TRACKING_STATE_QUERY: &str = "SELECT last_insert_rowid(), changes(), total_changes()";
+
 const DML_RETURNING_SETUP: &str = "
     CREATE TABLE returning_items (
         id INTEGER PRIMARY KEY,
@@ -2398,6 +2407,67 @@ fn dml_insert_update_delete_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(DML_SETUP);
     harness.execute_script(DML_SCRIPT);
     harness.assert_queries_match("DML", DML_CASES);
+}
+
+#[test]
+fn change_tracking_function_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CHANGE_TRACKING_SETUP);
+    harness.assert_queries_match(
+        "change tracking initial state",
+        &[QueryCase {
+            name: "initial state",
+            sql: CHANGE_TRACKING_STATE_QUERY,
+        }],
+    );
+
+    for (name, script) in [
+        (
+            "auto rowid insert",
+            "INSERT INTO change_tracking(label) VALUES ('alpha')",
+        ),
+        (
+            "explicit rowid insert",
+            "INSERT INTO change_tracking(id, label) VALUES (10, 'beta')",
+        ),
+        (
+            "multi row update",
+            "UPDATE change_tracking SET label = label || '-x' WHERE id IN (1, 10)",
+        ),
+        (
+            "no-op update",
+            "UPDATE change_tracking SET label = 'none' WHERE id = 99",
+        ),
+        ("matched delete", "DELETE FROM change_tracking WHERE id = 1"),
+        ("no-op delete", "DELETE FROM change_tracking WHERE id = 99"),
+    ] {
+        harness.execute_script(script);
+        harness.assert_queries_match(
+            "change tracking statement state",
+            &[QueryCase {
+                name,
+                sql: CHANGE_TRACKING_STATE_QUERY,
+            }],
+        );
+    }
+
+    let duplicate_insert = "INSERT INTO change_tracking(id, label) VALUES (12, 'beta-x')";
+    let franken_error = harness.franken.execute_batch(duplicate_insert).is_err();
+    let sqlite_error = harness.sqlite.execute_batch(duplicate_insert).is_err();
+    assert!(
+        sqlite_error,
+        "change tracking conformance expected rusqlite duplicate insert error"
+    );
+    assert_eq!(
+        franken_error, sqlite_error,
+        "change tracking conformance failed after duplicate insert ({duplicate_insert})"
+    );
+    harness.assert_queries_match(
+        "change tracking failed statement state",
+        &[QueryCase {
+            name: "failed duplicate insert preserves counters",
+            sql: CHANGE_TRACKING_STATE_QUERY,
+        }],
+    );
 }
 
 #[test]

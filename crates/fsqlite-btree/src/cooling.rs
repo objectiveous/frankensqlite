@@ -515,6 +515,32 @@ mod tests {
     }
 
     #[test]
+    fn run_cooling_scan_keeps_frequently_accessed_hot_pages_hot() {
+        // A HOT page is cooled only when access_count < cooling_threshold. A
+        // page accessed up to the threshold within the interval must stay HOT
+        // (the anti-thrash property) and not be counted as cooled. The existing
+        // scan tests only cool idle pages; the >= threshold branch was untested.
+        let csm = CoolingStateMachine::new(CoolingConfig {
+            cooling_threshold: 3,
+        });
+        csm.register_page(1);
+        csm.load_page(1, 0x1000); // COLD -> HOT, access_count = 1
+        csm.access_page(1); // access_count = 2
+        csm.access_page(1); // access_count = 3 (== threshold)
+
+        let result = csm.run_cooling_scan();
+        // access_count (3) is NOT < threshold (3), so the page stays HOT.
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Hot));
+        assert_eq!(result.pages_cooled, 0);
+        assert_eq!(result.pages_scanned, 1);
+
+        // The scan reset the access counter, so the next (idle) scan cools it.
+        let result2 = csm.run_cooling_scan();
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Cooling));
+        assert_eq!(result2.pages_cooled, 1);
+    }
+
+    #[test]
     fn cooling_tracker_counts_frame_addr_and_multi_page_scan() {
         let csm = CoolingStateMachine::new(CoolingConfig::default());
 

@@ -3655,6 +3655,38 @@ mod tests {
         assert!(!page_fits(&cells, BtreePageType::LeafTable, 0, exact - 1));
     }
 
+    // -- table_leaf_divider_bytes tests --
+
+    #[test]
+    fn test_table_leaf_divider_bytes_format() {
+        // An interior-table divider cell is a 4-byte big-endian left-child page
+        // number followed by the varint-encoded rowid of the rightmost cell on
+        // the left page. This is what lets the parent route searches after a
+        // table-leaf split, so pin the exact byte layout and that the trailing
+        // varint round-trips the rowid with nothing after it -- across the 1-,
+        // 2-, and 9-byte varint lengths.
+        let left = PageNumber::new(7).unwrap();
+        let divider_for = |rowid: i64| -> Vec<u8> {
+            let data = build_leaf_table_cell(rowid, b"payload");
+            let cell = GatheredCell {
+                size: u16::try_from(data.len()).unwrap(),
+                data,
+            };
+            table_leaf_divider_bytes(left, &cell, USABLE).unwrap()
+        };
+
+        for (rowid, varint_len) in [(5i64, 1usize), (300, 2), (i64::MAX, 9)] {
+            let divider = divider_for(rowid);
+            // First 4 bytes: the left child page number, big-endian.
+            assert_eq!(&divider[0..4], &left.get().to_be_bytes());
+            // Remaining bytes: the rowid as a varint, with nothing trailing.
+            let (got, n) = fsqlite_types::serial_type::read_varint(&divider[4..]).unwrap();
+            assert_eq!(got, u64::try_from(rowid).unwrap(), "divider must encode the cell rowid");
+            assert_eq!(n, varint_len, "varint byte length for rowid {rowid}");
+            assert_eq!(divider.len(), 4 + varint_len, "divider has no trailing bytes");
+        }
+    }
+
     // -- compute_distribution tests --
 
     #[test]

@@ -900,4 +900,51 @@ mod tests {
         assert!(s.contains("frames_repaired=2"));
         assert!(s.contains("recovery_ops=1"));
     }
+
+    #[test]
+    fn duration_us_saturating_converts_and_saturates() {
+        let normal = std::time::Duration::from_micros(12345);
+        assert_eq!(duration_us_saturating(normal), 12345);
+
+        let zero = std::time::Duration::ZERO;
+        assert_eq!(duration_us_saturating(zero), 0);
+
+        let huge = std::time::Duration::new(u64::MAX, 999_999_999);
+        assert_eq!(duration_us_saturating(huge), u64::MAX);
+    }
+
+    #[test]
+    fn fec_repair_snapshot_clone_and_eq() {
+        let c = WalFecRepairCounters::new();
+        c.record_repair(true, 400);
+        c.record_encode();
+        let a = c.snapshot();
+        let b = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(b.repairs_succeeded, 1);
+        assert_eq!(b.encode_ops, 1);
+    }
+
+    #[test]
+    fn group_commit_fsync_ratio_fewer_submissions_than_fsyncs() {
+        let g = GroupCommitMetrics::new();
+        g.record_submission();
+        g.record_fsync1();
+        g.record_fsync2();
+        g.record_fsync1();
+        g.record_fsync2();
+        let snap = g.snapshot();
+        assert_eq!(snap.fsync_reduction_ratio(), 0);
+    }
+
+    #[test]
+    fn recovery_snapshot_clone_and_eq() {
+        let r = WalRecoveryCounters::new();
+        r.record_recovery(75, 5, 3);
+        let a = r.snapshot();
+        let b = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(b.recovery_frames_total, 75);
+        assert_eq!(b.frames_repaired_total, 3);
+    }
 }

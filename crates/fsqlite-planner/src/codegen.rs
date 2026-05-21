@@ -3168,6 +3168,52 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_expr_case_searched_and_simple_forms() {
+        let lit = |n: i64| Expr::Literal(Literal::Integer(n), Span::ZERO);
+        let prog_of = |expr: Expr| {
+            let mut b = ProgramBuilder::new();
+            let reg = b.alloc_reg();
+            emit_expr(&mut b, &expr, reg).unwrap();
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.finish().unwrap()
+        };
+
+        // Searched CASE (no operand, no ELSE): each WHEN is guarded by IfNot,
+        // and the missing ELSE falls through to a Null default.
+        let searched = prog_of(Expr::Case {
+            operand: None,
+            whens: vec![(lit(1), lit(10))],
+            else_expr: None,
+            span: Span::ZERO,
+        });
+        assert!(
+            searched.ops().iter().any(|o| o.opcode == Opcode::IfNot),
+            "searched CASE guards each WHEN with IfNot"
+        );
+        assert!(
+            searched.ops().iter().any(|o| o.opcode == Opcode::Null),
+            "a CASE with no ELSE falls through to a Null default"
+        );
+
+        // Simple CASE (with operand and an ELSE): WHENs compare against the
+        // operand with Ne, and the explicit ELSE means no Null default.
+        let simple = prog_of(Expr::Case {
+            operand: Some(Box::new(lit(5))),
+            whens: vec![(lit(5), lit(10))],
+            else_expr: Some(Box::new(lit(0))),
+            span: Span::ZERO,
+        });
+        assert!(
+            simple.ops().iter().any(|o| o.opcode == Opcode::Ne),
+            "simple CASE compares the operand against each WHEN with Ne"
+        );
+        assert!(
+            !simple.ops().iter().any(|o| o.opcode == Opcode::Null),
+            "an explicit ELSE means no implicit Null default"
+        );
+    }
+
+    #[test]
     fn test_emit_expr_unsupported_expr_returns_error() {
         // emit_expr handles literals, placeholders, binary/unary ops, IsNull,
         // Cast, FunctionCall, Case, and Collate; everything else hits the

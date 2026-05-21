@@ -204,4 +204,78 @@ mod tests {
             assert!(p.p95 <= p.p99, "p95 <= p99");
         });
     }
+
+    #[test]
+    fn global_reset_zeroes_all_histograms_and_counters() {
+        with_global_metrics(|| {
+            GLOBAL_CONSOLIDATION_METRICS.hist_phase_b.record(999);
+            GLOBAL_CONSOLIDATION_METRICS.hist_full_commit.record(888);
+            GLOBAL_CONSOLIDATION_METRICS
+                .wake_reasons
+                .notify
+                .fetch_add(5, Ordering::Relaxed);
+            GLOBAL_CONSOLIDATION_METRICS.reset();
+            let s = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+            assert_eq!(s.hist_phase_b.count, 0);
+            assert_eq!(s.hist_full_commit.count, 0);
+            assert_eq!(s.wake_reasons.notify, 0);
+            assert_eq!(s.wake_reasons.total(), 0);
+        });
+    }
+
+    #[test]
+    fn global_hist_accumulates_multiple_records() {
+        with_global_metrics(|| {
+            for v in [10, 20, 30, 40, 50] {
+                GLOBAL_CONSOLIDATION_METRICS.hist_phase_b.record(v);
+            }
+            let s = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+            assert_eq!(s.hist_phase_b.count, 5);
+            assert_eq!(s.hist_phase_b.max, 50);
+        });
+    }
+
+    #[test]
+    fn global_wake_reasons_total_sums_all_fields() {
+        with_global_metrics(|| {
+            GLOBAL_CONSOLIDATION_METRICS
+                .wake_reasons
+                .notify
+                .fetch_add(2, Ordering::Relaxed);
+            GLOBAL_CONSOLIDATION_METRICS
+                .wake_reasons
+                .timeout
+                .fetch_add(3, Ordering::Relaxed);
+            GLOBAL_CONSOLIDATION_METRICS
+                .wake_reasons
+                .flusher_takeover
+                .fetch_add(1, Ordering::Relaxed);
+            GLOBAL_CONSOLIDATION_METRICS
+                .wake_reasons
+                .failed_epoch
+                .fetch_add(4, Ordering::Relaxed);
+            GLOBAL_CONSOLIDATION_METRICS
+                .wake_reasons
+                .busy_retry
+                .fetch_add(5, Ordering::Relaxed);
+            let s = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+            assert_eq!(s.wake_reasons.total(), 2 + 3 + 1 + 4 + 5);
+        });
+    }
+
+    #[test]
+    fn global_hist_single_value_all_percentiles_equal() {
+        with_global_metrics(|| {
+            GLOBAL_CONSOLIDATION_METRICS
+                .hist_wal_backend_lock_wait
+                .record(42);
+            let s = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+            let p = s.hist_wal_backend_lock_wait;
+            assert_eq!(p.count, 1);
+            assert_eq!(p.max, 42);
+            assert_eq!(p.p50, 42);
+            assert_eq!(p.p95, 42);
+            assert_eq!(p.p99, 42);
+        });
+    }
 }

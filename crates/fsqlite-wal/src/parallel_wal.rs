@@ -2934,4 +2934,85 @@ mod tests {
         let dbg = format!("{verdict:?}");
         assert!(dbg.contains("NotRun"));
     }
+
+    #[test]
+    fn decision_action_all_variants_copy_eq() {
+        let variants = [
+            ParallelWalDecisionAction::KeepCurrent,
+            ParallelWalDecisionAction::SealEpochNow,
+            ParallelWalDecisionAction::IncreaseLaneBudget,
+            ParallelWalDecisionAction::DecreaseLaneBudget,
+            ParallelWalDecisionAction::ForceConservative,
+        ];
+        for (i, a) in variants.iter().enumerate() {
+            let copied = *a;
+            assert_eq!(copied, *a);
+            for (j, b) in variants.iter().enumerate() {
+                assert_eq!(i == j, a == b);
+            }
+        }
+    }
+
+    #[test]
+    fn fsync_policy_all_variants_and_default() {
+        assert_eq!(FsyncPolicy::default(), FsyncPolicy::Full);
+        let variants = [FsyncPolicy::Full, FsyncPolicy::Normal, FsyncPolicy::Off];
+        for (i, a) in variants.iter().enumerate() {
+            let copied = *a;
+            assert_eq!(copied, *a);
+            for (j, b) in variants.iter().enumerate() {
+                assert_eq!(i == j, a == b);
+            }
+        }
+        let dbg = format!("{:?}", FsyncPolicy::Off);
+        assert!(dbg.contains("Off"));
+    }
+
+    #[test]
+    fn trace_record_clone_eq_debug() {
+        let tr = ParallelWalTraceRecord {
+            component: "test".into(),
+            trace_id: 1,
+            decision_id: None,
+            mode: ParallelWalOperatingMode::Auto,
+            lane_id: Some(0),
+            epoch: Some(5),
+            commit_seq_lo: None,
+            commit_seq_hi: None,
+            checkpoint_epoch: None,
+            recovery_epoch: None,
+            fallback_active: false,
+            fallback_reason: None,
+            policy_id: None,
+            policy_version: None,
+        };
+        let cloned = tr.clone();
+        assert_eq!(cloned, tr);
+        let dbg = format!("{tr:?}");
+        assert!(dbg.contains("ParallelWalTraceRecord"));
+    }
+
+    #[test]
+    fn commit_certificate_clone_eq_debug() {
+        let cert = ParallelWalCommitCertificate {
+            format_version: 1,
+            residue: ParallelWalOrderedResidue::default(),
+            certificate_epoch: 10,
+            commit_seq_lo: CommitSeq::new(1),
+            commit_seq_hi: CommitSeq::new(5),
+            durable_segment_epoch: 9,
+            lane_count: 4,
+            lane_record_counts: vec![2, 3, 0, 1],
+            db_size_pages: 100,
+            page_set_size: 6,
+            certificate_crc32c: 0,
+            fallback_active: false,
+        };
+        let cloned = cert.clone();
+        assert_eq!(cloned, cert);
+        assert_eq!(cert.lane_count, 4);
+        assert_eq!(cert.lane_record_counts.len(), 4);
+        let dbg = format!("{cert:?}");
+        assert!(dbg.contains("ParallelWalCommitCertificate"));
+    }
 }

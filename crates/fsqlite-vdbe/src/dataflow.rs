@@ -183,6 +183,8 @@ pub enum DataflowOperator {
     FilterEq { column: usize, value: SqliteValue },
     /// Keep only the requested columns, preserving row weight.
     Project { columns: Vec<usize> },
+    /// Keep rows whose algebraic weight matches the requested sign.
+    FilterWeightSign { sign: WeightSign },
     /// Consolidate algebraic weights by key and elide zero-weight results.
     ConsolidateByKey { key_columns: Vec<usize> },
     /// Emit one materialized `COUNT(*)` row per key.
@@ -252,6 +254,7 @@ impl DataflowOperator {
                 .iter()
                 .map(|row| Ok(WeightedRow::new(row.project(columns)?, row.weight)))
                 .collect(),
+            Self::FilterWeightSign { sign } => Ok(filter_weight_sign(rows, *sign)),
             Self::ConsolidateByKey { key_columns } => consolidate_by_key(rows, key_columns),
             Self::CountByKey { key_columns } => count_by_key(rows, key_columns),
             Self::SumIntegerByKey {
@@ -290,6 +293,15 @@ impl DataflowOperator {
             } => delta_join_update(stable_left, rows, stable_right, delta_right, key_spec),
         }
     }
+}
+
+/// Algebraic weight sign used to split insert and delete delta streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightSign {
+    /// Positive-weight rows, commonly insertion deltas.
+    Positive,
+    /// Negative-weight rows, commonly deletion deltas.
+    Negative,
 }
 
 /// Column mapping for delta-aware inner joins.
@@ -341,6 +353,16 @@ fn consolidate_by_key(
         .into_iter()
         .filter_map(|(values, weight)| (weight != 0).then(|| WeightedRow::new(values, weight)))
         .collect())
+}
+
+fn filter_weight_sign(rows: &[WeightedRow], sign: WeightSign) -> Vec<WeightedRow> {
+    rows.iter()
+        .filter_map(|row| match (sign, row.weight) {
+            (WeightSign::Positive, weight) if weight > 0 => Some(row.clone()),
+            (WeightSign::Negative, weight) if weight < 0 => Some(row.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn count_by_key(rows: &[WeightedRow], key_columns: &[usize]) -> DataflowResult<Vec<WeightedRow>> {
@@ -687,7 +709,7 @@ pub fn delta_join_update(
 #[cfg(test)]
 mod tests {
     use super::{
-        DataflowAutomaton, DataflowError, DataflowOperator, JoinKeySpec, WeightedRow,
+        DataflowAutomaton, DataflowError, DataflowOperator, JoinKeySpec, WeightSign, WeightedRow,
         delta_join_left, delta_join_right, delta_join_update, scale_weights, threshold_positive,
     };
     use fsqlite_types::SqliteValue;
@@ -735,6 +757,30 @@ mod tests {
                 expected_width: 2,
                 actual_width: 3
             }
+        );
+    }
+
+    #[test]
+    fn filter_weight_sign_keeps_requested_delta_side_and_elides_zeroes() {
+        let positive = DataflowAutomaton::new(vec![DataflowOperator::FilterWeightSign {
+            sign: WeightSign::Positive,
+        }]);
+        let negative = DataflowAutomaton::new(vec![DataflowOperator::FilterWeightSign {
+            sign: WeightSign::Negative,
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1)], 3),
+            WeightedRow::new(vec![int(2)], -2),
+            WeightedRow::new(vec![int(3)], 0),
+        ];
+
+        assert_eq!(
+            positive.execute(&rows).expect("positive stream"),
+            vec![WeightedRow::new(vec![int(1)], 3)]
+        );
+        assert_eq!(
+            negative.execute(&rows).expect("negative stream"),
+            vec![WeightedRow::new(vec![int(2)], -2)]
         );
     }
 

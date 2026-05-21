@@ -6408,6 +6408,19 @@ mod tests {
     }
 
     #[test]
+    fn test_qualifier_matches_table() {
+        // A qualifier matches by table name or by alias, case-insensitively.
+        // Table name, no alias.
+        assert!(qualifier_matches_table("t", "t", None));
+        assert!(qualifier_matches_table("T", "t", None)); // case-insensitive
+        assert!(!qualifier_matches_table("u", "t", None)); // no match, no alias
+        // With an alias, the qualifier may match either the name or the alias.
+        assert!(qualifier_matches_table("users", "users", Some("u")));
+        assert!(qualifier_matches_table("U", "users", Some("u"))); // alias, case-insensitive
+        assert!(!qualifier_matches_table("x", "users", Some("u"))); // matches neither
+    }
+
+    #[test]
     fn test_extract_qualified_column_requires_qualifier_and_canonicalizes() {
         // extract_qualified_column requires a table-qualified column and lower-
         // cases both the table and the column; bare columns and non-columns

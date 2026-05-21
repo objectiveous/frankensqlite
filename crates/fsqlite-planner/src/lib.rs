@@ -6048,6 +6048,29 @@ mod tests {
     }
 
     #[test]
+    fn test_cross_join_allowed_indices_via_tables() {
+        // Index-based variant of cross_join_allowed: current_path holds table
+        // indices, resolved against tables[*idx].name for the ordering check.
+        let tables = vec![
+            table_stats("a", 1, 1),
+            table_stats("b", 1, 1),
+            table_stats("c", 1, 1),
+        ];
+        let pairs = vec![("A".to_owned(), "B".to_owned())];
+
+        // B before A (empty path) -> false.
+        assert!(!cross_join_allowed_indices(&[], "B", &tables, &pairs));
+        // B after A: path [0] resolves to "a", matching "A" case-insensitively.
+        assert!(cross_join_allowed_indices(&[0], "B", &tables, &pairs));
+        // A (the left side) is unconstrained.
+        assert!(cross_join_allowed_indices(&[], "A", &tables, &pairs));
+        // A table not in any pair is allowed.
+        assert!(cross_join_allowed_indices(&[], "C", &tables, &pairs));
+        // Case-insensitive on both the candidate and the resolved table name.
+        assert!(cross_join_allowed_indices(&[0], "b", &tables, &pairs));
+    }
+
+    #[test]
     fn test_cross_join_allowed_enforces_right_after_left_ordering() {
         // For a cross-join pair (A, B), B may only be placed after A in the join
         // order. cross_join_allowed enforces this case-insensitively; candidates

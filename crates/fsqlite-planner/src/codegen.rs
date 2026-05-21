@@ -2409,6 +2409,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_insert_target_indices_resolution_order_and_errors() {
+        let table = TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo {
+                    name: "a".to_owned(),
+                    affinity: 'd',
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "b".to_owned(),
+                    affinity: 'd',
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "c".to_owned(),
+                    affinity: 'd',
+                    default_value: None,
+                },
+            ],
+            indexes: vec![],
+        };
+
+        // An empty column list targets all columns in declaration order.
+        assert_eq!(insert_target_indices(&[], &table).unwrap(), vec![0, 1, 2]);
+
+        // An explicit list resolves to positions in INSERT order (not table
+        // order), case-insensitively.
+        assert_eq!(
+            insert_target_indices(&["c".to_owned(), "A".to_owned()], &table).unwrap(),
+            vec![2, 0]
+        );
+
+        // An unknown column is rejected with ColumnNotFound.
+        assert!(matches!(
+            insert_target_indices(&["a".to_owned(), "missing".to_owned()], &table),
+            Err(CodegenError::ColumnNotFound { ref column, .. }) if column == "missing"
+        ));
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),

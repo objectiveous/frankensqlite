@@ -8663,6 +8663,132 @@ mod tests {
     }
 
     #[test]
+    fn test_read_page_with_cell_deltas_keeps_aborted_writes_out_of_horizon()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4275;
+        let row_b = 4276;
+        let row_c = 4277;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let a_original = vec![b'e'; 141];
+        let b_original = vec![b'f'; 142];
+        let a_aborted = vec![b'g'; 143];
+        let c_aborted = vec![b'h'; 144];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut bootstrap = mgr.begin(BeginKind::Concurrent).expect("bootstrap begin");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_original),
+                bootstrap.token(),
+            )
+            .expect("row a insert should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_b,
+                pgno,
+                leaf_table_cell(row_b, &b_original),
+                bootstrap.token(),
+            )
+            .expect("row b insert should fit budget");
+        let committed_seq = mgr.commit(&mut bootstrap).expect("bootstrap commit");
+        let expected_committed = vec![(row_a, a_original), (row_b, b_original)];
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).expect("writer begin");
+        mgr.cell_log()
+            .record_update(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_aborted),
+                writer.token(),
+            )
+            .expect("row a update should fit budget");
+        mgr.cell_log()
+            .record_delete(key_b, pgno, writer.token())
+            .expect("row b delete should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                key_c,
+                pgno,
+                leaf_table_cell(row_c, &c_aborted),
+                writer.token(),
+            )
+            .expect("row c insert should fit budget");
+
+        let writer_page = mgr
+            .read_page_with_cell_deltas(&mut writer, pgno, PageSize::DEFAULT.get())?
+            .expect("writer page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&writer_page)?,
+            vec![(row_a, a_aborted), (row_c, c_aborted)],
+            "writer must see its own uncommitted logical batch before abort"
+        );
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let reader_page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&reader_page)?,
+            expected_committed.clone(),
+            "reader must ignore another transaction's uncommitted logical batch before abort"
+        );
+        assert_eq!(
+            reader.read_version_for_page(pgno),
+            Some(committed_seq),
+            "uncommitted logical writes must not advance the reader's committed witness"
+        );
+
+        mgr.abort(&mut writer);
+
+        let reader_after_abort = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should remain visible after abort");
+        assert_eq!(
+            materialized_table_payloads(&reader_after_abort)?,
+            expected_committed.clone(),
+            "aborted logical writes must not change an existing reader's view"
+        );
+        assert_eq!(
+            reader.read_version_for_page(pgno),
+            Some(committed_seq),
+            "aborted logical writes must leave the reader's witness at the committed horizon"
+        );
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should stay visible after abort");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            expected_committed,
+            "fresh readers must not replay aborted logical writes"
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(committed_seq),
+            "fresh readers should witness only the last committed logical horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_read_page_with_cell_deltas_hides_post_snapshot_commit() -> fsqlite_error::Result<()> {
         use crate::cell_visibility::CellKey;
         use fsqlite_types::{BtreeRef, TableId};

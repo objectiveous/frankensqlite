@@ -399,6 +399,23 @@ mod tests {
     }
 
     #[test]
+    fn hash_rowid_is_deterministic_and_distinguishes_distinct_rowids() {
+        // hash_rowid is used as a black box throughout the filter tests, but its
+        // own contract is never pinned: it must be deterministic (same rowid ->
+        // same hash, which the insert/contains pairing depends on) and map
+        // distinct rowids to distinct hashes for a normal working set.
+        assert_eq!(hash_rowid(42), hash_rowid(42));
+        assert_eq!(hash_rowid(-1), hash_rowid(-1));
+        assert_eq!(hash_rowid(0), hash_rowid(0));
+
+        // Distinct rowids (including negatives) hash to distinct values.
+        let mut seen = std::collections::HashSet::new();
+        for r in -50_i64..=50 {
+            assert!(seen.insert(hash_rowid(r)), "hash collision for rowid {r}");
+        }
+    }
+
+    #[test]
     fn empty_contains_nothing() {
         let qf = QuotientFilter::new(8, 8).unwrap();
         for h in 0..1000u64 {

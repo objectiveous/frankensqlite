@@ -5805,6 +5805,34 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_cost_ext_ranks_point_access_below_full_scan_for_large_tables() {
+        // The PLANNER-2 per-row terms exist so the cost model ranks a point
+        // access *below* a full scan once a table has many rows. Verify the
+        // cross-path ordering (the planning consequence), not just per-path
+        // monotonicity: for the same table, rowid <= index-equality << full scan.
+        let (tp, ip, big) = (100u64, 50u64, 1_000_000u64);
+        let full = estimate_cost_ext(&AccessPathKind::FullTableScan, tp, ip, big);
+        let eq = estimate_cost_ext(&AccessPathKind::IndexScanEquality, tp, ip, big);
+        let rowid = estimate_cost_ext(&AccessPathKind::RowidLookup, tp, ip, big);
+
+        assert!(rowid <= eq, "rowid lookup should not cost more than index equality: {rowid} vs {eq}");
+        assert!(eq < full, "index equality must rank below a full scan on a large table: {eq} vs {full}");
+
+        // Equality/rowid stay ~row-count-insensitive (only one matched row's
+        // access cost), unlike the full scan which scales with n_rows.
+        let eq_zero = estimate_cost_ext(&AccessPathKind::IndexScanEquality, tp, ip, 0);
+        let rowid_zero = estimate_cost_ext(&AccessPathKind::RowidLookup, tp, ip, 0);
+        assert!(eq - eq_zero < 1.0, "equality cost must not scale with n_rows: delta {}", eq - eq_zero);
+        assert!(rowid - rowid_zero < 1.0, "rowid cost must not scale with n_rows: delta {}", rowid - rowid_zero);
+
+        // Sanity: n_rows=0 full scan equals table-page count, and a large row
+        // count grows it by orders of magnitude.
+        let full_zero = estimate_cost_ext(&AccessPathKind::FullTableScan, tp, ip, 0);
+        assert!((full_zero - 100.0).abs() < f64::EPSILON, "n_rows=0 full scan == table pages");
+        assert!(full > full_zero * 10.0, "full scan must grow strongly with n_rows: {full} vs {full_zero}");
+    }
+
+    #[test]
     fn test_estimate_cost_ext_scales_full_vs_index_preference() {
         // Scenario: two tables with the same (small) page count but very
         // different row counts. For a moderately selective index scan the

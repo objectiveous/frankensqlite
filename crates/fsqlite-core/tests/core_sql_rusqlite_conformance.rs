@@ -1584,6 +1584,49 @@ const SCALAR_NULL_COMPARISON_CASES: &[QueryCase] = &[
     },
 ];
 
+const CONDITIONAL_SCALAR_SETUP: &str = "
+    CREATE TABLE conditional_values (
+        id INTEGER PRIMARY KEY,
+        a INTEGER,
+        b REAL,
+        label TEXT,
+        fallback TEXT
+    );
+    INSERT INTO conditional_values (id, a, b, label, fallback) VALUES
+        (1, NULL, NULL, NULL, 'fallback'),
+        (2, 0, 0.0, '', 'empty'),
+        (3, 5, 2.5, 'five', NULL),
+        (4, -3, -1.5, 'same', 'same'),
+        (5, NULL, 7.0, '7', 'alt');
+";
+
+const CONDITIONAL_SCALAR_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "coalesce preserves first non null storage class",
+        sql: "SELECT coalesce(NULL, NULL, 'x'), typeof(coalesce(NULL, 42, 'x')), coalesce(NULL, 3.5), typeof(coalesce(NULL, 3.5))",
+    },
+    QueryCase {
+        name: "ifnull preserves selected storage class",
+        sql: "SELECT ifnull(NULL, 'fallback'), ifnull('value', 'fallback'), typeof(ifnull(NULL, 7)), typeof(ifnull(7, 'fallback'))",
+    },
+    QueryCase {
+        name: "nullif equality null and storage behavior",
+        sql: "SELECT nullif(1, 1), nullif(1, 2), nullif('a', 'a'), nullif('a', 'A'), typeof(nullif(1, 2)), typeof(nullif(NULL, NULL)), nullif(NULL, 1), nullif(1, NULL)",
+    },
+    QueryCase {
+        name: "iif numeric truthiness",
+        sql: "SELECT iif(1, 'T', 'F'), iif(0, 'T', 'F'), iif(NULL, 'T', 'F'), iif(0.5, 'T', 'F'), iif(-2, 'T', 'F')",
+    },
+    QueryCase {
+        name: "iif text numeric truthiness",
+        sql: "SELECT iif('1', 'T', 'F'), iif('0', 'T', 'F'), iif('abc', 'T', 'F'), iif('  5  ', 'T', 'F'), iif('-0.25', 'T', 'F')",
+    },
+    QueryCase {
+        name: "column driven conditional scalars",
+        sql: "SELECT id, coalesce(label, fallback, 'none'), ifnull(a, -99), nullif(label, fallback), iif(a, 'nonzero', 'zeroish'), iif(b, 'nonzero', 'zeroish') FROM conditional_values ORDER BY id",
+    },
+];
+
 const BETWEEN_IN_PREDICATE_SETUP: &str = "
     CREATE TABLE predicate_rows (
         id INTEGER PRIMARY KEY,
@@ -2909,6 +2952,12 @@ fn case_and_null_logic_match_rusqlite() {
 fn scalar_null_comparison_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
     harness.assert_queries_match("scalar NULL/comparison edge", SCALAR_NULL_COMPARISON_CASES);
+}
+
+#[test]
+fn conditional_scalar_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CONDITIONAL_SCALAR_SETUP);
+    harness.assert_queries_match("conditional scalar edge", CONDITIONAL_SCALAR_CASES);
 }
 
 #[test]

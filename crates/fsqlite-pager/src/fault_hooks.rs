@@ -280,6 +280,86 @@ mod tests {
     }
 
     #[test]
+    fn test_flush_hook_fires_once_then_disarms() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_after_flush_before_publish(arm("flush"));
+        let err = maybe_inject_after_flush_before_publish(5, 2, 8);
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("fault_inject:after_flush_before_publish"),
+        );
+
+        assert!(
+            maybe_inject_after_flush_before_publish(6, 3, 9).is_ok(),
+            "disarmed flush hook must not fire on second call"
+        );
+    }
+
+    #[test]
+    fn test_condvar_notify_record_captures_detail() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_drop_condvar_notify(FaultHookArm::new("run-cv", "scen-cv", "inv-cv"));
+        assert!(maybe_inject_drop_condvar_notify(77));
+
+        let records = take_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].point, "drop_condvar_notify");
+        assert_eq!(records[0].run_id, "run-cv");
+        assert_eq!(records[0].scenario_id, "scen-cv");
+        assert_eq!(records[0].invariant_family, "inv-cv");
+        assert!(records[0].detail.contains("completed_epoch=77"));
+    }
+
+    #[test]
+    fn test_all_hooks_fire_independently() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_after_flush_before_publish(arm("flush"));
+        arm_during_phase_c(arm("phase_c"));
+        arm_drop_condvar_notify(arm("condvar"));
+
+        assert!(maybe_inject_after_flush_before_publish(1, 1, 1).is_err());
+        assert!(maybe_inject_during_phase_c(2, 2).is_err());
+        assert!(maybe_inject_drop_condvar_notify(3));
+
+        let records = take_records();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].point, "after_flush_before_publish");
+        assert_eq!(records[1].point, "during_phase_c");
+        assert_eq!(records[2].point, "drop_condvar_notify");
+        assert_eq!(records[0].trigger_seq, 1);
+        assert_eq!(records[1].trigger_seq, 2);
+        assert_eq!(records[2].trigger_seq, 3);
+    }
+
+    #[test]
+    fn test_unarmed_hooks_are_noop() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        assert!(maybe_inject_after_flush_before_publish(1, 1, 1).is_ok());
+        assert!(maybe_inject_during_phase_c(1, 1).is_ok());
+        assert!(!maybe_inject_drop_condvar_notify(1));
+        assert!(take_records().is_empty());
+    }
+
+    #[test]
+    fn test_fault_hook_arm_equality() {
+        let a = FaultHookArm::new("r1", "s1", "inv1");
+        let b = FaultHookArm::new("r1", "s1", "inv1");
+        let c = FaultHookArm::new("r2", "s1", "inv1");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
     fn test_take_records_drains_and_is_empty_after() {
         let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();

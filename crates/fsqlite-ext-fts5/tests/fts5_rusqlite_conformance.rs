@@ -961,6 +961,37 @@ const SIGNED_ROWID_CASES: &[MatchCase] = &[
     },
 ];
 
+const ZERO_ROWID_REPLACEMENT_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "old zero-rowid term removed",
+        query: "sqlite",
+    },
+    MatchCase {
+        name: "new zero-rowid title term indexed",
+        query: "title:reborn",
+    },
+    MatchCase {
+        name: "new zero-rowid body term indexed",
+        query: "body:restored",
+    },
+    MatchCase {
+        name: "new zero-rowid phrase indexed",
+        query: r#""zero rowid""#,
+    },
+    MatchCase {
+        name: "negative signed rows retained",
+        query: "title:negative",
+    },
+    MatchCase {
+        name: "positive row retained",
+        query: "search",
+    },
+    MatchCase {
+        name: "signed rowid union remains stable",
+        query: "rowid OR restored",
+    },
+];
+
 const NO_RESULT_CASES: &[MatchCase] = &[
     MatchCase {
         name: "absent term",
@@ -2751,6 +2782,34 @@ fn signed_rowid_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "signed-rowid MATCH conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn zero_rowid_replacement_queries_match_rusqlite_reference() {
+    let mut harness = Fts5ConformanceHarness::with_docs(&[], SIGNED_ROWID_DOCS);
+    harness.insert_or_replace_doc(Doc {
+        rowid: 0,
+        title: "Zero reborn",
+        body: "zero rowid restored search",
+    });
+
+    let mut franken_rows = harness.franken_full_scan_rows();
+    franken_rows.sort_by_key(|row| row.0);
+    assert_eq!(
+        franken_rows,
+        harness.sqlite_full_scan_rows(),
+        "zero-rowid replacement full-scan conformance failed"
+    );
+
+    for case in ZERO_ROWID_REPLACEMENT_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "zero-rowid replacement MATCH conformance case failed: {} ({})",
             case.name,
             case.query
         );

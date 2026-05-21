@@ -350,6 +350,8 @@ pub enum DataflowOperator {
     SubtractRows { rows: Vec<WeightedRow> },
     /// Keep current stream rows whose values are present in a static batch.
     RetainRowsIn { rows: Vec<WeightedRow> },
+    /// Drop current stream rows whose values are present in a static batch.
+    RejectRowsIn { rows: Vec<WeightedRow> },
     /// Rewrite every non-zero input row to a fixed output weight.
     SetWeight { weight: i64 },
     /// Keep rows with positive accumulated weight as set membership.
@@ -500,6 +502,7 @@ impl DataflowOperator {
             Self::AddRows { rows: right } => Ok(add_rows(rows, right)),
             Self::SubtractRows { rows: right } => Ok(subtract_rows(rows, right)),
             Self::RetainRowsIn { rows: candidates } => Ok(retain_rows_in(rows, candidates)),
+            Self::RejectRowsIn { rows: candidates } => Ok(reject_rows_in(rows, candidates)),
             Self::SetWeight { weight } => Ok(set_weights(rows, *weight)),
             Self::ThresholdPositive => Ok(threshold_positive(rows)),
             Self::AppendWeightColumn => Ok(append_weight_column(rows)),
@@ -1541,6 +1544,24 @@ pub fn retain_rows_in(rows: &[WeightedRow], candidates: &[WeightedRow]) -> Vec<W
                 && retained_values
                     .iter()
                     .any(|candidate| candidate == &row.values)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Drop current stream rows whose values are present in a static batch.
+pub fn reject_rows_in(rows: &[WeightedRow], candidates: &[WeightedRow]) -> Vec<WeightedRow> {
+    let rejected_values: Vec<Vec<SqliteValue>> = consolidate_rows(candidates.to_vec())
+        .into_iter()
+        .map(|row| row.values)
+        .collect();
+
+    rows.iter()
+        .filter(|row| {
+            !row.is_zero()
+                && rejected_values
+                    .iter()
+                    .all(|candidate| candidate != &row.values)
         })
         .cloned()
         .collect()
@@ -4515,6 +4536,55 @@ mod tests {
         let actual = super::retain_rows_in(&rows, &[]);
 
         assert_eq!(actual, Vec::<WeightedRow>::new());
+    }
+
+    #[test]
+    fn reject_rows_in_operator_drops_current_rows_with_static_membership() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::RejectRowsIn {
+            rows: vec![
+                WeightedRow::new(vec![int(1), int(10)], 2),
+                WeightedRow::new(vec![int(3), int(30)], -1),
+                WeightedRow::new(vec![int(4), int(40)], 1),
+                WeightedRow::new(vec![int(4), int(40)], -1),
+                WeightedRow::new(vec![int(5), int(50)], 0),
+            ],
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), int(10)], 3),
+            WeightedRow::new(vec![int(2), int(20)], -2),
+            WeightedRow::insert(vec![int(3), int(30)]),
+            WeightedRow::new(vec![int(4), int(40)], 5),
+            WeightedRow::new(vec![int(5), int(50)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(2), int(20)], -2),
+                WeightedRow::new(vec![int(4), int(40)], 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn reject_rows_in_empty_static_batch_preserves_nonzero_rows() {
+        let rows = vec![
+            WeightedRow::insert(vec![int(1)]),
+            WeightedRow::delete(vec![int(2)]),
+            WeightedRow::new(vec![int(3)], 0),
+        ];
+
+        let actual = super::reject_rows_in(&rows, &[]);
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::insert(vec![int(1)]),
+                WeightedRow::delete(vec![int(2)]),
+            ]
+        );
     }
 
     #[test]

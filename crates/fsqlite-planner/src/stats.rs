@@ -538,6 +538,45 @@ mod tests {
     }
 
     #[test]
+    fn test_histogram_bucket_contains_is_inclusive_on_both_ends() {
+        let int_bucket = HistogramBucket {
+            lower: SqliteValue::Integer(10),
+            upper: SqliteValue::Integer(20),
+            count: 5,
+            ndv: 3,
+        };
+        assert!(int_bucket.contains(&SqliteValue::Integer(10)), "lower bound is inclusive");
+        assert!(int_bucket.contains(&SqliteValue::Integer(20)), "upper bound is inclusive");
+        assert!(int_bucket.contains(&SqliteValue::Integer(15)));
+        assert!(!int_bucket.contains(&SqliteValue::Integer(9)));
+        assert!(!int_bucket.contains(&SqliteValue::Integer(21)));
+
+        // A single-value bucket [5, 5] contains only 5.
+        let point = HistogramBucket {
+            lower: SqliteValue::Integer(5),
+            upper: SqliteValue::Integer(5),
+            count: 1,
+            ndv: 1,
+        };
+        assert!(point.contains(&SqliteValue::Integer(5)));
+        assert!(!point.contains(&SqliteValue::Integer(4)));
+        assert!(!point.contains(&SqliteValue::Integer(6)));
+
+        // Float buckets behave the same: inclusive endpoints, exclusive outside.
+        let float_bucket = HistogramBucket {
+            lower: SqliteValue::Float(1.0),
+            upper: SqliteValue::Float(2.0),
+            count: 4,
+            ndv: 4,
+        };
+        assert!(float_bucket.contains(&SqliteValue::Float(1.0)));
+        assert!(float_bucket.contains(&SqliteValue::Float(2.0)));
+        assert!(float_bucket.contains(&SqliteValue::Float(1.5)));
+        assert!(!float_bucket.contains(&SqliteValue::Float(0.99)));
+        assert!(!float_bucket.contains(&SqliteValue::Float(2.01)));
+    }
+
+    #[test]
     fn test_bytes_to_fraction_base256_encoding() {
         let bf = bytes_to_fraction;
         let approx = |a: f64, b: f64| (a - b).abs() < 1e-12;

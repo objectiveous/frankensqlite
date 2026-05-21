@@ -2112,6 +2112,46 @@ const STRING_SCALAR_EDGE_CASES: &[QueryCase] = &[
     },
 ];
 
+const FORMAT_QUOTE_SETUP: &str = "
+    CREATE TABLE format_values (
+        id INTEGER PRIMARY KEY,
+        label TEXT,
+        amount INTEGER,
+        payload BLOB
+    );
+    INSERT INTO format_values (id, label, amount, payload) VALUES
+        (1, 'alpha', 42, X'CAFE'),
+        (2, 'needs ''quote''', -7, X''),
+        (3, NULL, NULL, NULL);
+";
+
+const FORMAT_QUOTE_SCALAR_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "printf integer padding and bases",
+        sql: "SELECT printf('%d', 42), printf('%05d', 42), printf('%x', 255), printf('%o', 8)",
+    },
+    QueryCase {
+        name: "printf text float and escaped percent",
+        sql: "SELECT printf('%s:%.2f', 'pi', 3.14159), printf('%10s', 'hi'), printf('%-10s|', 'hi'), printf('%%')",
+    },
+    QueryCase {
+        name: "printf null coercion",
+        sql: "SELECT printf('%s', NULL), printf('%d', NULL)",
+    },
+    QueryCase {
+        name: "quote storage classes from table",
+        sql: "SELECT id, quote(label), quote(amount), quote(payload), quote(NULL) FROM format_values ORDER BY id",
+    },
+    QueryCase {
+        name: "zeroblob storage and hex",
+        sql: "SELECT typeof(zeroblob(0)), length(zeroblob(0)), hex(zeroblob(0)), typeof(zeroblob(4)), length(zeroblob(4)), hex(zeroblob(4))",
+    },
+    QueryCase {
+        name: "format and quote composition",
+        sql: "SELECT id, printf('%s=%s', IFNULL(label, 'none'), quote(amount)) FROM format_values ORDER BY id",
+    },
+];
+
 const MATH_FUNCTION_CASES: &[QueryCase] = &[
     QueryCase {
         name: "abs nulls and storage class",
@@ -2531,6 +2571,12 @@ fn string_functions_match_rusqlite() {
 fn string_scalar_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
     harness.assert_queries_match("string scalar edge", STRING_SCALAR_EDGE_CASES);
+}
+
+#[test]
+fn format_quote_scalar_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(FORMAT_QUOTE_SETUP);
+    harness.assert_queries_match("format quote scalar edge", FORMAT_QUOTE_SCALAR_CASES);
 }
 
 #[test]

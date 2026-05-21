@@ -1742,6 +1742,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn differential_plan_rejects_values_core_and_window_clause() {
+        // A bare VALUES core is not a differentiable view.
+        let values = parse_select("VALUES (1), (2)");
+        assert_eq!(
+            compile_differential_view_plan(&values).unwrap_err(),
+            DifferentialPlanError::UnsupportedValuesCore
+        );
+
+        // A named WINDOW clause is unsupported.
+        let window = parse_select("SELECT id FROM users WINDOW w AS (PARTITION BY status)");
+        assert_eq!(
+            compile_differential_view_plan(&window).unwrap_err(),
+            DifferentialPlanError::UnsupportedWindowClause
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
 

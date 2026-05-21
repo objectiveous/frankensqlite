@@ -538,6 +538,34 @@ mod tests {
     }
 
     #[test]
+    fn test_bytes_to_fraction_base256_encoding() {
+        let bf = bytes_to_fraction;
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-12;
+
+        // Empty -> 0; a single byte contributes value / 256.
+        assert!(approx(bf(b""), 0.0));
+        assert!(approx(bf(&[0x80]), 0.5));
+        assert!(approx(bf(&[0x40]), 0.25));
+        assert!(approx(bf(&[0xFF]), 255.0 / 256.0));
+
+        // The second byte contributes value / 256^2.
+        assert!(approx(bf(&[0x00, 0x80]), 128.0 / 65536.0)); // 2^-9 = 0.001953125
+        assert!(approx(bf(&[0x80, 0x80]), 0.5 + 128.0 / 65536.0));
+
+        // Only the first 8 bytes matter; trailing bytes are ignored.
+        assert!(approx(bf(&[0xFF; 9]), bf(&[0xFF; 8])));
+
+        // Strictly increasing with the most-significant byte; result stays in [0, 1).
+        assert!(bf(&[0x02]) > bf(&[0x01]));
+        assert!(bf(&[0x01]) > bf(&[0x00, 0xFF, 0xFF]));
+        let max8 = bf(&[0xFF; 8]);
+        assert!(
+            (0.0..1.0).contains(&max8),
+            "eight 0xFF bytes must stay below 1.0, got {max8}"
+        );
+    }
+
+    #[test]
     fn test_interpolate_position_clamps_handles_degenerate_and_mixed_types() {
         use SqliteValue::{Float, Integer};
         let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;

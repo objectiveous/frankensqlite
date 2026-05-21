@@ -6094,6 +6094,18 @@ mod tests {
     }
 
     #[test]
+    fn test_column_exists_ignore_case() {
+        // column_exists_ignore_case is a case-insensitive membership check over
+        // a column-name list.
+        let cols = vec!["Name".to_owned(), "Age".to_owned()];
+        assert!(column_exists_ignore_case(&cols, "Name")); // exact
+        assert!(column_exists_ignore_case(&cols, "name")); // case-insensitive
+        assert!(column_exists_ignore_case(&cols, "AGE"));
+        assert!(!column_exists_ignore_case(&cols, "id")); // absent
+        assert!(!column_exists_ignore_case(&[], "name")); // empty list
+    }
+
+    #[test]
     fn test_extract_range_probe_for_column() {
         // For the leading column, an equality term yields an Equality probe and
         // a range term (x > 5) yields a Range probe; terms on other columns (or

@@ -1628,3 +1628,41 @@ fn thread_buffer_slot_stable_within_thread() {
     assert_eq!(slot1, slot2);
     assert!(slot1 < 16);
 }
+
+#[test]
+fn pool_invalid_core_id_returns_error() {
+    let pool = PerCoreWalBufferPool::new(2, BufferConfig::default());
+    assert!(pool.append_to_core(2, make_record(0, 1, 16)).is_err());
+    assert!(pool.append_to_core(99, make_record(0, 1, 16)).is_err());
+    assert!(pool.append_to_core(0, make_record(0, 1, 16)).is_ok());
+}
+
+#[test]
+fn pool_core_count_and_contention_start_at_zero() {
+    let pool = PerCoreWalBufferPool::new(4, BufferConfig::default());
+    assert_eq!(pool.core_count(), 4);
+    assert_eq!(pool.contention_events_total(), 0);
+}
+
+#[test]
+fn epoch_config_default_values() {
+    let cfg = EpochConfig::default();
+    assert_eq!(cfg.advance_interval_ms, DEFAULT_EPOCH_ADVANCE_INTERVAL_MS);
+}
+
+#[test]
+fn epoch_flush_batch_total_records() {
+    let batch = EpochFlushBatch {
+        epoch: 1,
+        records: vec![make_record(0, 1, 8), make_record(0, 2, 8)],
+        records_per_core: vec![2],
+    };
+    assert_eq!(batch.total_records(), 2);
+
+    let empty = EpochFlushBatch {
+        epoch: 0,
+        records: Vec::new(),
+        records_per_core: Vec::new(),
+    };
+    assert_eq!(empty.total_records(), 0);
+}

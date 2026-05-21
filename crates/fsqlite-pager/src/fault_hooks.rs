@@ -372,4 +372,64 @@ mod tests {
         let second = take_records();
         assert!(second.is_empty(), "take_records must drain");
     }
+
+    #[test]
+    fn test_rearming_overwrites_previous_arm() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_during_phase_c(FaultHookArm::new("first", "s1", "inv1"));
+        arm_during_phase_c(FaultHookArm::new("second", "s2", "inv2"));
+
+        let _ = maybe_inject_during_phase_c(1, 1);
+        let records = take_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].run_id, "second", "re-arm must overwrite first");
+    }
+
+    #[test]
+    fn test_trigger_seq_monotonic_across_cycles() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_after_flush_before_publish(arm("flush"));
+        let _ = maybe_inject_after_flush_before_publish(1, 1, 1);
+        let r1 = take_records();
+
+        arm_during_phase_c(arm("phase_c"));
+        let _ = maybe_inject_during_phase_c(2, 2);
+        let r2 = take_records();
+
+        assert!(
+            r2[0].trigger_seq > r1[0].trigger_seq,
+            "trigger_seq must increase across take_records drains"
+        );
+    }
+
+    #[test]
+    fn test_fault_hook_arm_new_maps_fields_correctly() {
+        let a = FaultHookArm::new("my-run", "my-scenario", "my-invariant");
+        assert_eq!(a.run_id, "my-run");
+        assert_eq!(a.scenario_id, "my-scenario");
+        assert_eq!(a.invariant_family, "my-invariant");
+    }
+
+    #[test]
+    fn test_fault_injection_record_fields_from_condvar_hook() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_drop_condvar_notify(FaultHookArm::new("r", "s", "i"));
+        assert!(maybe_inject_drop_condvar_notify(999));
+
+        let records = take_records();
+        assert_eq!(records.len(), 1);
+        let rec = &records[0];
+        assert_eq!(rec.point, "drop_condvar_notify");
+        assert_eq!(rec.run_id, "r");
+        assert_eq!(rec.scenario_id, "s");
+        assert_eq!(rec.invariant_family, "i");
+        assert!(rec.detail.contains("completed_epoch=999"));
+        assert!(rec.trigger_seq > 0);
+    }
 }

@@ -947,4 +947,70 @@ mod tests {
         assert_eq!(b.recovery_frames_total, 75);
         assert_eq!(b.frames_repaired_total, 3);
     }
+
+    #[test]
+    fn wal_metrics_snapshot_avg_checkpoint_and_display() {
+        let snap = WalMetricsSnapshot {
+            frames_written_total: 100,
+            bytes_written_total: 409600,
+            wal_frames_current: 10,
+            checkpoint_count: 5,
+            checkpoint_frames_backfilled_total: 90,
+            checkpoint_duration_us_total: 5000,
+            wal_resets_total: 2,
+        };
+        assert_eq!(snap.avg_checkpoint_duration_us(), 1000);
+        let display = format!("{snap}");
+        assert!(display.contains("wal_frames_written=100"));
+        let zero = WalMetricsSnapshot {
+            checkpoint_count: 0, ..snap
+        };
+        assert_eq!(zero.avg_checkpoint_duration_us(), 0);
+    }
+
+    #[test]
+    fn fec_repair_snapshot_avg_and_display() {
+        let snap = WalFecRepairCountersSnapshot {
+            repairs_total: 4,
+            repairs_succeeded: 3,
+            repairs_failed: 1,
+            repair_duration_us_total: 2000,
+            encode_ops: 10,
+        };
+        assert_eq!(snap.avg_repair_duration_us(), 500);
+        let display = format!("{snap}");
+        assert!(display.contains("succeeded=3"));
+        let zero = WalFecRepairCountersSnapshot {
+            repairs_total: 0, ..snap
+        };
+        assert_eq!(zero.avg_repair_duration_us(), 0);
+    }
+
+    #[test]
+    fn recovery_snapshot_display() {
+        let snap = WalRecoveryCountersSnapshot {
+            recovery_frames_total: 50,
+            corruption_detected_total: 2,
+            frames_repaired_total: 1,
+            recovery_ops_total: 3,
+        };
+        let display = format!("{snap}");
+        assert!(display.contains("recovery_frames=50"));
+        assert!(display.contains("corruption=2"));
+    }
+
+    #[test]
+    fn group_commit_snapshot_display() {
+        let snap = GroupCommitMetricsSnapshot {
+            groups_flushed: 10,
+            frames_flushed: 200,
+            batches_consolidated: 15,
+            sync_count: 10,
+            bytes_flushed: 819200,
+            flush_duration_us_total: 5000,
+        };
+        let display = format!("{snap}");
+        assert!(display.contains("groups_flushed=10"));
+        assert!(display.contains("frames_flushed=200"));
+    }
 }

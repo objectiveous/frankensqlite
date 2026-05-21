@@ -5927,6 +5927,53 @@ mod tests {
     }
 
     #[test]
+    fn test_expr_guarantees_non_null_for_matching_column() {
+        // expr_guarantees_non_null reports whether a WHERE expression proves the
+        // given column is non-NULL: an explicit IS NOT NULL, or a comparison to a
+        // non-NULL literal, on the SAME column qualifies; IS NULL, a NULL
+        // literal, or a different column does not.
+        let pcol = WhereColumn {
+            table: None,
+            column: "x".to_owned(),
+        };
+        let col = |n: &str| Box::new(Expr::Column(ColumnRef::bare(n), Span::ZERO));
+
+        // x IS NOT NULL guarantees x is non-null.
+        let is_not_null = Expr::IsNull {
+            expr: col("x"),
+            not: true,
+            span: Span::ZERO,
+        };
+        assert!(expr_guarantees_non_null(&is_not_null, &pcol));
+
+        // x IS NULL does not.
+        let is_null = Expr::IsNull {
+            expr: col("x"),
+            not: false,
+            span: Span::ZERO,
+        };
+        assert!(!expr_guarantees_non_null(&is_null, &pcol));
+
+        // x = 5 (non-null literal) guarantees non-null; x = NULL does not.
+        let eq = |lit: Literal| Expr::BinaryOp {
+            left: col("x"),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(lit, Span::ZERO)),
+            span: Span::ZERO,
+        };
+        assert!(expr_guarantees_non_null(&eq(Literal::Integer(5)), &pcol));
+        assert!(!expr_guarantees_non_null(&eq(Literal::Null), &pcol));
+
+        // An IS NOT NULL on a DIFFERENT column does not help.
+        let other = Expr::IsNull {
+            expr: col("y"),
+            not: true,
+            span: Span::ZERO,
+        };
+        assert!(!expr_guarantees_non_null(&other, &pcol));
+    }
+
+    #[test]
     fn test_estimate_cost_ext_zero_rows_matches_legacy() {
         // With n_rows == 0 the ext function must match the legacy formulas.
         let legacy = estimate_cost(&AccessPathKind::FullTableScan, 1000, 0);

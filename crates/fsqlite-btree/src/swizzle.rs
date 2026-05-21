@@ -464,6 +464,30 @@ mod tests {
     }
 
     #[test]
+    fn try_unswizzle_reports_observed_state_on_compare_exchange_failure() {
+        // Symmetric to try_swizzle_reports_observed_state_on_compare_exchange_
+        // failure, which was the only CAS-failure path tested. A pointer
+        // swizzled to 0x4000 rejects an unswizzle that expects a different frame
+        // address (0x5000), reporting the encoded expected vs observed words,
+        // and the pointer is left unchanged.
+        let ptr = SwizzlePtr::new_swizzled(0x4000).expect("aligned frame address should encode");
+        let err = ptr
+            .try_unswizzle(0x5000, 77)
+            .expect_err("mismatched expected frame addr must fail");
+        let expected = 0x5000_u64 | SWIZZLED_TAG;
+        let observed = 0x4000_u64 | SWIZZLED_TAG;
+        assert_eq!(
+            err,
+            SwizzleError::CompareExchangeFailed { expected, observed }
+        );
+        // A failed CAS must leave the pointer untouched.
+        assert_eq!(
+            ptr.state(Ordering::Acquire),
+            SwizzleState::Swizzled { frame_addr: 0x4000 }
+        );
+    }
+
+    #[test]
     fn temperature_state_machine_transitions_match_design_contract() {
         assert!(
             PageTemperature::Hot

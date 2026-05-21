@@ -32,6 +32,13 @@ struct RankingCase {
 }
 
 #[derive(Clone, Copy)]
+struct WeightedRankingCase {
+    name: &'static str,
+    query: &'static str,
+    weights: &'static [f64],
+}
+
+#[derive(Clone, Copy)]
 struct AuxiliaryCase {
     name: &'static str,
     query: &'static str,
@@ -486,6 +493,28 @@ const BM25_CASES: &[RankingCase] = &[
     },
 ];
 
+const TITLE_HEAVY_WEIGHTS: &[f64] = &[8.0, 1.0];
+const BODY_HEAVY_WEIGHTS: &[f64] = &[1.0, 4.0];
+const SQLITE_TITLE_HEAVY_WEIGHTS: &[f64] = &[5.0, 1.0];
+
+const WEIGHTED_BM25_CASES: &[WeightedRankingCase] = &[
+    WeightedRankingCase {
+        name: "title-heavy rust search",
+        query: "rust search",
+        weights: TITLE_HEAVY_WEIGHTS,
+    },
+    WeightedRankingCase {
+        name: "body-heavy rust search",
+        query: "rust search",
+        weights: BODY_HEAVY_WEIGHTS,
+    },
+    WeightedRankingCase {
+        name: "title-heavy sqlite search",
+        query: "sqlite search",
+        weights: SQLITE_TITLE_HEAVY_WEIGHTS,
+    },
+];
+
 const AUXILIARY_CASES: &[AuxiliaryCase] = &[
     AuxiliaryCase {
         name: "single term",
@@ -684,6 +713,41 @@ impl Fts5ConformanceHarness {
             .expect("query rusqlite FTS5 BM25 rowids")
             .collect::<std::result::Result<Vec<_>, _>>()
             .expect("read rusqlite FTS5 BM25 rowids")
+    }
+
+    fn franken_weighted_ranked_rowids(&self, query: &str, weights: &[f64]) -> Vec<i64> {
+        let mut ranked = self
+            .franken
+            .search_queries_with_weights(&[query], weights)
+            .expect("FrankenSQLite FTS5 weighted ranked query");
+        ranked.sort_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        ranked.into_iter().map(|(rowid, _score)| rowid).collect()
+    }
+
+    fn sqlite_weighted_bm25_rowids(&self, query: &str, weights: &[f64]) -> Vec<i64> {
+        let weights_sql = weights
+            .iter()
+            .map(|weight| weight.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rank_expr = if weights_sql.is_empty() {
+            "bm25(docs)".to_owned()
+        } else {
+            format!("bm25(docs, {weights_sql})")
+        };
+        let sql = format!("SELECT rowid FROM docs WHERE docs MATCH ?1 ORDER BY {rank_expr}, rowid");
+        let mut stmt = self
+            .sqlite
+            .prepare(&sql)
+            .expect("prepare rusqlite FTS5 weighted BM25 query");
+        stmt.query_map([query], |row| row.get::<_, i64>(0))
+            .expect("query rusqlite FTS5 weighted BM25 rowids")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("read rusqlite FTS5 weighted BM25 rowids")
     }
 
     fn franken_highlight_body_rows(&self, query: &str) -> Vec<(i64, String)> {
@@ -963,6 +1027,22 @@ fn bm25_ranking_matches_rusqlite_reference() {
             "BM25 conformance case failed: {} ({})",
             case.name,
             case.query
+        );
+    }
+}
+
+#[test]
+fn weighted_bm25_ranking_matches_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::with_docs(&[], BM25_DOCS);
+
+    for case in WEIGHTED_BM25_CASES {
+        assert_eq!(
+            harness.franken_weighted_ranked_rowids(case.query, case.weights),
+            harness.sqlite_weighted_bm25_rowids(case.query, case.weights),
+            "weighted BM25 conformance case failed: {} ({}, {:?})",
+            case.name,
+            case.query,
+            case.weights
         );
     }
 }

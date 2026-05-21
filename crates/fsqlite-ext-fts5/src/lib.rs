@@ -4700,6 +4700,7 @@ fn prefix_slice(term: &str, prefix_length: usize) -> Option<&str> {
 /// Standard BM25 parameters.
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
+const BM25_IDF_FLOOR: f64 = 1.0e-6;
 
 /// Compute BM25 score for a document against a set of query terms.
 ///
@@ -4726,26 +4727,33 @@ pub fn bm25_score(
         }
         let df = df_int as f64;
 
-        // IDF component
-        let idf = ((n - df + 0.5) / (df + 0.5)).ln_1p();
+        let idf = ((n - df + 0.5) / (df + 0.5)).ln().max(BM25_IDF_FLOOR);
 
-        // Get per-column frequencies for weighting
+        let mut weighted_tf = 0.0;
         let postings = index.get_postings(term);
         for posting in postings {
             if posting.docid != docid {
                 continue;
             }
             let tf = posting.positions.len() as f64;
-            let col_weight = weights.get(posting.column as usize).copied().unwrap_or(1.0);
-
-            let denom = if avgdl > 0.0 {
-                BM25_K1.mul_add(1.0 - BM25_B + BM25_B * dl / avgdl, tf)
-            } else {
-                tf + BM25_K1
-            };
-
-            score += col_weight * idf * (tf * (BM25_K1 + 1.0)) / denom;
+            let col_weight = usize::try_from(posting.column)
+                .ok()
+                .and_then(|column| weights.get(column).copied())
+                .unwrap_or(1.0);
+            weighted_tf += col_weight * tf;
         }
+
+        if weighted_tf == 0.0 {
+            continue;
+        }
+
+        let denom = if avgdl > 0.0 {
+            BM25_K1.mul_add(1.0 - BM25_B + BM25_B * dl / avgdl, weighted_tf)
+        } else {
+            weighted_tf + BM25_K1
+        };
+
+        score += idf * (weighted_tf * (BM25_K1 + 1.0)) / denom;
     }
 
     // Return negative score (lower = better, SQLite FTS5 convention).
@@ -6150,21 +6158,28 @@ impl<'a> Fts5ShadowQuery<'a> {
                 continue;
             }
             let df = df_int as f64;
-            let idf = ((n - df + 0.5) / (df + 0.5)).ln_1p();
+            let idf = ((n - df + 0.5) / (df + 0.5)).ln().max(BM25_IDF_FLOOR);
 
+            let mut weighted_tf = 0.0;
             for (column, tf_u32) in self.term_column_frequencies(term, rowid)? {
                 let tf = f64::from(tf_u32);
                 let column_weight = usize::try_from(column)
                     .ok()
                     .and_then(|index| weights.get(index).copied())
                     .unwrap_or(1.0);
-                let denom = if avgdl > 0.0 {
-                    BM25_K1.mul_add(1.0 - BM25_B + BM25_B * dl / avgdl, tf)
-                } else {
-                    tf + BM25_K1
-                };
-                score += column_weight * idf * (tf * (BM25_K1 + 1.0)) / denom;
+                weighted_tf += column_weight * tf;
             }
+
+            if weighted_tf == 0.0 {
+                continue;
+            }
+
+            let denom = if avgdl > 0.0 {
+                BM25_K1.mul_add(1.0 - BM25_B + BM25_B * dl / avgdl, weighted_tf)
+            } else {
+                weighted_tf + BM25_K1
+            };
+            score += idf * (weighted_tf * (BM25_K1 + 1.0)) / denom;
         }
 
         Ok(-score)

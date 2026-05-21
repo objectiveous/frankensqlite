@@ -6099,6 +6099,35 @@ mod tests {
     }
 
     #[test]
+    fn test_prepare_plan_cache_lookup_evicts_stale_hot_entry() {
+        // No-op when the hot key is None or matches the lookup key; on a
+        // mismatch it flushes the LRU touch and clears the hot cache so the
+        // upcoming lookup starts clean.
+        let mut p = QueryPlanner::new();
+
+        // Fresh: hot key None -> is_some_and false -> no-op.
+        p.prepare_plan_cache_lookup(42);
+        assert!(p.hot_plan_cache_key.is_none());
+        assert!(p.hot_plan_cache_plan.is_none());
+
+        // Same hot key as the lookup -> no-op (state preserved).
+        p.hot_plan_cache_key = Some(42);
+        p.hot_plan_cache_needs_lru_touch = true;
+        p.prepare_plan_cache_lookup(42);
+        assert_eq!(p.hot_plan_cache_key, Some(42));
+        assert!(p.hot_plan_cache_needs_lru_touch);
+
+        // Different key -> flushes (clears the touch flag) and clears the hot
+        // cache so the upcoming lookup starts clean.
+        p.hot_plan_cache_key = Some(42);
+        p.hot_plan_cache_needs_lru_touch = true;
+        p.prepare_plan_cache_lookup(99);
+        assert!(p.hot_plan_cache_key.is_none());
+        assert!(p.hot_plan_cache_plan.is_none());
+        assert!(!p.hot_plan_cache_needs_lru_touch);
+    }
+
+    #[test]
     fn test_flush_hot_plan_cache_lru_touch_clears_flag() {
         // flush is a no-op when needs_lru_touch is false; otherwise it touches
         // the LRU for the cached key (discarding the result) and clears the

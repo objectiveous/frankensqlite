@@ -1744,6 +1744,16 @@ mod tests {
     }
 
     #[test]
+    fn btree_op_type_as_str_labels() {
+        // Metric-dimension labels for fsqlite_btree_operations_total; the enum's
+        // as_str was never directly asserted.
+        use crate::BtreeOpType::{Delete, Insert, Seek};
+        assert_eq!(Seek.as_str(), "seek");
+        assert_eq!(Insert.as_str(), "insert");
+        assert_eq!(Delete.as_str(), "delete");
+    }
+
+    #[test]
     fn conflict_topology_policy_mode_labels_and_raw_round_trip() {
         // as_str labels (pub) plus the to_raw/from_raw codec that stashes the
         // mode in a u64 atomic. as_str was never directly asserted, and

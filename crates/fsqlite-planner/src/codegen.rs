@@ -2068,6 +2068,59 @@ mod tests {
         Expr::Placeholder(PlaceholderType::Numbered(n), Span::ZERO)
     }
 
+    #[test]
+    fn test_table_schema_accessors_affinity_index_and_case_insensitive_lookup() {
+        let schema = TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo {
+                    name: "id".to_owned(),
+                    affinity: 'd',
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "name".to_owned(),
+                    affinity: 'b',
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "age".to_owned(),
+                    affinity: 'c',
+                    default_value: None,
+                },
+            ],
+            indexes: vec![IndexSchema {
+                name: "idx_age_name".to_owned(),
+                root_page: 3,
+                columns: vec!["age".to_owned(), "name".to_owned()],
+                is_unique: false,
+            }],
+        };
+
+        // affinity_string: one char per column, in declaration order.
+        assert_eq!(schema.affinity_string(), "dbc");
+
+        // column_index: case-insensitive, in declaration order; None for absent.
+        assert_eq!(schema.column_index("id"), Some(0));
+        assert_eq!(schema.column_index("NAME"), Some(1), "lookup is case-insensitive");
+        assert_eq!(schema.column_index("Age"), Some(2));
+        assert_eq!(schema.column_index("missing"), None);
+
+        // index_for_column matches the LEFTMOST index column only (case-insensitive).
+        assert_eq!(schema.index_for_column("age").map(|i| i.name.as_str()), Some("idx_age_name"));
+        assert_eq!(
+            schema.index_for_column("AGE").map(|i| i.name.as_str()),
+            Some("idx_age_name"),
+            "case-insensitive"
+        );
+        assert!(
+            schema.index_for_column("name").is_none(),
+            "a non-leftmost index column is not matched"
+        );
+        assert!(schema.index_for_column("id").is_none());
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),

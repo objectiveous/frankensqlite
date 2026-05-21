@@ -6076,6 +6076,24 @@ mod tests {
     }
 
     #[test]
+    fn test_is_like_prefix_safe_for_column_rejects_ascii_alphabetic_prefixes() {
+        // A LIKE prefix is safe for a prefix-range index scan only when it
+        // contains no ASCII alphabetic characters: default LIKE folds ASCII
+        // letter case, so an alphabetic prefix could miss the opposite-case rows
+        // a plain range scan would skip. Digits, punctuation, an empty prefix,
+        // and non-ASCII letters are safe.
+        assert!(is_like_prefix_safe_for_column(None, "123"));
+        assert!(is_like_prefix_safe_for_column(None, ""));
+        assert!(is_like_prefix_safe_for_column(None, "_5%"));
+        // Any ASCII letter makes the prefix unsafe.
+        assert!(!is_like_prefix_safe_for_column(None, "abc"));
+        assert!(!is_like_prefix_safe_for_column(None, "1a"));
+        assert!(!is_like_prefix_safe_for_column(None, "Z"));
+        // Non-ASCII letters are not ASCII-alphabetic, so they stay safe.
+        assert!(is_like_prefix_safe_for_column(None, "é"));
+    }
+
+    #[test]
     fn test_compare_partial_index_literals_handles_cross_type_numerics() {
         use std::cmp::Ordering;
         let int = Literal::Integer;

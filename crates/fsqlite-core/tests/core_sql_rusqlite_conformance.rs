@@ -1136,6 +1136,33 @@ const DATE_TIME_CASES: &[QueryCase] = &[
     },
 ];
 
+const DATE_TIME_EDGE_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "start modifiers preserve SQLite modifier order",
+        sql: "SELECT date('2024-03-15', 'start of month', '+1 day'), date('2024-03-15', '+1 day', 'start of month')",
+    },
+    QueryCase {
+        name: "weekday modifier advances or noops",
+        sql: "SELECT date('2024-03-15', 'weekday 0'), date('2024-03-17', 'weekday 0')",
+    },
+    QueryCase {
+        name: "numeric input modifiers",
+        sql: "SELECT datetime(0, 'unixepoch'), datetime(1710531045, 'auto'), date(2460384.5, 'auto')",
+    },
+    QueryCase {
+        name: "iso separator and bare time inputs",
+        sql: "SELECT datetime('2024-03-15T14:30:00'), date('12:30:00'), time('2024-03-15T14:30:45')",
+    },
+    QueryCase {
+        name: "timezone offset normalization",
+        sql: "SELECT datetime('2026-04-07T16:00:00Z'), datetime('2026-04-07T16:00:00+01:00'), datetime('2026-04-07T16:00:00-05:30')",
+    },
+    QueryCase {
+        name: "strftime epoch and weekday fields",
+        sql: "SELECT strftime('%s', '1970-01-02 00:00:00'), strftime('%w', '2024-03-17'), strftime('%W', '2024-03-18')",
+    },
+];
+
 const JSON1_CASES: &[QueryCase] = &[
     QueryCase {
         name: "json validation and canonicalization",
@@ -1438,6 +1465,12 @@ fn triggers_match_rusqlite() {
 fn date_time_functions_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new("");
     harness.assert_queries_match("date/time", DATE_TIME_CASES);
+}
+
+#[test]
+fn date_time_modifier_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new("");
+    harness.assert_queries_match("date/time modifier edge", DATE_TIME_EDGE_CASES);
 }
 
 #[test]

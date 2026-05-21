@@ -447,4 +447,35 @@ mod tests {
         assert!(data2[..p2].iter().all(|&x| x <= 5));
         assert!(data2[p2..].iter().all(|&x| x > 5));
     }
+
+    #[test]
+    fn cracking_preserves_permutation_and_answers_every_range() {
+        // Database cracking only REORGANIZES the column; after any sequence of
+        // queries it must stay a permutation of the original (no element lost
+        // or duplicated), and every range query must return exactly the in-range
+        // elements -- including with duplicates and degenerate single-value ranges.
+        let original: Vec<i32> = vec![9, 3, 7, 1, 5, 2, 8, 4, 6, 0, 9, 5, 1, 7, 3];
+        let mut col = CrackedColumn::new(original.clone());
+
+        let mut expected_sorted = original.clone();
+        expected_sorted.sort_unstable();
+
+        for (lo, hi) in [(3, 6), (0, 2), (5, 9), (1, 1), (7, 7), (0, 9), (4, 8), (2, 5)] {
+            let mut got: Vec<i32> = col.range_query(lo, hi).to_vec();
+            got.sort_unstable();
+            let mut want: Vec<i32> = original
+                .iter()
+                .copied()
+                .filter(|x| (lo..=hi).contains(x))
+                .collect();
+            want.sort_unstable();
+            assert_eq!(got, want, "range_query({lo},{hi}) returned the wrong set");
+        }
+
+        // The column is still a permutation of the original.
+        let mut after: Vec<i32> = col.full_scan().to_vec();
+        after.sort_unstable();
+        assert_eq!(after, expected_sorted, "cracking must preserve the multiset");
+        assert_eq!(col.len(), original.len());
+    }
 }

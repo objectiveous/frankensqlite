@@ -695,4 +695,65 @@ mod tests {
         assert_eq!(snap.consolidation.total_commits(), 1);
         assert_eq!(snap.consolidation.inner_lock_wait_us_total, 50);
     }
+
+    #[test]
+    fn ring_buffer_capacity_one_keeps_latest() {
+        let rb = WalTelemetryRingBuffer::new(1);
+        let events = all_event_variants();
+        for event in &events {
+            rb.on_event(event);
+        }
+        assert_eq!(rb.len(), 1);
+        let drained = rb.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].kind_str(), events.last().unwrap().kind_str());
+    }
+
+    #[test]
+    fn ring_buffer_drain_on_empty_returns_empty_vec() {
+        let rb = WalTelemetryRingBuffer::new(8);
+        assert!(rb.is_empty());
+        let drained = rb.drain();
+        assert!(drained.is_empty());
+    }
+
+    #[test]
+    fn ring_buffer_is_not_empty_after_overflow() {
+        let rb = WalTelemetryRingBuffer::new(2);
+        for event in all_event_variants().iter().take(5) {
+            rb.on_event(event);
+        }
+        assert!(!rb.is_empty());
+        assert_eq!(rb.len(), 2);
+    }
+
+    #[test]
+    fn event_clone_and_equality() {
+        let event = WalTelemetryEvent::FrameAppended {
+            frame_count: 5,
+            bytes_written: 20_480,
+            is_commit: true,
+            timestamp_ns: 999,
+        };
+        let cloned = event.clone();
+        assert_eq!(event, cloned);
+
+        let different = WalTelemetryEvent::FrameAppended {
+            frame_count: 5,
+            bytes_written: 20_480,
+            is_commit: false,
+            timestamp_ns: 999,
+        };
+        assert_ne!(event, different);
+    }
+
+    #[test]
+    fn observer_trait_is_object_safe() {
+        let obs: Box<dyn WalTelemetryObserver> = Box::new(NoOpWalObserver);
+        let event = WalTelemetryEvent::WalReset {
+            new_checkpoint_seq: 1,
+            timestamp_ns: 42,
+        };
+        obs.on_event(&event);
+    }
 }

@@ -247,6 +247,33 @@ const PHRASE_PREFIX_NEAR_CASES: &[MatchCase] = &[
     },
 ];
 
+const COLUMN_FILTER_INITIAL_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "braced multi-column filter",
+        query: "{title body}:sqlite",
+    },
+    MatchCase {
+        name: "braced phrase filter",
+        query: r#"{title body}:"rust sqlite""#,
+    },
+    MatchCase {
+        name: "negative title filter",
+        query: "-title:rust",
+    },
+    MatchCase {
+        name: "initial token across indexed columns",
+        query: "^rust",
+    },
+    MatchCase {
+        name: "initial token inside title filter",
+        query: "title:^rust",
+    },
+    MatchCase {
+        name: "initial phrase",
+        query: r#"^"rust sqlite""#,
+    },
+];
+
 const BM25_CASES: &[RankingCase] = &[
     RankingCase {
         name: "single term frequency",
@@ -505,6 +532,21 @@ fn phrase_prefix_near_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "phrase/prefix/NEAR conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn column_filter_and_initial_token_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in COLUMN_FILTER_INITIAL_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "column-filter/initial-token conformance case failed: {} ({})",
             case.name,
             case.query
         );

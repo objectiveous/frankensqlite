@@ -985,4 +985,71 @@ mod tests {
             "page array + hash table = segment size"
         );
     }
+
+    #[test]
+    fn test_wal_ckpt_info_to_bytes_roundtrip() {
+        let ckpt = WalCkptInfo {
+            n_backfill: 42,
+            a_read_mark: [1, 2, 3, 4, 5],
+            a_lock: [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80],
+            n_backfill_attempted: 99,
+            not_used0: 0,
+        };
+        let bytes = ckpt.to_bytes();
+        let parsed = WalCkptInfo::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed, ckpt);
+    }
+
+    #[test]
+    fn test_wal_index_hdr_copies_match_mismatch() {
+        let mut buf = [0u8; 2 * WAL_INDEX_HDR_BYTES];
+        buf[..WAL_INDEX_HDR_BYTES].fill(0xAA);
+        buf[WAL_INDEX_HDR_BYTES..].fill(0xBB);
+        assert!(!wal_index_hdr_copies_match(&buf));
+
+        buf[WAL_INDEX_HDR_BYTES..].copy_from_slice(&buf[..WAL_INDEX_HDR_BYTES].to_vec());
+        assert!(wal_index_hdr_copies_match(&buf));
+
+        assert!(!wal_index_hdr_copies_match(&[0u8; WAL_INDEX_HDR_BYTES - 1]));
+    }
+
+    #[test]
+    fn test_parse_write_shm_header_roundtrip() {
+        let hdr = WalIndexHdr {
+            i_version: WAL_INDEX_VERSION,
+            unused: 0,
+            i_change: 7,
+            is_init: 1,
+            big_end_cksum: 0,
+            sz_page: 4096,
+            mx_frame: 100,
+            n_page: 50,
+            a_frame_cksum: [0x1234, 0x5678],
+            a_salt: [0xAAAA, 0xBBBB],
+            a_cksum: [0xCCCC, 0xDDDD],
+        };
+        let ckpt = WalCkptInfo {
+            n_backfill: 10,
+            a_read_mark: [0, 5, 10, 15, 20],
+            a_lock: [0; WAL_LOCK_SLOT_COUNT],
+            n_backfill_attempted: 10,
+            not_used0: 0,
+        };
+        let mut buf = [0u8; WAL_SHM_FIRST_HEADER_BYTES];
+        write_shm_header(&mut buf, &hdr, &ckpt).unwrap();
+        let (parsed_hdr, parsed_ckpt) = parse_shm_header(&buf).unwrap().unwrap();
+        assert_eq!(parsed_hdr, hdr);
+        assert_eq!(parsed_ckpt, ckpt);
+    }
+
+    #[test]
+    fn test_first_segment_capacity_less_than_subsequent() {
+        let first = WalIndexHashSegment::new(WalIndexSegmentKind::First);
+        let sub = WalIndexHashSegment::new(WalIndexSegmentKind::Subsequent);
+        assert!(first.capacity() < sub.capacity());
+        assert_eq!(first.kind(), WalIndexSegmentKind::First);
+        assert_eq!(sub.kind(), WalIndexSegmentKind::Subsequent);
+        assert_eq!(sub.capacity(), WAL_SHM_SUBSEQUENT_USABLE_PAGE_ENTRIES);
+        assert_eq!(first.capacity(), WAL_SHM_FIRST_USABLE_PAGE_ENTRIES);
+    }
 }

@@ -745,6 +745,52 @@ mod tests {
     }
 
     #[test]
+    fn mixed_frame_submission_debug_and_clone() {
+        let mut sub = MixedFrameSubmission::new(test_txn_id(), CommitSeq::new(7));
+        sub.add_full_page(test_page_number(), vec![0u8; 64]);
+        let dbg = format!("{sub:?}");
+        assert!(dbg.contains("MixedFrameSubmission"));
+        let cloned = sub.clone();
+        assert_eq!(cloned.txn_id, test_txn_id());
+        assert_eq!(cloned.commit_seq, CommitSeq::new(7));
+        assert_eq!(cloned.full_page_frames.len(), 1);
+    }
+
+    #[test]
+    fn cell_delta_descriptor_debug_and_clone() {
+        let desc = CellDeltaDescriptor::insert(test_page_number(), test_key_digest(), vec![9, 8, 7]);
+        let dbg = format!("{desc:?}");
+        assert!(dbg.contains("CellDeltaDescriptor"));
+        let cloned = desc.clone();
+        assert_eq!(cloned.page_number, test_page_number());
+        assert_eq!(cloned.cell_data, vec![9, 8, 7]);
+        assert_eq!(cloned.cell_key_digest, test_key_digest());
+    }
+
+    #[test]
+    fn mixed_commit_stats_debug_and_clone() {
+        let mut sub = MixedFrameSubmission::new(test_txn_id(), CommitSeq::new(1));
+        sub.add_full_page(test_page_number(), vec![0u8; 4096]);
+        let stats = MixedCommitStats::calculate(&sub, 4096);
+        let dbg = format!("{stats:?}");
+        assert!(dbg.contains("MixedCommitStats"));
+        let cloned = stats.clone();
+        assert_eq!(cloned.full_page_frames, stats.full_page_frames);
+        assert_eq!(cloned.full_page_bytes, stats.full_page_bytes);
+    }
+
+    #[test]
+    fn new_submission_stores_txn_id_and_commit_seq() {
+        let txn = TxnId::new(999).unwrap();
+        let seq = CommitSeq::new(555);
+        let sub = MixedFrameSubmission::new(txn, seq);
+        assert_eq!(sub.txn_id, txn);
+        assert_eq!(sub.commit_seq, seq);
+        assert!(sub.full_page_frames.is_empty());
+        assert!(sub.cell_delta_frames.is_empty());
+    }
+
+    #[test]
     fn test_compression_ratio_cell_only_below_one() {
         let mut sub = MixedFrameSubmission::new(test_txn_id(), CommitSeq::new(1));
         sub.add_cell_delta(CellDeltaWalFrame::new(

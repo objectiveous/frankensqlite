@@ -897,6 +897,31 @@ mod tests {
     }
 
     #[test]
+    fn chain_tip_hash_tracks_the_latest_record() {
+        // The empty-log genesis case is covered elsewhere; this pins that the
+        // chain tip advances to the most recent record's hash as plans are
+        // logged, and that each record chains onto the previous tip.
+        let tables = sample_tables();
+        let indexes = sample_indexes();
+        let plan = sample_plan();
+        let mut log = DecisionLog::new();
+        assert_eq!(log.chain_tip_hash(), GENESIS_HASH);
+
+        log.record_plan("SELECT 1", &tables, &indexes, 0, None, 0, &plan, 1, false);
+        let tip_after_first = log.chain_tip_hash().to_owned();
+        // The tip is no longer genesis and equals the first record's hash.
+        assert_ne!(tip_after_first, GENESIS_HASH);
+        assert_eq!(tip_after_first, log.decisions[0].record_hash);
+
+        log.record_plan("SELECT 2", &tables, &indexes, 0, None, 0, &plan, 1, false);
+        // The tip advances to the second record, which chains onto the first
+        // (its prev_hash is the previous tip).
+        assert_eq!(log.chain_tip_hash(), log.decisions[1].record_hash);
+        assert_eq!(log.decisions[1].prev_hash, tip_after_first);
+        assert_ne!(log.chain_tip_hash(), tip_after_first);
+    }
+
+    #[test]
     fn decision_log_tamper_detection() {
         let tables = sample_tables();
         let indexes = sample_indexes();

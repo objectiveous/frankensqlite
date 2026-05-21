@@ -340,6 +340,8 @@ pub enum DataflowOperator {
     ConsolidateRows,
     /// Multiply every row weight by `factor`, eliding zero-weight output rows.
     ScaleWeight { factor: i64 },
+    /// Reverse every row's algebraic delta polarity.
+    NegateWeight,
     /// Rewrite every non-zero input row to a fixed output weight.
     SetWeight { weight: i64 },
     /// Keep rows with positive accumulated weight as set membership.
@@ -485,6 +487,7 @@ impl DataflowOperator {
             } => average_integer_by_key(rows, key_columns, *value_column),
             Self::ConsolidateRows => Ok(consolidate_rows(rows.iter().cloned().collect())),
             Self::ScaleWeight { factor } => Ok(scale_weights(rows, *factor)),
+            Self::NegateWeight => Ok(negate_weights(rows)),
             Self::SetWeight { weight } => Ok(set_weights(rows, *weight)),
             Self::ThresholdPositive => Ok(threshold_positive(rows)),
             Self::AppendWeightColumn => Ok(append_weight_column(rows)),
@@ -1474,6 +1477,11 @@ pub fn scale_weights(rows: &[WeightedRow], factor: i64) -> Vec<WeightedRow> {
             (weight != 0).then(|| WeightedRow::new(row.values.clone(), weight))
         })
         .collect()
+}
+
+/// Reverse row weights while preserving row order and values.
+pub fn negate_weights(rows: &[WeightedRow]) -> Vec<WeightedRow> {
+    scale_weights(rows, -1)
 }
 
 /// Rewrite non-zero input rows to a fixed algebraic weight.
@@ -4263,6 +4271,35 @@ mod tests {
         let rows = vec![WeightedRow::new(vec![int(1)], i64::MAX)];
 
         let actual = scale_weights(&rows, 2);
+
+        assert_eq!(actual, vec![WeightedRow::new(vec![int(1)], i64::MAX)]);
+    }
+
+    #[test]
+    fn negate_weight_operator_reverses_delta_polarity() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::NegateWeight]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), int(10)], 3),
+            WeightedRow::new(vec![int(2), int(20)], -2),
+            WeightedRow::new(vec![int(3), int(30)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(1), int(10)], -3),
+                WeightedRow::new(vec![int(2), int(20)], 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn negate_weights_saturates_minimum_weight() {
+        let rows = vec![WeightedRow::new(vec![int(1)], i64::MIN)];
+
+        let actual = super::negate_weights(&rows);
 
         assert_eq!(actual, vec![WeightedRow::new(vec![int(1)], i64::MAX)]);
     }

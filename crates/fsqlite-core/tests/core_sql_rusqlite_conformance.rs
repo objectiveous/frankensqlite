@@ -1283,6 +1283,29 @@ const NUMERIC_COERCION_CASES: &[QueryCase] = &[
     },
 ];
 
+const GROUP_BY_EXPRESSION_ALIAS_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "group by select list alias",
+        sql: "SELECT COALESCE(label, 'none') AS bucket, COUNT(*) AS n, SUM(COALESCE(a, 0)) FROM expr_rows GROUP BY bucket ORDER BY bucket",
+    },
+    QueryCase {
+        name: "group by ordinal expression",
+        sql: "SELECT CASE WHEN a IS NULL OR b IS NULL THEN 'partial' WHEN a = b THEN 'same' ELSE 'diff' END AS kind, COUNT(*), MIN(id), MAX(id) FROM expr_rows GROUP BY 1 ORDER BY kind",
+    },
+    QueryCase {
+        name: "group by boolean null flags",
+        sql: "SELECT a IS NULL AS missing_a, b IS NULL AS missing_b, COUNT(*) FROM expr_rows GROUP BY missing_a, missing_b ORDER BY missing_a, missing_b",
+    },
+    QueryCase {
+        name: "having aggregate alias over grouped expression",
+        sql: "SELECT COALESCE(label, 'none') AS bucket, COUNT(*) AS n FROM expr_rows GROUP BY bucket HAVING n >= 1 ORDER BY n DESC, bucket",
+    },
+    QueryCase {
+        name: "null values share one group",
+        sql: "SELECT label, COUNT(*), MIN(id), MAX(id) FROM expr_rows GROUP BY label ORDER BY label IS NOT NULL, label",
+    },
+];
+
 const DISTINCT_ORDER_LIMIT_CASES: &[QueryCase] = &[
     QueryCase {
         name: "distinct nullable text ordering",
@@ -2000,6 +2023,15 @@ fn boolean_logic_precedence_edges_match_rusqlite() {
 fn numeric_coercion_expression_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
     harness.assert_queries_match("numeric coercion edge", NUMERIC_COERCION_CASES);
+}
+
+#[test]
+fn group_by_expression_and_alias_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
+    harness.assert_queries_match(
+        "GROUP BY expression/alias edge",
+        GROUP_BY_EXPRESSION_ALIAS_CASES,
+    );
 }
 
 #[test]

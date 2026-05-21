@@ -2330,6 +2330,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_expr_classifiers_column_name_rowid_and_bind_param() {
+        let col = |name: &str| Expr::Column(ColumnRef::bare(name), Span::ZERO);
+        let lit = Expr::Literal(Literal::Integer(7), Span::ZERO);
+
+        // column_name: a plain column -> its name; rowid aliases / non-columns -> None.
+        assert_eq!(column_name(&col("name")), Some("name".to_owned()));
+        assert_eq!(column_name(&col("rowid")), None, "rowid is excluded from column extraction");
+        assert_eq!(column_name(&col("OID")), None);
+        assert_eq!(column_name(&lit), None);
+
+        // is_rowid_expr: true only for a rowid-alias column expression.
+        assert!(is_rowid_expr(&col("rowid")));
+        assert!(is_rowid_expr(&col("_rowid_")));
+        assert!(!is_rowid_expr(&col("name")));
+        assert!(!is_rowid_expr(&lit));
+
+        // bind_param_ref: numbered/anonymous placeholders; non-placeholder -> None.
+        assert_eq!(bind_param_ref(&placeholder(5)), Some(BindParamRef::Numbered(5)));
+        assert_eq!(
+            bind_param_ref(&Expr::Placeholder(PlaceholderType::Anonymous, Span::ZERO)),
+            Some(BindParamRef::Anonymous)
+        );
+        assert_eq!(bind_param_ref(&lit), None);
+        // bind_param_index collapses anonymous to 1, numbered to its index.
+        assert_eq!(bind_param_index(&placeholder(5)), Some(5));
+        assert_eq!(
+            bind_param_index(&Expr::Placeholder(PlaceholderType::Anonymous, Span::ZERO)),
+            Some(1)
+        );
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),

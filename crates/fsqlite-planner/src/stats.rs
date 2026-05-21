@@ -985,6 +985,21 @@ mod tests {
         assert!(cmp_matches(&v100, Operator::Gt, &v50));
         assert!(cmp_matches(&v100, Operator::Ge, &v100));
         assert!(cmp_matches(&v50, Operator::Ne, &v100));
+
+        // IS / IS NOT mirror Eq / Ne on samples.
+        assert!(cmp_matches(&v50, Operator::Is, &v50));
+        assert!(!cmp_matches(&v50, Operator::Is, &v100));
+        assert!(cmp_matches(&v50, Operator::IsNot, &v100));
+        assert!(!cmp_matches(&v50, Operator::IsNot, &v50));
+
+        // Le also matches strictly-less; Ge also matches strictly-greater.
+        assert!(cmp_matches(&v50, Operator::Le, &v100));
+        assert!(cmp_matches(&v100, Operator::Ge, &v50));
+
+        // LIKE / GLOB are not evaluated against samples: they never match, even
+        // when the two values are equal.
+        assert!(!cmp_matches(&v50, Operator::Like, &v50));
+        assert!(!cmp_matches(&v50, Operator::Glob, &v50));
     }
 
     #[test]

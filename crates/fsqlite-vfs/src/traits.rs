@@ -469,4 +469,75 @@ mod tests {
         let all_zero = buf.iter().all(|&b| b == 0);
         assert!(!all_zero, "256-byte randomness buffer should not be all zeros");
     }
+
+    #[test]
+    fn vfs_randomness_non_aligned_buffer() {
+        use crate::memory::MemoryVfs;
+        use crate::traits::Vfs;
+
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let mut buf = [0u8; 13];
+        vfs.randomness(&cx, &mut buf);
+        let all_zero = buf.iter().all(|&b| b == 0);
+        assert!(!all_zero, "13-byte non-aligned buffer should be filled");
+    }
+
+    #[test]
+    fn vfs_write_page_batch_empty_is_noop() {
+        struct Stub;
+        impl VfsFile for Stub {
+            fn close(&mut self, _: &Cx) -> Result<()> { Ok(()) }
+            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> { Ok(0) }
+            fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+                panic!("write should not be called for empty batch");
+            }
+            fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> { Ok(()) }
+            fn sync(&mut self, _: &Cx, _: SyncFlags) -> Result<()> { Ok(()) }
+            fn file_size(&self, _: &Cx) -> Result<u64> { Ok(0) }
+            fn lock(&mut self, _: &Cx, _: LockLevel) -> Result<()> { Ok(()) }
+            fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> { Ok(()) }
+            fn check_reserved_lock(&self, _: &Cx) -> Result<bool> { Ok(false) }
+            fn shm_map(&mut self, _: &Cx, _: u32, _: u32, _: bool) -> Result<ShmRegion> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn shm_lock(&mut self, _: &Cx, _: u32, _: u32, _: u32) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn shm_barrier(&self) {}
+            fn shm_unmap(&mut self, _: &Cx, _: bool) -> Result<()> { Ok(()) }
+        }
+
+        let cx = Cx::new();
+        let mut file = Stub;
+        let writes: Vec<(u64, &[u8])> = vec![];
+        file.write_page_batch(&cx, &writes).unwrap();
+    }
+
+    #[test]
+    fn memory_vfs_name_is_memory() {
+        use crate::memory::MemoryVfs;
+        use crate::traits::Vfs;
+
+        let vfs = MemoryVfs::new();
+        assert_eq!(vfs.name(), "memory");
+    }
+
+    #[test]
+    fn vfs_current_time_advances_with_unix_millis() {
+        use crate::memory::MemoryVfs;
+        use crate::traits::Vfs;
+
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        cx.set_unix_millis_for_testing(0);
+        let t0 = vfs.current_time(&cx);
+        cx.set_unix_millis_for_testing(86_400_000);
+        let t1 = vfs.current_time(&cx);
+        let delta = t1 - t0;
+        assert!(
+            (delta - 1.0).abs() < 1e-6,
+            "86400000ms = 1 Julian day, got delta {delta}"
+        );
+    }
 }

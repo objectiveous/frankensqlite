@@ -635,4 +635,52 @@ mod tests {
         let ev = EValueEvictor::new();
         assert!(ev.choose_victim(&[]).is_none());
     }
+
+    #[test]
+    fn debug_format_contains_expected_fields() {
+        let ev = EValueEvictor::with_rates(2.0, 0.5);
+        ev.record_access(pn(1));
+        ev.record_access(pn(2));
+        let dbg = format!("{ev:?}");
+        assert!(dbg.contains("EValueEvictor"));
+        assert!(dbg.contains("r_hit"));
+        assert!(dbg.contains("r_tick"));
+        assert!(dbg.contains("initial_e"));
+        assert!(dbg.contains("pages"), "should show page count");
+    }
+
+    #[test]
+    fn clamp_e_handles_nan_negative_infinity() {
+        assert_eq!(clamp_e(f64::NAN), E_VALUE_FLOOR);
+        assert_eq!(clamp_e(f64::NEG_INFINITY), E_VALUE_FLOOR);
+        assert_eq!(clamp_e(f64::INFINITY), E_VALUE_FLOOR);
+        assert_eq!(clamp_e(-1.0), E_VALUE_FLOOR);
+        assert_eq!(clamp_e(0.0), E_VALUE_FLOOR);
+        assert_eq!(clamp_e(E_VALUE_FLOOR), E_VALUE_FLOOR);
+        assert_eq!(clamp_e(E_VALUE_CEIL), E_VALUE_CEIL);
+        assert_eq!(clamp_e(E_VALUE_CEIL + 1.0), E_VALUE_CEIL);
+        assert_eq!(clamp_e(42.0), 42.0);
+    }
+
+    #[test]
+    fn choose_victim_single_candidate_returns_it() {
+        let ev = EValueEvictor::new();
+        let p = pn(7);
+        ev.record_access(p);
+        let victim = ev.choose_victim(&[p]);
+        assert_eq!(victim, Some(p));
+    }
+
+    #[test]
+    fn forget_is_idempotent_and_updates_tracked() {
+        let ev = EValueEvictor::new();
+        ev.record_access(pn(1));
+        ev.record_access(pn(2));
+        assert_eq!(ev.tracked(), 2);
+        ev.forget(pn(1));
+        assert_eq!(ev.tracked(), 1);
+        ev.forget(pn(1));
+        assert_eq!(ev.tracked(), 1, "second forget must be no-op");
+        assert!(ev.e_value(pn(2)).is_some(), "other page unaffected");
+    }
 }

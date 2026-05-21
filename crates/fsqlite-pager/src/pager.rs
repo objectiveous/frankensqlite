@@ -26713,4 +26713,69 @@ mod tests {
             "read-only pager must default to S3-FIFO eviction"
         );
     }
+
+    #[test]
+    fn pager_commit_profile_snapshot_default_and_debug() {
+        let def = PagerCommitProfileSnapshot::default();
+        assert_eq!(def.commit_calls, 0);
+        assert_eq!(def.phase_a_time_ns, 0);
+        assert_eq!(def.wal_commit_time_ns, 0);
+        let copied = def;
+        assert_eq!(copied, def);
+        let dbg = format!("{def:?}");
+        assert!(dbg.contains("PagerCommitProfileSnapshot"));
+    }
+
+    #[test]
+    fn wal_commit_sync_policy_variants_eq() {
+        let deferred = WalCommitSyncPolicy::Deferred;
+        let per_commit = WalCommitSyncPolicy::PerCommit;
+        assert_ne!(deferred, per_commit);
+        assert!(!deferred.should_sync_on_commit());
+        assert!(per_commit.should_sync_on_commit());
+        let copied = deferred;
+        assert_eq!(copied, deferred);
+        let dbg = format!("{per_commit:?}");
+        assert!(dbg.contains("PerCommit"));
+    }
+
+    #[test]
+    fn pager_metadata_publication_class_all_variants() {
+        let variants = [
+            PagerMetadataPublicationClass::SnapshotSummary,
+            PagerMetadataPublicationClass::PagePlaneResidency,
+            PagerMetadataPublicationClass::CertificateDerivedIntent,
+        ];
+        for (i, v) in variants.iter().enumerate() {
+            let copied = *v;
+            assert_eq!(copied, *v);
+            for (j, w) in variants.iter().enumerate() {
+                assert_eq!(i == j, v == w);
+            }
+        }
+        assert_eq!(PAGER_METADATA_PUBLICATION_CONTRACTS.len(), 3);
+        assert_eq!(
+            PAGER_METADATA_PUBLICATION_CONTRACTS[0].class,
+            PagerMetadataPublicationClass::SnapshotSummary
+        );
+    }
+
+    #[test]
+    fn pager_published_snapshot_debug_clone_copy_eq() {
+        let snap = PagerPublishedSnapshot {
+            snapshot_gen: 4,
+            visible_commit_seq: CommitSeq::new(10),
+            db_size: 100,
+            journal_mode: JournalMode::Wal,
+            freelist_count: 5,
+            checkpoint_active: false,
+            page_set_size: 42,
+        };
+        let copied = snap;
+        assert_eq!(copied, snap);
+        let other = PagerPublishedSnapshot { db_size: 200, ..snap };
+        assert_ne!(snap, other);
+        let dbg = format!("{snap:?}");
+        assert!(dbg.contains("PagerPublishedSnapshot"));
+    }
 }

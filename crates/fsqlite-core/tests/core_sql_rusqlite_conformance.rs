@@ -1360,6 +1360,33 @@ const STRING_FUNCTION_CASES: &[QueryCase] = &[
     },
 ];
 
+const STRING_SCALAR_EDGE_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "ascii case conversion and null propagation",
+        sql: "SELECT upper('MiXeD'), lower('MiXeD'), upper(NULL), lower(NULL)",
+    },
+    QueryCase {
+        name: "length storage class and null behavior",
+        sql: "SELECT length('hello'), length(''), length(NULL), typeof(length('abc'))",
+    },
+    QueryCase {
+        name: "default trim family",
+        sql: "SELECT trim('  padded  '), ltrim('  padded  '), rtrim('  padded  ')",
+    },
+    QueryCase {
+        name: "custom trim character sets",
+        sql: "SELECT trim('xyxhelloxy', 'xy'), ltrim('xyxhello', 'xy'), rtrim('helloxyx', 'xy')",
+    },
+    QueryCase {
+        name: "hex conversion storage class",
+        sql: "SELECT hex('Az'), hex(42), typeof(hex(42))",
+    },
+    QueryCase {
+        name: "string functions over table columns",
+        sql: "SELECT id, upper(IFNULL(label, 'none')), length(IFNULL(label, '')), trim(label || '  ') FROM expr_rows ORDER BY id",
+    },
+];
+
 const MATH_FUNCTION_CASES: &[QueryCase] = &[
     QueryCase {
         name: "abs nulls and storage class",
@@ -1651,6 +1678,12 @@ fn json1_functions_match_rusqlite() {
 fn string_functions_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new("");
     harness.assert_queries_match("string functions", STRING_FUNCTION_CASES);
+}
+
+#[test]
+fn string_scalar_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
+    harness.assert_queries_match("string scalar edge", STRING_SCALAR_EDGE_CASES);
 }
 
 #[test]

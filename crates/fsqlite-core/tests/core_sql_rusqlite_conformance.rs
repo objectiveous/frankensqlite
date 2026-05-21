@@ -673,6 +673,43 @@ const DML_CASES: &[QueryCase] = &[
     },
 ];
 
+const DML_RETURNING_SETUP: &str = "
+    CREATE TABLE returning_items (
+        id INTEGER PRIMARY KEY,
+        sku TEXT NOT NULL UNIQUE,
+        qty INTEGER NOT NULL,
+        note TEXT DEFAULT 'seed'
+    );
+
+    INSERT INTO returning_items(id, sku, qty, note) VALUES
+        (1, 'alpha', 10, 'first'),
+        (2, 'beta', 20, 'second'),
+        (3, 'gamma', 30, 'third');
+";
+
+const DML_RETURNING_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "insert returning expressions",
+        sql: "INSERT INTO returning_items(sku, qty, note) VALUES ('delta', 40, 'inserted') RETURNING id, sku, qty, note, qty * 2",
+    },
+    QueryCase {
+        name: "update returning mutated row",
+        sql: "UPDATE returning_items SET qty = qty + 5, note = note || '-updated' WHERE sku = 'alpha' RETURNING id, sku, qty, note",
+    },
+    QueryCase {
+        name: "delete returning deleted row",
+        sql: "DELETE FROM returning_items WHERE sku = 'gamma' RETURNING id, sku, qty, note",
+    },
+    QueryCase {
+        name: "insert returning defaulted column",
+        sql: "INSERT INTO returning_items(id, sku, qty) VALUES (10, 'epsilon', 50) RETURNING id, sku, qty, note",
+    },
+    QueryCase {
+        name: "final returning table state",
+        sql: "SELECT id, sku, qty, note FROM returning_items ORDER BY id",
+    },
+];
+
 const ATTACHED_UPDATE_SETUP: &str = "
     ATTACH DATABASE ':memory:' AS aux;
 
@@ -1944,6 +1981,12 @@ fn dml_insert_update_delete_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(DML_SETUP);
     harness.execute_script(DML_SCRIPT);
     harness.assert_queries_match("DML", DML_CASES);
+}
+
+#[test]
+fn dml_returning_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(DML_RETURNING_SETUP);
+    harness.assert_queries_match("DML RETURNING edge", DML_RETURNING_CASES);
 }
 
 #[test]

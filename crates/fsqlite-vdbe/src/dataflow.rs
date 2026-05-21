@@ -344,6 +344,8 @@ pub enum DataflowOperator {
     NegateWeight,
     /// Collapse every non-zero row weight to its algebraic sign.
     NormalizeWeightSign,
+    /// Subtract a static weighted-row batch from the current stream.
+    SubtractRows { rows: Vec<WeightedRow> },
     /// Rewrite every non-zero input row to a fixed output weight.
     SetWeight { weight: i64 },
     /// Keep rows with positive accumulated weight as set membership.
@@ -491,6 +493,7 @@ impl DataflowOperator {
             Self::ScaleWeight { factor } => Ok(scale_weights(rows, *factor)),
             Self::NegateWeight => Ok(negate_weights(rows)),
             Self::NormalizeWeightSign => Ok(normalize_weight_sign(rows)),
+            Self::SubtractRows { rows: right } => Ok(subtract_rows(rows, right)),
             Self::SetWeight { weight } => Ok(set_weights(rows, *weight)),
             Self::ThresholdPositive => Ok(threshold_positive(rows)),
             Self::AppendWeightColumn => Ok(append_weight_column(rows)),
@@ -1501,6 +1504,14 @@ pub fn normalize_weight_sign(rows: &[WeightedRow]) -> Vec<WeightedRow> {
             Some(WeightedRow::new(row.values.clone(), weight))
         })
         .collect()
+}
+
+/// Subtract a static weighted-row batch and consolidate matching rows.
+pub fn subtract_rows(left: &[WeightedRow], right: &[WeightedRow]) -> Vec<WeightedRow> {
+    let mut rows = Vec::with_capacity(left.len() + right.len());
+    rows.extend(left.iter().filter(|row| !row.is_zero()).cloned());
+    rows.extend(negate_weights(right));
+    consolidate_rows(rows)
 }
 
 /// Rewrite non-zero input rows to a fixed algebraic weight.
@@ -4350,6 +4361,49 @@ mod tests {
         let actual = super::normalize_weight_sign(&rows);
 
         assert_eq!(actual, vec![WeightedRow::delete(vec![int(1)])]);
+    }
+
+    #[test]
+    fn subtract_rows_operator_subtracts_static_batch_and_consolidates() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::SubtractRows {
+            rows: vec![
+                WeightedRow::new(vec![int(1), int(10)], 1),
+                WeightedRow::new(vec![int(3), int(30)], 2),
+                WeightedRow::new(vec![int(4), int(40)], 0),
+            ],
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), int(10)], 3),
+            WeightedRow::insert(vec![int(2), int(20)]),
+            WeightedRow::new(vec![int(5), int(50)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(1), int(10)], 2),
+                WeightedRow::insert(vec![int(2), int(20)]),
+                WeightedRow::new(vec![int(3), int(30)], -2),
+            ]
+        );
+    }
+
+    #[test]
+    fn subtract_rows_elides_exact_cancellations() {
+        let left = vec![
+            WeightedRow::insert(vec![int(1)]),
+            WeightedRow::new(vec![int(2)], 2),
+        ];
+        let right = vec![
+            WeightedRow::insert(vec![int(1)]),
+            WeightedRow::new(vec![int(2)], 2),
+        ];
+
+        let actual = super::subtract_rows(&left, &right);
+
+        assert_eq!(actual, Vec::<WeightedRow>::new());
     }
 
     #[test]

@@ -115,6 +115,29 @@ const SPARSE_ROWID_DOCS: &[Doc] = &[
     },
 ];
 
+const SIGNED_ROWID_DOCS: &[Doc] = &[
+    Doc {
+        rowid: -20,
+        title: "Negative rust",
+        body: "signed rowid rust token",
+    },
+    Doc {
+        rowid: 0,
+        title: "Zero sqlite",
+        body: "zero rowid sqlite token",
+    },
+    Doc {
+        rowid: 15,
+        title: "Positive search",
+        body: "positive rowid search token",
+    },
+    Doc {
+        rowid: -3,
+        title: "Negative cooking",
+        body: "negative rowid herbs",
+    },
+];
+
 const PHRASE_CONCAT_DOCS: &[Doc] = &[
     Doc {
         rowid: 1,
@@ -908,6 +931,33 @@ const SPARSE_ROWID_CASES: &[MatchCase] = &[
     MatchCase {
         name: "prefix term",
         query: "eps*",
+    },
+];
+
+const SIGNED_ROWID_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "negative rowid term",
+        query: "rust",
+    },
+    MatchCase {
+        name: "zero rowid term",
+        query: "sqlite",
+    },
+    MatchCase {
+        name: "positive rowid term",
+        query: "search",
+    },
+    MatchCase {
+        name: "negative rowid column filter",
+        query: "title:negative",
+    },
+    MatchCase {
+        name: "mixed signed rowid union",
+        query: "rust OR sqlite OR cooking",
+    },
+    MatchCase {
+        name: "signed rowid prefix",
+        query: "row*",
     },
 ];
 
@@ -2432,6 +2482,29 @@ fn sparse_rowid_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "sparse-rowid MATCH conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn signed_rowid_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::with_docs(&[], SIGNED_ROWID_DOCS);
+    let mut franken_rows = harness.franken_full_scan_rows();
+    franken_rows.sort_by_key(|row| row.0);
+
+    assert_eq!(
+        franken_rows,
+        harness.sqlite_full_scan_rows(),
+        "signed-rowid full-scan conformance failed"
+    );
+
+    for case in SIGNED_ROWID_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "signed-rowid MATCH conformance case failed: {} ({})",
             case.name,
             case.query
         );

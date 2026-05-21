@@ -432,4 +432,62 @@ mod tests {
         assert!(rec.detail.contains("completed_epoch=999"));
         assert!(rec.trigger_seq > 0);
     }
+
+    #[test]
+    fn test_fault_injection_record_clone_and_eq() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_during_phase_c(FaultHookArm::new("rc", "sc", "ic"));
+        let _ = maybe_inject_during_phase_c(42, 7);
+        let records = take_records();
+        let original = &records[0];
+        let cloned = original.clone();
+        assert_eq!(*original, cloned);
+        assert_eq!(cloned.trigger_seq, original.trigger_seq);
+        assert_eq!(cloned.point, "during_phase_c");
+        assert_eq!(cloned.detail, original.detail);
+    }
+
+    #[test]
+    fn test_fault_hook_arm_clone_and_debug() {
+        let a = FaultHookArm::new("run-dbg", "scen-dbg", "inv-dbg");
+        let b = a.clone();
+        assert_eq!(a, b);
+        let dbg = format!("{a:?}");
+        assert!(dbg.contains("run-dbg"));
+        assert!(dbg.contains("scen-dbg"));
+        assert!(dbg.contains("inv-dbg"));
+    }
+
+    #[test]
+    fn test_flush_error_message_includes_all_arm_fields() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_after_flush_before_publish(FaultHookArm::new("R1", "S1", "INV1"));
+        let err = maybe_inject_after_flush_before_publish(1, 1, 1).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("run_id=R1"), "error must include run_id");
+        assert!(msg.contains("scenario_id=S1"), "error must include scenario_id");
+        assert!(
+            msg.contains("invariant_family=INV1"),
+            "error must include invariant_family"
+        );
+    }
+
+    #[test]
+    fn test_flush_hook_boundary_zero_counts() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_after_flush_before_publish(arm("zero"));
+        let err = maybe_inject_after_flush_before_publish(0, 0, 0);
+        assert!(err.is_err());
+        let records = take_records();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].detail.contains("flush_epoch=0"));
+        assert!(records[0].detail.contains("batch_count=0"));
+        assert!(records[0].detail.contains("frame_count=0"));
+    }
 }

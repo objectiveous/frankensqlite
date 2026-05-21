@@ -2362,6 +2362,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_default_value_to_expr_handles_missing_valid_and_invalid_defaults() {
+        let no_default = ColumnInfo {
+            name: "a".to_owned(),
+            affinity: 'd',
+            default_value: None,
+        };
+        let with_default = ColumnInfo {
+            name: "b".to_owned(),
+            affinity: 'd',
+            default_value: Some("42".to_owned()),
+        };
+        let bad_default = ColumnInfo {
+            name: "c".to_owned(),
+            affinity: 'd',
+            default_value: Some("1 +".to_owned()),
+        };
+        let table = TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![no_default.clone(), with_default.clone()],
+            indexes: vec![],
+        };
+
+        // No DEFAULT -> NULL literal.
+        assert!(matches!(
+            default_value_to_expr(&table, &no_default),
+            Ok(Expr::Literal(Literal::Null, _))
+        ));
+        // A valid DEFAULT parses to an expression.
+        assert!(default_value_to_expr(&table, &with_default).is_ok());
+        // An unparseable DEFAULT surfaces as a CodegenError::Unsupported.
+        assert!(matches!(
+            default_value_to_expr(&table, &bad_default),
+            Err(CodegenError::Unsupported(_))
+        ));
+
+        // insert_default_exprs produces one expr per column; the no-default
+        // column yields a NULL literal.
+        let defaults = insert_default_exprs(&table).expect("defaults compile");
+        assert_eq!(defaults.len(), 2);
+        assert!(
+            matches!(defaults[0], Expr::Literal(Literal::Null, _)),
+            "column a has no default -> NULL"
+        );
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),

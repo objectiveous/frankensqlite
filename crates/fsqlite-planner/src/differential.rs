@@ -1718,6 +1718,30 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn differential_plan_rejects_with_compound_and_having_clauses() {
+        // Per-clause fail-closed rejections the proptest's case set does not
+        // cover (it covers DISTINCT/ORDER BY/LIMIT/star/joins/aggregate-arg).
+        let with = parse_select("WITH c AS (SELECT id FROM users) SELECT id FROM c");
+        assert_eq!(
+            compile_differential_view_plan(&with).unwrap_err(),
+            DifferentialPlanError::UnsupportedWithClause
+        );
+
+        let compound = parse_select("SELECT id FROM a UNION SELECT id FROM b");
+        assert_eq!(
+            compile_differential_view_plan(&compound).unwrap_err(),
+            DifferentialPlanError::UnsupportedCompoundSelect
+        );
+
+        let having =
+            parse_select("SELECT status, COUNT(*) FROM orders GROUP BY status HAVING COUNT(*) > 1");
+        assert_eq!(
+            compile_differential_view_plan(&having).unwrap_err(),
+            DifferentialPlanError::UnsupportedHavingClause
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
 

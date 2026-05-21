@@ -490,4 +490,51 @@ mod tests {
         assert!(records[0].detail.contains("batch_count=0"));
         assert!(records[0].detail.contains("frame_count=0"));
     }
+
+    #[test]
+    fn fault_hook_arm_clone_eq_debug() {
+        let a = FaultHookArm::new("run1", "scen1", "inv1");
+        let b = a.clone();
+        assert_eq!(a, b);
+        let c = FaultHookArm::new("run2", "scen1", "inv1");
+        assert_ne!(a, c);
+        let dbg = format!("{a:?}");
+        assert!(dbg.contains("FaultHookArm"));
+        assert!(dbg.contains("run1"));
+    }
+
+    #[test]
+    fn fault_injection_record_clone_eq_debug() {
+        let r = FaultInjectionRecord {
+            trigger_seq: 7,
+            point: "test_point",
+            run_id: "r1".to_owned(),
+            scenario_id: "s1".to_owned(),
+            invariant_family: "inv".to_owned(),
+            detail: "some detail".to_owned(),
+        };
+        let cloned = r.clone();
+        assert_eq!(r, cloned);
+        let other = FaultInjectionRecord { trigger_seq: 8, ..r.clone() };
+        assert_ne!(r, other);
+        let dbg = format!("{r:?}");
+        assert!(dbg.contains("FaultInjectionRecord"));
+        assert!(dbg.contains("test_point"));
+    }
+
+    #[test]
+    fn clear_resets_and_take_records_returns_empty() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+        let records = take_records();
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn fault_hook_arm_new_stores_fields() {
+        let arm = FaultHookArm::new("rid", "sid", "ifam");
+        assert_eq!(arm.run_id, "rid");
+        assert_eq!(arm.scenario_id, "sid");
+        assert_eq!(arm.invariant_family, "ifam");
+    }
 }

@@ -888,6 +888,43 @@ const DDL_CASES: &[QueryCase] = &[
     },
 ];
 
+const DEFAULT_VALUE_SETUP: &str = "
+    CREATE TABLE default_items (
+        id INTEGER PRIMARY KEY,
+        name TEXT DEFAULT 'unnamed',
+        qty INTEGER DEFAULT 7,
+        active INTEGER NOT NULL DEFAULT 1,
+        note TEXT
+    );
+";
+
+const DEFAULT_VALUE_SCRIPT: &str = "
+    INSERT INTO default_items DEFAULT VALUES;
+    INSERT INTO default_items(id, note) VALUES (10, 'explicit id');
+    INSERT INTO default_items(name, qty, active, note) VALUES ('custom', 3, 0, 'all explicit');
+    INSERT INTO default_items(id, name, note) VALUES (20, NULL, 'explicit null name');
+    INSERT INTO default_items(name) VALUES ('name-only');
+";
+
+const DEFAULT_VALUE_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "default values and omitted columns",
+        sql: "SELECT id, name, qty, active, note FROM default_items ORDER BY id",
+    },
+    QueryCase {
+        name: "defaulted column aggregates",
+        sql: "SELECT COUNT(*), SUM(qty), SUM(active), COUNT(note), COUNT(name) FROM default_items",
+    },
+    QueryCase {
+        name: "explicit null does not use default",
+        sql: "SELECT id, name IS NULL, note FROM default_items WHERE id = 20",
+    },
+    QueryCase {
+        name: "defaulted values participate in grouping",
+        sql: "SELECT active, COUNT(*), SUM(qty) FROM default_items GROUP BY active ORDER BY active",
+    },
+];
+
 const ROWID_IDENTIFIER_SETUP: &str = r#"
     CREATE TABLE rowid_items (
         name TEXT NOT NULL,
@@ -1760,6 +1797,13 @@ fn error_paths_match_rusqlite() {
 fn ddl_defaults_and_views_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(DDL_SETUP);
     harness.assert_queries_match("DDL/default/view", DDL_CASES);
+}
+
+#[test]
+fn default_values_and_column_defaults_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(DEFAULT_VALUE_SETUP);
+    harness.execute_script(DEFAULT_VALUE_SCRIPT);
+    harness.assert_queries_match("DEFAULT VALUES/default column", DEFAULT_VALUE_CASES);
 }
 
 #[test]

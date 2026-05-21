@@ -1751,4 +1751,61 @@ mod tests {
             "rollback_to_savepoint must restore page state"
         );
     }
+
+    #[test]
+    fn test_transaction_mode_default_is_deferred() {
+        assert_eq!(TransactionMode::default(), TransactionMode::Deferred);
+    }
+
+    #[test]
+    fn test_checkpoint_result_fields() {
+        let result = CheckpointResult {
+            total_frames: 100,
+            frames_backfilled: 80,
+            completed: false,
+            wal_was_reset: false,
+            requested_mode: CheckpointMode::Full,
+            effective_mode: CheckpointMode::Passive,
+        };
+        assert_eq!(result.total_frames, 100);
+        assert_eq!(result.frames_backfilled, 80);
+        assert!(!result.completed);
+        assert_ne!(result.requested_mode, result.effective_mode);
+    }
+
+    #[test]
+    fn test_prepared_wal_frame_batch_page_data_and_frame_slice() {
+        let frame_size = 32;
+        let page_data_offset = 8;
+        let mut frame_bytes = vec![0u8; frame_size * 2];
+        frame_bytes[8] = 0xAA;
+        frame_bytes[frame_size + 8] = 0xBB;
+
+        let batch = PreparedWalFrameBatch {
+            frame_size,
+            page_data_offset,
+            big_endian_checksum: false,
+            frame_metas: vec![
+                PreparedWalFrameMeta { page_number: 1, db_size_if_commit: 0 },
+                PreparedWalFrameMeta { page_number: 2, db_size_if_commit: 5 },
+            ],
+            checksum_transforms: Vec::new(),
+            frame_bytes,
+            last_commit_frame_offset: None,
+            finalized_for: None,
+            finalized_running_checksum: None,
+        };
+
+        assert_eq!(batch.page_data(0)[0], 0xAA);
+        assert_eq!(batch.page_data(1)[0], 0xBB);
+        assert_eq!(batch.frame_slice(0).len(), frame_size);
+        assert_eq!(batch.frame_slice(1).len(), frame_size);
+
+        let refs = batch.frame_refs();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].page_number, 1);
+        assert_eq!(refs[1].db_size_if_commit, 5);
+        assert_eq!(refs[0].page_data[0], 0xAA);
+        assert_eq!(refs[1].page_data[0], 0xBB);
+    }
 }

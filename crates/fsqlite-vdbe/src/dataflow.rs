@@ -215,6 +215,8 @@ pub enum DataflowOperator {
     ConsolidateRows,
     /// Multiply every row weight by `factor`, eliding zero-weight output rows.
     ScaleWeight { factor: i64 },
+    /// Rewrite every non-zero input row to a fixed output weight.
+    SetWeight { weight: i64 },
     /// Keep rows with positive accumulated weight as set membership.
     ThresholdPositive,
     /// Append each row's algebraic weight as an integer payload column for emission.
@@ -278,6 +280,7 @@ impl DataflowOperator {
             } => average_integer_by_key(rows, key_columns, *value_column),
             Self::ConsolidateRows => Ok(consolidate_rows(rows.iter().cloned().collect())),
             Self::ScaleWeight { factor } => Ok(scale_weights(rows, *factor)),
+            Self::SetWeight { weight } => Ok(set_weights(rows, *weight)),
             Self::ThresholdPositive => Ok(threshold_positive(rows)),
             Self::AppendWeightColumn => Ok(append_weight_column(rows)),
             Self::DeltaJoinLeft {
@@ -596,6 +599,17 @@ pub fn scale_weights(rows: &[WeightedRow], factor: i64) -> Vec<WeightedRow> {
         .collect()
 }
 
+/// Rewrite non-zero input rows to a fixed algebraic weight.
+pub fn set_weights(rows: &[WeightedRow], weight: i64) -> Vec<WeightedRow> {
+    if weight == 0 {
+        return Vec::new();
+    }
+
+    rows.iter()
+        .filter_map(|row| (!row.is_zero()).then(|| WeightedRow::new(row.values.clone(), weight)))
+        .collect()
+}
+
 /// Convert accumulated differential counts into positive set membership.
 pub fn threshold_positive(rows: &[WeightedRow]) -> Vec<WeightedRow> {
     consolidate_rows(rows.to_vec())
@@ -726,7 +740,8 @@ pub fn delta_join_update(
 mod tests {
     use super::{
         DataflowAutomaton, DataflowError, DataflowOperator, JoinKeySpec, WeightSign, WeightedRow,
-        delta_join_left, delta_join_right, delta_join_update, scale_weights, threshold_positive,
+        delta_join_left, delta_join_right, delta_join_update, scale_weights, set_weights,
+        threshold_positive,
     };
     use fsqlite_types::SqliteValue;
 
@@ -1084,6 +1099,38 @@ mod tests {
         let actual = scale_weights(&rows, 2);
 
         assert_eq!(actual, vec![WeightedRow::new(vec![int(1)], i64::MAX)]);
+    }
+
+    #[test]
+    fn set_weight_operator_normalizes_surviving_row_weights() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::SetWeight { weight: 1 }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), int(10)], 3),
+            WeightedRow::new(vec![int(2), int(20)], -2),
+            WeightedRow::new(vec![int(3), int(30)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::insert(vec![int(1), int(10)]),
+                WeightedRow::insert(vec![int(2), int(20)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn set_weights_zero_output_weight_elides_all_rows() {
+        let rows = vec![
+            WeightedRow::new(vec![int(1)], 3),
+            WeightedRow::new(vec![int(2)], -2),
+        ];
+
+        let actual = set_weights(&rows, 0);
+
+        assert_eq!(actual, Vec::<WeightedRow>::new());
     }
 
     #[test]

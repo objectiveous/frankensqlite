@@ -1607,6 +1607,47 @@ const IS_DISTINCT_FROM_CASES: &[QueryCase] = &[
     },
 ];
 
+const TYPEOF_SCALAR_SETUP: &str = "
+    CREATE TABLE typeof_values (
+        id INTEGER PRIMARY KEY,
+        value
+    );
+    INSERT INTO typeof_values (id, value) VALUES
+        (1, NULL),
+        (2, 42),
+        (3, 3.5),
+        (4, 'text'),
+        (5, X'00FF'),
+        (6, '12');
+";
+
+const TYPEOF_SCALAR_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "literal storage classes",
+        sql: "SELECT typeof(NULL), typeof(0), typeof(-7), typeof(3.5), typeof('text'), typeof(X'00FF')",
+    },
+    QueryCase {
+        name: "expression result storage classes",
+        sql: "SELECT typeof(1 + 2), typeof(1 + 2.5), typeof('1' + 2), typeof('a' || 'b'), typeof(NULL || 'x')",
+    },
+    QueryCase {
+        name: "cast result storage classes",
+        sql: "SELECT typeof(CAST(42 AS TEXT)), typeof(CAST('42' AS INTEGER)), typeof(CAST('3.5' AS REAL)), typeof(CAST('abc' AS BLOB)), typeof(CAST(NULL AS BLOB))",
+    },
+    QueryCase {
+        name: "column driven storage classes",
+        sql: "SELECT id, typeof(value), quote(value) FROM typeof_values ORDER BY id",
+    },
+    QueryCase {
+        name: "case and coalesce storage classes",
+        sql: "SELECT id, typeof(CASE WHEN id % 2 = 0 THEN value ELSE NULL END), typeof(coalesce(value, 'fallback')) FROM typeof_values ORDER BY id",
+    },
+    QueryCase {
+        name: "scalar subquery storage classes",
+        sql: "SELECT typeof((SELECT value FROM typeof_values WHERE id = 5)), typeof((SELECT value FROM typeof_values WHERE id = 1)), typeof((SELECT max(value) FROM typeof_values WHERE id IN (2, 3)))",
+    },
+];
+
 const CONDITIONAL_SCALAR_SETUP: &str = "
     CREATE TABLE conditional_values (
         id INTEGER PRIMARY KEY,
@@ -3178,6 +3219,12 @@ fn scalar_null_comparison_edges_match_rusqlite() {
 fn is_distinct_from_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
     harness.assert_queries_match("IS DISTINCT FROM edge", IS_DISTINCT_FROM_CASES);
+}
+
+#[test]
+fn typeof_scalar_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(TYPEOF_SCALAR_SETUP);
+    harness.assert_queries_match("typeof scalar edge", TYPEOF_SCALAR_CASES);
 }
 
 #[test]

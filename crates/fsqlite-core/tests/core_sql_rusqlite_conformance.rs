@@ -185,6 +185,29 @@ const SELECT_JOIN_GROUP_AGGREGATE_CASES: &[QueryCase] = &[
     },
 ];
 
+const LEFT_JOIN_PREDICATE_EDGE_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "on predicate preserves null extended left rows",
+        sql: "SELECT s.id, COALESCE(ret.qty, 0) FROM sales s LEFT JOIN returns ret ON ret.sale_id = s.id AND ret.qty >= 2 ORDER BY s.id",
+    },
+    QueryCase {
+        name: "where predicate filters null extended rows",
+        sql: "SELECT s.id, ret.qty FROM sales s LEFT JOIN returns ret ON ret.sale_id = s.id WHERE ret.qty >= 2 ORDER BY s.id",
+    },
+    QueryCase {
+        name: "left join is null anti join",
+        sql: "SELECT s.id FROM sales s LEFT JOIN returns ret ON ret.sale_id = s.id WHERE ret.id IS NULL ORDER BY s.id",
+    },
+    QueryCase {
+        name: "chained left join aggregate null extension",
+        sql: "SELECT st.name, COUNT(s.id), COUNT(ret.id) FROM stores st LEFT JOIN sales s ON s.store_id = st.id LEFT JOIN returns ret ON ret.sale_id = s.id GROUP BY st.name ORDER BY st.name",
+    },
+    QueryCase {
+        name: "mixed inner and left join ordering",
+        sql: "SELECT r.name, st.name, s.id, ret.qty FROM regions r JOIN stores st ON st.region_id = r.id JOIN sales s ON s.store_id = st.id LEFT JOIN returns ret ON ret.sale_id = s.id ORDER BY r.name, st.name, s.id",
+    },
+];
+
 const JOIN_USING_NATURAL_SETUP: &str = "
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -1723,6 +1746,12 @@ fn select_join_group_by_aggregates_match_rusqlite() {
         "SELECT/JOIN/GROUP BY/aggregate",
         SELECT_JOIN_GROUP_AGGREGATE_CASES,
     );
+}
+
+#[test]
+fn left_join_predicate_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
+    harness.assert_queries_match("LEFT JOIN predicate edge", LEFT_JOIN_PREDICATE_EDGE_CASES);
 }
 
 #[test]

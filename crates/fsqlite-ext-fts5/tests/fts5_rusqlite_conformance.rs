@@ -187,6 +187,7 @@ const UNICODE61_DIACRITIC_OPTIONS: &[&str] = &["tokenize='unicode61 remove_diacr
 const UNICODE61_CODE_TOKEN_OPTIONS: &[&str] = &[r#"tokenize="unicode61 tokenchars '-_./:@#$%'""#];
 const UNICODE61_SEPARATOR_OPTIONS: &[&str] = &[r#"tokenize="unicode61 separators '_.'""#];
 const UNINDEXED_COLUMN_SPECS: &[&str] = &["title", "body UNINDEXED"];
+const CONTENTLESS_OPTIONS: &[&str] = &["content=''"];
 const PORTER_OPTIONS: &[&str] = &["tokenize='porter'"];
 const TRIGRAM_OPTIONS: &[&str] = &["tokenize='trigram'"];
 
@@ -295,6 +296,29 @@ const UNINDEXED_COLUMN_CASES: &[MatchCase] = &[
     MatchCase {
         name: "unindexed phrase filter",
         query: r#"body:"full text""#,
+    },
+];
+
+const CONTENTLESS_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "contentless title term",
+        query: "rust",
+    },
+    MatchCase {
+        name: "contentless body term",
+        query: "search",
+    },
+    MatchCase {
+        name: "contentless title filter",
+        query: "title:sqlite",
+    },
+    MatchCase {
+        name: "contentless body filter",
+        query: "body:writers",
+    },
+    MatchCase {
+        name: "contentless prefix",
+        query: "compat*",
     },
 ];
 
@@ -592,6 +616,21 @@ fn unindexed_columns_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "UNINDEXED column conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn contentless_tables_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::with_docs(CONTENTLESS_OPTIONS, DOCS);
+
+    for case in CONTENTLESS_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "contentless table conformance case failed: {} ({})",
             case.name,
             case.query
         );

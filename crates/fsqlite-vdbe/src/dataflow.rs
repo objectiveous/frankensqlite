@@ -360,6 +360,8 @@ pub enum DataflowOperator {
     ThresholdPositive,
     /// Append each row's algebraic weight as an integer payload column for emission.
     AppendWeightColumn,
+    /// Append each row's algebraic weight sign as an integer payload column.
+    AppendWeightSignColumn,
     /// Compute `DeltaLeft JOIN Right`, with the current stream as the delta-left input.
     DeltaJoinLeft {
         stable_right: Vec<WeightedRow>,
@@ -509,6 +511,7 @@ impl DataflowOperator {
             Self::SetWeight { weight } => Ok(set_weights(rows, *weight)),
             Self::ThresholdPositive => Ok(threshold_positive(rows)),
             Self::AppendWeightColumn => Ok(append_weight_column(rows)),
+            Self::AppendWeightSignColumn => Ok(append_weight_sign_column(rows)),
             Self::DeltaJoinLeft {
                 stable_right,
                 key_spec,
@@ -1604,6 +1607,18 @@ pub fn append_weight_column(rows: &[WeightedRow]) -> Vec<WeightedRow> {
             let mut values = row.values.clone();
             values.push(SqliteValue::Integer(row.weight));
             Some(WeightedRow::insert(values))
+        })
+        .collect()
+}
+
+/// Materialize algebraic weight polarity into payload rows for delta emission.
+pub fn append_weight_sign_column(rows: &[WeightedRow]) -> Vec<WeightedRow> {
+    normalize_weight_sign(rows)
+        .into_iter()
+        .map(|row| {
+            let mut values = row.values;
+            values.push(SqliteValue::Integer(row.weight));
+            WeightedRow::insert(values)
         })
         .collect()
 }
@@ -4713,6 +4728,35 @@ mod tests {
                 WeightedRow::insert(vec![int(2), int(20), int(-2)]),
             ]
         );
+    }
+
+    #[test]
+    fn append_weight_sign_column_materializes_delta_polarity_for_emission() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::AppendWeightSignColumn]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), int(10)], 3),
+            WeightedRow::new(vec![int(2), int(20)], -2),
+            WeightedRow::new(vec![int(3), int(30)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::insert(vec![int(1), int(10), int(1)]),
+                WeightedRow::insert(vec![int(2), int(20), int(-1)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn append_weight_sign_column_handles_minimum_weight_without_overflow() {
+        let rows = vec![WeightedRow::new(vec![int(1)], i64::MIN)];
+
+        let actual = super::append_weight_sign_column(&rows);
+
+        assert_eq!(actual, vec![WeightedRow::insert(vec![int(1), int(-1)])]);
     }
 
     #[test]

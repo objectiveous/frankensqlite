@@ -5927,6 +5927,26 @@ mod tests {
     }
 
     #[test]
+    fn test_cross_join_allowed_enforces_right_after_left_ordering() {
+        // For a cross-join pair (A, B), B may only be placed after A in the join
+        // order. cross_join_allowed enforces this case-insensitively; candidates
+        // not on the right of any pair are always allowed.
+        let pairs = vec![("A".to_owned(), "B".to_owned())];
+
+        // B before A is not allowed (A is not yet in the path).
+        assert!(!cross_join_allowed(&[], "B", &pairs));
+        // B after A is allowed.
+        assert!(cross_join_allowed(&["A".to_owned()], "B", &pairs));
+        // A (the left side) is unconstrained -- allowed anywhere.
+        assert!(cross_join_allowed(&[], "A", &pairs));
+        // A table not in any pair is allowed.
+        assert!(cross_join_allowed(&[], "C", &pairs));
+        // The check is case-insensitive on both the candidate and the path.
+        assert!(!cross_join_allowed(&[], "b", &pairs));
+        assert!(cross_join_allowed(&["a".to_owned()], "b", &pairs));
+    }
+
+    #[test]
     fn test_collect_conjuncts_flattens_and_tree_regardless_of_nesting() {
         // collect_conjuncts recursively splits on AND (both sides), so any AND
         // tree flattens to its leaves no matter how it is nested; a non-AND

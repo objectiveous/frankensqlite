@@ -87,6 +87,34 @@ const DOCS: &[Doc] = &[
     },
 ];
 
+const SPARSE_ROWID_DOCS: &[Doc] = &[
+    Doc {
+        rowid: 42,
+        title: "Beta SQLite",
+        body: "SQLite search beta",
+    },
+    Doc {
+        rowid: 7,
+        title: "Alpha Rust",
+        body: "Rust search alpha",
+    },
+    Doc {
+        rowid: 1001,
+        title: "Gamma Rust",
+        body: "Rust SQLite gamma",
+    },
+    Doc {
+        rowid: 13,
+        title: "Delta cooking",
+        body: "Cooking herbs",
+    },
+    Doc {
+        rowid: 256,
+        title: "Epsilon search",
+        body: "Prefix search SQLite",
+    },
+];
+
 const PHRASE_CONCAT_DOCS: &[Doc] = &[
     Doc {
         rowid: 1,
@@ -845,6 +873,41 @@ const ROWID_WINDOW_CASES: &[RowidWindowCase] = &[
         query: "sqlite",
         limit: 2,
         offset: 10,
+    },
+];
+
+const SPARSE_ROWID_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "low rowid term",
+        query: "rust",
+    },
+    MatchCase {
+        name: "middle rowid term",
+        query: "search",
+    },
+    MatchCase {
+        name: "high rowid term",
+        query: "gamma",
+    },
+    MatchCase {
+        name: "title column term",
+        query: "title:epsilon",
+    },
+    MatchCase {
+        name: "body column term",
+        query: "body:sqlite",
+    },
+    MatchCase {
+        name: "boolean intersection",
+        query: "rust AND sqlite",
+    },
+    MatchCase {
+        name: "boolean union",
+        query: "rust OR cooking",
+    },
+    MatchCase {
+        name: "prefix term",
+        query: "eps*",
     },
 ];
 
@@ -2294,6 +2357,29 @@ fn rowid_window_queries_match_rusqlite_reference() {
             case.query,
             case.limit,
             case.offset
+        );
+    }
+}
+
+#[test]
+fn sparse_rowid_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::with_docs(&[], SPARSE_ROWID_DOCS);
+    let mut franken_rows = harness.franken_full_scan_rows();
+    franken_rows.sort_by_key(|row| row.0);
+
+    assert_eq!(
+        franken_rows,
+        harness.sqlite_full_scan_rows(),
+        "sparse-rowid full-scan conformance failed"
+    );
+
+    for case in SPARSE_ROWID_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "sparse-rowid MATCH conformance case failed: {} ({})",
+            case.name,
+            case.query
         );
     }
 }

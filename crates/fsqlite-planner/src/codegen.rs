@@ -3110,6 +3110,37 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_expr_function_call_canonicalizes_name_and_threads_arg_count() {
+        // emit_expr lowers a scalar function call to PureFunc, canonicalizing the
+        // name to uppercase (the registry's canonical form) and threading the
+        // argument count into p5.
+        let mut b = ProgramBuilder::new();
+        let reg = b.alloc_reg();
+        let expr = Expr::FunctionCall {
+            name: "abs".to_owned(), // lowercase on purpose
+            args: FunctionArgs::List(vec![Expr::Literal(Literal::Integer(3), Span::ZERO)]),
+            distinct: false,
+            order_by: vec![],
+            filter: None,
+            over: None,
+            span: Span::ZERO,
+        };
+        emit_expr(&mut b, &expr, reg).unwrap();
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let prog = b.finish().unwrap();
+        let func = prog
+            .ops()
+            .iter()
+            .find(|o| o.opcode == Opcode::PureFunc)
+            .expect("PureFunc op present");
+        assert!(
+            matches!(&func.p4, P4::FuncName(n) if n.as_str() == "ABS"),
+            "lowercase 'abs' must be canonicalized to uppercase in P4"
+        );
+        assert_eq!(func.p5, 1, "one argument threaded into p5");
+    }
+
+    #[test]
     fn test_emit_expr_large_integer_literal_uses_int64_opcode() {
         let mut b = ProgramBuilder::new();
         let reg = b.alloc_reg();

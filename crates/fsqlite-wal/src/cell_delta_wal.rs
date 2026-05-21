@@ -1073,4 +1073,69 @@ mod tests {
                 .contains("invalid marker word")
         );
     }
+
+    #[test]
+    fn test_serialized_size_empty_delete_frame() {
+        let frame = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Delete,
+            CommitSeq::new(1),
+            test_txn_id(1),
+            vec![],
+        );
+        assert_eq!(frame.serialized_size(), CELL_DELTA_MIN_FRAME_SIZE);
+        assert_eq!(frame.serialize().unwrap().len(), CELL_DELTA_MIN_FRAME_SIZE);
+    }
+
+    #[test]
+    fn test_cell_delta_wal_frame_clone_preserves_equality() {
+        let frame = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Update,
+            CommitSeq::new(77),
+            test_txn_id(33),
+            vec![0xAA; 200],
+        );
+        let cloned = frame.clone();
+        assert_eq!(frame, cloned);
+        assert_eq!(cloned.cell_data.len(), 200);
+
+        let dbg = format!("{frame:?}");
+        assert!(dbg.contains("CellDeltaWalFrame"));
+    }
+
+    #[test]
+    fn test_is_cell_delta_frame_rejects_corrupted_checksum() {
+        let frame = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Insert,
+            CommitSeq::new(100),
+            test_txn_id(42),
+            vec![1, 2, 3],
+        );
+        let mut serialized = frame.serialize().unwrap();
+        let last = serialized.len() - 1;
+        serialized[last] ^= 0xFF;
+        assert!(!is_cell_delta_frame(&serialized));
+    }
+
+    #[test]
+    fn test_serialize_exact_max_data_size_succeeds() {
+        let frame = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Insert,
+            CommitSeq::new(1),
+            test_txn_id(1),
+            vec![0u8; CELL_DELTA_MAX_DATA_SIZE],
+        );
+        let serialized = frame.serialize().unwrap();
+        let expected = CELL_DELTA_HEADER_SIZE + CELL_DELTA_MAX_DATA_SIZE + CELL_DELTA_CHECKSUM_SIZE;
+        assert_eq!(serialized.len(), expected);
+        let deserialized = CellDeltaWalFrame::deserialize(&serialized).unwrap();
+        assert_eq!(deserialized.cell_data.len(), CELL_DELTA_MAX_DATA_SIZE);
+    }
 }

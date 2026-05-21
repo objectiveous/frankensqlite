@@ -1585,6 +1585,35 @@ mod tests {
     }
 
     #[test]
+    fn test_cell_on_page_size_fast_interior_table_cell() {
+        use fsqlite_types::serial_type::write_varint;
+        // Interior-table cell layout: a 4-byte left-child page pointer followed
+        // by a rowid varint and NO payload. The existing fast-size tests only
+        // cover leaf-table cells; this exercises the InteriorTable early-return
+        // path, cross-checked against the CellRef-based size like its siblings.
+        let usable: u32 = 4096;
+        let mut page = vec![0u8; 4096];
+        let cell_offset = 100;
+        // 4-byte left child pointer.
+        page[cell_offset..cell_offset + 4].copy_from_slice(&7u32.to_be_bytes());
+        // rowid varint (300 -> 2 bytes).
+        let rowid_len = write_varint(&mut page[cell_offset + 4..], 300u64);
+
+        let cell =
+            CellRef::parse(&page, cell_offset, BtreePageType::InteriorTable, usable).unwrap();
+        let expected = crate::payload::cell_on_page_size(&cell, cell_offset);
+        let fast =
+            cell_on_page_size_fast(&page, cell_offset, BtreePageType::InteriorTable, usable)
+                .unwrap();
+        assert_eq!(fast, expected);
+        assert_eq!(
+            fast,
+            4 + rowid_len,
+            "interior-table cell size = 4-byte child pointer + rowid varint"
+        );
+    }
+
+    #[test]
     fn test_cell_on_page_size_fast_matches_cellref_leaf_table_with_overflow() {
         let mut page = vec![0u8; 4096];
         let cell_offset = 0;

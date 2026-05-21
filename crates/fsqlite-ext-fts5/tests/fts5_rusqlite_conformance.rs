@@ -1427,6 +1427,33 @@ const MUTATION_CASES: &[MatchCase] = &[
     },
 ];
 
+const DELETE_ALL_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "deleted title term",
+        query: "rust",
+    },
+    MatchCase {
+        name: "deleted body term",
+        query: "search",
+    },
+    MatchCase {
+        name: "deleted phrase",
+        query: r#""full text""#,
+    },
+    MatchCase {
+        name: "deleted prefix",
+        query: "compat*",
+    },
+    MatchCase {
+        name: "deleted boolean expression",
+        query: "rust OR cooking",
+    },
+    MatchCase {
+        name: "deleted column filter",
+        query: "body:writers",
+    },
+];
+
 const INVALID_QUERY_CASES: &[MatchCase] = &[
     MatchCase {
         name: "empty query",
@@ -2740,6 +2767,30 @@ fn mutation_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "mutation conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn delete_all_queries_match_rusqlite_reference() {
+    let mut harness = Fts5ConformanceHarness::new(&[]);
+    for doc in DOCS {
+        harness.delete_doc(doc.rowid);
+    }
+
+    assert_eq!(
+        harness.franken_full_scan_rows(),
+        harness.sqlite_full_scan_rows(),
+        "delete-all full-scan conformance failed"
+    );
+
+    for case in DELETE_ALL_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "delete-all MATCH conformance case failed: {} ({})",
             case.name,
             case.query
         );

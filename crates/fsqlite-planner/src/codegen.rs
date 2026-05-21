@@ -2153,6 +2153,29 @@ mod tests {
         assert_eq!(type_to_affinity("DATETIME"), 'C');
     }
 
+    #[test]
+    fn test_rowid_ref_aliases_and_conflict_action_codes() {
+        // SQLite recognizes three case-insensitive rowid aliases.
+        for name in ["rowid", "ROWID", "_rowid_", "oid", "OID", "RowId"] {
+            assert!(is_rowid_ref(&ColumnRef::bare(name)), "{name} is a rowid alias");
+        }
+        for name in ["id", "name", "rowid_", "row_id", "_oid_"] {
+            assert!(!is_rowid_ref(&ColumnRef::bare(name)), "{name} is not a rowid alias");
+        }
+
+        // ON CONFLICT actions map to OE_ codes; a missing action defaults to ABORT.
+        assert_eq!(conflict_action_to_oe(None), OE_ABORT, "default conflict action is ABORT");
+        assert_eq!(conflict_action_to_oe(Some(&ConflictAction::Abort)), OE_ABORT);
+        assert_eq!(conflict_action_to_oe(Some(&ConflictAction::Rollback)), OE_ROLLBACK);
+        assert_eq!(conflict_action_to_oe(Some(&ConflictAction::Fail)), OE_FAIL);
+        assert_eq!(conflict_action_to_oe(Some(&ConflictAction::Ignore)), OE_IGNORE);
+        assert_eq!(conflict_action_to_oe(Some(&ConflictAction::Replace)), OE_REPLACE);
+        // The five OE conflict codes are distinct.
+        let codes: std::collections::HashSet<u16> =
+            [OE_ROLLBACK, OE_ABORT, OE_FAIL, OE_IGNORE, OE_REPLACE].into_iter().collect();
+        assert_eq!(codes.len(), 5, "OE conflict codes must be distinct");
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),

@@ -491,6 +491,31 @@ mod tests {
     }
 
     #[test]
+    fn theoretical_fp_rate_is_load_factor_over_two_pow_r() {
+        // theoretical_fp_rate = load_factor / 2^r_bits (Bender 3). The existing
+        // fp_rate test only uses it as an inequality bound; this pins the exact
+        // formula -- crucially that the denominator is 2^r_bits, not 2^q_bits --
+        // plus the empty-filter zero.
+        let mut qf = QuotientFilter::new(4, 8).expect("valid bit sizes");
+        assert_eq!(qf.r_bits(), 8);
+
+        // Empty: zero load -> zero theoretical fp rate.
+        assert!((qf.theoretical_fp_rate() - 0.0).abs() < f64::EPSILON);
+
+        // After a few distinct inserts the rate equals load_factor / 2^r_bits.
+        for h in [0x1111_u64, 0x2222, 0x3333, 0x4444] {
+            let _ = qf.insert(h);
+        }
+        let two_pow_r = (1u64 << qf.r_bits()) as f64; // 2^8 = 256, NOT 2^q (16)
+        let expected = qf.load_factor() / two_pow_r;
+        assert!((qf.theoretical_fp_rate() - expected).abs() < 1e-12);
+        assert!(
+            qf.theoretical_fp_rate() > 0.0,
+            "a non-empty filter has a positive theoretical fp rate"
+        );
+    }
+
+    #[test]
     fn collisions_are_tolerated() {
         let mut qf = QuotientFilter::new(8, 8).unwrap();
         let q: u64 = 0x42 << 8;

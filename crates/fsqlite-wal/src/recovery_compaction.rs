@@ -1649,4 +1649,63 @@ mod tests {
         assert!(!summary.cancelled);
         assert!((summary.space_amp_before - 3.0).abs() < f64::EPSILON);
     }
+
+    #[test]
+    fn capsule_decode_outcome_debug_clone_eq_all_variants() {
+        let sys = CapsuleDecodeOutcome::Systematic;
+        let rep = CapsuleDecodeOutcome::Repaired { repair_symbols_used: 3 };
+        let fail = CapsuleDecodeOutcome::Failed { reason: "corrupt".into() };
+        assert_eq!(sys.clone(), sys);
+        assert_eq!(rep.clone(), rep);
+        assert_eq!(fail.clone(), fail);
+        assert_ne!(sys, rep);
+        let dbg = format!("{fail:?}");
+        assert!(dbg.contains("Failed"));
+        assert!(dbg.contains("corrupt"));
+    }
+
+    #[test]
+    fn compaction_mdp_state_hash_distinguishes_fields() {
+        use std::collections::HashSet;
+        let a = CompactionMdpState { space_amp_bucket: 0, read_regime: 0, write_regime: 0, compaction_debt: 0 };
+        let b = CompactionMdpState { space_amp_bucket: 1, read_regime: 0, write_regime: 0, compaction_debt: 0 };
+        let c = CompactionMdpState { space_amp_bucket: 0, read_regime: 1, write_regime: 0, compaction_debt: 0 };
+        let mut set = HashSet::new();
+        set.insert(a);
+        set.insert(b);
+        set.insert(c);
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&a));
+    }
+
+    #[test]
+    fn compaction_action_and_rate_limit_debug_clone_copy_eq() {
+        let defer = CompactionAction::Defer;
+        let now = CompactionAction::CompactNow { rate_limit: CompactionRateLimit::Medium };
+        assert_ne!(defer, now);
+        let copied = defer;
+        assert_eq!(copied, defer);
+        let dbg = format!("{now:?}");
+        assert!(dbg.contains("CompactNow"));
+        assert!(dbg.contains("Medium"));
+        let rates = [CompactionRateLimit::Low, CompactionRateLimit::Medium, CompactionRateLimit::High];
+        for r in &rates {
+            let c = *r;
+            assert_eq!(c, *r);
+        }
+    }
+
+    #[test]
+    fn reader_lease_debug_clone_eq_hash() {
+        use std::collections::HashSet;
+        let lease = ReaderLease { lease_id: 42, segment_ids: vec![make_oid(0x01), make_oid(0x02)] };
+        let dbg = format!("{lease:?}");
+        assert!(dbg.contains("ReaderLease"));
+        assert!(dbg.contains("42"));
+        let cloned = lease.clone();
+        assert_eq!(cloned, lease);
+        let mut set = HashSet::new();
+        set.insert(lease.clone());
+        assert!(set.contains(&lease));
+    }
 }

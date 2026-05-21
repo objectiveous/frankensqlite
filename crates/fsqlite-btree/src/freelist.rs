@@ -453,6 +453,20 @@ mod tests {
     }
 
     #[test]
+    fn test_max_leaf_entries_saturates_on_tiny_pages() {
+        // The formula is (usable/4) - 2, using saturating_sub so that
+        // pathologically small usable sizes yield 0 leaf entries rather than
+        // underflowing (which on u32 would wrap to a huge count and later
+        // overflow the trunk page). test_max_leaf_entries only covers the
+        // ordinary 512/4096 cases.
+        assert_eq!(max_leaf_entries(0), 0);
+        assert_eq!(max_leaf_entries(4), 0); // 4/4 = 1, 1 - 2 saturates to 0
+        assert_eq!(max_leaf_entries(8), 0); // 8/4 = 2, 2 - 2 = 0
+        assert_eq!(max_leaf_entries(11), 0); // 11/4 = 2, 2 - 2 = 0
+        assert_eq!(max_leaf_entries(12), 1); // 12/4 = 3, 3 - 2 = 1 (first nonzero)
+    }
+
+    #[test]
     fn test_trunk_parse_write_roundtrip() {
         let trunk = FreelistTrunk {
             next_trunk: Some(PageNumber::new(10).unwrap()),

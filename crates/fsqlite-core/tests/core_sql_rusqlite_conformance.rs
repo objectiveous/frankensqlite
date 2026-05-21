@@ -2204,6 +2204,56 @@ const CHAR_UNICODE_SCALAR_CASES: &[QueryCase] = &[
     },
 ];
 
+const SCALAR_MIN_MAX_SETUP: &str = "
+    CREATE TABLE scalar_extrema (
+        id INTEGER PRIMARY KEY,
+        a INTEGER,
+        b REAL,
+        label TEXT,
+        payload BLOB
+    );
+    INSERT INTO scalar_extrema (id, a, b, label, payload) VALUES
+        (1, 10, 5.5, 'alpha', X'01'),
+        (2, -3, 7.25, 'Beta', X'02FF'),
+        (3, NULL, 4.0, NULL, NULL),
+        (4, 8, NULL, 'gamma', X'');
+";
+
+const SCALAR_MIN_MAX_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "literal scalar extrema",
+        sql: "SELECT min(3, 1, 4, 1, 5), max(3, 1, 4, 1, 5), typeof(min(3, 1)), typeof(max(3, 1))",
+    },
+    QueryCase {
+        name: "null argument propagation",
+        sql: "SELECT min(NULL, 1, 2), max(1, NULL, 2), min(NULL, NULL), max(NULL, NULL)",
+    },
+    QueryCase {
+        name: "mixed integer real storage class",
+        sql: "SELECT min(10, 2.5), max(10, 2.5), typeof(min(10, 2.5)), typeof(max(10, 2.5))",
+    },
+    QueryCase {
+        name: "mixed numeric text storage class",
+        sql: "SELECT min(10, '2'), max(10, '2'), typeof(min(10, '2')), typeof(max(10, '2'))",
+    },
+    QueryCase {
+        name: "binary text ordering",
+        sql: "SELECT min('Beta', 'alpha', 'gamma'), max('Beta', 'alpha', 'gamma')",
+    },
+    QueryCase {
+        name: "blob storage ordering",
+        sql: "SELECT min(X'01', X'0100'), max(X'01', X'0100'), typeof(min(X'01', X'0100')), typeof(max(X'01', X'0100'))",
+    },
+    QueryCase {
+        name: "column driven numeric extrema",
+        sql: "SELECT id, min(a, b), max(a, b), min(COALESCE(a, 0), COALESCE(b, 0)) FROM scalar_extrema ORDER BY id",
+    },
+    QueryCase {
+        name: "column driven text and blob extrema",
+        sql: "SELECT id, min(label, 'm'), max(label, 'm'), min(payload, X'10'), max(payload, X'10') FROM scalar_extrema ORDER BY id",
+    },
+];
+
 const FORMAT_QUOTE_SETUP: &str = "
     CREATE TABLE format_values (
         id INTEGER PRIMARY KEY,
@@ -2736,6 +2786,12 @@ fn string_scalar_edges_match_rusqlite() {
 fn char_unicode_scalar_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CHAR_UNICODE_SETUP);
     harness.assert_queries_match("char unicode scalar edge", CHAR_UNICODE_SCALAR_CASES);
+}
+
+#[test]
+fn scalar_min_max_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(SCALAR_MIN_MAX_SETUP);
+    harness.assert_queries_match("scalar min max edge", SCALAR_MIN_MAX_CASES);
 }
 
 #[test]

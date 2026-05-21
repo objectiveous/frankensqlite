@@ -240,6 +240,8 @@ pub enum DataflowOperator {
     },
     /// Keep rows whose floating-point column is finite.
     FilterFloatFinite { column: usize },
+    /// Keep rows whose floating-point column is NaN or infinite.
+    FilterFloatNonFinite { column: usize },
     /// Keep rows where an integer column satisfies the comparison.
     FilterIntegerCompare {
         column: usize,
@@ -355,6 +357,7 @@ impl DataflowOperator {
                 upper,
             } => filter_integer_not_between(rows, *column, *lower, *upper),
             Self::FilterFloatFinite { column } => filter_float_finite(rows, *column),
+            Self::FilterFloatNonFinite { column } => filter_float_non_finite(rows, *column),
             Self::FilterIntegerCompare { column, op, value } => {
                 filter_integer_compare(rows, *column, *op, *value)
             }
@@ -739,6 +742,23 @@ fn filter_float_finite(rows: &[WeightedRow], column: usize) -> DataflowResult<Ve
     rows.iter()
         .filter_map(|row| match row.values.get(column) {
             Some(SqliteValue::Float(candidate)) if candidate.is_finite() => Some(Ok(row.clone())),
+            Some(SqliteValue::Float(_)) => None,
+            Some(_) => Some(Err(DataflowError::PredicateValueNotFloat { column })),
+            None => Some(Err(DataflowError::ColumnOutOfBounds {
+                column,
+                width: row.width(),
+            })),
+        })
+        .collect()
+}
+
+fn filter_float_non_finite(
+    rows: &[WeightedRow],
+    column: usize,
+) -> DataflowResult<Vec<WeightedRow>> {
+    rows.iter()
+        .filter_map(|row| match row.values.get(column) {
+            Some(SqliteValue::Float(candidate)) if !candidate.is_finite() => Some(Ok(row.clone())),
             Some(SqliteValue::Float(_)) => None,
             Some(_) => Some(Err(DataflowError::PredicateValueNotFloat { column })),
             None => Some(Err(DataflowError::ColumnOutOfBounds {
@@ -2039,6 +2059,68 @@ mod tests {
         let err = automaton
             .execute(&[WeightedRow::insert(vec![int(1), SqliteValue::Float(1.5)])])
             .expect_err("invalid finite-float predicate column should fail");
+
+        assert_eq!(
+            err,
+            DataflowError::ColumnOutOfBounds {
+                column: 2,
+                width: 2
+            }
+        );
+    }
+
+    #[test]
+    fn filter_float_non_finite_keeps_only_nan_and_infinity_weighted_rows() {
+        let automaton =
+            DataflowAutomaton::new(vec![DataflowOperator::FilterFloatNonFinite { column: 1 }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), SqliteValue::Float(1.5)], 7),
+            WeightedRow::new(vec![int(2), SqliteValue::Float(f64::INFINITY)], -2),
+            WeightedRow::new(vec![int(3), SqliteValue::Float(f64::NEG_INFINITY)], 4),
+            WeightedRow::new(vec![int(4), SqliteValue::Float(f64::NAN)], 5),
+            WeightedRow::new(vec![int(5), SqliteValue::Float(0.25)], -6),
+            WeightedRow::new(vec![int(6), SqliteValue::Float(f64::INFINITY)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(actual.len(), 3);
+        assert_eq!(
+            actual[0],
+            WeightedRow::new(vec![int(2), SqliteValue::Float(f64::INFINITY)], -2)
+        );
+        assert_eq!(
+            actual[1],
+            WeightedRow::new(vec![int(3), SqliteValue::Float(f64::NEG_INFINITY)], 4)
+        );
+        assert_eq!(actual[2].weight, 5);
+        assert_eq!(actual[2].values[0], int(4));
+        let SqliteValue::Float(value) = actual[2].values[1] else {
+            panic!("expected NaN payload");
+        };
+        assert!(value.is_nan());
+    }
+
+    #[test]
+    fn filter_float_non_finite_rejects_non_float_values() {
+        let automaton =
+            DataflowAutomaton::new(vec![DataflowOperator::FilterFloatNonFinite { column: 1 }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), int(2)])])
+            .expect_err("non-float predicate input should fail");
+
+        assert_eq!(err, DataflowError::PredicateValueNotFloat { column: 1 });
+    }
+
+    #[test]
+    fn filter_float_non_finite_rejects_out_of_bounds_columns() {
+        let automaton =
+            DataflowAutomaton::new(vec![DataflowOperator::FilterFloatNonFinite { column: 2 }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), SqliteValue::Float(1.5)])])
+            .expect_err("invalid non-finite-float predicate column should fail");
 
         assert_eq!(
             err,

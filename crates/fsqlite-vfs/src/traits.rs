@@ -370,4 +370,103 @@ mod tests {
         vfs.randomness(&cx, &mut buf);
         // Can't assert much about the value, just that it doesn't panic.
     }
+
+    #[test]
+    fn vfs_is_memory_default_is_false() {
+        use crate::memory::MemoryVfs;
+        use crate::traits::Vfs;
+
+        let vfs = MemoryVfs::new();
+        assert!(
+            vfs.is_memory(),
+            "MemoryVfs::is_memory must return true"
+        );
+    }
+
+    #[test]
+    fn vfs_trait_is_object_safe() {
+        use crate::memory::MemoryVfs;
+        fn _accepts_dyn(_v: &dyn Vfs<File = crate::memory::MemoryFile>) {}
+        let _vfs = MemoryVfs::new();
+    }
+
+    #[test]
+    fn vfs_file_set_busy_timeout_is_noop() {
+        struct Stub;
+        impl VfsFile for Stub {
+            fn close(&mut self, _: &Cx) -> Result<()> { Ok(()) }
+            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> { Ok(0) }
+            fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> { Ok(()) }
+            fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> { Ok(()) }
+            fn sync(&mut self, _: &Cx, _: SyncFlags) -> Result<()> { Ok(()) }
+            fn file_size(&self, _: &Cx) -> Result<u64> { Ok(0) }
+            fn lock(&mut self, _: &Cx, _: LockLevel) -> Result<()> { Ok(()) }
+            fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> { Ok(()) }
+            fn check_reserved_lock(&self, _: &Cx) -> Result<bool> { Ok(false) }
+            fn shm_map(&mut self, _: &Cx, _: u32, _: u32, _: bool) -> Result<ShmRegion> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn shm_lock(&mut self, _: &Cx, _: u32, _: u32, _: u32) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn shm_barrier(&self) {}
+            fn shm_unmap(&mut self, _: &Cx, _: bool) -> Result<()> { Ok(()) }
+        }
+
+        let mut file = Stub;
+        file.set_busy_timeout_ms(5000);
+        file.set_busy_timeout_ms(0);
+    }
+
+    #[test]
+    fn vfs_file_write_page_batch_default_delegates_to_write() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        struct CountingFile;
+        impl VfsFile for CountingFile {
+            fn close(&mut self, _: &Cx) -> Result<()> { Ok(()) }
+            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> { Ok(0) }
+            fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+                WRITE_COUNT.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> { Ok(()) }
+            fn sync(&mut self, _: &Cx, _: SyncFlags) -> Result<()> { Ok(()) }
+            fn file_size(&self, _: &Cx) -> Result<u64> { Ok(0) }
+            fn lock(&mut self, _: &Cx, _: LockLevel) -> Result<()> { Ok(()) }
+            fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> { Ok(()) }
+            fn check_reserved_lock(&self, _: &Cx) -> Result<bool> { Ok(false) }
+            fn shm_map(&mut self, _: &Cx, _: u32, _: u32, _: bool) -> Result<ShmRegion> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn shm_lock(&mut self, _: &Cx, _: u32, _: u32, _: u32) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn shm_barrier(&self) {}
+            fn shm_unmap(&mut self, _: &Cx, _: bool) -> Result<()> { Ok(()) }
+        }
+
+        WRITE_COUNT.store(0, Ordering::Relaxed);
+        let cx = Cx::new();
+        let mut file = CountingFile;
+        let data = [0u8; 4096];
+        let writes: Vec<(u64, &[u8])> = vec![(0, &data), (4096, &data), (8192, &data)];
+        file.write_page_batch(&cx, &writes).unwrap();
+        assert_eq!(WRITE_COUNT.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn vfs_randomness_fills_large_buffer() {
+        use crate::memory::MemoryVfs;
+        use crate::traits::Vfs;
+
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let mut buf = [0u8; 256];
+        vfs.randomness(&cx, &mut buf);
+        let all_zero = buf.iter().all(|&b| b == 0);
+        assert!(!all_zero, "256-byte randomness buffer should not be all zeros");
+    }
 }

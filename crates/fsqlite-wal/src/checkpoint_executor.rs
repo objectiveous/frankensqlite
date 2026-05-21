@@ -811,4 +811,90 @@ mod tests {
             .expect("append commit after restart");
         assert_eq!(wal.frame_count(), 2);
     }
+
+    #[test]
+    fn test_checkpoint_deduplicates_same_page_uses_latest_frame() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        let page1_v1 = sample_page(0x01);
+        let page1_v2 = sample_page(0x02);
+        wal.append_frame(&cx, 1, &page1_v1, 0).expect("append v1");
+        wal.append_frame(&cx, 1, &page1_v2, 1).expect("append v2");
+
+        let state = CheckpointState {
+            total_frames: 2,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+        let mut target = RecordingTarget::new();
+        let result = execute_checkpoint(&cx, &mut wal, CheckpointMode::Passive, state, &mut target)
+            .expect("checkpoint");
+
+        assert_eq!(result.frames_backfilled, 2);
+        assert_eq!(target.pages.len(), 1, "same page written twice → one deduped write");
+        assert_eq!(target.pages[0].0.get(), 1);
+        assert_eq!(target.pages[0].1, page1_v2, "must use latest frame's data");
+    }
+
+    #[test]
+    fn test_recording_target_read_page_default_returns_none() {
+        let cx = test_cx();
+        let target = RecordingTarget::new();
+        let mut buf = vec![0u8; 4096];
+        let page = PageNumber::new(1).expect("valid page");
+        let result = target.read_page_if_supported(&cx, page, &mut buf).expect("no error");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_consecutive_restarts_bump_salts_and_checkpoint_seq() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        for round in 0..3u32 {
+            populate_wal(&mut wal, &cx, 2);
+            let state = CheckpointState {
+                total_frames: 2,
+                backfilled_frames: 0,
+                oldest_reader_frame: None,
+            };
+            let mut target = RecordingTarget::new();
+            execute_checkpoint(&cx, &mut wal, CheckpointMode::Restart, state, &mut target)
+                .expect("checkpoint");
+            assert_eq!(wal.header().checkpoint_seq, round + 1);
+        }
+        assert_eq!(wal.header().checkpoint_seq, 3);
+        let salts = wal.header().salts;
+        assert_eq!(salts.salt1, test_salts().salt1.wrapping_add(3));
+        assert_eq!(salts.salt2, test_salts().salt2.wrapping_add(3));
+    }
+
+    #[test]
+    fn test_checkpoint_execution_result_fields() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        populate_wal(&mut wal, &cx, 3);
+
+        let state = CheckpointState {
+            total_frames: 3,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+        let mut target = RecordingTarget::new();
+        let result = execute_checkpoint(&cx, &mut wal, CheckpointMode::Full, state, &mut target)
+            .expect("checkpoint");
+
+        assert_eq!(result.frames_backfilled, 3);
+        assert_eq!(result.db_size_pages, Some(3));
+        assert!(!result.wal_was_reset);
+        assert_eq!(result.plan.mode, CheckpointMode::Full);
+        assert!(result.plan.completes_checkpoint());
+    }
 }

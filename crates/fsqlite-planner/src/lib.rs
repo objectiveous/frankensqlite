@@ -8179,6 +8179,47 @@ mod tests {
     }
 
     #[test]
+    fn test_single_table_source_name_and_alias() {
+        use fsqlite_ast::{JoinClause, JoinKind, JoinType};
+
+        // A single-table FROM with no joins yields Ok((name, alias)); any joins
+        // or a non-Table source yield Err(UnsupportedFromSource).
+        let tbl = |alias: Option<&str>| TableOrSubquery::Table {
+            name: QualifiedName::bare("users"),
+            alias: alias.map(str::to_owned),
+            index_hint: None,
+            time_travel: None,
+        };
+        let fc = |source: TableOrSubquery, joins: Vec<JoinClause>| FromClause { source, joins };
+
+        // Bare table, no alias.
+        let bare_fc = fc(tbl(None), vec![]);
+        let (name, alias) = single_table_source_name_and_alias(&bare_fc).unwrap();
+        assert_eq!(name, "users");
+        assert_eq!(alias, None);
+
+        // Bare table with an alias.
+        let aliased_fc = fc(tbl(Some("u")), vec![]);
+        let (name, alias) = single_table_source_name_and_alias(&aliased_fc).unwrap();
+        assert_eq!(name, "users");
+        assert_eq!(alias, Some("u"));
+
+        // A join present -> Err.
+        let with_join = fc(
+            tbl(None),
+            vec![JoinClause {
+                join_type: JoinType {
+                    natural: false,
+                    kind: JoinKind::Inner,
+                },
+                table: tbl(None),
+                constraint: None,
+            }],
+        );
+        assert!(single_table_source_name_and_alias(&with_join).is_err());
+    }
+
+    #[test]
     fn test_from_clause_supports_leapfrog_branches() {
         use fsqlite_ast::{JoinClause, JoinConstraint, JoinKind, JoinType};
 

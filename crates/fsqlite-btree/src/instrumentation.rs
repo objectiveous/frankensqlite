@@ -1717,6 +1717,33 @@ mod tests {
     }
 
     #[test]
+    fn hot_page_deflection_status_labels_and_predicates() {
+        // as_str / is_active / is_applied are exercised via the split-advice
+        // wrapper, but the enum's own per-variant contract was never directly
+        // asserted.
+        use crate::HotPageDeflectionStatus::{
+            AdvisoryOnly, Applied, BudgetExhausted, Inactive, OperatorOverride,
+        };
+
+        assert_eq!(Inactive.as_str(), "inactive");
+        assert_eq!(AdvisoryOnly.as_str(), "advisory_only");
+        assert_eq!(Applied.as_str(), "applied");
+        assert_eq!(BudgetExhausted.as_str(), "budget_exhausted");
+        assert_eq!(OperatorOverride.as_str(), "operator_override");
+
+        // is_active: the three pathological-hotspot states are active; Inactive
+        // and OperatorOverride (forced baseline) are not.
+        assert!(AdvisoryOnly.is_active() && Applied.is_active() && BudgetExhausted.is_active());
+        assert!(!Inactive.is_active() && !OperatorOverride.is_active());
+
+        // is_applied: only Applied consumed a bounded deflection credit.
+        assert!(Applied.is_applied());
+        for s in [Inactive, AdvisoryOnly, BudgetExhausted, OperatorOverride] {
+            assert!(!s.is_applied());
+        }
+    }
+
+    #[test]
     fn conflict_topology_advice_applies_hot_right_edge_fill_shift() {
         let _guard = super::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
             .lock()

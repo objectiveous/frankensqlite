@@ -436,6 +436,34 @@ mod tests {
     }
 
     #[test]
+    fn avg_segment_size_and_is_fully_sorted_metrics() {
+        // avg_segment_size = len / (num_cracks + 1): a fresh column is a single
+        // segment, and cracking shrinks the average. is_fully_sorted is a pure
+        // ascending-order check. Neither metric was directly tested.
+
+        // Empty column: zero average, vacuously sorted.
+        let empty: CrackedColumn<i32> = CrackedColumn::new(vec![]);
+        assert!((empty.avg_segment_size() - 0.0).abs() < f64::EPSILON);
+        assert!(empty.is_fully_sorted());
+
+        // A pre-sorted column reports fully sorted even before any cracking.
+        let sorted = CrackedColumn::new(vec![1_i32, 2, 3, 4]);
+        assert!(sorted.is_fully_sorted());
+
+        // Unsorted fresh column: a single segment (avg == len), not yet sorted.
+        let mut col = CrackedColumn::new(vec![5_i32, 1, 4, 2, 8, 3, 7, 6]);
+        assert_eq!(col.num_cracks(), 0);
+        assert!((col.avg_segment_size() - 8.0).abs() < f64::EPSILON);
+        assert!(!col.is_fully_sorted());
+
+        // A range query cracks the column into more segments, dropping the
+        // average segment size below the full length.
+        let _ = col.range_query(3, 6);
+        assert!(col.num_cracks() > 0);
+        assert!(col.avg_segment_size() < 8.0);
+    }
+
+    #[test]
     fn partition_functions() {
         let mut data = vec![5, 3, 8, 1, 7, 2];
         let p = partition_lower(&mut data, 5);

@@ -521,6 +521,33 @@ const UNICODE61_TOKENCHAR_CASES: &[MatchCase] = &[
     },
 ];
 
+const UNICODE61_CUSTOM_SEPARATOR_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "dot separator exposes right token",
+        query: "beta",
+    },
+    MatchCase {
+        name: "underscore separator exposes right token",
+        query: "gamma",
+    },
+    MatchCase {
+        name: "custom separators support adjacent phrase",
+        query: r#""beta gamma""#,
+    },
+    MatchCase {
+        name: "joined token remains distinct",
+        query: "alphabetagamma",
+    },
+    MatchCase {
+        name: "split phrase excludes joined token",
+        query: r#""alpha beta""#,
+    },
+    MatchCase {
+        name: "body column custom separator phrase",
+        query: r#"body:"beta gamma""#,
+    },
+];
+
 const ASCII_TOKENIZER_CASES: &[MatchCase] = &[
     MatchCase {
         name: "ascii case folds uppercase body",
@@ -1605,6 +1632,22 @@ fn default_unicode61_separator_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "default unicode61 separator conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn unicode61_custom_separator_queries_match_rusqlite_reference() {
+    let harness =
+        Fts5ConformanceHarness::with_docs(UNICODE61_SEPARATOR_OPTIONS, UNICODE61_SEPARATOR_DOCS);
+
+    for case in UNICODE61_CUSTOM_SEPARATOR_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "unicode61 custom separator conformance case failed: {} ({})",
             case.name,
             case.query
         );

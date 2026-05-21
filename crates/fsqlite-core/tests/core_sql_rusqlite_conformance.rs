@@ -981,6 +981,33 @@ const SCALAR_NULL_COMPARISON_CASES: &[QueryCase] = &[
     },
 ];
 
+const DISTINCT_ORDER_LIMIT_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "distinct nullable text ordering",
+        sql: "SELECT DISTINCT label FROM expr_rows ORDER BY label",
+    },
+    QueryCase {
+        name: "distinct boolean null flags",
+        sql: "SELECT DISTINCT a IS NULL, b IS NULL FROM expr_rows ORDER BY 1, 2",
+    },
+    QueryCase {
+        name: "order by alias and ordinal with limit offset",
+        sql: "SELECT id, COALESCE(label, 'none') AS resolved FROM expr_rows ORDER BY 2 DESC, 1 LIMIT 3 OFFSET 1",
+    },
+    QueryCase {
+        name: "order by computed expression",
+        sql: "SELECT id, a + COALESCE(b, 0) AS total FROM expr_rows ORDER BY total DESC, id",
+    },
+    QueryCase {
+        name: "null aware order by expression",
+        sql: "SELECT id, label FROM expr_rows ORDER BY label IS NULL, label DESC, id LIMIT 4",
+    },
+    QueryCase {
+        name: "distinct case expression with limit",
+        sql: "SELECT DISTINCT CASE WHEN a IS NULL THEN 'missing' WHEN a >= b THEN 'ge' ELSE 'lt' END AS bucket FROM expr_rows ORDER BY bucket LIMIT 3",
+    },
+];
+
 const SUBQUERY_SETUP: &str = "
     CREATE TABLE customers (
         id INTEGER PRIMARY KEY,
@@ -1506,6 +1533,12 @@ fn case_and_null_logic_match_rusqlite() {
 fn scalar_null_comparison_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
     harness.assert_queries_match("scalar NULL/comparison edge", SCALAR_NULL_COMPARISON_CASES);
+}
+
+#[test]
+fn distinct_order_limit_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
+    harness.assert_queries_match("DISTINCT/ORDER/LIMIT edge", DISTINCT_ORDER_LIMIT_CASES);
 }
 
 #[test]

@@ -581,6 +581,39 @@ mod tests {
     }
 
     #[test]
+    fn test_freelist_reuses_freed_page_before_extending_db() {
+        // Reuse must take precedence over file growth, and extension resumes from
+        // the high-water mark (not the reused page + 1). The existing tests cover
+        // allocate-from-a-prefilled-freelist, pure extension, and a single
+        // deallocate+allocate in isolation, but not this interleaving.
+        let mut fl = Freelist::new(100, 4096);
+
+        // Empty freelist: the first two allocations extend the db file.
+        assert_eq!(fl.allocate().unwrap().get(), 101);
+        assert_eq!(fl.allocate().unwrap().get(), 102);
+        assert_eq!(fl.db_page_count(), 102);
+
+        // Free page 101; the next allocation must reuse it rather than extend.
+        fl.deallocate(PageNumber::new(101).unwrap());
+        assert_eq!(fl.free_count(), 1);
+        assert_eq!(
+            fl.allocate().unwrap().get(),
+            101,
+            "freed page must be reused before extending the db"
+        );
+        assert_eq!(fl.free_count(), 0);
+
+        // Freelist empty again: extension resumes from the high-water mark
+        // (db_page_count is still 102), yielding 103 -- not the reused 101 + 1.
+        assert_eq!(
+            fl.allocate().unwrap().get(),
+            103,
+            "extension must resume from the high-water mark, not the reused page"
+        );
+        assert_eq!(fl.db_page_count(), 103);
+    }
+
+    #[test]
     fn test_freelist_max_page_count() {
         let mut fl = Freelist::new(MAX_PAGE_COUNT, 4096);
         assert!(fl.allocate().is_err());

@@ -2721,4 +2721,44 @@ mod tests {
         assert_eq!(m.miss_rate_ppm(), 42_000);
         assert_eq!(m.p99_read_latency_micros(), 750);
     }
+
+    #[test]
+    fn config_new_capacity_one_edge() {
+        let config = S3FifoConfig::new(1);
+        assert_eq!(config.capacity(), 1);
+        assert_eq!(config.small_capacity(), 1);
+        assert_eq!(config.main_capacity(), 0);
+        assert_eq!(config.ghost_capacity(), 1);
+    }
+
+    #[test]
+    fn config_accessors_sum_correctly() {
+        for cap in [2, 10, 100, 1000] {
+            let config = S3FifoConfig::new(cap);
+            assert_eq!(
+                config.small_capacity() + config.main_capacity(),
+                config.capacity(),
+                "small + main must equal capacity for cap={cap}"
+            );
+        }
+    }
+
+    #[test]
+    fn rollout_gate_default_field_values() {
+        let gate = S3FifoRolloutGate::default();
+        assert_eq!(gate.active_policy(), RolloutPolicy::S3Fifo);
+        assert_eq!(gate.consecutive_bad_windows(), 0);
+    }
+
+    #[test]
+    fn rollout_gate_new_clamps_zero_required_windows_to_one() {
+        let baseline = RolloutMetrics::new(100_000, 1_000);
+        let bad = RolloutMetrics::new(200_000, 1_000);
+        let mut gate = S3FifoRolloutGate::new(500, 1000, 0, RolloutPolicy::S3Fifo);
+        assert_eq!(
+            gate.evaluate_window(baseline, bad),
+            RolloutDecision::FallbackToArc,
+            "required_consecutive_bad_windows=0 must clamp to 1, so one bad window triggers fallback"
+        );
+    }
 }

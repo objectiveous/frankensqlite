@@ -6094,6 +6094,42 @@ mod tests {
     }
 
     #[test]
+    fn test_connected_components_groups_join_connected_tables() {
+        // connected_components builds a join graph from equi-join predicates and
+        // returns the sets of tables reachable from one another.
+        let pred = |lt: &str, rt: &str| EquiJoinPredicate {
+            left: ColumnKey {
+                table: lt.to_owned(),
+                column: "x".to_owned(),
+            },
+            right: ColumnKey {
+                table: rt.to_owned(),
+                column: "y".to_owned(),
+            },
+        };
+        let tables = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+
+        // a joined to b; c isolated -> components of size 2 ({a,b}) and 1 ({c}).
+        let comps = connected_components(&tables, &[pred("a", "b")]);
+        let mut sizes: Vec<usize> = comps.iter().map(Vec::len).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![1, 2]);
+
+        // a-b-c chain -> one component covering all three.
+        let comps = connected_components(&tables, &[pred("a", "b"), pred("b", "c")]);
+        assert_eq!(comps.len(), 1);
+        assert_eq!(comps[0].len(), 3);
+
+        // No predicates -> each table is its own component.
+        let comps = connected_components(&tables, &[]);
+        assert_eq!(comps.len(), 3);
+        assert!(comps.iter().all(|c| c.len() == 1));
+
+        // No tables -> no components.
+        assert!(connected_components(&[], &[pred("a", "b")]).is_empty());
+    }
+
+    #[test]
     fn test_column_exists_ignore_case() {
         // column_exists_ignore_case is a case-insensitive membership check over
         // a column-name list.

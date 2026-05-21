@@ -1666,3 +1666,53 @@ fn epoch_flush_batch_total_records() {
     };
     assert_eq!(empty.total_records(), 0);
 }
+
+#[test]
+fn wal_record_encoded_len_includes_images() {
+    let r = make_record(0, 1, 100);
+    let len = r.encoded_len();
+    assert!(len >= RECORD_FIXED_OVERHEAD_BYTES + 200);
+    let small = make_record(0, 1, 0);
+    assert!(small.encoded_len() >= RECORD_FIXED_OVERHEAD_BYTES);
+    assert!(small.encoded_len() < len);
+}
+
+#[test]
+fn buffer_state_variant_equality() {
+    assert_eq!(BufferState::Writable, BufferState::Writable);
+    assert_eq!(
+        BufferState::Sealed { epoch: 5 },
+        BufferState::Sealed { epoch: 5 }
+    );
+    assert_ne!(
+        BufferState::Sealed { epoch: 5 },
+        BufferState::Sealed { epoch: 6 }
+    );
+    assert_ne!(
+        BufferState::Sealed { epoch: 1 },
+        BufferState::Flushing { epoch: 1 }
+    );
+    let dbg = format!("{:?}", BufferState::Flushing { epoch: 3 });
+    assert!(dbg.contains("Flushing"));
+}
+
+#[test]
+fn pool_append_batch_to_core_works() {
+    let pool = PerCoreWalBufferPool::new(2, BufferConfig::default());
+    let records = vec![make_record(0, 1, 16), make_record(0, 2, 16)];
+    let outcome = pool.append_batch_to_core(0, records).unwrap();
+    assert_eq!(outcome, AppendOutcome::Appended);
+    assert!(pool.append_batch_to_core(99, vec![make_record(0, 1, 16)]).is_err());
+}
+
+#[test]
+fn epoch_coordinator_mark_and_query_durable_epoch() {
+    let coord = EpochOrderCoordinator::new(2, BufferConfig::default(), EpochConfig::default());
+    assert_eq!(coord.durable_epoch(), None);
+    coord.mark_epoch_durable(5);
+    assert_eq!(coord.durable_epoch(), Some(5));
+    coord.mark_epoch_durable(3);
+    assert_eq!(coord.durable_epoch(), Some(5), "should keep max");
+    coord.mark_epoch_durable(10);
+    assert_eq!(coord.durable_epoch(), Some(10));
+}

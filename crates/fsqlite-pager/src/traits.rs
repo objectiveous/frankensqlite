@@ -1872,4 +1872,69 @@ mod tests {
         assert_eq!(refs[0].page_data[0], 0xAA);
         assert_eq!(refs[1].page_data[0], 0xBB);
     }
+
+    #[test]
+    fn prepared_wal_frame_meta_debug_clone_copy_eq() {
+        let a = PreparedWalFrameMeta { page_number: 5, db_size_if_commit: 0 };
+        let b = PreparedWalFrameMeta { page_number: 5, db_size_if_commit: 10 };
+        let copied = a;
+        assert_eq!(copied, a);
+        assert_ne!(a, b);
+        let dbg = format!("{a:?}");
+        assert!(dbg.contains("PreparedWalFrameMeta"));
+        assert!(dbg.contains("5"));
+    }
+
+    #[test]
+    fn prepared_wal_checksum_seed_default_and_eq() {
+        let def = PreparedWalChecksumSeed::default();
+        assert_eq!(def.s1, 0);
+        assert_eq!(def.s2, 0);
+        let other = PreparedWalChecksumSeed { s1: 1, s2: 2 };
+        assert_ne!(def, other);
+        let copied = other;
+        assert_eq!(copied, other);
+        let dbg = format!("{def:?}");
+        assert!(dbg.contains("PreparedWalChecksumSeed"));
+    }
+
+    #[test]
+    fn prepared_wal_finalization_state_default_and_eq() {
+        let def = PreparedWalFinalizationState::default();
+        assert_eq!(def.checkpoint_seq, 0);
+        assert_eq!(def.salt1, 0);
+        assert_eq!(def.salt2, 0);
+        assert_eq!(def.start_frame_index, 0);
+        assert_eq!(def.seed, PreparedWalChecksumSeed::default());
+        let other = PreparedWalFinalizationState {
+            checkpoint_seq: 1,
+            salt1: 0xAA,
+            salt2: 0xBB,
+            start_frame_index: 42,
+            seed: PreparedWalChecksumSeed { s1: 10, s2: 20 },
+        };
+        assert_ne!(def, other);
+        let cloned = other.clone();
+        assert_eq!(cloned, other);
+        let dbg = format!("{other:?}");
+        assert!(dbg.contains("PreparedWalFinalizationState"));
+    }
+
+    #[test]
+    fn transaction_mode_all_variants_debug_copy_eq() {
+        let variants = [
+            (TransactionMode::Deferred, "Deferred"),
+            (TransactionMode::Immediate, "Immediate"),
+            (TransactionMode::Exclusive, "Exclusive"),
+            (TransactionMode::Concurrent, "Concurrent"),
+            (TransactionMode::ReadOnly, "ReadOnly"),
+        ];
+        for (mode, expected) in &variants {
+            let dbg = format!("{mode:?}");
+            assert!(dbg.contains(expected), "expected {expected} in {dbg}");
+            let copied = *mode;
+            assert_eq!(copied, *mode);
+        }
+        assert_ne!(TransactionMode::Deferred, TransactionMode::Concurrent);
+    }
 }

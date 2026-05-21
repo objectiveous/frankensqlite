@@ -410,6 +410,8 @@ pub struct Savepoint {
     pub write_set_len: usize,
     /// Snapshot of structural page tracking at savepoint creation.
     pub structural_pages_snapshot: HashSet<PageNumber>,
+    /// Number of intent-log entries at savepoint creation.
+    pub intent_log_len: usize,
     /// Number of cell-level deltas tracked for this transaction at savepoint creation.
     pub cell_delta_len: usize,
 }
@@ -1181,6 +1183,7 @@ impl TransactionManager {
             write_set_snapshot: txn.write_set_data.clone(),
             write_set_len: txn.write_set.len(),
             structural_pages_snapshot: txn.structural_pages.clone(),
+            intent_log_len: txn.intent_log.len(),
             cell_delta_len: self.cell_log.txn_delta_count(txn.token()),
         }
     }
@@ -1210,6 +1213,7 @@ impl TransactionManager {
         txn.write_set_versions
             .retain(|pgno, _| txn.write_set_data.contains_key(pgno));
         txn.structural_pages = savepoint.structural_pages_snapshot.clone();
+        txn.intent_log.truncate(savepoint.intent_log_len);
 
         tracing::debug!(
             txn_id = %txn.txn_id,
@@ -3788,6 +3792,44 @@ mod tests {
         assert!(
             !txn.structural_pages.contains(&p2),
             "rolled-back structural page must not leave stale classification"
+        );
+    }
+
+    #[test]
+    fn test_rollback_to_savepoint_truncates_intent_log_but_keeps_witnesses() {
+        use fsqlite_types::{IntentFootprint, IntentOp, IntentOpKind, RowId, TableId};
+
+        fn insert_intent(rowid: i64, record: &[u8]) -> IntentOp {
+            IntentOp {
+                schema_epoch: 0,
+                footprint: IntentFootprint::empty(),
+                op: IntentOpKind::Insert {
+                    table: TableId::new(1),
+                    key: RowId::new(rowid),
+                    record: record.to_vec(),
+                },
+            }
+        }
+
+        let m = mgr();
+        let mut txn = m.begin(BeginKind::Concurrent).unwrap();
+        txn.intent_log.push(insert_intent(1, b"before"));
+        let sp = m.savepoint(&txn, "sp_intent");
+
+        txn.intent_log.push(insert_intent(2, b"after"));
+        txn.read_keys
+            .insert(fsqlite_types::WitnessKey::Page(PageNumber::new(2).unwrap()));
+
+        m.rollback_to_savepoint(&mut txn, &sp);
+
+        assert_eq!(
+            txn.intent_log,
+            vec![insert_intent(1, b"before")],
+            "ROLLBACK TO must discard post-savepoint intent entries"
+        );
+        assert!(
+            !txn.read_keys.is_empty(),
+            "SSI witnesses intentionally survive savepoint rollback"
         );
     }
 

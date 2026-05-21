@@ -1478,3 +1478,153 @@ fn bd_ncivz_2_abort_cleanup_drops_non_committed_records() {
         "recovery input should only contain committed records"
     );
 }
+
+// -- PerCoreWalBuffer unit-level state machine tests --
+
+#[test]
+fn seal_active_on_already_sealed_returns_error() {
+    let config = BufferConfig {
+        capacity_bytes: 640,
+        ..BufferConfig::default()
+    };
+    let mut buf = PerCoreWalBuffer::new(0, config);
+    buf.seal_active(1).expect("first seal");
+    assert!(buf.seal_active(2).is_err());
+}
+
+#[test]
+fn begin_flush_on_writable_returns_error() {
+    let config = BufferConfig {
+        capacity_bytes: 640,
+        ..BufferConfig::default()
+    };
+    let mut buf = PerCoreWalBuffer::new(0, config);
+    assert!(buf.begin_flush().is_err());
+}
+
+#[test]
+fn complete_flush_on_non_flushing_returns_error() {
+    let config = BufferConfig {
+        capacity_bytes: 640,
+        ..BufferConfig::default()
+    };
+    let mut buf = PerCoreWalBuffer::new(0, config);
+    assert!(buf.complete_flush().is_err());
+}
+
+#[test]
+fn force_serialized_drain_collects_all_lanes() {
+    let config = BufferConfig {
+        capacity_bytes: 640,
+        overflow_policy: OverflowPolicy::AllocateOverflow,
+        overflow_fallback_bytes: 4096,
+    };
+    let mut buf = PerCoreWalBuffer::new(0, config);
+
+    buf.append(make_record(0, 1, 64));
+    buf.seal_active(1).unwrap();
+    buf.begin_flush().unwrap();
+
+    buf.append(make_record(0, 2, 64));
+
+    let drained = buf.force_serialized_drain();
+    assert_eq!(drained.len(), 2);
+    assert_eq!(buf.active_state(), BufferState::Writable);
+    assert_eq!(buf.flush_state(), BufferState::Writable);
+    assert_eq!(buf.active_len(), 0);
+    assert_eq!(buf.flush_len(), 0);
+    assert_eq!(buf.overflow_len(), 0);
+    assert_eq!(buf.fallback_decision(), FallbackDecision::ContinueParallel);
+}
+
+#[test]
+fn overflow_drains_into_active_after_complete_flush() {
+    let config = BufferConfig {
+        capacity_bytes: 160,
+        overflow_policy: OverflowPolicy::AllocateOverflow,
+        overflow_fallback_bytes: 4096,
+    };
+    let mut buf = PerCoreWalBuffer::new(0, config);
+
+    buf.append(make_record(0, 1, 48));
+    assert_eq!(
+        buf.append(make_record(0, 2, 48)),
+        AppendOutcome::QueuedOverflow
+    );
+    assert_eq!(buf.active_len(), 1);
+    assert_eq!(buf.overflow_len(), 1);
+
+    buf.seal_active(1).unwrap();
+    buf.begin_flush().unwrap();
+    buf.complete_flush().unwrap();
+
+    assert!(buf.overflow_len() == 0 || buf.active_len() > 0);
+    assert_eq!(buf.active_state(), BufferState::Writable);
+}
+
+#[test]
+fn append_record_exceeding_capacity_latches_fallback() {
+    let config = BufferConfig {
+        capacity_bytes: 32,
+        ..BufferConfig::default()
+    };
+    let mut buf = PerCoreWalBuffer::new(0, config);
+    let outcome = buf.append(make_record(0, 1, 128));
+    assert_eq!(outcome, AppendOutcome::Blocked);
+    assert_eq!(buf.fallback_decision(), FallbackDecision::ForceSerializedDrain);
+}
+
+#[test]
+fn append_batch_with_oversized_single_record_latches_fallback() {
+    let config = BufferConfig {
+        capacity_bytes: 32,
+        ..BufferConfig::default()
+    };
+    let mut buf = PerCoreWalBuffer::new(0, config);
+    let outcome = buf.append_batch(vec![make_record(0, 1, 128)]);
+    assert_eq!(outcome, AppendOutcome::Blocked);
+    assert_eq!(buf.fallback_decision(), FallbackDecision::ForceSerializedDrain);
+}
+
+#[test]
+fn append_batch_all_fit_returns_appended() {
+    let config = BufferConfig {
+        capacity_bytes: 4096,
+        ..BufferConfig::default()
+    };
+    let mut buf = PerCoreWalBuffer::new(0, config);
+    let records = vec![make_record(0, 1, 32), make_record(0, 2, 32)];
+    assert_eq!(buf.append_batch(records), AppendOutcome::Appended);
+    assert_eq!(buf.active_len(), 2);
+}
+
+#[test]
+fn recovery_order_sorts_by_epoch_then_seq() {
+    let mut r1 = make_record(0, 10, 16);
+    r1.epoch = 2;
+    let mut r2 = make_record(0, 5, 16);
+    r2.epoch = 1;
+    let mut r3 = make_record(0, 7, 16);
+    r3.epoch = 2;
+
+    let ordered = EpochOrderCoordinator::recovery_order(&[r1, r2.clone(), r3]);
+    assert_eq!(ordered[0].epoch, 1);
+    assert_eq!(ordered[0].begin_seq.get(), r2.begin_seq.get());
+    assert!(ordered[1].epoch <= ordered[2].epoch);
+}
+
+#[test]
+fn buffer_config_default_values() {
+    let config = BufferConfig::default();
+    assert_eq!(config.capacity_bytes, DEFAULT_BUFFER_CAPACITY_BYTES);
+    assert_eq!(config.overflow_fallback_bytes, DEFAULT_OVERFLOW_FALLBACK_BYTES);
+    assert_eq!(config.overflow_policy, OverflowPolicy::AllocateOverflow);
+}
+
+#[test]
+fn thread_buffer_slot_stable_within_thread() {
+    let slot1 = thread_buffer_slot(16);
+    let slot2 = thread_buffer_slot(16);
+    assert_eq!(slot1, slot2);
+    assert!(slot1 < 16);
+}

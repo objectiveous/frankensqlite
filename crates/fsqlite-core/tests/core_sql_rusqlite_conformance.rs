@@ -228,6 +228,23 @@ const UPSERT_CASES: &[QueryCase] = &[
     },
 ];
 
+const WITH_UPSERT_RETURNING_SETUP: &str = UPSERT_SETUP;
+
+const WITH_UPSERT_RETURNING_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "with insert-select upsert returning conflict and insert rows",
+        sql: "WITH incoming(key, value) AS (VALUES ('alpha', 5), ('epsilon', 50)) INSERT INTO kv(key, value) SELECT key, value FROM incoming WHERE 1 ON CONFLICT(key) DO UPDATE SET value = value + excluded.value, updated = updated + 1 RETURNING key, value, updated",
+    },
+    QueryCase {
+        name: "with insert-select do nothing returning only inserted rows",
+        sql: "WITH incoming(key, value) AS (VALUES ('beta', 70), ('zeta', 60)) INSERT INTO kv(key, value) SELECT key, value FROM incoming WHERE 1 ON CONFLICT(key) DO NOTHING RETURNING key, value, updated",
+    },
+    QueryCase {
+        name: "final rows after with upsert returning",
+        sql: "SELECT key, value, updated FROM kv ORDER BY key",
+    },
+];
+
 const CTE_SETUP: &str = "
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -1233,6 +1250,12 @@ fn upsert_conflict_handling_matches_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(UPSERT_SETUP);
     harness.execute_script(UPSERT_SCRIPT);
     harness.assert_queries_match("UPSERT", UPSERT_CASES);
+}
+
+#[test]
+fn with_upsert_returning_matches_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(WITH_UPSERT_RETURNING_SETUP);
+    harness.assert_queries_match("WITH/UPSERT/RETURNING", WITH_UPSERT_RETURNING_CASES);
 }
 
 #[test]

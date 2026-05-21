@@ -8596,6 +8596,66 @@ mod tests {
     }
 
     #[test]
+    fn test_read_page_with_cell_deltas_hides_other_uncommitted_delete() -> fsqlite_error::Result<()>
+    {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4250;
+        let payload = vec![b'k'; 135];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut inserter = mgr.begin(BeginKind::Concurrent).expect("inserter begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                inserter.token(),
+            )
+            .expect("logical insert should fit budget");
+        mgr.commit(&mut inserter).expect("insert commit");
+
+        let mut deleter = mgr.begin(BeginKind::Concurrent).expect("deleter begin");
+        mgr.cell_log()
+            .record_delete(cell_key, pgno, deleter.token())
+            .expect("logical delete should fit budget");
+
+        let deleter_page = mgr
+            .read_page_with_cell_deltas(&mut deleter, pgno, PageSize::DEFAULT.get())?
+            .expect("deleter should see the base page");
+        assert_eq!(
+            materialized_table_payloads(&deleter_page)?,
+            Vec::<(i64, Vec<u8>)>::new(),
+            "deleter must see its own uncommitted logical delete"
+        );
+
+        let mut other_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("other reader begin");
+        let other_page = mgr
+            .read_page_with_cell_deltas(&mut other_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("other reader should see the base page");
+        assert_eq!(
+            materialized_table_payloads(&other_page)?,
+            vec![(rowid, payload)],
+            "other transactions must not see uncommitted logical deletes"
+        );
+
+        mgr.abort(&mut deleter);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_read_page_with_cell_deltas_materializes_own_uncommitted_delete()
     -> fsqlite_error::Result<()> {
         use crate::cell_visibility::CellKey;

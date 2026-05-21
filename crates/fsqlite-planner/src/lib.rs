@@ -5986,6 +5986,15 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_plan_cache_capacity_floors_at_one() {
+        // A requested plan-cache capacity is clamped to a non-zero value: 0
+        // becomes 1 (no zero-capacity cache), positive values pass through.
+        assert_eq!(normalize_plan_cache_capacity(0).get(), 1);
+        assert_eq!(normalize_plan_cache_capacity(1).get(), 1);
+        assert_eq!(normalize_plan_cache_capacity(10).get(), 10);
+    }
+
+    #[test]
     fn test_ordered_subset_preserves_join_order() {
         // ordered_subset keeps only the selected tables but in join_order's
         // order (not the set's), and ignores selected tables absent from the

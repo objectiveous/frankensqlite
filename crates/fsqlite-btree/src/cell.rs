@@ -1048,6 +1048,53 @@ mod tests {
     }
 
     #[test]
+    fn test_content_offset_resolves_sentinel_and_empty_page() {
+        // content_offset() is the resolver used on every page load. It clamps
+        // both the empty-page case and the "cell_content_offset == 0 means
+        // 65536" sentinel to usable_size, and otherwise returns the stored
+        // offset verbatim. test_page_header_content_offset_zero_means_65536 only
+        // checks the parse/write round-trip of the sentinel value; the resolver
+        // method itself was never invoked by a test.
+        let usable = 4096u32;
+
+        // Branch 1: an empty page (cell_count == 0) resolves to usable_size even
+        // when the stored offset is a normal in-range value.
+        let empty = BtreePageHeader {
+            page_type: BtreePageType::LeafTable,
+            first_freeblock: 0,
+            cell_count: 0,
+            cell_content_offset: 1234,
+            fragmented_free_bytes: 0,
+            right_child: None,
+        };
+        assert_eq!(empty.content_offset(usable), usable as usize);
+
+        // Branch 2: a non-empty page carrying the 65536 sentinel (on-disk 0)
+        // also resolves to usable_size.
+        let sentinel = BtreePageHeader {
+            page_type: BtreePageType::LeafTable,
+            first_freeblock: 0,
+            cell_count: 5,
+            cell_content_offset: 65536,
+            fragmented_free_bytes: 0,
+            right_child: None,
+        };
+        assert_eq!(sentinel.content_offset(usable), usable as usize);
+
+        // Branch 3: a non-empty page with a real in-range offset returns it
+        // unchanged.
+        let normal = BtreePageHeader {
+            page_type: BtreePageType::LeafTable,
+            first_freeblock: 0,
+            cell_count: 5,
+            cell_content_offset: 3800,
+            fragmented_free_bytes: 0,
+            right_child: None,
+        };
+        assert_eq!(normal.content_offset(usable), 3800);
+    }
+
+    #[test]
     fn test_page_header_invalid_type() {
         let mut page = vec![0u8; 4096];
         page[0] = 0xFF; // Invalid type.

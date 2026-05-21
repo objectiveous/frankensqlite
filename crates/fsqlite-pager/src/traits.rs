@@ -1937,4 +1937,50 @@ mod tests {
         }
         assert_ne!(TransactionMode::Deferred, TransactionMode::Concurrent);
     }
+
+    #[test]
+    fn wal_frame_ref_debug_clone_copy() {
+        let data = [0xABu8; 16];
+        let frame = WalFrameRef { page_number: 3, page_data: &data, db_size_if_commit: 0 };
+        let copied = frame;
+        assert_eq!(copied.page_number, 3);
+        assert_eq!(copied.page_data.len(), 16);
+        assert_eq!(copied.db_size_if_commit, 0);
+        let dbg = format!("{frame:?}");
+        assert!(dbg.contains("WalFrameRef"));
+    }
+
+    #[test]
+    fn mock_checkpoint_page_writer_default_and_trait_methods() {
+        let mut writer = MockCheckpointPageWriter;
+        let cx = Cx::new();
+        let page = PageNumber::new(1).unwrap();
+        writer.write_page(&cx, page, &[0u8; 4096]).unwrap();
+        writer.truncate(&cx, 10).unwrap();
+        writer.sync(&cx).unwrap();
+        let dbg = format!("{writer:?}");
+        assert!(dbg.contains("MockCheckpointPageWriter"));
+    }
+
+    #[test]
+    fn transaction_kind_drained_debug() {
+        let kind = TransactionKind::Drained;
+        let dbg = format!("{kind:?}");
+        assert!(dbg.contains("Drained"));
+    }
+
+    #[test]
+    fn wal_publication_snapshot_authoritative_boundary() {
+        let base = WalPublicationSnapshot {
+            publication_seq: 1,
+            generation: WalGenerationIdentity::default(),
+            last_commit_frame: Some(10),
+            commit_count: 5,
+            latest_frame_entries: 10,
+            index_is_partial: false,
+        };
+        assert!(base.lookup_contract_is_authoritative());
+        let partial = WalPublicationSnapshot { index_is_partial: true, ..base };
+        assert!(!partial.lookup_contract_is_authoritative());
+    }
 }

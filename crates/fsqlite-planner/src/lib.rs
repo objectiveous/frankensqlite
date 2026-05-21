@@ -8490,6 +8490,52 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_pairwise_hash_join_cost_left_deep_accumulation() {
+        // Left-deep hash-join cost model: each join step charges build+probe
+        // (scanning both inputs, written as min+max which equals their sum) and
+        // grows the running intermediate cardinality by a factor of the join
+        // selectivity heuristic (0.25). A single relation costs nothing.
+        // estimate_pairwise_hash_join_cost has no direct unit test, only
+        // indirect coverage inside best_access_path.
+
+        // Fewer than two relations: nothing to join, zero cost.
+        assert!(
+            estimate_pairwise_hash_join_cost(&["A".to_owned()], &HashMap::new()).abs() < 1e-9
+        );
+        let empty: Vec<String> = vec![];
+        assert!(estimate_pairwise_hash_join_cost(&empty, &HashMap::new()).abs() < 1e-9);
+
+        let rows = |pairs: &[(&str, f64)]| -> HashMap<String, f64> {
+            pairs.iter().map(|&(t, n)| (t.to_owned(), n)).collect()
+        };
+
+        // Two relations A(100) |><| B(250): cost is just the two scans, 100+250,
+        // independent of selectivity (the intermediate is never reused).
+        let ab = estimate_pairwise_hash_join_cost(
+            &["A".to_owned(), "B".to_owned()],
+            &rows(&[("A", 100.0), ("B", 250.0)]),
+        );
+        assert!((ab - 350.0).abs() < 1e-9, "two-table cost should be 100+250, got {ab}");
+
+        // Three relations A(100), B(250), C(40): after A|><|B the intermediate is
+        // 100*250*0.25 = 6250, so the third step charges 6250+40. Total =
+        // (100+250) + (6250+40) = 6640.
+        let abc = estimate_pairwise_hash_join_cost(
+            &["A".to_owned(), "B".to_owned(), "C".to_owned()],
+            &rows(&[("A", 100.0), ("B", 250.0), ("C", 40.0)]),
+        );
+        assert!((abc - 6640.0).abs() < 1e-9, "three-table cost should be 6640, got {abc}");
+
+        // Unknown tables default to 1 row (floored at 1.0): cost 1 + 1 = 2.
+        let defaulted =
+            estimate_pairwise_hash_join_cost(&["X".to_owned(), "Y".to_owned()], &HashMap::new());
+        assert!(
+            (defaulted - 2.0).abs() < 1e-9,
+            "missing rows default to 1 -> 2, got {defaulted}"
+        );
+    }
+
+    #[test]
     fn test_estimate_agm_upper_bound_triangle_and_guards() {
         // The AGM (Atserias-Grohe-Marx) fractional-cover bound on worst-case join
         // output. The textbook case is the triangle query R(A,B) |><| S(B,C) |><|

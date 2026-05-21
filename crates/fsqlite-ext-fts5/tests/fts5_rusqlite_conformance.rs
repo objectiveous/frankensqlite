@@ -220,6 +220,29 @@ const TRIGRAM_MATCH_DOCS: &[Doc] = &[
     },
 ];
 
+const TRIGRAM_CASE_SENSITIVE_DOCS: &[Doc] = &[
+    Doc {
+        rowid: 1,
+        title: "Upper ABC",
+        body: "ABCdef GHI",
+    },
+    Doc {
+        rowid: 2,
+        title: "Lower abc",
+        body: "abcdef ghi",
+    },
+    Doc {
+        rowid: 3,
+        title: "Mixed AbC",
+        body: "zzAbCyy",
+    },
+    Doc {
+        rowid: 4,
+        title: "Short AB",
+        body: "AB",
+    },
+];
+
 const TRIGRAM_DIACRITIC_DOCS: &[Doc] = &[
     Doc {
         rowid: 1,
@@ -557,6 +580,37 @@ const TRIGRAM_MATCH_CASES: &[MatchCase] = &[
     MatchCase {
         name: "leading context multi-trigram term",
         query: "zzabc",
+    },
+];
+
+const TRIGRAM_CASE_SENSITIVE_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "uppercase trigram stays uppercase",
+        query: "ABC",
+    },
+    MatchCase {
+        name: "lowercase trigram stays lowercase",
+        query: "abc",
+    },
+    MatchCase {
+        name: "mixed-case trigram stays mixed",
+        query: "AbC",
+    },
+    MatchCase {
+        name: "uppercase multi-trigram term",
+        query: "ABCd",
+    },
+    MatchCase {
+        name: "lowercase multi-trigram term",
+        query: "abcd",
+    },
+    MatchCase {
+        name: "uppercase title column filter",
+        query: "title:ABC",
+    },
+    MatchCase {
+        name: "lowercase body column filter",
+        query: "body:ghi",
     },
 ];
 
@@ -1539,6 +1593,24 @@ fn trigram_match_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "trigram MATCH conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn trigram_case_sensitive_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::with_docs(
+        TRIGRAM_CASE_SENSITIVE_OPTIONS,
+        TRIGRAM_CASE_SENSITIVE_DOCS,
+    );
+
+    for case in TRIGRAM_CASE_SENSITIVE_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "trigram case-sensitive conformance case failed: {} ({})",
             case.name,
             case.query
         );

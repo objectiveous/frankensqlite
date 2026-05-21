@@ -185,6 +185,62 @@ const SELECT_JOIN_GROUP_AGGREGATE_CASES: &[QueryCase] = &[
     },
 ];
 
+const JOIN_USING_NATURAL_SETUP: &str = "
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        dept_id INTEGER,
+        employee TEXT NOT NULL,
+        grade INTEGER NOT NULL
+    );
+    CREATE TABLE departments (
+        dept_id INTEGER PRIMARY KEY,
+        dept_name TEXT NOT NULL,
+        region TEXT NOT NULL
+    );
+
+    INSERT INTO employees VALUES
+        (1, 10, 'Ada', 5),
+        (2, 10, 'Bert', 3),
+        (3, 20, 'Cara', 4),
+        (4, 99, 'Drew', 2),
+        (5, NULL, 'Eli', 1);
+    INSERT INTO departments VALUES
+        (10, 'Engineering', 'North'),
+        (20, 'Support', 'South'),
+        (30, 'Sales', 'East');
+";
+
+const JOIN_USING_NATURAL_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "inner join using shared column",
+        sql: "SELECT employee, dept_name, region FROM employees JOIN departments USING (dept_id) ORDER BY employee",
+    },
+    QueryCase {
+        name: "left join using preserves unmatched rows",
+        sql: "SELECT employee, dept_name, region FROM employees LEFT JOIN departments USING (dept_id) ORDER BY employee",
+    },
+    QueryCase {
+        name: "natural join uses shared dept id",
+        sql: "SELECT employee, dept_name, region FROM employees NATURAL JOIN departments ORDER BY employee",
+    },
+    QueryCase {
+        name: "natural left join preserves unmatched rows",
+        sql: "SELECT employee, dept_name, region FROM employees NATURAL LEFT JOIN departments ORDER BY employee",
+    },
+    QueryCase {
+        name: "using column is projected once in star expansion",
+        sql: "SELECT * FROM employees JOIN departments USING (dept_id) ORDER BY id LIMIT 2",
+    },
+    QueryCase {
+        name: "unqualified using column after aliases",
+        sql: "SELECT e.employee, d.dept_name FROM employees AS e JOIN departments AS d USING (dept_id) WHERE dept_id = 10 ORDER BY e.employee",
+    },
+    QueryCase {
+        name: "group by using column after join",
+        sql: "SELECT dept_id, COUNT(*), MIN(employee), MAX(employee) FROM employees JOIN departments USING (dept_id) GROUP BY dept_id ORDER BY dept_id",
+    },
+];
+
 const AGGREGATE_EDGE_CASES: &[QueryCase] = &[
     QueryCase {
         name: "empty input aggregate identities",
@@ -1541,6 +1597,12 @@ fn select_join_group_by_aggregates_match_rusqlite() {
         "SELECT/JOIN/GROUP BY/aggregate",
         SELECT_JOIN_GROUP_AGGREGATE_CASES,
     );
+}
+
+#[test]
+fn join_using_and_natural_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(JOIN_USING_NATURAL_SETUP);
+    harness.assert_queries_match("JOIN USING/NATURAL edge", JOIN_USING_NATURAL_CASES);
 }
 
 #[test]

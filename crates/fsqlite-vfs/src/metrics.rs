@@ -504,6 +504,99 @@ mod tests {
     }
 
     #[test]
+    fn vfs_metrics_new_is_zeroed() {
+        let m = VfsMetrics::new();
+        assert_eq!(m.read_ops.load(Ordering::Relaxed), 0);
+        assert_eq!(m.write_ops.load(Ordering::Relaxed), 0);
+        assert_eq!(m.sync_ops.load(Ordering::Relaxed), 0);
+        assert_eq!(m.lock_ops.load(Ordering::Relaxed), 0);
+        assert_eq!(m.unlock_ops.load(Ordering::Relaxed), 0);
+        assert_eq!(m.truncate_ops.load(Ordering::Relaxed), 0);
+        assert_eq!(m.close_ops.load(Ordering::Relaxed), 0);
+        assert_eq!(m.file_size_ops.load(Ordering::Relaxed), 0);
+        assert_eq!(m.read_bytes_total.load(Ordering::Relaxed), 0);
+        assert_eq!(m.write_bytes_total.load(Ordering::Relaxed), 0);
+        assert_eq!(m.total_ops(), 0);
+    }
+
+    #[test]
+    fn vfs_metrics_total_ops_matches_snapshot() {
+        let m = VfsMetrics::new();
+        m.read_ops.store(10, Ordering::Relaxed);
+        m.write_ops.store(5, Ordering::Relaxed);
+        m.sync_ops.store(3, Ordering::Relaxed);
+        m.lock_ops.store(2, Ordering::Relaxed);
+        m.unlock_ops.store(2, Ordering::Relaxed);
+        m.truncate_ops.store(1, Ordering::Relaxed);
+        m.close_ops.store(1, Ordering::Relaxed);
+        m.file_size_ops.store(7, Ordering::Relaxed);
+
+        let snap = m.snapshot();
+        assert_eq!(m.total_ops(), snap.total_ops());
+        assert_eq!(snap.total_ops(), 31);
+    }
+
+    #[test]
+    fn metrics_snapshot_default_is_zeroed() {
+        let snap = MetricsSnapshot::default();
+        assert_eq!(snap.total_ops(), 0);
+        assert_eq!(snap.read_bytes_total, 0);
+        assert_eq!(snap.write_bytes_total, 0);
+    }
+
+    #[test]
+    fn global_metrics_sync_truncate_file_size_close_increment() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let (file, _) = vfs
+            .open(
+                &cx,
+                Some(Path::new("ops_test.db")),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
+            )
+            .unwrap();
+
+        let before = GLOBAL_VFS_METRICS.snapshot();
+        let mut traced = TracingFile::new(file, "ops_test.db");
+
+        traced.write(&cx, &[0u8; 100], 0).unwrap();
+        traced.sync(&cx, SyncFlags::NORMAL).unwrap();
+        traced.truncate(&cx, 50).unwrap();
+        let _size = traced.file_size(&cx).unwrap();
+        traced.close(&cx).unwrap();
+
+        let after = GLOBAL_VFS_METRICS.snapshot();
+        assert!(after.sync_ops > before.sync_ops);
+        assert!(after.truncate_ops > before.truncate_ops);
+        assert!(after.file_size_ops > before.file_size_ops);
+        assert!(after.close_ops > before.close_ops);
+    }
+
+    #[test]
+    fn metrics_snapshot_equality() {
+        let a = MetricsSnapshot {
+            read_ops: 1,
+            write_ops: 2,
+            sync_ops: 3,
+            lock_ops: 4,
+            unlock_ops: 5,
+            truncate_ops: 6,
+            close_ops: 7,
+            file_size_ops: 8,
+            read_bytes_total: 100,
+            write_bytes_total: 200,
+        };
+        let b = a;
+        assert_eq!(a, b);
+
+        let c = MetricsSnapshot {
+            read_ops: 99,
+            ..a
+        };
+        assert_ne!(a, c);
+    }
+
+    #[test]
     fn tracing_file_inner_access() {
         let cx = Cx::new();
         let vfs = MemoryVfs::new();

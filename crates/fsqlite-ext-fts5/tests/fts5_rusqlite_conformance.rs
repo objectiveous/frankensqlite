@@ -1477,6 +1477,33 @@ const MUTATION_CASES: &[MatchCase] = &[
     },
 ];
 
+const EMPTY_REPLACEMENT_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "old body term removed",
+        query: "language",
+    },
+    MatchCase {
+        name: "old title term removed from row",
+        query: "title:rust",
+    },
+    MatchCase {
+        name: "old body phrase removed",
+        query: r#""fast search""#,
+    },
+    MatchCase {
+        name: "other rust rows retained",
+        query: "rust",
+    },
+    MatchCase {
+        name: "other search rows retained",
+        query: "search",
+    },
+    MatchCase {
+        name: "other sqlite rows retained",
+        query: "sqlite",
+    },
+];
+
 const REINSERT_ROWID_CASES: &[MatchCase] = &[
     MatchCase {
         name: "old rowid term removed",
@@ -2867,6 +2894,34 @@ fn mutation_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "mutation conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn empty_replacement_queries_match_rusqlite_reference() {
+    let mut harness = Fts5ConformanceHarness::new(&[]);
+    harness.insert_or_replace_doc(Doc {
+        rowid: 1,
+        title: "",
+        body: "",
+    });
+
+    let mut franken_rows = harness.franken_full_scan_rows();
+    franken_rows.sort_by_key(|row| row.0);
+    assert_eq!(
+        franken_rows,
+        harness.sqlite_full_scan_rows(),
+        "empty-replacement full-scan conformance failed"
+    );
+
+    for case in EMPTY_REPLACEMENT_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "empty-replacement MATCH conformance case failed: {} ({})",
             case.name,
             case.query
         );

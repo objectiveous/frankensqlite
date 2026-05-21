@@ -9658,6 +9658,37 @@ mod tests {
         assert!((loss - 50.0).abs() < 1e-10);
     }
 
+    #[test]
+    fn test_asymmetric_loss_quadratic_under_linear_over() {
+        // Existing tests compare one under vs one over point; this pins the
+        // functional shape: overestimate is a linear 1 - ratio penalty, while
+        // underestimate grows quadratically in (ratio - 1).
+        let loss = asymmetric_estimation_loss;
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
+
+        // Overestimate (ratio < 1): exact linear 1 - ratio.
+        assert!(approx(loss(100.0, 75.0), 0.25));
+        assert!(approx(loss(100.0, 50.0), 0.5));
+        assert!(approx(loss(100.0, 25.0), 0.75));
+        assert!(approx(loss(100.0, 0.0), 1.0));
+        // Linear: equal actual-decrements yield equal loss increments.
+        assert!(approx(
+            loss(100.0, 50.0) - loss(100.0, 75.0),
+            loss(100.0, 25.0) - loss(100.0, 50.0)
+        ));
+
+        // Underestimate (ratio > 1): doubling the excess (ratio - 1) quadruples
+        // the loss, independent of the penalty constant (it cancels in the ratio).
+        let base = loss(100.0, 200.0); // ratio 2 -> k * 1
+        assert!(base > 0.0);
+        assert!(approx(loss(100.0, 300.0), 4.0 * base)); // ratio 3 -> k * 4
+        assert!(approx(loss(100.0, 500.0), 16.0 * base)); // ratio 5 -> k * 16
+
+        // Loss is monotonic in the ratio on both sides.
+        assert!(loss(100.0, 250.0) > loss(100.0, 200.0), "underestimate loss grows with ratio");
+        assert!(loss(100.0, 25.0) > loss(100.0, 50.0), "overestimate loss grows as estimate worsens");
+    }
+
     // ── DPccp tests (bd-1as.3) ──
 
     #[test]

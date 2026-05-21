@@ -3942,4 +3942,59 @@ mod tests {
         cp.unpin();
         assert!(!cp.is_pinned());
     }
+
+    #[test]
+    fn cache_lookup_debug_clone_copy_eq() {
+        let variants = [CacheLookup::Hit, CacheLookup::GhostHitB1, CacheLookup::GhostHitB2, CacheLookup::Miss];
+        for v in &variants {
+            let copied = *v;
+            assert_eq!(copied, *v);
+        }
+        assert_ne!(CacheLookup::Hit, CacheLookup::Miss);
+        let dbg = format!("{:?}", CacheLookup::GhostHitB1);
+        assert!(dbg.contains("GhostHitB1"));
+    }
+
+    #[test]
+    fn async_lookup_debug_clone_copy_eq() {
+        let variants = [AsyncLookup::Hit, AsyncLookup::Loaded, AsyncLookup::WaitedForPeerHit, AsyncLookup::WaitedForPeerMiss];
+        for v in &variants {
+            let copied = *v;
+            assert_eq!(copied, *v);
+        }
+        assert_ne!(AsyncLookup::Hit, AsyncLookup::Loaded);
+        let dbg = format!("{:?}", AsyncLookup::WaitedForPeerMiss);
+        assert!(dbg.contains("WaitedForPeerMiss"));
+    }
+
+    #[test]
+    fn cache_key_hash_distinguishes_pgno_and_seq() {
+        use std::collections::HashSet;
+        let a = key(1, 0);
+        let b = key(1, 1);
+        let c = key(2, 0);
+        let mut set = HashSet::new();
+        set.insert(a);
+        set.insert(b);
+        set.insert(c);
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&key(1, 0)));
+    }
+
+    #[test]
+    fn cache_metrics_snapshot_debug_clone_copy() {
+        let snap = CacheMetricsSnapshot {
+            hits: 1, misses: 2, ghost_hits_b1: 0, ghost_hits_b2: 0,
+            evictions_t1: 0, evictions_t2: 0, version_coalesce_count: 0, admits: 0,
+            t1_len: 3, t2_len: 4, b1_len: 0, b2_len: 0,
+            p: 5, capacity: 10, total_bytes: 100, max_bytes: 200,
+            multi_version_pages: 0, capacity_overflow_events: 0,
+        };
+        let dbg = format!("{snap:?}");
+        assert!(dbg.contains("CacheMetricsSnapshot"));
+        let copied = snap;
+        assert_eq!(copied, snap);
+        let cloned = snap.clone();
+        assert_eq!(cloned.hits, 1);
+    }
 }

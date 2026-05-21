@@ -6356,6 +6356,31 @@ mod tests {
     }
 
     #[test]
+    fn test_literal_satisfies_predicate_literal() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        use AstBinaryOp::{Eq, Ge, Gt, Le, Lt, Ne};
+
+        // Eq is satisfied only by Equal.
+        assert!(literal_satisfies_predicate_literal(Equal, Eq));
+        assert!(!literal_satisfies_predicate_literal(Less, Eq));
+        assert!(!literal_satisfies_predicate_literal(Greater, Eq));
+        // Gt only by Greater; Ge by Greater or Equal.
+        assert!(literal_satisfies_predicate_literal(Greater, Gt));
+        assert!(!literal_satisfies_predicate_literal(Equal, Gt));
+        assert!(literal_satisfies_predicate_literal(Greater, Ge));
+        assert!(literal_satisfies_predicate_literal(Equal, Ge));
+        assert!(!literal_satisfies_predicate_literal(Less, Ge));
+        // Lt only by Less; Le by Less or Equal.
+        assert!(literal_satisfies_predicate_literal(Less, Lt));
+        assert!(!literal_satisfies_predicate_literal(Equal, Lt));
+        assert!(literal_satisfies_predicate_literal(Less, Le));
+        assert!(literal_satisfies_predicate_literal(Equal, Le));
+        assert!(!literal_satisfies_predicate_literal(Greater, Le));
+        // Unsupported ops (Ne) -> false.
+        assert!(!literal_satisfies_predicate_literal(Equal, Ne));
+    }
+
+    #[test]
     fn test_compare_partial_index_literals_handles_cross_type_numerics() {
         use std::cmp::Ordering;
         let int = Literal::Integer;

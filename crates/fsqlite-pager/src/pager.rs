@@ -26778,4 +26778,62 @@ mod tests {
         let dbg = format!("{snap:?}");
         assert!(dbg.contains("PagerPublishedSnapshot"));
     }
+
+    #[test]
+    fn pager_committed_snapshot_copy_eq_debug() {
+        let snap = PagerCommittedSnapshot {
+            commit_seq: CommitSeq::new(5),
+            db_size: 100,
+            journal_mode: JournalMode::Wal,
+            freelist_count: 3,
+            checkpoint_active: false,
+            writer_active: true,
+            db_file_size_bytes: 409_600,
+        };
+        let copied = snap;
+        assert_eq!(copied, snap);
+        let other = PagerCommittedSnapshot { db_size: 200, ..snap };
+        assert_ne!(snap, other);
+        let dbg = format!("{snap:?}");
+        assert!(dbg.contains("PagerCommittedSnapshot"));
+    }
+
+    #[test]
+    fn parallel_wal_publication_intent_copy_eq_debug() {
+        let intent = ParallelWalPublicationIntent {
+            certificate_epoch: 7,
+            visible_commit_seq: CommitSeq::new(10),
+            page_plane_visible_commit_seq: CommitSeq::new(9),
+            db_size: 50,
+            journal_mode: JournalMode::Wal,
+            freelist_count: 0,
+            checkpoint_active: false,
+            page_set_size: 12,
+        };
+        let copied = intent;
+        assert_eq!(copied, intent);
+        let other = ParallelWalPublicationIntent { certificate_epoch: 8, ..intent };
+        assert_ne!(intent, other);
+        let dbg = format!("{intent:?}");
+        assert!(dbg.contains("ParallelWalPublicationIntent"));
+    }
+
+    #[test]
+    fn pager_metadata_publication_contract_copy_eq() {
+        let c = PAGER_METADATA_PUBLICATION_CONTRACTS[0];
+        assert_eq!(c.class, PagerMetadataPublicationClass::SnapshotSummary);
+        assert!(!c.touchpoint.is_empty());
+        assert!(!c.current_primitive.is_empty());
+        let copied = c;
+        assert_eq!(copied, c);
+    }
+
+    #[test]
+    fn pager_metadata_publication_contracts_cover_all_classes() {
+        let classes: Vec<_> = PAGER_METADATA_PUBLICATION_CONTRACTS.iter().map(|c| c.class).collect();
+        assert!(classes.contains(&PagerMetadataPublicationClass::SnapshotSummary));
+        assert!(classes.contains(&PagerMetadataPublicationClass::PagePlaneResidency));
+        assert!(classes.contains(&PagerMetadataPublicationClass::CertificateDerivedIntent));
+        assert_eq!(classes.len(), 3);
+    }
 }

@@ -704,4 +704,60 @@ mod tests {
         assert!(s.contains("close: 7"), "missing close");
         assert!(s.contains("file_size: 8"), "missing file_size");
     }
+
+    #[test]
+    fn metrics_snapshot_total_ops_sums_all_fields() {
+        let snap = MetricsSnapshot {
+            read_ops: 10,
+            write_ops: 20,
+            sync_ops: 5,
+            lock_ops: 3,
+            unlock_ops: 3,
+            truncate_ops: 1,
+            close_ops: 1,
+            file_size_ops: 2,
+            read_bytes_total: 999,
+            write_bytes_total: 888,
+        };
+        assert_eq!(snap.total_ops(), 10 + 20 + 5 + 3 + 3 + 1 + 1 + 2);
+    }
+
+    #[test]
+    fn tracing_file_path_accessor() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let (file, _) = vfs
+            .open(
+                &cx,
+                Some(Path::new("path_test.db")),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
+            )
+            .unwrap();
+        let traced = TracingFile::new(file, "path_test.db");
+        assert_eq!(traced.path(), "path_test.db");
+    }
+
+    #[test]
+    fn vfs_metrics_total_ops_matches_snapshot() {
+        let m = VfsMetrics::new();
+        m.read_ops.store(5, Ordering::Relaxed);
+        m.write_ops.store(3, Ordering::Relaxed);
+        m.sync_ops.store(2, Ordering::Relaxed);
+        let snap = m.snapshot();
+        assert_eq!(m.total_ops(), snap.total_ops());
+    }
+
+    #[test]
+    fn metrics_snapshot_display_contains_byte_counters() {
+        let snap = MetricsSnapshot {
+            read_ops: 1,
+            write_ops: 1,
+            read_bytes_total: 4096,
+            write_bytes_total: 8192,
+            ..MetricsSnapshot::default()
+        };
+        let s = format!("{snap}");
+        assert!(s.contains("4096"), "missing read byte count");
+        assert!(s.contains("8192"), "missing write byte count");
+    }
 }

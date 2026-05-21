@@ -26680,4 +26680,37 @@ mod tests {
              status=skipped reason=requires_benchmark_harness"
         );
     }
+
+    #[test]
+    fn test_simple_pager_open_defaults_to_s3_fifo_eviction() {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/s3fifo_default_rw.db");
+        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        assert!(
+            matches!(
+                pager.cache.eviction_policy(),
+                crate::page_cache::PageCacheEvictionPolicy::S3Fifo(_)
+            ),
+            "read-write pager must default to S3-FIFO eviction"
+        );
+    }
+
+    #[test]
+    fn test_simple_pager_open_readonly_defaults_to_s3_fifo_eviction() {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/s3fifo_default_ro.db");
+        {
+            let _rw = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        }
+        let cx = Cx::new();
+        let pager =
+            SimplePager::open_readonly_with_cx(&cx, vfs, &path, PageSize::DEFAULT).unwrap();
+        assert!(
+            matches!(
+                pager.cache.eviction_policy(),
+                crate::page_cache::PageCacheEvictionPolicy::S3Fifo(_)
+            ),
+            "read-only pager must default to S3-FIFO eviction"
+        );
+    }
 }

@@ -6099,6 +6099,32 @@ mod tests {
     }
 
     #[test]
+    fn test_flush_hot_plan_cache_lru_touch_clears_flag() {
+        // flush is a no-op when needs_lru_touch is false; otherwise it touches
+        // the LRU for the cached key (discarding the result) and clears the
+        // flag. The flag-transition is directly observable.
+        let mut p = QueryPlanner::new();
+        // Fresh: flag is false, flush is a no-op.
+        assert!(!p.hot_plan_cache_needs_lru_touch);
+        p.flush_hot_plan_cache_lru_touch();
+        assert!(!p.hot_plan_cache_needs_lru_touch);
+
+        // Flag true, no key -> still clears the flag (no plan_cache.get).
+        p.hot_plan_cache_needs_lru_touch = true;
+        p.flush_hot_plan_cache_lru_touch();
+        assert!(!p.hot_plan_cache_needs_lru_touch);
+
+        // Flag true with a key -> plan_cache.get is called (returns None on
+        // an empty cache, ignored), and the flag is cleared. The cache stays
+        // empty because get does not insert.
+        p.hot_plan_cache_key = Some(42);
+        p.hot_plan_cache_needs_lru_touch = true;
+        p.flush_hot_plan_cache_lru_touch();
+        assert!(!p.hot_plan_cache_needs_lru_touch);
+        assert!(p.is_plan_cache_empty());
+    }
+
+    #[test]
     fn test_lookup_hot_plan_cache_and_clear() {
         // On a fresh planner the hot cache is empty; any lookup misses without
         // setting needs_lru_touch. Seeding just the key (no plan) makes a

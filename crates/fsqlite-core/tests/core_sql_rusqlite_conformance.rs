@@ -1306,6 +1306,29 @@ const GROUP_BY_EXPRESSION_ALIAS_CASES: &[QueryCase] = &[
     },
 ];
 
+const ORDER_BY_EXPRESSION_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "case expression custom text rank",
+        sql: "SELECT id, label FROM expr_rows ORDER BY CASE WHEN label = 'high' THEN 0 WHEN label = 'same' THEN 1 WHEN label IS NULL THEN 3 ELSE 2 END, id",
+    },
+    QueryCase {
+        name: "computed nullable arithmetic sort",
+        sql: "SELECT id, a, b FROM expr_rows ORDER BY COALESCE(a, -1000) + COALESCE(b, -1000) DESC, id",
+    },
+    QueryCase {
+        name: "predicate expression ordering",
+        sql: "SELECT id, a, b FROM expr_rows ORDER BY a IS NULL, b IS NULL, a DESC, id",
+    },
+    QueryCase {
+        name: "repeated projected expression ordering",
+        sql: "SELECT id, COALESCE(label, 'none') AS resolved FROM expr_rows ORDER BY COALESCE(label, 'none') = 'none', COALESCE(label, 'none') DESC, id",
+    },
+    QueryCase {
+        name: "case expression with limit offset",
+        sql: "SELECT id, label FROM expr_rows ORDER BY CASE WHEN a IS NULL THEN 2 WHEN a >= b THEN 0 ELSE 1 END, id LIMIT 3 OFFSET 1",
+    },
+];
+
 const DISTINCT_ORDER_LIMIT_CASES: &[QueryCase] = &[
     QueryCase {
         name: "distinct nullable text ordering",
@@ -2032,6 +2055,12 @@ fn group_by_expression_and_alias_edges_match_rusqlite() {
         "GROUP BY expression/alias edge",
         GROUP_BY_EXPRESSION_ALIAS_CASES,
     );
+}
+
+#[test]
+fn order_by_expression_and_case_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
+    harness.assert_queries_match("ORDER BY expression/CASE edge", ORDER_BY_EXPRESSION_CASES);
 }
 
 #[test]

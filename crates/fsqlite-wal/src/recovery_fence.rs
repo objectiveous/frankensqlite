@@ -1035,4 +1035,43 @@ mod tests {
     fn pid_alive_os_zero_is_dead() {
         assert!(!pid_alive_os(0));
     }
+
+    #[test]
+    fn fence_new_matches_default() {
+        let a = RecoveryFence::new();
+        let b = RecoveryFence::default();
+        assert_eq!(a.is_recovery_in_progress(), b.is_recovery_in_progress());
+        assert_eq!(a.generation(), b.generation());
+    }
+
+    #[test]
+    fn fence_generation_increments_across_cycles() {
+        let fence = RecoveryFence::new();
+        for expected in 1..=3u64 {
+            let guard = fence.try_acquire_for_recovery().unwrap();
+            drop(guard);
+            assert_eq!(fence.generation(), expected);
+        }
+    }
+
+    #[test]
+    fn fence_acquire_with_budget_returns_busy_when_held() {
+        let fence = RecoveryFence::new();
+        let _guard = fence.try_acquire_for_recovery().unwrap();
+        let result = fence.acquire_for_recovery_with(0, Duration::from_millis(1));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn checkpoint_checksum_verdict_equality() {
+        let m1 = CheckpointChecksumVerdict::Match;
+        let m2 = CheckpointChecksumVerdict::Match;
+        assert_eq!(m1, m2);
+
+        let page = PageNumber::new(5).unwrap();
+        let mm = CheckpointChecksumVerdict::Mismatch {
+            first_bad_page: page,
+        };
+        assert_ne!(m1, mm);
+    }
 }

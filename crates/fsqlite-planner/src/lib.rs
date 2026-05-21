@@ -6094,6 +6094,37 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_in_list_probe() {
+        // x IN (1, 2, 3) yields an InList probe carrying the column and its
+        // values; an empty list, NOT IN, and a non-IN expression all yield None.
+        let col = || Box::new(Expr::Column(ColumnRef::bare("x"), Span::ZERO));
+        let lit = |n: i64| Expr::Literal(Literal::Integer(n), Span::ZERO);
+        let in_expr = |items: Vec<Expr>, not: bool| Expr::In {
+            expr: col(),
+            set: InSet::List(items),
+            not,
+            span: Span::ZERO,
+        };
+
+        match extract_in_list_probe(&in_expr(vec![lit(1), lit(2), lit(3)], false), "x") {
+            Some(AccessPathProbe::InList { column, values }) => {
+                assert_eq!(column, "x");
+                assert_eq!(values.len(), 3);
+            }
+            _ => panic!("expected an InList probe"),
+        }
+
+        // Empty list -> None.
+        assert!(extract_in_list_probe(&in_expr(vec![], false), "x").is_none());
+        // x NOT IN (1, 2) -> None.
+        assert!(extract_in_list_probe(&in_expr(vec![lit(1), lit(2)], true), "x").is_none());
+        // A non-IN expression -> None.
+        assert!(
+            extract_in_list_probe(&Expr::Literal(Literal::Integer(1), Span::ZERO), "x").is_none()
+        );
+    }
+
+    #[test]
     fn test_reverse_comparison_op() {
         use AstBinaryOp::{Add, Eq, Ge, Gt, Le, Lt, Ne};
         // Reversing a comparison swaps operand order: Eq is symmetric, and

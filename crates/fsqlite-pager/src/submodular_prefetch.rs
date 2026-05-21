@@ -397,4 +397,42 @@ mod tests {
         let picked_zero = greedy_select(&cands, 2, 0.0);
         assert_eq!(picked_neg, picked_zero);
     }
+
+    #[test]
+    fn objective_empty_selection_is_zero() {
+        assert!((objective(&[], 0.0)).abs() < 1e-12);
+        assert!((objective(&[], 0.5)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn objective_single_element_equals_hit_prob() {
+        let sel = [c(1, 0.73, 0)];
+        assert!((objective(&sel, 0.0) - 0.73).abs() < 1e-12);
+        assert!((objective(&sel, 1.0) - 0.73).abs() < 1e-12);
+    }
+
+    #[test]
+    fn greedy_select_all_zero_hit_prob_returns_empty() {
+        let cands = vec![c(1, 0.0, 0), c(2, 0.0, 1), c(3, 0.0, 2)];
+        assert!(greedy_select(&cands, 3, 0.0).is_empty());
+    }
+
+    #[test]
+    fn penalty_only_affects_same_group() {
+        let selected = [c(1, 0.9, 0)];
+        let diff_group = c(2, 0.8, 1);
+        let same_group = c(3, 0.8, 0);
+
+        let gain_diff = expected_gain(&selected, &diff_group, 1.0);
+        let gain_same = expected_gain(&selected, &same_group, 1.0);
+
+        assert!(
+            (gain_diff - 0.8).abs() < 1e-12,
+            "different group should have no penalty: {gain_diff}"
+        );
+        assert!(
+            gain_same < gain_diff,
+            "same group should pay penalty: {gain_same} vs {gain_diff}"
+        );
+    }
 }

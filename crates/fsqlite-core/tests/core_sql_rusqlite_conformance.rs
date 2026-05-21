@@ -208,6 +208,29 @@ const LEFT_JOIN_PREDICATE_EDGE_CASES: &[QueryCase] = &[
     },
 ];
 
+const JOIN_ALIAS_SELF_EDGE_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "self join same store pairs",
+        sql: "SELECT first.id, second.id FROM sales AS first JOIN sales AS second ON first.store_id = second.store_id AND first.id < second.id ORDER BY first.id, second.id",
+    },
+    QueryCase {
+        name: "left self join finds last sale per store",
+        sql: "SELECT s.id, s.store_id FROM sales AS s LEFT JOIN sales AS later ON later.store_id = s.store_id AND later.id > s.id WHERE later.id IS NULL ORDER BY s.store_id, s.id",
+    },
+    QueryCase {
+        name: "alias qualified join predicate",
+        sql: "SELECT st.name, r.name FROM stores AS st JOIN regions AS r ON r.id = st.region_id WHERE st.id IN (10, 30) ORDER BY st.name",
+    },
+    QueryCase {
+        name: "computed predicate inside join on",
+        sql: "SELECT s.id, p.name FROM sales AS s JOIN products AS p ON p.id = s.product_id AND s.qty * p.base_price >= 50 ORDER BY s.id",
+    },
+    QueryCase {
+        name: "filtered join product with constant on",
+        sql: "SELECT r.name, st.name FROM regions AS r JOIN stores AS st ON 1 = 1 WHERE st.region_id = r.id ORDER BY r.name, st.name",
+    },
+];
+
 const JOIN_USING_NATURAL_SETUP: &str = "
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -1775,6 +1798,12 @@ fn select_join_group_by_aggregates_match_rusqlite() {
 fn left_join_predicate_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
     harness.assert_queries_match("LEFT JOIN predicate edge", LEFT_JOIN_PREDICATE_EDGE_CASES);
+}
+
+#[test]
+fn join_alias_and_self_join_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
+    harness.assert_queries_match("JOIN alias/self edge", JOIN_ALIAS_SELF_EDGE_CASES);
 }
 
 #[test]

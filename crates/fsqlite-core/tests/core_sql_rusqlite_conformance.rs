@@ -2254,6 +2254,47 @@ const SCALAR_MIN_MAX_CASES: &[QueryCase] = &[
     },
 ];
 
+const MISC_SCALAR_SETUP: &str = "
+    CREATE TABLE misc_scalar_values (
+        id INTEGER PRIMARY KEY,
+        label TEXT,
+        n INTEGER,
+        payload BLOB
+    );
+    INSERT INTO misc_scalar_values (id, label, n, payload) VALUES
+        (1, 'alpha', 10, X'00FF'),
+        (2, '', -2, X''),
+        (3, NULL, NULL, NULL),
+        (4, 'space ', 0, X'4142');
+";
+
+const MISC_SCALAR_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "octet length text and null",
+        sql: "SELECT octet_length(''), octet_length('abc'), octet_length(char(233)), length(char(233)), typeof(octet_length('abc')), octet_length(NULL)",
+    },
+    QueryCase {
+        name: "octet length blob and numeric",
+        sql: "SELECT octet_length(X''), octet_length(X'00FF'), length(X'00FF'), octet_length(12345), octet_length(-7.5)",
+    },
+    QueryCase {
+        name: "randomblob length and type",
+        sql: "SELECT length(randomblob(0)), length(randomblob(-5)), length(randomblob(NULL)), length(randomblob(3)), typeof(randomblob(3))",
+    },
+    QueryCase {
+        name: "likelihood family returns first argument",
+        sql: "SELECT likelihood(42, 0.25), likelihood('text', 0.75), likely('yes'), unlikely(NULL), typeof(likely(3.5))",
+    },
+    QueryCase {
+        name: "likelihood family in predicates",
+        sql: "SELECT id FROM misc_scalar_values WHERE likely(n >= 0) OR unlikely(label IS NULL) ORDER BY id",
+    },
+    QueryCase {
+        name: "misc scalar functions over table columns",
+        sql: "SELECT id, octet_length(label), octet_length(payload), likelihood(label, 0.5), likely(n IS NULL) FROM misc_scalar_values ORDER BY id",
+    },
+];
+
 const FORMAT_QUOTE_SETUP: &str = "
     CREATE TABLE format_values (
         id INTEGER PRIMARY KEY,
@@ -2792,6 +2833,12 @@ fn char_unicode_scalar_edges_match_rusqlite() {
 fn scalar_min_max_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(SCALAR_MIN_MAX_SETUP);
     harness.assert_queries_match("scalar min max edge", SCALAR_MIN_MAX_CASES);
+}
+
+#[test]
+fn misc_scalar_function_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(MISC_SCALAR_SETUP);
+    harness.assert_queries_match("misc scalar function edge", MISC_SCALAR_CASES);
 }
 
 #[test]

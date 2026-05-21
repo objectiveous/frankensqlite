@@ -2501,6 +2501,52 @@ const FORMAT_QUOTE_SCALAR_CASES: &[QueryCase] = &[
     },
 ];
 
+const UNHEX_SCALAR_SETUP: &str = "
+    CREATE TABLE unhex_values (
+        id INTEGER PRIMARY KEY,
+        raw,
+        ignore_chars
+    );
+    INSERT INTO unhex_values (id, raw, ignore_chars) VALUES
+        (1, '4869', NULL),
+        (2, '48-69', '-'),
+        (3, '4 869', ' '),
+        (4, '', '-'),
+        (5, NULL, '-'),
+        (6, '4142', '4');
+";
+
+const UNHEX_SCALAR_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "valid hex to blob storage",
+        sql: "SELECT hex(unhex('48656C6C6F')), typeof(unhex('48656C6C6F')), length(unhex('48656C6C6F'))",
+    },
+    QueryCase {
+        name: "mixed case and numeric coercion",
+        sql: "SELECT hex(unhex('abCD')), hex(unhex(4142)), typeof(unhex(4142))",
+    },
+    QueryCase {
+        name: "empty and null inputs",
+        sql: "SELECT hex(unhex('')), typeof(unhex('')), length(unhex('')), unhex(NULL) IS NULL, typeof(unhex(NULL)), unhex('41', NULL) IS NULL",
+    },
+    QueryCase {
+        name: "invalid and odd length inputs",
+        sql: "SELECT unhex('Z1') IS NULL, unhex('A') IS NULL, unhex('123') IS NULL, typeof(unhex('GG'))",
+    },
+    QueryCase {
+        name: "ignored separators between byte pairs",
+        sql: "SELECT hex(unhex('48-65-6C', '-')), hex(unhex('48 65 6C', ' ')), hex(unhex('48:65:6C', ':'))",
+    },
+    QueryCase {
+        name: "ignored chars inside byte pair and hex digit ignore argument",
+        sql: "SELECT unhex('4 865', ' ') IS NULL, hex(unhex('41', '4'))",
+    },
+    QueryCase {
+        name: "column driven unhex",
+        sql: "SELECT id, hex(unhex(raw)), typeof(unhex(raw)), hex(unhex(raw, ignore_chars)), unhex(raw, ignore_chars) IS NULL FROM unhex_values ORDER BY id",
+    },
+];
+
 const MATH_FUNCTION_CASES: &[QueryCase] = &[
     QueryCase {
         name: "abs nulls and storage class",
@@ -3109,6 +3155,12 @@ fn misc_scalar_function_edges_match_rusqlite() {
 fn format_quote_scalar_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(FORMAT_QUOTE_SETUP);
     harness.assert_queries_match("format quote scalar edge", FORMAT_QUOTE_SCALAR_CASES);
+}
+
+#[test]
+fn unhex_scalar_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(UNHEX_SCALAR_SETUP);
+    harness.assert_queries_match("unhex scalar edge", UNHEX_SCALAR_CASES);
 }
 
 #[test]

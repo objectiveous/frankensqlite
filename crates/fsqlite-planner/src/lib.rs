@@ -7073,6 +7073,91 @@ mod tests {
     }
 
     #[test]
+    fn test_from_clause_supports_leapfrog_branches() {
+        use fsqlite_ast::{JoinClause, JoinConstraint, JoinKind, JoinType};
+
+        // from_clause_supports_leapfrog gates leapfrog routing on join shape.
+        // The routing tests only ever pass None (-> supported); the rejection
+        // branches were never exercised directly.
+        let tbl = |name: &str| TableOrSubquery::Table {
+            name: QualifiedName::bare(name),
+            alias: None,
+            index_hint: None,
+            time_travel: None,
+        };
+        let col = |name: &str| Expr::Column(ColumnRef::bare(name), Span::ZERO);
+        let from = |jt: JoinType, constraint: Option<JoinConstraint>| FromClause {
+            source: tbl("a"),
+            joins: vec![JoinClause {
+                join_type: jt,
+                table: tbl("b"),
+                constraint,
+            }],
+        };
+        let inner = || JoinType {
+            natural: false,
+            kind: JoinKind::Inner,
+        };
+
+        // No FROM clause at all -> trivially supported.
+        assert!(from_clause_supports_leapfrog(None));
+
+        // Inner join with an equi-column ON predicate (x = y) is supported.
+        let equi_on = Expr::BinaryOp {
+            left: Box::new(col("x")),
+            op: AstBinaryOp::Eq,
+            right: Box::new(col("y")),
+            span: Span::ZERO,
+        };
+        assert!(from_clause_supports_leapfrog(Some(&from(
+            inner(),
+            Some(JoinConstraint::On(equi_on))
+        ))));
+
+        // A non-empty USING constraint is supported.
+        assert!(from_clause_supports_leapfrog(Some(&from(
+            inner(),
+            Some(JoinConstraint::Using(vec!["x".to_owned()]))
+        ))));
+
+        // Rejection: a non-equi ON (column = literal) is not equi-column.
+        let nonequi_on = Expr::BinaryOp {
+            left: Box::new(col("x")),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(5), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        assert!(!from_clause_supports_leapfrog(Some(&from(
+            inner(),
+            Some(JoinConstraint::On(nonequi_on))
+        ))));
+
+        // Rejection: an empty USING list.
+        assert!(!from_clause_supports_leapfrog(Some(&from(
+            inner(),
+            Some(JoinConstraint::Using(vec![]))
+        ))));
+
+        // Rejection: a NATURAL join.
+        assert!(!from_clause_supports_leapfrog(Some(&from(
+            JoinType {
+                natural: true,
+                kind: JoinKind::Inner,
+            },
+            None
+        ))));
+
+        // Rejection: an outer (LEFT) join.
+        assert!(!from_clause_supports_leapfrog(Some(&from(
+            JoinType {
+                natural: false,
+                kind: JoinKind::Left,
+            },
+            None
+        ))));
+    }
+
+    #[test]
     fn test_two_way_join_stays_hash_even_with_leapfrog_enabled() {
         let tables = [table_stats("t1", 10, 100), table_stats("t2", 12, 120)];
         let terms = [join_term("t1", "k", "t2", "k")];

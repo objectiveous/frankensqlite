@@ -860,4 +860,44 @@ mod tests {
         let g = GroupCommitMetrics::default();
         assert_eq!(g.snapshot().group_commits_total, 0);
     }
+
+    #[test]
+    fn wal_metrics_avg_checkpoint_duration() {
+        let m = WalMetrics::new();
+        m.record_checkpoint(10, 3000);
+        m.record_checkpoint(20, 5000);
+        let snap = m.snapshot();
+        assert_eq!(snap.avg_checkpoint_duration_us(), 4000);
+        assert_eq!(WalMetrics::new().snapshot().avg_checkpoint_duration_us(), 0);
+    }
+
+    #[test]
+    fn wal_metrics_set_frames_current() {
+        let m = WalMetrics::new();
+        m.set_wal_frames_current(42);
+        assert_eq!(m.snapshot().wal_frames_current, 42);
+        m.set_wal_frames_current(0);
+        assert_eq!(m.snapshot().wal_frames_current, 0);
+    }
+
+    #[test]
+    fn wal_metrics_snapshot_clone_and_eq() {
+        let m = WalMetrics::new();
+        m.record_frame_write(1024);
+        m.record_wal_reset();
+        let a = m.snapshot();
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn recovery_snapshot_display_contains_all_fields() {
+        let r = WalRecoveryCounters::new();
+        r.record_recovery(50, 3, 2);
+        let s = r.snapshot().to_string();
+        assert!(s.contains("wal_recovery_frames=50"));
+        assert!(s.contains("corruption_detected=3"));
+        assert!(s.contains("frames_repaired=2"));
+        assert!(s.contains("recovery_ops=1"));
+    }
 }

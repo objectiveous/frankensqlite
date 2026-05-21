@@ -3672,6 +3672,65 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_codegen_delete_notexists_jump_skips_delete_to_close() {
+        // DELETE FROM t WHERE rowid = ?1 guards the row delete with NotExists:
+        // when the rowid is absent the NotExists jump must skip past Delete and
+        // land on Close, so a missing row is a no-op rather than deleting whatever
+        // the cursor currently points at. The subsequence check in
+        // `test_codegen_delete_by_rowid` only proves the opcodes are present in
+        // order; this pins the actual jump target.
+        let stmt = DeleteStatement {
+            with: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+                time_travel: None,
+            },
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(1)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_delete(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        let notexists = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::NotExists)
+            .expect("NotExists op present");
+        let delete = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Delete)
+            .expect("Delete op present");
+        let close = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Close)
+            .expect("Close op present");
+
+        // Delete sits strictly between the guard and Close, so it is exactly the
+        // instruction the NotExists branch hops over.
+        assert!(notexists < delete, "NotExists must precede Delete");
+        assert!(delete < close, "Delete must precede Close");
+
+        // NotExists jumps to the Close instruction when the rowid is absent.
+        assert_eq!(
+            usize::try_from(ops[notexists].p2).unwrap(),
+            close,
+            "NotExists must jump to Close (skipping Delete) when the rowid is absent"
+        );
+    }
+
     // === Test 5: Label resolution ===
     #[test]
     fn test_codegen_label_resolution() {

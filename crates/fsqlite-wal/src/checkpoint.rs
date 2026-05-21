@@ -425,4 +425,79 @@ mod tests {
         assert!(plan.should_truncate_wal());
         assert!(!plan.should_reset_wal());
     }
+
+    #[test]
+    fn test_remaining_frames_saturates_at_zero() {
+        let state = CheckpointState {
+            total_frames: 10,
+            backfilled_frames: 10,
+            oldest_reader_frame: None,
+        };
+        assert_eq!(state.remaining_frames(), 0);
+        let over = CheckpointState {
+            total_frames: 5,
+            backfilled_frames: 99,
+            oldest_reader_frame: None,
+        };
+        assert_eq!(over.remaining_frames(), 0);
+    }
+
+    #[test]
+    fn test_normalized_clamps_reader_to_total() {
+        let state = CheckpointState {
+            total_frames: 20,
+            backfilled_frames: 30,
+            oldest_reader_frame: Some(50),
+        };
+        let n = state.normalized();
+        assert_eq!(n.backfilled_frames, 20);
+        assert_eq!(n.oldest_reader_frame, Some(20));
+    }
+
+    #[test]
+    fn test_full_reader_at_backfill_boundary_is_blocked() {
+        let plan = plan_checkpoint(
+            CheckpointMode::Full,
+            CheckpointState {
+                total_frames: 100,
+                backfilled_frames: 60,
+                oldest_reader_frame: Some(60),
+            },
+        );
+        assert_eq!(plan.frames_to_backfill, 0);
+        assert!(!plan.completes_checkpoint());
+        assert!(plan.blocked_by_readers);
+    }
+
+    #[test]
+    fn test_passive_never_reports_blocked() {
+        for reader in [Some(10), Some(50), None] {
+            let plan = plan_checkpoint(
+                CheckpointMode::Passive,
+                CheckpointState {
+                    total_frames: 50,
+                    backfilled_frames: 0,
+                    oldest_reader_frame: reader,
+                },
+            );
+            assert!(
+                !plan.blocked_by_readers,
+                "Passive must never report blocked (reader={reader:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_restart_no_post_action_on_empty_wal() {
+        let plan = plan_checkpoint(
+            CheckpointMode::Restart,
+            CheckpointState {
+                total_frames: 0,
+                backfilled_frames: 0,
+                oldest_reader_frame: None,
+            },
+        );
+        assert!(plan.completes_checkpoint());
+        assert!(!plan.should_reset_wal());
+    }
 }

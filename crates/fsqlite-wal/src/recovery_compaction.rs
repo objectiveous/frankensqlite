@@ -1708,4 +1708,78 @@ mod tests {
         set.insert(lease.clone());
         assert!(set.contains(&lease));
     }
+
+    #[test]
+    fn durability_violation_debug_clone_eq() {
+        let v = DurabilityViolation {
+            commit_seq: CommitSeq::new(7),
+            capsule_object_id: make_oid(0xAA),
+            reason: "bad checksum".into(),
+        };
+        let cloned = v.clone();
+        assert_eq!(cloned, v);
+        let dbg = format!("{v:?}");
+        assert!(dbg.contains("DurabilityViolation"));
+        assert!(dbg.contains("bad checksum"));
+        let v2 = DurabilityViolation {
+            commit_seq: CommitSeq::new(8),
+            capsule_object_id: make_oid(0xAA),
+            reason: "bad checksum".into(),
+        };
+        assert_ne!(v, v2);
+    }
+
+    #[test]
+    fn checkpoint_ref_debug_clone_eq() {
+        let cp = CheckpointRef {
+            commit_seq: CommitSeq::new(42),
+            manifest_object_id: make_oid(0xBB),
+        };
+        let cloned = cp.clone();
+        assert_eq!(cloned, cp);
+        let dbg = format!("{cp:?}");
+        assert!(dbg.contains("CheckpointRef"));
+        let cp2 = CheckpointRef {
+            commit_seq: CommitSeq::new(43),
+            manifest_object_id: make_oid(0xBB),
+        };
+        assert_ne!(cp, cp2);
+    }
+
+    #[test]
+    fn compaction_summary_debug_clone_fields() {
+        let s = CompactionSummary {
+            space_amp_before: 2.5,
+            space_amp_after: 1.1,
+            live_objects: 100,
+            dead_objects: 50,
+            old_segments: 3,
+            new_segments: 1,
+            retired_segments: 2,
+            published: true,
+            cancelled: false,
+        };
+        let cloned = s.clone();
+        assert_eq!(cloned.live_objects, 100);
+        assert_eq!(cloned.dead_objects, 50);
+        assert!(cloned.published);
+        assert!(!cloned.cancelled);
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("CompactionSummary"));
+    }
+
+    #[test]
+    fn segment_ref_debug_clone_fields() {
+        let seg = SegmentRef {
+            segment_id: make_oid(0x10),
+            object_ids: vec![make_oid(0x20), make_oid(0x30)],
+            size_bytes: 4096,
+        };
+        let cloned = seg.clone();
+        assert_eq!(cloned.segment_id, make_oid(0x10));
+        assert_eq!(cloned.object_ids.len(), 2);
+        assert_eq!(cloned.size_bytes, 4096);
+        let dbg = format!("{seg:?}");
+        assert!(dbg.contains("SegmentRef"));
+    }
 }

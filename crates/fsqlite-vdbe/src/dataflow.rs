@@ -202,6 +202,11 @@ pub enum DataflowOperator {
         key_columns: Vec<usize>,
         value_column: usize,
     },
+    /// Emit one materialized floating-point `AVG(value_column)` row per key.
+    AverageIntegerByKey {
+        key_columns: Vec<usize>,
+        value_column: usize,
+    },
     /// Consolidate algebraic weights by complete row value.
     ConsolidateRows,
     /// Multiply every row weight by `factor`, eliding zero-weight output rows.
@@ -259,6 +264,10 @@ impl DataflowOperator {
                 key_columns,
                 value_column,
             } => max_integer_by_key(rows, key_columns, *value_column),
+            Self::AverageIntegerByKey {
+                key_columns,
+                value_column,
+            } => average_integer_by_key(rows, key_columns, *value_column),
             Self::ConsolidateRows => Ok(consolidate_rows(rows.iter().cloned().collect())),
             Self::ScaleWeight { factor } => Ok(scale_weights(rows, *factor)),
             Self::ThresholdPositive => Ok(threshold_positive(rows)),
@@ -441,6 +450,42 @@ fn max_integer_by_key(
         .map(|(mut values, max_value)| {
             values.push(SqliteValue::Integer(max_value));
             WeightedRow::insert(values)
+        })
+        .collect())
+}
+
+fn average_integer_by_key(
+    rows: &[WeightedRow],
+    key_columns: &[usize],
+    value_column: usize,
+) -> DataflowResult<Vec<WeightedRow>> {
+    let mut groups: Vec<(Vec<SqliteValue>, i64, i64)> = Vec::new();
+    for row in rows {
+        if row.weight <= 0 {
+            continue;
+        }
+        let key = row.project(key_columns)?;
+        let value = integer_value_at(row, value_column)?;
+        let weighted_value = value.saturating_mul(row.weight);
+        if let Some((_, sum, count)) = groups
+            .iter_mut()
+            .find(|(candidate, _, _)| *candidate == key)
+        {
+            *sum = sum.saturating_add(weighted_value);
+            *count = count.saturating_add(row.weight);
+        } else {
+            groups.push((key, weighted_value, row.weight));
+        }
+    }
+
+    Ok(groups
+        .into_iter()
+        .filter_map(|(mut values, sum, count)| {
+            if count <= 0 {
+                return None;
+            }
+            values.push(SqliteValue::Float(sum as f64 / count as f64));
+            Some(WeightedRow::insert(values))
         })
         .collect())
 }
@@ -850,6 +895,45 @@ mod tests {
     #[test]
     fn max_integer_by_key_rejects_non_integer_values() {
         let automaton = DataflowAutomaton::new(vec![DataflowOperator::MaxIntegerByKey {
+            key_columns: vec![0],
+            value_column: 1,
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), SqliteValue::Float(1.5)])])
+            .expect_err("non-integer aggregate input should fail");
+
+        assert_eq!(err, DataflowError::AggregateValueNotInteger { column: 1 });
+    }
+
+    #[test]
+    fn average_integer_by_key_appends_average_for_positive_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::AverageIntegerByKey {
+            key_columns: vec![0],
+            value_column: 1,
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(2), int(20)], 2),
+            WeightedRow::new(vec![int(1), int(10)], 1),
+            WeightedRow::new(vec![int(2), int(8)], 1),
+            WeightedRow::new(vec![int(1), int(30)], -1),
+            WeightedRow::new(vec![int(3), int(30)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::insert(vec![int(2), SqliteValue::Float(16.0)]),
+                WeightedRow::insert(vec![int(1), SqliteValue::Float(10.0)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn average_integer_by_key_rejects_non_integer_values() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::AverageIntegerByKey {
             key_columns: vec![0],
             value_column: 1,
         }]);

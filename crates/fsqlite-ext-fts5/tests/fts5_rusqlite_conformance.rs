@@ -186,6 +186,7 @@ const UNICODE61_SEPARATOR_DOCS: &[Doc] = &[
 const UNICODE61_DIACRITIC_OPTIONS: &[&str] = &["tokenize='unicode61 remove_diacritics 2'"];
 const UNICODE61_CODE_TOKEN_OPTIONS: &[&str] = &[r#"tokenize="unicode61 tokenchars '-_./:@#$%'""#];
 const UNICODE61_SEPARATOR_OPTIONS: &[&str] = &[r#"tokenize="unicode61 separators '_.'""#];
+const UNINDEXED_COLUMN_SPECS: &[&str] = &["title", "body UNINDEXED"];
 const PORTER_OPTIONS: &[&str] = &["tokenize='porter'"];
 const TRIGRAM_OPTIONS: &[&str] = &["tokenize='trigram'"];
 
@@ -274,6 +275,29 @@ const COLUMN_FILTER_INITIAL_CASES: &[MatchCase] = &[
     },
 ];
 
+const UNINDEXED_COLUMN_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "unindexed column filter",
+        query: "body:search",
+    },
+    MatchCase {
+        name: "indexed title filter",
+        query: "title:rust",
+    },
+    MatchCase {
+        name: "implicit union excludes unindexed body",
+        query: "search",
+    },
+    MatchCase {
+        name: "braced filter excludes unindexed body hits",
+        query: "{title body}:sqlite",
+    },
+    MatchCase {
+        name: "unindexed phrase filter",
+        query: r#"body:"full text""#,
+    },
+];
+
 const BM25_CASES: &[RankingCase] = &[
     RankingCase {
         name: "single term frequency",
@@ -348,7 +372,12 @@ impl Fts5ConformanceHarness {
     }
 
     fn with_docs(options: &[&str], docs: &[Doc]) -> Self {
-        let mut args = vec!["fts5", "main", "docs", "title", "body"];
+        Self::with_schema(&["title", "body"], options, docs)
+    }
+
+    fn with_schema(column_specs: &[&str], options: &[&str], docs: &[Doc]) -> Self {
+        let mut args = vec!["fts5", "main", "docs"];
+        args.extend_from_slice(column_specs);
         args.extend_from_slice(options);
 
         let cx = Cx::new();
@@ -358,6 +387,7 @@ impl Fts5ConformanceHarness {
         }
 
         let sqlite = Connection::open_in_memory().expect("open rusqlite in-memory database");
+        let columns = column_specs.join(", ");
         let sql_options = if options.is_empty() {
             String::new()
         } else {
@@ -365,7 +395,7 @@ impl Fts5ConformanceHarness {
         };
         sqlite
             .execute_batch(&format!(
-                "CREATE VIRTUAL TABLE docs USING fts5(title, body{sql_options});"
+                "CREATE VIRTUAL TABLE docs USING fts5({columns}{sql_options});"
             ))
             .expect("create rusqlite FTS5 table");
         for doc in docs {
@@ -547,6 +577,21 @@ fn column_filter_and_initial_token_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "column-filter/initial-token conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn unindexed_columns_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::with_schema(UNINDEXED_COLUMN_SPECS, &[], DOCS);
+
+    for case in UNINDEXED_COLUMN_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "UNINDEXED column conformance case failed: {} ({})",
             case.name,
             case.query
         );

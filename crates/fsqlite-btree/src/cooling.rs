@@ -441,4 +441,37 @@ mod tests {
         let err = csm.evict_page(1).unwrap_err();
         assert_eq!(err, "page is a pinned root");
     }
+
+    #[test]
+    fn cooling_tracker_counts_frame_addr_and_multi_page_scan() {
+        let csm = CoolingStateMachine::new(CoolingConfig::default());
+
+        // Two ordinary loaded pages (-> Hot) plus one pinned root (-> Hot).
+        csm.register_page(1);
+        csm.load_page(1, 0x1000);
+        csm.register_page(2);
+        csm.load_page(2, 0x2000);
+        csm.pin_root(3);
+        csm.load_page(3, 0x3000);
+
+        assert_eq!(csm.tracked_count(), 3);
+        assert_eq!(csm.pinned_count(), 1);
+        assert!(csm.is_pinned(3) && !csm.is_pinned(1));
+
+        // frame_addr reports the loaded address; an unregistered page has none.
+        assert_eq!(csm.frame_addr(1), Some(0x1000));
+        assert_eq!(csm.frame_addr(2), Some(0x2000));
+        assert!(csm.temperature(999).is_none(), "unregistered page has no temperature");
+
+        // One scan cools both unpinned pages; the pinned root stays Hot.
+        let result = csm.run_cooling_scan();
+        assert_eq!(result.pages_cooled, 2, "two unpinned pages cool; the pinned root does not");
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Cooling));
+        assert_eq!(csm.temperature(2), Some(PageTemperature::Cooling));
+        assert_eq!(csm.temperature(3), Some(PageTemperature::Hot));
+
+        // A cooled page is now evictable; the pinned root is not.
+        assert!(csm.evict_page(1).is_ok());
+        assert!(csm.evict_page(3).is_err());
+    }
 }

@@ -1477,6 +1477,39 @@ const MUTATION_CASES: &[MatchCase] = &[
     },
 ];
 
+const MUTATION_ROWID_WINDOW_CASES: &[RowidWindowCase] = &[
+    RowidWindowCase {
+        name: "replacement term first row",
+        query: "bytecode",
+        limit: 1,
+        offset: 0,
+    },
+    RowidWindowCase {
+        name: "inserted and retained rust rows",
+        query: "rust",
+        limit: 2,
+        offset: 1,
+    },
+    RowidWindowCase {
+        name: "search rows after replacement",
+        query: "search",
+        limit: 3,
+        offset: 0,
+    },
+    RowidWindowCase {
+        name: "mutation row after retained search rows",
+        query: "search OR mutation",
+        limit: 2,
+        offset: 2,
+    },
+    RowidWindowCase {
+        name: "deleted row window past end",
+        query: "bread",
+        limit: 2,
+        offset: 1,
+    },
+];
+
 const EMPTY_REPLACEMENT_CASES: &[MatchCase] = &[
     MatchCase {
         name: "old body term removed",
@@ -2927,6 +2960,34 @@ fn mutation_queries_match_rusqlite_reference() {
             "mutation conformance case failed: {} ({})",
             case.name,
             case.query
+        );
+    }
+}
+
+#[test]
+fn mutation_rowid_window_queries_match_rusqlite_reference() {
+    let mut harness = Fts5ConformanceHarness::new(&[]);
+    harness.delete_doc(4);
+    harness.insert_or_replace_doc(Doc {
+        rowid: 2,
+        title: "Planner notes",
+        body: "query planner builds bytecode search paths",
+    });
+    harness.insert_or_replace_doc(Doc {
+        rowid: 6,
+        title: "Fresh rust",
+        body: "fresh rust token for mutation search",
+    });
+
+    for case in MUTATION_ROWID_WINDOW_CASES {
+        assert_eq!(
+            harness.franken_match_rowid_window(*case),
+            harness.sqlite_match_rowid_window(*case),
+            "mutation rowid window conformance case failed: {} ({}, limit {}, offset {})",
+            case.name,
+            case.query,
+            case.limit,
+            case.offset
         );
     }
 }

@@ -538,6 +538,42 @@ mod tests {
     }
 
     #[test]
+    fn test_interpolate_position_clamps_handles_degenerate_and_mixed_types() {
+        use SqliteValue::{Float, Integer};
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
+
+        // Integer: linear position, clamped to [0,1] for values outside [min,max].
+        assert!(approx(interpolate_position(&Integer(0), &Integer(100), &Integer(50)), 0.5));
+        assert!(approx(interpolate_position(&Integer(0), &Integer(100), &Integer(0)), 0.0));
+        assert!(approx(interpolate_position(&Integer(0), &Integer(100), &Integer(100)), 1.0));
+        assert!(
+            approx(interpolate_position(&Integer(0), &Integer(100), &Integer(-50)), 0.0),
+            "below min clamps to 0"
+        );
+        assert!(
+            approx(interpolate_position(&Integer(0), &Integer(100), &Integer(200)), 1.0),
+            "above max clamps to 1"
+        );
+        // Degenerate range (max <= min) carries no information -> 0.5.
+        assert!(approx(interpolate_position(&Integer(50), &Integer(50), &Integer(50)), 0.5));
+        assert!(approx(interpolate_position(&Integer(100), &Integer(0), &Integer(50)), 0.5));
+
+        // Float: same linear behavior; any NaN endpoint/value returns 0.5.
+        assert!(approx(interpolate_position(&Float(0.0), &Float(10.0), &Float(2.5)), 0.25));
+        assert!(
+            approx(interpolate_position(&Float(0.0), &Float(10.0), &Float(f64::NAN)), 0.5),
+            "NaN value -> 0.5"
+        );
+        assert!(
+            approx(interpolate_position(&Float(f64::NAN), &Float(10.0), &Float(5.0)), 0.5),
+            "NaN min -> 0.5"
+        );
+
+        // Mixed / uncomparable types fall through to the 0.5 default.
+        assert!(approx(interpolate_position(&Integer(0), &Float(10.0), &Integer(5)), 0.5));
+    }
+
+    #[test]
     fn test_histogram_equality_and_range_estimates_multi_bucket() {
         // Two equi-depth buckets with distinct densities so equality estimates
         // (count / ndv) differ per bucket and range estimates span both.

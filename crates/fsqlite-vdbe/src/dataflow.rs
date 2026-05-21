@@ -211,6 +211,8 @@ pub enum DataflowOperator {
         column: usize,
         values: Vec<SqliteValue>,
     },
+    /// Keep rows whose blob column starts with the configured byte prefix.
+    FilterBlobPrefix { column: usize, prefix: Vec<u8> },
     /// Keep rows whose text column starts with the configured prefix.
     FilterTextPrefix { column: usize, prefix: String },
     /// Keep rows whose text column ends with the configured suffix.
@@ -347,6 +349,7 @@ impl DataflowOperator {
                 .collect(),
             Self::FilterInSet { column, values } => filter_in_set(rows, *column, values),
             Self::FilterNotInSet { column, values } => filter_not_in_set(rows, *column, values),
+            Self::FilterBlobPrefix { column, prefix } => filter_blob_prefix(rows, *column, prefix),
             Self::FilterTextPrefix { column, prefix } => filter_text_prefix(rows, *column, prefix),
             Self::FilterTextSuffix { column, suffix } => filter_text_suffix(rows, *column, suffix),
             Self::FilterTextContains { column, needle } => {
@@ -615,6 +618,26 @@ fn filter_not_in_set(
                 Some(Ok(row.clone()))
             }
             Some(_) => None,
+            None => Some(Err(DataflowError::ColumnOutOfBounds {
+                column,
+                width: row.width(),
+            })),
+        })
+        .collect()
+}
+
+fn filter_blob_prefix(
+    rows: &[WeightedRow],
+    column: usize,
+    prefix: &[u8],
+) -> DataflowResult<Vec<WeightedRow>> {
+    rows.iter()
+        .filter_map(|row| match row.values.get(column) {
+            Some(SqliteValue::Blob(candidate)) if candidate.starts_with(prefix) => {
+                Some(Ok(row.clone()))
+            }
+            Some(SqliteValue::Blob(_)) => None,
+            Some(_) => Some(Err(DataflowError::PredicateValueNotBlob { column })),
             None => Some(Err(DataflowError::ColumnOutOfBounds {
                 column,
                 width: row.width(),
@@ -1437,6 +1460,86 @@ mod tests {
         let err = automaton
             .execute(&[WeightedRow::insert(vec![int(1), int(2)])])
             .expect_err("invalid not-in-set predicate column should fail");
+
+        assert_eq!(
+            err,
+            DataflowError::ColumnOutOfBounds {
+                column: 2,
+                width: 2
+            }
+        );
+    }
+
+    #[test]
+    fn filter_blob_prefix_keeps_matching_weighted_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterBlobPrefix {
+            column: 1,
+            prefix: vec![0xCA, 0xFE],
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), blob(&[0xCA])], 7),
+            WeightedRow::new(vec![int(2), blob(&[0xCA, 0xFE])], -2),
+            WeightedRow::new(vec![int(3), blob(&[0xCA, 0xFE, 0xBA])], 4),
+            WeightedRow::new(vec![int(4), blob(&[0xBA, 0xBE])], 5),
+            WeightedRow::new(vec![int(5), blob(&[0xCA, 0xFE, 0x01])], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(2), blob(&[0xCA, 0xFE])], -2),
+                WeightedRow::new(vec![int(3), blob(&[0xCA, 0xFE, 0xBA])], 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_blob_prefix_empty_prefix_keeps_all_non_zero_blob_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterBlobPrefix {
+            column: 1,
+            prefix: Vec::new(),
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), blob(&[1, 2])], 7),
+            WeightedRow::new(vec![int(2), blob(&[])], -2),
+            WeightedRow::new(vec![int(3), blob(&[3])], 0),
+        ];
+
+        assert_eq!(
+            automaton.execute(&rows).expect("dataflow should execute"),
+            vec![
+                WeightedRow::new(vec![int(1), blob(&[1, 2])], 7),
+                WeightedRow::new(vec![int(2), blob(&[])], -2),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_blob_prefix_rejects_non_blob_values() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterBlobPrefix {
+            column: 1,
+            prefix: vec![0xCA],
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), text("cafe")])])
+            .expect_err("non-blob predicate input should fail");
+
+        assert_eq!(err, DataflowError::PredicateValueNotBlob { column: 1 });
+    }
+
+    #[test]
+    fn filter_blob_prefix_rejects_out_of_bounds_columns() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterBlobPrefix {
+            column: 2,
+            prefix: vec![0xCA],
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), blob(&[0xCA])])])
+            .expect_err("invalid blob-prefix predicate column should fail");
 
         assert_eq!(
             err,

@@ -1074,4 +1074,55 @@ mod tests {
         };
         assert_ne!(m1, mm);
     }
+
+    #[test]
+    fn pid_lock_entry_copy_clone_eq_debug() {
+        let entry = PidOwnedLockEntry {
+            page: PageNumber::new(10).unwrap(),
+            pid: 1234,
+            sequence: 77,
+        };
+        let copied = entry;
+        assert_eq!(entry, copied);
+        let cloned = entry.clone();
+        assert_eq!(entry, cloned);
+        let dbg = format!("{entry:?}");
+        assert!(dbg.contains("PidOwnedLockEntry"));
+        assert!(dbg.contains("1234"));
+    }
+
+    #[test]
+    fn recovery_fence_constants_match_documented_values() {
+        assert_eq!(RECOVERY_FENCE_BACKOFF, Duration::from_millis(100));
+        assert_eq!(RECOVERY_FENCE_MAX_RETRIES, 10);
+        assert_eq!(RECOVERY_FENCE_SPIN_ATTEMPTS, 4096);
+    }
+
+    #[test]
+    fn checkpoint_checksum_verdict_clone_and_debug() {
+        let m = CheckpointChecksumVerdict::Match;
+        let mc = m.clone();
+        assert_eq!(m, mc);
+
+        let page = PageNumber::new(3).unwrap();
+        let mm = CheckpointChecksumVerdict::Mismatch {
+            first_bad_page: page,
+        };
+        let mmc = mm.clone();
+        assert_eq!(mm, mmc);
+
+        let dbg_match = format!("{m:?}");
+        assert!(dbg_match.contains("Match"));
+        let dbg_mismatch = format!("{mm:?}");
+        assert!(dbg_mismatch.contains("Mismatch"));
+    }
+
+    #[test]
+    fn pid_alive_os_nonexistent_high_pid() {
+        #[cfg(unix)]
+        {
+            let high_pid = 4_000_000_000;
+            assert!(!pid_alive_os(high_pid));
+        }
+    }
 }

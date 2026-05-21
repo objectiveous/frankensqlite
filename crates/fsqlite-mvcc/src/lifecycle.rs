@@ -8537,6 +8537,61 @@ mod tests {
     }
 
     #[test]
+    fn test_read_page_with_cell_deltas_replays_same_txn_insert_then_delete()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4252;
+        let payload = vec![b't'; 138];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                txn.token(),
+            )
+            .expect("logical insert should fit budget");
+        mgr.cell_log()
+            .record_delete(cell_key, pgno, txn.token())
+            .expect("logical delete should fit budget");
+
+        let page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&page)?,
+            Vec::<(i64, Vec<u8>)>::new(),
+            "transaction-local reads must replay insert-then-delete as absent"
+        );
+
+        mgr.commit(&mut txn).expect("combined logical commit");
+
+        let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
+        let committed_page = mgr
+            .read_page_with_cell_deltas(&mut reader, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&committed_page)?,
+            Vec::<(i64, Vec<u8>)>::new(),
+            "committed reads must preserve the insert-then-delete ordering"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_read_page_with_cell_deltas_hides_other_uncommitted_delta() -> fsqlite_error::Result<()>
     {
         use crate::cell_visibility::CellKey;

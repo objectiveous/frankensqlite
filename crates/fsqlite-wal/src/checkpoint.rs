@@ -500,4 +500,63 @@ mod tests {
         assert!(plan.completes_checkpoint());
         assert!(!plan.should_reset_wal());
     }
+
+    #[test]
+    fn test_normalized_is_idempotent() {
+        let state = CheckpointState {
+            total_frames: 10,
+            backfilled_frames: 50,
+            oldest_reader_frame: Some(99),
+        };
+        let n1 = state.normalized();
+        let n2 = n1.normalized();
+        assert_eq!(n1, n2);
+    }
+
+    #[test]
+    fn test_normalized_none_reader_passes_through() {
+        let state = CheckpointState {
+            total_frames: 30,
+            backfilled_frames: 10,
+            oldest_reader_frame: None,
+        };
+        let n = state.normalized();
+        assert_eq!(n.total_frames, 30);
+        assert_eq!(n.backfilled_frames, 10);
+        assert!(n.oldest_reader_frame.is_none());
+    }
+
+    #[test]
+    fn test_reset_and_truncate_are_mutually_exclusive() {
+        for mode in [
+            CheckpointMode::Passive,
+            CheckpointMode::Full,
+            CheckpointMode::Restart,
+            CheckpointMode::Truncate,
+        ] {
+            for reader in [Some(50), None] {
+                let plan = plan_checkpoint(
+                    mode,
+                    CheckpointState {
+                        total_frames: 50,
+                        backfilled_frames: 0,
+                        oldest_reader_frame: reader,
+                    },
+                );
+                assert!(
+                    !(plan.should_reset_wal() && plan.should_truncate_wal()),
+                    "{mode:?} reader={reader:?}: reset and truncate must be mutually exclusive"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_mode_copy_and_eq() {
+        let a = CheckpointMode::Restart;
+        let b = a;
+        assert_eq!(a, b);
+        assert_ne!(CheckpointMode::Passive, CheckpointMode::Full);
+        assert_ne!(CheckpointMode::Restart, CheckpointMode::Truncate);
+    }
 }

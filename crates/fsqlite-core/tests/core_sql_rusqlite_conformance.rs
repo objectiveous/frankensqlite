@@ -1127,6 +1127,65 @@ const DDL_CASES: &[QueryCase] = &[
     },
 ];
 
+const CTAS_SETUP: &str = "
+    CREATE TABLE ctas_source (
+        id INTEGER PRIMARY KEY,
+        category TEXT NOT NULL,
+        name TEXT NOT NULL,
+        qty INTEGER NOT NULL,
+        price INTEGER NOT NULL,
+        active INTEGER NOT NULL
+    );
+
+    INSERT INTO ctas_source(id, category, name, qty, price, active) VALUES
+        (1, 'hardware', 'bolt', 10, 2, 1),
+        (2, 'hardware', 'nut', 5, 3, 0),
+        (3, 'tool', 'driver', 2, 25, 1),
+        (4, 'tool', 'wrench', 1, 40, 1);
+
+    CREATE TABLE ctas_filtered AS
+        SELECT id, name, qty, price, qty * price AS inventory_value
+        FROM ctas_source
+        WHERE active = 1;
+
+    CREATE TABLE ctas_expression AS
+        SELECT category, upper(name) AS upper_name, qty + price AS qty_plus_price
+        FROM ctas_source
+        WHERE id IN (1, 3, 4);
+
+    CREATE TABLE ctas_empty AS
+        SELECT id, name, qty
+        FROM ctas_source
+        WHERE qty < 0;
+";
+
+const CTAS_SCRIPT: &str = "
+    INSERT INTO ctas_empty VALUES (99, 'manual', 7);
+";
+
+const CTAS_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "filtered projection rows",
+        sql: "SELECT id, name, qty, price, inventory_value FROM ctas_filtered ORDER BY id",
+    },
+    QueryCase {
+        name: "expression projection rows",
+        sql: "SELECT category, upper_name, qty_plus_price FROM ctas_expression ORDER BY category, upper_name",
+    },
+    QueryCase {
+        name: "empty ctas accepts later insert",
+        sql: "SELECT id, name, qty FROM ctas_empty ORDER BY id",
+    },
+    QueryCase {
+        name: "ctas projected value storage classes",
+        sql: "SELECT id, typeof(inventory_value), inventory_value FROM ctas_filtered ORDER BY id",
+    },
+    QueryCase {
+        name: "ctas schema rows registered",
+        sql: "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('ctas_filtered', 'ctas_expression', 'ctas_empty') ORDER BY name",
+    },
+];
+
 const DEFAULT_VALUE_SETUP: &str = "
     CREATE TABLE default_items (
         id INTEGER PRIMARY KEY,
@@ -2170,6 +2229,13 @@ fn check_constraint_edges_match_rusqlite() {
 fn ddl_defaults_and_views_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(DDL_SETUP);
     harness.assert_queries_match("DDL/default/view", DDL_CASES);
+}
+
+#[test]
+fn create_table_as_select_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CTAS_SETUP);
+    harness.execute_script(CTAS_SCRIPT);
+    harness.assert_queries_match("CREATE TABLE AS SELECT edge", CTAS_CASES);
 }
 
 #[test]

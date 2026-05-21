@@ -559,4 +559,63 @@ mod tests {
         assert_ne!(CheckpointMode::Passive, CheckpointMode::Full);
         assert_ne!(CheckpointMode::Restart, CheckpointMode::Truncate);
     }
+
+    #[test]
+    fn test_checkpoint_mode_debug_and_serialize() {
+        let dbg = format!("{:?}", CheckpointMode::Truncate);
+        assert!(dbg.contains("Truncate"));
+        let json = serde_json::to_string(&CheckpointMode::Passive).unwrap();
+        assert_eq!(json, "\"Passive\"");
+        let json_full = serde_json::to_string(&CheckpointMode::Full).unwrap();
+        assert_eq!(json_full, "\"Full\"");
+    }
+
+    #[test]
+    fn test_checkpoint_state_clone_copy_debug() {
+        let state = CheckpointState {
+            total_frames: 100,
+            backfilled_frames: 50,
+            oldest_reader_frame: Some(75),
+        };
+        let copied = state;
+        let cloned = state.clone();
+        assert_eq!(copied, cloned);
+        let dbg = format!("{state:?}");
+        assert!(dbg.contains("CheckpointState"));
+        assert!(dbg.contains("total_frames"));
+        assert!(dbg.contains("100"));
+    }
+
+    #[test]
+    fn test_checkpoint_plan_clone_debug() {
+        use super::{CheckpointPostAction, CheckpointProgress};
+        let plan = plan_checkpoint(
+            CheckpointMode::Restart,
+            CheckpointState {
+                total_frames: 20,
+                backfilled_frames: 20,
+                oldest_reader_frame: None,
+            },
+        );
+        let cloned = plan;
+        assert_eq!(plan, cloned);
+        let dbg = format!("{plan:?}");
+        assert!(dbg.contains("CheckpointPlan"));
+        assert!(dbg.contains("Restart"));
+        assert_eq!(plan.progress, CheckpointProgress::Complete);
+        assert_eq!(plan.post_action, CheckpointPostAction::ResetWal);
+    }
+
+    #[test]
+    fn test_progress_and_post_action_variants_eq_debug() {
+        use super::{CheckpointPostAction, CheckpointProgress};
+        assert_ne!(CheckpointProgress::Partial, CheckpointProgress::Complete);
+        assert_eq!(CheckpointProgress::Partial, CheckpointProgress::Partial);
+        assert_ne!(CheckpointPostAction::None, CheckpointPostAction::ResetWal);
+        assert_ne!(CheckpointPostAction::ResetWal, CheckpointPostAction::TruncateWal);
+        let dbg_prog = format!("{:?}", CheckpointProgress::Complete);
+        assert!(dbg_prog.contains("Complete"));
+        let dbg_act = format!("{:?}", CheckpointPostAction::TruncateWal);
+        assert!(dbg_act.contains("TruncateWal"));
+    }
 }

@@ -3695,6 +3695,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_codegen_update_makerecord_carries_table_affinity_string() {
+        // UPDATE re-packs the full row with MakeRecord, whose P4 must be the
+        // table's affinity string so each column value is coerced to its declared
+        // affinity on write-back. affinity_string()/type_to_affinity are unit
+        // tested in isolation, and test_codegen_update_by_rowid checks the
+        // MakeRecord column count, but neither pins that the computed affinity
+        // string actually reaches the emitted MakeRecord op's P4 operand.
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+                time_travel: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("b".to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(2)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        // Derive the expectation from the schema itself (no brittle literal): for
+        // test_schema this is the two column affinities "dC".
+        let expected_affinity = schema[0].affinity_string();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let make_record = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::MakeRecord)
+            .expect("MakeRecord op present");
+        match &make_record.p4 {
+            P4::Affinity(aff) => assert_eq!(
+                *aff, expected_affinity,
+                "MakeRecord P4 affinity must equal the table's affinity_string()"
+            ),
+            _ => panic!("MakeRecord P4 must be P4::Affinity (got a different P4 variant)"),
+        }
+    }
+
     // === Test 4: DELETE by rowid ===
     #[test]
     fn test_codegen_delete_by_rowid() {

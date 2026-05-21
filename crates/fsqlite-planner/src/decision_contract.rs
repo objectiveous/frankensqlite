@@ -956,6 +956,35 @@ mod tests {
     }
 
     #[test]
+    fn calibration_stats_handle_empty_and_uncalibrated_without_nan() {
+        // Empty log: the is_empty guard must return zeroed stats, never a
+        // div-by-zero NaN from the mean/median/stddev computation.
+        let empty = DecisionLog::new();
+        let s = empty.calibration_stats();
+        assert_eq!(s.calibrated_decisions, 0);
+        assert_eq!(s.miscalibrated_count, 0);
+        assert!(
+            !s.mean_ratio.is_nan() && !s.median_ratio.is_nan() && !s.stddev_ratio.is_nan(),
+            "empty log must not produce NaN ratios"
+        );
+        assert!(s.mean_ratio.abs() < f64::EPSILON);
+
+        // Decisions recorded but never given an actual cost contribute no
+        // calibrated samples, so the aggregate stays zeroed (still no NaN).
+        let tables = sample_tables();
+        let indexes = sample_indexes();
+        let plan = sample_plan();
+        let mut log = DecisionLog::new();
+        for i in 0..3 {
+            let _ =
+                log.record_plan(&format!("Q{i}"), &tables, &indexes, 0, None, 0, &plan, 1, false);
+        }
+        let s = log.calibration_stats();
+        assert_eq!(s.calibrated_decisions, 0, "no actuals recorded -> nothing calibrated");
+        assert!(!s.mean_ratio.is_nan(), "uncalibrated log must not produce NaN");
+    }
+
+    #[test]
     fn calibration_stats_well_calibrated() {
         let tables = sample_tables();
         let indexes = sample_indexes();

@@ -272,6 +272,33 @@ const AGGREGATE_EDGE_CASES: &[QueryCase] = &[
     },
 ];
 
+const HAVING_AGGREGATE_ORDER_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "having without group by over single aggregate group",
+        sql: "SELECT COUNT(*) AS sale_count, SUM(qty) AS total_qty FROM sales HAVING total_qty > 100",
+    },
+    QueryCase {
+        name: "aggregate alias in having and order by",
+        sql: "SELECT product_id, SUM(qty) AS total_qty FROM sales GROUP BY product_id HAVING total_qty >= 10 ORDER BY total_qty DESC, product_id",
+    },
+    QueryCase {
+        name: "aggregate expressions in order by",
+        sql: "SELECT store_id, COUNT(*) AS sale_count, SUM(qty) AS total_qty FROM sales GROUP BY store_id ORDER BY SUM(qty) DESC, COUNT(*) DESC, store_id",
+    },
+    QueryCase {
+        name: "filtered aggregate aliases in having",
+        sql: "SELECT substr(sale_date, 1, 7) AS month, COUNT(*) FILTER (WHERE qty >= 10) AS large_sales, SUM(qty) FILTER (WHERE product_id = 300) AS bolt_qty FROM sales GROUP BY month HAVING large_sales > 0 OR bolt_qty IS NOT NULL ORDER BY month",
+    },
+    QueryCase {
+        name: "aggregate ordering with limit offset",
+        sql: "SELECT store_id, SUM(qty) AS total_qty FROM sales GROUP BY store_id HAVING SUM(qty) > 5 ORDER BY total_qty DESC, store_id LIMIT 2 OFFSET 1",
+    },
+    QueryCase {
+        name: "left join aggregate having count",
+        sql: "SELECT r.name, COUNT(ret.id) AS return_rows, COALESCE(SUM(ret.qty), 0) AS returned_qty FROM regions r JOIN stores st ON st.region_id = r.id LEFT JOIN sales s ON s.store_id = st.id LEFT JOIN returns ret ON ret.sale_id = s.id GROUP BY r.name HAVING return_rows >= 1 ORDER BY returned_qty DESC, r.name",
+    },
+];
+
 const UPSERT_SETUP: &str = "
     CREATE TABLE kv (
         id INTEGER PRIMARY KEY,
@@ -1704,6 +1731,15 @@ fn join_using_and_natural_edges_match_rusqlite() {
 fn aggregate_edge_cases_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
     harness.assert_queries_match("aggregate edge", AGGREGATE_EDGE_CASES);
+}
+
+#[test]
+fn having_and_aggregate_ordering_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(SALES_SETUP);
+    harness.assert_queries_match(
+        "HAVING/aggregate ordering edge",
+        HAVING_AGGREGATE_ORDER_CASES,
+    );
 }
 
 #[test]

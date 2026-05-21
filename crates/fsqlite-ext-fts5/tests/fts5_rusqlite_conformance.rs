@@ -746,6 +746,58 @@ impl Fts5ConformanceHarness {
             .expect("read rusqlite FTS5 multiple MATCH rowids")
     }
 
+    fn franken_full_scan_rows(&self) -> Vec<(i64, String, String)> {
+        let cx = Cx::new();
+        let mut cursor = self.franken.open().expect("open FrankenSQLite FTS5 cursor");
+        cursor
+            .filter(&cx, 0, None, &[])
+            .expect("filter FrankenSQLite FTS5 cursor for full scan");
+
+        let mut rows = Vec::new();
+        while !cursor.eof() {
+            let rowid = cursor.rowid().expect("read FrankenSQLite FTS5 rowid");
+
+            let mut title_ctx = ColumnContext::new();
+            cursor
+                .column(&mut title_ctx, 0)
+                .expect("read FrankenSQLite FTS5 title column");
+            let title = title_ctx
+                .take_value()
+                .expect("FrankenSQLite FTS5 title value")
+                .to_text();
+
+            let mut body_ctx = ColumnContext::new();
+            cursor
+                .column(&mut body_ctx, 1)
+                .expect("read FrankenSQLite FTS5 body column");
+            let body = body_ctx
+                .take_value()
+                .expect("FrankenSQLite FTS5 body value")
+                .to_text();
+
+            rows.push((rowid, title, body));
+            cursor.next(&cx).expect("advance FrankenSQLite FTS5 cursor");
+        }
+        rows
+    }
+
+    fn sqlite_full_scan_rows(&self) -> Vec<(i64, String, String)> {
+        let mut stmt = self
+            .sqlite
+            .prepare("SELECT rowid, title, body FROM docs ORDER BY rowid")
+            .expect("prepare rusqlite FTS5 full scan query");
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .expect("query rusqlite FTS5 full scan rows")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("read rusqlite FTS5 full scan rows")
+    }
+
     fn franken_match_is_error(&self, query: &str) -> bool {
         self.franken.search(query).is_err()
     }
@@ -1071,6 +1123,17 @@ fn multiple_match_constraints_match_rusqlite_reference() {
             case.right_query
         );
     }
+}
+
+#[test]
+fn full_scan_rows_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    assert_eq!(
+        harness.franken_full_scan_rows(),
+        harness.sqlite_full_scan_rows(),
+        "full-scan rowid and column conformance failed"
+    );
 }
 
 #[test]

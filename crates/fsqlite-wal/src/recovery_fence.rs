@@ -1125,4 +1125,68 @@ mod tests {
             assert!(!pid_alive_os(high_pid));
         }
     }
+
+    #[test]
+    fn pid_owned_lock_registry_register_deregister_snapshot() {
+        let reg = PidOwnedLockRegistry::new();
+        assert!(reg.is_empty());
+        let p1 = PageNumber::new(1).unwrap();
+        let seq = reg.register(p1, 42);
+        assert_eq!(reg.len(), 1);
+        let seq2 = reg.register(p1, 42);
+        assert_eq!(seq, seq2, "re-entrant register returns same sequence");
+        assert_eq!(reg.len(), 1);
+        let snap = reg.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].page, p1);
+        assert_eq!(snap[0].pid, 42);
+        assert!(reg.deregister(p1, 42));
+        assert!(reg.is_empty());
+        assert!(!reg.deregister(p1, 42));
+    }
+
+    #[test]
+    fn expected_page_checksum_debug_clone_copy_eq() {
+        let a = ExpectedPageChecksum {
+            page: PageNumber::new(5).unwrap(),
+            checksum: crate::checksum::Xxh3Checksum128(0xAA, 0xBB),
+        };
+        let copied = a;
+        assert_eq!(copied, a);
+        let b = ExpectedPageChecksum {
+            page: PageNumber::new(6).unwrap(),
+            checksum: crate::checksum::Xxh3Checksum128(0xAA, 0xBB),
+        };
+        assert_ne!(a, b);
+        let dbg = format!("{a:?}");
+        assert!(dbg.contains("ExpectedPageChecksum"));
+    }
+
+    #[test]
+    fn checkpoint_checksum_verdict_variants_eq() {
+        let m = CheckpointChecksumVerdict::Match;
+        let mm = CheckpointChecksumVerdict::Mismatch {
+            first_bad_page: PageNumber::new(3).unwrap(),
+        };
+        assert_ne!(m, mm);
+        let cloned = mm.clone();
+        assert_eq!(mm, cloned);
+        let dbg = format!("{m:?}");
+        assert!(dbg.contains("Match"));
+    }
+
+    #[test]
+    fn pid_owned_lock_entry_debug_clone_copy_eq() {
+        let e = PidOwnedLockEntry {
+            page: PageNumber::new(7).unwrap(),
+            pid: 100,
+            sequence: 1,
+        };
+        let copied = e;
+        assert_eq!(copied, e);
+        let other = PidOwnedLockEntry { pid: 200, ..e };
+        assert_ne!(e, other);
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("PidOwnedLockEntry"));
+    }
 }

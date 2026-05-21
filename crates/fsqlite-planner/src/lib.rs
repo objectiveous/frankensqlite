@@ -6808,6 +6808,39 @@ mod tests {
     }
 
     #[test]
+    fn test_where_columns_compatible_vs_equivalent() {
+        // _compatible: column names match (case-insens) AND tables either both
+        // match or at least one is None (treats None as a wildcard).
+        // _equivalent: stricter -- both tables must match OR both be None;
+        // mixed Some/None is NOT equivalent. The Some-vs-None case is the
+        // distinguishing input.
+        let bare = |c: &str| WhereColumn {
+            table: None,
+            column: c.to_owned(),
+        };
+        let qual = |t: &str, c: &str| WhereColumn {
+            table: Some(t.to_owned()),
+            column: c.to_owned(),
+        };
+
+        // Same column, both None -> both true.
+        assert!(where_columns_compatible(&bare("x"), &bare("X")));
+        assert!(where_columns_equivalent(&bare("x"), &bare("X")));
+        // Same column, both same table (case-insens) -> both true.
+        assert!(where_columns_compatible(&qual("t", "x"), &qual("T", "X")));
+        assert!(where_columns_equivalent(&qual("t", "x"), &qual("T", "X")));
+        // Same column, different tables -> both false.
+        assert!(!where_columns_compatible(&qual("t", "x"), &qual("u", "x")));
+        assert!(!where_columns_equivalent(&qual("t", "x"), &qual("u", "x")));
+        // Mixed Some/None: compatible treats None as wildcard, equivalent doesn't.
+        assert!(where_columns_compatible(&qual("t", "x"), &bare("x")));
+        assert!(!where_columns_equivalent(&qual("t", "x"), &bare("x")));
+        // Different columns -> both false (regardless of table).
+        assert!(!where_columns_compatible(&bare("x"), &bare("y")));
+        assert!(!where_columns_equivalent(&bare("x"), &bare("y")));
+    }
+
+    #[test]
     fn test_qualifier_matches_table() {
         // A qualifier matches by table name or by alias, case-insensitively.
         // Table name, no alias.

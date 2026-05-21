@@ -2256,6 +2256,39 @@ mod tests {
         assert_eq!(extract_column_eq_bind(None), None);
     }
 
+    #[test]
+    fn test_extract_rowid_bind_symmetry_and_form_preservation() {
+        let eq = |left: Expr, right: Expr| Expr::BinaryOp {
+            left: Box::new(left),
+            op: AstBinaryOp::Eq,
+            right: Box::new(right),
+            span: Span::ZERO,
+        };
+        let col = |name: &str| Expr::Column(ColumnRef::bare(name), Span::ZERO);
+
+        // `rowid = ?2` -> Numbered(2); the *_param form collapses to 2.
+        let e = eq(col("rowid"), placeholder(2));
+        assert_eq!(extract_rowid_bind(Some(&e)), Some(BindParamRef::Numbered(2)));
+        assert_eq!(extract_rowid_bind_param(Some(&e)), Some(2));
+
+        // Symmetric, and the `oid` alias is recognized: `?3 = oid` -> Numbered(3).
+        let e = eq(placeholder(3), col("oid"));
+        assert_eq!(extract_rowid_bind(Some(&e)), Some(BindParamRef::Numbered(3)));
+
+        // An anonymous placeholder preserves its form; *_param collapses it to 1.
+        let e = eq(col("rowid"), Expr::Placeholder(PlaceholderType::Anonymous, Span::ZERO));
+        assert_eq!(extract_rowid_bind(Some(&e)), Some(BindParamRef::Anonymous));
+        assert_eq!(extract_rowid_bind_param(Some(&e)), Some(1));
+
+        // A non-rowid column is not extracted here (handled by column-eq path).
+        let e = eq(col("name"), placeholder(1));
+        assert_eq!(extract_rowid_bind(Some(&e)), None);
+
+        // Non-bind RHS and a missing WHERE -> None.
+        assert_eq!(extract_rowid_bind(Some(&eq(col("rowid"), col("id")))), None);
+        assert_eq!(extract_rowid_bind(None), None);
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),

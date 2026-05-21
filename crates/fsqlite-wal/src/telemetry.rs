@@ -813,4 +813,62 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0], event);
     }
+
+    #[test]
+    fn ring_buffer_wraps_at_capacity() {
+        let rb = WalTelemetryRingBuffer::new(2);
+        for i in 0..5u64 {
+            rb.on_event(&WalTelemetryEvent::WalReset {
+                new_checkpoint_seq: i as u32,
+                timestamp_ns: i,
+            });
+        }
+        assert_eq!(rb.len(), 2);
+        let drained = rb.drain();
+        assert_eq!(drained.len(), 2);
+        if let WalTelemetryEvent::WalReset { new_checkpoint_seq, .. } = &drained[0] {
+            assert_eq!(*new_checkpoint_seq, 3);
+        } else {
+            panic!("expected WalReset");
+        }
+    }
+
+    #[test]
+    fn noop_observer_does_not_panic() {
+        let obs = NoOpWalObserver;
+        obs.on_event(&WalTelemetryEvent::WalReset {
+            new_checkpoint_seq: 0,
+            timestamp_ns: 0,
+        });
+    }
+
+    #[test]
+    fn ring_buffer_empty_drain_returns_empty() {
+        let rb = WalTelemetryRingBuffer::new(4);
+        assert!(rb.is_empty());
+        assert_eq!(rb.len(), 0);
+        let drained = rb.drain();
+        assert!(drained.is_empty());
+    }
+
+    #[test]
+    fn wal_telemetry_event_debug_clone_eq() {
+        let a = WalTelemetryEvent::FrameAppended {
+            frame_count: 3,
+            bytes_written: 12288,
+            is_commit: true,
+            timestamp_ns: 100,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+        let c = WalTelemetryEvent::FrameAppended {
+            frame_count: 1,
+            bytes_written: 4096,
+            is_commit: false,
+            timestamp_ns: 200,
+        };
+        assert_ne!(a, c);
+        let dbg = format!("{a:?}");
+        assert!(dbg.contains("FrameAppended"));
+    }
 }

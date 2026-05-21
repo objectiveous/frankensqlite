@@ -2380,4 +2380,57 @@ mod tests {
             "second handle reports correct file size"
         );
     }
+
+    #[test]
+    fn test_usage_snapshot_live_reserved_fragmentation() {
+        let snap = MemoryVfsUsageSnapshot {
+            file_bytes: 100,
+            file_reserved_bytes: 200,
+            shm_bytes: 50,
+            shm_reserved_bytes: 80,
+            peak_reserved_bytes: 300,
+            growth_events: 2,
+            file_count: 1,
+            shm_region_count: 1,
+            initial_reserve_bytes: 0,
+            growth_chunk_bytes: 64 * 1024,
+            max_bytes: None,
+        };
+        assert_eq!(snap.live_bytes(), 150);
+        assert_eq!(snap.reserved_bytes(), 280);
+        assert_eq!(snap.fragmentation_bytes(), 130);
+    }
+
+    #[test]
+    fn test_memory_vfs_config_default() {
+        let cfg = MemoryVfsConfig::default();
+        assert_eq!(cfg.initial_reserve_bytes, 0);
+        assert_eq!(cfg.growth_chunk_bytes, WASM_LINEAR_MEMORY_PAGE_BYTES);
+        assert_eq!(cfg.max_bytes, None);
+        let cfg2 = cfg;
+        assert_eq!(cfg, cfg2);
+    }
+
+    #[test]
+    fn test_new_with_config_and_config_accessor() {
+        let cfg = MemoryVfsConfig {
+            initial_reserve_bytes: 8192,
+            growth_chunk_bytes: 4096,
+            max_bytes: Some(1_000_000),
+        };
+        let vfs = MemoryVfs::new_with_config(cfg);
+        let retrieved = vfs.config().unwrap();
+        assert_eq!(retrieved, cfg);
+    }
+
+    #[test]
+    fn test_usage_snapshot_default_all_zero() {
+        let snap = MemoryVfsUsageSnapshot::default();
+        assert_eq!(snap.live_bytes(), 0);
+        assert_eq!(snap.reserved_bytes(), 0);
+        assert_eq!(snap.fragmentation_bytes(), 0);
+        assert_eq!(snap.file_count, 0);
+        assert_eq!(snap.growth_events, 0);
+        assert_eq!(snap.peak_reserved_bytes, 0);
+    }
 }

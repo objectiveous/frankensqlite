@@ -63,6 +63,8 @@ impl WeightedRow {
 pub enum DataflowError {
     /// A requested column index exceeded the row width.
     ColumnOutOfBounds { column: usize, width: usize },
+    /// Integer predicate operators only accept integer value inputs.
+    PredicateValueNotInteger { column: usize },
     /// Integer aggregate operators only accept integer value inputs.
     AggregateValueNotInteger { column: usize },
     /// Join key mappings must specify the same number of left and right columns.
@@ -79,6 +81,9 @@ impl fmt::Display for DataflowError {
         match self {
             Self::ColumnOutOfBounds { column, width } => {
                 write!(f, "column {column} out of bounds for row width {width}")
+            }
+            Self::PredicateValueNotInteger { column } => {
+                write!(f, "predicate value column {column} is not an integer")
             }
             Self::AggregateValueNotInteger { column } => {
                 write!(f, "aggregate value column {column} is not an integer")
@@ -181,6 +186,12 @@ impl DataflowAutomaton {
 pub enum DataflowOperator {
     /// Keep only rows where `column == value`.
     FilterEq { column: usize, value: SqliteValue },
+    /// Keep rows where an integer column satisfies the comparison.
+    FilterIntegerCompare {
+        column: usize,
+        op: IntegerComparison,
+        value: i64,
+    },
     /// Keep only the requested columns, preserving row weight.
     Project { columns: Vec<usize> },
     /// Keep rows whose algebraic weight matches the requested sign.
@@ -254,6 +265,9 @@ impl DataflowOperator {
                     })),
                 })
                 .collect(),
+            Self::FilterIntegerCompare { column, op, value } => {
+                filter_integer_compare(rows, *column, *op, *value)
+            }
             Self::Project { columns } => rows
                 .iter()
                 .map(|row| Ok(WeightedRow::new(row.project(columns)?, row.weight)))
@@ -297,6 +311,30 @@ impl DataflowOperator {
                 delta_right,
                 key_spec,
             } => delta_join_update(stable_left, rows, stable_right, delta_right, key_spec),
+        }
+    }
+}
+
+/// Integer predicate comparison used by dataflow filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegerComparison {
+    /// Match values strictly below the threshold.
+    LessThan,
+    /// Match values at or below the threshold.
+    LessOrEqual,
+    /// Match values strictly above the threshold.
+    GreaterThan,
+    /// Match values at or above the threshold.
+    GreaterOrEqual,
+}
+
+impl IntegerComparison {
+    fn matches(self, candidate: i64, threshold: i64) -> bool {
+        match self {
+            Self::LessThan => candidate < threshold,
+            Self::LessOrEqual => candidate <= threshold,
+            Self::GreaterThan => candidate > threshold,
+            Self::GreaterOrEqual => candidate >= threshold,
         }
     }
 }
@@ -380,6 +418,27 @@ fn append_literal_column(rows: &[WeightedRow], value: &SqliteValue) -> Vec<Weigh
             let mut values = row.values.clone();
             values.push(value.clone());
             Some(WeightedRow::new(values, row.weight))
+        })
+        .collect()
+}
+
+fn filter_integer_compare(
+    rows: &[WeightedRow],
+    column: usize,
+    op: IntegerComparison,
+    value: i64,
+) -> DataflowResult<Vec<WeightedRow>> {
+    rows.iter()
+        .filter_map(|row| match row.values.get(column) {
+            Some(SqliteValue::Integer(candidate)) if op.matches(*candidate, value) => {
+                Some(Ok(row.clone()))
+            }
+            Some(SqliteValue::Integer(_)) => None,
+            Some(_) => Some(Err(DataflowError::PredicateValueNotInteger { column })),
+            None => Some(Err(DataflowError::ColumnOutOfBounds {
+                column,
+                width: row.width(),
+            })),
         })
         .collect()
 }
@@ -739,9 +798,9 @@ pub fn delta_join_update(
 #[cfg(test)]
 mod tests {
     use super::{
-        DataflowAutomaton, DataflowError, DataflowOperator, JoinKeySpec, WeightSign, WeightedRow,
-        delta_join_left, delta_join_right, delta_join_update, scale_weights, set_weights,
-        threshold_positive,
+        DataflowAutomaton, DataflowError, DataflowOperator, IntegerComparison, JoinKeySpec,
+        WeightSign, WeightedRow, delta_join_left, delta_join_right, delta_join_update,
+        scale_weights, set_weights, threshold_positive,
     };
     use fsqlite_types::SqliteValue;
 
@@ -787,6 +846,67 @@ mod tests {
             DataflowError::SchemaChanged {
                 expected_width: 2,
                 actual_width: 3
+            }
+        );
+    }
+
+    #[test]
+    fn filter_integer_compare_keeps_matching_weighted_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterIntegerCompare {
+            column: 1,
+            op: IntegerComparison::GreaterOrEqual,
+            value: 10,
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), int(9)], 3),
+            WeightedRow::new(vec![int(2), int(10)], -2),
+            WeightedRow::new(vec![int(3), int(11)], 4),
+            WeightedRow::new(vec![int(4), int(12)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(2), int(10)], -2),
+                WeightedRow::new(vec![int(3), int(11)], 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_integer_compare_rejects_non_integer_values() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterIntegerCompare {
+            column: 1,
+            op: IntegerComparison::LessThan,
+            value: 10,
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), SqliteValue::Float(1.5)])])
+            .expect_err("non-integer predicate input should fail");
+
+        assert_eq!(err, DataflowError::PredicateValueNotInteger { column: 1 });
+    }
+
+    #[test]
+    fn filter_integer_compare_rejects_out_of_bounds_columns() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterIntegerCompare {
+            column: 2,
+            op: IntegerComparison::LessOrEqual,
+            value: 10,
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), int(2)])])
+            .expect_err("invalid predicate column should fail");
+
+        assert_eq!(
+            err,
+            DataflowError::ColumnOutOfBounds {
+                column: 2,
+                width: 2
             }
         );
     }

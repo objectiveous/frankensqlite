@@ -956,6 +956,20 @@ mod tests {
         assert!((default_selectivity(Operator::Ne) - 0.99).abs() < 0.001);
         assert!((default_selectivity(Operator::Lt) - 0.333).abs() < 0.001);
         assert!((default_selectivity(Operator::Like) - 0.1).abs() < 0.001);
+
+        // Complete the operator coverage: the aliases collapse to their primary
+        // operator's selectivity, and all four range operators agree.
+        let eps = 1e-9;
+        assert!((default_selectivity(Operator::Is) - default_selectivity(Operator::Eq)).abs() < eps);
+        assert!(
+            (default_selectivity(Operator::IsNot) - default_selectivity(Operator::Ne)).abs() < eps
+        );
+        assert!(
+            (default_selectivity(Operator::Glob) - default_selectivity(Operator::Like)).abs() < eps
+        );
+        for op in [Operator::Le, Operator::Gt, Operator::Ge] {
+            assert!((default_selectivity(op) - default_selectivity(Operator::Lt)).abs() < eps);
+        }
     }
 
     #[test]

@@ -2945,6 +2945,35 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_expr_scalar_literal_opcodes() {
+        // test_emit_expr_large_integer_literal_uses_int64_opcode covers the
+        // Integer small/large split; this pins the opcode (and p1, for booleans)
+        // that each remaining scalar literal lowers to.
+        let emit_first = |lit: Literal| -> (Opcode, i32) {
+            let mut b = ProgramBuilder::new();
+            let reg = b.alloc_reg();
+            emit_expr(&mut b, &Expr::Literal(lit, Span::ZERO), reg).unwrap();
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            let prog = b.finish().unwrap();
+            let op = prog
+                .ops()
+                .iter()
+                .find(|o| o.opcode != Opcode::Halt)
+                .expect("a literal op");
+            (op.opcode, op.p1)
+        };
+
+        assert_eq!(emit_first(Literal::Null).0, Opcode::Null);
+        assert_eq!(emit_first(Literal::Float(1.5)).0, Opcode::Real);
+        assert_eq!(emit_first(Literal::String("hi".to_owned())).0, Opcode::String8);
+        assert_eq!(emit_first(Literal::Blob(vec![1, 2, 3])).0, Opcode::Blob);
+
+        // Boolean literals both lower to Integer, distinguished by p1 (1 / 0).
+        assert_eq!(emit_first(Literal::True), (Opcode::Integer, 1));
+        assert_eq!(emit_first(Literal::False), (Opcode::Integer, 0));
+    }
+
+    #[test]
     fn test_emit_expr_large_integer_literal_uses_int64_opcode() {
         let mut b = ProgramBuilder::new();
         let reg = b.alloc_reg();

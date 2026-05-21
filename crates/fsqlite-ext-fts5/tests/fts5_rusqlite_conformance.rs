@@ -125,6 +125,24 @@ const UNICODE61_DIACRITIC_DOCS: &[Doc] = &[
     },
 ];
 
+const UNICODE61_DISTINCT_DIACRITIC_DOCS: &[Doc] = &[
+    Doc {
+        rowid: 1,
+        title: "Accent record",
+        body: "café crème résumé",
+    },
+    Doc {
+        rowid: 2,
+        title: "Plain record",
+        body: "cafe creme resume",
+    },
+    Doc {
+        rowid: 3,
+        title: "Mixed record",
+        body: "café resume",
+    },
+];
+
 const PORTER_DOCS: &[Doc] = &[
     Doc {
         rowid: 1,
@@ -239,6 +257,7 @@ const UNICODE61_DEFAULT_SEPARATOR_DOCS: &[Doc] = &[
 ];
 
 const UNICODE61_DIACRITIC_OPTIONS: &[&str] = &["tokenize='unicode61 remove_diacritics 2'"];
+const UNICODE61_KEEP_DIACRITIC_OPTIONS: &[&str] = &[r#"tokenize="unicode61 remove_diacritics 0""#];
 const UNICODE61_CODE_TOKEN_OPTIONS: &[&str] = &[r#"tokenize="unicode61 tokenchars '-_./:@#$%'""#];
 const UNICODE61_SEPARATOR_OPTIONS: &[&str] = &[r#"tokenize="unicode61 separators '_.'""#];
 const UNINDEXED_COLUMN_SPECS: &[&str] = &["title", "body UNINDEXED"];
@@ -334,6 +353,33 @@ const DEFAULT_DIACRITIC_CASES: &[MatchCase] = &[
     MatchCase {
         name: "accented prefix matches plain token",
         query: "résum*",
+    },
+];
+
+const KEEP_DIACRITIC_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "accented term stays distinct",
+        query: "café",
+    },
+    MatchCase {
+        name: "plain term stays distinct",
+        query: "cafe",
+    },
+    MatchCase {
+        name: "accented phrase stays distinct",
+        query: r#""café crème""#,
+    },
+    MatchCase {
+        name: "plain phrase stays distinct",
+        query: r#""cafe creme""#,
+    },
+    MatchCase {
+        name: "accented prefix stays distinct",
+        query: "résum*",
+    },
+    MatchCase {
+        name: "plain prefix stays distinct",
+        query: "resum*",
     },
 ];
 
@@ -1260,6 +1306,24 @@ fn default_unicode61_diacritic_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "default unicode61 diacritic conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn unicode61_keep_diacritic_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::with_docs(
+        UNICODE61_KEEP_DIACRITIC_OPTIONS,
+        UNICODE61_DISTINCT_DIACRITIC_DOCS,
+    );
+
+    for case in KEEP_DIACRITIC_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "unicode61 keep-diacritic conformance case failed: {} ({})",
             case.name,
             case.query
         );

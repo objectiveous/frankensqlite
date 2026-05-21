@@ -1634,6 +1634,41 @@ const DELETE_REPLACE_TERM_REUSE_CASES: &[MatchCase] = &[
     },
 ];
 
+const REPLACE_THEN_DELETE_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "original title term removed after delete",
+        query: "title:fts",
+    },
+    MatchCase {
+        name: "original body term removed after delete",
+        query: "body:prefix",
+    },
+    MatchCase {
+        name: "intermediate title term removed after delete",
+        query: "temporary",
+    },
+    MatchCase {
+        name: "intermediate body term removed after delete",
+        query: "ephemeral",
+    },
+    MatchCase {
+        name: "intermediate phrase removed after delete",
+        query: r#""replacement token""#,
+    },
+    MatchCase {
+        name: "retained rust rows after replace delete",
+        query: "rust",
+    },
+    MatchCase {
+        name: "retained sqlite rows after replace delete",
+        query: "sqlite",
+    },
+    MatchCase {
+        name: "retained search rows after replace delete",
+        query: "search",
+    },
+];
+
 const REINSERT_ROWID_CASES: &[MatchCase] = &[
     MatchCase {
         name: "old rowid term removed",
@@ -3170,6 +3205,35 @@ fn delete_replace_term_reuse_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "delete-replace term-reuse MATCH conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn replace_then_delete_queries_match_rusqlite_reference() {
+    let mut harness = Fts5ConformanceHarness::new(&[]);
+    harness.insert_or_replace_doc(Doc {
+        rowid: 2,
+        title: "Temporary row",
+        body: "ephemeral replacement token",
+    });
+    harness.delete_doc(2);
+
+    let mut franken_rows = harness.franken_full_scan_rows();
+    franken_rows.sort_by_key(|row| row.0);
+    assert_eq!(
+        franken_rows,
+        harness.sqlite_full_scan_rows(),
+        "replace-then-delete full-scan conformance failed"
+    );
+
+    for case in REPLACE_THEN_DELETE_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "replace-then-delete MATCH conformance case failed: {} ({})",
             case.name,
             case.query
         );

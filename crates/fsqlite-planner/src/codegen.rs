@@ -2517,6 +2517,33 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_find_table_is_case_insensitive_and_errors_on_missing() {
+        let schema = vec![
+            TableSchema {
+                name: "Users".to_owned(),
+                root_page: 2,
+                columns: vec![],
+                indexes: vec![],
+            },
+            TableSchema {
+                name: "orders".to_owned(),
+                root_page: 3,
+                columns: vec![],
+                indexes: vec![],
+            },
+        ];
+        // Exact and case-insensitive name matches.
+        assert_eq!(find_table(&schema, "Users").unwrap().name, "Users");
+        assert_eq!(find_table(&schema, "users").unwrap().name, "Users", "case-insensitive");
+        assert_eq!(find_table(&schema, "ORDERS").unwrap().name, "orders");
+        // A missing table -> TableNotFound carrying the requested name.
+        assert!(matches!(
+            find_table(&schema, "missing"),
+            Err(CodegenError::TableNotFound(ref n)) if n == "missing"
+        ));
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),

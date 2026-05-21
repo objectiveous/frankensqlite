@@ -256,10 +256,29 @@ const UNICODE61_DEFAULT_SEPARATOR_DOCS: &[Doc] = &[
     },
 ];
 
+const ASCII_TOKENIZER_DOCS: &[Doc] = &[
+    Doc {
+        rowid: 1,
+        title: "ASCII cafe",
+        body: "cafe HELLO world",
+    },
+    Doc {
+        rowid: 2,
+        title: "Accent record",
+        body: "café hello world",
+    },
+    Doc {
+        rowid: 3,
+        title: "Upper token",
+        body: "HELLO-writer ABC123",
+    },
+];
+
 const UNICODE61_DIACRITIC_OPTIONS: &[&str] = &["tokenize='unicode61 remove_diacritics 2'"];
 const UNICODE61_KEEP_DIACRITIC_OPTIONS: &[&str] = &[r#"tokenize="unicode61 remove_diacritics 0""#];
 const UNICODE61_CODE_TOKEN_OPTIONS: &[&str] = &[r#"tokenize="unicode61 tokenchars '-_./:@#$%'""#];
 const UNICODE61_SEPARATOR_OPTIONS: &[&str] = &[r#"tokenize="unicode61 separators '_.'""#];
+const ASCII_TOKENIZER_OPTIONS: &[&str] = &["tokenize='ascii'"];
 const UNINDEXED_COLUMN_SPECS: &[&str] = &["title", "body UNINDEXED"];
 const COLUMN_SIZE_ZERO_OPTIONS: &[&str] = &["columnsize=0"];
 const CONTENTLESS_OPTIONS: &[&str] = &["content=''"];
@@ -403,6 +422,41 @@ const DEFAULT_SEPARATOR_CASES: &[MatchCase] = &[
     MatchCase {
         name: "prefix includes joined and split tokens",
         query: "alph*",
+    },
+];
+
+const ASCII_TOKENIZER_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "ascii case folds uppercase body",
+        query: "hello",
+    },
+    MatchCase {
+        name: "ascii exact token excludes accented suffix",
+        query: "cafe",
+    },
+    MatchCase {
+        name: "ascii prefix fragment excludes non-ascii token",
+        query: "caf",
+    },
+    MatchCase {
+        name: "non-ascii query normalizes through ascii tokenizer",
+        query: "café",
+    },
+    MatchCase {
+        name: "ascii phrase across folded tokens",
+        query: r#""hello world""#,
+    },
+    MatchCase {
+        name: "ascii alnum token",
+        query: "abc123",
+    },
+    MatchCase {
+        name: "ascii prefix over folded token",
+        query: "writ*",
+    },
+    MatchCase {
+        name: "ascii title column filter",
+        query: "title:ascii",
     },
 ];
 
@@ -1339,6 +1393,21 @@ fn default_unicode61_separator_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "default unicode61 separator conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn ascii_tokenizer_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::with_docs(ASCII_TOKENIZER_OPTIONS, ASCII_TOKENIZER_DOCS);
+
+    for case in ASCII_TOKENIZER_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "ascii tokenizer conformance case failed: {} ({})",
             case.name,
             case.query
         );

@@ -2914,7 +2914,8 @@ impl Fts5Tokenizer for Unicode61Tokenizer {
     }
 }
 
-/// ASCII tokenizer: like unicode61 but only ASCII alphanumeric characters.
+/// ASCII tokenizer: folds ASCII letters and treats all non-ASCII codepoints as
+/// token characters.
 #[derive(Debug, Default)]
 pub struct AsciiTokenizer;
 
@@ -2925,8 +2926,10 @@ impl AsciiTokenizer {
             Some(ch)
         } else if ch.is_ascii_uppercase() {
             Some(ch.to_ascii_lowercase())
-        } else {
+        } else if ch.is_ascii() {
             None
+        } else {
+            Some(ch)
         }
     }
 }
@@ -15185,12 +15188,11 @@ mod tests {
     }
 
     #[test]
-    fn test_ascii_tokenizer_non_ascii_dropped() {
+    fn test_ascii_tokenizer_keeps_non_ascii_token_chars() {
         let tok = AsciiTokenizer;
         let tokens = tok.tokenize("café hello");
         let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
-        // 'é' is not ASCII alphanumeric, so "caf" and "hello" are separate tokens.
-        assert_eq!(terms, vec!["caf", "hello"]);
+        assert_eq!(terms, vec!["café", "hello"]);
     }
 
     #[test]

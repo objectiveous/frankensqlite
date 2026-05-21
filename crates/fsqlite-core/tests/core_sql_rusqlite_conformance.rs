@@ -409,6 +409,56 @@ const WITH_UPSERT_RETURNING_CASES: &[QueryCase] = &[
     },
 ];
 
+const CONFLICT_RESOLUTION_SETUP: &str = "
+    CREATE TABLE conflict_items (
+        id INTEGER PRIMARY KEY,
+        sku TEXT NOT NULL UNIQUE,
+        qty INTEGER NOT NULL,
+        note TEXT DEFAULT 'seed'
+    );
+
+    INSERT INTO conflict_items(id, sku, qty, note) VALUES
+        (1, 'alpha', 10, 'first'),
+        (2, 'beta', 20, 'second'),
+        (3, 'gamma', 30, 'third');
+";
+
+const CONFLICT_RESOLUTION_SCRIPT: &str = "
+    INSERT OR IGNORE INTO conflict_items(id, sku, qty, note)
+        VALUES (4, 'alpha', 99, 'ignored-by-sku');
+    INSERT OR IGNORE INTO conflict_items(id, sku, qty, note)
+        VALUES (4, 'delta', 40, 'inserted');
+    INSERT OR REPLACE INTO conflict_items(id, sku, qty, note)
+        VALUES (2, 'beta', 25, 'replaced-by-id');
+    INSERT OR REPLACE INTO conflict_items(id, sku, qty, note)
+        VALUES (5, 'gamma', 35, 'replaced-by-sku');
+    UPDATE OR IGNORE conflict_items
+        SET sku = 'delta', note = 'ignored-update'
+        WHERE id = 2;
+    UPDATE OR REPLACE conflict_items
+        SET sku = 'delta', qty = qty + 5, note = 'replace-update'
+        WHERE id = 1;
+";
+
+const CONFLICT_RESOLUTION_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "final conflict resolution rows",
+        sql: "SELECT id, sku, qty, note FROM conflict_items ORDER BY id",
+    },
+    QueryCase {
+        name: "ignored and replaced rows are absent",
+        sql: "SELECT COUNT(*) FROM conflict_items WHERE note LIKE 'ignored%' OR id IN (3, 4)",
+    },
+    QueryCase {
+        name: "unique sku groups remain singular",
+        sql: "SELECT sku, COUNT(*), SUM(qty) FROM conflict_items GROUP BY sku ORDER BY sku",
+    },
+    QueryCase {
+        name: "post conflict aggregate state",
+        sql: "SELECT COUNT(*), SUM(qty), MIN(id), MAX(id) FROM conflict_items",
+    },
+];
+
 const CTE_SETUP: &str = "
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -1944,6 +1994,13 @@ fn upsert_conflict_handling_matches_rusqlite() {
 fn with_upsert_returning_matches_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(WITH_UPSERT_RETURNING_SETUP);
     harness.assert_queries_match("WITH/UPSERT/RETURNING", WITH_UPSERT_RETURNING_CASES);
+}
+
+#[test]
+fn conflict_resolution_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CONFLICT_RESOLUTION_SETUP);
+    harness.execute_script(CONFLICT_RESOLUTION_SCRIPT);
+    harness.assert_queries_match("conflict resolution edge", CONFLICT_RESOLUTION_CASES);
 }
 
 #[test]

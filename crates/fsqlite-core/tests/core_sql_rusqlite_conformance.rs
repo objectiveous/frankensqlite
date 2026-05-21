@@ -1584,6 +1584,29 @@ const SCALAR_NULL_COMPARISON_CASES: &[QueryCase] = &[
     },
 ];
 
+const IS_DISTINCT_FROM_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "literal null distinctness",
+        sql: "SELECT NULL IS DISTINCT FROM NULL, NULL IS DISTINCT FROM 1, 1 IS DISTINCT FROM NULL, 1 IS NOT DISTINCT FROM 1, 1 IS NOT DISTINCT FROM NULL",
+    },
+    QueryCase {
+        name: "literal mixed storage distinctness",
+        sql: "SELECT 1 IS DISTINCT FROM 1.0, 1 IS DISTINCT FROM '1', 'a' IS DISTINCT FROM 'A', X'41' IS DISTINCT FROM 'A'",
+    },
+    QueryCase {
+        name: "column driven null aware distinctness",
+        sql: "SELECT id, a IS DISTINCT FROM b, a IS NOT DISTINCT FROM b, label IS DISTINCT FROM NULL, label IS NOT DISTINCT FROM 'high' FROM expr_rows ORDER BY id",
+    },
+    QueryCase {
+        name: "expression operands",
+        sql: "SELECT id, (a + 0) IS DISTINCT FROM b, COALESCE(label, 'none') IS NOT DISTINCT FROM label, (a > b) IS DISTINCT FROM NULL FROM expr_rows ORDER BY id",
+    },
+    QueryCase {
+        name: "scalar subquery operands",
+        sql: "SELECT id, a IS DISTINCT FROM (SELECT max(b) FROM expr_rows), label IS NOT DISTINCT FROM (SELECT label FROM expr_rows WHERE id = 1) FROM expr_rows ORDER BY id",
+    },
+];
+
 const CONDITIONAL_SCALAR_SETUP: &str = "
     CREATE TABLE conditional_values (
         id INTEGER PRIMARY KEY,
@@ -3149,6 +3172,12 @@ fn case_and_null_logic_match_rusqlite() {
 fn scalar_null_comparison_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
     harness.assert_queries_match("scalar NULL/comparison edge", SCALAR_NULL_COMPARISON_CASES);
+}
+
+#[test]
+fn is_distinct_from_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
+    harness.assert_queries_match("IS DISTINCT FROM edge", IS_DISTINCT_FROM_CASES);
 }
 
 #[test]

@@ -1156,6 +1156,40 @@ mod tests {
     }
 
     #[test]
+    fn calibration_stats_rate_and_well_calibrated_boundaries() {
+        let stats = |cal: usize, misc: usize, median: f64| CalibrationStats {
+            total_decisions: cal,
+            calibrated_decisions: cal,
+            miscalibrated_count: misc,
+            mean_ratio: median,
+            median_ratio: median,
+            stddev_ratio: 0.0,
+            min_ratio: median,
+            max_ratio: median,
+        };
+
+        // miscalibration_rate: zero calibrated -> 0.0 (guarded, no div-by-zero).
+        assert!(stats(0, 5, 1.0).miscalibration_rate().abs() < f64::EPSILON);
+        assert!((stats(10, 3, 1.0).miscalibration_rate() - 0.3).abs() < 1e-9);
+        assert!((stats(4, 1, 1.0).miscalibration_rate() - 0.25).abs() < 1e-9);
+
+        // No data -> well-calibrated (no evidence of miscalibration).
+        assert!(CalibrationStats::default().is_well_calibrated());
+
+        // Median boundaries are inclusive [0.5, 2.0]; rate must stay under 10%.
+        assert!(stats(100, 0, 1.0).is_well_calibrated());
+        assert!(stats(100, 0, 0.5).is_well_calibrated(), "median == 0.5 is in range");
+        assert!(stats(100, 0, 2.0).is_well_calibrated(), "median == 2.0 is in range");
+        assert!(!stats(100, 0, 0.49).is_well_calibrated(), "median below 0.5 fails");
+        assert!(!stats(100, 0, 2.01).is_well_calibrated(), "median above 2.0 fails");
+
+        // The miscalibration-rate threshold is strict (< 0.10): exactly 10% fails.
+        assert!(stats(100, 9, 1.0).is_well_calibrated(), "9% with a good median is ok");
+        assert!(!stats(100, 10, 1.0).is_well_calibrated(), "exactly 10% is not ok");
+        assert!(!stats(100, 50, 1.0).is_well_calibrated(), "high rate overrides a good median");
+    }
+
+    #[test]
     fn calibration_stats_display() {
         let stats = CalibrationStats {
             total_decisions: 10,

@@ -394,6 +394,33 @@ const CAST_COLLATION_CASES: &[QueryCase] = &[
     },
 ];
 
+const COLLATION_EXPRESSION_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "explicit nocase comparison on expression",
+        sql: "SELECT w FROM words WHERE w COLLATE NOCASE = 'apple' ORDER BY w COLLATE BINARY",
+    },
+    QueryCase {
+        name: "explicit binary comparison overrides column nocase",
+        sql: "SELECT w FROM words WHERE w COLLATE BINARY = 'Apple' ORDER BY w COLLATE BINARY",
+    },
+    QueryCase {
+        name: "explicit binary grouping overrides column nocase",
+        sql: "SELECT tag COLLATE BINARY, COUNT(*) FROM tags GROUP BY tag COLLATE BINARY ORDER BY tag COLLATE BINARY",
+    },
+    QueryCase {
+        name: "distinct aggregate respects explicit collation",
+        sql: "SELECT COUNT(DISTINCT tag COLLATE BINARY), COUNT(DISTINCT tag COLLATE NOCASE) FROM tags",
+    },
+    QueryCase {
+        name: "explicit binary comparison overrides column rtrim",
+        sql: "SELECT id, label FROM padded WHERE label COLLATE BINARY = 'abc' ORDER BY id",
+    },
+    QueryCase {
+        name: "explicit rtrim grouping on expression",
+        sql: "SELECT label COLLATE RTRIM, COUNT(*) FROM padded GROUP BY label COLLATE RTRIM ORDER BY label COLLATE BINARY",
+    },
+];
+
 const DML_SETUP: &str = "
     CREATE TABLE inventory (
         id INTEGER PRIMARY KEY,
@@ -1274,6 +1301,12 @@ fn window_functions_match_rusqlite() {
 fn cast_and_collation_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CAST_COLLATION_SETUP);
     harness.assert_queries_match("CAST/collation", CAST_COLLATION_CASES);
+}
+
+#[test]
+fn collation_expression_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CAST_COLLATION_SETUP);
+    harness.assert_queries_match("collation expression", COLLATION_EXPRESSION_CASES);
 }
 
 #[test]

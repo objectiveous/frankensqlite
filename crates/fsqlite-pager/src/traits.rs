@@ -1774,6 +1774,70 @@ mod tests {
     }
 
     #[test]
+    fn test_journal_mode_debug_clone_copy_eq() {
+        let a = JournalMode::Wal;
+        let b = a;
+        let c = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_ne!(JournalMode::Delete, JournalMode::Wal);
+        let dbg = format!("{a:?}");
+        assert!(dbg.contains("Wal"));
+    }
+
+    #[test]
+    fn test_checkpoint_result_clone_debug() {
+        let result = CheckpointResult {
+            total_frames: 50,
+            frames_backfilled: 50,
+            completed: true,
+            wal_was_reset: true,
+            requested_mode: CheckpointMode::Truncate,
+            effective_mode: CheckpointMode::Truncate,
+        };
+        let cloned = result.clone();
+        assert_eq!(result, cloned);
+        let dbg = format!("{result:?}");
+        assert!(dbg.contains("CheckpointResult"));
+        assert!(dbg.contains("Truncate"));
+        assert!(dbg.contains("wal_was_reset"));
+    }
+
+    #[test]
+    fn test_wal_publication_snapshot_clone_copy_debug() {
+        let snap = WalPublicationSnapshot {
+            publication_seq: 42,
+            generation: WalGenerationIdentity::default(),
+            last_commit_frame: Some(100),
+            commit_count: 7,
+            latest_frame_entries: 50,
+            index_is_partial: false,
+        };
+        let copied = snap;
+        let cloned = snap.clone();
+        assert_eq!(copied, cloned);
+        let dbg = format!("{snap:?}");
+        assert!(dbg.contains("WalPublicationSnapshot"));
+        assert!(dbg.contains("publication_seq"));
+        assert!(dbg.contains("42"));
+    }
+
+    #[test]
+    fn test_checkpoint_mode_all_variants_debug() {
+        for (mode, expected) in [
+            (CheckpointMode::Passive, "Passive"),
+            (CheckpointMode::Full, "Full"),
+            (CheckpointMode::Restart, "Restart"),
+            (CheckpointMode::Truncate, "Truncate"),
+        ] {
+            let dbg = format!("{mode:?}");
+            assert!(dbg.contains(expected), "expected {expected} in {dbg}");
+            let copy = mode;
+            assert_eq!(mode, copy);
+        }
+    }
+
+    #[test]
     fn test_prepared_wal_frame_batch_page_data_and_frame_slice() {
         let frame_size = 32;
         let page_data_offset = 8;

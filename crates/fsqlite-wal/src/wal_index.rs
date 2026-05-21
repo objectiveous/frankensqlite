@@ -905,6 +905,75 @@ mod tests {
     }
 
     #[test]
+    fn test_wal_index_hdr_from_bytes_too_short() {
+        let buf = [0u8; WAL_INDEX_HDR_BYTES - 1];
+        let err = WalIndexHdr::from_bytes(&buf).unwrap_err();
+        assert!(err.to_string().contains("too small"));
+    }
+
+    #[test]
+    fn test_wal_ckpt_info_from_bytes_too_short() {
+        let buf = [0u8; WAL_CKPT_INFO_BYTES - 1];
+        let err = WalCkptInfo::from_bytes(&buf).unwrap_err();
+        assert!(err.to_string().contains("too small"));
+    }
+
+    #[test]
+    fn test_write_shm_header_too_short_buffer() {
+        let hdr = WalIndexHdr {
+            i_version: WAL_INDEX_VERSION,
+            unused: 0,
+            i_change: 0,
+            is_init: 1,
+            big_end_cksum: 0,
+            sz_page: 4096,
+            mx_frame: 0,
+            n_page: 0,
+            a_frame_cksum: [0; 2],
+            a_salt: [0; 2],
+            a_cksum: [0; 2],
+        };
+        let ckpt = WalCkptInfo {
+            n_backfill: 0,
+            a_read_mark: [0; WAL_READ_MARK_COUNT],
+            a_lock: [0; WAL_LOCK_SLOT_COUNT],
+            n_backfill_attempted: 0,
+            not_used0: 0,
+        };
+        let mut buf = [0u8; WAL_SHM_FIRST_HEADER_BYTES - 1];
+        let err = write_shm_header(&mut buf, &hdr, &ckpt).unwrap_err();
+        assert!(err.to_string().contains("too small"));
+    }
+
+    #[test]
+    fn test_hash_segment_is_empty_and_len() {
+        let mut seg = WalIndexHashSegment::new(WalIndexSegmentKind::Subsequent);
+        assert!(seg.is_empty());
+        assert_eq!(seg.len(), 0);
+        seg.insert(1).unwrap();
+        seg.insert(2).unwrap();
+        assert!(!seg.is_empty());
+        assert_eq!(seg.len(), 2);
+    }
+
+    #[test]
+    fn test_lookup_missing_page_returns_none() {
+        let mut seg = WalIndexHashSegment::new(WalIndexSegmentKind::Subsequent);
+        seg.insert(10).unwrap();
+        assert!(seg.lookup(10).is_some());
+        assert!(seg.lookup(99).is_none());
+    }
+
+    #[test]
+    fn test_duplicate_page_insert_returns_latest() {
+        let mut seg = WalIndexHashSegment::new(WalIndexSegmentKind::Subsequent);
+        seg.insert(42).unwrap();
+        seg.insert(42).unwrap();
+        let result = seg.lookup(42).expect("should find page");
+        assert_eq!(result.one_based_index, 2, "lookup returns latest entry");
+    }
+
+    #[test]
     fn test_wal_index_segment_physical_layout() {
         // Verify segment layout: page-number array at bytes 0..16384,
         // hash table at bytes 16384..32768 in a 32KB segment.

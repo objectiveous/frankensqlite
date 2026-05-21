@@ -3076,6 +3076,40 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_expr_is_null_vs_is_not_null_guard_opcode() {
+        // x IS NULL and x IS NOT NULL both materialize 1/0, but the guard is
+        // IsNull vs NotNull respectively. emit_expr's IsNull branch was untested.
+        let prog_of = |not: bool| {
+            let mut b = ProgramBuilder::new();
+            let reg = b.alloc_reg();
+            let expr = Expr::IsNull {
+                expr: Box::new(Expr::Literal(Literal::Integer(3), Span::ZERO)),
+                not,
+                span: Span::ZERO,
+            };
+            emit_expr(&mut b, &expr, reg).unwrap();
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.finish().unwrap()
+        };
+
+        // IS NULL: guarded by IsNull, then the 0 / Goto / 1 materialization.
+        let is_null = prog_of(false);
+        assert!(has_opcodes(
+            &is_null,
+            &[Opcode::IsNull, Opcode::Integer, Opcode::Goto, Opcode::Integer]
+        ));
+        assert!(!is_null.ops().iter().any(|o| o.opcode == Opcode::NotNull));
+
+        // IS NOT NULL: guarded by NotNull instead.
+        let is_not_null = prog_of(true);
+        assert!(has_opcodes(
+            &is_not_null,
+            &[Opcode::NotNull, Opcode::Integer, Opcode::Goto, Opcode::Integer]
+        ));
+        assert!(!is_not_null.ops().iter().any(|o| o.opcode == Opcode::IsNull));
+    }
+
+    #[test]
     fn test_emit_expr_large_integer_literal_uses_int64_opcode() {
         let mut b = ProgramBuilder::new();
         let reg = b.alloc_reg();

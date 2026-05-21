@@ -855,6 +855,33 @@ const NO_RESULT_BOOLEAN_CASES: &[MatchCase] = &[
     },
 ];
 
+const NO_RESULT_PHRASE_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "reversed title phrase",
+        query: r#""sqlite rust""#,
+    },
+    MatchCase {
+        name: "column-filtered reversed title phrase",
+        query: r#"title:"sqlite rust""#,
+    },
+    MatchCase {
+        name: "body terms are non-adjacent",
+        query: r#"body:"rust search""#,
+    },
+    MatchCase {
+        name: "title and body terms do not phrase-match across columns",
+        query: r#""rust fts""#,
+    },
+    MatchCase {
+        name: "prefix phrase with missing final token",
+        query: "rust + zz*",
+    },
+    MatchCase {
+        name: "quoted body phrase in wrong column",
+        query: r#"title:"full text""#,
+    },
+];
+
 const BOOLEAN_PRECEDENCE_CASES: &[MatchCase] = &[
     MatchCase {
         name: "and binds tighter than or",
@@ -2082,6 +2109,21 @@ fn no_result_boolean_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "no-result boolean conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn no_result_phrase_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in NO_RESULT_PHRASE_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "no-result phrase conformance case failed: {} ({})",
             case.name,
             case.query
         );

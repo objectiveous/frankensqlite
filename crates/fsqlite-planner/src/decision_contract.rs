@@ -1146,6 +1146,40 @@ mod tests {
     }
 
     #[test]
+    fn record_actual_returns_false_for_unknown_contract_id() {
+        let tables = sample_tables();
+        let indexes = sample_indexes();
+        let plan = sample_plan();
+        let mut log = DecisionLog::new();
+        let id = log.record_plan("SELECT 1", &tables, &indexes, 0, None, 0, &plan, 1, false);
+
+        // A bogus contract id is a safe no-op that reports failure: no panic, and
+        // the real decision stays uncalibrated.
+        assert!(!log.record_actual(
+            id + 1_000_000,
+            ActualCost {
+                page_reads: 50,
+                cpu_micros: 10,
+                actual_rows: 5,
+                wall_time_micros: 20,
+            }
+        ));
+        assert_eq!(log.calibration_stats().calibrated_decisions, 0);
+
+        // Recording against the real id succeeds and calibrates that decision.
+        assert!(log.record_actual(
+            id,
+            ActualCost {
+                page_reads: 50,
+                cpu_micros: 10,
+                actual_rows: 5,
+                wall_time_micros: 20,
+            }
+        ));
+        assert_eq!(log.calibration_stats().calibrated_decisions, 1);
+    }
+
+    #[test]
     fn empty_log_stats() {
         let log = DecisionLog::new();
         let stats = log.calibration_stats();

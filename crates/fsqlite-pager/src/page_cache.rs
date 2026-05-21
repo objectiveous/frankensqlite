@@ -8034,4 +8034,65 @@ mod tests {
         let default_val = resolve_page_buffer_max(None);
         assert!(default_val > 0);
     }
+
+    #[test]
+    fn lightweight_snapshot_total_accesses_and_hit_rate() {
+        let snap = PageCacheLightweightSnapshot {
+            hits: 80, misses: 20, admits: 0, evictions: 0,
+            cached_pages: 0, pool_capacity: 0,
+        };
+        assert_eq!(snap.total_accesses(), 100);
+        let rate = snap.hit_rate_percent();
+        assert!((rate - 80.0).abs() < f64::EPSILON);
+        let empty = PageCacheLightweightSnapshot::default();
+        assert_eq!(empty.total_accesses(), 0);
+        assert!((empty.hit_rate_percent() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn metrics_snapshot_default_and_computed_methods() {
+        let def = PageCacheMetricsSnapshot::default();
+        assert_eq!(def.hits, 0);
+        assert_eq!(def.total_accesses(), 0);
+        assert!((def.hit_rate_percent() - 0.0).abs() < f64::EPSILON);
+        let snap = PageCacheMetricsSnapshot {
+            hits: 90, misses: 10, admits: 5, evictions: 3,
+            cached_pages: 50, pool_capacity: 100,
+            dirty_ratio_pct: 25, t1_size: 30, t2_size: 20,
+            b1_size: 5, b2_size: 3, p_target: 40,
+            mvcc_multi_version_pages: 2,
+        };
+        assert_eq!(snap.total_accesses(), 100);
+        let eff = snap.efficiency_snapshot();
+        assert_eq!(eff.hits, 90);
+        assert_eq!(eff.pool_capacity, 100);
+    }
+
+    #[test]
+    fn page_cache_page_snapshot_debug_clone_copy_eq() {
+        let snap = PageCachePageSnapshot {
+            page_no: PageNumber::new(7).unwrap(),
+            version_txn_id: Some(42),
+            queue: Some(PageCacheQueueKind::T2),
+            dirty: true,
+            ref_count: 3,
+            access_count: 99,
+        };
+        let copied = snap;
+        assert_eq!(copied, snap);
+        let other = PageCachePageSnapshot { dirty: false, ..snap };
+        assert_ne!(snap, other);
+        let dbg = format!("{snap:?}");
+        assert!(dbg.contains("PageCachePageSnapshot"));
+    }
+
+    #[test]
+    fn page_cache_eviction_policy_default_is_arbitrary() {
+        let def = PageCacheEvictionPolicy::default();
+        assert_eq!(def, PageCacheEvictionPolicy::Arbitrary);
+        let dbg = format!("{def:?}");
+        assert!(dbg.contains("Arbitrary"));
+        let copied = def;
+        assert_eq!(copied, def);
+    }
 }

@@ -456,4 +456,46 @@ mod tests {
         let p = ThompsonPartitioner::new();
         assert!(!p.tick(), "first tick must not trigger resample");
     }
+
+    #[test]
+    fn beta_arm_debug_contains_fields() {
+        let arm = BetaArm::new(0.75);
+        arm.alpha.store(10, Ordering::Relaxed);
+        arm.beta.store(20, Ordering::Relaxed);
+        let dbg = format!("{arm:?}");
+        assert!(dbg.contains("BetaArm"));
+        assert!(dbg.contains("alpha"));
+        assert!(dbg.contains("beta"));
+        assert!(dbg.contains("arm_ratio"));
+        assert!(dbg.contains("0.75"));
+    }
+
+    #[test]
+    fn thompson_partitioner_debug_contains_fields() {
+        let p = ThompsonPartitioner::new();
+        let dbg = format!("{p:?}");
+        assert!(dbg.contains("ThompsonPartitioner"));
+        assert!(dbg.contains("arms"));
+        assert!(dbg.contains("current_arm"));
+        assert!(dbg.contains("access_count"));
+    }
+
+    #[test]
+    fn splitmix64_clone_produces_independent_stream() {
+        let mut rng1 = SplitMix64::new(0xBEEF);
+        let _ = rng1.next_u64();
+        let mut rng2 = rng1.clone();
+        let a = rng1.next_u64();
+        let b = rng2.next_u64();
+        assert_eq!(a, b, "cloned PRNG must produce same next value");
+        let _ = rng1.next_u64();
+        let c = rng1.next_u64();
+        let d = rng2.next_u64();
+        assert_ne!(c, d, "diverged PRNGs must produce different values");
+    }
+
+    #[test]
+    fn resample_interval_constant_is_ten_thousand() {
+        assert_eq!(RESAMPLE_INTERVAL, 10_000);
+    }
 }

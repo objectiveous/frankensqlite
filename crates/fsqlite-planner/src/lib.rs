@@ -5971,6 +5971,32 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_join_predicates() {
+        // Equi-join terms between two tables in the set become EquiJoinPredicate
+        // entries; a term involving a table outside the set is skipped; an
+        // empty term list yields nothing.
+        let mut set: HashSet<String> = HashSet::new();
+        set.insert("a".to_owned());
+        set.insert("b".to_owned());
+        let terms = [join_term("a", "x", "b", "y")]; // a.x = b.y
+
+        let (equi, theta) = collect_join_predicates(&terms, &set);
+        assert_eq!(equi.len(), 1);
+        assert!(theta.is_empty());
+
+        // With only one table in the set, the predicate is skipped.
+        let mut just_a: HashSet<String> = HashSet::new();
+        just_a.insert("a".to_owned());
+        let (equi, theta) = collect_join_predicates(&terms, &just_a);
+        assert!(equi.is_empty());
+        assert!(theta.is_empty());
+
+        // An empty term list yields nothing.
+        let (equi, theta) = collect_join_predicates(&[], &set);
+        assert!(equi.is_empty() && theta.is_empty());
+    }
+
+    #[test]
     fn test_has_join_predicate_detects_equi_join_either_orientation() {
         // has_join_predicate finds an equi-join column predicate between two
         // tables in either argument order, case-insensitively; absent or

@@ -587,6 +587,35 @@ mod tests {
     }
 
     #[test]
+    fn test_freelist_rejects_and_skips_pages_beyond_db_size() {
+        // deallocate must reject pages beyond the current db size — returning
+        // them later would corrupt the freelist on flush.
+        let mut fl = Freelist::new(10, 4096);
+        fl.deallocate(PageNumber::new(5).unwrap()); // in range -> kept
+        fl.deallocate(PageNumber::new(100).unwrap()); // beyond db_page_count -> rejected
+        assert_eq!(fl.free_count(), 1, "out-of-range page must not enter the freelist");
+        assert_eq!(fl.allocate().unwrap().get(), 5);
+
+        // allocate must skip stale freelist entries pointing beyond the db, then
+        // fall through to extending the file.
+        let mut fl = Freelist::with_pages(
+            vec![PageNumber::new(99).unwrap(), PageNumber::new(5).unwrap()],
+            10,
+            4096,
+        );
+        // Top of the LIFO stack (5) is in range and allocated first.
+        assert_eq!(fl.allocate().unwrap().get(), 5);
+        // The remaining entry (99) is stale (> db_page_count 10): it is skipped,
+        // so the allocator extends the db to page 11 rather than returning 99.
+        assert_eq!(
+            fl.allocate().unwrap().get(),
+            11,
+            "stale entry skipped; db extended instead"
+        );
+        assert_eq!(fl.db_page_count(), 11);
+    }
+
+    #[test]
     fn test_btree_freelist_reclamation() {
         let mut freelist = Freelist::new(200, 4096);
         let reclaimed = PageNumber::new(150).unwrap();

@@ -2168,6 +2168,42 @@ const STRING_SCALAR_EDGE_CASES: &[QueryCase] = &[
     },
 ];
 
+const CHAR_UNICODE_SETUP: &str = "
+    CREATE TABLE char_unicode_values (
+        id INTEGER PRIMARY KEY,
+        label TEXT,
+        code INTEGER
+    );
+    INSERT INTO char_unicode_values (id, label, code) VALUES
+        (1, 'Alpha', 65),
+        (2, ' space', 32),
+        (3, '', 90),
+        (4, NULL, 48);
+";
+
+const CHAR_UNICODE_SCALAR_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "unicode ascii empty and null inputs",
+        sql: "SELECT unicode('A'), unicode(' '), unicode('Alpha'), unicode(''), unicode(NULL)",
+    },
+    QueryCase {
+        name: "char single and multi codepoints",
+        sql: "SELECT char(65), char(65, 66, 67), char(32), length(char(65, 66, 67)), hex(char(65, 66, 67))",
+    },
+    QueryCase {
+        name: "unicode char round trips",
+        sql: "SELECT unicode(char(90)), char(unicode('Q')), hex(char(unicode('A'), unicode('B')))",
+    },
+    QueryCase {
+        name: "column driven unicode and char",
+        sql: "SELECT id, unicode(label), char(code), hex(char(code)) FROM char_unicode_values ORDER BY id",
+    },
+    QueryCase {
+        name: "unicode expression feeds char",
+        sql: "SELECT id, char(unicode(substr(label, 1, 1)) + 1) FROM char_unicode_values WHERE label IS NOT NULL AND label <> '' ORDER BY id",
+    },
+];
+
 const FORMAT_QUOTE_SETUP: &str = "
     CREATE TABLE format_values (
         id INTEGER PRIMARY KEY,
@@ -2694,6 +2730,12 @@ fn string_functions_match_rusqlite() {
 fn string_scalar_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
     harness.assert_queries_match("string scalar edge", STRING_SCALAR_EDGE_CASES);
+}
+
+#[test]
+fn char_unicode_scalar_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CHAR_UNICODE_SETUP);
+    harness.assert_queries_match("char unicode scalar edge", CHAR_UNICODE_SCALAR_CASES);
 }
 
 #[test]

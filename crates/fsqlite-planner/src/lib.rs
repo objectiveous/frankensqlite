@@ -5927,6 +5927,50 @@ mod tests {
     }
 
     #[test]
+    fn test_expression_is_equi_column_predicate() {
+        // True only for a column = column equality; column=literal, literal=
+        // column, literal=literal, a non-Eq op, and a non-BinaryOp all fail.
+        let col = |n: &str| Box::new(Expr::Column(ColumnRef::bare(n), Span::ZERO));
+        let lit = |n: i64| Box::new(Expr::Literal(Literal::Integer(n), Span::ZERO));
+        let bin = |l: Box<Expr>, op: AstBinaryOp, r: Box<Expr>| Expr::BinaryOp {
+            left: l,
+            op,
+            right: r,
+            span: Span::ZERO,
+        };
+
+        assert!(expression_is_equi_column_predicate(&bin(
+            col("a"),
+            AstBinaryOp::Eq,
+            col("b")
+        )));
+        assert!(!expression_is_equi_column_predicate(&bin(
+            col("a"),
+            AstBinaryOp::Eq,
+            lit(5)
+        )));
+        assert!(!expression_is_equi_column_predicate(&bin(
+            lit(5),
+            AstBinaryOp::Eq,
+            col("b")
+        )));
+        assert!(!expression_is_equi_column_predicate(&bin(
+            lit(5),
+            AstBinaryOp::Eq,
+            lit(6)
+        )));
+        assert!(!expression_is_equi_column_predicate(&bin(
+            col("a"),
+            AstBinaryOp::Lt,
+            col("b")
+        )));
+        assert!(!expression_is_equi_column_predicate(&Expr::Literal(
+            Literal::Integer(1),
+            Span::ZERO
+        )));
+    }
+
+    #[test]
     fn test_has_join_predicate_detects_equi_join_either_orientation() {
         // has_join_predicate finds an equi-join column predicate between two
         // tables in either argument order, case-insensitively; absent or

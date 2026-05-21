@@ -481,4 +481,62 @@ mod tests {
         assert_eq!(r.point, "wal_after_append");
         assert!(r.trigger_seq > 0);
     }
+
+    #[test]
+    fn test_fault_injection_record_clone_and_eq() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_sync_failure(FaultHookArm::new("rc", "sc", "ic"));
+        let _ = maybe_inject_sync_failure(3, SyncFlags::NORMAL);
+        let records = take_records();
+        let original = &records[0];
+        let cloned = original.clone();
+        assert_eq!(*original, cloned);
+        assert_eq!(cloned.point, "wal_sync_failure");
+        assert_eq!(cloned.detail, original.detail);
+    }
+
+    #[test]
+    fn test_fault_hook_arm_debug_format() {
+        let a = FaultHookArm::new("dbg-run", "dbg-scen", "dbg-inv");
+        let dbg = format!("{a:?}");
+        assert!(dbg.contains("FaultHookArm"));
+        assert!(dbg.contains("dbg-run"));
+        assert!(dbg.contains("dbg-scen"));
+        assert!(dbg.contains("dbg-inv"));
+    }
+
+    #[test]
+    fn test_sync_failure_detail_captures_flags() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_sync_failure(arm("sf"));
+        let _ = maybe_inject_sync_failure(5, SyncFlags::FULL);
+        let records = take_records();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].detail.contains("frame_count_before=5"));
+        assert!(
+            records[0].detail.contains("flags="),
+            "detail should include flags representation"
+        );
+    }
+
+    #[test]
+    fn test_append_busy_rearming_resets_countdown() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+
+        arm_append_busy_countdown(arm("first"), 2);
+        assert!(maybe_inject_append_busy(0, 1).is_ok(), "1st of 2");
+        arm_append_busy_countdown(arm("second"), 3);
+        assert!(maybe_inject_append_busy(1, 1).is_ok(), "1st of 3");
+        assert!(maybe_inject_append_busy(2, 1).is_ok(), "2nd of 3");
+        let err = maybe_inject_append_busy(3, 1);
+        assert!(err.is_err(), "3rd of 3 should fire");
+        let records = take_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].run_id, "test-second");
+    }
 }

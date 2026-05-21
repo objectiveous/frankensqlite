@@ -277,6 +277,12 @@ pub enum DataflowOperator {
     FilterFloatNonFinite { column: usize },
     /// Keep rows whose floating-point column matches the requested sign.
     FilterFloatSign { column: usize, sign: FloatSign },
+    /// Keep rows where a floating-point column satisfies the comparison.
+    FilterFloatCompare {
+        column: usize,
+        op: FloatComparison,
+        value: SqliteValue,
+    },
     /// Keep rows where an integer column satisfies the comparison.
     FilterIntegerCompare {
         column: usize,
@@ -424,6 +430,9 @@ impl DataflowOperator {
             Self::FilterFloatFinite { column } => filter_float_finite(rows, *column),
             Self::FilterFloatNonFinite { column } => filter_float_non_finite(rows, *column),
             Self::FilterFloatSign { column, sign } => filter_float_sign(rows, *column, *sign),
+            Self::FilterFloatCompare { column, op, value } => {
+                filter_float_compare(rows, *column, *op, value)
+            }
             Self::FilterIntegerCompare { column, op, value } => {
                 filter_integer_compare(rows, *column, *op, *value)
             }
@@ -490,6 +499,30 @@ pub enum IntegerComparison {
 
 impl IntegerComparison {
     fn matches(self, candidate: i64, threshold: i64) -> bool {
+        match self {
+            Self::LessThan => candidate < threshold,
+            Self::LessOrEqual => candidate <= threshold,
+            Self::GreaterThan => candidate > threshold,
+            Self::GreaterOrEqual => candidate >= threshold,
+        }
+    }
+}
+
+/// Floating-point predicate comparison used by dataflow filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatComparison {
+    /// Match values strictly below the threshold.
+    LessThan,
+    /// Match values at or below the threshold.
+    LessOrEqual,
+    /// Match values strictly above the threshold.
+    GreaterThan,
+    /// Match values at or above the threshold.
+    GreaterOrEqual,
+}
+
+impl FloatComparison {
+    fn matches(self, candidate: f64, threshold: f64) -> bool {
         match self {
             Self::LessThan => candidate < threshold,
             Self::LessOrEqual => candidate <= threshold,
@@ -1087,6 +1120,31 @@ fn filter_float_sign(
         .collect()
 }
 
+fn filter_float_compare(
+    rows: &[WeightedRow],
+    column: usize,
+    op: FloatComparison,
+    value: &SqliteValue,
+) -> DataflowResult<Vec<WeightedRow>> {
+    let SqliteValue::Float(threshold) = value else {
+        return Err(DataflowError::PredicateValueNotFloat { column });
+    };
+
+    rows.iter()
+        .filter_map(|row| match row.values.get(column) {
+            Some(SqliteValue::Float(candidate)) if op.matches(*candidate, *threshold) => {
+                Some(Ok(row.clone()))
+            }
+            Some(SqliteValue::Float(_)) => None,
+            Some(_) => Some(Err(DataflowError::PredicateValueNotFloat { column })),
+            None => Some(Err(DataflowError::ColumnOutOfBounds {
+                column,
+                width: row.width(),
+            })),
+        })
+        .collect()
+}
+
 fn filter_integer_compare(
     rows: &[WeightedRow],
     column: usize,
@@ -1480,9 +1538,9 @@ pub fn delta_join_update(
 #[cfg(test)]
 mod tests {
     use super::{
-        DataflowAutomaton, DataflowError, DataflowOperator, FloatSign, IntegerComparison,
-        JoinKeySpec, NullPredicate, WeightSign, WeightedRow, delta_join_left, delta_join_right,
-        delta_join_update, scale_weights, set_weights, threshold_positive,
+        DataflowAutomaton, DataflowError, DataflowOperator, FloatComparison, FloatSign,
+        IntegerComparison, JoinKeySpec, NullPredicate, WeightSign, WeightedRow, delta_join_left,
+        delta_join_right, delta_join_update, scale_weights, set_weights, threshold_positive,
     };
     use fsqlite_types::SqliteValue;
 
@@ -3365,6 +3423,111 @@ mod tests {
         let err = automaton
             .execute(&[WeightedRow::insert(vec![int(1), SqliteValue::Float(1.5)])])
             .expect_err("invalid real-sign predicate column should fail");
+
+        assert_eq!(
+            err,
+            DataflowError::ColumnOutOfBounds {
+                column: 2,
+                width: 2
+            }
+        );
+    }
+
+    #[test]
+    fn filter_float_compare_keeps_matching_weighted_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterFloatCompare {
+            column: 1,
+            op: FloatComparison::GreaterOrEqual,
+            value: SqliteValue::Float(1.5),
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), SqliteValue::Float(1.25)], 3),
+            WeightedRow::new(vec![int(2), SqliteValue::Float(1.5)], -2),
+            WeightedRow::new(vec![int(3), SqliteValue::Float(2.0)], 4),
+            WeightedRow::new(vec![int(4), SqliteValue::Float(f64::INFINITY)], 5),
+            WeightedRow::new(vec![int(5), SqliteValue::Float(f64::NAN)], 6),
+            WeightedRow::new(vec![int(6), SqliteValue::Float(3.0)], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(2), SqliteValue::Float(1.5)], -2),
+                WeightedRow::new(vec![int(3), SqliteValue::Float(2.0)], 4),
+                WeightedRow::new(vec![int(4), SqliteValue::Float(f64::INFINITY)], 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_float_compare_supports_lower_bound_operators() {
+        let rows = vec![
+            WeightedRow::new(vec![int(1), SqliteValue::Float(-2.0)], 3),
+            WeightedRow::new(vec![int(2), SqliteValue::Float(-1.0)], -2),
+            WeightedRow::new(vec![int(3), SqliteValue::Float(0.0)], 4),
+            WeightedRow::new(vec![int(4), SqliteValue::Float(1.0)], 5),
+        ];
+
+        let strict = DataflowAutomaton::new(vec![DataflowOperator::FilterFloatCompare {
+            column: 1,
+            op: FloatComparison::LessThan,
+            value: SqliteValue::Float(0.0),
+        }])
+        .execute(&rows)
+        .expect("strict comparison should execute");
+        let inclusive = DataflowAutomaton::new(vec![DataflowOperator::FilterFloatCompare {
+            column: 1,
+            op: FloatComparison::LessOrEqual,
+            value: SqliteValue::Float(0.0),
+        }])
+        .execute(&rows)
+        .expect("inclusive comparison should execute");
+
+        assert_eq!(
+            strict,
+            vec![
+                WeightedRow::new(vec![int(1), SqliteValue::Float(-2.0)], 3),
+                WeightedRow::new(vec![int(2), SqliteValue::Float(-1.0)], -2),
+            ]
+        );
+        assert_eq!(
+            inclusive,
+            vec![
+                WeightedRow::new(vec![int(1), SqliteValue::Float(-2.0)], 3),
+                WeightedRow::new(vec![int(2), SqliteValue::Float(-1.0)], -2),
+                WeightedRow::new(vec![int(3), SqliteValue::Float(0.0)], 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_float_compare_rejects_non_float_values() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterFloatCompare {
+            column: 1,
+            op: FloatComparison::GreaterThan,
+            value: SqliteValue::Float(1.0),
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), int(2)])])
+            .expect_err("non-float predicate input should fail");
+
+        assert_eq!(err, DataflowError::PredicateValueNotFloat { column: 1 });
+    }
+
+    #[test]
+    fn filter_float_compare_rejects_out_of_bounds_columns() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterFloatCompare {
+            column: 2,
+            op: FloatComparison::GreaterThan,
+            value: SqliteValue::Float(1.0),
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), SqliteValue::Float(2.0)])])
+            .expect_err("invalid real comparison predicate column should fail");
 
         assert_eq!(
             err,

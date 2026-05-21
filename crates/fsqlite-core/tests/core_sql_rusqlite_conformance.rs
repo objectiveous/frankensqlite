@@ -1169,6 +1169,37 @@ const DISTINCT_ORDER_LIMIT_CASES: &[QueryCase] = &[
     },
 ];
 
+const ORDER_BY_NULLS_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "text ascending nulls last",
+        sql: "SELECT id, label FROM expr_rows ORDER BY label ASC NULLS LAST, id",
+    },
+    QueryCase {
+        name: "text descending nulls first",
+        sql: "SELECT id, label FROM expr_rows ORDER BY label DESC NULLS FIRST, id",
+    },
+    QueryCase {
+        name: "integer ascending nulls first",
+        sql: "SELECT id, a FROM expr_rows ORDER BY a ASC NULLS FIRST, id",
+    },
+    QueryCase {
+        name: "integer descending nulls last",
+        sql: "SELECT id, b FROM expr_rows ORDER BY b DESC NULLS LAST, id",
+    },
+    QueryCase {
+        name: "alias ordering nulls last",
+        sql: "SELECT id, label AS resolved FROM expr_rows ORDER BY resolved ASC NULLS LAST, id",
+    },
+    QueryCase {
+        name: "computed expression nulls first",
+        sql: "SELECT id, a + b AS total FROM expr_rows ORDER BY total DESC NULLS FIRST, id",
+    },
+    QueryCase {
+        name: "null placement with limit offset",
+        sql: "SELECT id, a FROM expr_rows ORDER BY a ASC NULLS LAST, id LIMIT 3 OFFSET 1",
+    },
+];
+
 const SUBQUERY_SETUP: &str = "
     CREATE TABLE customers (
         id INTEGER PRIMARY KEY,
@@ -1754,6 +1785,12 @@ fn numeric_coercion_expression_edges_match_rusqlite() {
 fn distinct_order_limit_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
     harness.assert_queries_match("DISTINCT/ORDER/LIMIT edge", DISTINCT_ORDER_LIMIT_CASES);
+}
+
+#[test]
+fn order_by_nulls_placement_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
+    harness.assert_queries_match("ORDER BY NULLS placement edge", ORDER_BY_NULLS_CASES);
 }
 
 #[test]

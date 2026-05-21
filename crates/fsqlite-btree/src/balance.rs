@@ -3274,6 +3274,60 @@ mod tests {
     }
 
     #[test]
+    fn test_choose_leaf_table_split_index_keeps_both_pages_nonempty() {
+        // The split index must leave both pages non-empty (1 <= split <= n-1)
+        // for every heat policy and cell count — a split at 0 or n would pile
+        // every cell onto one side (a correctness bug / non-terminating
+        // balance). Fewer than 2 cells cannot split. The existing bias test
+        // checks split *ordering* only, not this bound or the < 2 edge.
+        for n in [2usize, 3, 8, 12, 50] {
+            let cells = fixed_cost_cells(n, 64);
+            for hot_idx in [0, n / 2, n - 1] {
+                let policy = leaf_table_split_policy_for_page(None, n, hot_idx);
+                let split = choose_leaf_table_split_index(&cells, 0, 0, USABLE, policy)
+                    .expect("a split must exist for n >= 2 with small cells");
+                assert!(
+                    (1..n).contains(&split),
+                    "split {split} must keep both pages non-empty (n={n}, hot_idx={hot_idx})"
+                );
+            }
+        }
+
+        // Fewer than 2 cells: nothing to split.
+        assert_eq!(
+            choose_leaf_table_split_index(
+                &fixed_cost_cells(1, 64),
+                0,
+                0,
+                USABLE,
+                leaf_table_split_policy_for_page(None, 1, 0)
+            ),
+            None
+        );
+        assert_eq!(
+            choose_leaf_table_split_index(
+                &fixed_cost_cells(0, 64),
+                0,
+                0,
+                USABLE,
+                leaf_table_split_policy_for_page(None, 0, 0)
+            ),
+            None
+        );
+
+        // Equal-cost cells with interior heat (55% target) land the split just
+        // right of center, never at an extreme. The per-cell cost cancels in the
+        // fraction, so 20 cells -> ~11 regardless of cell size.
+        let cells = fixed_cost_cells(20, 64);
+        let interior = leaf_table_split_policy_for_page(None, 20, 10);
+        let split = choose_leaf_table_split_index(&cells, 0, 0, USABLE, interior).expect("split");
+        assert!(
+            (10..=12).contains(&split),
+            "interior 55% split should sit near 11, got {split}"
+        );
+    }
+
+    #[test]
     fn test_conflict_heat_adjusts_leaf_table_split_target_for_hot_page() {
         let _guard = crate::instrumentation::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
             .lock()

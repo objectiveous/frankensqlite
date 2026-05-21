@@ -6076,6 +6076,23 @@ mod tests {
     }
 
     #[test]
+    fn test_like_prefix_upper_bound() {
+        // The exclusive upper bound for a LIKE-prefix range scan increments the
+        // last incrementable character and truncates after it; a trailing
+        // char::MAX rolls over to the previous character.
+        assert_eq!(like_prefix_upper_bound("abc").as_deref(), Some("abd"));
+        assert_eq!(like_prefix_upper_bound("a").as_deref(), Some("b"));
+        // Empty prefix has no upper bound.
+        assert_eq!(like_prefix_upper_bound(""), None);
+        // A trailing char::MAX rolls over: it is skipped and the previous
+        // character is incremented (truncating the max away).
+        let with_max = format!("a{}", char::MAX);
+        assert_eq!(like_prefix_upper_bound(&with_max).as_deref(), Some("b"));
+        // A lone char::MAX cannot be incremented -> None.
+        assert_eq!(like_prefix_upper_bound(&char::MAX.to_string()), None);
+    }
+
+    #[test]
     fn test_is_like_prefix_safe_for_column_rejects_ascii_alphabetic_prefixes() {
         // A LIKE prefix is safe for a prefix-range index scan only when it
         // contains no ASCII alphabetic characters: default LIKE folds ASCII

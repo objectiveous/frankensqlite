@@ -207,6 +207,8 @@ pub enum DataflowOperator {
     FilterTextSuffix { column: usize, suffix: String },
     /// Keep rows whose text column contains the configured substring.
     FilterTextContains { column: usize, needle: String },
+    /// Keep rows whose text column does not contain the configured substring.
+    FilterTextNotContains { column: usize, needle: String },
     /// Keep rows where an integer column lies in an inclusive range.
     FilterIntegerBetween {
         column: usize,
@@ -303,6 +305,9 @@ impl DataflowOperator {
             Self::FilterTextSuffix { column, suffix } => filter_text_suffix(rows, *column, suffix),
             Self::FilterTextContains { column, needle } => {
                 filter_text_contains(rows, *column, needle)
+            }
+            Self::FilterTextNotContains { column, needle } => {
+                filter_text_not_contains(rows, *column, needle)
             }
             Self::FilterIntegerBetween {
                 column,
@@ -571,6 +576,26 @@ fn filter_text_contains(
     rows.iter()
         .filter_map(|row| match row.values.get(column) {
             Some(SqliteValue::Text(candidate)) if candidate.as_str().contains(needle) => {
+                Some(Ok(row.clone()))
+            }
+            Some(SqliteValue::Text(_)) => None,
+            Some(_) => Some(Err(DataflowError::PredicateValueNotText { column })),
+            None => Some(Err(DataflowError::ColumnOutOfBounds {
+                column,
+                width: row.width(),
+            })),
+        })
+        .collect()
+}
+
+fn filter_text_not_contains(
+    rows: &[WeightedRow],
+    column: usize,
+    needle: &str,
+) -> DataflowResult<Vec<WeightedRow>> {
+    rows.iter()
+        .filter_map(|row| match row.values.get(column) {
+            Some(SqliteValue::Text(candidate)) if !candidate.as_str().contains(needle) => {
                 Some(Ok(row.clone()))
             }
             Some(SqliteValue::Text(_)) => None,
@@ -1390,6 +1415,79 @@ mod tests {
         let err = automaton
             .execute(&[WeightedRow::insert(vec![int(1), text("beta")])])
             .expect_err("invalid text-contains predicate column should fail");
+
+        assert_eq!(
+            err,
+            DataflowError::ColumnOutOfBounds {
+                column: 2,
+                width: 2
+            }
+        );
+    }
+
+    #[test]
+    fn filter_text_not_contains_keeps_non_matching_weighted_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterTextNotContains {
+            column: 1,
+            needle: "et".to_owned(),
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), text("alpha")], 7),
+            WeightedRow::new(vec![int(2), text("beta")], -2),
+            WeightedRow::new(vec![int(3), text("theta")], 4),
+            WeightedRow::new(vec![int(4), text("gamma")], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![WeightedRow::new(vec![int(1), text("alpha")], 7)]
+        );
+    }
+
+    #[test]
+    fn filter_text_not_contains_empty_needle_matches_no_text_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterTextNotContains {
+            column: 1,
+            needle: String::new(),
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), text("alpha")], 7),
+            WeightedRow::new(vec![int(2), text("beta")], -2),
+            WeightedRow::new(vec![int(3), text("gamma")], 0),
+        ];
+
+        assert_eq!(
+            automaton.execute(&rows).expect("dataflow should execute"),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn filter_text_not_contains_rejects_non_text_values() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterTextNotContains {
+            column: 1,
+            needle: "et".to_owned(),
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), int(2)])])
+            .expect_err("non-text predicate input should fail");
+
+        assert_eq!(err, DataflowError::PredicateValueNotText { column: 1 });
+    }
+
+    #[test]
+    fn filter_text_not_contains_rejects_out_of_bounds_columns() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterTextNotContains {
+            column: 2,
+            needle: "et".to_owned(),
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), text("beta")])])
+            .expect_err("invalid text-not-contains predicate column should fail");
 
         assert_eq!(
             err,

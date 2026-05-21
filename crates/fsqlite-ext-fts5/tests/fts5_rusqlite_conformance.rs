@@ -872,6 +872,29 @@ const COLUMN_FILTER_INITIAL_CASES: &[MatchCase] = &[
     },
 ];
 
+const COLUMN_FILTER_SET_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "negative braced column set",
+        query: "-{title body}:rust",
+    },
+    MatchCase {
+        name: "spaced negative braced column set",
+        query: "- {title body}: rust",
+    },
+    MatchCase {
+        name: "braced title or body filter",
+        query: "{title}:rust OR {body}:writers",
+    },
+    MatchCase {
+        name: "braced set with body exclusion",
+        query: "{title body}:search NOT body:systems",
+    },
+    MatchCase {
+        name: "negative braced title filter",
+        query: "-{title}:rust",
+    },
+];
+
 const UNINDEXED_COLUMN_CASES: &[MatchCase] = &[
     MatchCase {
         name: "unindexed column filter",
@@ -1894,6 +1917,21 @@ fn column_filter_and_initial_token_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "column-filter/initial-token conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn column_filter_set_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in COLUMN_FILTER_SET_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "column-filter set conformance case failed: {} ({})",
             case.name,
             case.query
         );

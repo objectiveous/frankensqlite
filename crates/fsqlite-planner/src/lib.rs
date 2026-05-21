@@ -6076,6 +6076,58 @@ mod tests {
     }
 
     #[test]
+    fn test_compare_partial_index_literals_handles_cross_type_numerics() {
+        use std::cmp::Ordering;
+        let int = Literal::Integer;
+        let flt = Literal::Float;
+
+        // Same-type comparisons.
+        assert_eq!(
+            compare_partial_index_literals(&int(3), &int(5)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_partial_index_literals(&flt(2.0), &flt(2.0)),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            compare_partial_index_literals(
+                &Literal::String("a".to_owned()),
+                &Literal::String("b".to_owned())
+            ),
+            Some(Ordering::Less)
+        );
+
+        // Integer and Float compare numerically across types.
+        assert_eq!(
+            compare_partial_index_literals(&int(5), &flt(5.0)),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            compare_partial_index_literals(&int(3), &flt(5.0)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_partial_index_literals(&flt(7.0), &int(2)),
+            Some(Ordering::Greater)
+        );
+
+        // Incompatible types, NULL, and NaN are unordered -> None.
+        assert_eq!(
+            compare_partial_index_literals(&int(1), &Literal::String("x".to_owned())),
+            None
+        );
+        assert_eq!(
+            compare_partial_index_literals(&Literal::Null, &int(1)),
+            None
+        );
+        assert_eq!(
+            compare_partial_index_literals(&flt(f64::NAN), &flt(1.0)),
+            None
+        );
+    }
+
+    #[test]
     fn test_extract_qualified_column_requires_qualifier_and_canonicalizes() {
         // extract_qualified_column requires a table-qualified column and lower-
         // cases both the table and the column; bare columns and non-columns

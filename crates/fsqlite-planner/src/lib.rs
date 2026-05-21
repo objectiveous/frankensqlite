@@ -6511,6 +6511,45 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_is_not_null_predicate() {
+        // Only `<column> IS NOT NULL` normalizes to its column; IS NULL, a
+        // non-column operand, and non-IsNull expressions yield None.
+        let isnull = |inner: Expr, not: bool| Expr::IsNull {
+            expr: Box::new(inner),
+            not,
+            span: Span::ZERO,
+        };
+        let col = |n: &str| Expr::Column(ColumnRef::bare(n), Span::ZERO);
+
+        // x IS NOT NULL -> Some(column x).
+        assert_eq!(
+            normalize_is_not_null_predicate(&isnull(col("x"), true)),
+            Some(WhereColumn {
+                table: None,
+                column: "x".to_owned()
+            })
+        );
+        // x IS NULL (not: false) -> None.
+        assert_eq!(
+            normalize_is_not_null_predicate(&isnull(col("x"), false)),
+            None
+        );
+        // (5) IS NOT NULL -> None: the operand is not a column.
+        assert_eq!(
+            normalize_is_not_null_predicate(&isnull(
+                Expr::Literal(Literal::Integer(5), Span::ZERO),
+                true
+            )),
+            None
+        );
+        // A non-IsNull expression -> None.
+        assert_eq!(
+            normalize_is_not_null_predicate(&Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            None
+        );
+    }
+
+    #[test]
     fn test_expr_guarantees_non_null_for_matching_column() {
         // expr_guarantees_non_null reports whether a WHERE expression proves the
         // given column is non-NULL: an explicit IS NOT NULL, or a comparison to a

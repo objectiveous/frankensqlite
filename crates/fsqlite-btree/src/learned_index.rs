@@ -414,6 +414,22 @@ mod tests {
     }
 
     #[test]
+    fn max_error_and_keys_accessors_reflect_build_inputs() {
+        // max_error() returns the configured error bound and keys() returns the
+        // stored (sorted) key slice. Neither accessor was directly tested.
+        let keys = vec![1_u64, 4, 9, 16, 25, 36];
+        let idx = LearnedIndex::build(&keys, LearnedIndexConfig { max_error: 8 });
+
+        assert_eq!(idx.max_error(), 8);
+        assert_eq!(idx.keys(), keys.as_slice());
+        assert_eq!(idx.len(), keys.len());
+
+        // The default config's error bound (16) flows through unchanged.
+        let def = LearnedIndex::build(&keys, LearnedIndexConfig::default());
+        assert_eq!(def.max_error(), 16);
+    }
+
+    #[test]
     fn lookup_with_extreme_key_does_not_overflow() {
         let keys: Vec<u64> = (0..128).collect();
         let idx = LearnedIndex::build(&keys, LearnedIndexConfig::default());

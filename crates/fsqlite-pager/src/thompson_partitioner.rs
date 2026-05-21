@@ -347,4 +347,78 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn record_outcome_miss_increments_beta() {
+        let p = ThompsonPartitioner::new();
+        let idx = p.current_arm_index();
+        let beta_before = p.arms()[idx].beta.load(Ordering::Relaxed);
+        let alpha_before = p.arms()[idx].alpha.load(Ordering::Relaxed);
+
+        for _ in 0..50 {
+            p.record_outcome(false);
+        }
+
+        assert_eq!(p.arms()[idx].beta.load(Ordering::Relaxed), beta_before + 50);
+        assert_eq!(p.arms()[idx].alpha.load(Ordering::Relaxed), alpha_before);
+    }
+
+    #[test]
+    fn default_trait_matches_new() {
+        let d = ThompsonPartitioner::default();
+        let n = ThompsonPartitioner::new();
+        assert_eq!(d.arm_count(), n.arm_count());
+        assert_eq!(d.current_arm_index(), n.current_arm_index());
+        assert!((d.current_hot_ratio() - n.current_hot_ratio()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resample_is_deterministic_for_same_access_count() {
+        let p1 = ThompsonPartitioner::new();
+        let p2 = ThompsonPartitioner::new();
+
+        for _ in 0..100 {
+            p1.record_outcome(true);
+            p2.record_outcome(true);
+        }
+        p1.access_count.store(42, Ordering::Relaxed);
+        p2.access_count.store(42, Ordering::Relaxed);
+
+        p1.resample();
+        p2.resample();
+        assert_eq!(p1.current_arm_index(), p2.current_arm_index());
+    }
+
+    #[test]
+    fn splitmix64_zero_seed_avoids_degenerate_state() {
+        let mut rng = SplitMix64::new(0);
+        let mut all_zero = true;
+        for _ in 0..10 {
+            if rng.next_u64() != 0 {
+                all_zero = false;
+                break;
+            }
+        }
+        assert!(!all_zero, "zero-seeded PRNG must not produce all zeros");
+    }
+
+    #[test]
+    fn penalized_arm_loses_to_rewarded_arm() {
+        let p = ThompsonPartitioner::new();
+        p.current_arm.store(0, Ordering::Relaxed);
+        for _ in 0..500 {
+            p.record_outcome(false);
+        }
+        p.current_arm.store(8, Ordering::Relaxed);
+        for _ in 0..500 {
+            p.record_outcome(true);
+        }
+
+        p.resample();
+        assert_eq!(
+            p.current_arm_index(),
+            8,
+            "arm 8 (heavily rewarded) must beat arm 0 (heavily penalized)"
+        );
+    }
 }

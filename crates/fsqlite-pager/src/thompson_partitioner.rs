@@ -498,4 +498,41 @@ mod tests {
     fn resample_interval_constant_is_ten_thousand() {
         assert_eq!(RESAMPLE_INTERVAL, 10_000);
     }
+
+    #[test]
+    fn beta_arm_new_starts_with_uniform_prior() {
+        let arm = BetaArm::new(0.3);
+        assert_eq!(arm.alpha.load(Ordering::Relaxed), 1);
+        assert_eq!(arm.beta.load(Ordering::Relaxed), 1);
+        assert!((arm.arm_ratio - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn thompson_partitioner_default_starts_at_middle_arm() {
+        let tp = ThompsonPartitioner::default();
+        let ratio = tp.current_hot_ratio();
+        assert!((ratio - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn record_outcome_updates_alpha_beta() {
+        let tp = ThompsonPartitioner::new();
+        let idx = tp.current_arm.load(Ordering::Relaxed);
+        let a_before = tp.arms[idx].alpha.load(Ordering::Relaxed);
+        let b_before = tp.arms[idx].beta.load(Ordering::Relaxed);
+        tp.record_outcome(true);
+        tp.record_outcome(false);
+        tp.record_outcome(true);
+        assert_eq!(tp.arms[idx].alpha.load(Ordering::Relaxed), a_before + 2);
+        assert_eq!(tp.arms[idx].beta.load(Ordering::Relaxed), b_before + 1);
+    }
+
+    #[test]
+    fn tick_returns_false_below_resample_interval() {
+        let tp = ThompsonPartitioner::new();
+        for _ in 0..100 {
+            assert!(!tp.tick());
+        }
+        assert_eq!(tp.access_count.load(Ordering::Relaxed), 100);
+    }
 }

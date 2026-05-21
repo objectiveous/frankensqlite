@@ -6040,6 +6040,65 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_cache_key_with_feature_flags() {
+        // plan_cache_key_with_feature_flags packs the schema cookie and feature
+        // toggles into the xxh3 seed, so distinct (sql, cookie, flags) tuples
+        // get distinct keys. The function is deterministic for fixed inputs.
+        let sql = "SELECT * FROM t";
+
+        // Determinism: same inputs -> same key.
+        assert_eq!(
+            plan_cache_key_with_feature_flags(sql, 1, PlannerFeatureFlags::default()),
+            plan_cache_key_with_feature_flags(sql, 1, PlannerFeatureFlags::default())
+        );
+
+        // The four feature-flag combinations produce four distinct keys.
+        let kd = plan_cache_key_with_feature_flags(sql, 1, PlannerFeatureFlags::default());
+        let kl = plan_cache_key_with_feature_flags(
+            sql,
+            1,
+            PlannerFeatureFlags {
+                leapfrog_join: true,
+                ..PlannerFeatureFlags::default()
+            },
+        );
+        let kp = plan_cache_key_with_feature_flags(
+            sql,
+            1,
+            PlannerFeatureFlags {
+                dpccp_join: true,
+                ..PlannerFeatureFlags::default()
+            },
+        );
+        let kb = plan_cache_key_with_feature_flags(
+            sql,
+            1,
+            PlannerFeatureFlags {
+                leapfrog_join: true,
+                dpccp_join: true,
+            },
+        );
+        let set: std::collections::HashSet<u64> = [kd, kl, kp, kb].into_iter().collect();
+        assert_eq!(
+            set.len(),
+            4,
+            "all four feature-flag combinations must produce distinct keys"
+        );
+
+        // Different schema cookies -> different keys.
+        assert_ne!(
+            plan_cache_key_with_feature_flags(sql, 1, PlannerFeatureFlags::default()),
+            plan_cache_key_with_feature_flags(sql, 2, PlannerFeatureFlags::default())
+        );
+
+        // Different SQL -> different keys.
+        assert_ne!(
+            plan_cache_key_with_feature_flags(sql, 1, PlannerFeatureFlags::default()),
+            plan_cache_key_with_feature_flags("SELECT 1", 1, PlannerFeatureFlags::default())
+        );
+    }
+
+    #[test]
     fn test_normalize_plan_cache_capacity_floors_at_one() {
         // A requested plan-cache capacity is clamped to a non-zero value: 0
         // becomes 1 (no zero-capacity cache), positive values pass through.

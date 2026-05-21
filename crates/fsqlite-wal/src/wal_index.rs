@@ -1052,4 +1052,89 @@ mod tests {
         assert_eq!(sub.capacity(), WAL_SHM_SUBSEQUENT_USABLE_PAGE_ENTRIES);
         assert_eq!(first.capacity(), WAL_SHM_FIRST_USABLE_PAGE_ENTRIES);
     }
+
+    #[test]
+    fn test_hash_slots_accessor_reflects_inserts() {
+        let mut seg = WalIndexHashSegment::new(WalIndexSegmentKind::Subsequent);
+        let slots_before = seg.hash_slots();
+        assert!(slots_before.iter().all(|&s| s == 0));
+
+        seg.insert(7).unwrap();
+        seg.insert(15).unwrap();
+        let slots_after = seg.hash_slots();
+        let non_zero: usize = slots_after.iter().filter(|&&s| s != 0).count();
+        assert_eq!(non_zero, 2);
+
+        let slot_7 = usize::try_from(wal_index_hash_slot(7)).unwrap();
+        assert_eq!(slots_after[slot_7], 1, "page 7 is first entry → one-based 1");
+        let slot_15 = usize::try_from(wal_index_hash_slot(15)).unwrap();
+        assert_eq!(slots_after[slot_15], 2, "page 15 is second entry → one-based 2");
+    }
+
+    #[test]
+    fn test_parse_shm_header_too_short_returns_error() {
+        let buf = [0u8; WAL_SHM_FIRST_HEADER_BYTES - 1];
+        let err = parse_shm_header(&buf).unwrap_err();
+        assert!(err.to_string().contains("too small"));
+    }
+
+    #[test]
+    fn test_from_bytes_accepts_oversized_buffers() {
+        let hdr = WalIndexHdr {
+            i_version: WAL_INDEX_VERSION,
+            unused: 0,
+            i_change: 55,
+            is_init: 1,
+            big_end_cksum: 0,
+            sz_page: 4096,
+            mx_frame: 10,
+            n_page: 5,
+            a_frame_cksum: [111, 222],
+            a_salt: [333, 444],
+            a_cksum: [555, 666],
+        };
+        let small = hdr.to_bytes();
+        let mut big = [0xFFu8; 128];
+        big[..WAL_INDEX_HDR_BYTES].copy_from_slice(&small);
+        let parsed = WalIndexHdr::from_bytes(&big).unwrap();
+        assert_eq!(parsed, hdr);
+
+        let ckpt = WalCkptInfo {
+            n_backfill: 9,
+            a_read_mark: [1, 2, 3, 4, 5],
+            a_lock: [0; WAL_LOCK_SLOT_COUNT],
+            n_backfill_attempted: 12,
+            not_used0: 0,
+        };
+        let small_ckpt = ckpt.to_bytes();
+        let mut big_ckpt = [0xFFu8; 128];
+        big_ckpt[..WAL_CKPT_INFO_BYTES].copy_from_slice(&small_ckpt);
+        let parsed_ckpt = WalCkptInfo::from_bytes(&big_ckpt).unwrap();
+        assert_eq!(parsed_ckpt, ckpt);
+    }
+
+    #[test]
+    fn test_wal_hash_lookup_fields_and_derives() {
+        let a = WalHashLookup {
+            slot: 42,
+            one_based_index: 7,
+            page_number: 100,
+        };
+        let b = a;
+        assert_eq!(a, b);
+
+        let c = WalHashLookup {
+            slot: 42,
+            one_based_index: 8,
+            page_number: 100,
+        };
+        assert_ne!(a, c);
+
+        assert_eq!(a.slot, 42);
+        assert_eq!(a.one_based_index, 7);
+        assert_eq!(a.page_number, 100);
+
+        let dbg = format!("{a:?}");
+        assert!(dbg.contains("WalHashLookup"));
+    }
 }

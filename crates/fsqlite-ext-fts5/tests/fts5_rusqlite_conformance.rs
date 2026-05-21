@@ -1750,6 +1750,33 @@ const DELETE_ALL_CASES: &[MatchCase] = &[
     },
 ];
 
+const MISSING_ROW_DELETE_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "rust rows retained after missing delete",
+        query: "rust",
+    },
+    MatchCase {
+        name: "sqlite rows retained after missing delete",
+        query: "sqlite",
+    },
+    MatchCase {
+        name: "title filter retained after missing delete",
+        query: "title:sqlite",
+    },
+    MatchCase {
+        name: "body filter retained after missing delete",
+        query: "body:prefix",
+    },
+    MatchCase {
+        name: "phrase retained after missing delete",
+        query: r#""full text""#,
+    },
+    MatchCase {
+        name: "boolean retained after missing delete",
+        query: "rust OR cooking",
+    },
+];
+
 const INVALID_QUERY_CASES: &[MatchCase] = &[
     MatchCase {
         name: "empty query",
@@ -3347,6 +3374,30 @@ fn delete_all_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "delete-all MATCH conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn missing_row_delete_queries_match_rusqlite_reference() {
+    let mut harness = Fts5ConformanceHarness::new(&[]);
+    harness.delete_doc(9_999);
+
+    let mut franken_rows = harness.franken_full_scan_rows();
+    franken_rows.sort_by_key(|row| row.0);
+    assert_eq!(
+        franken_rows,
+        harness.sqlite_full_scan_rows(),
+        "missing-row delete full-scan conformance failed"
+    );
+
+    for case in MISSING_ROW_DELETE_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "missing-row delete MATCH conformance case failed: {} ({})",
             case.name,
             case.query
         );

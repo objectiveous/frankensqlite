@@ -287,6 +287,33 @@ const CASE_FOLDING_CASES: &[MatchCase] = &[
     },
 ];
 
+const DEFAULT_DIACRITIC_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "plain query matches accented text",
+        query: "cafe",
+    },
+    MatchCase {
+        name: "accented query matches plain text",
+        query: "résumé",
+    },
+    MatchCase {
+        name: "plain phrase matches accented phrase",
+        query: r#""cafe creme""#,
+    },
+    MatchCase {
+        name: "accented phrase matches plain phrase",
+        query: r#""café crème""#,
+    },
+    MatchCase {
+        name: "plain prefix matches accented token",
+        query: "crem*",
+    },
+    MatchCase {
+        name: "accented prefix matches plain token",
+        query: "résum*",
+    },
+];
+
 const MULTIPLE_MATCH_CASES: &[MultiMatchCase] = &[
     MultiMatchCase {
         name: "intersect bare terms",
@@ -1172,6 +1199,21 @@ fn case_folding_match_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "case-folding MATCH conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn default_unicode61_diacritic_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::with_docs(&[], UNICODE61_DIACRITIC_DOCS);
+
+    for case in DEFAULT_DIACRITIC_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "default unicode61 diacritic conformance case failed: {} ({})",
             case.name,
             case.query
         );

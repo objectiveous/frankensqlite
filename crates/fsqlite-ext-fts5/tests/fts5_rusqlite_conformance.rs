@@ -1,6 +1,6 @@
 use fsqlite_ext_fts5::{Fts5HighlightFunc, Fts5SnippetFunc, Fts5Table};
 use fsqlite_func::ScalarFunction;
-use fsqlite_func::vtab::VirtualTable;
+use fsqlite_func::vtab::{ColumnContext, VirtualTable, VirtualTableCursor};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::value::{SmallText, SqliteValue};
 use rusqlite::Connection;
@@ -745,6 +745,51 @@ impl Fts5ConformanceHarness {
         .expect("read rusqlite FTS5 BM25 scores")
     }
 
+    fn franken_rank_column_scores(&self, query: &str, rank_column: i32) -> Vec<(i64, f64)> {
+        let cx = Cx::new();
+        let mut cursor = self.franken.open().expect("open FrankenSQLite FTS5 cursor");
+        cursor
+            .filter(
+                &cx,
+                1,
+                None,
+                &[SqliteValue::Text(SmallText::from_string(query.to_owned()))],
+            )
+            .expect("filter FrankenSQLite FTS5 cursor");
+
+        let mut scores = Vec::new();
+        while !cursor.eof() {
+            let rowid = cursor.rowid().expect("read FrankenSQLite FTS5 rowid");
+            let mut ctx = ColumnContext::new();
+            cursor
+                .column(&mut ctx, rank_column)
+                .expect("read FrankenSQLite FTS5 rank column");
+            let value = ctx
+                .take_value()
+                .expect("FrankenSQLite FTS5 rank column value");
+            let SqliteValue::Float(score) = value else {
+                panic!("FrankenSQLite FTS5 rank column returned {value:?}");
+            };
+            scores.push((rowid, score));
+            cursor.next(&cx).expect("advance FrankenSQLite FTS5 cursor");
+        }
+        scores.sort_by_key(|(rowid, _score)| *rowid);
+        scores
+    }
+
+    fn sqlite_rank_column_scores(&self, query: &str) -> Vec<(i64, f64)> {
+        let mut stmt = self
+            .sqlite
+            .prepare("SELECT rowid, rank FROM docs WHERE docs MATCH ?1 ORDER BY rowid")
+            .expect("prepare rusqlite FTS5 rank query");
+        stmt.query_map([query], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+        })
+        .expect("query rusqlite FTS5 rank scores")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("read rusqlite FTS5 rank scores")
+    }
+
     fn franken_weighted_ranked_rowids(&self, query: &str, weights: &[f64]) -> Vec<i64> {
         let mut ranked = self
             .franken
@@ -1199,6 +1244,25 @@ fn bm25_scores_match_rusqlite_reference() {
             &harness.franken_weighted_bm25_scores(case.query, case.weights),
             &harness.sqlite_weighted_bm25_scores(case.query, case.weights),
             format_args!("{} ({}, {:?})", case.name, case.query, case.weights),
+        );
+    }
+}
+
+#[test]
+fn rank_column_matches_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::with_docs(&[], BM25_DOCS);
+
+    for case in BM25_CASES {
+        let sqlite = harness.sqlite_rank_column_scores(case.query);
+        assert_bm25_scores_match(
+            &harness.franken_rank_column_scores(case.query, -1),
+            &sqlite,
+            format_args!("hidden rank column {} ({})", case.name, case.query),
+        );
+        assert_bm25_scores_match(
+            &harness.franken_rank_column_scores(case.query, 2),
+            &sqlite,
+            format_args!("trailing rank column {} ({})", case.name, case.query),
         );
     }
 }

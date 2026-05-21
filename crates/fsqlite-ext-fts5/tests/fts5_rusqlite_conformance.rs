@@ -1002,6 +1002,41 @@ const PHRASE_PREFIX_NEAR_CASES: &[MatchCase] = &[
     },
 ];
 
+const PREFIX_BOOLEAN_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "prefix and bare term",
+        query: "sea* AND rust",
+    },
+    MatchCase {
+        name: "prefix disjunction",
+        query: "search* OR cook*",
+    },
+    MatchCase {
+        name: "title prefix with body term",
+        query: "title:sea* AND body:rust",
+    },
+    MatchCase {
+        name: "grouped title prefix with body term",
+        query: "(title:rust OR title:search*) AND body:search",
+    },
+    MatchCase {
+        name: "body prefix or title prefix",
+        query: "body:compat* OR title:cook*",
+    },
+    MatchCase {
+        name: "prefix with column exclusion",
+        query: "search* NOT title:search*",
+    },
+    MatchCase {
+        name: "title term and body prefix",
+        query: "title:rust AND body:compat*",
+    },
+    MatchCase {
+        name: "body prefix disjunction",
+        query: "body:prefix* OR body:writer*",
+    },
+];
+
 const NEAR_DEFAULT_COLUMN_CASES: &[MatchCase] = &[
     MatchCase {
         name: "default near distance",
@@ -2292,6 +2327,21 @@ fn phrase_prefix_near_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "phrase/prefix/NEAR conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn prefix_boolean_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in PREFIX_BOOLEAN_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "prefix boolean conformance case failed: {} ({})",
             case.name,
             case.query
         );

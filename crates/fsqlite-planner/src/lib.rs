@@ -6094,6 +6094,20 @@ mod tests {
     }
 
     #[test]
+    fn test_reverse_comparison_op() {
+        use AstBinaryOp::{Add, Eq, Ge, Gt, Le, Lt, Ne};
+        // Reversing a comparison swaps operand order: Eq is symmetric, and
+        // Lt<->Gt, Le<->Ge swap. Ne and non-comparison ops return None.
+        assert!(matches!(reverse_comparison_op(Eq), Some(Eq)));
+        assert!(matches!(reverse_comparison_op(Lt), Some(Gt)));
+        assert!(matches!(reverse_comparison_op(Gt), Some(Lt)));
+        assert!(matches!(reverse_comparison_op(Le), Some(Ge)));
+        assert!(matches!(reverse_comparison_op(Ge), Some(Le)));
+        assert!(reverse_comparison_op(Ne).is_none());
+        assert!(reverse_comparison_op(Add).is_none());
+    }
+
+    #[test]
     fn test_normalize_column_literal_comparison_orients_column_left() {
         // normalize_column_literal_comparison puts the column on the left: a
         // column-OP-literal comparison keeps its op, while literal-OP-column

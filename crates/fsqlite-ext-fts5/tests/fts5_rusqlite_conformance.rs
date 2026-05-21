@@ -1568,6 +1568,33 @@ const REPEATED_REPLACEMENT_CASES: &[MatchCase] = &[
     },
 ];
 
+const NOOP_REPLACEMENT_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "same title term remains single row",
+        query: "title:sqlite",
+    },
+    MatchCase {
+        name: "same title abbreviation remains",
+        query: "title:fts",
+    },
+    MatchCase {
+        name: "same body term remains",
+        query: "body:prefix",
+    },
+    MatchCase {
+        name: "same phrase remains",
+        query: r#""full text""#,
+    },
+    MatchCase {
+        name: "same boolean expression remains stable",
+        query: "sqlite OR search",
+    },
+    MatchCase {
+        name: "same column phrase remains stable",
+        query: r#"body:"phrase and prefix""#,
+    },
+];
+
 const COLUMN_MIGRATION_REPLACEMENT_CASES: &[MatchCase] = &[
     MatchCase {
         name: "new title term indexed",
@@ -3148,6 +3175,39 @@ fn repeated_replacement_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "repeated-replacement MATCH conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn noop_replacement_queries_match_rusqlite_reference() {
+    let mut harness = Fts5ConformanceHarness::new(&[]);
+    harness.insert_or_replace_doc(Doc {
+        rowid: 2,
+        title: "SQLite FTS",
+        body: "SQLite full text search supports phrase and prefix queries",
+    });
+    harness.insert_or_replace_doc(Doc {
+        rowid: 2,
+        title: "SQLite FTS",
+        body: "SQLite full text search supports phrase and prefix queries",
+    });
+
+    let mut franken_rows = harness.franken_full_scan_rows();
+    franken_rows.sort_by_key(|row| row.0);
+    assert_eq!(
+        franken_rows,
+        harness.sqlite_full_scan_rows(),
+        "noop-replacement full-scan conformance failed"
+    );
+
+    for case in NOOP_REPLACEMENT_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "noop-replacement MATCH conformance case failed: {} ({})",
             case.name,
             case.query
         );

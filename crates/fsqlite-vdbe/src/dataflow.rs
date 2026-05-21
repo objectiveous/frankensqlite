@@ -235,6 +235,8 @@ pub enum DataflowOperator {
     },
     /// Keep rows whose text column character length equals the configured length.
     FilterTextLengthExact { column: usize, length: usize },
+    /// Keep rows whose text column character length differs from the configured length.
+    FilterTextLengthNotExact { column: usize, length: usize },
     /// Keep rows whose blob column byte length lies in an inclusive range.
     FilterBlobLengthBetween {
         column: usize,
@@ -384,6 +386,9 @@ impl DataflowOperator {
             } => filter_text_length_between(rows, *column, *lower, *upper),
             Self::FilterTextLengthExact { column, length } => {
                 filter_text_length_exact(rows, *column, *length)
+            }
+            Self::FilterTextLengthNotExact { column, length } => {
+                filter_text_length_not_exact(rows, *column, *length)
             }
             Self::FilterBlobLengthBetween {
                 column,
@@ -852,6 +857,26 @@ fn filter_text_length_exact(
     rows.iter()
         .filter_map(|row| match row.values.get(column) {
             Some(SqliteValue::Text(candidate)) if candidate.chars().count() == length => {
+                Some(Ok(row.clone()))
+            }
+            Some(SqliteValue::Text(_)) => None,
+            Some(_) => Some(Err(DataflowError::PredicateValueNotText { column })),
+            None => Some(Err(DataflowError::ColumnOutOfBounds {
+                column,
+                width: row.width(),
+            })),
+        })
+        .collect()
+}
+
+fn filter_text_length_not_exact(
+    rows: &[WeightedRow],
+    column: usize,
+    length: usize,
+) -> DataflowResult<Vec<WeightedRow>> {
+    rows.iter()
+        .filter_map(|row| match row.values.get(column) {
+            Some(SqliteValue::Text(candidate)) if candidate.chars().count() != length => {
                 Some(Ok(row.clone()))
             }
             Some(SqliteValue::Text(_)) => None,
@@ -2439,6 +2464,105 @@ mod tests {
         let err = automaton
             .execute(&[WeightedRow::insert(vec![int(1), text("echo")])])
             .expect_err("invalid text-length-exact predicate column should fail");
+
+        assert_eq!(
+            err,
+            DataflowError::ColumnOutOfBounds {
+                column: 2,
+                width: 2
+            }
+        );
+    }
+
+    #[test]
+    fn filter_text_length_not_exact_keeps_non_matching_weighted_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterTextLengthNotExact {
+            column: 1,
+            length: 4,
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), text("at")], 7),
+            WeightedRow::new(vec![int(2), text("echo")], -2),
+            WeightedRow::new(vec![int(3), text("beta")], 4),
+            WeightedRow::new(vec![int(4), text("alpha")], 5),
+            WeightedRow::new(vec![int(5), text("sun")], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(1), text("at")], 7),
+                WeightedRow::new(vec![int(4), text("alpha")], 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_text_length_not_exact_counts_unicode_scalar_values() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterTextLengthNotExact {
+            column: 1,
+            length: 4,
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), text("echo")], 3),
+            WeightedRow::new(vec![int(2), text("\u{e9}cho")], -2),
+            WeightedRow::new(vec![int(3), text("\u{e9}chos")], 5),
+            WeightedRow::new(vec![int(4), text("e\u{301}cho")], 6),
+        ];
+
+        assert_eq!(
+            automaton.execute(&rows).expect("dataflow should execute"),
+            vec![
+                WeightedRow::new(vec![int(3), text("\u{e9}chos")], 5),
+                WeightedRow::new(vec![int(4), text("e\u{301}cho")], 6),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_text_length_not_exact_excludes_empty_text_length() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterTextLengthNotExact {
+            column: 1,
+            length: 0,
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), text("")], 7),
+            WeightedRow::new(vec![int(2), text("a")], -2),
+            WeightedRow::new(vec![int(3), text("")], 0),
+        ];
+
+        assert_eq!(
+            automaton.execute(&rows).expect("dataflow should execute"),
+            vec![WeightedRow::new(vec![int(2), text("a")], -2)]
+        );
+    }
+
+    #[test]
+    fn filter_text_length_not_exact_rejects_non_text_values() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterTextLengthNotExact {
+            column: 1,
+            length: 4,
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), int(4)])])
+            .expect_err("non-text predicate input should fail");
+
+        assert_eq!(err, DataflowError::PredicateValueNotText { column: 1 });
+    }
+
+    #[test]
+    fn filter_text_length_not_exact_rejects_out_of_bounds_columns() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterTextLengthNotExact {
+            column: 2,
+            length: 4,
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), text("echo")])])
+            .expect_err("invalid text-length-not-exact predicate column should fail");
 
         assert_eq!(
             err,

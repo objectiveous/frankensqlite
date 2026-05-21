@@ -212,6 +212,7 @@ const UNICODE61_DIACRITIC_OPTIONS: &[&str] = &["tokenize='unicode61 remove_diacr
 const UNICODE61_CODE_TOKEN_OPTIONS: &[&str] = &[r#"tokenize="unicode61 tokenchars '-_./:@#$%'""#];
 const UNICODE61_SEPARATOR_OPTIONS: &[&str] = &[r#"tokenize="unicode61 separators '_.'""#];
 const UNINDEXED_COLUMN_SPECS: &[&str] = &["title", "body UNINDEXED"];
+const COLUMN_SIZE_ZERO_OPTIONS: &[&str] = &["columnsize=0"];
 const CONTENTLESS_OPTIONS: &[&str] = &["content=''"];
 const PREFIX_INDEX_OPTIONS: &[&str] = &["prefix='2 3'"];
 const DETAIL_COLUMN_OPTIONS: &[&str] = &["detail=column"];
@@ -902,6 +903,44 @@ fn unindexed_columns_match_rusqlite_reference() {
             "UNINDEXED column conformance case failed: {} ({})",
             case.name,
             case.query
+        );
+    }
+}
+
+#[test]
+fn columnsize_zero_tables_match_rusqlite_reference() {
+    let match_harness = Fts5ConformanceHarness::with_docs(COLUMN_SIZE_ZERO_OPTIONS, DOCS);
+
+    for case in MATCH_CASES {
+        assert_eq!(
+            match_harness.franken_match_rowids(case.query),
+            match_harness.sqlite_match_rowids(case.query),
+            "columnsize=0 MATCH conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+
+    let ranking_harness = Fts5ConformanceHarness::with_docs(COLUMN_SIZE_ZERO_OPTIONS, BM25_DOCS);
+
+    for case in BM25_CASES {
+        assert_eq!(
+            ranking_harness.franken_ranked_rowids(case.query),
+            ranking_harness.sqlite_bm25_rowids(case.query),
+            "columnsize=0 BM25 conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+
+    for case in WEIGHTED_BM25_CASES {
+        assert_eq!(
+            ranking_harness.franken_weighted_ranked_rowids(case.query, case.weights),
+            ranking_harness.sqlite_weighted_bm25_rowids(case.query, case.weights),
+            "columnsize=0 weighted BM25 conformance case failed: {} ({}, {:?})",
+            case.name,
+            case.query,
+            case.weights
         );
     }
 }

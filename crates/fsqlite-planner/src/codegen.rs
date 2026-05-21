@@ -3141,6 +3141,33 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_expr_collate_is_transparent() {
+        // COLLATE is a no-op at this codegen layer: emit_expr(x COLLATE C) emits
+        // exactly what emit_expr(x) would, with no collation-specific opcode.
+        let mut b = ProgramBuilder::new();
+        let reg = b.alloc_reg();
+        let expr = Expr::Collate {
+            expr: Box::new(Expr::Literal(Literal::Integer(3), Span::ZERO)),
+            collation: "NOCASE".to_owned(),
+            span: Span::ZERO,
+        };
+        emit_expr(&mut b, &expr, reg).unwrap();
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let prog = b.finish().unwrap();
+        let non_halt: Vec<Opcode> = prog
+            .ops()
+            .iter()
+            .map(|o| o.opcode)
+            .filter(|&o| o != Opcode::Halt)
+            .collect();
+        assert_eq!(
+            non_halt,
+            vec![Opcode::Integer],
+            "COLLATE wraps transparently: only the inner literal's opcode is emitted"
+        );
+    }
+
+    #[test]
     fn test_emit_expr_large_integer_literal_uses_int64_opcode() {
         let mut b = ProgramBuilder::new();
         let reg = b.alloc_reg();

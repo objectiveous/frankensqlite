@@ -189,6 +189,8 @@ const UNICODE61_SEPARATOR_OPTIONS: &[&str] = &[r#"tokenize="unicode61 separators
 const UNINDEXED_COLUMN_SPECS: &[&str] = &["title", "body UNINDEXED"];
 const CONTENTLESS_OPTIONS: &[&str] = &["content=''"];
 const PREFIX_INDEX_OPTIONS: &[&str] = &["prefix='2 3'"];
+const DETAIL_COLUMN_OPTIONS: &[&str] = &["detail=column"];
+const DETAIL_NONE_OPTIONS: &[&str] = &["detail=none"];
 const PORTER_OPTIONS: &[&str] = &["tokenize='porter'"];
 const TRIGRAM_OPTIONS: &[&str] = &["tokenize='trigram'"];
 
@@ -343,6 +345,44 @@ const PREFIX_INDEX_CASES: &[MatchCase] = &[
     MatchCase {
         name: "near prefix",
         query: "NEAR(rust compat*, 4)",
+    },
+];
+
+const DETAIL_COLUMN_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "detail column term",
+        query: "rust",
+    },
+    MatchCase {
+        name: "detail column prefix",
+        query: "search*",
+    },
+    MatchCase {
+        name: "detail column title filter",
+        query: "title:sqlite",
+    },
+    MatchCase {
+        name: "detail column boolean",
+        query: "rust AND sqlite",
+    },
+];
+
+const DETAIL_NONE_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "detail none term",
+        query: "rust",
+    },
+    MatchCase {
+        name: "detail none implicit column union",
+        query: "sqlite",
+    },
+    MatchCase {
+        name: "detail none boolean or",
+        query: "rust OR bread",
+    },
+    MatchCase {
+        name: "detail none binary not",
+        query: "sqlite NOT cooking",
     },
 ];
 
@@ -709,6 +749,31 @@ fn prefix_index_options_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "prefix-index option conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn detail_mode_queries_match_rusqlite_reference() {
+    let detail_column = Fts5ConformanceHarness::with_docs(DETAIL_COLUMN_OPTIONS, DOCS);
+    for case in DETAIL_COLUMN_CASES {
+        assert_eq!(
+            detail_column.franken_match_rowids(case.query),
+            detail_column.sqlite_match_rowids(case.query),
+            "detail=column conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+
+    let detail_none = Fts5ConformanceHarness::with_docs(DETAIL_NONE_OPTIONS, DOCS);
+    for case in DETAIL_NONE_CASES {
+        assert_eq!(
+            detail_none.franken_match_rowids(case.query),
+            detail_none.sqlite_match_rowids(case.query),
+            "detail=none conformance case failed: {} ({})",
             case.name,
             case.query
         );

@@ -5275,6 +5275,57 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_output_aliases_and_count_output_columns() {
+        // SELECT 1 AS renamed, bare_col, 2 -> aliased / bare-column-name / unaliased-expr.
+        let core = SelectCore::Select {
+            distinct: Distinctness::All,
+            columns: vec![
+                ResultColumn::Expr {
+                    expr: Expr::Literal(Literal::Integer(1), Span::ZERO),
+                    alias: Some("renamed".to_owned()),
+                },
+                ResultColumn::Expr {
+                    expr: Expr::Column(ColumnRef::bare("bare_col"), Span::ZERO),
+                    alias: None,
+                },
+                ResultColumn::Expr {
+                    expr: Expr::Literal(Literal::Integer(2), Span::ZERO),
+                    alias: None,
+                },
+            ],
+            from: None,
+            where_clause: None,
+            group_by: vec![],
+            having: None,
+            windows: vec![],
+        };
+        assert_eq!(count_output_columns(&core), 3);
+        assert_eq!(
+            extract_output_aliases(&core),
+            vec![Some("renamed".to_owned()), Some("bare_col".to_owned()), None]
+        );
+
+        // VALUES: width comes from the first row; every column is unnamed.
+        let values = SelectCore::Values(vec![
+            vec![
+                Expr::Literal(Literal::Integer(1), Span::ZERO),
+                Expr::Literal(Literal::Integer(2), Span::ZERO),
+            ],
+            vec![
+                Expr::Literal(Literal::Integer(3), Span::ZERO),
+                Expr::Literal(Literal::Integer(4), Span::ZERO),
+            ],
+        ]);
+        assert_eq!(count_output_columns(&values), 2);
+        assert_eq!(extract_output_aliases(&values), vec![None, None]);
+
+        // Empty VALUES -> zero columns.
+        let empty = SelectCore::Values(vec![]);
+        assert_eq!(count_output_columns(&empty), 0);
+        assert!(extract_output_aliases(&empty).is_empty());
+    }
+
+    #[test]
     fn test_compound_order_by_second_select_alias() {
         // SELECT 1 AS a UNION SELECT 2 AS b ORDER BY b
         // → b is in the second SELECT at col 0

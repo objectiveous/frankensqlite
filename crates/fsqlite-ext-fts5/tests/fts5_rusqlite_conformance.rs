@@ -18,6 +18,13 @@ struct MatchCase {
     query: &'static str,
 }
 
+#[derive(Clone, Copy)]
+struct MultiMatchCase {
+    name: &'static str,
+    left_query: &'static str,
+    right_query: &'static str,
+}
+
 struct TokenizerCase {
     name: &'static str,
     options: &'static [&'static str],
@@ -250,6 +257,29 @@ const MATCH_CASES: &[MatchCase] = &[
     MatchCase {
         name: "body column filter",
         query: "body:search",
+    },
+];
+
+const MULTIPLE_MATCH_CASES: &[MultiMatchCase] = &[
+    MultiMatchCase {
+        name: "intersect bare terms",
+        left_query: "rust",
+        right_query: "sqlite",
+    },
+    MultiMatchCase {
+        name: "intersect title and body filters",
+        left_query: "title:rust",
+        right_query: "body:search",
+    },
+    MultiMatchCase {
+        name: "reverse column filters",
+        left_query: "body:search",
+        right_query: "title:sqlite",
+    },
+    MultiMatchCase {
+        name: "compound boolean intersection",
+        left_query: "rust OR bread",
+        right_query: "sqlite NOT cooking",
     },
 ];
 
@@ -677,6 +707,45 @@ impl Fts5ConformanceHarness {
             .expect("read rusqlite FTS5 rowids")
     }
 
+    fn franken_multiple_match_rowids(&self, left_query: &str, right_query: &str) -> Vec<i64> {
+        let cx = Cx::new();
+        let mut cursor = self.franken.open().expect("open FrankenSQLite FTS5 cursor");
+        cursor
+            .filter(
+                &cx,
+                1,
+                None,
+                &[
+                    SqliteValue::Text(SmallText::from_string(left_query.to_owned())),
+                    SqliteValue::Text(SmallText::from_string(right_query.to_owned())),
+                ],
+            )
+            .expect("filter FrankenSQLite FTS5 cursor with multiple MATCH constraints");
+
+        let mut rowids = Vec::new();
+        while !cursor.eof() {
+            rowids.push(cursor.rowid().expect("read FrankenSQLite FTS5 rowid"));
+            cursor.next(&cx).expect("advance FrankenSQLite FTS5 cursor");
+        }
+        rowids.sort_unstable();
+        rowids
+    }
+
+    fn sqlite_multiple_match_rowids(&self, left_query: &str, right_query: &str) -> Vec<i64> {
+        let mut stmt = self
+            .sqlite
+            .prepare(
+                "SELECT rowid FROM docs \
+                 WHERE docs MATCH ?1 AND docs MATCH ?2 \
+                 ORDER BY rowid",
+            )
+            .expect("prepare rusqlite FTS5 multiple MATCH query");
+        stmt.query_map([left_query, right_query], |row| row.get::<_, i64>(0))
+            .expect("query rusqlite FTS5 multiple MATCH rowids")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("read rusqlite FTS5 multiple MATCH rowids")
+    }
+
     fn franken_match_is_error(&self, query: &str) -> bool {
         self.franken.search(query).is_err()
     }
@@ -984,6 +1053,22 @@ fn match_queries_match_rusqlite_reference() {
             "MATCH conformance case failed: {} ({})",
             case.name,
             case.query
+        );
+    }
+}
+
+#[test]
+fn multiple_match_constraints_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in MULTIPLE_MATCH_CASES {
+        assert_eq!(
+            harness.franken_multiple_match_rowids(case.left_query, case.right_query),
+            harness.sqlite_multiple_match_rowids(case.left_query, case.right_query),
+            "multiple MATCH conformance case failed: {} ({} AND {})",
+            case.name,
+            case.left_query,
+            case.right_query
         );
     }
 }

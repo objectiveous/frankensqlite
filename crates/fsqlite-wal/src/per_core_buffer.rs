@@ -1764,3 +1764,41 @@ fn epoch_coordinator_mark_and_query_durable_epoch() {
     coord.mark_epoch_durable(10);
     assert_eq!(coord.durable_epoch(), Some(10));
 }
+
+#[test]
+fn buffer_config_default_values() {
+    let cfg = BufferConfig::default();
+    assert_eq!(cfg.capacity_bytes, DEFAULT_BUFFER_CAPACITY_BYTES);
+    assert_eq!(cfg.overflow_policy, OverflowPolicy::AllocateOverflow);
+    assert_eq!(cfg.overflow_fallback_bytes, DEFAULT_OVERFLOW_FALLBACK_BYTES);
+    let copied = cfg;
+    assert_eq!(copied, cfg);
+    let dbg = format!("{cfg:?}");
+    assert!(dbg.contains("BufferConfig"));
+}
+
+#[test]
+fn epoch_config_default_and_epoch_flush_batch_total() {
+    let ecfg = EpochConfig::default();
+    assert_eq!(ecfg.advance_interval_ms, DEFAULT_EPOCH_ADVANCE_INTERVAL_MS);
+    let batch = EpochFlushBatch {
+        epoch: 5,
+        records: Vec::new(),
+        records_per_core: vec![0, 0],
+    };
+    assert_eq!(batch.total_records(), 0);
+    assert_eq!(batch.epoch, 5);
+}
+
+#[test]
+fn epoch_order_coordinator_current_and_append_epoch() {
+    let coord = EpochOrderCoordinator::new(2, BufferConfig::default(), EpochConfig::default());
+    assert_eq!(coord.current_epoch(), 0);
+    assert_eq!(coord.append_epoch(), 0);
+}
+
+#[test]
+fn per_core_buffer_pool_core_count() {
+    let pool = PerCoreWalBufferPool::new(4, BufferConfig::default());
+    assert_eq!(pool.core_count(), 4);
+}

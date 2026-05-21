@@ -818,6 +818,29 @@ const BOOLEAN_PRECEDENCE_CASES: &[MatchCase] = &[
     },
 ];
 
+const PARENTHESIZED_BOOLEAN_CASES: &[MatchCase] = &[
+    MatchCase {
+        name: "nested single term",
+        query: "((rust))",
+    },
+    MatchCase {
+        name: "or of grouped and terms",
+        query: "(rust AND search) OR (sqlite AND writers)",
+    },
+    MatchCase {
+        name: "grouped not rhs",
+        query: "(rust OR sqlite) NOT (bread OR cooking)",
+    },
+    MatchCase {
+        name: "grouped column filters with and",
+        query: "(title:rust OR body:prefix) AND search",
+    },
+    MatchCase {
+        name: "two grouped column-filter disjunctions",
+        query: "(title:rust OR title:sqlite) AND (body:search OR body:writers)",
+    },
+];
+
 const PHRASE_PREFIX_NEAR_CASES: &[MatchCase] = &[
     MatchCase {
         name: "quoted phrase",
@@ -1983,6 +2006,21 @@ fn boolean_precedence_queries_match_rusqlite_reference() {
             harness.franken_match_rowids(case.query),
             harness.sqlite_match_rowids(case.query),
             "boolean precedence conformance case failed: {} ({})",
+            case.name,
+            case.query
+        );
+    }
+}
+
+#[test]
+fn parenthesized_boolean_queries_match_rusqlite_reference() {
+    let harness = Fts5ConformanceHarness::new(&[]);
+
+    for case in PARENTHESIZED_BOOLEAN_CASES {
+        assert_eq!(
+            harness.franken_match_rowids(case.query),
+            harness.sqlite_match_rowids(case.query),
+            "parenthesized boolean conformance case failed: {} ({})",
             case.name,
             case.query
         );

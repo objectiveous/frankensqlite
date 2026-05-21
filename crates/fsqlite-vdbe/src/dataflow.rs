@@ -69,6 +69,8 @@ pub enum DataflowError {
     PredicateValueNotFloat { column: usize },
     /// Text predicate operators only accept text value inputs.
     PredicateValueNotText { column: usize },
+    /// Blob predicate operators only accept blob value inputs.
+    PredicateValueNotBlob { column: usize },
     /// Integer aggregate operators only accept integer value inputs.
     AggregateValueNotInteger { column: usize },
     /// Join key mappings must specify the same number of left and right columns.
@@ -94,6 +96,9 @@ impl fmt::Display for DataflowError {
             }
             Self::PredicateValueNotText { column } => {
                 write!(f, "predicate value column {column} is not text")
+            }
+            Self::PredicateValueNotBlob { column } => {
+                write!(f, "predicate value column {column} is not a blob")
             }
             Self::AggregateValueNotInteger { column } => {
                 write!(f, "aggregate value column {column} is not an integer")
@@ -216,6 +221,12 @@ pub enum DataflowOperator {
     FilterTextNotContains { column: usize, needle: String },
     /// Keep rows whose text column length lies in an inclusive character range.
     FilterTextLengthBetween {
+        column: usize,
+        lower: usize,
+        upper: usize,
+    },
+    /// Keep rows whose blob column byte length lies in an inclusive range.
+    FilterBlobLengthBetween {
         column: usize,
         lower: usize,
         upper: usize,
@@ -343,6 +354,11 @@ impl DataflowOperator {
                 lower,
                 upper,
             } => filter_text_length_between(rows, *column, *lower, *upper),
+            Self::FilterBlobLengthBetween {
+                column,
+                lower,
+                upper,
+            } => filter_blob_length_between(rows, *column, *lower, *upper),
             Self::FilterTextLengthNotBetween {
                 column,
                 lower,
@@ -691,6 +707,27 @@ fn filter_text_length_between(
             }
             Some(SqliteValue::Text(_)) => None,
             Some(_) => Some(Err(DataflowError::PredicateValueNotText { column })),
+            None => Some(Err(DataflowError::ColumnOutOfBounds {
+                column,
+                width: row.width(),
+            })),
+        })
+        .collect()
+}
+
+fn filter_blob_length_between(
+    rows: &[WeightedRow],
+    column: usize,
+    lower: usize,
+    upper: usize,
+) -> DataflowResult<Vec<WeightedRow>> {
+    rows.iter()
+        .filter_map(|row| match row.values.get(column) {
+            Some(SqliteValue::Blob(candidate)) if (lower..=upper).contains(&candidate.len()) => {
+                Some(Ok(row.clone()))
+            }
+            Some(SqliteValue::Blob(_)) => None,
+            Some(_) => Some(Err(DataflowError::PredicateValueNotBlob { column })),
             None => Some(Err(DataflowError::ColumnOutOfBounds {
                 column,
                 width: row.width(),
@@ -1206,8 +1243,8 @@ pub fn delta_join_update(
 #[cfg(test)]
 mod tests {
     use super::{
-        DataflowAutomaton, DataflowError, DataflowOperator, IntegerComparison, JoinKeySpec,
-        NullPredicate, WeightSign, WeightedRow, delta_join_left, delta_join_right,
+        DataflowAutomaton, DataflowError, DataflowOperator, FloatSign, IntegerComparison,
+        JoinKeySpec, NullPredicate, WeightSign, WeightedRow, delta_join_left, delta_join_right,
         delta_join_update, scale_weights, set_weights, threshold_positive,
     };
     use fsqlite_types::SqliteValue;
@@ -1218,6 +1255,10 @@ mod tests {
 
     fn text(value: &str) -> SqliteValue {
         SqliteValue::Text(value.into())
+    }
+
+    fn blob(bytes: &[u8]) -> SqliteValue {
+        SqliteValue::Blob(bytes.to_vec().into())
     }
 
     #[test]
@@ -1771,6 +1812,83 @@ mod tests {
         let err = automaton
             .execute(&[WeightedRow::insert(vec![int(1), text("echo")])])
             .expect_err("invalid text-length predicate column should fail");
+
+        assert_eq!(
+            err,
+            DataflowError::ColumnOutOfBounds {
+                column: 2,
+                width: 2
+            }
+        );
+    }
+
+    #[test]
+    fn filter_blob_length_between_keeps_matching_weighted_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterBlobLengthBetween {
+            column: 1,
+            lower: 2,
+            upper: 4,
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![int(1), blob(&[1])], 7),
+            WeightedRow::new(vec![int(2), blob(&[1, 2])], -2),
+            WeightedRow::new(vec![int(3), blob(&[1, 2, 3, 4])], 4),
+            WeightedRow::new(vec![int(4), blob(&[1, 2, 3, 4, 5])], 5),
+            WeightedRow::new(vec![int(5), blob(&[9, 9])], 0),
+        ];
+
+        let actual = automaton.execute(&rows).expect("dataflow should execute");
+
+        assert_eq!(
+            actual,
+            vec![
+                WeightedRow::new(vec![int(2), blob(&[1, 2])], -2),
+                WeightedRow::new(vec![int(3), blob(&[1, 2, 3, 4])], 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_blob_length_between_inverted_range_matches_no_rows() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterBlobLengthBetween {
+            column: 1,
+            lower: 5,
+            upper: 3,
+        }]);
+        let rows = vec![WeightedRow::new(vec![int(1), blob(&[1, 2, 3, 4])], 3)];
+
+        assert_eq!(
+            automaton.execute(&rows).expect("dataflow should execute"),
+            Vec::<WeightedRow>::new()
+        );
+    }
+
+    #[test]
+    fn filter_blob_length_between_rejects_non_blob_values() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterBlobLengthBetween {
+            column: 1,
+            lower: 2,
+            upper: 4,
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), text("blob")])])
+            .expect_err("non-blob predicate input should fail");
+
+        assert_eq!(err, DataflowError::PredicateValueNotBlob { column: 1 });
+    }
+
+    #[test]
+    fn filter_blob_length_between_rejects_out_of_bounds_columns() {
+        let automaton = DataflowAutomaton::new(vec![DataflowOperator::FilterBlobLengthBetween {
+            column: 2,
+            lower: 2,
+            upper: 4,
+        }]);
+
+        let err = automaton
+            .execute(&[WeightedRow::insert(vec![int(1), blob(&[1, 2])])])
+            .expect_err("invalid blob-length predicate column should fail");
 
         assert_eq!(
             err,

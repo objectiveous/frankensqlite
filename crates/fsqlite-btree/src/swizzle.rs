@@ -381,6 +381,40 @@ mod tests {
     }
 
     #[test]
+    fn swizzle_ptr_round_trips_boundary_values() {
+        // The round-trip tests use small values (42, 0x1000) and the overflow
+        // test rejects MAX_PAGE_ID + 1; this pins the accepted boundaries: page
+        // id 0, the largest valid page id (MAX_PAGE_ID), and the largest aligned
+        // frame address (all bits set except the tag bit).
+        let zero = SwizzlePtr::new_unswizzled(0).expect("zero page id encodes");
+        assert_eq!(
+            zero.state(Ordering::Acquire),
+            SwizzleState::Unswizzled { page_id: 0 }
+        );
+        assert!(!zero.is_swizzled(Ordering::Acquire));
+
+        let max = SwizzlePtr::new_unswizzled(MAX_PAGE_ID).expect("max page id encodes");
+        assert_eq!(
+            max.state(Ordering::Acquire),
+            SwizzleState::Unswizzled {
+                page_id: MAX_PAGE_ID
+            }
+        );
+        assert!(!max.is_swizzled(Ordering::Acquire));
+
+        // Largest aligned frame address: all bits set except the tag bit.
+        let top_frame = !SWIZZLED_TAG;
+        let swz = SwizzlePtr::new_swizzled(top_frame).expect("aligned top frame encodes");
+        assert_eq!(
+            swz.state(Ordering::Acquire),
+            SwizzleState::Swizzled {
+                frame_addr: top_frame
+            }
+        );
+        assert!(swz.is_swizzled(Ordering::Acquire));
+    }
+
+    #[test]
     fn unaligned_frame_address_is_rejected() {
         let err = SwizzlePtr::new_swizzled(0x1001).expect_err("must reject unaligned frame addr");
         assert_eq!(

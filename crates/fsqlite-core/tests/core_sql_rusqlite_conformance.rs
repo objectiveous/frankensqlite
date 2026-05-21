@@ -2168,6 +2168,48 @@ const STRING_SCALAR_EDGE_CASES: &[QueryCase] = &[
     },
 ];
 
+const CONCAT_SCALAR_SETUP: &str = "
+    CREATE TABLE concat_scalar_values (
+        id INTEGER PRIMARY KEY,
+        prefix TEXT,
+        suffix TEXT,
+        n INTEGER,
+        amount REAL
+    );
+    INSERT INTO concat_scalar_values (id, prefix, suffix, n, amount) VALUES
+        (1, 'alpha', 'one', 10, 1.5),
+        (2, '', 'empty-prefix', -3, -2.25),
+        (3, NULL, 'missing-prefix', NULL, NULL),
+        (4, 'space ', NULL, 0, 0.0);
+";
+
+const CONCAT_SCALAR_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "concat treats null as empty text",
+        sql: "SELECT concat('a', NULL, 'b'), concat(NULL, NULL), typeof(concat(NULL, NULL)), concat('', NULL, '')",
+    },
+    QueryCase {
+        name: "concat coerces numeric arguments",
+        sql: "SELECT concat('n=', 42, ',r=', 3.5), concat(-7, ':', 0), typeof(concat(1, 2))",
+    },
+    QueryCase {
+        name: "concat ws skips null values",
+        sql: "SELECT concat_ws('-', 'a', NULL, 'b'), concat_ws('-', NULL, NULL), concat_ws('', 'a', NULL, 'b')",
+    },
+    QueryCase {
+        name: "concat ws null separator returns null",
+        sql: "SELECT concat_ws(NULL, 'a', 'b'), concat_ws(NULL, NULL), typeof(concat_ws(NULL, 'a'))",
+    },
+    QueryCase {
+        name: "column driven concat",
+        sql: "SELECT id, concat(prefix, ':', suffix), concat('n=', n, ', amount=', amount) FROM concat_scalar_values ORDER BY id",
+    },
+    QueryCase {
+        name: "column driven concat ws",
+        sql: "SELECT id, concat_ws('|', prefix, suffix, n, amount), concat_ws('', prefix, suffix) FROM concat_scalar_values ORDER BY id",
+    },
+];
+
 const CHAR_UNICODE_SETUP: &str = "
     CREATE TABLE char_unicode_values (
         id INTEGER PRIMARY KEY,
@@ -2821,6 +2863,12 @@ fn string_functions_match_rusqlite() {
 fn string_scalar_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
     harness.assert_queries_match("string scalar edge", STRING_SCALAR_EDGE_CASES);
+}
+
+#[test]
+fn concat_scalar_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CONCAT_SCALAR_SETUP);
+    harness.assert_queries_match("concat scalar edge", CONCAT_SCALAR_CASES);
 }
 
 #[test]

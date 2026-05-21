@@ -147,6 +147,24 @@ const TRIGRAM_DOCS: &[Doc] = &[
     },
 ];
 
+const TRIGRAM_DIACRITIC_DOCS: &[Doc] = &[
+    Doc {
+        rowid: 1,
+        title: "Accent upper",
+        body: "ábC sigma",
+    },
+    Doc {
+        rowid: 2,
+        title: "Plain lower",
+        body: "abc tail",
+    },
+    Doc {
+        rowid: 3,
+        title: "Accent short",
+        body: "éAB mixed",
+    },
+];
+
 const UNICODE61_CODE_TOKEN_DOCS: &[Doc] = &[
     Doc {
         rowid: 1,
@@ -193,6 +211,8 @@ const DETAIL_COLUMN_OPTIONS: &[&str] = &["detail=column"];
 const DETAIL_NONE_OPTIONS: &[&str] = &["detail=none"];
 const PORTER_OPTIONS: &[&str] = &["tokenize='porter'"];
 const TRIGRAM_OPTIONS: &[&str] = &["tokenize='trigram'"];
+const TRIGRAM_CASE_SENSITIVE_OPTIONS: &[&str] = &["tokenize='trigram case_sensitive 1'"];
+const TRIGRAM_REMOVE_DIACRITICS_OPTIONS: &[&str] = &["tokenize='trigram remove_diacritics 1'"];
 
 const MATCH_CASES: &[MatchCase] = &[
     MatchCase {
@@ -456,6 +476,24 @@ const TOKENIZER_CASES: &[TokenizerCase] = &[
         name: "trigram case folding",
         options: TRIGRAM_OPTIONS,
         docs: TRIGRAM_DOCS,
+        query: "abc",
+    },
+    TokenizerCase {
+        name: "trigram case sensitive uppercase",
+        options: TRIGRAM_CASE_SENSITIVE_OPTIONS,
+        docs: TRIGRAM_DOCS,
+        query: "ABC",
+    },
+    TokenizerCase {
+        name: "trigram case sensitive lowercase",
+        options: TRIGRAM_CASE_SENSITIVE_OPTIONS,
+        docs: TRIGRAM_DOCS,
+        query: "abc",
+    },
+    TokenizerCase {
+        name: "trigram remove diacritics",
+        options: TRIGRAM_REMOVE_DIACRITICS_OPTIONS,
+        docs: TRIGRAM_DIACRITIC_DOCS,
         query: "abc",
     },
     TokenizerCase {

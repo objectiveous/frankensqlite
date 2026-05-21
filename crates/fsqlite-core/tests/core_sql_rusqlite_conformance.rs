@@ -2254,6 +2254,45 @@ const STRING_SCALAR_EDGE_CASES: &[QueryCase] = &[
     },
 ];
 
+const LENGTH_INSTR_NUL_SETUP: &str = "
+    CREATE TABLE length_instr_values (
+        id INTEGER PRIMARY KEY,
+        txt TEXT,
+        payload BLOB,
+        needle_text TEXT,
+        needle_blob BLOB
+    );
+    INSERT INTO length_instr_values (id, txt, payload, needle_text, needle_blob) VALUES
+        (1, 'abc', X'616263', 'b', X'62'),
+        (2, 'a' || char(0) || 'bc', X'61006263', char(0), X'0062'),
+        (3, char(0) || 'abc', X'00616263', 'a', X'00'),
+        (4, '', X'', '', X''),
+        (5, NULL, NULL, NULL, NULL);
+";
+
+const LENGTH_INSTR_NUL_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "embedded nul text length and instr",
+        sql: "SELECT length('a' || char(0) || 'bc'), octet_length('a' || char(0) || 'bc'), instr('a' || char(0) || 'bc', 'bc'), instr('a' || char(0) || 'bc', char(0))",
+    },
+    QueryCase {
+        name: "leading nul text length and instr",
+        sql: "SELECT length(char(0) || 'abc'), octet_length(char(0) || 'abc'), instr(char(0) || 'abc', 'a'), instr(char(0) || 'abc', char(0))",
+    },
+    QueryCase {
+        name: "blob length and byte instr",
+        sql: "SELECT length(X'61006263'), octet_length(X'61006263'), instr(X'61006263', X'0062'), instr(X'61006263', X'63'), instr(X'61006263', X'7A'), instr(X'61006263', X''), instr(X'', X'')",
+    },
+    QueryCase {
+        name: "numeric and null length instr",
+        sql: "SELECT length(12345), octet_length(12345), length(NULL), octet_length(NULL), instr(NULL, 'a'), instr('abc', NULL)",
+    },
+    QueryCase {
+        name: "column driven nul and blob length instr",
+        sql: "SELECT id, length(txt), octet_length(txt), instr(txt, needle_text), length(payload), octet_length(payload), instr(payload, needle_blob) FROM length_instr_values ORDER BY id",
+    },
+];
+
 const CONCAT_SCALAR_SETUP: &str = "
     CREATE TABLE concat_scalar_values (
         id INTEGER PRIMARY KEY,
@@ -3146,6 +3185,12 @@ fn substr_scalar_edges_match_rusqlite() {
 fn string_scalar_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
     harness.assert_queries_match("string scalar edge", STRING_SCALAR_EDGE_CASES);
+}
+
+#[test]
+fn length_instr_nul_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(LENGTH_INSTR_NUL_SETUP);
+    harness.assert_queries_match("length/instr NUL edge", LENGTH_INSTR_NUL_CASES);
 }
 
 #[test]

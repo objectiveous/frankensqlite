@@ -8874,6 +8874,101 @@ mod tests {
     }
 
     #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_update_pinned_after_other_delete()
+    -> fsqlite_error::Result<()> {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let row_a = 4291;
+        let row_b = 4292;
+        let row_c = 4293;
+        let key_a = CellKey::table_row(btree, row_a);
+        let key_b = CellKey::table_row(btree, row_b);
+        let key_c = CellKey::table_row(btree, row_c);
+        let a_original = vec![b'a'; 163];
+        let b_other = vec![b'c'; 165];
+        let a_own = vec![b'd'; 166];
+        let c_own = vec![b'e'; 167];
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut bootstrap = mgr.begin(BeginKind::Concurrent).expect("bootstrap begin");
+        mgr.cell_log()
+            .record_insert(
+                key_a,
+                pgno,
+                leaf_table_cell(row_a, &a_original),
+                bootstrap.token(),
+            )
+            .expect("row a insert should fit budget");
+        let committed_seq = mgr.commit(&mut bootstrap).expect("bootstrap commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        assert_eq!(
+            txn.snapshot.high, committed_seq,
+            "transaction must pin the row before the later delete commits"
+        );
+
+        let mut other = mgr.begin(BeginKind::Concurrent).expect("other begin");
+        mgr.cell_log()
+            .record_delete(key_a, pgno, other.token())
+            .expect("other row a delete should fit budget");
+        mgr.cell_log()
+            .record_insert(key_b, pgno, leaf_table_cell(row_b, &b_other), other.token())
+            .expect("other row b insert should fit budget");
+        let other_seq = mgr.commit(&mut other).expect("other batch commit");
+        assert!(other_seq > committed_seq);
+
+        mgr.cell_log()
+            .record_update(key_a, pgno, leaf_table_cell(row_a, &a_own), txn.token())
+            .expect("own row a update should fit budget");
+        mgr.cell_log()
+            .record_insert(key_c, pgno, leaf_table_cell(row_c, &c_own), txn.token())
+            .expect("own row c insert should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("committed page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            vec![(row_a, a_own.clone()), (row_c, c_own.clone())],
+            "own updates must apply to the pinned row without admitting later deletes"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(committed_seq),
+            "own updates and hidden post-snapshot deletes must leave the witness at the pinned horizon"
+        );
+
+        mgr.abort(&mut txn);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            vec![(row_b, b_other)],
+            "fresh readers must see the later committed delete/insert after abort"
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(other_seq),
+            "fresh readers should witness the later committed delete horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_read_page_with_cell_deltas_keeps_other_uncommitted_writes_out_of_horizon()
     -> fsqlite_error::Result<()> {
         use crate::cell_visibility::CellKey;

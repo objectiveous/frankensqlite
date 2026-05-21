@@ -8499,6 +8499,76 @@ mod tests {
     }
 
     #[test]
+    fn test_read_page_with_cell_deltas_keeps_own_delete_out_of_horizon() -> fsqlite_error::Result<()>
+    {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let rowid = 4271;
+        let payload = vec![b'd'; 136];
+        let cell_key = CellKey::table_row(btree, rowid);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut inserter = mgr.begin(BeginKind::Concurrent).expect("inserter begin");
+        mgr.cell_log()
+            .record_insert(
+                cell_key,
+                pgno,
+                leaf_table_cell(rowid, &payload),
+                inserter.token(),
+            )
+            .expect("logical insert should fit budget");
+        let insert_seq = mgr.commit(&mut inserter).expect("insert commit");
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).expect("txn begin");
+        mgr.cell_log()
+            .record_delete(cell_key, pgno, txn.token())
+            .expect("logical delete should fit budget");
+
+        let own_page = mgr
+            .read_page_with_cell_deltas(&mut txn, pgno, PageSize::DEFAULT.get())?
+            .expect("inserted page should stay visible");
+        assert_eq!(
+            materialized_table_payloads(&own_page)?,
+            Vec::<(i64, Vec<u8>)>::new(),
+            "transaction-local reads must materialize their own logical deletes"
+        );
+        assert_eq!(
+            txn.read_version_for_page(pgno),
+            Some(insert_seq),
+            "own uncommitted deletes must preserve the last committed read witness"
+        );
+
+        let delete_seq = mgr.commit(&mut txn).expect("delete commit");
+        assert!(delete_seq > insert_seq);
+
+        let mut fresh_reader = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("fresh reader begin");
+        let fresh_page = mgr
+            .read_page_with_cell_deltas(&mut fresh_reader, pgno, PageSize::DEFAULT.get())?
+            .expect("fresh page should be visible");
+        assert_eq!(
+            materialized_table_payloads(&fresh_page)?,
+            Vec::<(i64, Vec<u8>)>::new()
+        );
+        assert_eq!(
+            fresh_reader.read_version_for_page(pgno),
+            Some(delete_seq),
+            "fresh reads should witness the committed delete horizon"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_read_page_with_cell_deltas_hides_post_snapshot_commit() -> fsqlite_error::Result<()> {
         use crate::cell_visibility::CellKey;
         use fsqlite_types::{BtreeRef, TableId};

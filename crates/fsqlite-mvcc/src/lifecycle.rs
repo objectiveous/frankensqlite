@@ -7970,6 +7970,80 @@ mod tests {
     }
 
     #[test]
+    fn test_cell_delta_fcw_abort_releases_lock_and_deltas() {
+        use crate::cell_visibility::CellKey;
+        use fsqlite_types::{BtreeRef, TableId};
+
+        let mgr = mgr();
+        let pgno = PageNumber::new(2).expect("valid page");
+        let btree = BtreeRef::Table(TableId::new(1));
+        let first_key = CellKey::table_row(btree, 101);
+        let second_key = CellKey::table_row(btree, 102);
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).expect("seed begin");
+        mgr.write_page(&mut seed, pgno, empty_leaf_table_page())
+            .expect("seed empty leaf page");
+        mgr.commit(&mut seed).expect("seed commit");
+
+        let mut first = mgr.begin(BeginKind::Concurrent).expect("first begin");
+        let mut second = mgr.begin(BeginKind::Concurrent).expect("second begin");
+        let second_token = second.token();
+        mgr.cell_log()
+            .record_insert(
+                first_key,
+                pgno,
+                leaf_table_cell(101, &[b'a'; 8]),
+                first.token(),
+            )
+            .expect("first logical insert should fit budget");
+        mgr.cell_log()
+            .record_insert(
+                second_key,
+                pgno,
+                leaf_table_cell(102, &[b'b'; 8]),
+                second_token,
+            )
+            .expect("second logical insert should fit budget");
+
+        let first_seq = mgr.commit(&mut first).expect("first commit");
+        assert_eq!(
+            mgr.lock_table().holder(pgno),
+            None,
+            "successful logical commit should release its page lock"
+        );
+
+        let second_err = mgr
+            .commit(&mut second)
+            .expect_err("stale logical writer must fail FCW validation");
+        assert_eq!(second_err, MvccError::BusySnapshot);
+        assert_eq!(second.state, TransactionState::Aborted);
+        assert!(
+            second.page_locks.is_empty(),
+            "FCW abort should clear the logical commit lock set"
+        );
+        assert!(
+            second.write_version_for_page(pgno).is_none(),
+            "FCW abort should clear logical write-version metadata"
+        );
+        assert_eq!(
+            mgr.lock_table().holder(pgno),
+            None,
+            "FCW abort should release the page lock acquired before validation"
+        );
+        assert_eq!(
+            mgr.cell_log().txn_delta_count(second_token),
+            0,
+            "FCW abort should roll back uncommitted logical deltas"
+        );
+        assert_eq!(
+            mgr.cell_log().resolve(pgno, &second_key, first_seq),
+            None,
+            "rolled-back logical delta must not become visible"
+        );
+        assert_eq!(mgr.commit_index.latest(pgno), Some(first_seq));
+    }
+
+    #[test]
     fn test_cell_delta_only_commit_takes_page_lock_before_publish() {
         use crate::cell_visibility::CellKey;
         use fsqlite_types::{BtreeRef, TableId};

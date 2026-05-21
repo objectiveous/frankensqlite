@@ -2141,6 +2141,49 @@ const STRING_FUNCTION_CASES: &[QueryCase] = &[
     },
 ];
 
+const SUBSTR_SCALAR_SETUP: &str = "
+    CREATE TABLE substr_values (
+        id INTEGER PRIMARY KEY,
+        txt TEXT,
+        payload BLOB,
+        start_at INTEGER,
+        take_len INTEGER
+    );
+    INSERT INTO substr_values (id, txt, payload, start_at, take_len) VALUES
+        (1, 'abcdef', X'0102030405', 2, 3),
+        (2, 'abcdef', X'0102030405', -2, 2),
+        (3, 'abcdef', X'0102030405', 3, -2),
+        (4, 'eclair', X'CAFEBA', 1, 2),
+        (5, NULL, NULL, 1, 2);
+";
+
+const SUBSTR_SCALAR_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "negative length and zero position quirks",
+        sql: "SELECT substr('abcdef', 3, -2), substr('abcdef', -2, -2), substr('abcdef', 0, 3), substr('abcdef', 2, 0)",
+    },
+    QueryCase {
+        name: "substring alias mirrors substr",
+        sql: "SELECT substring('abcdef', 2, 3), substring('abcdef', -2), substring(NULL, 1, 2)",
+    },
+    QueryCase {
+        name: "unicode text slicing",
+        sql: "SELECT substr(char(233) || 'clair', 1, 2), substr(char(233) || 'clair', -3, 2), length(substr(char(233) || 'clair', 1, 2))",
+    },
+    QueryCase {
+        name: "blob slicing preserves blob storage",
+        sql: "SELECT hex(substr(X'0102030405', 2, 3)), hex(substr(X'0102030405', -2, -2)), typeof(substr(X'0102030405', 2, 3))",
+    },
+    QueryCase {
+        name: "null arguments",
+        sql: "SELECT substr(NULL, 1, 2), substr('abcdef', NULL, 2), typeof(substr(NULL, 1, 2)), typeof(substr('abcdef', NULL, 2))",
+    },
+    QueryCase {
+        name: "column driven substr",
+        sql: "SELECT id, substr(txt, start_at, take_len), hex(substr(payload, start_at, take_len)), typeof(substr(payload, start_at, take_len)) FROM substr_values ORDER BY id",
+    },
+];
+
 const STRING_SCALAR_EDGE_CASES: &[QueryCase] = &[
     QueryCase {
         name: "ascii case conversion and null propagation",
@@ -2969,6 +3012,12 @@ fn json1_functions_match_rusqlite() {
 fn string_functions_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new("");
     harness.assert_queries_match("string functions", STRING_FUNCTION_CASES);
+}
+
+#[test]
+fn substr_scalar_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(SUBSTR_SCALAR_SETUP);
+    harness.assert_queries_match("substr scalar edge", SUBSTR_SCALAR_CASES);
 }
 
 #[test]

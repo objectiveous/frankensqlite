@@ -389,6 +389,31 @@ mod tests {
     }
 
     #[test]
+    fn load_page_returns_true_only_on_first_cold_to_hot_transition() {
+        // load_page is documented to return true only when it performs the
+        // COLD -> HOT transition, and false when the page is already HOT or is
+        // re-heated from COOLING. No test pinned this return value.
+        let csm = CoolingStateMachine::new(CoolingConfig::default());
+        csm.register_page(1);
+
+        // First load performs COLD -> HOT and reports the transition.
+        assert!(csm.load_page(1, 0x1000));
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Hot));
+
+        // Cool the page (an idle HOT page cools under the default config).
+        csm.run_cooling_scan();
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Cooling));
+
+        // Loading a COOLING page re-heats it to HOT but returns false: there was
+        // no fresh COLD -> HOT transition.
+        assert!(!csm.load_page(1, 0x2000));
+        assert_eq!(csm.temperature(1), Some(PageTemperature::Hot));
+
+        // Loading an already-HOT page also returns false.
+        assert!(!csm.load_page(1, 0x3000));
+    }
+
+    #[test]
     fn re_heat_on_access() {
         let csm = CoolingStateMachine::new(CoolingConfig {
             cooling_threshold: 2,

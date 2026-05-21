@@ -2667,6 +2667,39 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_codegen_insert_threads_conflict_action_into_insert_op() {
+        let make = |conflict: Option<ConflictAction>| InsertStatement {
+            with: None,
+            or_conflict: conflict,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+
+        // The conflict operand (p5) of the emitted Insert op carries the OE_ code.
+        let oe_of = |conflict: Option<ConflictAction>| -> u16 {
+            let mut b = ProgramBuilder::new();
+            codegen_insert(&mut b, &make(conflict), &schema, &ctx).unwrap();
+            let prog = b.finish().unwrap();
+            prog.ops()
+                .iter()
+                .find(|op| op.opcode == Opcode::Insert)
+                .expect("Insert op present")
+                .p5
+        };
+
+        // A plain INSERT defaults to ABORT; OR IGNORE / OR REPLACE thread theirs.
+        assert_eq!(oe_of(None), OE_ABORT);
+        assert_eq!(oe_of(Some(ConflictAction::Ignore)), OE_IGNORE);
+        assert_eq!(oe_of(Some(ConflictAction::Replace)), OE_REPLACE);
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),

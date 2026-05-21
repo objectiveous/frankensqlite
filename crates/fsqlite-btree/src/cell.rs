@@ -1178,6 +1178,51 @@ mod tests {
         assert!(has_overflow(1500, 4096, BtreePageType::LeafIndex));
     }
 
+    #[test]
+    fn test_payload_overflow_threshold_and_clamp_across_page_sizes() {
+        // The SQLite payload thresholds must hold for every supported usable size,
+        // not just 4096. Hand-anchored conformance values (independently computed
+        // from the file-format formulas: table-leaf X = U-35; other X =
+        // (U-12)*64/255 - 23; M = (U-12)*32/255 - 23):
+        assert_eq!(max_local_payload(512, BtreePageType::LeafTable), 477);
+        assert_eq!(max_local_payload(1024, BtreePageType::LeafTable), 989);
+        assert_eq!(max_local_payload(65536, BtreePageType::LeafTable), 65_501);
+        assert_eq!(max_local_payload(512, BtreePageType::LeafIndex), 102);
+        assert_eq!(min_local_payload(512), 39);
+
+        for &usable in &[512u32, 1024, 4096, 65536] {
+            for &(page_type, label) in &[
+                (BtreePageType::LeafTable, "table-leaf"),
+                (BtreePageType::LeafIndex, "leaf-index"),
+            ] {
+                let max_local = max_local_payload(usable, page_type);
+                let min_local = min_local_payload(usable);
+                assert!(min_local < max_local, "U={usable} {label}: expect M < X");
+
+                // Exact overflow boundary: a payload of exactly X stays fully
+                // local; X+1 is the first size that overflows.
+                assert!(!has_overflow(max_local, usable, page_type), "U={usable} {label}");
+                assert!(has_overflow(max_local + 1, usable, page_type), "U={usable} {label}");
+                assert_eq!(
+                    local_payload_size(max_local, usable, page_type),
+                    max_local,
+                    "U={usable} {label}: payload == X must be entirely local"
+                );
+
+                // Overflowing payloads keep a local portion clamped to [M, X] and
+                // strictly smaller than the total payload.
+                for &payload in &[max_local + 1, max_local + 100, usable, usable * 4] {
+                    let local = local_payload_size(payload, usable, page_type);
+                    assert!(
+                        (min_local..=max_local).contains(&local),
+                        "U={usable} {label} P={payload}: local {local} not in [{min_local},{max_local}]"
+                    );
+                    assert!(local < payload, "U={usable} {label} P={payload}: overflow must spill");
+                }
+            }
+        }
+    }
+
     // -- Cell parsing tests --
 
     #[test]

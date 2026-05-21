@@ -1103,4 +1103,35 @@ mod tests {
         assert_eq!(prev2, 142);
         assert_eq!(region.read_u64_le(0).unwrap(), 141, "wrapping add");
     }
+
+    #[test]
+    fn test_shm_region_clone_is_independent() {
+        let region = ShmRegion::new(16);
+        region.write_u32_le(0, 0xDEAD).unwrap();
+        let cloned = region.clone();
+        assert_eq!(cloned.read_u32_le(0).unwrap(), 0xDEAD);
+        assert_eq!(cloned.len(), 16);
+        region.write_u32_le(0, 0xBEEF).unwrap();
+        assert_eq!(cloned.read_u32_le(0).unwrap(), 0xDEAD, "clone must be independent");
+    }
+
+    #[test]
+    fn test_wal_read_lock_slot_out_of_range() {
+        assert!(wal_read_lock_slot(WAL_NREADER).is_none());
+        assert!(wal_read_lock_slot(WAL_NREADER + 1).is_none());
+        assert!(wal_read_lock_slot(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn test_wal_lock_byte_out_of_range() {
+        assert!(wal_lock_byte(WAL_TOTAL_LOCKS).is_none());
+        assert!(wal_lock_byte(WAL_TOTAL_LOCKS + 1).is_none());
+        assert!(wal_lock_byte(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn test_shm_segment_size_is_32kib() {
+        assert_eq!(SHM_SEGMENT_SIZE, 32 * 1024);
+        assert_eq!(WAL_TOTAL_LOCKS, WAL_READ_LOCK_BASE + WAL_NREADER);
+    }
 }

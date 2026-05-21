@@ -1310,6 +1310,29 @@ const DISTINCT_ORDER_LIMIT_CASES: &[QueryCase] = &[
     },
 ];
 
+const LIMIT_OFFSET_EDGE_CASES: &[QueryCase] = &[
+    QueryCase {
+        name: "zero limit returns no rows",
+        sql: "SELECT id FROM expr_rows ORDER BY id LIMIT 0",
+    },
+    QueryCase {
+        name: "large offset returns no rows",
+        sql: "SELECT id FROM expr_rows ORDER BY id LIMIT 3 OFFSET 99",
+    },
+    QueryCase {
+        name: "negative limit keeps all rows after offset",
+        sql: "SELECT id FROM expr_rows ORDER BY id LIMIT -1 OFFSET 2",
+    },
+    QueryCase {
+        name: "computed limit and offset expressions",
+        sql: "SELECT id FROM expr_rows ORDER BY id LIMIT 1 + 2 OFFSET COALESCE(NULL, 1)",
+    },
+    QueryCase {
+        name: "comma syntax uses offset then count",
+        sql: "SELECT id FROM expr_rows ORDER BY id LIMIT 2, 2",
+    },
+];
+
 const ORDER_BY_NULLS_CASES: &[QueryCase] = &[
     QueryCase {
         name: "text ascending nulls last",
@@ -1983,6 +2006,12 @@ fn numeric_coercion_expression_edges_match_rusqlite() {
 fn distinct_order_limit_edges_match_rusqlite() {
     let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
     harness.assert_queries_match("DISTINCT/ORDER/LIMIT edge", DISTINCT_ORDER_LIMIT_CASES);
+}
+
+#[test]
+fn limit_offset_expression_edges_match_rusqlite() {
+    let harness = CoreSqlConformanceHarness::new(CASE_NULL_SETUP);
+    harness.assert_queries_match("LIMIT/OFFSET expression edge", LIMIT_OFFSET_EDGE_CASES);
 }
 
 #[test]

@@ -1466,6 +1466,191 @@ pub struct Fts5PendingFlush {
     pub pending_bytes: usize,
 }
 
+impl Fts5PendingFlush {
+    pub fn hotspot_profile(&self) -> Result<Fts5ShadowWriteHotspotProfile> {
+        Fts5ShadowWriteHotspotProfile::from_rows(&self.data_rows, &self.idx_rows)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fts5ShadowWriteMitigation {
+    NoWrites,
+    AppendOnlyRowsBeforeSingleMetadataCommit,
+    AppendOnlyRowsBeforeBatchedHotWrites,
+    RequiresMergeBatching,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Fts5ShadowWriteClass {
+    SegmentLeaf { segid: u32, pgno: u32 },
+    DoclistIndex { segid: u32, height: u8, pgno: u32 },
+    Tombstone { segid: u32, hash_pgno: u32 },
+    IdxPage { segid: u32, btree_page: u32 },
+    AveragesRecord,
+    StructureRecord,
+}
+
+impl Fts5ShadowWriteClass {
+    #[must_use]
+    pub const fn is_append_only_data(self) -> bool {
+        matches!(
+            self,
+            Self::SegmentLeaf { .. } | Self::DoclistIndex { .. } | Self::Tombstone { .. }
+        )
+    }
+
+    #[must_use]
+    pub const fn is_hot_write(self) -> bool {
+        matches!(
+            self,
+            Self::IdxPage { .. } | Self::AveragesRecord | Self::StructureRecord
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fts5ShadowWriteHotspotProfile {
+    pub data_row_writes: usize,
+    pub idx_row_writes: usize,
+    pub append_only_data_writes: usize,
+    pub segment_leaf_writes: usize,
+    pub doclist_index_writes: usize,
+    pub tombstone_writes: usize,
+    pub averages_record_writes: usize,
+    pub structure_record_writes: usize,
+    pub hot_write_count: usize,
+    pub append_only_rows_precede_hot_rows: bool,
+    pub unique_segment_pages: Vec<(u32, u32)>,
+    pub unique_doclist_index_pages: Vec<(u32, u8, u32)>,
+    pub unique_tombstone_pages: Vec<(u32, u32)>,
+    pub unique_idx_pages: Vec<(u32, u32)>,
+    pub publication_order: Vec<Fts5ShadowWriteClass>,
+    pub mitigation: Fts5ShadowWriteMitigation,
+}
+
+impl Fts5ShadowWriteHotspotProfile {
+    pub fn from_rows(data_rows: &[Fts5DataRow], idx_rows: &[Fts5IdxRow]) -> Result<Self> {
+        let mut segment_pages = BTreeSet::new();
+        let mut doclist_index_pages = BTreeSet::new();
+        let mut tombstone_pages = BTreeSet::new();
+        let mut idx_pages = BTreeSet::new();
+        let mut publication_order = Vec::with_capacity(data_rows.len() + idx_rows.len());
+
+        let mut segment_leaf_writes = 0;
+        let mut doclist_index_writes = 0;
+        let mut tombstone_writes = 0;
+        let mut averages_record_writes = 0;
+        let mut structure_record_writes = 0;
+
+        for row in data_rows {
+            let write_class = match Fts5DataRowid::decode(row.id)? {
+                Fts5DataRowid::Averages => {
+                    averages_record_writes += 1;
+                    Fts5ShadowWriteClass::AveragesRecord
+                }
+                Fts5DataRowid::Structure => {
+                    structure_record_writes += 1;
+                    Fts5ShadowWriteClass::StructureRecord
+                }
+                Fts5DataRowid::SegmentLeaf { segid, pgno } => {
+                    segment_leaf_writes += 1;
+                    segment_pages.insert((segid, pgno));
+                    Fts5ShadowWriteClass::SegmentLeaf { segid, pgno }
+                }
+                Fts5DataRowid::DoclistIndex {
+                    segid,
+                    height,
+                    pgno,
+                } => {
+                    doclist_index_writes += 1;
+                    doclist_index_pages.insert((segid, height, pgno));
+                    Fts5ShadowWriteClass::DoclistIndex {
+                        segid,
+                        height,
+                        pgno,
+                    }
+                }
+                Fts5DataRowid::Tombstone { segid, hash_pgno } => {
+                    tombstone_writes += 1;
+                    tombstone_pages.insert((segid, hash_pgno));
+                    Fts5ShadowWriteClass::Tombstone { segid, hash_pgno }
+                }
+            };
+            publication_order.push(write_class);
+        }
+
+        for row in idx_rows {
+            idx_pages.insert((row.segid, row.btree_page));
+            publication_order.push(Fts5ShadowWriteClass::IdxPage {
+                segid: row.segid,
+                btree_page: row.btree_page,
+            });
+        }
+
+        let idx_row_writes = idx_rows.len();
+        let append_only_data_writes = segment_leaf_writes + doclist_index_writes + tombstone_writes;
+        let metadata_writes = averages_record_writes + structure_record_writes;
+        let hot_write_count = metadata_writes + idx_row_writes;
+        let append_only_rows_precede_hot_rows =
+            Self::append_only_rows_precede_hot_rows(&publication_order);
+        let mitigation = Self::mitigation(
+            data_rows.len() + idx_row_writes,
+            hot_write_count,
+            append_only_rows_precede_hot_rows,
+            metadata_writes,
+        );
+
+        Ok(Self {
+            data_row_writes: data_rows.len(),
+            idx_row_writes,
+            append_only_data_writes,
+            segment_leaf_writes,
+            doclist_index_writes,
+            tombstone_writes,
+            averages_record_writes,
+            structure_record_writes,
+            hot_write_count,
+            append_only_rows_precede_hot_rows,
+            unique_segment_pages: segment_pages.into_iter().collect(),
+            unique_doclist_index_pages: doclist_index_pages.into_iter().collect(),
+            unique_tombstone_pages: tombstone_pages.into_iter().collect(),
+            unique_idx_pages: idx_pages.into_iter().collect(),
+            publication_order,
+            mitigation,
+        })
+    }
+
+    fn append_only_rows_precede_hot_rows(publication_order: &[Fts5ShadowWriteClass]) -> bool {
+        let mut seen_hot_write = false;
+        for write_class in publication_order {
+            if write_class.is_hot_write() {
+                seen_hot_write = true;
+            } else if seen_hot_write && write_class.is_append_only_data() {
+                return false;
+            }
+        }
+        true
+    }
+
+    const fn mitigation(
+        write_count: usize,
+        hot_write_count: usize,
+        append_only_rows_precede_hot_rows: bool,
+        metadata_writes: usize,
+    ) -> Fts5ShadowWriteMitigation {
+        if write_count == 0 {
+            return Fts5ShadowWriteMitigation::NoWrites;
+        }
+        if append_only_rows_precede_hot_rows && hot_write_count <= 1 && metadata_writes <= 1 {
+            return Fts5ShadowWriteMitigation::AppendOnlyRowsBeforeSingleMetadataCommit;
+        }
+        if append_only_rows_precede_hot_rows && metadata_writes <= 2 {
+            return Fts5ShadowWriteMitigation::AppendOnlyRowsBeforeBatchedHotWrites;
+        }
+        Fts5ShadowWriteMitigation::RequiresMergeBatching
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fts5MergeKind {
     Auto,
@@ -8003,6 +8188,13 @@ mod tests {
 
     #[allow(dead_code)]
     #[derive(Debug)]
+    struct Fts5ShadowWriteHotspotProfileStructure {
+        flush_profile: Fts5ShadowWriteHotspotProfile,
+        idx_profile: Fts5ShadowWriteHotspotProfile,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
     struct Fts5SegmentReaderStructure {
         cursor_terms: Vec<Vec<u8>>,
         exact_brown_rowids: Vec<u64>,
@@ -9217,6 +9409,80 @@ mod tests {
     }
 
     #[test]
+    fn test_fts5_pending_flush_hotspot_profile_keeps_single_structure_commit() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"]).unwrap();
+        table.insert_document(7, &["rust fts storage".to_owned()]);
+
+        let flush = table
+            .build_pending_hash()
+            .unwrap()
+            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0))
+            .unwrap();
+        let profile = flush.hotspot_profile().unwrap();
+
+        assert_eq!(profile.data_row_writes, 2);
+        assert_eq!(profile.segment_leaf_writes, 1);
+        assert_eq!(profile.structure_record_writes, 1);
+        assert_eq!(profile.idx_row_writes, 0);
+        assert_eq!(profile.hot_write_count, 1);
+        assert_eq!(profile.unique_segment_pages, vec![(4, 1)]);
+        assert!(profile.append_only_rows_precede_hot_rows);
+        assert_eq!(
+            profile.publication_order,
+            vec![
+                Fts5ShadowWriteClass::SegmentLeaf { segid: 4, pgno: 1 },
+                Fts5ShadowWriteClass::StructureRecord
+            ]
+        );
+        assert_eq!(
+            profile.mitigation,
+            Fts5ShadowWriteMitigation::AppendOnlyRowsBeforeSingleMetadataCommit
+        );
+    }
+
+    #[test]
+    fn test_fts5_shadow_write_hotspot_profile_classifies_idx_page_writes() {
+        let data_rows = vec![
+            Fts5DataRow::new(
+                Fts5DataRowid::SegmentLeaf { segid: 8, pgno: 1 }
+                    .encode()
+                    .unwrap(),
+                Vec::new(),
+            ),
+            Fts5DataRow::new(
+                Fts5DataRowid::DoclistIndex {
+                    segid: 8,
+                    height: 1,
+                    pgno: 3,
+                }
+                .encode()
+                .unwrap(),
+                Vec::new(),
+            ),
+            Fts5DataRow::new(FTS5_STRUCTURE_ROWID, Vec::new()),
+        ];
+        let idx_rows = vec![
+            Fts5IdxRow::new(8, b"alpha".to_vec(), 2, true),
+            Fts5IdxRow::new(8, b"beta".to_vec(), 2, false),
+        ];
+
+        let profile = Fts5ShadowWriteHotspotProfile::from_rows(&data_rows, &idx_rows).unwrap();
+
+        assert_eq!(profile.append_only_data_writes, 2);
+        assert_eq!(profile.doclist_index_writes, 1);
+        assert_eq!(profile.idx_row_writes, 2);
+        assert_eq!(profile.hot_write_count, 3);
+        assert_eq!(profile.unique_doclist_index_pages, vec![(8, 1, 3)]);
+        assert_eq!(profile.unique_idx_pages, vec![(8, 2)]);
+        assert!(profile.append_only_rows_precede_hot_rows);
+        assert_eq!(
+            profile.mitigation,
+            Fts5ShadowWriteMitigation::AppendOnlyRowsBeforeBatchedHotWrites
+        );
+    }
+
+    #[test]
     fn test_fts5_merge_scheduler_plans_auto_crisis_and_optimize() {
         let scheduler = Fts5MergeScheduler {
             automerge: 4,
@@ -9411,6 +9677,137 @@ mod tests {
             merge_inputs: 4,
         },
     ),
+}"#
+        );
+    }
+
+    #[test]
+    fn test_fts5_structural_snapshot_shadow_write_hotspot_profile() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"]).unwrap();
+        table.insert_document(7, &["rust fts storage".to_owned()]);
+        let flush_profile = table
+            .build_pending_hash()
+            .unwrap()
+            .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0))
+            .unwrap()
+            .hotspot_profile()
+            .unwrap();
+
+        let idx_data_rows = vec![
+            Fts5DataRow::new(
+                Fts5DataRowid::SegmentLeaf { segid: 8, pgno: 1 }
+                    .encode()
+                    .unwrap(),
+                Vec::new(),
+            ),
+            Fts5DataRow::new(
+                Fts5DataRowid::DoclistIndex {
+                    segid: 8,
+                    height: 1,
+                    pgno: 3,
+                }
+                .encode()
+                .unwrap(),
+                Vec::new(),
+            ),
+            Fts5DataRow::new(FTS5_STRUCTURE_ROWID, Vec::new()),
+        ];
+        let idx_rows = vec![
+            Fts5IdxRow::new(8, b"alpha".to_vec(), 2, true),
+            Fts5IdxRow::new(8, b"beta".to_vec(), 2, false),
+        ];
+        let snapshot = Fts5ShadowWriteHotspotProfileStructure {
+            flush_profile,
+            idx_profile: Fts5ShadowWriteHotspotProfile::from_rows(&idx_data_rows, &idx_rows)
+                .unwrap(),
+        };
+
+        assert_eq!(
+            format!("{snapshot:#?}"),
+            r#"Fts5ShadowWriteHotspotProfileStructure {
+    flush_profile: Fts5ShadowWriteHotspotProfile {
+        data_row_writes: 2,
+        idx_row_writes: 0,
+        append_only_data_writes: 1,
+        segment_leaf_writes: 1,
+        doclist_index_writes: 0,
+        tombstone_writes: 0,
+        averages_record_writes: 0,
+        structure_record_writes: 1,
+        hot_write_count: 1,
+        append_only_rows_precede_hot_rows: true,
+        unique_segment_pages: [
+            (
+                4,
+                1,
+            ),
+        ],
+        unique_doclist_index_pages: [],
+        unique_tombstone_pages: [],
+        unique_idx_pages: [],
+        publication_order: [
+            SegmentLeaf {
+                segid: 4,
+                pgno: 1,
+            },
+            StructureRecord,
+        ],
+        mitigation: AppendOnlyRowsBeforeSingleMetadataCommit,
+    },
+    idx_profile: Fts5ShadowWriteHotspotProfile {
+        data_row_writes: 3,
+        idx_row_writes: 2,
+        append_only_data_writes: 2,
+        segment_leaf_writes: 1,
+        doclist_index_writes: 1,
+        tombstone_writes: 0,
+        averages_record_writes: 0,
+        structure_record_writes: 1,
+        hot_write_count: 3,
+        append_only_rows_precede_hot_rows: true,
+        unique_segment_pages: [
+            (
+                8,
+                1,
+            ),
+        ],
+        unique_doclist_index_pages: [
+            (
+                8,
+                1,
+                3,
+            ),
+        ],
+        unique_tombstone_pages: [],
+        unique_idx_pages: [
+            (
+                8,
+                2,
+            ),
+        ],
+        publication_order: [
+            SegmentLeaf {
+                segid: 8,
+                pgno: 1,
+            },
+            DoclistIndex {
+                segid: 8,
+                height: 1,
+                pgno: 3,
+            },
+            StructureRecord,
+            IdxPage {
+                segid: 8,
+                btree_page: 2,
+            },
+            IdxPage {
+                segid: 8,
+                btree_page: 2,
+            },
+        ],
+        mitigation: AppendOnlyRowsBeforeBatchedHotWrites,
+    },
 }"#
         );
     }

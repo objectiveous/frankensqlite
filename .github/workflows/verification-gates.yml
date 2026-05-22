@@ -22,6 +22,7 @@ on:
       - "crates/fsqlite-harness/src/bin/durability_matrix_manifest.rs"
       - "crates/fsqlite-harness/src/bin/feature_coverage_dashboard.rs"
       - "crates/fsqlite-harness/src/bin/oracle_preflight_doctor_runner.rs"
+      - "crates/fsqlite-harness/src/bin/parity_status_report_runner.rs"
       - "crates/fsqlite-harness/src/bin/perf_baseline_pack_runner.rs"
       - "crates/fsqlite-harness/src/bin/validation_manifest_runner.rs"
       - "crates/fsqlite-harness/src/durability_matrix.rs"
@@ -29,6 +30,7 @@ on:
       - "crates/fsqlite-harness/src/feature_coverage_dashboard.rs"
       - "crates/fsqlite-harness/src/lib.rs"
       - "crates/fsqlite-harness/src/oracle_preflight_doctor.rs"
+      - "crates/fsqlite-harness/src/parity_status_report.rs"
       - "crates/fsqlite-harness/src/perf_loop.rs"
       - "crates/fsqlite-harness/src/performance_regression_detector.rs"
       - "crates/fsqlite-harness/src/validation_manifest.rs"
@@ -45,6 +47,7 @@ on:
       - "scripts/verify_backlog_quality_gate.sh"
       - "scripts/verify_bd_2yqp6_3_3_feature_coverage_dashboard.sh"
       - "scripts/verify_bd_2yqp6_2_5_oracle_preflight_doctor.sh"
+      - "scripts/verify_bd_2yqp6_7_5_parity_status_report.sh"
       - "scripts/verify_ci_artifact_gates.sh"
       - "scripts/verify_differential_ci_lane.sh"
       - "scripts/verify_durability_matrix.sh"
@@ -225,6 +228,62 @@ jobs:
         with:
           name: differential-ci-expanded-artifacts
           path: artifacts/differential-ci/expanded/
+          retention-days: 21
+
+  parity-status-report-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUST_BACKTRACE: "1"
+      CARGO_TERM_COLOR: always
+      FSQLITE_DISABLE_RCH: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+
+      - name: Run parity status report publication gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/parity-status-report-ci
+          bash ./scripts/verify_bd_2yqp6_7_5_parity_status_report.sh --json \
+            > artifacts/parity-status-report-ci/report.json
+
+      - name: Publish parity status report summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_path="artifacts/parity-status-report-ci/report.json"
+          if [[ -f "${report_path}" ]]; then
+            echo "### Parity Status Report Gate" >> "${GITHUB_STEP_SUMMARY}"
+            jq -r '
+              "- run_id: `\(.run_id)`",
+              "- trace_id: `\(.trace_id)`",
+              "- scenario_id: `\(.scenario_id)`",
+              "- report_json: `\(.artifacts.report_json)`",
+              "- report_json_sha256: `\(.artifacts.report_json_sha256)`",
+              "- report_markdown: `\(.artifacts.report_markdown)`",
+              "- report_markdown_sha256: `\(.artifacts.report_markdown_sha256)`",
+              "- result: `\(.result)`"
+            ' "${report_path}" >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "Parity status report summary missing at ${report_path}" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload parity status report artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-status-report-artifacts
+          path: |
+            artifacts/parity-status-report-ci/
+            artifacts/bd-2yqp6.7.5/
           retention-days: 21
 
   durability-matrix-gate:

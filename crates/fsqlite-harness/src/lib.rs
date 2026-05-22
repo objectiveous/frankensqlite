@@ -57,6 +57,7 @@ pub mod oracle;
 pub mod oracle_preflight_doctor;
 pub mod parity_evidence_matrix;
 pub mod parity_invariant_catalog;
+pub mod parity_status_report;
 pub mod parity_taxonomy;
 pub mod perf_loop;
 pub mod performance_regression_detector;

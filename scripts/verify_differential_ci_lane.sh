@@ -373,6 +373,7 @@ validate_ci_report_schema() {
       (.artifacts.doctor_json | one_line) and
       (.artifacts.doctor_human | one_line) and
       (.artifacts.doctor_log | one_line) and
+      (.artifacts.report_artifact | one_line) and
       (.artifacts.hashes.manifest_a_sha256 | sha256_hex) and
       (.artifacts.hashes.manifest_b_sha256 | sha256_hex) and
       (.artifacts.hashes.summary_a_sha256 | sha256_hex) and
@@ -656,6 +657,7 @@ write_ci_report_json() {
     --arg doctor_json "${DOCTOR_JSON#"${WORKSPACE_ROOT}"/}" \
     --arg doctor_human "${DOCTOR_MD#"${WORKSPACE_ROOT}"/}" \
     --arg doctor_log "${DOCTOR_LOG#"${WORKSPACE_ROOT}"/}" \
+    --arg report_artifact "${REPORT_JSON#"${WORKSPACE_ROOT}"/}" \
     --arg manifest_a_sha256 "${MANIFEST_A_SHA256}" \
     --arg manifest_b_sha256 "${MANIFEST_B_SHA256}" \
     --arg summary_a_sha256 "${SUMMARY_A_SHA256}" \
@@ -711,6 +713,7 @@ write_ci_report_json() {
           doctor_json: $doctor_json,
           doctor_human: $doctor_human,
           doctor_log: $doctor_log,
+          report_artifact: $report_artifact,
           hashes: {
             manifest_a_sha256: $manifest_a_sha256,
             manifest_b_sha256: $manifest_b_sha256,

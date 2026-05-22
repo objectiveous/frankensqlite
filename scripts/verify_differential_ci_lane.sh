@@ -400,7 +400,7 @@ validate_ci_report_schema() {
             (.first_failure.minimal_reproduction_json_pointer == null) or
             (.first_failure.minimal_reproduction_json_pointer | one_line)
           ) and
-          (.first_failure.artifact_entries | type == "array") and
+          (.first_failure.artifact_entries | type == "array" and length > 0) and
           (all(.first_failure.artifact_entries[]; one_line))
         )
       )
@@ -520,7 +520,7 @@ jq -e \
         (.first_failure.remediation_playbook.owner_hint | type == "string" and length > 0) and
         (.first_failure.remediation_playbook.next_commands | type == "array" and length > 0) and
         (all(.first_failure.remediation_playbook.next_commands[]; type == "string" and length > 0 and (contains("\n") | not) and (contains("\r") | not))) and
-        (.first_failure.artifact_entries | type == "array") and
+        (.first_failure.artifact_entries | type == "array" and length > 0) and
         (
           (.run_report.divergent_cases[0].minimal_reproduction == null) or
           (.first_failure.minimal_reproduction_json_pointer == "/run_report/divergent_cases/0/minimal_reproduction")

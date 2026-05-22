@@ -967,6 +967,9 @@ fn validate_manifest_replay_contract(manifest: &DifferentialManifest) -> Result<
         if first_failure.diagnostic_json_pointer.trim().is_empty() {
             return Err("first_failure.diagnostic_json_pointer must be non-empty".to_owned());
         }
+        if first_failure.artifact_entries.is_empty() {
+            return Err("first_failure.artifact_entries must be non-empty".to_owned());
+        }
         if first_failure
             .artifact_entries
             .iter()
@@ -2103,6 +2106,19 @@ mod tests {
             .expect_err("empty remediation command should fail");
 
         assert!(error.contains("first_failure.remediation_playbook.next_commands"));
+    }
+
+    #[test]
+    fn validate_manifest_replay_contract_rejects_empty_first_failure_artifacts() {
+        let mut first_failure = valid_first_failure(RootCauseDomain::Harness);
+        first_failure.artifact_entries.clear();
+        let run_report = empty_run_report(0, 1, Vec::new());
+        let manifest = manifest_for_validation(run_report, Some(first_failure), Vec::new());
+
+        let error = validate_manifest_replay_contract(&manifest)
+            .expect_err("missing first-failure artifacts should fail");
+
+        assert!(error.contains("first_failure.artifact_entries"));
     }
 
     #[test]

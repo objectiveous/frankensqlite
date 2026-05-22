@@ -6486,6 +6486,44 @@ mod tests {
     }
 
     #[test]
+    fn test_union_find() {
+        // UnionFind starts with each index as its own root; union merges sets so
+        // find on either side returns the same root; merging already-merged sets
+        // and self-union are no-ops. Standard union-by-rank with path
+        // compression in find.
+        let mut uf = UnionFind::new(5);
+        for i in 0..5 {
+            assert_eq!(uf.find(i), i);
+        }
+
+        // union(0, 1): they share a root.
+        uf.union(0, 1);
+        let r0 = uf.find(0);
+        assert_eq!(uf.find(1), r0);
+
+        // union(2, 3): a second group with a different root.
+        uf.union(2, 3);
+        let r2 = uf.find(2);
+        assert_eq!(uf.find(3), r2);
+        assert_ne!(r0, r2);
+        // Index 4 is still alone.
+        assert_eq!(uf.find(4), 4);
+
+        // Merge the two groups: {0,1,2,3} now share a single root.
+        uf.union(0, 2);
+        let r = uf.find(0);
+        for i in [1, 2, 3] {
+            assert_eq!(uf.find(i), r);
+        }
+        assert_eq!(uf.find(4), 4); // 4 still separate
+
+        // Self-union and re-union of already-merged are no-ops.
+        uf.union(0, 0);
+        uf.union(0, 2);
+        assert_eq!(uf.find(2), r);
+    }
+
+    #[test]
     fn test_connected_components_groups_join_connected_tables() {
         // connected_components builds a join graph from equi-join predicates and
         // returns the sets of tables reachable from one another.

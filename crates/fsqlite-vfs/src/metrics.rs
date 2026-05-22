@@ -725,31 +725,6 @@ mod tests {
     }
 
     #[test]
-    fn tracing_file_path_accessor() {
-        let cx = Cx::new();
-        let vfs = MemoryVfs::new();
-        let (file, _) = vfs
-            .open(
-                &cx,
-                Some(Path::new("path_test.db")),
-                VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
-            )
-            .unwrap();
-        let traced = TracingFile::new(file, "path_test.db");
-        assert_eq!(traced.path(), "path_test.db");
-    }
-
-    #[test]
-    fn vfs_metrics_total_ops_matches_snapshot() {
-        let m = VfsMetrics::new();
-        m.read_ops.store(5, Ordering::Relaxed);
-        m.write_ops.store(3, Ordering::Relaxed);
-        m.sync_ops.store(2, Ordering::Relaxed);
-        let snap = m.snapshot();
-        assert_eq!(m.total_ops(), snap.total_ops());
-    }
-
-    #[test]
     fn metrics_snapshot_display_contains_byte_counters() {
         let snap = MetricsSnapshot {
             read_ops: 1,

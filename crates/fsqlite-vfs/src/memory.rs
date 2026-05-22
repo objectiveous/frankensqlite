@@ -2501,7 +2501,7 @@ mod tests {
             growth_chunk_bytes: 8192,
             max_bytes: Some(1_048_576),
         };
-        let vfs = MemoryVfs::with_config(cfg);
+        let vfs = MemoryVfs::new_with_config(cfg);
         let snap = vfs.usage_snapshot();
         assert_eq!(snap.initial_reserve_bytes, 4096);
         assert_eq!(snap.growth_chunk_bytes, 8192);

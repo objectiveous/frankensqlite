@@ -283,6 +283,11 @@ hydrate_marked_artifact() {
     "${log_path}" >"${output_path}"
 }
 
+sha256_file() {
+  local path="$1"
+  sha256sum "${path}" | awk '{print $1}'
+}
+
 validate_manifest_runner_log_schema() {
   local log_path="$1"
   local run_label="$2"
@@ -506,6 +511,15 @@ MISMATCH_CLASS_COUNTS="$(
     | reduce .[] as $class ({}; .[$class] = ((.[$class] // 0) + 1))
   ' "${MANIFEST_A}"
 )"
+MANIFEST_A_SHA256="$(sha256_file "${MANIFEST_A}")"
+MANIFEST_B_SHA256="$(sha256_file "${MANIFEST_B}")"
+SUMMARY_A_SHA256="$(sha256_file "${SUMMARY_A}")"
+SUMMARY_B_SHA256="$(sha256_file "${SUMMARY_B}")"
+RUNNER_LOG_A_SHA256="$(sha256_file "${RUN_A_LOG}")"
+RUNNER_LOG_B_SHA256="$(sha256_file "${RUN_B_LOG}")"
+DOCTOR_JSON_SHA256="$(sha256_file "${DOCTOR_JSON}")"
+DOCTOR_HUMAN_SHA256="$(sha256_file "${DOCTOR_MD}")"
+DOCTOR_LOG_SHA256="$(sha256_file "${DOCTOR_LOG}")"
 
 # Warning mode: semantic mismatches and yellow preflight findings are tracked but non-blocking.
 if [[ "${run_a_status}" == "0" && "${doctor_status}" == "0" ]]; then
@@ -566,6 +580,15 @@ if ${JSON_OUTPUT}; then
     --arg doctor_json "${DOCTOR_JSON#"${WORKSPACE_ROOT}"/}" \
     --arg doctor_human "${DOCTOR_MD#"${WORKSPACE_ROOT}"/}" \
     --arg doctor_log "${DOCTOR_LOG#"${WORKSPACE_ROOT}"/}" \
+    --arg manifest_a_sha256 "${MANIFEST_A_SHA256}" \
+    --arg manifest_b_sha256 "${MANIFEST_B_SHA256}" \
+    --arg summary_a_sha256 "${SUMMARY_A_SHA256}" \
+    --arg summary_b_sha256 "${SUMMARY_B_SHA256}" \
+    --arg runner_log_a_sha256 "${RUNNER_LOG_A_SHA256}" \
+    --arg runner_log_b_sha256 "${RUNNER_LOG_B_SHA256}" \
+    --arg doctor_json_sha256 "${DOCTOR_JSON_SHA256}" \
+    --arg doctor_human_sha256 "${DOCTOR_HUMAN_SHA256}" \
+    --arg doctor_log_sha256 "${DOCTOR_LOG_SHA256}" \
     --argjson promotion_criteria "$(printf '%s\n' "${PROMOTION_CRITERIA[@]}" | jq -R . | jq -s .)" \
     '
       {
@@ -611,7 +634,18 @@ if ${JSON_OUTPUT}; then
           runner_log_b: $runner_log_b,
           doctor_json: $doctor_json,
           doctor_human: $doctor_human,
-          doctor_log: $doctor_log
+          doctor_log: $doctor_log,
+          hashes: {
+            manifest_a_sha256: $manifest_a_sha256,
+            manifest_b_sha256: $manifest_b_sha256,
+            summary_a_sha256: $summary_a_sha256,
+            summary_b_sha256: $summary_b_sha256,
+            runner_log_a_sha256: $runner_log_a_sha256,
+            runner_log_b_sha256: $runner_log_b_sha256,
+            doctor_json_sha256: $doctor_json_sha256,
+            doctor_human_sha256: $doctor_human_sha256,
+            doctor_log_sha256: $doctor_log_sha256
+          }
         },
         replay_command: $replay_command,
         first_failure_replay_command: $first_failure_replay_command,
@@ -662,6 +696,15 @@ else
   echo "Runner log B:         ${RUN_B_LOG#"${WORKSPACE_ROOT}"/}"
   echo "Doctor report:        ${DOCTOR_JSON#"${WORKSPACE_ROOT}"/}"
   echo "Doctor log:           ${DOCTOR_LOG#"${WORKSPACE_ROOT}"/}"
+  echo "Manifest A sha256:    ${MANIFEST_A_SHA256}"
+  echo "Manifest B sha256:    ${MANIFEST_B_SHA256}"
+  echo "Summary A sha256:     ${SUMMARY_A_SHA256}"
+  echo "Summary B sha256:     ${SUMMARY_B_SHA256}"
+  echo "Runner log A sha256:  ${RUNNER_LOG_A_SHA256}"
+  echo "Runner log B sha256:  ${RUNNER_LOG_B_SHA256}"
+  echo "Doctor JSON sha256:   ${DOCTOR_JSON_SHA256}"
+  echo "Doctor human sha256:  ${DOCTOR_HUMAN_SHA256}"
+  echo "Doctor log sha256:    ${DOCTOR_LOG_SHA256}"
   echo "Promotion criteria:"
   for criterion in "${PROMOTION_CRITERIA[@]}"; do
     echo "  - ${criterion}"

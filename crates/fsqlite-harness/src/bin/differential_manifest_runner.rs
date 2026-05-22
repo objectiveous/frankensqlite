@@ -592,8 +592,11 @@ fn path_to_utf8(path: &Path) -> String {
 }
 
 fn normalize_one_command(command: &str) -> Option<String> {
+    if command.contains('\n') || command.contains('\r') {
+        return None;
+    }
     let normalized = command.trim();
-    if normalized.is_empty() || normalized.contains('\n') || normalized.contains('\r') {
+    if normalized.is_empty() {
         return None;
     }
     Some(normalized.to_owned())
@@ -1437,6 +1440,7 @@ mod tests {
     use fsqlite_harness::mismatch_minimizer::{
         DeduplicatedFailures, MinimalReproduction, MismatchSignature,
     };
+    use proptest::prelude::*;
 
     fn test_config() -> Config {
         Config {
@@ -1589,6 +1593,23 @@ mod tests {
         }
     }
 
+    fn divergent_case_with_classification(
+        case_id: &str,
+        classification: MismatchClassification,
+        divergence_source: Option<DivergenceSource>,
+    ) -> CaseResult {
+        CaseResult {
+            case_id: case_id.to_owned(),
+            transform_name: "identity".to_owned(),
+            equivalence: EquivalenceExpectation::ExactRowMatch,
+            original_passed: false,
+            transformed_passed: true,
+            classification: Some(classification),
+            minimal_reproduction: None,
+            divergence_source,
+        }
+    }
+
     #[test]
     fn build_trace_id_is_deterministic() {
         let left = build_trace_id("example-run");
@@ -1683,6 +1704,135 @@ mod tests {
                 .owner_hint
                 .contains("fixture owners")
         );
+    }
+
+    #[test]
+    fn first_failure_replay_classifies_all_root_cause_domains() {
+        let cases = vec![
+            (
+                "parser",
+                divergent_case_with_repro(Subsystem::Parser),
+                RootCauseDomain::Parser,
+                "cargo test -p fsqlite-parser",
+                "parser owners",
+            ),
+            (
+                "planner",
+                divergent_case_with_classification(
+                    "planner-case",
+                    MismatchClassification::TrueDivergence {
+                        description: "name resolution failed before optimizer index choice"
+                            .to_owned(),
+                    },
+                    Some(DivergenceSource::Original),
+                ),
+                RootCauseDomain::Planner,
+                "cargo test -p fsqlite-planner",
+                "planner owners",
+            ),
+            (
+                "vdbe",
+                divergent_case_with_classification(
+                    "vdbe-case",
+                    MismatchClassification::TypeAffinityDifference,
+                    Some(DivergenceSource::Transformed),
+                ),
+                RootCauseDomain::Vdbe,
+                "cargo test -p fsqlite-vdbe",
+                "vdbe owners",
+            ),
+            (
+                "storage",
+                divergent_case_with_repro(Subsystem::Mvcc),
+                RootCauseDomain::Storage,
+                "cargo test -p fsqlite-btree",
+                "storage owners",
+            ),
+            (
+                "harness",
+                divergent_case_with_classification(
+                    "harness-case",
+                    MismatchClassification::FalsePositive {
+                        reason: "runner timeout produced invalid comparison evidence".to_owned(),
+                    },
+                    Some(DivergenceSource::CrossVariant),
+                ),
+                RootCauseDomain::Harness,
+                "cargo test -p fsqlite-harness --bin differential_manifest_runner",
+                "harness owners",
+            ),
+            (
+                "fixture",
+                divergent_case_with_classification(
+                    "fixture-case",
+                    MismatchClassification::FalsePositive {
+                        reason: "fixture corpus expected rows were wrong".to_owned(),
+                    },
+                    Some(DivergenceSource::CrossVariant),
+                ),
+                RootCauseDomain::Fixture,
+                "cargo test -p fsqlite-harness --bin differential_manifest_runner",
+                "fixture owners",
+            ),
+        ];
+
+        for (label, divergent_case, expected_domain, expected_command, expected_owner) in cases {
+            let report = empty_run_report(0, 1, vec![divergent_case]);
+            let first_failure = first_failure_replay(&report, "cargo run -p fsqlite-harness")
+                .expect("first failure generation should succeed")
+                .expect("divergent case should produce first failure");
+
+            assert_eq!(
+                first_failure.root_cause_domain, expected_domain,
+                "unexpected domain for {label}"
+            );
+            assert!(
+                first_failure
+                    .remediation_playbook
+                    .next_commands
+                    .iter()
+                    .any(|command| command.contains(expected_command)),
+                "missing validation command for {label}"
+            );
+            assert!(
+                first_failure
+                    .remediation_playbook
+                    .owner_hint
+                    .contains(expected_owner),
+                "missing owner hint for {label}"
+            );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn normalize_one_command_trims_single_line_commands(
+            prefix in "[ \\t]{0,4}",
+            core in "[!-~][ -~]{0,63}",
+            suffix in "[ \\t]{0,4}",
+        ) {
+            let command = format!("{prefix}{core}{suffix}");
+            let normalized = normalize_one_command(&command)
+                .expect("non-empty single-line command should normalize");
+
+            prop_assert_eq!(normalized, command.trim());
+        }
+
+        #[test]
+        fn ensure_one_command_rejects_blank_and_multiline_commands(
+            left in "[ -~]{0,32}",
+            right in "[ -~]{0,32}",
+            separator in prop_oneof![Just("\n"), Just("\r"), Just("\r\n")],
+        ) {
+            let blank_error = ensure_one_command(" \t ", "test.field")
+                .expect_err("blank command should be rejected");
+            prop_assert!(blank_error.contains("test.field"));
+
+            let multiline = format!("{left}{separator}{right}");
+            let multiline_error = ensure_one_command(&multiline, "test.field")
+                .expect_err("multiline command should be rejected");
+            prop_assert!(multiline_error.contains("single-line command"));
+        }
     }
 
     #[test]

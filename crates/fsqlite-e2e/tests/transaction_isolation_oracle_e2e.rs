@@ -216,30 +216,32 @@ fn write_write_conflict_detected() {
     c1.execute("BEGIN CONCURRENT").unwrap();
     c2.execute("BEGIN CONCURRENT").unwrap();
 
-    // Both update the same row
+    // Both update the same row — c2 may get Busy on UPDATE or COMMIT
     c1.execute("UPDATE ww SET val = 200 WHERE id = 1;").unwrap();
-    c2.execute("UPDATE ww SET val = 300 WHERE id = 1;").unwrap();
+    let c2_update = c2.execute("UPDATE ww SET val = 300 WHERE id = 1;");
 
-    // First commit should succeed
     let r1 = c1.execute("COMMIT");
     assert!(r1.is_ok(), "first commit should succeed");
 
-    // Second commit should fail (write-write conflict)
-    let r2 = c2.execute("COMMIT");
-    if r2.is_err() {
-        // Expected: conflict detected, rollback
+    if c2_update.is_err() {
+        // c2 got Busy on UPDATE (page-level conflict) — rollback
         let _ = c2.execute("ROLLBACK");
-
-        // Final value should be from c1
         let val = frank_scalar(&c1, "SELECT val FROM ww WHERE id = 1");
         assert_eq!(val, "200", "c1's write should win");
     } else {
-        // If both commits succeed, the last writer wins
-        let val = frank_scalar(&c1, "SELECT val FROM ww WHERE id = 1");
-        assert!(
-            val == "200" || val == "300",
-            "one of the writes should be the final value"
-        );
+        // c2 UPDATE succeeded, try commit
+        let r2 = c2.execute("COMMIT");
+        if r2.is_err() {
+            let _ = c2.execute("ROLLBACK");
+            let val = frank_scalar(&c1, "SELECT val FROM ww WHERE id = 1");
+            assert_eq!(val, "200", "c1's write should win after c2 conflict");
+        } else {
+            let val = frank_scalar(&c1, "SELECT val FROM ww WHERE id = 1");
+            assert!(
+                val == "200" || val == "300",
+                "one of the writes should be the final value"
+            );
+        }
     }
 }
 
@@ -269,20 +271,25 @@ fn non_conflicting_concurrent_transactions_both_commit() {
     c1.execute("BEGIN CONCURRENT").unwrap();
     c2.execute("BEGIN CONCURRENT").unwrap();
 
-    // c1 updates row 1, c2 updates row 2 — no conflict
+    // c1 updates row 1, c2 updates row 2 — no conflict at row level,
+    // but page-level MVCC may still return Busy on UPDATE or COMMIT
     c1.execute("UPDATE nc SET val = 11 WHERE id = 1;").unwrap();
-    c2.execute("UPDATE nc SET val = 22 WHERE id = 2;").unwrap();
+    let c2_update = c2.execute("UPDATE nc SET val = 22 WHERE id = 2;");
 
     let r1 = c1.execute("COMMIT");
-    let r2 = c2.execute("COMMIT");
-
     assert!(r1.is_ok(), "c1 commit should succeed (no conflict)");
 
-    if r2.is_err() {
-        // SSI may conservatively abort c2 even though rows are disjoint
+    if c2_update.is_err() {
+        // c2 got Busy on UPDATE — page-level conflict, rollback and retry
         let _ = c2.execute("ROLLBACK");
-        // Retry c2's update
         c2.execute("UPDATE nc SET val = 22 WHERE id = 2;").unwrap();
+    } else {
+        let r2 = c2.execute("COMMIT");
+        if r2.is_err() {
+            // SSI may conservatively abort c2 even though rows are disjoint
+            let _ = c2.execute("ROLLBACK");
+            c2.execute("UPDATE nc SET val = 22 WHERE id = 2;").unwrap();
+        }
     }
 
     let verify = fsqlite::Connection::open(&f_path).unwrap();

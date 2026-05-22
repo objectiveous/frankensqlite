@@ -4457,4 +4457,148 @@ mod tests {
         );
         wal2.close(&cx).expect("close");
     }
+
+    #[test]
+    fn crash_before_wal_frame_append_preserves_existing_frames() {
+        let _guard = FAULT_TEST_LOCK.lock().unwrap();
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        let p1 = sample_page(0xAA);
+        wal.append_frames(&cx, &[(1, &p1, 1)])
+            .expect("first append");
+        wal.durable_sync(&cx, SyncKind::FullDurable)
+            .expect("sync first frame");
+        assert_eq!(wal.frame_count(), 1);
+
+        crate::fault_hooks::arm_crash_boundary(
+            crate::fault_hooks::CrashBoundary::BeforeWalFrameAppend,
+            crate::fault_hooks::FaultHookArm::new(
+                "crash-before-append",
+                "WAL-FRAME-APPEND-CRASH",
+                "test_crash_before_append",
+            ),
+        );
+
+        let p2 = sample_page(0xBB);
+        let err = wal
+            .append_frames(&cx, &[(2, &p2, 2)])
+            .expect_err("should fail at crash boundary");
+        assert!(
+            err.to_string().contains("fault_inject"),
+            "error identifies the fault hook: {err}"
+        );
+
+        crate::fault_hooks::clear_crash_boundary();
+
+        wal.close(&cx).expect("close after crash");
+
+        let file2 = open_wal_file(&vfs, &cx);
+        let recovered = WalFile::open(&cx, file2).expect("reopen");
+        assert_eq!(
+            recovered.frame_count(),
+            1,
+            "only the first committed frame survives; the second was never written"
+        );
+        recovered.close(&cx).expect("close recovered");
+    }
+
+    #[test]
+    fn crash_after_fsync_before_publish_leaves_frames_durable() {
+        let _guard = FAULT_TEST_LOCK.lock().unwrap();
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        let p1 = sample_page(0xCC);
+        wal.append_frames(&cx, &[(1, &p1, 1)]).expect("append");
+
+        crate::fault_hooks::arm_crash_boundary(
+            crate::fault_hooks::CrashBoundary::AfterFsyncBeforePublish,
+            crate::fault_hooks::FaultHookArm::new(
+                "crash-after-fsync",
+                "WAL-FSYNC-PUBLISH-CRASH",
+                "test_crash_after_fsync",
+            ),
+        );
+
+        let err = wal
+            .durable_sync(&cx, SyncKind::FullDurable)
+            .expect_err("should fail at crash boundary");
+        assert!(
+            err.to_string().contains("fault_inject"),
+            "error identifies the fault hook: {err}"
+        );
+
+        crate::fault_hooks::clear_crash_boundary();
+
+        wal.close(&cx).expect("close after crash");
+
+        let file2 = open_wal_file(&vfs, &cx);
+        let recovered = WalFile::open(&cx, file2).expect("reopen");
+        assert_eq!(
+            recovered.frame_count(),
+            1,
+            "frame was fsynced before crash so it survives recovery"
+        );
+        recovered.close(&cx).expect("close recovered");
+    }
+
+    #[test]
+    fn crash_before_wal_header_write_on_reset_preserves_old_generation() {
+        let _guard = FAULT_TEST_LOCK.lock().unwrap();
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        let p1 = sample_page(0xDD);
+        wal.append_frames(&cx, &[(1, &p1, 1)]).expect("append");
+        wal.durable_sync(&cx, SyncKind::FullDurable).expect("sync");
+        assert_eq!(wal.frame_count(), 1);
+
+        let original_salts = wal.generation_identity().salts;
+
+        crate::fault_hooks::arm_crash_boundary(
+            crate::fault_hooks::CrashBoundary::BeforeWalHeaderWrite,
+            crate::fault_hooks::FaultHookArm::new(
+                "crash-before-header",
+                "WAL-HEADER-WRITE-CRASH",
+                "test_crash_before_header",
+            ),
+        );
+
+        let new_salts = WalSalts {
+            salt1: original_salts.salt1.wrapping_add(1),
+            salt2: original_salts.salt2.wrapping_add(1),
+        };
+        let err = wal
+            .reset(&cx, 1, new_salts, true)
+            .expect_err("should fail at crash boundary");
+        assert!(
+            err.to_string().contains("fault_inject"),
+            "error identifies the fault hook: {err}"
+        );
+
+        crate::fault_hooks::clear_crash_boundary();
+
+        wal.close(&cx).expect("close after crash");
+
+        let file2 = open_wal_file(&vfs, &cx);
+        let recovered = WalFile::open(&cx, file2).expect("reopen");
+        assert_eq!(
+            recovered.frame_count(),
+            1,
+            "header was never rewritten so old generation with 1 frame persists"
+        );
+        assert_eq!(
+            recovered.generation_identity().salts,
+            original_salts,
+            "salts unchanged — reset never wrote new header"
+        );
+        recovered.close(&cx).expect("close recovered");
+    }
 }

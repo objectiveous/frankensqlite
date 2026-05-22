@@ -45,8 +45,7 @@ use std::sync::{
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
-use fsqlite_types::flags::SyncFlags;
-use fsqlite_vfs::VfsFile;
+use fsqlite_vfs::{SyncKind, VfsFile};
 use tracing::{debug, info, trace};
 
 use crate::wal::{WalAppendFrameRef, WalFile};
@@ -1607,7 +1606,7 @@ pub fn write_consolidated_frames<F: VfsFile>(
     let _guard = span.enter();
 
     wal.append_frame_iter(cx, total_frames, frame_refs)?;
-    wal.file_mut().sync(cx, SyncFlags::FULL)?;
+    wal.durable_sync(cx, SyncKind::FullDurable)?;
     let bytes_written = u64::try_from(total_bytes).unwrap_or(u64::MAX);
 
     info!(
@@ -2561,7 +2560,10 @@ mod tests {
         assert_eq!(def.staged_frame_count, 0);
         assert_eq!(def.staging_elapsed_ns, 0);
         let other = TransactionFrameBatchContext {
-            batch_id: 1, lane_id: 3, staged_frame_count: 10, staging_elapsed_ns: 500,
+            batch_id: 1,
+            lane_id: 3,
+            staged_frame_count: 10,
+            staging_elapsed_ns: 500,
         };
         assert_ne!(def, other);
         let copied = other;
@@ -2572,7 +2574,11 @@ mod tests {
 
     #[test]
     fn consolidation_phase_and_submit_outcome_all_variants() {
-        let phases = [ConsolidationPhase::Filling, ConsolidationPhase::Flushing, ConsolidationPhase::Complete];
+        let phases = [
+            ConsolidationPhase::Filling,
+            ConsolidationPhase::Flushing,
+            ConsolidationPhase::Complete,
+        ];
         for (i, p) in phases.iter().enumerate() {
             let copied = *p;
             assert_eq!(copied, *p);
@@ -2589,11 +2595,18 @@ mod tests {
 
     #[test]
     fn transaction_frame_batch_builders() {
-        let frame = FrameSubmission { page_number: 5, page_data: vec![0u8; 16], db_size_if_commit: 0 };
+        let frame = FrameSubmission {
+            page_number: 5,
+            page_data: vec![0u8; 16],
+            db_size_if_commit: 0,
+        };
         let batch = TransactionFrameBatch::new(vec![frame.clone()])
             .with_conflict_snapshot(vec![5, 10], None)
             .with_context(TransactionFrameBatchContext {
-                batch_id: 99, lane_id: 2, staged_frame_count: 1, staging_elapsed_ns: 100,
+                batch_id: 99,
+                lane_id: 2,
+                staged_frame_count: 1,
+                staging_elapsed_ns: 100,
             });
         assert_eq!(batch.frame_count(), 1);
         assert!(!batch.has_commit_frame());
@@ -2616,7 +2629,11 @@ mod tests {
 
     #[test]
     fn frame_submission_debug_clone() {
-        let fs = FrameSubmission { page_number: 42, page_data: vec![0xAB; 8], db_size_if_commit: 0 };
+        let fs = FrameSubmission {
+            page_number: 42,
+            page_data: vec![0xAB; 8],
+            db_size_if_commit: 0,
+        };
         let cloned = fs.clone();
         assert_eq!(cloned.page_number, 42);
         assert_eq!(cloned.page_data.len(), 8);

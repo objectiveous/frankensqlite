@@ -8,6 +8,26 @@ use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 
 use crate::shm::ShmRegion;
 
+/// Durability level for `VfsFile::durable_sync`.
+///
+/// Centralizes per-filesystem sync policy so callers express intent
+/// ("make WAL frames durable") and the VFS maps it to the correct
+/// syscall: fdatasync on ext4/XFS, fsync on btrfs/ZFS, F_FULLFSYNC
+/// on APFS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SyncKind {
+    /// Data-only sync (fdatasync on Linux). Sufficient when file size
+    /// and metadata are unchanged (e.g. overwriting existing WAL frames).
+    DataOnly,
+    /// Data + metadata sync (fsync on Linux). Required when new allocation
+    /// blocks must be persisted (file growth, btrfs CoW).
+    DataAndMetadata,
+    /// Full durable barrier: the strongest sync the platform offers.
+    /// On APFS this maps to F_FULLFSYNC; elsewhere identical to
+    /// `DataAndMetadata`. Required for WAL commit frames.
+    FullDurable,
+}
+
 static DEFAULT_RANDOMNESS_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A virtual filesystem implementation.
@@ -129,6 +149,20 @@ pub trait VfsFile: Send + Sync {
     ///
     /// `flags` indicates the type of sync (normal, full, data-only).
     fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()>;
+
+    /// Durability-intent sync with per-filesystem policy.
+    ///
+    /// Callers express *what* must be durable (`SyncKind`); the VFS maps
+    /// it to the correct platform syscall. Default delegates to `sync()`
+    /// with `DATAONLY` / `FULL` flags; platform VFS backends override for
+    /// filesystem-specific behaviour (F_FULLFSYNC on APFS, etc.).
+    fn durable_sync(&mut self, cx: &Cx, kind: SyncKind) -> Result<()> {
+        let flags = match kind {
+            SyncKind::DataOnly => SyncFlags::DATAONLY,
+            SyncKind::DataAndMetadata | SyncKind::FullDurable => SyncFlags::FULL,
+        };
+        self.sync(cx, flags)
+    }
 
     /// Return the current file size in bytes.
     fn file_size(&self, cx: &Cx) -> Result<u64>;
@@ -814,6 +848,76 @@ mod tests {
             jd > 2_440_000.0,
             "Julian day should be after ~1968, got {jd}"
         );
+    }
+
+    #[test]
+    fn durable_sync_default_delegates_to_sync() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static LAST_FLAGS: AtomicU8 = AtomicU8::new(0);
+
+        struct RecordingFile;
+        impl VfsFile for RecordingFile {
+            fn close(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
+                Ok(0)
+            }
+            fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+                Ok(())
+            }
+            fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
+                Ok(())
+            }
+            fn sync(&mut self, _: &Cx, flags: SyncFlags) -> Result<()> {
+                LAST_FLAGS.store(flags.bits(), Ordering::Relaxed);
+                Ok(())
+            }
+            fn file_size(&self, _: &Cx) -> Result<u64> {
+                Ok(0)
+            }
+            fn lock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+                Ok(())
+            }
+            fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+                Ok(())
+            }
+            fn check_reserved_lock(&self, _: &Cx) -> Result<bool> {
+                Ok(false)
+            }
+            fn shm_map(&mut self, _: &Cx, _: u32, _: u32, _: bool) -> Result<ShmRegion> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn shm_lock(&mut self, _: &Cx, _: u32, _: u32, _: u32) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn shm_barrier(&self) {}
+            fn shm_unmap(&mut self, _: &Cx, _: bool) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let cx = Cx::new();
+        let mut f = RecordingFile;
+
+        f.durable_sync(&cx, SyncKind::DataOnly).unwrap();
+        assert_eq!(
+            LAST_FLAGS.load(Ordering::Relaxed),
+            SyncFlags::DATAONLY.bits()
+        );
+
+        f.durable_sync(&cx, SyncKind::FullDurable).unwrap();
+        assert_eq!(LAST_FLAGS.load(Ordering::Relaxed), SyncFlags::FULL.bits());
+
+        f.durable_sync(&cx, SyncKind::DataAndMetadata).unwrap();
+        assert_eq!(LAST_FLAGS.load(Ordering::Relaxed), SyncFlags::FULL.bits());
+    }
+
+    #[test]
+    fn sync_kind_variants_are_distinct() {
+        assert_ne!(SyncKind::DataOnly, SyncKind::DataAndMetadata);
+        assert_ne!(SyncKind::DataAndMetadata, SyncKind::FullDurable);
+        assert_ne!(SyncKind::DataOnly, SyncKind::FullDurable);
     }
 
     #[test]

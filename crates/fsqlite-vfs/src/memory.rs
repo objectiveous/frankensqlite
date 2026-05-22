@@ -2502,7 +2502,7 @@ mod tests {
             max_bytes: Some(1_048_576),
         };
         let vfs = MemoryVfs::new_with_config(cfg);
-        let snap = vfs.usage_snapshot();
+        let snap = vfs.usage_snapshot().unwrap();
         assert_eq!(snap.initial_reserve_bytes, 4096);
         assert_eq!(snap.growth_chunk_bytes, 8192);
         assert_eq!(snap.max_bytes, Some(1_048_576));

@@ -16,8 +16,15 @@
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::SyncFlags;
-use fsqlite_vfs::VfsFile;
+use fsqlite_vfs::{SyncKind, VfsFile};
 use tracing::{debug, error, warn};
+
+/// Whether the `FRANKENSQLITE_PARANOID_DURABILITY` env var is set.
+/// Checked once at startup to avoid repeated `env::var` calls on the hot path.
+static PARANOID_DURABILITY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("FRANKENSQLITE_PARANOID_DURABILITY")
+        .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"))
+});
 
 use crate::checksum::{
     SqliteWalChecksum, WAL_FORMAT_VERSION, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WAL_MAGIC_LE,
@@ -112,6 +119,11 @@ pub struct WalFile<F: VfsFile> {
     /// `&mut self`, so reuse stays serialized per handle without reintroducing
     /// any cross-writer coordination.
     frame_scratch: Vec<u8>,
+    /// Frame count at which the last successful durable_sync completed.
+    /// Used by debug-assertions and FRANKENSQLITE_PARANOID_DURABILITY to
+    /// verify the two-phase commit invariant: fsync must complete before
+    /// any CommitIndex publish for the same frames.
+    last_fsynced_frame_count: usize,
 }
 
 impl<F: VfsFile> WalFile<F> {
@@ -504,6 +516,7 @@ impl<F: VfsFile> WalFile<F> {
             frame_count: 0,
             last_commit_frame: None,
             frame_scratch: Vec::new(),
+            last_fsynced_frame_count: 0,
         })
     }
 
@@ -650,6 +663,7 @@ impl<F: VfsFile> WalFile<F> {
             frame_count: last_commit_frames,
             last_commit_frame: last_commit_frames.checked_sub(1),
             frame_scratch: Vec::new(),
+            last_fsynced_frame_count: last_commit_frames,
         })
     }
 
@@ -1276,6 +1290,71 @@ impl<F: VfsFile> WalFile<F> {
         self.file.sync(cx, flags)
     }
 
+    /// Durability-intent sync: makes all appended frames durable and records
+    /// the fsynced frame count for the two-phase commit invariant.
+    ///
+    /// Callers that will publish a CommitIndex MUST call this (not raw `sync`)
+    /// so the invariant tracker can verify ordering.
+    pub fn durable_sync(&mut self, cx: &Cx, kind: SyncKind) -> Result<()> {
+        #[cfg(any(test, feature = "fault-injection"))]
+        {
+            let flags = match kind {
+                SyncKind::DataOnly => SyncFlags::DATAONLY,
+                SyncKind::DataAndMetadata | SyncKind::FullDurable => SyncFlags::FULL,
+            };
+            crate::fault_hooks::maybe_inject_sync_failure(self.frame_count, flags)?;
+        }
+
+        self.file.durable_sync(cx, kind)?;
+        self.last_fsynced_frame_count = self.frame_count;
+
+        debug!(
+            target: "fsqlite_wal::durability",
+            fsynced_up_to = self.frame_count,
+            kind = ?kind,
+            "WAL durable sync complete"
+        );
+
+        Ok(())
+    }
+
+    /// Assert that it is safe to publish frames up to `publish_frame_count`
+    /// — i.e. that a durable_sync has already completed covering those frames.
+    ///
+    /// Under debug-assertions this panics. In release mode, it returns an error
+    /// only when `FRANKENSQLITE_PARANOID_DURABILITY=1` is set.
+    pub fn assert_publish_safe(&self, publish_frame_count: usize) -> Result<()> {
+        if self.last_fsynced_frame_count >= publish_frame_count {
+            return Ok(());
+        }
+
+        let msg = format!(
+            "publish-before-fsync: attempting to publish frame_count={publish_frame_count} \
+             but last fsynced only up to {fsynced}",
+            fsynced = self.last_fsynced_frame_count,
+        );
+
+        debug_assert!(false, "WAL durability invariant violated: {msg}");
+
+        if *PARANOID_DURABILITY {
+            error!(
+                target: "fsqlite_wal::durability",
+                publish_frame_count,
+                last_fsynced = self.last_fsynced_frame_count,
+                "PARANOID_DURABILITY: publish-before-fsync detected"
+            );
+            return Err(FrankenError::Internal(msg));
+        }
+
+        Ok(())
+    }
+
+    /// The frame count at which the last successful durable sync completed.
+    #[must_use]
+    pub fn last_fsynced_frame_count(&self) -> usize {
+        self.last_fsynced_frame_count
+    }
+
     /// Reset the WAL for a new checkpoint generation.
     ///
     /// Writes a new header with updated checkpoint sequence and salts,
@@ -1324,6 +1403,7 @@ impl<F: VfsFile> WalFile<F> {
         self.header = WalHeader::from_bytes(&header_bytes)?;
         self.frame_count = 0;
         self.last_commit_frame = None;
+        self.last_fsynced_frame_count = 0;
         self.frame_scratch.clear();
         crate::metrics::GLOBAL_WAL_METRICS.set_wal_frames_current(0);
 
@@ -4200,7 +4280,8 @@ mod tests {
         assert_eq!(wal.page_size(), PAGE_SIZE as usize);
         assert_eq!(wal.frame_count(), 0);
         assert!(wal.last_commit_frame().is_none());
-        wal.append_frame(&cx, 1, &sample_page(1), 5).expect("append");
+        wal.append_frame(&cx, 1, &sample_page(1), 5)
+            .expect("append");
         assert_eq!(wal.frame_count(), 1);
         assert_eq!(wal.last_commit_frame(), Some(0));
         wal.close(&cx).expect("close");
@@ -4249,5 +4330,111 @@ mod tests {
         let _f_ref = wal.file();
         let _f_mut = wal.file_mut();
         wal.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn durable_sync_records_fsynced_frame_count() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        assert_eq!(wal.last_fsynced_frame_count(), 0);
+
+        let page = vec![0xABu8; PAGE_SIZE as usize];
+        wal.append_frames(&cx, &[(1, &page, 1)]).expect("append");
+        assert_eq!(wal.frame_count(), 1);
+        assert_eq!(wal.last_fsynced_frame_count(), 0);
+
+        wal.durable_sync(&cx, fsqlite_vfs::SyncKind::FullDurable)
+            .expect("durable_sync");
+        assert_eq!(wal.last_fsynced_frame_count(), 1);
+        wal.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn assert_publish_safe_passes_after_durable_sync() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        let page = vec![0xCDu8; PAGE_SIZE as usize];
+        wal.append_frames(&cx, &[(1, &page, 1)]).expect("append");
+        wal.durable_sync(&cx, fsqlite_vfs::SyncKind::FullDurable)
+            .expect("durable_sync");
+        wal.assert_publish_safe(1)
+            .expect("should be safe after fsync");
+        wal.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn assert_publish_safe_passes_for_zero_frames() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        wal.assert_publish_safe(0).expect("zero frames always safe");
+        wal.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn durable_sync_with_data_only_kind() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        let page = vec![0xEFu8; PAGE_SIZE as usize];
+        wal.append_frames(&cx, &[(2, &page, 1)]).expect("append");
+        wal.durable_sync(&cx, fsqlite_vfs::SyncKind::DataOnly)
+            .expect("data-only sync");
+        assert_eq!(wal.last_fsynced_frame_count(), 1);
+        wal.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn durable_sync_reset_clears_fsynced_count() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        let page = vec![0x11u8; PAGE_SIZE as usize];
+        wal.append_frames(&cx, &[(1, &page, 1)]).expect("append");
+        wal.durable_sync(&cx, fsqlite_vfs::SyncKind::FullDurable)
+            .expect("durable_sync");
+        assert_eq!(wal.last_fsynced_frame_count(), 1);
+
+        let new_salts = WalSalts {
+            salt1: 0x1111_1111,
+            salt2: 0x2222_2222,
+        };
+        wal.reset(&cx, 1, new_salts, true).expect("reset");
+        assert_eq!(wal.last_fsynced_frame_count(), 0);
+        wal.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn opened_wal_has_fsynced_count_equal_to_frame_count() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        let page = vec![0x22u8; PAGE_SIZE as usize];
+        wal.append_frames(&cx, &[(1, &page, 1)]).expect("append");
+        wal.durable_sync(&cx, fsqlite_vfs::SyncKind::FullDurable)
+            .expect("durable_sync");
+        wal.close(&cx).expect("close");
+
+        let file2 = open_wal_file(&vfs, &cx);
+        let wal2 = WalFile::open(&cx, file2).expect("open");
+        assert_eq!(wal2.frame_count(), 1);
+        assert_eq!(
+            wal2.last_fsynced_frame_count(),
+            wal2.frame_count(),
+            "opened WAL assumes existing frames are durable"
+        );
+        wal2.close(&cx).expect("close");
     }
 }

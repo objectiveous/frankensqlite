@@ -36,7 +36,7 @@ fn fsqlite_query_sorted(conn: &fsqlite::Connection, sql: &str) -> Result<Vec<Vec
                     SqliteValue::Null => "NULL".into(),
                     SqliteValue::Integer(n) => n.to_string(),
                     SqliteValue::Float(f) => format!("{f}"),
-                    SqliteValue::Text(s) => s.clone(),
+                    SqliteValue::Text(s) => s.to_string(),
                     SqliteValue::Blob(b) => {
                         format!(
                             "X'{}'",
@@ -490,12 +490,10 @@ fn read_snapshot_isolation_during_concurrent_write() {
     wconn.execute("PRAGMA journal_mode = WAL;").unwrap();
     wconn.execute("BEGIN CONCURRENT").unwrap();
     wconn.execute("INSERT INTO snap VALUES (3, 300);").unwrap();
-    wconn
-        .execute("UPDATE snap SET val = 999 WHERE id = 1;")
-        .unwrap_or_else(|e| {
-            let _ = wconn.execute("ROLLBACK");
-            eprintln!("writer UPDATE failed (may be bd-jamrd): {e}");
-        });
+    if let Err(e) = wconn.execute("UPDATE snap SET val = 999 WHERE id = 1;") {
+        let _ = wconn.execute("ROLLBACK");
+        eprintln!("writer UPDATE failed (may be bd-jamrd): {e}");
+    }
     let _ = wconn.execute("COMMIT");
 
     reader_handle.join().expect("reader thread panicked");

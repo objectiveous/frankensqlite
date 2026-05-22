@@ -27,7 +27,7 @@ fn fsqlite_rows(conn: &fsqlite::Connection, sql: &str) -> Vec<Vec<String>> {
                     SqliteValue::Null => "NULL".into(),
                     SqliteValue::Integer(n) => n.to_string(),
                     SqliteValue::Float(f) => format!("{f}"),
-                    SqliteValue::Text(s) => s.clone(),
+                    SqliteValue::Text(s) => s.to_string(),
                     SqliteValue::Blob(b) => {
                         format!(
                             "X'{}'",

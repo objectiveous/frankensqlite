@@ -391,6 +391,7 @@ validate_ci_report_schema() {
           (.first_failure | type == "object") and
           (.first_failure.replay_command | one_line) and
           (.first_failure.root_cause_domain | IN("parser", "planner", "vdbe", "storage", "harness", "fixture")) and
+          (.first_failure.diagnostic_json_pointer | one_line) and
           (.first_failure.remediation_playbook.summary | one_line) and
           (.first_failure.remediation_playbook.evidence_json_pointer | one_line) and
           (.first_failure.remediation_playbook.owner_hint | one_line) and
@@ -560,6 +561,7 @@ FIRST_FAILURE_REPLAY_COMMAND="$(
     "${MANIFEST_A}"
 )"
 FIRST_FAILURE_ROOT_CAUSE_DOMAIN="$(jq -r '.first_failure.root_cause_domain // ""' "${MANIFEST_A}")"
+FIRST_FAILURE_DIAGNOSTIC_POINTER="$(jq -r '.first_failure.diagnostic_json_pointer // ""' "${MANIFEST_A}")"
 FIRST_FAILURE_REMEDIATION_SUMMARY="$(jq -r '.first_failure.remediation_playbook.summary // ""' "${MANIFEST_A}")"
 FIRST_FAILURE_REMEDIATION_EVIDENCE="$(jq -r '.first_failure.remediation_playbook.evidence_json_pointer // ""' "${MANIFEST_A}")"
 FIRST_FAILURE_REMEDIATION_OWNER="$(jq -r '.first_failure.remediation_playbook.owner_hint // ""' "${MANIFEST_A}")"
@@ -639,6 +641,7 @@ write_ci_report_json() {
     --arg replay_command "${REPLAY_COMMAND}" \
     --arg first_failure_replay_command "${FIRST_FAILURE_REPLAY_COMMAND}" \
     --arg first_failure_root_cause_domain "${FIRST_FAILURE_ROOT_CAUSE_DOMAIN}" \
+    --arg first_failure_diagnostic_pointer "${FIRST_FAILURE_DIAGNOSTIC_POINTER}" \
     --arg first_failure_remediation_summary "${FIRST_FAILURE_REMEDIATION_SUMMARY}" \
     --arg first_failure_remediation_evidence "${FIRST_FAILURE_REMEDIATION_EVIDENCE}" \
     --arg first_failure_remediation_owner "${FIRST_FAILURE_REMEDIATION_OWNER}" \
@@ -730,6 +733,7 @@ write_ci_report_json() {
         first_failure: if $diverged_cases == 0 then null else {
           replay_command: $first_failure_replay_command,
           root_cause_domain: $first_failure_root_cause_domain,
+          diagnostic_json_pointer: $first_failure_diagnostic_pointer,
           remediation_playbook: {
             summary: $first_failure_remediation_summary,
             evidence_json_pointer: $first_failure_remediation_evidence,
@@ -802,6 +806,8 @@ else
   if [[ -n "${FIRST_FAILURE_REPLAY_COMMAND}" ]]; then
     echo "First-failure root cause:"
     echo "  ${FIRST_FAILURE_ROOT_CAUSE_DOMAIN}"
+    echo "First-failure diagnostic pointer:"
+    echo "  ${FIRST_FAILURE_DIAGNOSTIC_POINTER}"
     echo "First-failure remediation:"
     echo "  Summary: ${FIRST_FAILURE_REMEDIATION_SUMMARY}"
     echo "  Evidence: ${FIRST_FAILURE_REMEDIATION_EVIDENCE}"

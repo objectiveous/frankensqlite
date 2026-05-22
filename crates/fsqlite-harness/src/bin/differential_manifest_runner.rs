@@ -13,13 +13,15 @@ use fsqlite_harness::corpus_ingest::{
     ingest_conformance_fixtures_with_report, ingest_slt_files_with_report,
 };
 use fsqlite_harness::differential_runner::{
-    DifferentialRunReport, DivergenceSource, RunConfig, run_metamorphic_differential,
+    CaseResult, DifferentialRunReport, DivergenceSource, RunConfig, run_metamorphic_differential,
 };
 use fsqlite_harness::differential_v2::{CsqliteExecutor, FsqliteExecutor};
 use fsqlite_harness::fixture_root_contract::{
     DEFAULT_FIXTURE_ROOT_MANIFEST_PATH, enforce_fixture_contract_alignment,
     load_fixture_root_contract,
 };
+use fsqlite_harness::metamorphic::MismatchClassification;
+use fsqlite_harness::mismatch_minimizer::Subsystem;
 
 const BEAD_ID: &str = "bd-mblr.7.1.2";
 const DEFAULT_SCENARIO_ID: &str = "DIFF-712";
@@ -363,12 +365,46 @@ struct ReplayCommand {
     command: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RootCauseDomain {
+    Parser,
+    Planner,
+    Vdbe,
+    Storage,
+    Harness,
+    Fixture,
+}
+
+impl RootCauseDomain {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Parser => "parser",
+            Self::Planner => "planner",
+            Self::Vdbe => "vdbe",
+            Self::Storage => "storage",
+            Self::Harness => "harness",
+            Self::Fixture => "fixture",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RemediationPlaybook {
+    summary: String,
+    next_commands: Vec<String>,
+    evidence_json_pointer: String,
+    owner_hint: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct FirstFailureReplay {
     case_id: String,
     transform_name: String,
     divergence_source: String,
     statement_index: Option<usize>,
+    root_cause_domain: RootCauseDomain,
+    remediation_playbook: RemediationPlaybook,
     replay_command: String,
     diagnostic_json_pointer: String,
     minimal_reproduction_json_pointer: Option<String>,
@@ -558,6 +594,175 @@ fn divergence_source_label(source: Option<DivergenceSource>) -> &'static str {
     }
 }
 
+fn root_cause_domain_from_subsystem(subsystem: Subsystem) -> RootCauseDomain {
+    match subsystem {
+        Subsystem::Parser => RootCauseDomain::Parser,
+        Subsystem::Resolver | Subsystem::Planner => RootCauseDomain::Planner,
+        Subsystem::Vdbe
+        | Subsystem::Functions
+        | Subsystem::Extension
+        | Subsystem::TypeSystem
+        | Subsystem::Pragma => RootCauseDomain::Vdbe,
+        Subsystem::Storage | Subsystem::Wal | Subsystem::Mvcc => RootCauseDomain::Storage,
+        Subsystem::Unknown => RootCauseDomain::Harness,
+    }
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn root_cause_domain_from_classification(
+    classification: &MismatchClassification,
+) -> RootCauseDomain {
+    match classification {
+        MismatchClassification::FalsePositive { reason } => {
+            let normalized = reason.to_ascii_lowercase();
+            if contains_any(&normalized, &["fixture", "corpus", "slt"]) {
+                RootCauseDomain::Fixture
+            } else {
+                RootCauseDomain::Harness
+            }
+        }
+        MismatchClassification::TrueDivergence { description } => {
+            let normalized = description.to_ascii_lowercase();
+            if contains_any(&normalized, &["parse", "parser", "syntax", "token"]) {
+                RootCauseDomain::Parser
+            } else if contains_any(
+                &normalized,
+                &[
+                    "planner",
+                    "optimizer",
+                    "index",
+                    "resolver",
+                    "name resolution",
+                ],
+            ) {
+                RootCauseDomain::Planner
+            } else if contains_any(
+                &normalized,
+                &["btree", "b-tree", "page", "pager", "wal", "mvcc", "storage"],
+            ) {
+                RootCauseDomain::Storage
+            } else if contains_any(&normalized, &["fixture", "corpus", "slt"]) {
+                RootCauseDomain::Fixture
+            } else {
+                RootCauseDomain::Vdbe
+            }
+        }
+        MismatchClassification::OrderDependentDifference
+        | MismatchClassification::TypeAffinityDifference
+        | MismatchClassification::NullHandlingDifference
+        | MismatchClassification::FloatingPointDifference { .. } => RootCauseDomain::Vdbe,
+    }
+}
+
+fn classify_root_cause_domain(first_case: &CaseResult) -> RootCauseDomain {
+    if let Some(repro) = &first_case.minimal_reproduction {
+        let subsystem_domain = root_cause_domain_from_subsystem(repro.signature.subsystem);
+        match subsystem_domain {
+            RootCauseDomain::Harness => {}
+            domain => return domain,
+        }
+    }
+
+    if let Some(classification) = &first_case.classification {
+        return root_cause_domain_from_classification(classification);
+    }
+
+    let case_context = format!(
+        "{} {}",
+        first_case.case_id.to_ascii_lowercase(),
+        first_case.transform_name.to_ascii_lowercase()
+    );
+    if contains_any(&case_context, &["fixture", "corpus", "slt"]) {
+        return RootCauseDomain::Fixture;
+    }
+
+    match first_case.divergence_source {
+        Some(DivergenceSource::Original | DivergenceSource::Transformed) => RootCauseDomain::Vdbe,
+        Some(DivergenceSource::CrossVariant) | None => RootCauseDomain::Harness,
+    }
+}
+
+fn domain_validation_command(domain: RootCauseDomain) -> &'static str {
+    match domain {
+        RootCauseDomain::Parser => "cargo test -p fsqlite-parser",
+        RootCauseDomain::Planner => "cargo test -p fsqlite-planner",
+        RootCauseDomain::Vdbe => "cargo test -p fsqlite-vdbe",
+        RootCauseDomain::Storage => {
+            "cargo test -p fsqlite-btree && cargo test -p fsqlite-pager && cargo test -p fsqlite-wal && cargo test -p fsqlite-mvcc"
+        }
+        RootCauseDomain::Harness | RootCauseDomain::Fixture => {
+            "cargo test -p fsqlite-harness --bin differential_manifest_runner"
+        }
+    }
+}
+
+fn owner_hint(domain: RootCauseDomain) -> &'static str {
+    match domain {
+        RootCauseDomain::Parser => "parser owners: inspect crates/fsqlite-parser first",
+        RootCauseDomain::Planner => "planner owners: inspect crates/fsqlite-planner first",
+        RootCauseDomain::Vdbe => "vdbe owners: inspect crates/fsqlite-vdbe first",
+        RootCauseDomain::Storage => {
+            "storage owners: inspect btree, pager, wal, and mvcc crates first"
+        }
+        RootCauseDomain::Harness => "harness owners: inspect crates/fsqlite-harness first",
+        RootCauseDomain::Fixture => {
+            "fixture owners: inspect corpus fixtures, SLT intake, and fixture-root contract first"
+        }
+    }
+}
+
+fn playbook_summary(first_case: &CaseResult, domain: RootCauseDomain) -> String {
+    let classification = first_case
+        .classification
+        .as_ref()
+        .map_or_else(|| "unclassified".to_owned(), ToString::to_string);
+    let repro_summary = first_case.minimal_reproduction.as_ref().map_or_else(
+        || "no minimized reproduction attached".to_owned(),
+        |repro| {
+            format!(
+                "signature={} subsystem={} minimal_statements={}",
+                repro.signature.hash,
+                repro.signature.subsystem,
+                repro.signature.minimal_statement_count
+            )
+        },
+    );
+
+    format!(
+        "Start in the {} domain for case `{}` transform `{}`; classification={}; {}.",
+        domain.as_str(),
+        first_case.case_id,
+        first_case.transform_name,
+        classification,
+        repro_summary
+    )
+}
+
+fn build_remediation_playbook(
+    first_case: &CaseResult,
+    domain: RootCauseDomain,
+    replay_command: &str,
+    evidence_json_pointer: &str,
+) -> Result<RemediationPlaybook, String> {
+    let next_commands = [
+        replay_command.to_owned(),
+        domain_validation_command(domain).to_owned(),
+    ]
+    .into_iter()
+    .map(|command| ensure_one_command(&command, "first_failure.remediation_playbook.next_commands"))
+    .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(RemediationPlaybook {
+        summary: playbook_summary(first_case, domain),
+        next_commands,
+        evidence_json_pointer: evidence_json_pointer.to_owned(),
+        owner_hint: owner_hint(domain).to_owned(),
+    })
+}
+
 fn first_failure_replay(
     run_report: &DifferentialRunReport,
     fallback_replay: &str,
@@ -572,6 +777,14 @@ fn first_failure_replay(
         .and_then(|repro| normalize_one_command(&repro.repro_command))
         .unwrap_or(fallback);
     let replay_command = ensure_one_command(&replay_command, "first_failure.replay_command")?;
+    let diagnostic_json_pointer = "/run_report/divergent_cases/0".to_owned();
+    let root_cause_domain = classify_root_cause_domain(first_case);
+    let remediation_playbook = build_remediation_playbook(
+        first_case,
+        root_cause_domain,
+        &replay_command,
+        &diagnostic_json_pointer,
+    )?;
 
     Ok(Some(FirstFailureReplay {
         case_id: first_case.case_id.clone(),
@@ -581,8 +794,10 @@ fn first_failure_replay(
             .minimal_reproduction
             .as_ref()
             .and_then(|repro| repro.first_divergence_index),
+        root_cause_domain,
+        remediation_playbook,
         replay_command,
-        diagnostic_json_pointer: "/run_report/divergent_cases/0".to_owned(),
+        diagnostic_json_pointer,
         minimal_reproduction_json_pointer: first_case
             .minimal_reproduction
             .as_ref()
@@ -688,6 +903,38 @@ fn validate_manifest_replay_contract(manifest: &DifferentialManifest) -> Result<
             &first_failure.replay_command,
             "first_failure.replay_command",
         )?;
+        if first_failure.remediation_playbook.summary.trim().is_empty() {
+            return Err("first_failure.remediation_playbook.summary must be non-empty".to_owned());
+        }
+        if first_failure
+            .remediation_playbook
+            .evidence_json_pointer
+            .trim()
+            .is_empty()
+        {
+            return Err(
+                "first_failure.remediation_playbook.evidence_json_pointer must be non-empty"
+                    .to_owned(),
+            );
+        }
+        if first_failure
+            .remediation_playbook
+            .owner_hint
+            .trim()
+            .is_empty()
+        {
+            return Err(
+                "first_failure.remediation_playbook.owner_hint must be non-empty".to_owned(),
+            );
+        }
+        if first_failure.remediation_playbook.next_commands.is_empty() {
+            return Err(
+                "first_failure.remediation_playbook.next_commands must be non-empty".to_owned(),
+            );
+        }
+        for command in &first_failure.remediation_playbook.next_commands {
+            ensure_one_command(command, "first_failure.remediation_playbook.next_commands")?;
+        }
         if first_failure.diagnostic_json_pointer.trim().is_empty() {
             return Err("first_failure.diagnostic_json_pointer must be non-empty".to_owned());
         }
@@ -750,6 +997,29 @@ fn build_human_summary(manifest: &DifferentialManifest) -> String {
         || "none".to_owned(),
         |failure| failure.artifact_entries.join(", "),
     );
+    let first_failure_root_cause_domain = manifest.first_failure.as_ref().map_or_else(
+        || "none".to_owned(),
+        |failure| failure.root_cause_domain.as_str().to_owned(),
+    );
+    let first_failure_remediation = manifest.first_failure.as_ref().map_or_else(
+        || "none".to_owned(),
+        |failure| {
+            let commands = failure
+                .remediation_playbook
+                .next_commands
+                .iter()
+                .map(|command| format!("- `{command}`"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "summary: {}\nowner_hint: {}\nevidence_json_pointer: {}\nnext_commands:\n{}",
+                failure.remediation_playbook.summary,
+                failure.remediation_playbook.owner_hint,
+                failure.remediation_playbook.evidence_json_pointer,
+                commands,
+            )
+        },
+    );
     let sampled_passing_section = if manifest.sampled_passing_replays.is_empty() {
         "none".to_owned()
     } else {
@@ -803,10 +1073,13 @@ first_failure_statement_index: `{}`\n\n\
 first_failure_json_pointer: `{}`\n\
 first_failure_minimal_repro_pointer: `{}`\n\
 first_failure_artifact_entries: `{}`\n\n\
+first_failure_root_cause_domain: `{}`\n\n\
 ## Replay\n\n\
 `{}`\n\n\
 ## First Failure Replay\n\n\
 `{}`\n\n\
+## First Failure Remediation\n\n\
+{}\n\n\
 ## Sampled Passing Replays\n\n\
 {}\n",
         manifest.run_id,
@@ -839,8 +1112,10 @@ first_failure_artifact_entries: `{}`\n\n\
         first_failure_pointer,
         first_failure_minimal_pointer,
         first_failure_artifact_entries,
+        first_failure_root_cause_domain,
         manifest.replay.command,
         first_failure_replay,
+        first_failure_remediation,
         sampled_passing_section,
     )
 }
@@ -1086,7 +1361,10 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use fsqlite_harness::differential_runner::CoverageSummary;
-    use fsqlite_harness::mismatch_minimizer::DeduplicatedFailures;
+    use fsqlite_harness::metamorphic::EquivalenceExpectation;
+    use fsqlite_harness::mismatch_minimizer::{
+        DeduplicatedFailures, MinimalReproduction, MismatchSignature,
+    };
 
     fn test_config() -> Config {
         Config {
@@ -1115,6 +1393,127 @@ mod tests {
             generated_unix_ms: 1_700_000_000_000,
             skip_fixtures: true,
             skip_slt: true,
+        }
+    }
+
+    fn empty_run_report(
+        passed: usize,
+        diverged: usize,
+        divergent_cases: Vec<CaseResult>,
+    ) -> DifferentialRunReport {
+        DifferentialRunReport {
+            bead_id: BEAD_ID.to_owned(),
+            data_hash: "abc123".to_owned(),
+            base_seed: 424_242,
+            total_cases: passed + diverged,
+            passed,
+            diverged,
+            sampled_passing_cases: Vec::new(),
+            skipped: 0,
+            divergent_cases,
+            deduplicated: DeduplicatedFailures::default(),
+            coverage_summary: CoverageSummary::default(),
+        }
+    }
+
+    fn manifest_for_validation(
+        run_report: DifferentialRunReport,
+        first_failure: Option<FirstFailureReplay>,
+        sampled_passing_replays: Vec<SampledPassingReplay>,
+    ) -> DifferentialManifest {
+        let config = test_config();
+        let replay = build_replay_command(&config);
+
+        DifferentialManifest {
+            schema_version: 1,
+            bead_id: BEAD_ID.to_owned(),
+            run_id: config.run_id.clone(),
+            trace_id: config.trace_id.clone(),
+            scenario_id: config.scenario_id.clone(),
+            generated_unix_ms: config.generated_unix_ms,
+            commit_sha: "deadbeef".to_owned(),
+            root_seed: config.root_seed,
+            fixture_root_manifest_path: path_to_utf8(&config.fixture_root_manifest_path),
+            fixture_root_manifest_sha256: config.fixture_root_manifest_sha256.clone(),
+            fixture_json_files_seen: 0,
+            fixture_entries_ingested: 0,
+            fixture_sql_statements_ingested: 0,
+            min_fixture_json_files: config.min_fixture_json_files,
+            min_fixture_entries: config.min_fixture_entries,
+            min_fixture_sql_statements: config.min_fixture_sql_statements,
+            slt_files_seen: 0,
+            slt_entries_ingested: 0,
+            slt_sql_statements_ingested: 0,
+            min_slt_files: config.min_slt_files,
+            min_slt_entries: config.min_slt_entries,
+            min_slt_sql_statements: config.min_slt_sql_statements,
+            corpus_entries: 1,
+            overall_pass: run_report.diverged == 0,
+            run_report,
+            first_failure,
+            sampled_passing_replays,
+            replay: ReplayCommand { command: replay },
+        }
+    }
+
+    fn valid_first_failure(root_cause_domain: RootCauseDomain) -> FirstFailureReplay {
+        FirstFailureReplay {
+            case_id: "case-1".to_owned(),
+            transform_name: "identity".to_owned(),
+            divergence_source: "original".to_owned(),
+            statement_index: Some(0),
+            root_cause_domain,
+            remediation_playbook: RemediationPlaybook {
+                summary: "Start with the harness evidence".to_owned(),
+                next_commands: vec![
+                    "cargo run -p fsqlite-harness --bin differential_manifest_runner".to_owned(),
+                ],
+                evidence_json_pointer: "/run_report/divergent_cases/0".to_owned(),
+                owner_hint: "harness owners: inspect crates/fsqlite-harness first".to_owned(),
+            },
+            replay_command: "cargo run -p fsqlite-harness --bin differential_manifest_runner"
+                .to_owned(),
+            diagnostic_json_pointer: "/run_report/divergent_cases/0".to_owned(),
+            minimal_reproduction_json_pointer: None,
+            artifact_entries: replay_artifact_entries(),
+        }
+    }
+
+    fn minimal_reproduction(subsystem: Subsystem) -> MinimalReproduction {
+        MinimalReproduction {
+            schema_version: fsqlite_harness::mismatch_minimizer::MINIMIZER_SCHEMA_VERSION,
+            signature: MismatchSignature {
+                hash: "feedfacecafebeef".to_owned(),
+                classification: MismatchClassification::TrueDivergence {
+                    description: "pager page image mismatch".to_owned(),
+                },
+                subsystem,
+                minimal_statement_count: 1,
+                first_diverging_sql: "SELECT * FROM t".to_owned(),
+            },
+            original_seed: 7,
+            schema: vec!["CREATE TABLE t(x)".to_owned()],
+            minimal_workload: vec!["SELECT * FROM t".to_owned()],
+            original_workload_size: 4,
+            reduction_ratio: 0.75,
+            first_divergence_index: Some(0),
+            divergences: Vec::new(),
+            repro_command: "cargo run -p fsqlite-harness --bin replay -- --case case-1".to_owned(),
+        }
+    }
+
+    fn divergent_case_with_repro(subsystem: Subsystem) -> CaseResult {
+        CaseResult {
+            case_id: "case-1".to_owned(),
+            transform_name: "identity".to_owned(),
+            equivalence: EquivalenceExpectation::ExactRowMatch,
+            original_passed: false,
+            transformed_passed: true,
+            classification: Some(MismatchClassification::TrueDivergence {
+                description: "pager page image mismatch".to_owned(),
+            }),
+            minimal_reproduction: Some(minimal_reproduction(subsystem)),
+            divergence_source: Some(DivergenceSource::Original),
         }
     }
 
@@ -1152,6 +1551,66 @@ mod tests {
         let normalized = ensure_one_command(&replay, "replay.command")
             .expect("runner replay command should be one-line");
         assert_eq!(normalized, replay);
+    }
+
+    #[test]
+    fn first_failure_replay_classifies_minimized_storage_and_builds_playbook() {
+        let report = empty_run_report(0, 1, vec![divergent_case_with_repro(Subsystem::Wal)]);
+        let first_failure = first_failure_replay(&report, "cargo run -p fsqlite-harness")
+            .expect("first failure generation should succeed")
+            .expect("divergent case should produce first failure");
+
+        assert_eq!(first_failure.root_cause_domain, RootCauseDomain::Storage);
+        assert_eq!(
+            first_failure.minimal_reproduction_json_pointer.as_deref(),
+            Some("/run_report/divergent_cases/0/minimal_reproduction")
+        );
+        assert_eq!(
+            first_failure.replay_command,
+            "cargo run -p fsqlite-harness --bin replay -- --case case-1"
+        );
+        assert!(
+            first_failure
+                .remediation_playbook
+                .summary
+                .contains("signature=feedfacecafebeef")
+        );
+        assert!(
+            first_failure
+                .remediation_playbook
+                .next_commands
+                .iter()
+                .any(|command| command.contains("cargo test -p fsqlite-btree"))
+        );
+    }
+
+    #[test]
+    fn first_failure_replay_classifies_fixture_false_positive_without_repro() {
+        let divergent_case = CaseResult {
+            case_id: "fixture-case".to_owned(),
+            transform_name: "fixture-load".to_owned(),
+            equivalence: EquivalenceExpectation::ExactRowMatch,
+            original_passed: false,
+            transformed_passed: true,
+            classification: Some(MismatchClassification::FalsePositive {
+                reason: "fixture corpus is missing expected rows".to_owned(),
+            }),
+            minimal_reproduction: None,
+            divergence_source: Some(DivergenceSource::CrossVariant),
+        };
+        let report = empty_run_report(0, 1, vec![divergent_case]);
+        let first_failure = first_failure_replay(&report, "cargo run -p fsqlite-harness")
+            .expect("first failure generation should succeed")
+            .expect("divergent case should produce first failure");
+
+        assert_eq!(first_failure.root_cause_domain, RootCauseDomain::Fixture);
+        assert!(first_failure.minimal_reproduction_json_pointer.is_none());
+        assert!(
+            first_failure
+                .remediation_playbook
+                .owner_hint
+                .contains("fixture owners")
+        );
     }
 
     #[test]
@@ -1279,6 +1738,22 @@ mod tests {
     }
 
     #[test]
+    fn human_summary_contains_first_failure_explainer_and_playbook() {
+        let first_failure = valid_first_failure(RootCauseDomain::Planner);
+        let run_report = empty_run_report(0, 1, Vec::new());
+        let manifest = manifest_for_validation(run_report, Some(first_failure), Vec::new());
+
+        let human = build_human_summary(&manifest);
+
+        assert!(human.contains("first_failure_root_cause_domain: `planner`"));
+        assert!(human.contains("## First Failure Remediation"));
+        assert!(human.contains("summary: Start with the harness evidence"));
+        assert!(
+            human.contains("- `cargo run -p fsqlite-harness --bin differential_manifest_runner`")
+        );
+    }
+
+    #[test]
     fn validate_manifest_replay_contract_requires_samples_when_passed() {
         let config = test_config();
         let replay = build_replay_command(&config);
@@ -1333,6 +1808,19 @@ mod tests {
         let error = validate_manifest_replay_contract(&manifest)
             .expect_err("missing sampled passing replay contract should fail");
         assert!(error.contains("sampled_passing_replays"));
+    }
+
+    #[test]
+    fn validate_manifest_replay_contract_rejects_empty_playbook_command() {
+        let mut first_failure = valid_first_failure(RootCauseDomain::Harness);
+        first_failure.remediation_playbook.next_commands = vec![" ".to_owned()];
+        let run_report = empty_run_report(0, 1, Vec::new());
+        let manifest = manifest_for_validation(run_report, Some(first_failure), Vec::new());
+
+        let error = validate_manifest_replay_contract(&manifest)
+            .expect_err("empty remediation command should fail");
+
+        assert!(error.contains("first_failure.remediation_playbook.next_commands"));
     }
 
     #[test]

@@ -286,18 +286,25 @@ fn write_skew_handled_correctly() {
     assert_eq!(count1, "2");
     assert_eq!(count2, "2");
 
-    // Both see 2 on call, so both think it's safe to go off
+    // Both see 2 on call, so both think it's safe to go off.
+    // Under page-level MVCC, c2's UPDATE may get Busy if c1 is already
+    // holding the same page.
     c1.execute("UPDATE oncall SET on_duty = 0 WHERE id = 1;")
         .unwrap();
-    c2.execute("UPDATE oncall SET on_duty = 0 WHERE id = 2;")
-        .unwrap();
+    let c2_update = c2.execute("UPDATE oncall SET on_duty = 0 WHERE id = 2;");
 
-    let r1 = c1.execute("COMMIT");
-    let r2 = c2.execute("COMMIT");
+    let c1_committed = c1.execute("COMMIT").is_ok();
 
-    if r2.is_err() {
+    let c2_committed = if c2_update.is_err() {
         let _ = c2.execute("ROLLBACK");
-    }
+        false
+    } else {
+        let ok = c2.execute("COMMIT").is_ok();
+        if !ok {
+            let _ = c2.execute("ROLLBACK");
+        }
+        ok
+    };
 
     // Under SSI, at most one should succeed — if both succeed, that's
     // a write skew anomaly. We accept either outcome but verify the
@@ -307,10 +314,10 @@ fn write_skew_handled_correctly() {
     let on_duty_n: i64 = on_duty.parse().unwrap();
     assert!(
         on_duty_n >= 1,
-        "invariant violated: {} doctors on call (expected >= 1). r1={:?}, r2={:?}",
+        "invariant violated: {} doctors on call (expected >= 1). c1={}, c2={}",
         on_duty_n,
-        r1.is_ok(),
-        r2.is_ok()
+        c1_committed,
+        c2_committed
     );
 }
 

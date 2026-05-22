@@ -8038,8 +8038,12 @@ mod tests {
     #[test]
     fn lightweight_snapshot_total_accesses_and_hit_rate() {
         let snap = PageCacheLightweightSnapshot {
-            hits: 80, misses: 20, admits: 0, evictions: 0,
-            cached_pages: 0, pool_capacity: 0,
+            hits: 80,
+            misses: 20,
+            admits: 0,
+            evictions: 0,
+            cached_pages: 0,
+            pool_capacity: 0,
         };
         assert_eq!(snap.total_accesses(), 100);
         let rate = snap.hit_rate_percent();
@@ -8056,10 +8060,18 @@ mod tests {
         assert_eq!(def.total_accesses(), 0);
         assert!((def.hit_rate_percent() - 0.0).abs() < f64::EPSILON);
         let snap = PageCacheMetricsSnapshot {
-            hits: 90, misses: 10, admits: 5, evictions: 3,
-            cached_pages: 50, pool_capacity: 100,
-            dirty_ratio_pct: 25, t1_size: 30, t2_size: 20,
-            b1_size: 5, b2_size: 3, p_target: 40,
+            hits: 90,
+            misses: 10,
+            admits: 5,
+            evictions: 3,
+            cached_pages: 50,
+            pool_capacity: 100,
+            dirty_ratio_pct: 25,
+            t1_size: 30,
+            t2_size: 20,
+            b1_size: 5,
+            b2_size: 3,
+            p_target: 40,
             mvcc_multi_version_pages: 2,
         };
         assert_eq!(snap.total_accesses(), 100);
@@ -8080,7 +8092,10 @@ mod tests {
         };
         let copied = snap;
         assert_eq!(copied, snap);
-        let other = PageCachePageSnapshot { dirty: false, ..snap };
+        let other = PageCachePageSnapshot {
+            dirty: false,
+            ..snap
+        };
         assert_ne!(snap, other);
         let dbg = format!("{snap:?}");
         assert!(dbg.contains("PageCachePageSnapshot"));
@@ -8094,5 +8109,238 @@ mod tests {
         assert!(dbg.contains("Arbitrary"));
         let copied = def;
         assert_eq!(copied, def);
+    }
+
+    // ---------------------------------------------------------------
+    // bd-pm1zd Track F verification tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_flat_page_array_basic() {
+        let mut arr = FastPageArray::new();
+        let pool = PageBufPool::new(PageSize::DEFAULT, 8);
+        let p1 = PageNumber::ONE;
+        let p2 = PageNumber::new(2).unwrap();
+        let p3 = PageNumber::new(3).unwrap();
+
+        let mut b1 = pool.acquire().unwrap();
+        b1.as_mut_slice()[0] = 0x11;
+        arr.insert(p1, b1);
+
+        let mut b2 = pool.acquire().unwrap();
+        b2.as_mut_slice()[0] = 0x22;
+        arr.insert(p2, b2);
+
+        let mut b3 = pool.acquire().unwrap();
+        b3.as_mut_slice()[0] = 0x33;
+        arr.insert(p3, b3);
+
+        assert_eq!(arr.get(p1).map(|s| s[0]), Some(0x11));
+        assert_eq!(arr.get(p2).map(|s| s[0]), Some(0x22));
+        assert_eq!(arr.get(p3).map(|s| s[0]), Some(0x33));
+
+        arr.remove(p2);
+        assert!(arr.get(p2).is_none());
+        assert_eq!(arr.get(p1).map(|s| s[0]), Some(0x11));
+        assert_eq!(arr.get(p3).map(|s| s[0]), Some(0x33));
+    }
+
+    #[test]
+    fn test_flat_page_array_bounds() {
+        let mut arr = FastPageArray::new();
+        let pool = PageBufPool::new(PageSize::DEFAULT, 4);
+
+        let within = PageNumber::new(32).unwrap();
+        let mut bw = pool.acquire().unwrap();
+        bw.as_mut_slice()[0] = 0xAA;
+        arr.insert(within, bw);
+        assert_eq!(arr.get(within).map(|s| s[0]), Some(0xAA));
+
+        let beyond = PageNumber::new(33).unwrap();
+        let mut bb = pool.acquire().unwrap();
+        bb.as_mut_slice()[0] = 0xBB;
+        arr.insert(beyond, bb);
+        assert!(
+            arr.get(beyond).is_some(),
+            "FastPageArray should grow to accommodate pages beyond initial capacity"
+        );
+        assert_eq!(arr.get(beyond).map(|s| s[0]), Some(0xBB));
+    }
+
+    #[test]
+    fn test_single_connection_fast_path_bypasses_shards() {
+        let cache = ShardedPageCache::new_single_connection(PageSize::DEFAULT);
+        assert!(cache.is_fast_path_enabled());
+
+        let p1 = PageNumber::ONE;
+        let p2 = PageNumber::new(100).unwrap();
+        cache.insert_fresh(p1, |data| data[0] = 0x11).unwrap();
+        cache.insert_fresh(p2, |data| data[0] = 0x22).unwrap();
+
+        cache.with_page(p1, |data| assert_eq!(data[0], 0x11));
+        cache.with_page(p2, |data| assert_eq!(data[0], 0x22));
+
+        let shard_dist = cache.shard_distribution();
+        let total_in_shards: usize = shard_dist.iter().sum();
+        assert_eq!(
+            total_in_shards, 0,
+            "single-connection fast path should not populate overflow shards"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_page_reads_8_threads() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let cache = Arc::new(ShardedPageCache::new(PageSize::DEFAULT));
+        let page_count = 64_u32;
+        for i in 1..=page_count {
+            let pn = PageNumber::new(i).unwrap();
+            cache
+                .insert_fresh(pn, |data| {
+                    data[0] = (i & 0xFF) as u8;
+                    data[1] = ((i >> 8) & 0xFF) as u8;
+                })
+                .unwrap();
+        }
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let c = Arc::clone(&cache);
+                thread::spawn(move || {
+                    for round in 0..100 {
+                        for i in 1..=page_count {
+                            let pn = PageNumber::new(i).unwrap();
+                            c.with_page(pn, |data| {
+                                assert_eq!(
+                                    data[0],
+                                    (i & 0xFF) as u8,
+                                    "round={round} page={i} byte mismatch"
+                                );
+                            });
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("reader thread panicked");
+        }
+
+        let m = cache.metrics_snapshot();
+        assert!(
+            m.hits >= 8 * 100 * u64::from(page_count),
+            "expected at least {} hits, got {}",
+            8 * 100 * u64::from(page_count),
+            m.hits
+        );
+    }
+
+    #[test]
+    fn test_page_eviction_correctness() {
+        let cache = ShardedPageCache::with_max_buffers(PageSize::DEFAULT, 128);
+
+        let p1 = PageNumber::new(1).unwrap();
+        let p2 = PageNumber::new(2).unwrap();
+        let p3 = PageNumber::new(3).unwrap();
+
+        cache.insert_fresh(p1, |data| data.fill(0x11)).unwrap();
+        cache.insert_fresh(p2, |data| data.fill(0x22)).unwrap();
+        cache.insert_fresh(p3, |data| data.fill(0x33)).unwrap();
+
+        assert!(cache.evict(p2));
+        assert!(!cache.contains(p2));
+        assert!(cache.contains(p1));
+        assert!(cache.contains(p3));
+
+        cache.insert_fresh(p2, |data| data.fill(0xDD)).unwrap();
+
+        cache.with_page(p2, |data| {
+            assert!(
+                data.iter().all(|&b| b == 0xDD),
+                "re-loaded page should have new data, not stale evicted data"
+            );
+        });
+
+        cache.with_page(p1, |data| {
+            assert!(
+                data.iter().all(|&b| b == 0x11),
+                "untouched page should still have original data"
+            );
+        });
+        cache.with_page(p3, |data| {
+            assert!(
+                data.iter().all(|&b| b == 0x33),
+                "untouched page should still have original data"
+            );
+        });
+    }
+
+    #[test]
+    fn test_flat_slots_lock_free_miss() {
+        let cache = ShardedPageCache::new(PageSize::DEFAULT);
+        let absent = PageNumber::new(999).unwrap();
+
+        assert!(!cache.contains(absent));
+        assert!(cache.get(absent).is_none());
+        assert!(cache.with_page(absent, |_| ()).is_none());
+        assert!(cache.get_shared(absent).is_none());
+
+        let m = cache.metrics_snapshot();
+        assert!(m.misses >= 1, "cache miss on absent page should be tracked");
+    }
+
+    #[test]
+    fn test_flat_slots_concurrent_insert_and_read() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let cache = Arc::new(ShardedPageCache::new(PageSize::DEFAULT));
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+
+        let mut writer_handles: Vec<thread::JoinHandle<()>> = Vec::new();
+        let mut reader_handles: Vec<thread::JoinHandle<u64>> = Vec::new();
+
+        for tid in 0..2_u32 {
+            let c = Arc::clone(&cache);
+            let b = Arc::clone(&barrier);
+            writer_handles.push(thread::spawn(move || {
+                b.wait();
+                for i in 0..500 {
+                    let pn = PageNumber::new(tid * 10000 + i + 1).unwrap();
+                    c.insert_fresh(pn, |data| data[0] = (tid & 0xFF) as u8)
+                        .unwrap();
+                }
+            }));
+        }
+
+        for tid in 0..2_u32 {
+            let c = Arc::clone(&cache);
+            let b = Arc::clone(&barrier);
+            reader_handles.push(thread::spawn(move || {
+                b.wait();
+                let mut found = 0_u64;
+                for _ in 0..5 {
+                    for i in 0..500 {
+                        let pn = PageNumber::new(tid * 10000 + i + 1).unwrap();
+                        if c.with_page(pn, |_| ()).is_some() {
+                            found += 1;
+                        }
+                    }
+                }
+                found
+            }));
+        }
+
+        for h in writer_handles {
+            h.join().expect("writer thread panicked");
+        }
+        for h in reader_handles {
+            h.join().expect("reader thread panicked");
+        }
+
+        assert!(cache.len() >= 1000);
     }
 }

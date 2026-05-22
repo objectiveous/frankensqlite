@@ -1103,4 +1103,48 @@ mod tests {
         assert_eq!(result.frames_backfilled, 0);
         assert!(!result.wal_was_reset);
     }
+
+    #[test]
+    fn mid_checkpoint_crash_produces_partial_backfill() {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap();
+
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        populate_wal(&mut wal, &cx, 5);
+
+        let state = CheckpointState {
+            total_frames: 5,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+
+        crate::fault_hooks::arm_crash_boundary(
+            crate::fault_hooks::CrashBoundary::MidCheckpoint,
+            crate::fault_hooks::FaultHookArm::new(
+                "mid-ckpt-crash",
+                "CHECKPOINT-MID-CRASH",
+                "test_mid_checkpoint_crash",
+            ),
+        );
+
+        let mut target = RecordingTarget::new();
+        let err = execute_checkpoint(&cx, &mut wal, CheckpointMode::Passive, state, &mut target)
+            .expect_err("should fail at MidCheckpoint boundary after first page");
+
+        crate::fault_hooks::clear_crash_boundary();
+
+        assert!(
+            err.to_string().contains("fault_inject"),
+            "error identifies the fault hook: {err}"
+        );
+        assert_eq!(
+            target.pages.len(),
+            1,
+            "only the first page was written before the crash fired on page_idx=1"
+        );
+    }
 }

@@ -745,7 +745,7 @@ mod tests {
             write_ops: 7,
             ..MetricsSnapshot::default()
         };
-        let cloned = snap.clone();
+        let cloned = snap;
         assert_eq!(snap, cloned);
         let dbg = format!("{snap:?}");
         assert!(dbg.contains("MetricsSnapshot"));

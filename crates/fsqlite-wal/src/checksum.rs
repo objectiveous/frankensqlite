@@ -3118,4 +3118,85 @@ mod tests {
         let dbg = format!("{:?}", IntegrityCheckLevel::BtreeStructural);
         assert!(dbg.contains("BtreeStructural"));
     }
+
+    #[test]
+    fn recovery_action_all_variants_copy_eq_debug() {
+        let variants = [
+            RecoveryAction::AttemptWalFecRepair,
+            RecoveryAction::TruncateWalAtFirstInvalidFrame,
+            RecoveryAction::EvictCacheAndRetryFromWal,
+            RecoveryAction::ExcludeCorruptedSymbolAndContinue,
+            RecoveryAction::ReportPersistentCorruption,
+        ];
+        for (i, v) in variants.iter().enumerate() {
+            let copied = *v;
+            assert_eq!(copied, *v);
+            for (j, w) in variants.iter().enumerate() {
+                assert_eq!(i == j, v == w);
+            }
+        }
+        let dbg = format!("{:?}", RecoveryAction::AttemptWalFecRepair);
+        assert!(dbg.contains("AttemptWalFecRepair"));
+    }
+
+    #[test]
+    fn wal_recovery_decision_and_fec_repair_outcome_copy_eq() {
+        let d1 = WalRecoveryDecision::Repaired;
+        let d2 = WalRecoveryDecision::Truncated;
+        assert_eq!(d1, d1);
+        assert_ne!(d1, d2);
+        let copied = d1;
+        assert_eq!(copied, WalRecoveryDecision::Repaired);
+        assert!(format!("{d2:?}").contains("Truncated"));
+
+        let outcomes = [
+            WalFecRepairOutcome::Repaired,
+            WalFecRepairOutcome::InsufficientSymbols,
+            WalFecRepairOutcome::SourceHashMismatch,
+        ];
+        for (i, o) in outcomes.iter().enumerate() {
+            let copied = *o;
+            assert_eq!(copied, *o);
+            for (j, p) in outcomes.iter().enumerate() {
+                assert_eq!(i == j, o == p);
+            }
+        }
+        assert!(format!("{:?}", WalFecRepairOutcome::SourceHashMismatch).contains("SourceHashMismatch"));
+    }
+
+    #[test]
+    fn crash_model_contract_default_all_flags_set_and_accessors() {
+        let c = CrashModelContract::default();
+        assert!(c.crash_at_any_point());
+        assert!(c.fsync_is_durability_barrier());
+        assert!(c.writes_reorder_without_fsync());
+        assert!(c.bitrot_exists());
+        assert!(c.metadata_may_require_directory_fsync());
+        assert_eq!(c, crash_model_contract());
+
+        let empty = CrashModelContract { flags: 0 };
+        assert!(!empty.crash_at_any_point());
+        assert!(!empty.fsync_is_durability_barrier());
+        assert!(!empty.writes_reorder_without_fsync());
+        assert!(!empty.bitrot_exists());
+        assert!(!empty.metadata_may_require_directory_fsync());
+        assert_ne!(c, empty);
+        assert!(format!("{c:?}").contains("CrashModelContract"));
+    }
+
+    #[test]
+    fn sector_sizes_and_btree_page_types_constants() {
+        assert!(supports_torn_write_sector_size(512));
+        assert!(supports_torn_write_sector_size(1024));
+        assert!(supports_torn_write_sector_size(4096));
+        assert!(!supports_torn_write_sector_size(2048));
+        assert!(!supports_torn_write_sector_size(0));
+
+        assert!(is_valid_btree_page_type(0x02));
+        assert!(is_valid_btree_page_type(0x05));
+        assert!(is_valid_btree_page_type(0x0A));
+        assert!(is_valid_btree_page_type(0x0D));
+        assert!(!is_valid_btree_page_type(0x00));
+        assert!(!is_valid_btree_page_type(0xFF));
+    }
 }

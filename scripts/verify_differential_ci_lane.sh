@@ -94,6 +94,7 @@ SUMMARY_A="${RUN_A}/differential_manifest.md"
 SUMMARY_B="${RUN_B}/differential_manifest.md"
 RUN_A_LOG="${RUN_A}/differential_manifest_runner.log"
 RUN_B_LOG="${RUN_B}/differential_manifest_runner.log"
+REPORT_JSON="${RUN_ROOT}/differential_ci_lane_report.json"
 DOCTOR_DIR="${RUN_ROOT}/doctor"
 DOCTOR_JSON="${DOCTOR_DIR}/oracle_preflight_doctor.json"
 DOCTOR_MD="${DOCTOR_DIR}/oracle_preflight_doctor.md"
@@ -328,6 +329,81 @@ validate_manifest_runner_log_schema() {
     echo "ERROR: ${run_label} runner log has invalid first_failure_replay_present field: ${log_line}" >&2
     exit 1
   fi
+}
+
+validate_ci_report_schema() {
+  local report_path="$1"
+
+  jq -e \
+    --arg schema_version "fsqlite.differential-ci-lane.v1" \
+    --arg bead_id "${BEAD_ID}" \
+    --arg lane_id "${LANE_ID}" \
+    --arg run_id "${RUN_ID}" \
+    --arg trace_id "${TRACE_ID}" \
+    --arg scenario_id "${SCENARIO_ID}" \
+    --argjson root_seed "${ROOT_SEED}" \
+    --argjson generated_unix_ms "${GENERATED_UNIX_MS}" \
+    '
+      def one_line:
+        type == "string" and length > 0 and (contains("\n") | not) and (contains("\r") | not);
+      def sha256_hex:
+        type == "string" and test("^[0-9a-f]{64}$");
+      .schema_version == $schema_version and
+      .bead_id == $bead_id and
+      .lane.id == $lane_id and
+      .lane.mode == "warning" and
+      (.lane.outcome | IN("pass", "warn")) and
+      .run.run_id == $run_id and
+      .run.trace_id == $trace_id and
+      .run.scenario_id == $scenario_id and
+      .run.root_seed == $root_seed and
+      .run.generated_unix_ms == $generated_unix_ms and
+      (.run.doctor_certifying | type == "boolean") and
+      (.run.deterministic_match | type == "boolean") and
+      (.results.total_cases | type == "number" and . >= 0) and
+      (.results.passed_cases | type == "number" and . >= 0) and
+      (.results.diverged_cases | type == "number" and . >= 0) and
+      (.results.sampled_passing_replay_count | type == "number" and . >= 0) and
+      (.artifacts.manifest_a | one_line) and
+      (.artifacts.manifest_b | one_line) and
+      (.artifacts.summary_a | one_line) and
+      (.artifacts.summary_b | one_line) and
+      (.artifacts.runner_log_a | one_line) and
+      (.artifacts.runner_log_b | one_line) and
+      (.artifacts.doctor_json | one_line) and
+      (.artifacts.doctor_human | one_line) and
+      (.artifacts.doctor_log | one_line) and
+      (.artifacts.hashes.manifest_a_sha256 | sha256_hex) and
+      (.artifacts.hashes.manifest_b_sha256 | sha256_hex) and
+      (.artifacts.hashes.summary_a_sha256 | sha256_hex) and
+      (.artifacts.hashes.summary_b_sha256 | sha256_hex) and
+      (.artifacts.hashes.runner_log_a_sha256 | sha256_hex) and
+      (.artifacts.hashes.runner_log_b_sha256 | sha256_hex) and
+      (.artifacts.hashes.doctor_json_sha256 | sha256_hex) and
+      (.artifacts.hashes.doctor_human_sha256 | sha256_hex) and
+      (.artifacts.hashes.doctor_log_sha256 | sha256_hex) and
+      (.replay_command | one_line) and
+      (
+        (.results.diverged_cases == 0 and .first_failure == null) or
+        (
+          (.results.diverged_cases > 0) and
+          (.first_failure | type == "object") and
+          (.first_failure.replay_command | one_line) and
+          (.first_failure.root_cause_domain | IN("parser", "planner", "vdbe", "storage", "harness", "fixture")) and
+          (.first_failure.remediation_playbook.summary | one_line) and
+          (.first_failure.remediation_playbook.evidence_json_pointer | one_line) and
+          (.first_failure.remediation_playbook.owner_hint | one_line) and
+          (.first_failure.remediation_playbook.next_commands | type == "array" and length > 0) and
+          (all(.first_failure.remediation_playbook.next_commands[]; one_line)) and
+          (
+            (.first_failure.minimal_reproduction_json_pointer == null) or
+            (.first_failure.minimal_reproduction_json_pointer | one_line)
+          ) and
+          (.first_failure.artifact_entries | type == "array") and
+          (all(.first_failure.artifact_entries[]; one_line))
+        )
+      )
+    ' "${report_path}" >/dev/null
 }
 
 run_doctor() {
@@ -664,7 +740,9 @@ if ${JSON_OUTPUT}; then
           artifact_entries: $first_failure_artifact_entries
         } end
       }
-    '
+    ' >"${REPORT_JSON}"
+  validate_ci_report_schema "${REPORT_JSON}"
+  cat "${REPORT_JSON}"
 else
   echo "=== Differential CI Lane Verification (${BEAD_ID}) ==="
   echo "Lane:                 ${LANE_ID} (warning mode)"

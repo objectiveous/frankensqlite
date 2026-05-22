@@ -607,6 +607,21 @@ fn ensure_one_command(command: &str, field_name: &str) -> Result<String, String>
         .ok_or_else(|| format!("{field_name}: must be non-empty, single-line command"))
 }
 
+fn ensure_artifact_entries(entries: &[String], field_name: &str) -> Result<(), String> {
+    if entries.is_empty() {
+        return Err(format!("{field_name} must be non-empty"));
+    }
+    if entries
+        .iter()
+        .any(|entry| normalize_one_command(entry).is_none())
+    {
+        return Err(format!(
+            "{field_name} must contain non-empty, single-line values"
+        ));
+    }
+    Ok(())
+}
+
 fn replay_artifact_entries() -> Vec<String> {
     vec![
         MANIFEST_JSON_ARTIFACT_ENTRY.to_owned(),
@@ -967,16 +982,10 @@ fn validate_manifest_replay_contract(manifest: &DifferentialManifest) -> Result<
         if first_failure.diagnostic_json_pointer.trim().is_empty() {
             return Err("first_failure.diagnostic_json_pointer must be non-empty".to_owned());
         }
-        if first_failure.artifact_entries.is_empty() {
-            return Err("first_failure.artifact_entries must be non-empty".to_owned());
-        }
-        if first_failure
-            .artifact_entries
-            .iter()
-            .any(|entry| entry.trim().is_empty())
-        {
-            return Err("first_failure.artifact_entries contains empty value".to_owned());
-        }
+        ensure_artifact_entries(
+            &first_failure.artifact_entries,
+            "first_failure.artifact_entries",
+        )?;
     }
 
     for sample in &manifest.sampled_passing_replays {
@@ -986,13 +995,10 @@ fn validate_manifest_replay_contract(manifest: &DifferentialManifest) -> Result<
                 "sampled_passing_replay.diagnostic_json_pointer must be non-empty".to_owned(),
             );
         }
-        if sample
-            .artifact_entries
-            .iter()
-            .any(|entry| entry.trim().is_empty())
-        {
-            return Err("sampled_passing_replay.artifact_entries contains empty value".to_owned());
-        }
+        ensure_artifact_entries(
+            &sample.artifact_entries,
+            "sampled_passing_replay.artifact_entries",
+        )?;
     }
 
     Ok(())
@@ -1558,6 +1564,18 @@ mod tests {
         }
     }
 
+    fn valid_sampled_passing_replay() -> SampledPassingReplay {
+        SampledPassingReplay {
+            case_id: "case-pass-1".to_owned(),
+            transform_name: "identity".to_owned(),
+            seed: 11,
+            replay_command: "cargo run -p fsqlite-harness --bin differential_manifest_runner"
+                .to_owned(),
+            diagnostic_json_pointer: "/run_report/sampled_passing_cases/0".to_owned(),
+            artifact_entries: replay_artifact_entries(),
+        }
+    }
+
     fn minimal_reproduction(subsystem: Subsystem) -> MinimalReproduction {
         MinimalReproduction {
             schema_version: fsqlite_harness::mismatch_minimizer::MINIMIZER_SCHEMA_VERSION,
@@ -2119,6 +2137,45 @@ mod tests {
             .expect_err("missing first-failure artifacts should fail");
 
         assert!(error.contains("first_failure.artifact_entries"));
+    }
+
+    #[test]
+    fn validate_manifest_replay_contract_rejects_multiline_first_failure_artifacts() {
+        let mut first_failure = valid_first_failure(RootCauseDomain::Harness);
+        first_failure.artifact_entries = vec!["manifest\nsummary".to_owned()];
+        let run_report = empty_run_report(0, 1, Vec::new());
+        let manifest = manifest_for_validation(run_report, Some(first_failure), Vec::new());
+
+        let error = validate_manifest_replay_contract(&manifest)
+            .expect_err("multiline first-failure artifact should fail");
+
+        assert!(error.contains("first_failure.artifact_entries"));
+    }
+
+    #[test]
+    fn validate_manifest_replay_contract_rejects_empty_sampled_passing_artifacts() {
+        let mut sample = valid_sampled_passing_replay();
+        sample.artifact_entries.clear();
+        let run_report = empty_run_report(1, 0, Vec::new());
+        let manifest = manifest_for_validation(run_report, None, vec![sample]);
+
+        let error = validate_manifest_replay_contract(&manifest)
+            .expect_err("missing sampled passing artifacts should fail");
+
+        assert!(error.contains("sampled_passing_replay.artifact_entries"));
+    }
+
+    #[test]
+    fn validate_manifest_replay_contract_rejects_multiline_sampled_passing_artifacts() {
+        let mut sample = valid_sampled_passing_replay();
+        sample.artifact_entries = vec!["manifest\nsummary".to_owned()];
+        let run_report = empty_run_report(1, 0, Vec::new());
+        let manifest = manifest_for_validation(run_report, None, vec![sample]);
+
+        let error = validate_manifest_replay_contract(&manifest)
+            .expect_err("multiline sampled passing artifact should fail");
+
+        assert!(error.contains("sampled_passing_replay.artifact_entries"));
     }
 
     #[test]

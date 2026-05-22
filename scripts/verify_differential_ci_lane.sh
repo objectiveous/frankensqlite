@@ -364,6 +364,23 @@ validate_ci_report_schema() {
       (.results.passed_cases | type == "number" and . >= 0) and
       (.results.diverged_cases | type == "number" and . >= 0) and
       (.results.sampled_passing_replay_count | type == "number" and . >= 0) and
+      (.sampled_passing_replays | type == "array") and
+      ((.sampled_passing_replays | length) == .results.sampled_passing_replay_count) and
+      (
+        (.results.passed_cases == 0 and .results.sampled_passing_replay_count == 0) or
+        (.results.passed_cases > 0 and .results.sampled_passing_replay_count > 0)
+      ) and
+      (
+        all(.sampled_passing_replays[];
+          (.case_id | one_line) and
+          (.transform_name | one_line) and
+          (.seed | type == "number" and . >= 0) and
+          (.replay_command | one_line) and
+          (.diagnostic_json_pointer | one_line) and
+          (.artifact_entries | type == "array" and length > 0) and
+          (all(.artifact_entries[]; one_line))
+        )
+      ) and
       (.artifacts.manifest_a | one_line) and
       (.artifacts.manifest_b | one_line) and
       (.artifacts.summary_a | one_line) and
@@ -508,6 +525,22 @@ jq -e \
     (.run_report.diverged >= 0) and
     (.run_report.deduplicated.total_before_dedup >= 0) and
     (.replay.command | type == "string" and length > 0 and (contains("\n") | not) and (contains("\r") | not)) and
+    (.sampled_passing_replays | type == "array") and
+    (
+      (.run_report.passed == 0 and (.sampled_passing_replays | length) == 0) or
+      (.run_report.passed > 0 and (.sampled_passing_replays | length) > 0)
+    ) and
+    (
+      all(.sampled_passing_replays[];
+        (.case_id | type == "string" and length > 0) and
+        (.transform_name | type == "string" and length > 0) and
+        (.seed | type == "number" and . >= 0) and
+        (.replay_command | type == "string" and length > 0 and (contains("\n") | not) and (contains("\r") | not)) and
+        (.diagnostic_json_pointer | type == "string" and length > 0) and
+        (.artifact_entries | type == "array" and length > 0) and
+        (all(.artifact_entries[]; type == "string" and length > 0 and (contains("\n") | not) and (contains("\r") | not)))
+      )
+    ) and
     (
       (.run_report.diverged == 0) or
       (
@@ -577,6 +610,7 @@ SAMPLED_PASSING_REPLAY_COUNT="$(
     'if has("sampled_passing_replays") then (.sampled_passing_replays | length) else 0 end' \
     "${MANIFEST_A}"
 )"
+SAMPLED_PASSING_REPLAYS="$(jq -c '.sampled_passing_replays // []' "${MANIFEST_A}")"
 TOTAL_CASES="$(jq -r '.run_report.total_cases' "${MANIFEST_A}")"
 PASSED_CASES="$(jq -r '.run_report.passed' "${MANIFEST_A}")"
 DIVERGED_CASES="$(jq -r '.run_report.diverged' "${MANIFEST_A}")"
@@ -649,6 +683,7 @@ write_ci_report_json() {
     --arg first_failure_minimal_repro_pointer "${FIRST_FAILURE_MINIMAL_REPRO_POINTER}" \
     --argjson first_failure_artifact_entries "${FIRST_FAILURE_ARTIFACT_ENTRIES}" \
     --argjson sampled_passing_replay_count "${SAMPLED_PASSING_REPLAY_COUNT}" \
+    --argjson sampled_passing_replays "${SAMPLED_PASSING_REPLAYS}" \
     --arg mismatch_class_counts "${MISMATCH_CLASS_COUNTS}" \
     --arg manifest_a "${MANIFEST_A#"${WORKSPACE_ROOT}"/}" \
     --arg manifest_b "${MANIFEST_B#"${WORKSPACE_ROOT}"/}" \
@@ -729,6 +764,7 @@ write_ci_report_json() {
           }
         },
         replay_command: $replay_command,
+        sampled_passing_replays: $sampled_passing_replays,
         first_failure_replay_command: $first_failure_replay_command,
         first_failure: if $diverged_cases == 0 then null else {
           replay_command: $first_failure_replay_command,
@@ -780,6 +816,16 @@ else
   echo "Dedup total:          ${DEDUP_TOTAL_COUNT}"
   echo "Mismatch classes:     ${MISMATCH_CLASS_COUNTS}"
   echo "Sampled pass replays: ${SAMPLED_PASSING_REPLAY_COUNT}"
+  if [[ "${SAMPLED_PASSING_REPLAY_COUNT}" != "0" ]]; then
+    echo "Sampled passing replay commands:"
+    jq -r \
+      '.[] | "  - " + .diagnostic_json_pointer + ": " + .replay_command' \
+      <<<"${SAMPLED_PASSING_REPLAYS}"
+    echo "Sampled passing artifact entries:"
+    jq -r \
+      '.[] | "  - " + .diagnostic_json_pointer + ": " + (.artifact_entries | join(", "))' \
+      <<<"${SAMPLED_PASSING_REPLAYS}"
+  fi
   echo "Manifest A:           ${MANIFEST_A#"${WORKSPACE_ROOT}"/}"
   echo "Manifest B:           ${MANIFEST_B#"${WORKSPACE_ROOT}"/}"
   echo "Runner log A:         ${RUN_A_LOG#"${WORKSPACE_ROOT}"/}"

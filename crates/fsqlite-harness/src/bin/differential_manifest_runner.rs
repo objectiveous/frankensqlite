@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -456,6 +456,14 @@ struct DifferentialManifest {
     first_failure: Option<FirstFailureReplay>,
     sampled_passing_replays: Vec<SampledPassingReplay>,
     replay: ReplayCommand,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FirstFailureLogFields<'a> {
+    root_cause_domain: &'a str,
+    diagnostic_json_pointer: &'a str,
+    replay_present: bool,
+    artifact_entries: usize,
 }
 
 fn print_help() {
@@ -1138,7 +1146,54 @@ first_failure_root_cause_domain: `{}`\n\n\
     )
 }
 
+fn first_failure_log_fields(manifest: &DifferentialManifest) -> FirstFailureLogFields<'_> {
+    manifest.first_failure.as_ref().map_or(
+        FirstFailureLogFields {
+            root_cause_domain: "none",
+            diagnostic_json_pointer: "none",
+            replay_present: false,
+            artifact_entries: 0,
+        },
+        |failure| FirstFailureLogFields {
+            root_cause_domain: failure.root_cause_domain.as_str(),
+            diagnostic_json_pointer: failure.diagnostic_json_pointer.as_str(),
+            replay_present: !failure.replay_command.trim().is_empty(),
+            artifact_entries: failure.artifact_entries.len(),
+        },
+    )
+}
+
+fn outcome_label(overall_pass: bool) -> &'static str {
+    if overall_pass { "pass" } else { "warn" }
+}
+
+fn differential_manifest_written_log_line(
+    output_json: &Path,
+    manifest: &DifferentialManifest,
+    elapsed_ms: u128,
+) -> String {
+    let first_failure_log = first_failure_log_fields(manifest);
+    format!(
+        "INFO differential_manifest_written path={} run_id={} trace_id={} scenario_id={} seed={} elapsed_ms={} outcome={} diverged={} total_cases={} data_hash={} first_failure_domain={} first_failure_pointer={} first_failure_replay_present={} first_failure_artifact_entries={}",
+        output_json.display(),
+        manifest.run_id,
+        manifest.trace_id,
+        manifest.scenario_id,
+        manifest.root_seed,
+        elapsed_ms,
+        outcome_label(manifest.overall_pass),
+        manifest.run_report.diverged,
+        manifest.run_report.total_cases,
+        manifest.run_report.data_hash,
+        first_failure_log.root_cause_domain,
+        first_failure_log.diagnostic_json_pointer,
+        first_failure_log.replay_present,
+        first_failure_log.artifact_entries,
+    )
+}
+
 fn run() -> Result<bool, String> {
+    let run_started = Instant::now();
     let config = Config::parse()?;
 
     let mut builder = CorpusBuilder::new(config.root_seed);
@@ -1246,12 +1301,10 @@ fn run() -> Result<bool, String> {
     write_text(&config.output_human, &human)?;
     maybe_stream_rch_artifacts(&json, &human);
 
+    let run_elapsed_ms = run_started.elapsed().as_millis();
     println!(
-        "INFO differential_manifest_written path={} diverged={} total_cases={} data_hash={}",
-        config.output_json.display(),
-        manifest.run_report.diverged,
-        manifest.run_report.total_cases,
-        manifest.run_report.data_hash,
+        "{}",
+        differential_manifest_written_log_line(&config.output_json, &manifest, run_elapsed_ms)
     );
     println!(
         "INFO differential_manifest_summary_written path={}",
@@ -1770,6 +1823,66 @@ mod tests {
         assert!(
             human.contains("- `cargo run -p fsqlite-harness --bin differential_manifest_runner`")
         );
+    }
+
+    #[test]
+    fn first_failure_log_fields_report_absence_explicitly() {
+        let run_report = empty_run_report(0, 0, Vec::new());
+        let manifest = manifest_for_validation(run_report, None, Vec::new());
+
+        let fields = first_failure_log_fields(&manifest);
+
+        assert_eq!(
+            fields,
+            FirstFailureLogFields {
+                root_cause_domain: "none",
+                diagnostic_json_pointer: "none",
+                replay_present: false,
+                artifact_entries: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn first_failure_log_fields_surface_diagnostics() {
+        let first_failure = valid_first_failure(RootCauseDomain::Parser);
+        let run_report = empty_run_report(0, 1, Vec::new());
+        let manifest = manifest_for_validation(run_report, Some(first_failure), Vec::new());
+
+        let fields = first_failure_log_fields(&manifest);
+
+        assert_eq!(fields.root_cause_domain, "parser");
+        assert_eq!(
+            fields.diagnostic_json_pointer,
+            "/run_report/divergent_cases/0"
+        );
+        assert!(fields.replay_present);
+        assert_eq!(fields.artifact_entries, 2);
+    }
+
+    #[test]
+    fn manifest_written_log_line_contains_ci_schema_fields() {
+        let first_failure = valid_first_failure(RootCauseDomain::Parser);
+        let run_report = empty_run_report(0, 1, Vec::new());
+        let manifest = manifest_for_validation(run_report, Some(first_failure), Vec::new());
+
+        let line = differential_manifest_written_log_line(
+            Path::new("artifacts/differential-manifest/differential_manifest.json"),
+            &manifest,
+            123,
+        );
+
+        assert!(line.starts_with("INFO differential_manifest_written "));
+        assert!(line.contains("run_id=bd-mblr.7.1.2-test-run"));
+        assert!(line.contains("trace_id=trace-test"));
+        assert!(line.contains("scenario_id=DIFF-712"));
+        assert!(line.contains("seed=424242"));
+        assert!(line.contains("elapsed_ms=123"));
+        assert!(line.contains("outcome=warn"));
+        assert!(line.contains("first_failure_domain=parser"));
+        assert!(line.contains("first_failure_pointer=/run_report/divergent_cases/0"));
+        assert!(line.contains("first_failure_replay_present=true"));
+        assert!(line.contains("first_failure_artifact_entries=2"));
     }
 
     #[test]

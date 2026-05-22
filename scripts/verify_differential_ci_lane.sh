@@ -283,6 +283,48 @@ hydrate_marked_artifact() {
     "${log_path}" >"${output_path}"
 }
 
+validate_manifest_runner_log_schema() {
+  local log_path="$1"
+  local run_label="$2"
+  local log_line
+
+  log_line="$(grep -E '^INFO differential_manifest_written ' "${log_path}" | tail -n 1 || true)"
+  if [[ -z "${log_line}" ]]; then
+    echo "ERROR: ${run_label} runner log is missing differential_manifest_written structured line: ${log_path}" >&2
+    exit 1
+  fi
+
+  for required_field in \
+    "run_id=${RUN_ID}" \
+    "trace_id=${TRACE_ID}" \
+    "scenario_id=${SCENARIO_ID}" \
+    "seed=${ROOT_SEED}" \
+    "first_failure_pointer=" \
+    "first_failure_artifact_entries="; do
+    if [[ "${log_line}" != *"${required_field}"* ]]; then
+      echo "ERROR: ${run_label} runner log missing required field ${required_field}: ${log_line}" >&2
+      exit 1
+    fi
+  done
+
+  if [[ ! "${log_line}" =~ elapsed_ms=[0-9]+ ]]; then
+    echo "ERROR: ${run_label} runner log has invalid elapsed_ms field: ${log_line}" >&2
+    exit 1
+  fi
+  if [[ ! "${log_line}" =~ outcome=(pass|warn) ]]; then
+    echo "ERROR: ${run_label} runner log has invalid outcome field: ${log_line}" >&2
+    exit 1
+  fi
+  if [[ ! "${log_line}" =~ first_failure_domain=(none|parser|planner|vdbe|storage|harness|fixture) ]]; then
+    echo "ERROR: ${run_label} runner log has invalid first_failure_domain field: ${log_line}" >&2
+    exit 1
+  fi
+  if [[ ! "${log_line}" =~ first_failure_replay_present=(true|false) ]]; then
+    echo "ERROR: ${run_label} runner log has invalid first_failure_replay_present field: ${log_line}" >&2
+    exit 1
+  fi
+}
+
 run_doctor() {
   local doctor_status
 
@@ -359,6 +401,9 @@ if [[ ! -s "${SUMMARY_A}" || ! -s "${SUMMARY_B}" ]]; then
   echo "ERROR: differential human summary output missing" >&2
   exit 1
 fi
+
+validate_manifest_runner_log_schema "${RUN_A_LOG}" "run-a"
+validate_manifest_runner_log_schema "${RUN_B_LOG}" "run-b"
 
 jq -e \
   --arg run_id "${RUN_ID}" \

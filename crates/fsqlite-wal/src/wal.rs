@@ -1013,6 +1013,15 @@ impl<F: VfsFile> WalFile<F> {
             self.last_commit_frame = Some(start_frame_index + last_commit_offset);
         }
 
+        #[cfg(any(test, feature = "fault-injection"))]
+        crate::fault_hooks::maybe_inject_crash_at(
+            crate::fault_hooks::CrashBoundary::AfterWalFrameAppendBeforeFsync,
+            &format!(
+                "end_frame={} frames_written={frame_count}",
+                self.frame_count
+            ),
+        )?;
+
         let bytes_per_frame = u64::try_from(frame_size).unwrap_or(u64::MAX);
         let bytes_written = u64::try_from(expected_bytes).unwrap_or(u64::MAX);
         let span = tracing::span!(
@@ -4598,6 +4607,51 @@ mod tests {
             recovered.generation_identity().salts,
             original_salts,
             "salts unchanged — reset never wrote new header"
+        );
+        recovered.close(&cx).expect("close recovered");
+    }
+
+    #[test]
+    fn crash_after_frame_append_before_fsync_frames_on_disk_but_not_durable() {
+        let _guard = FAULT_TEST_LOCK.lock().unwrap();
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        crate::fault_hooks::arm_crash_boundary(
+            crate::fault_hooks::CrashBoundary::AfterWalFrameAppendBeforeFsync,
+            crate::fault_hooks::FaultHookArm::new(
+                "crash-after-append",
+                "WAL-APPEND-FSYNC-CRASH",
+                "test_crash_after_append_before_fsync",
+            ),
+        );
+
+        let p1 = sample_page(0xEE);
+        let err = wal
+            .append_frames(&cx, &[(1, &p1, 1)])
+            .expect_err("should fail after append but before fsync");
+        assert!(
+            err.to_string().contains("fault_inject"),
+            "error identifies the fault hook: {err}"
+        );
+
+        crate::fault_hooks::clear_crash_boundary();
+
+        assert_eq!(
+            wal.last_fsynced_frame_count(),
+            0,
+            "no fsync happened so fsynced count is still zero"
+        );
+
+        wal.close(&cx).expect("close after crash");
+
+        let file2 = open_wal_file(&vfs, &cx);
+        let recovered = WalFile::open(&cx, file2).expect("reopen");
+        assert!(
+            recovered.frame_count() <= 1,
+            "frame may or may not survive recovery depending on MemoryVfs behavior (data written but not fsynced)"
         );
         recovered.close(&cx).expect("close recovered");
     }

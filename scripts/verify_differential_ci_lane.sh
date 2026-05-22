@@ -610,7 +610,7 @@ PROMOTION_CRITERIA=(
   "mismatch class trends triaged with owners and replay artifacts attached"
 )
 
-if ${JSON_OUTPUT}; then
+write_ci_report_json() {
   jq -n \
     --arg schema_version "fsqlite.differential-ci-lane.v1" \
     --arg bead_id "${BEAD_ID}" \
@@ -741,7 +741,13 @@ if ${JSON_OUTPUT}; then
         } end
       }
     ' >"${REPORT_JSON}"
-  validate_ci_report_schema "${REPORT_JSON}"
+}
+
+write_ci_report_json
+validate_ci_report_schema "${REPORT_JSON}"
+REPORT_JSON_SHA256="$(sha256_file "${REPORT_JSON}")"
+
+if ${JSON_OUTPUT}; then
   cat "${REPORT_JSON}"
 else
   echo "=== Differential CI Lane Verification (${BEAD_ID}) ==="
@@ -783,6 +789,8 @@ else
   echo "Doctor JSON sha256:   ${DOCTOR_JSON_SHA256}"
   echo "Doctor human sha256:  ${DOCTOR_HUMAN_SHA256}"
   echo "Doctor log sha256:    ${DOCTOR_LOG_SHA256}"
+  echo "CI report:            ${REPORT_JSON#"${WORKSPACE_ROOT}"/}"
+  echo "CI report sha256:     ${REPORT_JSON_SHA256}"
   echo "Promotion criteria:"
   for criterion in "${PROMOTION_CRITERIA[@]}"; do
     echo "  - ${criterion}"

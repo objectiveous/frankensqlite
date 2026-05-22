@@ -268,16 +268,17 @@ hydrate_marked_artifact() {
   local end_marker="$3"
   local output_path="$4"
 
-  if [[ -s "${output_path}" ]]; then
-    return 0
-  fi
-
   awk \
     -v begin_marker="${begin_marker}" \
     -v end_marker="${end_marker}" \
     '
       $0 == begin_marker { capture = 1; found = 1; next }
       $0 == end_marker { capture = 0; next }
+      # The manifest runner returns exit 1 for accepted warning-mode divergences.
+      # stderr is merged into the rch log, so the final warning line can arrive
+      # before buffered stdout finishes and would otherwise corrupt the streamed
+      # JSON artifact.
+      capture && $0 == "ERROR differential_manifest_runner overall_pass=false" { next }
       capture { print }
       END { exit found ? 0 : 1 }
     ' \

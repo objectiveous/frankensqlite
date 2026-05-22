@@ -232,11 +232,13 @@ jobs:
 
   parity-status-report-gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       RUST_BACKTRACE: "1"
       CARGO_TERM_COLOR: always
       FSQLITE_DISABLE_RCH: "1"
+      FSQLITE_PARITY_STATUS_INPUT_MODE: live-differential-ci
+      FSQLITE_PARITY_STATUS_DIFF_CI_LANE: smoke
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -266,6 +268,9 @@ jobs:
               "- run_id: `\(.run_id)`",
               "- trace_id: `\(.trace_id)`",
               "- scenario_id: `\(.scenario_id)`",
+              "- input_mode: `\(.input_mode)`",
+              "- differential_ci_lane: `\(.differential_ci_lane)`",
+              "- differential_manifest_json: `\(.artifacts.differential_manifest_json)`",
               "- report_json: `\(.artifacts.report_json)`",
               "- report_json_sha256: `\(.artifacts.report_json_sha256)`",
               "- report_markdown: `\(.artifacts.report_markdown)`",
@@ -283,6 +288,7 @@ jobs:
           name: parity-status-report-artifacts
           path: |
             artifacts/parity-status-report-ci/
+            artifacts/differential-ci/
             artifacts/bd-2yqp6.7.5/
           retention-days: 21
 

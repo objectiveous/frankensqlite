@@ -23,6 +23,9 @@ SUMMARY_JSON="${ARTIFACT_DIR}/verification_summary.json"
 RUNNER_TARGET_DIR="${REPO_ROOT}/.rch-target-parity-status-${RUN_ID}"
 RUNNER_BIN="${RUNNER_TARGET_DIR}/debug/parity_status_report_runner"
 JSON_OUTPUT=false
+INPUT_MODE="${FSQLITE_PARITY_STATUS_INPUT_MODE:-live-differential-ci}"
+DIFF_CI_LANE="${FSQLITE_PARITY_STATUS_DIFF_CI_LANE:-smoke}"
+DIFF_CI_REPORT_JSON=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -30,12 +33,46 @@ while [[ $# -gt 0 ]]; do
       JSON_OUTPUT=true
       shift
       ;;
+    --synthetic-inputs)
+      INPUT_MODE="synthetic"
+      shift
+      ;;
+    --live-differential-ci)
+      INPUT_MODE="live-differential-ci"
+      shift
+      ;;
+    --differential-ci-lane)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --differential-ci-lane requires a value" >&2
+        exit 2
+      fi
+      DIFF_CI_LANE="$2"
+      shift 2
+      ;;
     *)
       echo "ERROR: unknown argument: $1" >&2
       exit 2
       ;;
   esac
 done
+
+case "${INPUT_MODE}" in
+  live-differential-ci | synthetic)
+    ;;
+  *)
+    echo "ERROR: input mode must be live-differential-ci or synthetic: ${INPUT_MODE}" >&2
+    exit 2
+    ;;
+esac
+
+case "${DIFF_CI_LANE}" in
+  smoke | expanded)
+    ;;
+  *)
+    echo "ERROR: --differential-ci-lane must be smoke or expanded: ${DIFF_CI_LANE}" >&2
+    exit 2
+    ;;
+esac
 
 mkdir -p "${ARTIFACT_DIR}"
 
@@ -101,7 +138,8 @@ resolve_runner_binary() {
     | cut -d' ' -f2-
 }
 
-cat > "${PREFLIGHT_JSON}" <<EOF_PREFLIGHT
+write_synthetic_inputs() {
+  cat > "${PREFLIGHT_JSON}" <<EOF_PREFLIGHT
 {
   "schema_version": "1.0.0",
   "bead_id": "bd-2yqp6.2.5",
@@ -135,7 +173,7 @@ cat > "${PREFLIGHT_JSON}" <<EOF_PREFLIGHT
 }
 EOF_PREFLIGHT
 
-cat > "${DIFFERENTIAL_JSON}" <<EOF_DIFF
+  cat > "${DIFFERENTIAL_JSON}" <<EOF_DIFF
 {
   "schema_version": 1,
   "bead_id": "bd-mblr.7.1.2",
@@ -179,9 +217,50 @@ cat > "${DIFFERENTIAL_JSON}" <<EOF_DIFF
   }
 }
 EOF_DIFF
+}
+
+prepare_live_differential_ci_inputs() {
+  local lane_root="${REPO_ROOT}/artifacts/differential-ci/${DIFF_CI_LANE}"
+  local lane_env=()
+
+  PREFLIGHT_JSON="${lane_root}/doctor/oracle_preflight_doctor.json"
+  DIFFERENTIAL_JSON="${lane_root}/run-a/differential_manifest.json"
+  DIFF_CI_REPORT_JSON="${lane_root}/differential_ci_lane_report.json"
+
+  if command -v rch >/dev/null 2>&1 && [[ "${FSQLITE_DISABLE_RCH:-0}" != "1" ]]; then
+    lane_env=(DIFF_LANE_FORCE_RCH=1)
+  fi
+
+  if ! run_gate "differential_ci_${DIFF_CI_LANE}_lane" \
+    env "${lane_env[@]}" bash "${REPO_ROOT}/scripts/verify_differential_ci_lane.sh" \
+      --lane "${DIFF_CI_LANE}" \
+      --json \
+      --seed "${SEED}" \
+      --generated-unix-ms "${GENERATED_UNIX_MS}"; then
+    return 1
+  fi
+
+  for required_artifact in "${PREFLIGHT_JSON}" "${DIFFERENTIAL_JSON}" "${DIFF_CI_REPORT_JSON}"; do
+    if [[ ! -s "${required_artifact}" ]]; then
+      echo "ERROR: live differential CI artifact missing: ${required_artifact}" >&2
+      return 1
+    fi
+  done
+}
 
 RESULT="pass"
 emit_event "bootstrap" "start" "running" "verification started"
+
+case "${INPUT_MODE}" in
+  live-differential-ci)
+    if ! prepare_live_differential_ci_inputs; then
+      RESULT="fail"
+    fi
+    ;;
+  synthetic)
+    write_synthetic_inputs
+    ;;
+esac
 
 if ! run_gate "parity_status_unit_tests" \
   run_cargo cargo test --manifest-path crates/fsqlite-harness/Cargo.toml --lib parity_status_report -- --nocapture; then
@@ -213,6 +292,8 @@ if ! run_gate "parity_status_json_contract" \
   jq -e \
     --arg schema_version "fsqlite.parity_status_report.v1" \
     --arg bead_id "${BEAD_ID}" \
+    --arg input_mode "${INPUT_MODE}" \
+    --arg differential_json "${DIFFERENTIAL_JSON}" \
     '
       .schema_version == $schema_version and
       .bead_id == $bead_id and
@@ -220,19 +301,35 @@ if ! run_gate "parity_status_json_contract" \
       (.features | type == "array" and length > 0) and
       .evidence_freshness.overall_fresh == true and
       .oracle_preflight.present == true and
-      .oracle_preflight.certifying == true and
+      (.oracle_preflight.outcome | IN("green", "yellow")) and
+      (.oracle_preflight.certifying | type == "boolean") and
       .current_frontier.present == true and
-      .current_frontier.divergent_cases == 1 and
-      (.current_frontier.first_failure.root_cause_domain == "planner") and
-      (.current_frontier.first_failure.remediation_playbook.next_commands | length) > 0 and
+      .current_frontier.total_cases >= .current_frontier.passed_cases and
+      .current_frontier.divergent_cases >= 0 and
+      .current_frontier.sampled_passing_replay_count >= 0 and
+      (
+        (
+          .current_frontier.divergent_cases == 0 and
+          .current_frontier.first_failure == null
+        ) or (
+          .current_frontier.divergent_cases > 0 and
+          (.current_frontier.first_failure | type == "object") and
+          (.current_frontier.first_failure.root_cause_domain | IN("parser", "planner", "vdbe", "storage", "harness", "fixture")) and
+          (.current_frontier.first_failure.remediation_playbook.next_commands | length) > 0
+        )
+      ) and
       (.divergence_ledger | length) > 0 and
+      (
+        $input_mode != "live-differential-ci" or
+        (.evidence_freshness.sources | any(.source_id == "differential_manifest" and .artifact_path == $differential_json))
+      ) and
       (.validation_violations | length) == 0
     ' "${REPORT_JSON}"; then
   RESULT="fail"
 fi
 
 if ! run_gate "parity_status_markdown_contract" \
-  bash -c "grep -F '## Oracle Preflight' '${REPORT_MD}' >/dev/null && grep -F '## Current Frontier' '${REPORT_MD}' >/dev/null && grep -F 'root_cause_domain: \`planner\`' '${REPORT_MD}' >/dev/null"; then
+  bash -c "grep -F '## Oracle Preflight' '${REPORT_MD}' >/dev/null && grep -F '## Current Frontier' '${REPORT_MD}' >/dev/null && grep -F '## Divergence Ledger' '${REPORT_MD}' >/dev/null"; then
   RESULT="fail"
 fi
 
@@ -240,6 +337,12 @@ EVENTS_SHA256="$(sha256sum "${EVENTS_JSONL}" | awk '{print $1}')"
 TEST_LOG_SHA256="$(sha256sum "${TEST_LOG}" | awk '{print $1}')"
 REPORT_JSON_SHA256="$(sha256sum "${REPORT_JSON}" | awk '{print $1}')"
 REPORT_MD_SHA256="$(sha256sum "${REPORT_MD}" | awk '{print $1}')"
+PREFLIGHT_JSON_SHA256="$(sha256sum "${PREFLIGHT_JSON}" | awk '{print $1}')"
+DIFFERENTIAL_JSON_SHA256="$(sha256sum "${DIFFERENTIAL_JSON}" | awk '{print $1}')"
+DIFF_CI_REPORT_JSON_SHA256=""
+if [[ -s "${DIFF_CI_REPORT_JSON}" ]]; then
+  DIFF_CI_REPORT_JSON_SHA256="$(sha256sum "${DIFF_CI_REPORT_JSON}" | awk '{print $1}')"
+fi
 
 cat > "${SUMMARY_JSON}" <<EOF_SUMMARY
 {
@@ -248,7 +351,10 @@ cat > "${SUMMARY_JSON}" <<EOF_SUMMARY
   "scenario_id": "${SCENARIO_ID}",
   "seed": ${SEED},
   "bead_id": "${BEAD_ID}",
+  "input_mode": "${INPUT_MODE}",
+  "differential_ci_lane": "${DIFF_CI_LANE}",
   "commands": [
+    "DIFF_LANE_FORCE_RCH=1 bash scripts/verify_differential_ci_lane.sh --lane ${DIFF_CI_LANE} --json --seed ${SEED} --generated-unix-ms ${GENERATED_UNIX_MS}",
     "rch exec -- cargo test --manifest-path crates/fsqlite-harness/Cargo.toml --lib parity_status_report -- --nocapture",
     "rch exec -- cargo build -p fsqlite-harness --bin parity_status_report_runner",
     "${RESOLVED_RUNNER_BIN} --workspace-root ${REPO_ROOT} --oracle-preflight-json <preflight> --differential-manifest-json <manifest> --output-json <report> --output-human <markdown>",
@@ -259,6 +365,12 @@ cat > "${SUMMARY_JSON}" <<EOF_SUMMARY
     "events_sha256": "${EVENTS_SHA256}",
     "test_log": "${TEST_LOG}",
     "test_log_sha256": "${TEST_LOG_SHA256}",
+    "oracle_preflight_json": "${PREFLIGHT_JSON}",
+    "oracle_preflight_json_sha256": "${PREFLIGHT_JSON_SHA256}",
+    "differential_manifest_json": "${DIFFERENTIAL_JSON}",
+    "differential_manifest_json_sha256": "${DIFFERENTIAL_JSON_SHA256}",
+    "differential_ci_report_json": "${DIFF_CI_REPORT_JSON}",
+    "differential_ci_report_json_sha256": "${DIFF_CI_REPORT_JSON_SHA256}",
     "report_json": "${REPORT_JSON}",
     "report_json_sha256": "${REPORT_JSON_SHA256}",
     "report_markdown": "${REPORT_MD}",

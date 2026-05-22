@@ -8,6 +8,12 @@ use tempfile::TempDir;
 
 const _BEAD_ID: &str = "bd-aiica";
 
+fn temp_db_target(dir: &TempDir, filename: &str) -> (std::path::PathBuf, String) {
+    let database_file = dir.path().join(filename);
+    let connection_target = database_file.to_string_lossy().into_owned();
+    (database_file, connection_target)
+}
+
 fn create_clean_db(dir: &std::path::Path) -> std::path::PathBuf {
     let db_path = dir.join("clean.db");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -118,35 +124,38 @@ fn t5_fsqlite_created_db_passes_csqlite_check() {
 #[test]
 fn t6_fsqlite_multithread_db_passes_csqlite_check() {
     let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("mt.db");
-    let path_str = db_path.to_string_lossy().into_owned();
+    let (database_file, connection_target) = temp_db_target(&dir, "mt.db");
 
     {
-        let conn = fsqlite::Connection::open(path_str.clone()).unwrap();
+        let conn = fsqlite::Connection::open(connection_target.clone()).unwrap();
         let _ = conn.execute("PRAGMA fsqlite.concurrent_mode=ON;");
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
             .unwrap();
     }
 
-    let path = std::sync::Arc::new(path_str);
+    let connection_target = std::sync::Arc::new(connection_target);
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
     let mut handles = Vec::new();
 
     for tid in 0..4u32 {
-        let path = std::sync::Arc::clone(&path);
+        let connection_target = std::sync::Arc::clone(&connection_target);
         let barrier = std::sync::Arc::clone(&barrier);
         handles.push(std::thread::spawn(move || {
-            let conn = fsqlite::Connection::open(path.as_str().to_owned()).unwrap();
+            let conn = fsqlite::Connection::open(connection_target.as_str().to_owned()).unwrap();
             let _ = conn.execute("PRAGMA fsqlite.concurrent_mode=ON;");
             let _ = conn.execute("PRAGMA busy_timeout=5000;");
             barrier.wait();
 
             let base = i64::from(tid) * 100;
+            let value = format!("thread_{tid}");
             for i in 0..10i64 {
-                let _ = conn.execute(&format!(
-                    "INSERT INTO t VALUES ({}, 'thread_{tid}')",
-                    base + i
-                ));
+                let _ = conn.execute_with_params(
+                    "INSERT INTO t VALUES (?1, ?2)",
+                    &[
+                        fsqlite::SqliteValue::Integer(base + i),
+                        fsqlite::SqliteValue::Text(value.clone().into()),
+                    ],
+                );
             }
         }));
     }
@@ -155,11 +164,11 @@ fn t6_fsqlite_multithread_db_passes_csqlite_check() {
         h.join().unwrap();
     }
 
-    assert_eq!(integrity_check(&db_path), "ok");
+    assert_eq!(integrity_check(&database_file), "ok");
 }
 
 #[test]
-fn t7_verify_with_c_sqlite_clean() {
+fn t7_verify_with_c_sqlite_clean() -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("verify_clean.db");
     let path_str = db_path.to_string_lossy().into_owned();
@@ -170,11 +179,9 @@ fn t7_verify_with_c_sqlite_clean() {
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
     drop(conn);
 
-    let report = fsqlite_e2e::verify_csqlite::verify_with_c_sqlite(db_path.to_str().unwrap());
-    match report {
-        Ok(r) => assert!(r.ok, "clean DB should verify ok"),
-        Err(e) => panic!("verify_with_c_sqlite failed: {e}"),
-    }
+    let report = fsqlite_e2e::verify_csqlite::verify_with_c_sqlite(&db_path)?;
+    assert!(report.ok, "clean DB should verify ok");
+    Ok(())
 }
 
 #[test]

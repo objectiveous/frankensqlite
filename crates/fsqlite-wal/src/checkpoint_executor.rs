@@ -154,10 +154,18 @@ pub fn execute_checkpoint<F: VfsFile>(
         sorted_pages.sort_unstable_by_key(|(p, _)| p.get());
 
         let mut frame_buf = vec![0u8; wal.frame_size()];
-        for (page_no, frame_idx) in sorted_pages {
-            wal.read_frame_into(cx, frame_idx, &mut frame_buf)?;
+        for (_page_idx, (page_no, frame_idx)) in sorted_pages.iter().enumerate() {
+            #[cfg(any(test, feature = "fault-injection"))]
+            if _page_idx > 0 {
+                crate::fault_hooks::maybe_inject_crash_at(
+                    crate::fault_hooks::CrashBoundary::MidCheckpoint,
+                    &format!("page_idx={_page_idx} page_no={}", page_no.get()),
+                )?;
+            }
+
+            wal.read_frame_into(cx, *frame_idx, &mut frame_buf)?;
             let page_data = &frame_buf[WAL_FRAME_HEADER_SIZE..];
-            target.write_page(cx, page_no, page_data)?;
+            target.write_page(cx, *page_no, page_data)?;
 
             // bd-yfdb6: capture the expected post-checkpoint checksum so the
             // truncate path can verify disk state before discarding WAL
@@ -168,14 +176,14 @@ pub fn execute_checkpoint<F: VfsFile>(
             if page_data.len() >= crate::checksum::PAGE_CHECKSUM_RESERVED_BYTES {
                 if let Ok(checksum) = crate::checksum::read_page_checksum(page_data) {
                     expected_checksums.push(ExpectedPageChecksum {
-                        page: page_no,
+                        page: *page_no,
                         checksum,
                     });
                 }
             }
 
             debug!(
-                frame_idx,
+                frame_idx = *frame_idx,
                 page_number = page_no.get(),
                 "checkpoint: page backfilled"
             );
@@ -214,6 +222,12 @@ pub fn execute_checkpoint<F: VfsFile>(
 
     crate::metrics::GLOBAL_WAL_METRICS
         .record_checkpoint(u64::from(frames_backfilled), checkpoint_duration_us);
+
+    #[cfg(any(test, feature = "fault-injection"))]
+    crate::fault_hooks::maybe_inject_crash_at(
+        crate::fault_hooks::CrashBoundary::AfterCheckpoint,
+        &format!("frames_backfilled={frames_backfilled} wal_was_reset={wal_was_reset}"),
+    )?;
 
     Ok(CheckpointExecutionResult {
         plan,
@@ -834,7 +848,11 @@ mod tests {
             .expect("checkpoint");
 
         assert_eq!(result.frames_backfilled, 2);
-        assert_eq!(target.pages.len(), 1, "same page written twice → one deduped write");
+        assert_eq!(
+            target.pages.len(),
+            1,
+            "same page written twice → one deduped write"
+        );
         assert_eq!(target.pages[0].0.get(), 1);
         assert_eq!(target.pages[0].1, page1_v2, "must use latest frame's data");
     }
@@ -845,7 +863,9 @@ mod tests {
         let target = RecordingTarget::new();
         let mut buf = vec![0u8; 4096];
         let page = PageNumber::new(1).expect("valid page");
-        let result = target.read_page_if_supported(&cx, page, &mut buf).expect("no error");
+        let result = target
+            .read_page_if_supported(&cx, page, &mut buf)
+            .expect("no error");
         assert!(result.is_none());
     }
 
@@ -939,7 +959,10 @@ mod tests {
         execute_checkpoint(&cx, &mut wal, CheckpointMode::Passive, state, &mut target)
             .expect("checkpoint");
 
-        assert_eq!(target.sync_count, 1, "partial passive should sync exactly once");
+        assert_eq!(
+            target.sync_count, 1,
+            "partial passive should sync exactly once"
+        );
     }
 
     #[test]
@@ -972,10 +995,14 @@ mod tests {
         let file = open_wal_file(&vfs, &cx);
         let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
 
-        wal.append_frame(&cx, 5, &sample_page(5), 0).expect("append");
-        wal.append_frame(&cx, 2, &sample_page(2), 0).expect("append");
-        wal.append_frame(&cx, 8, &sample_page(8), 0).expect("append");
-        wal.append_frame(&cx, 1, &sample_page(1), 4).expect("append commit");
+        wal.append_frame(&cx, 5, &sample_page(5), 0)
+            .expect("append");
+        wal.append_frame(&cx, 2, &sample_page(2), 0)
+            .expect("append");
+        wal.append_frame(&cx, 8, &sample_page(8), 0)
+            .expect("append");
+        wal.append_frame(&cx, 1, &sample_page(1), 4)
+            .expect("append commit");
 
         let state = CheckpointState {
             total_frames: 4,
@@ -989,14 +1016,21 @@ mod tests {
         let page_nums: Vec<u32> = target.pages.iter().map(|(pn, _)| pn.get()).collect();
         let mut sorted = page_nums.clone();
         sorted.sort_unstable();
-        assert_eq!(page_nums, sorted, "pages must be written in ascending order");
+        assert_eq!(
+            page_nums, sorted,
+            "pages must be written in ascending order"
+        );
     }
 
     #[test]
     fn checkpoint_execution_result_clone_eq_debug() {
         let plan = plan_checkpoint(
             CheckpointMode::Passive,
-            CheckpointState { total_frames: 4, backfilled_frames: 0, oldest_reader_frame: None },
+            CheckpointState {
+                total_frames: 4,
+                backfilled_frames: 0,
+                oldest_reader_frame: None,
+            },
         );
         let result = CheckpointExecutionResult {
             plan,
@@ -1014,7 +1048,11 @@ mod tests {
     fn checkpoint_execution_result_ne_on_different_fields() {
         let plan = plan_checkpoint(
             CheckpointMode::Passive,
-            CheckpointState { total_frames: 1, backfilled_frames: 0, oldest_reader_frame: None },
+            CheckpointState {
+                total_frames: 1,
+                backfilled_frames: 0,
+                oldest_reader_frame: None,
+            },
         );
         let a = CheckpointExecutionResult {
             plan: plan.clone(),
@@ -1037,7 +1075,9 @@ mod tests {
         let cx = test_cx();
         let page = PageNumber::new(1).expect("valid");
         let mut buf = [0u8; 4096];
-        let result = target.read_page_if_supported(&cx, page, &mut buf).expect("ok");
+        let result = target
+            .read_page_if_supported(&cx, page, &mut buf)
+            .expect("ok");
         assert!(result.is_none());
     }
 
@@ -1047,7 +1087,11 @@ mod tests {
         let vfs = MemoryVfs::new();
         let file = open_wal_file(&vfs, &cx);
         let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
-        let state = CheckpointState { total_frames: 0, backfilled_frames: 0, oldest_reader_frame: None };
+        let state = CheckpointState {
+            total_frames: 0,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
         let mut target = RecordingTarget::new();
         let result = execute_checkpoint(&cx, &mut wal, CheckpointMode::Passive, state, &mut target)
             .expect("checkpoint");

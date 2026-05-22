@@ -223,6 +223,154 @@ fn fault_error(point: &str, arm: &FaultHookArm) -> FrankenError {
     )))
 }
 
+/// The 8 crash-injection phase boundaries for WAL durability testing (bd-hd2he).
+///
+/// Each boundary represents a point in the commit protocol where a crash
+/// (SIGKILL, power loss) could leave the system in a partially committed state.
+/// The crash injection harness arms one boundary per test iteration to verify
+/// that recovery always produces a consistent state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CrashBoundary {
+    /// Before the WAL header is written during reset/creation.
+    BeforeWalHeaderWrite,
+    /// Before WAL frame bytes are appended to disk.
+    BeforeWalFrameAppend,
+    /// After WAL frames are appended but before fsync (frames on disk but not durable).
+    AfterWalFrameAppendBeforeFsync,
+    /// After fsync completes but before CommitIndex/SHM publish.
+    AfterFsyncBeforePublish,
+    /// Between page-table rebuild steps during recovery.
+    BetweenPageTableRebuildSteps,
+    /// After publish completes but before checkpoint starts.
+    AfterPublishBeforeCheckpoint,
+    /// Mid-checkpoint (some pages written back to DB, not all).
+    MidCheckpoint,
+    /// After checkpoint completes.
+    AfterCheckpoint,
+}
+
+impl CrashBoundary {
+    /// All 8 boundaries in protocol order.
+    #[must_use]
+    pub const fn all() -> [Self; 8] {
+        [
+            Self::BeforeWalHeaderWrite,
+            Self::BeforeWalFrameAppend,
+            Self::AfterWalFrameAppendBeforeFsync,
+            Self::AfterFsyncBeforePublish,
+            Self::BetweenPageTableRebuildSteps,
+            Self::AfterPublishBeforeCheckpoint,
+            Self::MidCheckpoint,
+            Self::AfterCheckpoint,
+        ]
+    }
+
+    /// String name for structured logging.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BeforeWalHeaderWrite => "before-wal-header-write",
+            Self::BeforeWalFrameAppend => "before-wal-frame-append",
+            Self::AfterWalFrameAppendBeforeFsync => "after-wal-frame-append-before-fsync",
+            Self::AfterFsyncBeforePublish => "after-fsync-before-publish",
+            Self::BetweenPageTableRebuildSteps => "between-page-table-rebuild-steps",
+            Self::AfterPublishBeforeCheckpoint => "after-publish-before-checkpoint",
+            Self::MidCheckpoint => "mid-checkpoint",
+            Self::AfterCheckpoint => "after-checkpoint",
+        }
+    }
+}
+
+impl std::fmt::Display for CrashBoundary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// State for the crash-boundary injection system (bd-hd2he).
+#[derive(Debug, Default)]
+struct CrashBoundaryState {
+    armed: Option<(CrashBoundary, FaultHookArm)>,
+    fire_count: u64,
+}
+
+static CRASH_BOUNDARY_STATE: LazyLock<Mutex<CrashBoundaryState>> =
+    LazyLock::new(|| Mutex::new(CrashBoundaryState::default()));
+
+/// Arm a specific crash boundary. Only one boundary can be armed at a time.
+pub fn arm_crash_boundary(boundary: CrashBoundary, arm: FaultHookArm) {
+    let mut state = CRASH_BOUNDARY_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.armed = Some((boundary, arm));
+}
+
+/// Disarm any active crash boundary.
+pub fn disarm_crash_boundary() {
+    let mut state = CRASH_BOUNDARY_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.armed = None;
+}
+
+/// Check whether the given boundary is armed and fire if so.
+/// Returns `Err` with a fault injection error if the boundary fires.
+pub fn maybe_inject_crash_at(boundary: CrashBoundary, detail: &str) -> Result<()> {
+    let mut state = CRASH_BOUNDARY_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some((armed_boundary, ref arm)) = state.armed else {
+        return Ok(());
+    };
+    if armed_boundary != boundary {
+        return Ok(());
+    }
+    let arm_clone = arm.clone();
+    state.fire_count += 1;
+    let fire_count = state.fire_count;
+    state.armed = None;
+
+    warn!(
+        target: "fsqlite_wal::crash_injection",
+        boundary = boundary.as_str(),
+        fire_count,
+        run_id = %arm_clone.run_id,
+        scenario_id = %arm_clone.scenario_id,
+        detail,
+        "crash boundary fired"
+    );
+
+    // Also record in the general fault injection records
+    let mut wal_state = WAL_FAULT_HOOK_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    record_trigger(
+        &mut wal_state,
+        &arm_clone,
+        boundary.as_str(),
+        detail.to_owned(),
+    );
+
+    Err(fault_error(boundary.as_str(), &arm_clone))
+}
+
+/// How many times a crash boundary has fired since the last clear.
+#[must_use]
+pub fn crash_boundary_fire_count() -> u64 {
+    CRASH_BOUNDARY_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .fire_count
+}
+
+/// Clear the crash boundary state (fire count + armed state).
+pub fn clear_crash_boundary() {
+    let mut state = CRASH_BOUNDARY_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *state = CrashBoundaryState::default();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,7 +383,9 @@ mod tests {
 
     #[test]
     fn test_clear_resets_all_armed_hooks_and_records() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_after_append(arm("append"));
@@ -255,58 +405,88 @@ mod tests {
 
     #[test]
     fn test_after_append_fires_once_then_disarms() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_after_append(arm("append"));
         let err = maybe_inject_after_append(5, 3);
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("fault_inject:wal_after_append"));
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("fault_inject:wal_after_append")
+        );
 
         assert!(maybe_inject_after_append(8, 2).is_ok());
     }
 
     #[test]
     fn test_sync_failure_fires_once_then_disarms() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_sync_failure(arm("sync"));
         let err = maybe_inject_sync_failure(10, SyncFlags::FULL);
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("fault_inject:wal_sync_failure"));
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("fault_inject:wal_sync_failure")
+        );
 
         assert!(maybe_inject_sync_failure(10, SyncFlags::FULL).is_ok());
     }
 
     #[test]
     fn test_append_busy_countdown_fires_on_nth_invocation() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_append_busy_countdown(arm("busy"), 3);
-        assert!(maybe_inject_append_busy(0, 1).is_ok(), "1st call should not fire");
-        assert!(maybe_inject_append_busy(1, 1).is_ok(), "2nd call should not fire");
+        assert!(
+            maybe_inject_append_busy(0, 1).is_ok(),
+            "1st call should not fire"
+        );
+        assert!(
+            maybe_inject_append_busy(1, 1).is_ok(),
+            "2nd call should not fire"
+        );
         let err = maybe_inject_append_busy(2, 1);
         assert!(err.is_err(), "3rd call should fire");
         assert!(matches!(err.unwrap_err(), FrankenError::Busy));
 
-        assert!(maybe_inject_append_busy(3, 1).is_ok(), "disarmed after fire");
+        assert!(
+            maybe_inject_append_busy(3, 1).is_ok(),
+            "disarmed after fire"
+        );
     }
 
     #[test]
     fn test_append_busy_countdown_minimum_one() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_append_busy_countdown(arm("busy"), 0);
         let err = maybe_inject_append_busy(0, 1);
-        assert!(err.is_err(), "countdown of 0 should clamp to 1 and fire immediately");
+        assert!(
+            err.is_err(),
+            "countdown of 0 should clamp to 1 and fire immediately"
+        );
     }
 
     #[test]
     fn test_crash_header_truncate_fires_once() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_crash_header_truncate(arm("crash"));
@@ -323,7 +503,9 @@ mod tests {
 
     #[test]
     fn test_records_capture_trigger_details() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_after_append(FaultHookArm::new("run-a", "scen-a", "inv-a"));
@@ -350,7 +532,9 @@ mod tests {
 
     #[test]
     fn test_take_records_drains_and_is_empty_after() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_after_append(arm("append"));
@@ -364,7 +548,9 @@ mod tests {
 
     #[test]
     fn test_rearming_overwrites_previous_arm() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_after_append(FaultHookArm::new("first", "s1", "i1"));
@@ -378,7 +564,9 @@ mod tests {
 
     #[test]
     fn test_trigger_seq_monotonic_across_drain_cycles() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_after_append(arm("a"));
@@ -394,7 +582,9 @@ mod tests {
 
     #[test]
     fn test_crash_header_truncate_record_detail() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_crash_header_truncate(FaultHookArm::new("r", "s", "i"));
@@ -409,7 +599,9 @@ mod tests {
 
     #[test]
     fn test_all_four_hooks_fire_independently() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_after_append(arm("append"));
@@ -441,7 +633,9 @@ mod tests {
 
     #[test]
     fn test_unarmed_hooks_are_noop_from_fresh_state() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         assert!(maybe_inject_after_append(0, 1).is_ok());
@@ -453,7 +647,9 @@ mod tests {
 
     #[test]
     fn test_append_busy_countdown_one_fires_immediately() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_append_busy_countdown(arm("busy"), 1);
@@ -467,7 +663,9 @@ mod tests {
 
     #[test]
     fn test_fault_injection_record_fields() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_after_append(FaultHookArm::new("run-x", "scen-y", "fam-z"));
@@ -484,7 +682,9 @@ mod tests {
 
     #[test]
     fn test_fault_injection_record_clone_and_eq() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_sync_failure(FaultHookArm::new("rc", "sc", "ic"));
@@ -509,7 +709,9 @@ mod tests {
 
     #[test]
     fn test_sync_failure_detail_captures_flags() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_sync_failure(arm("sf"));
@@ -525,7 +727,9 @@ mod tests {
 
     #[test]
     fn test_append_busy_rearming_resets_countdown() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_append_busy_countdown(arm("first"), 2);
@@ -564,7 +768,10 @@ mod tests {
         };
         let cloned = r.clone();
         assert_eq!(r, cloned);
-        let other = FaultInjectionRecord { trigger_seq: 2, ..r.clone() };
+        let other = FaultInjectionRecord {
+            trigger_seq: 2,
+            ..r.clone()
+        };
         assert_ne!(r, other);
         let dbg = format!("{r:?}");
         assert!(dbg.contains("FaultInjectionRecord"));
@@ -572,7 +779,9 @@ mod tests {
 
     #[test]
     fn clear_resets_and_take_records_returns_empty() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
         let records = take_records();
         assert!(records.is_empty());
@@ -584,5 +793,184 @@ mod tests {
         assert_eq!(a.run_id, "rid");
         assert_eq!(a.scenario_id, "sid");
         assert_eq!(a.invariant_family, "ifam");
+    }
+
+    // ---------------------------------------------------------------
+    // CrashBoundary tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn crash_boundary_arm_and_fire() {
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+        clear_crash_boundary();
+
+        arm_crash_boundary(CrashBoundary::MidCheckpoint, arm("cb"));
+        let err = maybe_inject_crash_at(CrashBoundary::MidCheckpoint, "page_idx=3");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("mid-checkpoint"));
+    }
+
+    #[test]
+    fn crash_boundary_wrong_boundary_does_not_fire() {
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+        clear_crash_boundary();
+
+        arm_crash_boundary(CrashBoundary::AfterCheckpoint, arm("cb"));
+        assert!(maybe_inject_crash_at(CrashBoundary::MidCheckpoint, "").is_ok());
+    }
+
+    #[test]
+    fn crash_boundary_fires_once_then_disarms() {
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+        clear_crash_boundary();
+
+        arm_crash_boundary(CrashBoundary::BeforeWalFrameAppend, arm("cb"));
+        assert!(maybe_inject_crash_at(CrashBoundary::BeforeWalFrameAppend, "f=1").is_err());
+        assert!(maybe_inject_crash_at(CrashBoundary::BeforeWalFrameAppend, "f=2").is_ok());
+    }
+
+    #[test]
+    fn crash_boundary_fire_count_increments() {
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+        clear_crash_boundary();
+
+        assert_eq!(crash_boundary_fire_count(), 0);
+
+        arm_crash_boundary(CrashBoundary::AfterFsyncBeforePublish, arm("cb1"));
+        let _ = maybe_inject_crash_at(CrashBoundary::AfterFsyncBeforePublish, "");
+        assert_eq!(crash_boundary_fire_count(), 1);
+
+        arm_crash_boundary(CrashBoundary::AfterCheckpoint, arm("cb2"));
+        let _ = maybe_inject_crash_at(CrashBoundary::AfterCheckpoint, "");
+        assert_eq!(crash_boundary_fire_count(), 2);
+    }
+
+    #[test]
+    fn crash_boundary_disarm_prevents_fire() {
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+        clear_crash_boundary();
+
+        arm_crash_boundary(CrashBoundary::BeforeWalHeaderWrite, arm("cb"));
+        disarm_crash_boundary();
+        assert!(maybe_inject_crash_at(CrashBoundary::BeforeWalHeaderWrite, "").is_ok());
+    }
+
+    #[test]
+    fn crash_boundary_clear_resets_fire_count_and_armed() {
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+        clear_crash_boundary();
+
+        arm_crash_boundary(CrashBoundary::MidCheckpoint, arm("cb"));
+        let _ = maybe_inject_crash_at(CrashBoundary::MidCheckpoint, "");
+        assert_eq!(crash_boundary_fire_count(), 1);
+
+        clear_crash_boundary();
+        assert_eq!(crash_boundary_fire_count(), 0);
+        assert!(maybe_inject_crash_at(CrashBoundary::MidCheckpoint, "").is_ok());
+    }
+
+    #[test]
+    fn crash_boundary_records_in_wal_fault_records() {
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+        clear_crash_boundary();
+
+        arm_crash_boundary(
+            CrashBoundary::AfterCheckpoint,
+            FaultHookArm::new("run-cb", "scen-cb", "inv-cb"),
+        );
+        let _ = maybe_inject_crash_at(CrashBoundary::AfterCheckpoint, "pages=42");
+
+        let records = take_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].point, "after-checkpoint");
+        assert_eq!(records[0].run_id, "run-cb");
+        assert_eq!(records[0].scenario_id, "scen-cb");
+        assert!(records[0].detail.contains("pages=42"));
+    }
+
+    #[test]
+    fn crash_boundary_unarmed_is_noop() {
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+        clear_crash_boundary();
+
+        for boundary in CrashBoundary::all() {
+            assert!(maybe_inject_crash_at(boundary, "").is_ok());
+        }
+        assert!(take_records().is_empty());
+    }
+
+    #[test]
+    fn crash_boundary_all_returns_8_variants() {
+        let all = CrashBoundary::all();
+        assert_eq!(all.len(), 8);
+        for (i, b) in all.iter().enumerate() {
+            for (j, c) in all.iter().enumerate() {
+                if i != j {
+                    assert_ne!(b, c);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn crash_boundary_as_str_and_display() {
+        assert_eq!(
+            CrashBoundary::BeforeWalHeaderWrite.as_str(),
+            "before-wal-header-write"
+        );
+        assert_eq!(CrashBoundary::MidCheckpoint.to_string(), "mid-checkpoint");
+        assert_eq!(
+            CrashBoundary::AfterCheckpoint.to_string(),
+            "after-checkpoint"
+        );
+    }
+
+    #[test]
+    fn crash_boundary_rearming_overwrites_previous() {
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+        clear_crash_boundary();
+
+        arm_crash_boundary(
+            CrashBoundary::MidCheckpoint,
+            FaultHookArm::new("first", "s1", "i1"),
+        );
+        arm_crash_boundary(
+            CrashBoundary::AfterCheckpoint,
+            FaultHookArm::new("second", "s2", "i2"),
+        );
+
+        assert!(maybe_inject_crash_at(CrashBoundary::MidCheckpoint, "").is_ok());
+        assert!(maybe_inject_crash_at(CrashBoundary::AfterCheckpoint, "").is_err());
+
+        let records = take_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].run_id, "second");
     }
 }

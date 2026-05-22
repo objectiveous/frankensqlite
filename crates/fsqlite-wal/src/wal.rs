@@ -1000,6 +1000,13 @@ impl<F: VfsFile> WalFile<F> {
 
         let start_frame_index = self.frame_count;
         let offset = self.frame_offset(start_frame_index);
+
+        #[cfg(any(test, feature = "fault-injection"))]
+        crate::fault_hooks::maybe_inject_crash_at(
+            crate::fault_hooks::CrashBoundary::BeforeWalFrameAppend,
+            &format!("start_frame={start_frame_index} frame_count={frame_count}"),
+        )?;
+
         self.file.write(cx, prepared_frame_bytes, offset)?;
         self.advance_state_after_write(frame_count, final_running_checksum)?;
         if let Some(last_commit_offset) = last_commit_offset {
@@ -1315,6 +1322,12 @@ impl<F: VfsFile> WalFile<F> {
             "WAL durable sync complete"
         );
 
+        #[cfg(any(test, feature = "fault-injection"))]
+        crate::fault_hooks::maybe_inject_crash_at(
+            crate::fault_hooks::CrashBoundary::AfterFsyncBeforePublish,
+            &format!("fsynced_up_to={}", self.frame_count),
+        )?;
+
         Ok(())
     }
 
@@ -1376,6 +1389,13 @@ impl<F: VfsFile> WalFile<F> {
             checksum: SqliteWalChecksum::default(),
         };
         let header_bytes = new_header.to_bytes()?;
+
+        #[cfg(any(test, feature = "fault-injection"))]
+        crate::fault_hooks::maybe_inject_crash_at(
+            crate::fault_hooks::CrashBoundary::BeforeWalHeaderWrite,
+            &format!("checkpoint_seq={new_checkpoint_seq}"),
+        )?;
+
         self.file.write(cx, &header_bytes, 0)?;
 
         // H9 fault hook: crash after header write, before truncate.

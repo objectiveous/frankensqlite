@@ -6676,6 +6676,48 @@ mod tests {
     }
 
     #[test]
+    fn test_where_terms_imply_predicate() {
+        // For every AND-conjunct of the predicate, some term must imply it (via
+        // expr_implies_partial_predicate). Pinning the multi-conjunct and
+        // empty-terms behaviors.
+        let col = |n: &str| Box::new(Expr::Column(ColumnRef::bare(n), Span::ZERO));
+        let is_not_null = |n: &str| Expr::IsNull {
+            expr: col(n),
+            not: true,
+            span: Span::ZERO,
+        };
+        let and = |l: Expr, r: Expr| Expr::BinaryOp {
+            left: Box::new(l),
+            op: AstBinaryOp::And,
+            right: Box::new(r),
+            span: Span::ZERO,
+        };
+
+        // x = 5 implies x IS NOT NULL.
+        let terms = [eq_term_value("x", 5)];
+        assert!(where_terms_imply_predicate(&terms, &is_not_null("x")));
+
+        // x = 5 does not imply y IS NOT NULL (different column).
+        assert!(!where_terms_imply_predicate(&terms, &is_not_null("y")));
+
+        // Both terms together imply (x IS NOT NULL AND y IS NOT NULL).
+        let both = [eq_term_value("x", 5), eq_term_value("y", 7)];
+        assert!(where_terms_imply_predicate(
+            &both,
+            &and(is_not_null("x"), is_not_null("y"))
+        ));
+
+        // Only the x term -> the y conjunct is unimplied -> overall false.
+        assert!(!where_terms_imply_predicate(
+            &terms,
+            &and(is_not_null("x"), is_not_null("y"))
+        ));
+
+        // No terms -> any() over empty is false -> no implication possible.
+        assert!(!where_terms_imply_predicate(&[], &is_not_null("x")));
+    }
+
+    #[test]
     fn test_expr_implies_partial_predicate() {
         // A query predicate implies a partial-index predicate when it is
         // structurally identical, when it guarantees the column non-null for an

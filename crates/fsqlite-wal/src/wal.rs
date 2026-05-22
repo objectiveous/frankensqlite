@@ -23,7 +23,7 @@ use tracing::{debug, error, warn};
 /// Checked once at startup to avoid repeated `env::var` calls on the hot path.
 static PARANOID_DURABILITY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     std::env::var("FRANKENSQLITE_PARANOID_DURABILITY")
-        .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 });
 
 use crate::checksum::{

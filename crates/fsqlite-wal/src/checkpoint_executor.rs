@@ -154,13 +154,18 @@ pub fn execute_checkpoint<F: VfsFile>(
         sorted_pages.sort_unstable_by_key(|(p, _)| p.get());
 
         let mut frame_buf = vec![0u8; wal.frame_size()];
-        for (_page_idx, (page_no, frame_idx)) in sorted_pages.iter().enumerate() {
+        #[cfg(any(test, feature = "fault-injection"))]
+        let mut _fault_page_idx: usize = 0;
+        for (page_no, frame_idx) in &sorted_pages {
             #[cfg(any(test, feature = "fault-injection"))]
-            if _page_idx > 0 {
-                crate::fault_hooks::maybe_inject_crash_at(
-                    crate::fault_hooks::CrashBoundary::MidCheckpoint,
-                    &format!("page_idx={_page_idx} page_no={}", page_no.get()),
-                )?;
+            {
+                if _fault_page_idx > 0 {
+                    crate::fault_hooks::maybe_inject_crash_at(
+                        crate::fault_hooks::CrashBoundary::MidCheckpoint,
+                        &format!("page_idx={_fault_page_idx} page_no={}", page_no.get()),
+                    )?;
+                }
+                _fault_page_idx += 1;
             }
 
             wal.read_frame_into(cx, *frame_idx, &mut frame_buf)?;

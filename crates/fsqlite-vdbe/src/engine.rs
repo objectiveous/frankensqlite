@@ -12726,6 +12726,23 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            Opcode::String8 => {
+                match &op.p4 {
+                    P4::Str(s) => self.write_text_to_reg(op.p2, s),
+                    _ => self.set_reg_fast(op.p2, SqliteValue::Text(SmallText::new(""))),
+                }
+                *pc += 1;
+                Ok(true)
+            }
+            Opcode::Real => {
+                let val = match &op.p4 {
+                    P4::Real(v) => *v,
+                    _ => 0.0,
+                };
+                self.set_reg_fast(op.p2, SqliteValue::Float(val));
+                *pc += 1;
+                Ok(true)
+            }
             Opcode::If => {
                 let val = self.get_reg(op.p1);
                 let should_jump = if val.is_null() {
@@ -22441,6 +22458,55 @@ mod tests {
         });
         assert_eq!(rows[0], vec![SqliteValue::Text("shallow_me".into())]);
         assert_eq!(rows[1], vec![SqliteValue::Text("shallow_me".into())]);
+    }
+
+    #[test]
+    fn test_string8_via_hot_path() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            b.emit_op(
+                Opcode::String8,
+                0,
+                r1,
+                0,
+                P4::Str("hello_hot".to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::String8, 0, r2, 0, P4::Str(String::new()), 0);
+            b.emit_op(Opcode::ResultRow, r1, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r2, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Text("hello_hot".into())]);
+        assert_eq!(rows[1], vec![SqliteValue::Text("".into())]);
+    }
+
+    #[test]
+    fn test_string8_hot_path_reuses_existing_text_buffer() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(
+                Opcode::String8,
+                0,
+                r,
+                0,
+                P4::Str("first_value".to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::String8, 0, r, 0, P4::Str("second".to_owned()), 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Text("first_value".into())]);
+        assert_eq!(rows[1], vec![SqliteValue::Text("second".into())]);
     }
 
     #[test]

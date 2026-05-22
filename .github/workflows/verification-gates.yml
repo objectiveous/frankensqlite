@@ -128,7 +128,13 @@ jobs:
               "- mismatch_class_counts: `\(.results.mismatch_class_counts)`",
               "- manifest_a: `\(.artifacts.manifest_a)`",
               "- runner_log_a: `\(.artifacts.runner_log_a)`",
-              "- replay_command: `\(.replay_command)`"
+              "- replay_command: `\(.replay_command)`",
+              "- first_failure_root_cause: `\(.first_failure.root_cause_domain // "none")`",
+              "- first_failure_replay_command: `\(.first_failure.replay_command // "none")`",
+              "- first_failure_remediation_owner: `\(.first_failure.remediation_playbook.owner_hint // "none")`",
+              "- first_failure_remediation_summary: \(.first_failure.remediation_playbook.summary // "none")",
+              "- first_failure_remediation_commands: `\((.first_failure.remediation_playbook.next_commands // []) | join(" ; "))`",
+              "- first_failure_artifact_entries: `\((.first_failure.artifact_entries // []) | join(", "))`"
             ' "${report_path}" >> "${GITHUB_STEP_SUMMARY}"
           else
             echo "Differential smoke report missing at ${report_path}" >> "${GITHUB_STEP_SUMMARY}"
@@ -185,7 +191,13 @@ jobs:
               "- mismatch_class_counts: `\(.results.mismatch_class_counts)`",
               "- manifest_a: `\(.artifacts.manifest_a)`",
               "- runner_log_a: `\(.artifacts.runner_log_a)`",
-              "- replay_command: `\(.replay_command)`"
+              "- replay_command: `\(.replay_command)`",
+              "- first_failure_root_cause: `\(.first_failure.root_cause_domain // "none")`",
+              "- first_failure_replay_command: `\(.first_failure.replay_command // "none")`",
+              "- first_failure_remediation_owner: `\(.first_failure.remediation_playbook.owner_hint // "none")`",
+              "- first_failure_remediation_summary: \(.first_failure.remediation_playbook.summary // "none")",
+              "- first_failure_remediation_commands: `\((.first_failure.remediation_playbook.next_commands // []) | join(" ; "))`",
+              "- first_failure_artifact_entries: `\((.first_failure.artifact_entries // []) | join(", "))`"
             ' "${report_path}" >> "${GITHUB_STEP_SUMMARY}"
           else
             echo "Differential expanded report missing at ${report_path}" >> "${GITHUB_STEP_SUMMARY}"

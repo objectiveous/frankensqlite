@@ -1065,7 +1065,11 @@ mod tests {
         assert_eq!(region.len(), 16);
         assert_eq!(region.read_u32_le(0).unwrap(), 0xDEAD);
         assert_eq!(region.read_u32_le(4).unwrap(), 0xBEEF);
-        assert_eq!(region.read_u32_le(8).unwrap(), 0, "grown region zero-filled");
+        assert_eq!(
+            region.read_u32_le(8).unwrap(),
+            0,
+            "grown region zero-filled"
+        );
 
         region.try_resize_heap(4).unwrap();
         assert_eq!(region.len(), 4);
@@ -1112,7 +1116,11 @@ mod tests {
         assert_eq!(cloned.read_u32_le(0).unwrap(), 0xDEAD);
         assert_eq!(cloned.len(), 16);
         region.write_u32_le(0, 0xBEEF).unwrap();
-        assert_eq!(cloned.read_u32_le(0).unwrap(), 0xDEAD, "clone must be independent");
+        assert_eq!(
+            cloned.read_u32_le(0).unwrap(),
+            0xDEAD,
+            "clone must be independent"
+        );
     }
 
     #[test]

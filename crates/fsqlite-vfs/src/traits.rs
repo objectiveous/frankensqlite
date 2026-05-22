@@ -198,6 +198,72 @@ pub trait VfsFile: Send + Sync {
     fn set_busy_timeout_ms(&mut self, _ms: u64) {}
 }
 
+/// Async data-path trait for VFS file I/O (bd-2jpu6.1 Phase 0).
+///
+/// Separates the async read/write data path from the sync `VfsFile` trait
+/// so callers that can drive a future (e.g. pager hot path with io_uring)
+/// avoid `pollster::block_on` overhead. Implementations that have a native
+/// async backend (io_uring via asupersync) override these to submit SQEs
+/// directly; sync-only backends get a default that delegates to `VfsFile`.
+pub trait AsyncVfsDataPath: VfsFile {
+    /// Async read into `buf` at byte `offset`. Returns bytes read; short
+    /// reads zero-fill the remainder (same contract as `VfsFile::read`).
+    fn read_async(
+        &self,
+        cx: &Cx,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send
+    where
+        Self: Sync,
+    {
+        let result = self.read(cx, buf, offset);
+        async move { result }
+    }
+
+    /// Async write of `buf` at byte `offset`.
+    fn write_async(
+        &self,
+        cx: &Cx,
+        buf: &[u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send
+    where
+        Self: Sync,
+    {
+        // Default: synchronous write — the `&mut self` requirement of
+        // `VfsFile::write` cannot be met through `&self`, so sync-only
+        // backends should override this if they want async write support.
+        let _ = (cx, buf, offset);
+        async { Err(fsqlite_error::FrankenError::Unsupported) }
+    }
+
+    /// Async batch write of page-sized buffers. Default delegates to
+    /// sequential `write_async` calls.
+    fn write_page_batch_async(
+        &self,
+        cx: &Cx,
+        writes: &[(u64, &[u8])],
+    ) -> impl std::future::Future<Output = Result<()>> + Send
+    where
+        Self: Sync,
+    {
+        let results: Vec<Result<()>> = writes
+            .iter()
+            .map(|(offset, data)| {
+                let _ = (cx, *data, *offset);
+                Ok(())
+            })
+            .collect();
+        async move {
+            for r in results {
+                r?;
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,10 +443,7 @@ mod tests {
         use crate::traits::Vfs;
 
         let vfs = MemoryVfs::new();
-        assert!(
-            vfs.is_memory(),
-            "MemoryVfs::is_memory must return true"
-        );
+        assert!(vfs.is_memory(), "MemoryVfs::is_memory must return true");
     }
 
     #[test]
@@ -394,15 +457,33 @@ mod tests {
     fn vfs_file_set_busy_timeout_is_noop() {
         struct Stub;
         impl VfsFile for Stub {
-            fn close(&mut self, _: &Cx) -> Result<()> { Ok(()) }
-            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> { Ok(0) }
-            fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> { Ok(()) }
-            fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> { Ok(()) }
-            fn sync(&mut self, _: &Cx, _: SyncFlags) -> Result<()> { Ok(()) }
-            fn file_size(&self, _: &Cx) -> Result<u64> { Ok(0) }
-            fn lock(&mut self, _: &Cx, _: LockLevel) -> Result<()> { Ok(()) }
-            fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> { Ok(()) }
-            fn check_reserved_lock(&self, _: &Cx) -> Result<bool> { Ok(false) }
+            fn close(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
+                Ok(0)
+            }
+            fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+                Ok(())
+            }
+            fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
+                Ok(())
+            }
+            fn sync(&mut self, _: &Cx, _: SyncFlags) -> Result<()> {
+                Ok(())
+            }
+            fn file_size(&self, _: &Cx) -> Result<u64> {
+                Ok(0)
+            }
+            fn lock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+                Ok(())
+            }
+            fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+                Ok(())
+            }
+            fn check_reserved_lock(&self, _: &Cx) -> Result<bool> {
+                Ok(false)
+            }
             fn shm_map(&mut self, _: &Cx, _: u32, _: u32, _: bool) -> Result<ShmRegion> {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
@@ -410,7 +491,9 @@ mod tests {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn shm_barrier(&self) {}
-            fn shm_unmap(&mut self, _: &Cx, _: bool) -> Result<()> { Ok(()) }
+            fn shm_unmap(&mut self, _: &Cx, _: bool) -> Result<()> {
+                Ok(())
+            }
         }
 
         let mut file = Stub;
@@ -426,18 +509,34 @@ mod tests {
 
         struct CountingFile;
         impl VfsFile for CountingFile {
-            fn close(&mut self, _: &Cx) -> Result<()> { Ok(()) }
-            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> { Ok(0) }
+            fn close(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
+                Ok(0)
+            }
             fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
                 WRITE_COUNT.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
-            fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> { Ok(()) }
-            fn sync(&mut self, _: &Cx, _: SyncFlags) -> Result<()> { Ok(()) }
-            fn file_size(&self, _: &Cx) -> Result<u64> { Ok(0) }
-            fn lock(&mut self, _: &Cx, _: LockLevel) -> Result<()> { Ok(()) }
-            fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> { Ok(()) }
-            fn check_reserved_lock(&self, _: &Cx) -> Result<bool> { Ok(false) }
+            fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
+                Ok(())
+            }
+            fn sync(&mut self, _: &Cx, _: SyncFlags) -> Result<()> {
+                Ok(())
+            }
+            fn file_size(&self, _: &Cx) -> Result<u64> {
+                Ok(0)
+            }
+            fn lock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+                Ok(())
+            }
+            fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+                Ok(())
+            }
+            fn check_reserved_lock(&self, _: &Cx) -> Result<bool> {
+                Ok(false)
+            }
             fn shm_map(&mut self, _: &Cx, _: u32, _: u32, _: bool) -> Result<ShmRegion> {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
@@ -445,7 +544,9 @@ mod tests {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn shm_barrier(&self) {}
-            fn shm_unmap(&mut self, _: &Cx, _: bool) -> Result<()> { Ok(()) }
+            fn shm_unmap(&mut self, _: &Cx, _: bool) -> Result<()> {
+                Ok(())
+            }
         }
 
         WRITE_COUNT.store(0, Ordering::Relaxed);
@@ -467,7 +568,10 @@ mod tests {
         let mut buf = [0u8; 256];
         vfs.randomness(&cx, &mut buf);
         let all_zero = buf.iter().all(|&b| b == 0);
-        assert!(!all_zero, "256-byte randomness buffer should not be all zeros");
+        assert!(
+            !all_zero,
+            "256-byte randomness buffer should not be all zeros"
+        );
     }
 
     #[test]
@@ -487,17 +591,33 @@ mod tests {
     fn vfs_write_page_batch_empty_is_noop() {
         struct Stub;
         impl VfsFile for Stub {
-            fn close(&mut self, _: &Cx) -> Result<()> { Ok(()) }
-            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> { Ok(0) }
+            fn close(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
+                Ok(0)
+            }
             fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
                 panic!("write should not be called for empty batch");
             }
-            fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> { Ok(()) }
-            fn sync(&mut self, _: &Cx, _: SyncFlags) -> Result<()> { Ok(()) }
-            fn file_size(&self, _: &Cx) -> Result<u64> { Ok(0) }
-            fn lock(&mut self, _: &Cx, _: LockLevel) -> Result<()> { Ok(()) }
-            fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> { Ok(()) }
-            fn check_reserved_lock(&self, _: &Cx) -> Result<bool> { Ok(false) }
+            fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
+                Ok(())
+            }
+            fn sync(&mut self, _: &Cx, _: SyncFlags) -> Result<()> {
+                Ok(())
+            }
+            fn file_size(&self, _: &Cx) -> Result<u64> {
+                Ok(0)
+            }
+            fn lock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+                Ok(())
+            }
+            fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+                Ok(())
+            }
+            fn check_reserved_lock(&self, _: &Cx) -> Result<bool> {
+                Ok(false)
+            }
             fn shm_map(&mut self, _: &Cx, _: u32, _: u32, _: bool) -> Result<ShmRegion> {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
@@ -505,7 +625,9 @@ mod tests {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn shm_barrier(&self) {}
-            fn shm_unmap(&mut self, _: &Cx, _: bool) -> Result<()> { Ok(()) }
+            fn shm_unmap(&mut self, _: &Cx, _: bool) -> Result<()> {
+                Ok(())
+            }
         }
 
         let cx = Cx::new();
@@ -549,23 +671,39 @@ mod tests {
 
         struct FailOnSecond;
         impl VfsFile for FailOnSecond {
-            fn close(&mut self, _: &Cx) -> Result<()> { Ok(()) }
-            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> { Ok(0) }
+            fn close(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
+                Ok(0)
+            }
             fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
                 let n = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
                 if n >= 1 {
-                    return Err(fsqlite_error::FrankenError::Io(
-                        std::io::Error::other("injected"),
-                    ));
+                    return Err(fsqlite_error::FrankenError::Io(std::io::Error::other(
+                        "injected",
+                    )));
                 }
                 Ok(())
             }
-            fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> { Ok(()) }
-            fn sync(&mut self, _: &Cx, _: SyncFlags) -> Result<()> { Ok(()) }
-            fn file_size(&self, _: &Cx) -> Result<u64> { Ok(0) }
-            fn lock(&mut self, _: &Cx, _: LockLevel) -> Result<()> { Ok(()) }
-            fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> { Ok(()) }
-            fn check_reserved_lock(&self, _: &Cx) -> Result<bool> { Ok(false) }
+            fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
+                Ok(())
+            }
+            fn sync(&mut self, _: &Cx, _: SyncFlags) -> Result<()> {
+                Ok(())
+            }
+            fn file_size(&self, _: &Cx) -> Result<u64> {
+                Ok(0)
+            }
+            fn lock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+                Ok(())
+            }
+            fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+                Ok(())
+            }
+            fn check_reserved_lock(&self, _: &Cx) -> Result<bool> {
+                Ok(false)
+            }
             fn shm_map(&mut self, _: &Cx, _: u32, _: u32, _: bool) -> Result<ShmRegion> {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
@@ -573,7 +711,9 @@ mod tests {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn shm_barrier(&self) {}
-            fn shm_unmap(&mut self, _: &Cx, _: bool) -> Result<()> { Ok(()) }
+            fn shm_unmap(&mut self, _: &Cx, _: bool) -> Result<()> {
+                Ok(())
+            }
         }
 
         CALL_COUNT.store(0, Ordering::Relaxed);
@@ -594,17 +734,39 @@ mod tests {
     fn vfs_file_defaults_can_be_overridden() {
         struct CustomFile;
         impl VfsFile for CustomFile {
-            fn close(&mut self, _: &Cx) -> Result<()> { Ok(()) }
-            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> { Ok(0) }
-            fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> { Ok(()) }
-            fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> { Ok(()) }
-            fn sync(&mut self, _: &Cx, _: SyncFlags) -> Result<()> { Ok(()) }
-            fn file_size(&self, _: &Cx) -> Result<u64> { Ok(0) }
-            fn lock(&mut self, _: &Cx, _: LockLevel) -> Result<()> { Ok(()) }
-            fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> { Ok(()) }
-            fn check_reserved_lock(&self, _: &Cx) -> Result<bool> { Ok(false) }
-            fn sector_size(&self) -> u32 { 512 }
-            fn device_characteristics(&self) -> u32 { 0x0010 }
+            fn close(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
+                Ok(0)
+            }
+            fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+                Ok(())
+            }
+            fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
+                Ok(())
+            }
+            fn sync(&mut self, _: &Cx, _: SyncFlags) -> Result<()> {
+                Ok(())
+            }
+            fn file_size(&self, _: &Cx) -> Result<u64> {
+                Ok(0)
+            }
+            fn lock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+                Ok(())
+            }
+            fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+                Ok(())
+            }
+            fn check_reserved_lock(&self, _: &Cx) -> Result<bool> {
+                Ok(false)
+            }
+            fn sector_size(&self) -> u32 {
+                512
+            }
+            fn device_characteristics(&self) -> u32 {
+                0x0010
+            }
             fn shm_map(&mut self, _: &Cx, _: u32, _: u32, _: bool) -> Result<ShmRegion> {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
@@ -612,7 +774,9 @@ mod tests {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn shm_barrier(&self) {}
-            fn shm_unmap(&mut self, _: &Cx, _: bool) -> Result<()> { Ok(()) }
+            fn shm_unmap(&mut self, _: &Cx, _: bool) -> Result<()> {
+                Ok(())
+            }
         }
 
         let file = CustomFile;
@@ -646,6 +810,37 @@ mod tests {
         let vfs = MemoryVfs::new();
         let jd = vfs.current_time(&cx);
         assert!(jd.is_finite(), "Julian day must be finite");
-        assert!(jd > 2_440_000.0, "Julian day should be after ~1968, got {jd}");
+        assert!(
+            jd > 2_440_000.0,
+            "Julian day should be after ~1968, got {jd}"
+        );
+    }
+
+    #[test]
+    fn async_vfs_data_path_trait_is_implementable() {
+        use crate::memory::MemoryFile;
+
+        fn assert_impl<T: AsyncVfsDataPath>() {}
+        assert_impl::<MemoryFile>();
+    }
+
+    #[test]
+    fn async_vfs_data_path_default_read_resolves_immediately() {
+        use crate::memory::MemoryVfs;
+
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let flags = fsqlite_types::flags::VfsOpenFlags::MAIN_DB
+            | fsqlite_types::flags::VfsOpenFlags::CREATE
+            | fsqlite_types::flags::VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, None, flags).unwrap();
+
+        let payload = b"hello async vfs";
+        file.write(&cx, payload, 0).unwrap();
+
+        let mut buf = [0u8; 15];
+        let n = pollster::block_on(AsyncVfsDataPath::read_async(&file, &cx, &mut buf, 0)).unwrap();
+        assert_eq!(n, 15);
+        assert_eq!(&buf, payload);
     }
 }

@@ -361,6 +361,11 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
     }
 }
 
+impl<F: VfsFile + crate::traits::AsyncVfsDataPath> crate::traits::AsyncVfsDataPath
+    for TracingFile<F>
+{
+}
+
 // TracingFile is Send+Sync automatically because F: VfsFile requires Send+Sync
 // and String is Send+Sync.
 
@@ -589,10 +594,7 @@ mod tests {
         let b = a;
         assert_eq!(a, b);
 
-        let c = MetricsSnapshot {
-            read_ops: 99,
-            ..a
-        };
+        let c = MetricsSnapshot { read_ops: 99, ..a };
         assert_ne!(a, c);
     }
 
@@ -790,7 +792,11 @@ mod tests {
             read_bytes_total: 999_999,
             write_bytes_total: 888_888,
         };
-        assert_eq!(snap.total_ops(), 0, "byte counters must not inflate total_ops");
+        assert_eq!(
+            snap.total_ops(),
+            0,
+            "byte counters must not inflate total_ops"
+        );
     }
 
     #[test]

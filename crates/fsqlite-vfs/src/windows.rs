@@ -1169,6 +1169,8 @@ impl VfsFile for WindowsFile {
     }
 }
 
+impl crate::traits::AsyncVfsDataPath for WindowsFile {}
+
 impl Drop for WindowsFile {
     fn drop(&mut self) {
         if !self.is_closed() || self.shm_state.is_some() {

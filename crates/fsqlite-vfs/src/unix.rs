@@ -2130,6 +2130,8 @@ impl VfsFile for UnixFile {
     }
 }
 
+impl crate::traits::AsyncVfsDataPath for UnixFile {}
+
 impl Drop for UnixFile {
     fn drop(&mut self) {
         if !self.closed {

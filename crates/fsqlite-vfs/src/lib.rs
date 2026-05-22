@@ -96,7 +96,7 @@ pub mod host_fs {
 pub use memory::{MemoryFile, MemoryVfs, MemoryVfsConfig, MemoryVfsUsageSnapshot};
 pub use metrics::{GLOBAL_VFS_METRICS, TracingFile, VfsMetrics};
 pub use shm::ShmRegion;
-pub use traits::{Vfs, VfsFile};
+pub use traits::{AsyncVfsDataPath, Vfs, VfsFile};
 #[cfg(all(feature = "native", unix))]
 pub use unix::{UnixFile, UnixVfs};
 #[cfg(all(feature = "native", target_os = "linux"))]

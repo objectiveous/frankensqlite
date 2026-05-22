@@ -1039,6 +1039,8 @@ impl VfsFile for MemoryFile {
     }
 }
 
+impl crate::traits::AsyncVfsDataPath for MemoryFile {}
+
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
@@ -2290,7 +2292,11 @@ mod tests {
         assert_eq!(file.file_size(&cx).unwrap(), 0, "empty file");
 
         file.write(&cx, &[0xAA; 100], 0).unwrap();
-        assert_eq!(file.file_size(&cx).unwrap(), 100, "after 100-byte write at 0");
+        assert_eq!(
+            file.file_size(&cx).unwrap(),
+            100,
+            "after 100-byte write at 0"
+        );
 
         file.write(&cx, &[0xBB; 50], 200).unwrap();
         assert_eq!(
@@ -2465,16 +2471,24 @@ mod tests {
     #[test]
     fn usage_snapshot_debug_clone_copy_eq() {
         let a = MemoryVfsUsageSnapshot {
-            file_bytes: 10, file_reserved_bytes: 20,
-            shm_bytes: 5, shm_reserved_bytes: 8,
-            peak_reserved_bytes: 28, growth_events: 1,
-            file_count: 1, shm_region_count: 0,
-            initial_reserve_bytes: 0, growth_chunk_bytes: 65536,
+            file_bytes: 10,
+            file_reserved_bytes: 20,
+            shm_bytes: 5,
+            shm_reserved_bytes: 8,
+            peak_reserved_bytes: 28,
+            growth_events: 1,
+            file_count: 1,
+            shm_region_count: 0,
+            initial_reserve_bytes: 0,
+            growth_chunk_bytes: 65536,
             max_bytes: None,
         };
         let copied = a;
         assert_eq!(copied, a);
-        let b = MemoryVfsUsageSnapshot { file_bytes: 99, ..a };
+        let b = MemoryVfsUsageSnapshot {
+            file_bytes: 99,
+            ..a
+        };
         assert_ne!(a, b);
         let dbg = format!("{a:?}");
         assert!(dbg.contains("MemoryVfsUsageSnapshot"));

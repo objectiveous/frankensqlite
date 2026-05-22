@@ -855,6 +855,148 @@ impl VfsFile for IoUringFile {
     }
 }
 
+#[cfg(feature = "linux-asupersync-uring")]
+impl crate::traits::AsyncVfsDataPath for IoUringFile {
+    fn read_async(
+        &self,
+        cx: &Cx,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send {
+        async move {
+            checkpoint_or_abort(cx)?;
+            let backend = match &self.asupersync_backend {
+                Some(b) if self.runtime.is_available() => b,
+                _ => return self.inner.read(cx, buf, offset),
+            };
+
+            let start = Instant::now();
+            let mut total = 0_usize;
+            while total < buf.len() {
+                checkpoint_or_abort(cx)?;
+                let chunk_end = next_chunk_end(total, buf.len());
+                let off = offset
+                    .checked_add(u64::try_from(total).expect("usize must fit into u64"))
+                    .ok_or_else(|| {
+                        FrankenError::Io(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "offset overflow during async io_uring read",
+                        ))
+                    })?;
+
+                #[cfg(test)]
+                if FORCE_ASUPERSYNC_READ_FAIL.load(Ordering::Acquire) {
+                    return Err(FrankenError::Io(io::Error::other(
+                        "forced asupersync read failure",
+                    )));
+                }
+                #[cfg(test)]
+                if FORCE_ASUPERSYNC_READ_ABORT.load(Ordering::Acquire) {
+                    return Err(FrankenError::Abort);
+                }
+
+                let bytes_read = backend
+                    .read_at(&mut buf[total..chunk_end], off)
+                    .await
+                    .map_err(FrankenError::Io)?;
+
+                if bytes_read == 0 {
+                    break;
+                }
+                total += bytes_read;
+            }
+
+            if total < buf.len() {
+                buf[total..].fill(0);
+            }
+
+            let elapsed = start.elapsed();
+            if record_io_uring_read_latency(elapsed) {
+                let snapshot = io_uring_latency_snapshot();
+                enforce_conformal_breach_policy(
+                    &self.runtime,
+                    "read",
+                    elapsed,
+                    snapshot.read_conformal_upper_bound_us,
+                    IO_URING_READ_CONFORMAL_BREACH_MSG,
+                );
+            }
+            Ok(total)
+        }
+    }
+
+    fn write_async(
+        &self,
+        cx: &Cx,
+        buf: &[u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
+            checkpoint_or_abort(cx)?;
+            let backend = match &self.asupersync_backend {
+                Some(b) if self.runtime.is_available() => b,
+                _ => {
+                    record_io_uring_write_unix_fallback();
+                    return Err(FrankenError::Unsupported);
+                }
+            };
+
+            let start = Instant::now();
+            let mut total = 0_usize;
+            while total < buf.len() {
+                checkpoint_or_abort(cx)?;
+                let chunk_end = next_chunk_end(total, buf.len());
+                let off = offset
+                    .checked_add(u64::try_from(total).expect("usize must fit into u64"))
+                    .ok_or_else(|| {
+                        FrankenError::Io(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "offset overflow during async io_uring write",
+                        ))
+                    })?;
+
+                #[cfg(test)]
+                if FORCE_ASUPERSYNC_WRITE_FAIL.load(Ordering::Acquire) {
+                    return Err(FrankenError::Io(io::Error::other(
+                        "forced asupersync write failure",
+                    )));
+                }
+                #[cfg(test)]
+                if FORCE_ASUPERSYNC_WRITE_ABORT.load(Ordering::Acquire) {
+                    return Err(FrankenError::Abort);
+                }
+
+                let advanced = backend
+                    .write_at(&buf[total..chunk_end], off)
+                    .await
+                    .map_err(FrankenError::Io)?;
+
+                if advanced == 0 {
+                    return Err(FrankenError::Io(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "async io_uring write advanced by 0 bytes",
+                    )));
+                }
+                let remaining = chunk_end - total;
+                total += advanced.min(remaining);
+            }
+
+            let elapsed = start.elapsed();
+            if record_io_uring_write_latency(elapsed) {
+                let snapshot = io_uring_latency_snapshot();
+                enforce_conformal_breach_policy(
+                    &self.runtime,
+                    "write",
+                    elapsed,
+                    snapshot.write_conformal_upper_bound_us,
+                    IO_URING_WRITE_CONFORMAL_BREACH_MSG,
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

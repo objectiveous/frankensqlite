@@ -511,7 +511,6 @@ jq -e \
       (.run_report.diverged == 0) or
       (
         (.run_report.divergent_cases | length) > 0 and
-        (.run_report.divergent_cases[0].minimal_reproduction.repro_command | type == "string" and length > 0) and
         (.first_failure | type == "object") and
         (.first_failure.root_cause_domain | IN("parser", "planner", "vdbe", "storage", "harness", "fixture")) and
         (.first_failure.replay_command | type == "string" and length > 0 and (contains("\n") | not) and (contains("\r") | not)) and

@@ -13,6 +13,11 @@ use fsqlite_harness::oracle_preflight_doctor::{
 use sha2::{Digest, Sha256};
 
 const DEFAULT_OUTPUT_DIR: &str = "artifacts/oracle-preflight-doctor";
+const RCH_STREAM_ARTIFACTS_ENV: &str = "FSQLITE_RCH_STREAM_ARTIFACTS";
+const RCH_JSON_ARTIFACT_BEGIN: &str = "__FSQLITE_RCH_JSON_ARTIFACT_BEGIN__";
+const RCH_JSON_ARTIFACT_END: &str = "__FSQLITE_RCH_JSON_ARTIFACT_END__";
+const RCH_HUMAN_ARTIFACT_BEGIN: &str = "__FSQLITE_RCH_HUMAN_ARTIFACT_BEGIN__";
+const RCH_HUMAN_ARTIFACT_END: &str = "__FSQLITE_RCH_HUMAN_ARTIFACT_END__";
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -302,6 +307,19 @@ fn write_text(path: &Path, content: &str) -> Result<(), String> {
         .map_err(|error| format!("output_write_failed path={} error={error}", path.display()))
 }
 
+fn maybe_stream_rch_artifacts(json: &str, human: &str) {
+    if env::var_os(RCH_STREAM_ARTIFACTS_ENV).is_none() {
+        return;
+    }
+
+    println!("\n{RCH_JSON_ARTIFACT_BEGIN}");
+    println!("{json}");
+    println!("{RCH_JSON_ARTIFACT_END}");
+    println!("\n{RCH_HUMAN_ARTIFACT_BEGIN}");
+    println!("{human}");
+    println!("{RCH_HUMAN_ARTIFACT_END}");
+}
+
 fn build_human_summary(report: &OraclePreflightReport) -> String {
     let mut summary = format!(
         "# Oracle Preflight Doctor ({BEAD_ID})\n\n\
@@ -394,6 +412,7 @@ fn run() -> Result<DoctorOutcome, String> {
 
     write_text(&config.output_json, &json)?;
     write_text(&config.output_human, &human)?;
+    maybe_stream_rch_artifacts(&json, &human);
 
     println!(
         "INFO oracle_preflight_doctor_report path={} outcome={} certifying={} findings={}",

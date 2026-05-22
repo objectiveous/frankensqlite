@@ -28,6 +28,11 @@ const DEFAULT_SCENARIO_ID: &str = "DIFF-712";
 const DEFAULT_OUTPUT_PREFIX: &str = "artifacts/differential-manifest";
 const MANIFEST_JSON_ARTIFACT_ENTRY: &str = "differential_manifest_json";
 const MANIFEST_SUMMARY_ARTIFACT_ENTRY: &str = "differential_manifest_summary";
+const RCH_STREAM_ARTIFACTS_ENV: &str = "FSQLITE_RCH_STREAM_ARTIFACTS";
+const RCH_JSON_ARTIFACT_BEGIN: &str = "__FSQLITE_RCH_JSON_ARTIFACT_BEGIN__";
+const RCH_JSON_ARTIFACT_END: &str = "__FSQLITE_RCH_JSON_ARTIFACT_END__";
+const RCH_HUMAN_ARTIFACT_BEGIN: &str = "__FSQLITE_RCH_HUMAN_ARTIFACT_BEGIN__";
+const RCH_HUMAN_ARTIFACT_END: &str = "__FSQLITE_RCH_HUMAN_ARTIFACT_END__";
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -554,6 +559,19 @@ fn write_text(path: &Path, content: &str) -> Result<(), String> {
     }
     fs::write(path, content)
         .map_err(|error| format!("output_write_failed path={} error={error}", path.display()))
+}
+
+fn maybe_stream_rch_artifacts(json: &str, human: &str) {
+    if env::var_os(RCH_STREAM_ARTIFACTS_ENV).is_none() {
+        return;
+    }
+
+    println!("\n{RCH_JSON_ARTIFACT_BEGIN}");
+    println!("{json}");
+    println!("{RCH_JSON_ARTIFACT_END}");
+    println!("\n{RCH_HUMAN_ARTIFACT_BEGIN}");
+    println!("{human}");
+    println!("{RCH_HUMAN_ARTIFACT_END}");
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -1226,6 +1244,7 @@ fn run() -> Result<bool, String> {
 
     write_text(&config.output_json, &json)?;
     write_text(&config.output_human, &human)?;
+    maybe_stream_rch_artifacts(&json, &human);
 
     println!(
         "INFO differential_manifest_written path={} diverged={} total_cases={} data_hash={}",

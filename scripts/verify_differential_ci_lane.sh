@@ -99,6 +99,10 @@ DOCTOR_JSON="${DOCTOR_DIR}/oracle_preflight_doctor.json"
 DOCTOR_MD="${DOCTOR_DIR}/oracle_preflight_doctor.md"
 DOCTOR_LOG="${DOCTOR_DIR}/oracle_preflight_doctor_runner.log"
 FIXTURE_ROOT_MANIFEST="${WORKSPACE_ROOT}/docs/contracts/corpus_manifest.toml"
+RCH_JSON_ARTIFACT_BEGIN="__FSQLITE_RCH_JSON_ARTIFACT_BEGIN__"
+RCH_JSON_ARTIFACT_END="__FSQLITE_RCH_JSON_ARTIFACT_END__"
+RCH_HUMAN_ARTIFACT_BEGIN="__FSQLITE_RCH_HUMAN_ARTIFACT_BEGIN__"
+RCH_HUMAN_ARTIFACT_END="__FSQLITE_RCH_HUMAN_ARTIFACT_END__"
 
 mkdir -p "${RUN_A}" "${RUN_B}" "${DOCTOR_DIR}"
 
@@ -148,6 +152,14 @@ if [[ -n "${CFLAGS:-}" ]]; then
     RCH_PREFIX+=(env)
   fi
   RCH_PREFIX+=("CFLAGS=${CFLAGS}")
+fi
+REMOTE_ARTIFACT_STREAM=0
+if [[ "${FORCE_RCH}" == "1" || "${DIFF_LANE_USE_RCH:-0}" == "1" ]]; then
+  REMOTE_ARTIFACT_STREAM=1
+  if [[ ${#RCH_PREFIX[@]} -eq 3 ]]; then
+    RCH_PREFIX+=(env)
+  fi
+  RCH_PREFIX+=("FSQLITE_RCH_STREAM_ARTIFACTS=1")
 fi
 
 RUNNER_BIN="${DIFF_LANE_RUNNER_BIN:-}"
@@ -225,6 +237,19 @@ run_manifest() {
   run_status=$?
   set -e
 
+  if [[ "${REMOTE_ARTIFACT_STREAM}" == "1" ]]; then
+    hydrate_marked_artifact \
+      "${runner_log}" \
+      "${RCH_JSON_ARTIFACT_BEGIN}" \
+      "${RCH_JSON_ARTIFACT_END}" \
+      "${output_json}" || true
+    hydrate_marked_artifact \
+      "${runner_log}" \
+      "${RCH_HUMAN_ARTIFACT_BEGIN}" \
+      "${RCH_HUMAN_ARTIFACT_END}" \
+      "${output_human}" || true
+  fi
+
   # 0 => no divergences; 1 => divergences present (warning-mode acceptable)
   if [[ ${run_status} -ne 0 && ${run_status} -ne 1 ]]; then
     echo "ERROR: differential_manifest_runner failed unexpectedly (exit=${run_status})" >&2
@@ -234,6 +259,28 @@ run_manifest() {
   fi
 
   printf '%s' "${run_status}"
+}
+
+hydrate_marked_artifact() {
+  local log_path="$1"
+  local begin_marker="$2"
+  local end_marker="$3"
+  local output_path="$4"
+
+  if [[ -s "${output_path}" ]]; then
+    return 0
+  fi
+
+  awk \
+    -v begin_marker="${begin_marker}" \
+    -v end_marker="${end_marker}" \
+    '
+      $0 == begin_marker { capture = 1; found = 1; next }
+      $0 == end_marker { capture = 0; next }
+      capture { print }
+      END { exit found ? 0 : 1 }
+    ' \
+    "${log_path}" >"${output_path}"
 }
 
 run_doctor() {
@@ -255,6 +302,19 @@ run_doctor() {
   doctor_status=$?
   set -e
 
+  if [[ "${REMOTE_ARTIFACT_STREAM}" == "1" ]]; then
+    hydrate_marked_artifact \
+      "${DOCTOR_LOG}" \
+      "${RCH_JSON_ARTIFACT_BEGIN}" \
+      "${RCH_JSON_ARTIFACT_END}" \
+      "${DOCTOR_JSON}" || true
+    hydrate_marked_artifact \
+      "${DOCTOR_LOG}" \
+      "${RCH_HUMAN_ARTIFACT_BEGIN}" \
+      "${RCH_HUMAN_ARTIFACT_END}" \
+      "${DOCTOR_MD}" || true
+  fi
+
   # 0 => green (certifying), 1 => yellow (non-certifying warning), 2 => red (blocking)
   if [[ ${doctor_status} -eq 2 ]]; then
     echo "ERROR: oracle preflight doctor reported red (blocking) condition (exit=${doctor_status})" >&2
@@ -270,7 +330,7 @@ run_doctor() {
     exit 1
   fi
 
-  if [[ ! -f "${DOCTOR_JSON}" ]]; then
+  if [[ ! -s "${DOCTOR_JSON}" ]]; then
     echo "ERROR: oracle preflight doctor output missing at ${DOCTOR_JSON}" >&2
     exit 1
   fi
@@ -290,12 +350,12 @@ if [[ "${run_a_status}" != "${run_b_status}" ]]; then
   exit 1
 fi
 
-if [[ ! -f "${MANIFEST_A}" || ! -f "${MANIFEST_B}" ]]; then
+if [[ ! -s "${MANIFEST_A}" || ! -s "${MANIFEST_B}" ]]; then
   echo "ERROR: differential manifest output missing" >&2
   exit 1
 fi
 
-if [[ ! -f "${SUMMARY_A}" || ! -f "${SUMMARY_B}" ]]; then
+if [[ ! -s "${SUMMARY_A}" || ! -s "${SUMMARY_B}" ]]; then
   echo "ERROR: differential human summary output missing" >&2
   exit 1
 fi
@@ -324,7 +384,21 @@ jq -e \
       (.run_report.diverged == 0) or
       (
         (.run_report.divergent_cases | length) > 0 and
-        (.run_report.divergent_cases[0].minimal_reproduction.repro_command | type == "string" and length > 0)
+        (.run_report.divergent_cases[0].minimal_reproduction.repro_command | type == "string" and length > 0) and
+        (.first_failure | type == "object") and
+        (.first_failure.root_cause_domain | IN("parser", "planner", "vdbe", "storage", "harness", "fixture")) and
+        (.first_failure.replay_command | type == "string" and length > 0 and (contains("\n") | not) and (contains("\r") | not)) and
+        (.first_failure.diagnostic_json_pointer | type == "string" and length > 0) and
+        (.first_failure.remediation_playbook.summary | type == "string" and length > 0) and
+        (.first_failure.remediation_playbook.evidence_json_pointer | type == "string" and length > 0) and
+        (.first_failure.remediation_playbook.owner_hint | type == "string" and length > 0) and
+        (.first_failure.remediation_playbook.next_commands | type == "array" and length > 0) and
+        (all(.first_failure.remediation_playbook.next_commands[]; type == "string" and length > 0 and (contains("\n") | not) and (contains("\r") | not))) and
+        (.first_failure.artifact_entries | type == "array") and
+        (
+          (.run_report.divergent_cases[0].minimal_reproduction == null) or
+          (.first_failure.minimal_reproduction_json_pointer == "/run_report/divergent_cases/0/minimal_reproduction")
+        )
       )
     )
   ' "${MANIFEST_A}" >/dev/null
@@ -359,6 +433,17 @@ FIRST_FAILURE_REPLAY_COMMAND="$(
     '.first_failure.replay_command // .run_report.divergent_cases[0].minimal_reproduction.repro_command // ""' \
     "${MANIFEST_A}"
 )"
+FIRST_FAILURE_ROOT_CAUSE_DOMAIN="$(jq -r '.first_failure.root_cause_domain // ""' "${MANIFEST_A}")"
+FIRST_FAILURE_REMEDIATION_SUMMARY="$(jq -r '.first_failure.remediation_playbook.summary // ""' "${MANIFEST_A}")"
+FIRST_FAILURE_REMEDIATION_EVIDENCE="$(jq -r '.first_failure.remediation_playbook.evidence_json_pointer // ""' "${MANIFEST_A}")"
+FIRST_FAILURE_REMEDIATION_OWNER="$(jq -r '.first_failure.remediation_playbook.owner_hint // ""' "${MANIFEST_A}")"
+FIRST_FAILURE_REMEDIATION_NEXT_COMMANDS="$(
+  jq -c '.first_failure.remediation_playbook.next_commands // []' "${MANIFEST_A}"
+)"
+FIRST_FAILURE_MINIMAL_REPRO_POINTER="$(
+  jq -r '.first_failure.minimal_reproduction_json_pointer // ""' "${MANIFEST_A}"
+)"
+FIRST_FAILURE_ARTIFACT_ENTRIES="$(jq -c '.first_failure.artifact_entries // []' "${MANIFEST_A}")"
 SAMPLED_PASSING_REPLAY_COUNT="$(
   jq -r \
     'if has("sampled_passing_replays") then (.sampled_passing_replays | length) else 0 end' \
@@ -418,17 +503,24 @@ if ${JSON_OUTPUT}; then
     --argjson dedup_total_count "${DEDUP_TOTAL_COUNT}" \
     --arg replay_command "${REPLAY_COMMAND}" \
     --arg first_failure_replay_command "${FIRST_FAILURE_REPLAY_COMMAND}" \
+    --arg first_failure_root_cause_domain "${FIRST_FAILURE_ROOT_CAUSE_DOMAIN}" \
+    --arg first_failure_remediation_summary "${FIRST_FAILURE_REMEDIATION_SUMMARY}" \
+    --arg first_failure_remediation_evidence "${FIRST_FAILURE_REMEDIATION_EVIDENCE}" \
+    --arg first_failure_remediation_owner "${FIRST_FAILURE_REMEDIATION_OWNER}" \
+    --argjson first_failure_remediation_next_commands "${FIRST_FAILURE_REMEDIATION_NEXT_COMMANDS}" \
+    --arg first_failure_minimal_repro_pointer "${FIRST_FAILURE_MINIMAL_REPRO_POINTER}" \
+    --argjson first_failure_artifact_entries "${FIRST_FAILURE_ARTIFACT_ENTRIES}" \
     --argjson sampled_passing_replay_count "${SAMPLED_PASSING_REPLAY_COUNT}" \
     --arg mismatch_class_counts "${MISMATCH_CLASS_COUNTS}" \
-    --arg manifest_a "${MANIFEST_A#${WORKSPACE_ROOT}/}" \
-    --arg manifest_b "${MANIFEST_B#${WORKSPACE_ROOT}/}" \
-    --arg summary_a "${SUMMARY_A#${WORKSPACE_ROOT}/}" \
-    --arg summary_b "${SUMMARY_B#${WORKSPACE_ROOT}/}" \
-    --arg runner_log_a "${RUN_A_LOG#${WORKSPACE_ROOT}/}" \
-    --arg runner_log_b "${RUN_B_LOG#${WORKSPACE_ROOT}/}" \
-    --arg doctor_json "${DOCTOR_JSON#${WORKSPACE_ROOT}/}" \
-    --arg doctor_human "${DOCTOR_MD#${WORKSPACE_ROOT}/}" \
-    --arg doctor_log "${DOCTOR_LOG#${WORKSPACE_ROOT}/}" \
+    --arg manifest_a "${MANIFEST_A#"${WORKSPACE_ROOT}"/}" \
+    --arg manifest_b "${MANIFEST_B#"${WORKSPACE_ROOT}"/}" \
+    --arg summary_a "${SUMMARY_A#"${WORKSPACE_ROOT}"/}" \
+    --arg summary_b "${SUMMARY_B#"${WORKSPACE_ROOT}"/}" \
+    --arg runner_log_a "${RUN_A_LOG#"${WORKSPACE_ROOT}"/}" \
+    --arg runner_log_b "${RUN_B_LOG#"${WORKSPACE_ROOT}"/}" \
+    --arg doctor_json "${DOCTOR_JSON#"${WORKSPACE_ROOT}"/}" \
+    --arg doctor_human "${DOCTOR_MD#"${WORKSPACE_ROOT}"/}" \
+    --arg doctor_log "${DOCTOR_LOG#"${WORKSPACE_ROOT}"/}" \
     --argjson promotion_criteria "$(printf '%s\n' "${PROMOTION_CRITERIA[@]}" | jq -R . | jq -s .)" \
     '
       {
@@ -477,7 +569,21 @@ if ${JSON_OUTPUT}; then
           doctor_log: $doctor_log
         },
         replay_command: $replay_command,
-        first_failure_replay_command: $first_failure_replay_command
+        first_failure_replay_command: $first_failure_replay_command,
+        first_failure: if $diverged_cases == 0 then null else {
+          replay_command: $first_failure_replay_command,
+          root_cause_domain: $first_failure_root_cause_domain,
+          remediation_playbook: {
+            summary: $first_failure_remediation_summary,
+            evidence_json_pointer: $first_failure_remediation_evidence,
+            owner_hint: $first_failure_remediation_owner,
+            next_commands: $first_failure_remediation_next_commands
+          },
+          minimal_reproduction_json_pointer: (
+            if $first_failure_minimal_repro_pointer == "" then null else $first_failure_minimal_repro_pointer end
+          ),
+          artifact_entries: $first_failure_artifact_entries
+        } end
       }
     '
 else
@@ -489,7 +595,7 @@ else
   echo "Commit SHA:           ${COMMIT_SHA}"
   echo "Root seed:            ${ROOT_SEED}"
   echo "Generated unix ms:    ${GENERATED_UNIX_MS}"
-  echo "Fixture manifest:     ${FIXTURE_ROOT_MANIFEST#${WORKSPACE_ROOT}/}"
+  echo "Fixture manifest:     ${FIXTURE_ROOT_MANIFEST#"${WORKSPACE_ROOT}"/}"
   echo "Fixture sha256:       ${FIXTURE_ROOT_MANIFEST_SHA256}"
   echo "Doctor exit code:     ${doctor_status}"
   echo "Doctor outcome:       ${DOCTOR_OUTCOME}"
@@ -505,12 +611,12 @@ else
   echo "Dedup total:          ${DEDUP_TOTAL_COUNT}"
   echo "Mismatch classes:     ${MISMATCH_CLASS_COUNTS}"
   echo "Sampled pass replays: ${SAMPLED_PASSING_REPLAY_COUNT}"
-  echo "Manifest A:           ${MANIFEST_A#${WORKSPACE_ROOT}/}"
-  echo "Manifest B:           ${MANIFEST_B#${WORKSPACE_ROOT}/}"
-  echo "Runner log A:         ${RUN_A_LOG#${WORKSPACE_ROOT}/}"
-  echo "Runner log B:         ${RUN_B_LOG#${WORKSPACE_ROOT}/}"
-  echo "Doctor report:        ${DOCTOR_JSON#${WORKSPACE_ROOT}/}"
-  echo "Doctor log:           ${DOCTOR_LOG#${WORKSPACE_ROOT}/}"
+  echo "Manifest A:           ${MANIFEST_A#"${WORKSPACE_ROOT}"/}"
+  echo "Manifest B:           ${MANIFEST_B#"${WORKSPACE_ROOT}"/}"
+  echo "Runner log A:         ${RUN_A_LOG#"${WORKSPACE_ROOT}"/}"
+  echo "Runner log B:         ${RUN_B_LOG#"${WORKSPACE_ROOT}"/}"
+  echo "Doctor report:        ${DOCTOR_JSON#"${WORKSPACE_ROOT}"/}"
+  echo "Doctor log:           ${DOCTOR_LOG#"${WORKSPACE_ROOT}"/}"
   echo "Promotion criteria:"
   for criterion in "${PROMOTION_CRITERIA[@]}"; do
     echo "  - ${criterion}"
@@ -518,6 +624,23 @@ else
   echo "Replay command:"
   echo "  ${REPLAY_COMMAND}"
   if [[ -n "${FIRST_FAILURE_REPLAY_COMMAND}" ]]; then
+    echo "First-failure root cause:"
+    echo "  ${FIRST_FAILURE_ROOT_CAUSE_DOMAIN}"
+    echo "First-failure remediation:"
+    echo "  Summary: ${FIRST_FAILURE_REMEDIATION_SUMMARY}"
+    echo "  Evidence: ${FIRST_FAILURE_REMEDIATION_EVIDENCE}"
+    echo "  Owner: ${FIRST_FAILURE_REMEDIATION_OWNER}"
+    if [[ -n "${FIRST_FAILURE_MINIMAL_REPRO_POINTER}" ]]; then
+      echo "  Minimal repro: ${FIRST_FAILURE_MINIMAL_REPRO_POINTER}"
+    fi
+    echo "First-failure remediation commands:"
+    while IFS= read -r command; do
+      echo "  - ${command}"
+    done < <(jq -r '.[]' <<<"${FIRST_FAILURE_REMEDIATION_NEXT_COMMANDS}")
+    echo "First-failure artifact entries:"
+    while IFS= read -r artifact_entry; do
+      echo "  - ${artifact_entry}"
+    done < <(jq -r '.[]' <<<"${FIRST_FAILURE_ARTIFACT_ENTRIES}")
     echo "First-failure replay command:"
     echo "  ${FIRST_FAILURE_REPLAY_COMMAND}"
   fi

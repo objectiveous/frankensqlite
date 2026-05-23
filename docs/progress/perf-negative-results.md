@@ -12,6 +12,36 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-23 - VDBE `Opcode::Variable` hot-dispatch promotion
+
+- Target: `vdbe_pipeline_execute_variable` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, added during this pass to
+  isolate bound-parameter load dispatch cost with one owned integer binding and
+  repeated `Opcode::Variable` loads into a stable destination register.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate threaded
+  `borrowed_bindings` into `try_execute_hot_opcode` and added a byte-equivalent
+  `Opcode::Variable` arm that preserved borrowed-binding precedence, owned
+  binding fallback, and NULL for unbound parameters. The source patch was
+  unwound after measurement.
+- Evidence:
+  baseline command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-variable-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_variable --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=900.16 ns`, `256=3.5429 us`, `1024=17.421 us`.
+  Candidate command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-variable-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_variable --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=1.0468 us`, `256=4.0193 us`, `1024=13.806 us`.
+- Result: rejected. The large 1024-op stream improved, but 64- and 256-op
+  streams regressed materially. Real SQL statements normally carry a small to
+  medium number of parameter loads, so the mixed result is not a safe standalone
+  dispatch promotion.
+- Do not retry `Opcode::Variable` hot-dispatch promotion as a standalone patch.
+  Reconsider only if a real prepared-statement workload with many parameter
+  loads shows `Variable` dominating and the candidate improves that workload
+  without regressing short and medium parameter-load streams.
+
 ## 2026-05-23 - VDBE NotNull hot-dispatch promotion
 
 - Target: `vdbe_pipeline_execute_notnull` in

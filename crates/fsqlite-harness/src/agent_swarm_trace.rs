@@ -22,6 +22,9 @@ pub const SWARM_TRACE_SCHEMA_VERSION: &str = "1.0.0";
 /// Version of the privacy scrubber contract.
 pub const SWARM_TRACE_SCRUBBER_VERSION: &str = "1.0.0";
 
+/// Version of the fixed-seed synthetic trace generator.
+pub const SYNTHETIC_TRACE_GENERATOR_VERSION: &str = "1.0.0";
+
 /// Marker used in structured logs when no failure diagnostic exists yet.
 pub const FIRST_FAILURE_DIAGNOSTIC_ABSENT: &str = "none";
 
@@ -368,6 +371,224 @@ impl RedactionSummary {
     }
 }
 
+/// Workload family used by the deterministic synthetic trace generator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyntheticTraceScenario {
+    /// Agents append session events and tool-call logs.
+    SessionEventAppend,
+    /// Agents repeatedly claim, update, and complete task-queue rows.
+    TaskQueueClaimLoop,
+    /// Artifact index writes are mixed with read-heavy metadata lookups.
+    ArtifactIndexMixedLookup,
+    /// Many agents update shared counters and status rows.
+    HotCounterStatusRows,
+    /// Long readers overlap with bursty writers.
+    LongReaderBurstWriter,
+}
+
+impl SyntheticTraceScenario {
+    /// Stable scenario identifier used in trace and log metadata.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionEventAppend => "session_event_append",
+            Self::TaskQueueClaimLoop => "task_queue_claim_loop",
+            Self::ArtifactIndexMixedLookup => "artifact_index_mixed_lookup",
+            Self::HotCounterStatusRows => "hot_counter_status_rows",
+            Self::LongReaderBurstWriter => "long_reader_burst_writer",
+        }
+    }
+
+    fn expected_contention_shape(self, hot_key_ratio: u8) -> String {
+        let skew = match hot_key_ratio {
+            0..=24 => "low_skew",
+            25..=74 => "mixed_skew",
+            _ => "high_skew",
+        };
+        let base = match self {
+            Self::SessionEventAppend => "append_heavy_session_streams",
+            Self::TaskQueueClaimLoop => "claim_update_status_rows",
+            Self::ArtifactIndexMixedLookup => "metadata_read_write_mix",
+            Self::HotCounterStatusRows => "shared_counter_hotspots",
+            Self::LongReaderBurstWriter => "long_reader_writer_overlap",
+        };
+        format!("{base}:{skew}")
+    }
+
+    fn target_invariants(self) -> &'static str {
+        match self {
+            Self::SessionEventAppend => {
+                "schema_conformance,deterministic_seed,transaction_boundaries,append_order_shape"
+            }
+            Self::TaskQueueClaimLoop => {
+                "schema_conformance,deterministic_seed,transaction_boundaries,no_double_claim_shape"
+            }
+            Self::ArtifactIndexMixedLookup => {
+                "schema_conformance,deterministic_seed,transaction_boundaries,read_write_shape"
+            }
+            Self::HotCounterStatusRows => {
+                "schema_conformance,deterministic_seed,transaction_boundaries,hotspot_conflict_shape"
+            }
+            Self::LongReaderBurstWriter => {
+                "schema_conformance,deterministic_seed,transaction_boundaries,mvcc_visibility_shape"
+            }
+        }
+    }
+
+    fn phase(self, is_read: bool) -> &'static str {
+        match (self, is_read) {
+            (Self::SessionEventAppend, true) => "session-read",
+            (Self::SessionEventAppend, false) => "session-append",
+            (Self::TaskQueueClaimLoop, true) => "queue-peek",
+            (Self::TaskQueueClaimLoop, false) => "queue-claim",
+            (Self::ArtifactIndexMixedLookup, true) => "artifact-lookup",
+            (Self::ArtifactIndexMixedLookup, false) => "artifact-index-write",
+            (Self::HotCounterStatusRows, true) => "counter-read",
+            (Self::HotCounterStatusRows, false) => "counter-update",
+            (Self::LongReaderBurstWriter, true) => "long-read",
+            (Self::LongReaderBurstWriter, false) => "bursty-write",
+        }
+    }
+}
+
+/// All synthetic scenario families currently emitted by the replay lab.
+pub const SYNTHETIC_TRACE_SCENARIOS: [SyntheticTraceScenario; 5] = [
+    SyntheticTraceScenario::SessionEventAppend,
+    SyntheticTraceScenario::TaskQueueClaimLoop,
+    SyntheticTraceScenario::ArtifactIndexMixedLookup,
+    SyntheticTraceScenario::HotCounterStatusRows,
+    SyntheticTraceScenario::LongReaderBurstWriter,
+];
+
+/// Configuration for deterministic synthetic agent-swarm trace generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyntheticTraceConfig {
+    /// Workload family to synthesize.
+    pub scenario: SyntheticTraceScenario,
+    /// Fixed seed for deterministic generation.
+    pub seed: u64,
+    /// Number of logical agents represented in the trace.
+    pub agent_count: usize,
+    /// Number of transactions to emit.
+    pub transaction_count: usize,
+    /// Relative read weight in the transaction mix.
+    pub read_weight: u16,
+    /// Relative write weight in the transaction mix.
+    pub write_weight: u16,
+    /// Percentage of transactions routed to hot keys, from 0 to 100.
+    pub hot_key_ratio: u8,
+}
+
+impl SyntheticTraceConfig {
+    /// Create a synthetic trace configuration.
+    pub const fn new(
+        scenario: SyntheticTraceScenario,
+        seed: u64,
+        agent_count: usize,
+        transaction_count: usize,
+    ) -> Self {
+        Self {
+            scenario,
+            seed,
+            agent_count,
+            transaction_count,
+            read_weight: 40,
+            write_weight: 60,
+            hot_key_ratio: 70,
+        }
+    }
+
+    /// Override the read/write transaction mix.
+    pub const fn with_read_write_mix(mut self, read_weight: u16, write_weight: u16) -> Self {
+        self.read_weight = read_weight;
+        self.write_weight = write_weight;
+        self
+    }
+
+    /// Override the hot-key skew percentage.
+    pub const fn with_hot_key_ratio(mut self, hot_key_ratio: u8) -> Self {
+        self.hot_key_ratio = hot_key_ratio;
+        self
+    }
+
+    /// Stable read/write mix label used in metadata and logs.
+    pub fn read_write_mix(&self) -> String {
+        format!("read:{}:write:{}", self.read_weight, self.write_weight)
+    }
+
+    fn validate(&self) -> Result<(), SyntheticTraceError> {
+        if self.agent_count == 0 {
+            return Err(SyntheticTraceError::AgentCountZero);
+        }
+        if self.transaction_count == 0 {
+            return Err(SyntheticTraceError::TransactionCountZero);
+        }
+        if self.read_write_total() == 0 {
+            return Err(SyntheticTraceError::EmptyReadWriteMix);
+        }
+        if self.hot_key_ratio > 100 {
+            return Err(SyntheticTraceError::HotKeyRatioOutOfRange(
+                self.hot_key_ratio,
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_write_total(&self) -> u64 {
+        u64::from(self.read_weight) + u64::from(self.write_weight)
+    }
+
+    fn choose_read(&self, rng: &mut SyntheticTraceRng) -> bool {
+        rng.next_bounded(self.read_write_total()) < u64::from(self.read_weight)
+    }
+}
+
+/// Error raised while generating a synthetic trace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyntheticTraceError {
+    /// `agent_count` must be greater than zero.
+    AgentCountZero,
+    /// `transaction_count` must be greater than zero.
+    TransactionCountZero,
+    /// At least one read or write weight must be non-zero.
+    EmptyReadWriteMix,
+    /// Hot-key skew is a percentage and must be at most 100.
+    HotKeyRatioOutOfRange(u8),
+    /// Generated raw trace data failed schema validation.
+    Trace(TraceScrubError),
+}
+
+impl fmt::Display for SyntheticTraceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AgentCountZero => {
+                f.write_str("synthetic trace agent_count must be greater than zero")
+            }
+            Self::TransactionCountZero => {
+                f.write_str("synthetic trace transaction_count must be greater than zero")
+            }
+            Self::EmptyReadWriteMix => {
+                f.write_str("synthetic trace read/write mix must include at least one operation")
+            }
+            Self::HotKeyRatioOutOfRange(value) => {
+                write!(
+                    f,
+                    "synthetic trace hot_key_ratio must be <= 100, got {value}"
+                )
+            }
+            Self::Trace(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for SyntheticTraceError {}
+
+impl From<TraceScrubError> for SyntheticTraceError {
+    fn from(value: TraceScrubError) -> Self {
+        Self::Trace(value)
+    }
+}
+
 /// Error raised while validating trace fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TraceScrubError {
@@ -472,6 +693,53 @@ pub fn scrub_sql_statement(sql: &str) -> ScrubbedSql {
     }
 }
 
+/// Generate a deterministic synthetic trace from a fixed seed and workload mix.
+pub fn generate_synthetic_swarm_trace(
+    config: SyntheticTraceConfig,
+) -> Result<AgentSwarmTrace, SyntheticTraceError> {
+    config.validate()?;
+
+    let mut rng = SyntheticTraceRng::new(config.seed);
+    let mut statements = Vec::with_capacity(config.transaction_count.saturating_mul(3));
+    let mut logical_order = 0_u64;
+
+    for tx_index in 0..config.transaction_count {
+        let context = synthetic_transaction_context(&config, &mut rng, tx_index);
+        statements.push(synthetic_statement(
+            logical_order,
+            &context,
+            SyntheticStatementSpec::begin(),
+        )?);
+        logical_order += 1;
+
+        let is_read = config.choose_read(&mut rng);
+        let sequence = rng.next_u64();
+        statements.push(synthetic_statement(
+            logical_order,
+            &context,
+            synthetic_operation_spec(&config, &context, sequence, is_read),
+        )?);
+        logical_order += 1;
+
+        statements.push(synthetic_statement(
+            logical_order,
+            &context,
+            SyntheticStatementSpec::commit(),
+        )?);
+        logical_order += 1;
+    }
+
+    let trace = AgentSwarmTrace::new(
+        synthetic_trace_id(&config),
+        synthetic_run_id(&config),
+        synthetic_scenario_id(config.scenario),
+        synthetic_trace_metadata(&config)?,
+        statements,
+    )?;
+    log_synthetic_swarm_trace_generation(&config, &trace, None);
+    Ok(trace)
+}
+
 /// Emit the structured summary fields required by replay-lab operators.
 pub fn log_swarm_trace_scrub_summary(trace: &AgentSwarmTrace, first_failure_diag: Option<&str>) {
     tracing::info!(
@@ -486,6 +754,277 @@ pub fn log_swarm_trace_scrub_summary(trace: &AgentSwarmTrace, first_failure_diag
         first_failure_diag = first_failure_diag.unwrap_or(FIRST_FAILURE_DIAGNOSTIC_ABSENT),
         "agent swarm trace scrub summary",
     );
+}
+
+/// Emit the structured fields required for synthetic trace generation logs.
+pub fn log_synthetic_swarm_trace_generation(
+    config: &SyntheticTraceConfig,
+    trace: &AgentSwarmTrace,
+    first_failure_diag: Option<&str>,
+) {
+    tracing::info!(
+        target: "fsqlite.agent_swarm_trace.synthetic",
+        trace_id = %trace.trace_id,
+        run_id = %trace.run_id,
+        scenario_id = %trace.scenario_id,
+        seed = config.seed,
+        agent_count = config.agent_count,
+        transaction_count = config.transaction_count,
+        hot_key_ratio = config.hot_key_ratio,
+        read_write_mix = %config.read_write_mix(),
+        generator_version = SYNTHETIC_TRACE_GENERATOR_VERSION,
+        first_failure_diag = first_failure_diag.unwrap_or(FIRST_FAILURE_DIAGNOSTIC_ABSENT),
+        "synthetic agent swarm trace generated",
+    );
+}
+
+struct SyntheticTraceRng {
+    state: u64,
+}
+
+impl SyntheticTraceRng {
+    const fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut value = self.state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        value ^ (value >> 31)
+    }
+
+    fn next_bounded(&mut self, bound: u64) -> u64 {
+        debug_assert!(bound > 0);
+        self.next_u64() % bound
+    }
+
+    fn choose_hot_key(&mut self, hot_key_ratio: u8) -> bool {
+        self.next_bounded(100) < u64::from(hot_key_ratio)
+    }
+}
+
+struct SyntheticTxnContext {
+    actor_id: String,
+    connection_id: String,
+    transaction_id: String,
+    concurrency_group: String,
+    workload_key: String,
+    source_prefix: String,
+}
+
+struct SyntheticStatementSpec {
+    boundary: TransactionBoundary,
+    workload_phase: &'static str,
+    sql: String,
+    expected_result_class: ExpectedResultClass,
+    row_count_class: RowCountClass,
+}
+
+impl SyntheticStatementSpec {
+    fn begin() -> Self {
+        Self {
+            boundary: TransactionBoundary::Begin,
+            workload_phase: "transaction-begin",
+            sql: "BEGIN CONCURRENT".to_owned(),
+            expected_result_class: ExpectedResultClass::Success,
+            row_count_class: RowCountClass::Zero,
+        }
+    }
+
+    fn commit() -> Self {
+        Self {
+            boundary: TransactionBoundary::Commit,
+            workload_phase: "transaction-commit",
+            sql: "COMMIT".to_owned(),
+            expected_result_class: ExpectedResultClass::Success,
+            row_count_class: RowCountClass::Zero,
+        }
+    }
+}
+
+fn synthetic_transaction_context(
+    config: &SyntheticTraceConfig,
+    rng: &mut SyntheticTraceRng,
+    tx_index: usize,
+) -> SyntheticTxnContext {
+    let agent_index = rng.next_bounded(config.agent_count as u64);
+    let actor_id = format!("agent-{agent_index:04}");
+    let connection_slot = rng.next_bounded(4);
+    let connection_id = format!("{actor_id}-conn-{connection_slot:02}");
+    let transaction_id = format!("txn-{}-{tx_index:08}", config.scenario.as_str());
+    let workload_key = synthetic_workload_key(config, rng);
+    let key_temperature = if workload_key.starts_with("hot-") {
+        "hot"
+    } else {
+        "cold"
+    };
+    let concurrency_group = format!(
+        "{}-{key_temperature}-{}",
+        config.scenario.as_str(),
+        workload_key
+    );
+    let source_prefix = format!("{}:{tx_index:08}", config.scenario.as_str());
+
+    SyntheticTxnContext {
+        actor_id,
+        connection_id,
+        transaction_id,
+        concurrency_group,
+        workload_key,
+        source_prefix,
+    }
+}
+
+fn synthetic_workload_key(config: &SyntheticTraceConfig, rng: &mut SyntheticTraceRng) -> String {
+    if rng.choose_hot_key(config.hot_key_ratio) {
+        let hot_set = (config.agent_count.max(1) as u64).min(16);
+        format!("hot-{:02}", rng.next_bounded(hot_set))
+    } else {
+        format!("cold-{:08x}", rng.next_u64() & 0xFFFF_FFFF)
+    }
+}
+
+fn synthetic_statement(
+    logical_order: u64,
+    context: &SyntheticTxnContext,
+    spec: SyntheticStatementSpec,
+) -> Result<TraceStatement, SyntheticTraceError> {
+    let logical_timestamp = format!("tick-{logical_order:012}");
+    let source_ref = format!("{}:stmt-{logical_order:012}", context.source_prefix);
+    Ok(TraceStatement::from_raw(RawTraceStatement {
+        logical_order,
+        logical_timestamp: Some(&logical_timestamp),
+        actor_id: &context.actor_id,
+        connection_id: &context.connection_id,
+        transaction_id: Some(&context.transaction_id),
+        transaction_boundary: spec.boundary,
+        concurrency_group: &context.concurrency_group,
+        workload_phase: spec.workload_phase,
+        sql: &spec.sql,
+        expected_result_class: spec.expected_result_class,
+        row_count_class: spec.row_count_class,
+        error_class: None,
+        source: StatementSource::new("synthetic-generator", source_ref)?,
+    })?)
+}
+
+fn synthetic_operation_spec(
+    config: &SyntheticTraceConfig,
+    context: &SyntheticTxnContext,
+    sequence: u64,
+    is_read: bool,
+) -> SyntheticStatementSpec {
+    let key = &context.workload_key;
+    let actor = &context.actor_id;
+    let sequence_bucket = sequence % 1_000_000;
+    let sql = match (config.scenario, is_read) {
+        (SyntheticTraceScenario::SessionEventAppend, true) => format!(
+            "SELECT COUNT(*) FROM session_events WHERE session_id = '{key}' AND agent_id = '{actor}';"
+        ),
+        (SyntheticTraceScenario::SessionEventAppend, false) => format!(
+            "INSERT INTO session_events(session_id, agent_id, event_kind, payload, seq) VALUES ('{key}', '{actor}', 'tool_call', 'payload-{sequence_bucket}', {sequence_bucket});"
+        ),
+        (SyntheticTraceScenario::TaskQueueClaimLoop, true) => format!(
+            "SELECT id, status FROM task_queue WHERE shard = '{key}' AND status = 'ready' ORDER BY priority DESC LIMIT 1;"
+        ),
+        (SyntheticTraceScenario::TaskQueueClaimLoop, false) => format!(
+            "UPDATE task_queue SET status = 'claimed', owner = '{actor}', claim_seq = {sequence_bucket} WHERE shard = '{key}' AND status = 'ready';"
+        ),
+        (SyntheticTraceScenario::ArtifactIndexMixedLookup, true) => format!(
+            "SELECT artifact_id, content_hash FROM artifact_index WHERE workspace = '{key}' AND path_hash = 'path-{sequence_bucket}';"
+        ),
+        (SyntheticTraceScenario::ArtifactIndexMixedLookup, false) => format!(
+            "INSERT INTO artifact_index(workspace, artifact_id, path_hash, content_hash, updated_by) VALUES ('{key}', 'artifact-{sequence_bucket}', 'path-{sequence_bucket}', 'hash-{sequence_bucket}', '{actor}');"
+        ),
+        (SyntheticTraceScenario::HotCounterStatusRows, true) => {
+            format!("SELECT value, updated_by FROM swarm_counters WHERE counter_key = '{key}';")
+        }
+        (SyntheticTraceScenario::HotCounterStatusRows, false) => format!(
+            "UPDATE swarm_counters SET value = value + 1, updated_by = '{actor}', update_seq = {sequence_bucket} WHERE counter_key = '{key}';"
+        ),
+        (SyntheticTraceScenario::LongReaderBurstWriter, true) => format!(
+            "SELECT event_id, payload FROM session_events WHERE session_id = '{key}' AND logical_clock BETWEEN {sequence_bucket} AND {} ORDER BY logical_clock;",
+            sequence_bucket + 250
+        ),
+        (SyntheticTraceScenario::LongReaderBurstWriter, false) => format!(
+            "INSERT INTO session_status(session_id, agent_id, status, logical_clock) VALUES ('{key}', '{actor}', 'checkpoint', {sequence_bucket});"
+        ),
+    };
+
+    SyntheticStatementSpec {
+        boundary: TransactionBoundary::None,
+        workload_phase: config.scenario.phase(is_read),
+        sql,
+        expected_result_class: ExpectedResultClass::Success,
+        row_count_class: if is_read {
+            RowCountClass::Few
+        } else {
+            RowCountClass::One
+        },
+    }
+}
+
+fn synthetic_trace_metadata(
+    config: &SyntheticTraceConfig,
+) -> Result<TraceMetadata, SyntheticTraceError> {
+    let mut metadata = TraceMetadata::new(
+        "synthetic-agent-swarm",
+        format!("{}:{:016x}", config.scenario.as_str(), config.seed),
+    )?;
+    metadata.logical_clock = Some(format!("splitmix64-seed-{:016x}", config.seed));
+    metadata.tags.insert(
+        "generator_version".to_owned(),
+        SYNTHETIC_TRACE_GENERATOR_VERSION.to_owned(),
+    );
+    metadata.tags.insert(
+        "scenario_family".to_owned(),
+        config.scenario.as_str().to_owned(),
+    );
+    metadata
+        .tags
+        .insert("seed".to_owned(), config.seed.to_string());
+    metadata
+        .tags
+        .insert("agent_count".to_owned(), config.agent_count.to_string());
+    metadata.tags.insert(
+        "transaction_count".to_owned(),
+        config.transaction_count.to_string(),
+    );
+    metadata
+        .tags
+        .insert("hot_key_ratio".to_owned(), config.hot_key_ratio.to_string());
+    metadata
+        .tags
+        .insert("read_write_mix".to_owned(), config.read_write_mix());
+    metadata.tags.insert(
+        "expected_contention_shape".to_owned(),
+        config
+            .scenario
+            .expected_contention_shape(config.hot_key_ratio),
+    );
+    metadata.tags.insert(
+        "target_invariants".to_owned(),
+        config.scenario.target_invariants().to_owned(),
+    );
+    Ok(metadata)
+}
+
+fn synthetic_trace_id(config: &SyntheticTraceConfig) -> String {
+    format!(
+        "trace-synthetic-{}-{:016x}",
+        config.scenario.as_str(),
+        config.seed
+    )
+}
+
+fn synthetic_run_id(config: &SyntheticTraceConfig) -> String {
+    format!("run-synthetic-{:016x}", config.seed)
+}
+
+fn synthetic_scenario_id(scenario: SyntheticTraceScenario) -> String {
+    format!("scenario-synthetic-{}", scenario.as_str())
 }
 
 fn required_owned(field: &'static str, value: String) -> Result<String, TraceScrubError> {
@@ -636,6 +1175,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     const GOLDEN: &str = include_str!("../conformance/agent_swarm_trace_sanitized_golden.json");
 
@@ -764,6 +1304,238 @@ mod tests {
         }
     }
 
+    #[test]
+    fn synthetic_trace_generator_is_seed_deterministic() {
+        let config = SyntheticTraceConfig::new(
+            SyntheticTraceScenario::TaskQueueClaimLoop,
+            0xA11C_E5ED,
+            8,
+            12,
+        )
+        .with_read_write_mix(30, 70)
+        .with_hot_key_ratio(85);
+
+        let first = generate_synthetic_swarm_trace(config.clone()).expect("first trace");
+        let second = generate_synthetic_swarm_trace(config.clone()).expect("second trace");
+        assert_eq!(first, second);
+
+        let changed_seed = SyntheticTraceConfig {
+            seed: 0xA11C_E5EE,
+            ..config
+        };
+        let third = generate_synthetic_swarm_trace(changed_seed).expect("third trace");
+        assert_ne!(first.statements, third.statements);
+    }
+
+    #[test]
+    fn synthetic_trace_generator_varies_by_scenario_family() {
+        let mut operation_shapes = BTreeSet::new();
+
+        for scenario in SYNTHETIC_TRACE_SCENARIOS {
+            let trace = generate_synthetic_swarm_trace(SyntheticTraceConfig::new(
+                scenario,
+                0x51A7_E5E1,
+                4,
+                4,
+            ))
+            .expect("scenario trace");
+
+            assert_eq!(
+                trace
+                    .metadata
+                    .tags
+                    .get("scenario_family")
+                    .map(String::as_str),
+                Some(scenario.as_str())
+            );
+            operation_shapes.insert(trace.statements[1].statement_shape.clone());
+        }
+
+        assert_eq!(operation_shapes.len(), SYNTHETIC_TRACE_SCENARIOS.len());
+    }
+
+    #[test]
+    fn synthetic_trace_generator_records_contention_metadata_and_invariants() {
+        let config = SyntheticTraceConfig::new(
+            SyntheticTraceScenario::LongReaderBurstWriter,
+            0xFEED_FACE,
+            6,
+            5,
+        )
+        .with_read_write_mix(80, 20)
+        .with_hot_key_ratio(90);
+
+        let trace = generate_synthetic_swarm_trace(config.clone()).expect("synthetic trace");
+        let encoded = serde_json::to_string(&trace).expect("trace serializes");
+        let decoded: AgentSwarmTrace = serde_json::from_str(&encoded).expect("trace deserializes");
+
+        assert_eq!(trace, decoded);
+        assert_eq!(trace.statement_count(), config.transaction_count * 3);
+        assert_eq!(trace.transaction_count(), config.transaction_count);
+        assert_eq!(
+            trace
+                .metadata
+                .tags
+                .get("generator_version")
+                .map(String::as_str),
+            Some(SYNTHETIC_TRACE_GENERATOR_VERSION)
+        );
+        assert_eq!(
+            trace.metadata.tags.get("seed").map(String::as_str),
+            Some("4277009102")
+        );
+        assert_eq!(
+            trace.metadata.tags.get("agent_count").map(String::as_str),
+            Some("6")
+        );
+        assert_eq!(
+            trace
+                .metadata
+                .tags
+                .get("transaction_count")
+                .map(String::as_str),
+            Some("5")
+        );
+        assert_eq!(
+            trace.metadata.tags.get("hot_key_ratio").map(String::as_str),
+            Some("90")
+        );
+        assert_eq!(
+            trace
+                .metadata
+                .tags
+                .get("read_write_mix")
+                .map(String::as_str),
+            Some("read:80:write:20")
+        );
+        assert!(
+            trace
+                .metadata
+                .tags
+                .get("expected_contention_shape")
+                .is_some_and(|shape| shape.contains("high_skew"))
+        );
+        assert!(
+            trace
+                .metadata
+                .tags
+                .get("target_invariants")
+                .is_some_and(|invariants| invariants.contains("mvcc_visibility_shape"))
+        );
+        assert!(
+            trace
+                .statements
+                .iter()
+                .all(|statement| statement.logical_timestamp.is_some())
+        );
+        assert!(
+            trace
+                .statements
+                .iter()
+                .step_by(3)
+                .all(|statement| statement.transaction_boundary == TransactionBoundary::Begin)
+        );
+    }
+
+    #[test]
+    fn synthetic_trace_generator_rejects_invalid_config() {
+        let no_agents =
+            SyntheticTraceConfig::new(SyntheticTraceScenario::SessionEventAppend, 1, 0, 1);
+        assert_eq!(
+            generate_synthetic_swarm_trace(no_agents),
+            Err(SyntheticTraceError::AgentCountZero)
+        );
+
+        let no_transactions =
+            SyntheticTraceConfig::new(SyntheticTraceScenario::SessionEventAppend, 1, 1, 0);
+        assert_eq!(
+            generate_synthetic_swarm_trace(no_transactions),
+            Err(SyntheticTraceError::TransactionCountZero)
+        );
+
+        let no_mix = SyntheticTraceConfig::new(SyntheticTraceScenario::SessionEventAppend, 1, 1, 1)
+            .with_read_write_mix(0, 0);
+        assert_eq!(
+            generate_synthetic_swarm_trace(no_mix),
+            Err(SyntheticTraceError::EmptyReadWriteMix)
+        );
+
+        let invalid_hot_key_ratio =
+            SyntheticTraceConfig::new(SyntheticTraceScenario::SessionEventAppend, 1, 1, 1)
+                .with_hot_key_ratio(101);
+        assert_eq!(
+            generate_synthetic_swarm_trace(invalid_hot_key_ratio),
+            Err(SyntheticTraceError::HotKeyRatioOutOfRange(101))
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn synthetic_trace_generation_preserves_bounded_config(
+            seed in any::<u64>(),
+            scenario_index in 0usize..SYNTHETIC_TRACE_SCENARIOS.len(),
+            agent_count in 1usize..12,
+            transaction_count in 1usize..20,
+            read_weight in 0u16..100,
+            write_weight in 0u16..100,
+            hot_key_ratio in 0u8..=100,
+        ) {
+            prop_assume!(u64::from(read_weight) + u64::from(write_weight) > 0);
+
+            let scenario = SYNTHETIC_TRACE_SCENARIOS[scenario_index];
+            let config = SyntheticTraceConfig::new(
+                scenario,
+                seed,
+                agent_count,
+                transaction_count,
+            )
+            .with_read_write_mix(read_weight, write_weight)
+            .with_hot_key_ratio(hot_key_ratio);
+            let trace = generate_synthetic_swarm_trace(config.clone()).expect("synthetic trace");
+
+            prop_assert_eq!(trace.statement_count(), transaction_count * 3);
+            prop_assert_eq!(trace.transaction_count(), transaction_count);
+            let expected_seed = seed.to_string();
+            let expected_agent_count = agent_count.to_string();
+            let expected_transaction_count = transaction_count.to_string();
+            let expected_hot_key_ratio = hot_key_ratio.to_string();
+            let expected_read_write_mix = config.read_write_mix();
+            prop_assert_eq!(
+                trace.metadata.tags.get("scenario_family").map(String::as_str),
+                Some(scenario.as_str())
+            );
+            prop_assert_eq!(
+                trace.metadata.tags.get("seed").map(String::as_str),
+                Some(expected_seed.as_str())
+            );
+            prop_assert_eq!(
+                trace.metadata.tags.get("agent_count").map(String::as_str),
+                Some(expected_agent_count.as_str())
+            );
+            prop_assert_eq!(
+                trace
+                    .metadata
+                    .tags
+                    .get("transaction_count")
+                    .map(String::as_str),
+                Some(expected_transaction_count.as_str())
+            );
+            prop_assert_eq!(
+                trace.metadata.tags.get("hot_key_ratio").map(String::as_str),
+                Some(expected_hot_key_ratio.as_str())
+            );
+            prop_assert_eq!(
+                trace.metadata.tags.get("read_write_mix").map(String::as_str),
+                Some(expected_read_write_mix.as_str())
+            );
+            let schema_safe = trace
+                .statements
+                .iter()
+                .all(TraceStatement::schema_safe_for_synthetic_property);
+            prop_assert!(schema_safe);
+        }
+    }
+
     fn raw_statement<'a>(
         logical_order: u64,
         actor_id: &'a str,
@@ -847,5 +1619,21 @@ mod tests {
             statements,
         )
         .expect("sample trace")
+    }
+
+    trait SyntheticTraceStatementTestExt {
+        fn schema_safe_for_synthetic_property(&self) -> bool;
+    }
+
+    impl SyntheticTraceStatementTestExt for TraceStatement {
+        fn schema_safe_for_synthetic_property(&self) -> bool {
+            !self.actor_id.trim().is_empty()
+                && !self.connection_id.trim().is_empty()
+                && !self.concurrency_group.trim().is_empty()
+                && !self.workload_phase.trim().is_empty()
+                && !self.scrubbed_sql.trim().is_empty()
+                && self.statement_shape.len() == 64
+                && self.transaction_id.is_some()
+        }
     }
 }

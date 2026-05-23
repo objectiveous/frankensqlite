@@ -12529,6 +12529,23 @@ impl VdbeEngine {
                 }
                 Ok(true)
             }
+            // IfNotZero backs countdown loops such as recursive query
+            // step limits: read integer register p1, decrement when
+            // non-zero, and jump to p2 until it reaches zero. Same
+            // small-body branch-counter shape as IfPos/DecrJumpZero.
+            Opcode::IfNotZero => {
+                let val = self.get_reg(op.p1).to_integer();
+                if val != 0 {
+                    self.set_reg_int(op.p1, val.wrapping_sub(1));
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        *pc = op.p2 as usize;
+                    }
+                } else {
+                    *pc += 1;
+                }
+                Ok(true)
+            }
             // IsNull is the highest-frequency unpromoted opcode in
             // codegen (87 emit sites — more than Goto/Column/Copy/Null
             // individually). It backs every NOT NULL constraint check,

@@ -140,6 +140,29 @@ fn build_execute_stage_multiply_program(op_repeats: usize) -> VdbeProgram {
 }
 
 /// Build a dispatch-dominated program whose inner loop is a stream of
+/// `Divide` ops over stable non-zero integer inputs. The output register is
+/// distinct so every iteration exercises the same division body without
+/// changing the divisor or dividend.
+fn build_execute_stage_divide_program(op_repeats: usize) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    let end = builder.emit_label();
+    builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+    let divisor = builder.alloc_reg();
+    let dividend = builder.alloc_reg();
+    let out = builder.alloc_reg();
+    builder.emit_op(Opcode::Integer, 7, divisor, 0, P4::None, 0);
+    builder.emit_op(Opcode::Integer, 84, dividend, 0, P4::None, 0);
+    for _ in 0..op_repeats {
+        builder.emit_op(Opcode::Divide, divisor, dividend, out, P4::None, 0);
+    }
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder.resolve_label(end);
+    builder
+        .finish()
+        .expect("pipeline execute divide benchmark program should build")
+}
+
+/// Build a dispatch-dominated program whose inner loop is a stream of
 /// `Variable` loads. The benchmark seeds one owned binding on the engine, so
 /// each opcode exercises the common bound-parameter path: convert p1 from
 /// one-based to zero-based, read the binding, clone it, and write the target
@@ -691,6 +714,39 @@ fn bench_vdbe_execute_multiply_stage(c: &mut Criterion) {
                     let outcome = engine
                         .execute(program)
                         .expect("pipeline execute multiply benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_vdbe_execute_divide_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_divide");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let program = build_execute_stage_divide_program(op_repeats);
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &program,
+            |b, program| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute divide benchmark should execute");
                     black_box(outcome);
                 });
             },
@@ -1280,6 +1336,7 @@ criterion_group!(
     bench_vdbe_execute_add_stage,
     bench_vdbe_execute_subtract_stage,
     bench_vdbe_execute_multiply_stage,
+    bench_vdbe_execute_divide_stage,
     bench_vdbe_execute_variable_stage,
     bench_vdbe_execute_copy_stage,
     bench_vdbe_execute_scopy_stage,

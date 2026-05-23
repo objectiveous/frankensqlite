@@ -12518,6 +12518,18 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            Opcode::ShiftRight => {
+                let a = self.get_reg(op.p1);
+                let b = self.get_reg(op.p2);
+                if a.is_null() || b.is_null() {
+                    self.set_reg_fast(op.p3, SqliteValue::Null);
+                } else {
+                    let result = sql_shift_right(b.to_integer(), a.to_integer());
+                    self.set_reg_fast(op.p3, result);
+                }
+                *pc += 1;
+                Ok(true)
+            }
             // Copy is the most frequently emitted register-motion opcode in
             // codegen (71 sites), driving SELECT projection, expression
             // propagation, and materialization staging. p3 is almost always 0

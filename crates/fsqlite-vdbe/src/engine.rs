@@ -12686,6 +12686,17 @@ impl VdbeEngine {
                 }
                 Ok(true)
             }
+            Opcode::NotNull => {
+                if self.get_reg(op.p1).is_null() {
+                    *pc += 1;
+                } else {
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        *pc = op.p2 as usize;
+                    }
+                }
+                Ok(true)
+            }
             // IfNot is the canonical falsy-branch jump: emitted ~48
             // production sites driving CASE/COALESCE WHEN-fallthrough,
             // AND-short-circuit, LIMIT-zero detection, HAVING-skip,
@@ -31736,6 +31747,40 @@ mod tests {
                 vec![SqliteValue::Integer(7)],
             ]
         );
+    }
+
+    #[test]
+    fn test_not_null_via_hot_path() {
+        // Pins the hot-path arm's behaviour to the main-match arm:
+        // - val IS NULL: fall through
+        // - val IS NOT NULL: jump to p2
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let skip1 = b.emit_label();
+            let skip2 = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_null = b.alloc_reg();
+            let r_int = b.alloc_reg();
+            let r_hit = b.alloc_reg();
+            b.emit_op(Opcode::Null, 0, r_null, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 7, r_int, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_hit, 0, P4::None, 0);
+
+            b.emit_jump_to_label(Opcode::NotNull, r_null, 0, skip1, P4::None, 0);
+            b.emit_op(Opcode::AddImm, r_hit, 1, 0, P4::None, 0);
+            b.resolve_label(skip1);
+
+            b.emit_jump_to_label(Opcode::NotNull, r_int, 0, skip2, P4::None, 0);
+            b.emit_op(Opcode::AddImm, r_hit, 1, 0, P4::None, 0);
+            b.resolve_label(skip2);
+
+            b.emit_op(Opcode::ResultRow, r_hit, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
     }
 
     #[test]

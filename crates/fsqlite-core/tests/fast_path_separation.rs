@@ -107,6 +107,17 @@ fn assert_count_star_sum_row(
     }
 }
 
+fn explain_opcode_names(conn: &Connection, sql: &str) -> Vec<String> {
+    conn.query(&format!("EXPLAIN {sql}"))
+        .unwrap()
+        .into_iter()
+        .map(|row| match row.get(1) {
+            Some(fsqlite_types::SqliteValue::Text(opcode)) => opcode.to_string(),
+            other => format!("<non-text opcode column: {other:?}>"),
+        })
+        .collect()
+}
+
 fn stringify_fsqlite_value(value: &fsqlite_types::SqliteValue) -> String {
     match value {
         fsqlite_types::SqliteValue::Null => "NULL".to_owned(),
@@ -1446,6 +1457,248 @@ fn test_query_row_rowid_range_uses_direct_counter() {
             fsqlite_error::FrankenError::QueryReturnedMultipleRows
         ),
         "multi-row rowid range should surface QueryReturnedMultipleRows"
+    );
+}
+
+#[test]
+fn test_b3_point_lookup_profile_scales_across_table_sizes() {
+    const ROW_COUNTS: [i64; 4] = [100, 1_000, 10_000, 100_000];
+    const PROBES_PER_SIZE: usize = 96;
+
+    let _profile_guard = FastPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute(
+        "CREATE TABLE t(
+            id INTEGER PRIMARY KEY,
+            payload TEXT NOT NULL,
+            score INTEGER NOT NULL
+        )",
+    )
+    .unwrap();
+
+    let rowid_opcodes = explain_opcode_names(&conn, "SELECT payload FROM t WHERE id = 42");
+    eprintln!(
+        "[bd-6eyrg.3] rowid point lookup bytecode: {}",
+        rowid_opcodes.join(", ")
+    );
+    assert!(
+        rowid_opcodes.iter().any(|op| op == "SeekRowid"),
+        "rowid point lookup should emit SeekRowid, got {rowid_opcodes:?}"
+    );
+    assert!(
+        !rowid_opcodes.iter().any(|op| op == "Rewind"),
+        "rowid point lookup should not lower to a scan, got {rowid_opcodes:?}"
+    );
+
+    let insert = conn.prepare("INSERT INTO t VALUES (?1, ?2, ?3)").unwrap();
+    let mut seeded_through = 0_i64;
+    let mut measured_avg_nanos = Vec::with_capacity(ROW_COUNTS.len());
+
+    for row_count in ROW_COUNTS {
+        conn.execute("BEGIN").unwrap();
+        for id in (seeded_through + 1)..=row_count {
+            insert
+                .execute_with_params(&[
+                    fsqlite_types::SqliteValue::Integer(id),
+                    fsqlite_types::SqliteValue::Text(format!("payload_{id}").into()),
+                    fsqlite_types::SqliteValue::Integer(id * 7),
+                ])
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        seeded_through = row_count;
+
+        let select = conn.prepare("SELECT payload FROM t WHERE id = ?1").unwrap();
+        let warm_probe = [fsqlite_types::SqliteValue::Integer(row_count / 2)];
+        let warm_row = select.query_row_with_params(&warm_probe).unwrap();
+        assert_eq!(
+            warm_row.get(0),
+            Some(&fsqlite_types::SqliteValue::Text(
+                format!("payload_{}", row_count / 2).into()
+            )),
+            "warm point lookup should return the expected payload"
+        );
+
+        reset_hot_path_profile();
+        let before = hot_path_profile_snapshot();
+        let started = std::time::Instant::now();
+        for probe_index in 0..PROBES_PER_SIZE {
+            let probe_index = i64::try_from(probe_index).unwrap();
+            let probe_id = 1 + ((probe_index * 7_919) % row_count);
+            let row = select
+                .query_row_with_params(&[fsqlite_types::SqliteValue::Integer(probe_id)])
+                .unwrap();
+            std::hint::black_box(row);
+        }
+        let elapsed = started.elapsed();
+        let after = hot_path_profile_snapshot();
+
+        let avg_nanos = elapsed.as_nanos() / u128::try_from(PROBES_PER_SIZE).unwrap();
+        measured_avg_nanos.push(avg_nanos);
+        let (fast_delta, slow_delta) = fast_slow_delta(&before.parser, &after.parser);
+        let direct_delta = after
+            .direct_rowid_lookup_query_row_hits
+            .saturating_sub(before.direct_rowid_lookup_query_row_hits);
+        eprintln!(
+            "[bd-6eyrg.3] point_lookup rows={row_count} probes={PROBES_PER_SIZE} \
+             avg_ns={avg_nanos} total_us={} direct_rowid_hits={direct_delta} \
+             fast_delta={fast_delta} slow_delta={slow_delta}",
+            elapsed.as_micros()
+        );
+
+        let expected_probes = u64::try_from(PROBES_PER_SIZE).unwrap();
+        assert_eq!(
+            direct_delta, expected_probes,
+            "rowid lookup at {row_count} rows should stay on the direct rowid path: before={before:?} after={after:?}"
+        );
+        assert!(
+            fast_delta >= expected_probes,
+            "rowid lookup at {row_count} rows should be recorded as fast-path execution: before={before:?} after={after:?}"
+        );
+        assert_eq!(
+            slow_delta, 0,
+            "rowid lookup at {row_count} rows should not fall back to slow execution"
+        );
+
+        let budget_nanos = if row_count <= 1_000 {
+            50_000_u128
+        } else if row_count == 10_000 {
+            100_000_u128
+        } else {
+            200_000_u128
+        };
+        assert!(
+            avg_nanos < budget_nanos,
+            "point lookup at {row_count} rows averaged {avg_nanos}ns, budget {budget_nanos}ns"
+        );
+    }
+
+    let first_avg = measured_avg_nanos.first().copied().unwrap_or(1).max(1);
+    let last_avg = measured_avg_nanos.last().copied().unwrap_or(first_avg);
+    assert!(
+        last_avg <= first_avg.saturating_mul(4),
+        "point lookup should scale logarithmically: 100-row avg {first_avg}ns, 100k-row avg {last_avg}ns"
+    );
+}
+
+#[test]
+fn test_b3_covering_indexed_equality_profile_stays_seek_bounded() {
+    const ROW_COUNT: i64 = 10_000;
+    const PROBES: usize = 96;
+
+    let _profile_guard = FastPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute(
+        "CREATE TABLE t(
+            id INTEGER PRIMARY KEY,
+            category TEXT NOT NULL,
+            name TEXT NOT NULL,
+            payload TEXT NOT NULL
+        )",
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX t_category_payload ON t(category, payload)")
+        .unwrap();
+
+    let insert = conn
+        .prepare("INSERT INTO t VALUES (?1, ?2, ?3, ?4)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for id in 1..=ROW_COUNT {
+        insert
+            .execute_with_params(&[
+                fsqlite_types::SqliteValue::Integer(id),
+                fsqlite_types::SqliteValue::Text(format!("cat_{id:05}").into()),
+                fsqlite_types::SqliteValue::Text(format!("name_{id:05}").into()),
+                fsqlite_types::SqliteValue::Text(format!("payload_{id:05}").into()),
+            ])
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    let covering_opcodes =
+        explain_opcode_names(&conn, "SELECT payload FROM t WHERE category = 'cat_05000'");
+    eprintln!(
+        "[bd-6eyrg.3] covering indexed equality bytecode: {}",
+        covering_opcodes.join(", ")
+    );
+    assert!(
+        covering_opcodes.iter().any(|op| op == "SeekGE"),
+        "covering indexed equality should probe the covering index, got {covering_opcodes:?}"
+    );
+    assert!(
+        !covering_opcodes.iter().any(|op| op == "SeekRowid"),
+        "covering indexed equality should avoid table rowid lookup, got {covering_opcodes:?}"
+    );
+
+    let covering = conn
+        .prepare("SELECT payload FROM t WHERE category = ?1")
+        .unwrap();
+    let probe = [fsqlite_types::SqliteValue::Text("cat_05000".into())];
+    let warm_rows = covering.query_with_params(&probe).unwrap();
+    assert_eq!(warm_rows.len(), 1);
+    assert_eq!(
+        warm_rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Text("payload_05000".into())),
+        "covering lookup should return the expected payload"
+    );
+
+    reset_hot_path_profile();
+    let before = hot_path_profile_snapshot();
+    let started = std::time::Instant::now();
+    let mut row_total = 0_usize;
+    for _ in 0..PROBES {
+        let rows = covering.query_with_params(&probe).unwrap();
+        row_total = row_total.saturating_add(rows.len());
+        std::hint::black_box(rows);
+    }
+    let elapsed = started.elapsed();
+    let after = hot_path_profile_snapshot();
+
+    let avg_nanos = elapsed.as_nanos() / u128::try_from(PROBES).unwrap();
+    let (fast_delta, slow_delta) = fast_slow_delta(&before.parser, &after.parser);
+    let opcode_total = |opcode: &str| {
+        after
+            .vdbe
+            .opcode_execution_totals
+            .iter()
+            .find(|count| count.opcode == opcode)
+            .map_or(0, |count| count.total)
+    };
+    let seek_ge_total = opcode_total("SeekGE");
+    let seek_rowid_total = opcode_total("SeekRowid");
+    eprintln!(
+        "[bd-6eyrg.3] covering_index_lookup rows={ROW_COUNT} probes={PROBES} \
+         avg_ns={avg_nanos} total_us={} row_total={row_total} \
+         seek_ge_execs={seek_ge_total} seek_rowid_execs={seek_rowid_total} \
+         fast_delta={fast_delta} slow_delta={slow_delta}",
+        elapsed.as_micros()
+    );
+
+    let expected_probes = u64::try_from(PROBES).unwrap();
+    assert_eq!(
+        row_total, PROBES,
+        "each covering index probe should return exactly one row"
+    );
+    assert!(
+        seek_ge_total >= expected_probes,
+        "covering indexed equality should execute one SeekGE probe per lookup: before={before:?} after={after:?}"
+    );
+    assert_eq!(
+        seek_rowid_total, 0,
+        "covering indexed equality should avoid dynamic table rowid seeks: before={before:?} after={after:?}"
+    );
+    assert!(
+        fast_delta >= expected_probes,
+        "covering indexed equality should be recorded as fast-path execution: before={before:?} after={after:?}"
+    );
+    assert_eq!(
+        slow_delta, 0,
+        "covering indexed equality should not fall back to slow execution"
+    );
+    assert!(
+        avg_nanos < 100_000,
+        "covering indexed equality averaged {avg_nanos}ns, budget 100000ns"
     );
 }
 

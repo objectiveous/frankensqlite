@@ -12593,6 +12593,20 @@ impl VdbeEngine {
                 }
                 Ok(true)
             }
+            // Not is a compact expression-evaluation opcode: read p1, apply
+            // SQLite truthiness, and write a boolean/null result into p2. Keep
+            // the body byte-equivalent to the main-match arm while avoiding
+            // the large dispatch table for repeated boolean projections.
+            Opcode::Not => {
+                let val = self.get_reg(op.p1);
+                if val.is_null() {
+                    self.set_reg_fast(op.p2, SqliteValue::Null);
+                } else {
+                    self.set_reg_int(op.p2, i64::from(!vdbe_real_is_truthy(val)));
+                }
+                *pc += 1;
+                Ok(true)
+            }
             // Rowid extracts the rowid of the currently-positioned row on
             // cursor p1 into register p2.  Emitted at ~51 codegen sites
             // across fsqlite-vdbe/-planner/-core, driving every JOIN

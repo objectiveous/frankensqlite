@@ -93,7 +93,15 @@ impl std::fmt::Debug for ShmRegionBacking {
 impl Clone for ShmRegionBacking {
     fn clone(&self) -> Self {
         match self {
-            Self::Heap(v) => Self::Heap(Arc::clone(v)),
+            // Deep-copy heap-backed regions so `Clone` produces an independent
+            // buffer (matching Rust convention that `Clone` is a value copy,
+            // not an `Arc`-style alias). Multi-process sharing of mmap-backed
+            // regions still aliases by design — that's the whole point of
+            // `MAP_SHARED`.
+            Self::Heap(v) => {
+                let guard = v.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                Self::Heap(Arc::new(Mutex::new(guard.clone())))
+            }
             #[cfg(unix)]
             Self::Mmap(m) => Self::Mmap(Arc::clone(m)),
         }
@@ -547,10 +555,11 @@ impl ShmRegion {
 
     /// Resize a heap-backed shared-memory region without panicking on OOM.
     ///
-    /// Existing clones of this `ShmRegion` will still share the same underlying
-    /// data, but their locally cached `len()` will not be updated. This matches
-    /// the semantics of `mremap` where other handles must explicitly remap
-    /// to see the new size, while still sharing the physical bytes.
+    /// Note that `Clone` on a heap-backed `ShmRegion` deep-copies the buffer,
+    /// so existing clones are independent and unaffected by this resize.
+    /// Mmap-backed regions (when present) still alias by design and would
+    /// share the new size if they could be resized — but mmap-backed resizing
+    /// is not supported here and must go through `shm_map` again.
     ///
     /// # Errors
     ///
@@ -835,12 +844,18 @@ mod tests {
     }
 
     #[test]
-    fn test_shm_region_clone_shares_data() {
+    fn test_shm_region_clone_copies_existing_data() {
+        // `Clone` produces an independent buffer that initially mirrors the
+        // source's contents (see also `test_shm_region_clone_is_independent`
+        // for the post-clone divergence invariant).
         let r1 = ShmRegion::new(16);
-        let r2 = r1.clone();
-
         r1.write_u32_le(0, 0x1234_5678).unwrap();
+        let r2 = r1.clone();
         assert_eq!(r2.read_u32_le(0).unwrap(), 0x1234_5678);
+        // r1 must remain readable (clone copies, doesn't move) — using the
+        // original here also keeps clippy from flagging the clone as
+        // redundant under `-D clippy::nursery`.
+        assert_eq!(r1.read_u32_le(0).unwrap(), 0x1234_5678);
     }
 
     #[test]
@@ -985,12 +1000,20 @@ mod tests {
     }
 
     #[test]
-    fn test_shm_region_stale_clone_after_shrink_returns_error() {
+    fn test_shm_region_clone_unaffected_by_original_shrink() {
+        // Since `Clone` deep-copies heap-backed regions, shrinking the
+        // original must not invalidate reads on the clone — the clone owns
+        // an independent 16-byte buffer.
         let mut region = ShmRegion::new(16);
         let clone = region.clone();
         region.try_resize_heap(4).unwrap();
 
-        let err = clone.read_u64_le(8).unwrap_err();
+        assert_eq!(clone.len(), 16);
+        assert_eq!(clone.lock().len(), 16);
+        // Reading the full 16 bytes of the clone must succeed.
+        clone.read_u64_le(8).unwrap();
+        // The shrunk original, however, must reject the out-of-range read.
+        let err = region.read_u64_le(8).unwrap_err();
         assert!(matches!(err, FrankenError::OutOfRange { .. }));
     }
 

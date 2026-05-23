@@ -37,6 +37,9 @@ pub const AGENT_SWARM_REPLAY_HARNESS_VERSION: &str = "1.0.0";
 /// Version of the resource envelope and fairness scorecard contract.
 pub const AGENT_SWARM_RESOURCE_SCORECARD_VERSION: &str = "1.0.0";
 
+/// Version of the replay evidence manifest contract.
+pub const AGENT_SWARM_EVIDENCE_MANIFEST_VERSION: &str = "1.0.0";
+
 /// Marker used in structured logs when no failure diagnostic exists yet.
 pub const FIRST_FAILURE_DIAGNOSTIC_ABSENT: &str = "none";
 
@@ -646,6 +649,15 @@ pub enum AgentSwarmReplayError {
     JsonDecode(String),
     /// Trace fixture could not be read from disk.
     FixtureRead(String),
+    /// Evidence manifest or minimized-trace JSON could not be encoded.
+    JsonEncode(String),
+    /// Evidence artifact could not be written to disk.
+    EvidenceWrite {
+        /// Artifact path.
+        path: String,
+        /// Filesystem error message.
+        message: String,
+    },
     /// A built-in SQL backend could not be opened.
     BackendOpen {
         /// Backend that failed to initialize.
@@ -669,6 +681,12 @@ impl fmt::Display for AgentSwarmReplayError {
             }
             Self::FixtureRead(message) => {
                 write!(f, "agent-swarm trace fixture read failed: {message}")
+            }
+            Self::JsonEncode(message) => {
+                write!(f, "agent-swarm evidence JSON encode failed: {message}")
+            }
+            Self::EvidenceWrite { path, message } => {
+                write!(f, "agent-swarm evidence write failed for {path}: {message}")
             }
             Self::BackendOpen { backend, message } => {
                 write!(
@@ -1250,6 +1268,247 @@ pub struct AgentSwarmResourceScorecard {
     pub backends: Vec<AgentSwarmBackendResourceScorecard>,
 }
 
+/// Replay failure category used by evidence manifests and regression proposals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSwarmFailureCategory {
+    /// SQL parser or syntax surface.
+    Parser,
+    /// Query planner surface.
+    Planner,
+    /// VDBE bytecode or execution surface.
+    Vdbe,
+    /// Pager or page-cache surface.
+    Pager,
+    /// WAL or durability surface.
+    Wal,
+    /// MVCC/concurrent-writer/conflict surface.
+    Mvcc,
+    /// Extension-specific surface.
+    Extension,
+    /// Resource envelope, memory, CPU, or fairness surface.
+    ResourceEnvelope,
+    /// Unclassified or no failure.
+    Unknown,
+}
+
+impl AgentSwarmFailureCategory {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Parser => "parser",
+            Self::Planner => "planner",
+            Self::Vdbe => "vdbe",
+            Self::Pager => "pager",
+            Self::Wal => "wal",
+            Self::Mvcc => "mvcc",
+            Self::Extension => "extension",
+            Self::ResourceEnvelope => "resource_envelope",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Existing Beads summary used for duplicate detection before proposing regressions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmExistingBeadSummary {
+    /// Existing Bead id.
+    pub id: String,
+    /// Existing Bead title.
+    pub title: String,
+    /// Existing Bead status.
+    pub status: String,
+    /// Existing Bead labels.
+    pub labels: Vec<String>,
+    /// Explicit duplicate keys such as minimized trace hashes or trace ids.
+    pub duplicate_keys: Vec<String>,
+}
+
+impl AgentSwarmExistingBeadSummary {
+    /// Create a summary with no labels or duplicate keys.
+    pub fn new(id: impl Into<String>, title: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+            status: "open".to_owned(),
+            labels: Vec::new(),
+            duplicate_keys: Vec::new(),
+        }
+    }
+
+    /// Attach labels used by duplicate detection.
+    pub fn with_labels(mut self, labels: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.labels = labels.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Attach explicit duplicate keys used by duplicate detection.
+    pub fn with_duplicate_keys(
+        mut self,
+        duplicate_keys: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.duplicate_keys = duplicate_keys.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+/// Configuration for producing an evidence manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmEvidenceManifestConfig {
+    /// Path to the full trace artifact.
+    pub trace_artifact_path: String,
+    /// Optional precomputed hash of the full trace artifact.
+    pub trace_artifact_hash: Option<String>,
+    /// Command line used to produce the replay report.
+    pub replay_command: String,
+    /// Directory/prefix for derived evidence artifacts.
+    pub artifact_root: String,
+    /// Existing Beads checked before proposing new regression work.
+    pub existing_beads: Vec<AgentSwarmExistingBeadSummary>,
+    /// Whether duplicate-free failures should emit patch-ready Bead proposals.
+    pub propose_regression_bead: bool,
+}
+
+impl AgentSwarmEvidenceManifestConfig {
+    /// Build evidence-manifest config for a trace artifact and replay command.
+    pub fn new(trace_artifact_path: impl Into<String>, replay_command: impl Into<String>) -> Self {
+        Self {
+            trace_artifact_path: trace_artifact_path.into(),
+            trace_artifact_hash: None,
+            replay_command: replay_command.into(),
+            artifact_root: "tests/artifacts/agent-swarm-replay".to_owned(),
+            existing_beads: Vec::new(),
+            propose_regression_bead: true,
+        }
+    }
+
+    /// Attach a known trace artifact hash.
+    pub fn with_trace_artifact_hash(mut self, trace_artifact_hash: impl Into<String>) -> Self {
+        self.trace_artifact_hash = Some(trace_artifact_hash.into());
+        self
+    }
+
+    /// Override the artifact root used for minimized traces.
+    pub fn with_artifact_root(mut self, artifact_root: impl Into<String>) -> Self {
+        self.artifact_root = artifact_root.into();
+        self
+    }
+
+    /// Attach existing Beads for duplicate checks.
+    pub fn with_existing_beads(
+        mut self,
+        existing_beads: impl IntoIterator<Item = AgentSwarmExistingBeadSummary>,
+    ) -> Self {
+        self.existing_beads = existing_beads.into_iter().collect();
+        self
+    }
+
+    /// Disable regression proposal emission.
+    pub const fn without_regression_proposals(mut self) -> Self {
+        self.propose_regression_bead = false;
+        self
+    }
+}
+
+/// Backend identity snapshot included in evidence manifests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmEvidenceBackendVersion {
+    /// Backend role.
+    pub backend: AgentSwarmReplayBackend,
+    /// Executor identity string.
+    pub engine_identity: String,
+    /// Comparison role.
+    pub comparison_role: String,
+    /// Whether the backend is FrankenSQLite's concurrent-writer default path.
+    pub concurrent_writer_default: bool,
+}
+
+/// Backend result metrics included in evidence manifests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmEvidenceBackendMetrics {
+    /// Backend role.
+    pub backend: AgentSwarmReplayBackend,
+    /// Statement count.
+    pub statements_total: usize,
+    /// Throughput from the replay report.
+    pub throughput_statements_per_second_x1000: u64,
+    /// p50 latency.
+    pub latency_p50_ns: u64,
+    /// p95 latency.
+    pub latency_p95_ns: u64,
+    /// p99 latency.
+    pub latency_p99_ns: u64,
+    /// Abort/error count.
+    pub abort_count: usize,
+    /// Retry count.
+    pub retry_count: u64,
+    /// Expected-result mismatch count.
+    pub expected_mismatch_count: usize,
+    /// Conflict/error classes.
+    pub conflict_classes: BTreeMap<String, usize>,
+    /// Replay memory high-water estimate.
+    pub memory_high_water_bytes: usize,
+}
+
+/// Patch-ready regression Bead proposal emitted only for duplicate-free failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmRegressionBeadProposal {
+    /// Deterministic proposed Bead id/key.
+    pub proposed_bead_id: String,
+    /// Proposed title.
+    pub title: String,
+    /// Proposed description body.
+    pub description: String,
+    /// Proposed labels.
+    pub labels: Vec<String>,
+    /// Duplicate key future agents should record on the created Bead.
+    pub duplicate_key: String,
+}
+
+/// Machine-readable replay evidence manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmEvidenceManifest {
+    /// Manifest schema version.
+    pub schema_version: String,
+    /// Manifest implementation version.
+    pub manifest_version: String,
+    /// Trace identifier.
+    pub trace_id: String,
+    /// Run identifier.
+    pub run_id: String,
+    /// Scenario identifier.
+    pub scenario_id: String,
+    /// Stable hash of this evidence artifact payload.
+    pub artifact_hash: String,
+    /// Path to the full trace artifact.
+    pub trace_artifact_path: String,
+    /// Hash of the full trace artifact or deterministic path fallback.
+    pub trace_artifact_hash: String,
+    /// Command line used to produce the replay report.
+    pub replay_command: String,
+    /// Smoke command embedded in the replay report.
+    pub smoke_command: String,
+    /// Heavy rch command embedded in the replay report.
+    pub heavy_command: String,
+    /// Backend identity snapshots.
+    pub backend_versions: Vec<AgentSwarmEvidenceBackendVersion>,
+    /// Backend result metrics.
+    pub result_metrics: Vec<AgentSwarmEvidenceBackendMetrics>,
+    /// First-failure diagnostic.
+    pub first_failure_diag: String,
+    /// Assigned failure category.
+    pub failure_category: AgentSwarmFailureCategory,
+    /// Hash of the minimized failing trace slice.
+    pub minimized_trace_hash: String,
+    /// Path where the minimized trace slice should be stored.
+    pub minimized_trace_artifact_path: Option<String>,
+    /// Minimized failing trace slice.
+    pub minimized_trace_slice: Vec<TraceStatement>,
+    /// Duplicate candidate Bead ids found before proposal.
+    pub duplicate_candidate_ids: Vec<String>,
+    /// Patch-ready proposal for duplicate-free reproducible failures.
+    pub proposed_regression_bead: Option<AgentSwarmRegressionBeadProposal>,
+}
+
 /// Scrub sensitive SQL literals while preserving statement topology.
 pub fn scrub_sql_statement(sql: &str) -> ScrubbedSql {
     let chars = sql.chars().collect::<Vec<_>>();
@@ -1504,6 +1763,19 @@ pub fn replay_agent_swarm_trace(
     replay_agent_swarm_trace_with_executors(trace, config, &fsqlite, &csqlite)
 }
 
+/// Replay a trace and write a durable evidence manifest plus minimized trace artifact.
+pub fn replay_agent_swarm_trace_with_evidence(
+    trace: &AgentSwarmTrace,
+    replay_config: &AgentSwarmReplayConfig,
+    evidence_config: &AgentSwarmEvidenceManifestConfig,
+    manifest_path: impl AsRef<Path>,
+) -> Result<(AgentSwarmReplayReport, AgentSwarmEvidenceManifest), AgentSwarmReplayError> {
+    let report = replay_agent_swarm_trace(trace, replay_config)?;
+    let manifest = build_agent_swarm_evidence_manifest(&report, evidence_config);
+    write_agent_swarm_evidence_manifest_files(&manifest, manifest_path)?;
+    Ok((report, manifest))
+}
+
 /// Replay a trace against caller-provided subject and reference executors.
 pub fn replay_agent_swarm_trace_with_executors<F, C>(
     trace: &AgentSwarmTrace,
@@ -1598,6 +1870,119 @@ pub fn score_agent_swarm_resource_envelope(
     };
     log_agent_swarm_resource_scorecard(&scorecard);
     scorecard
+}
+
+/// Build a durable evidence manifest from a replay report.
+pub fn build_agent_swarm_evidence_manifest(
+    report: &AgentSwarmReplayReport,
+    config: &AgentSwarmEvidenceManifestConfig,
+) -> AgentSwarmEvidenceManifest {
+    let first_failure_diag = report
+        .first_failure
+        .as_ref()
+        .map_or(FIRST_FAILURE_DIAGNOSTIC_ABSENT, |failure| {
+            failure.reason.as_str()
+        })
+        .to_owned();
+    let failure_category = classify_agent_swarm_failure(report);
+    let minimized_trace_slice = report
+        .first_failure
+        .as_ref()
+        .map_or_else(Vec::new, |failure| {
+            failure.minimal_reproducer_trace_slice.clone()
+        });
+    let minimized_trace_hash = stable_json_hash(&minimized_trace_slice);
+    let minimized_trace_artifact_path = report.first_failure.as_ref().map(|_| {
+        format!(
+            "{}/{}-{}-minimized-trace.json",
+            config.artifact_root, report.trace_id, report.run_id
+        )
+    });
+    let trace_artifact_hash = config
+        .trace_artifact_hash
+        .clone()
+        .unwrap_or_else(|| sha256_hex(config.trace_artifact_path.as_bytes()));
+    let backend_versions = report
+        .backends
+        .iter()
+        .map(evidence_backend_version)
+        .collect::<Vec<_>>();
+    let result_metrics = report
+        .backends
+        .iter()
+        .map(evidence_backend_metrics)
+        .collect::<Vec<_>>();
+    let duplicate_candidate_ids = duplicate_candidate_ids(
+        config,
+        report,
+        failure_category,
+        &minimized_trace_hash,
+        &first_failure_diag,
+    );
+    let proposed_regression_bead = if config.propose_regression_bead
+        && report.first_failure.is_some()
+        && duplicate_candidate_ids.is_empty()
+    {
+        Some(regression_bead_proposal(
+            report,
+            failure_category,
+            &minimized_trace_hash,
+            &first_failure_diag,
+        ))
+    } else {
+        None
+    };
+    let artifact_hash = evidence_artifact_hash(
+        report,
+        config,
+        &trace_artifact_hash,
+        failure_category,
+        &minimized_trace_hash,
+        &duplicate_candidate_ids,
+        &result_metrics,
+    );
+    let manifest = AgentSwarmEvidenceManifest {
+        schema_version: SWARM_TRACE_SCHEMA_VERSION.to_owned(),
+        manifest_version: AGENT_SWARM_EVIDENCE_MANIFEST_VERSION.to_owned(),
+        trace_id: report.trace_id.clone(),
+        run_id: report.run_id.clone(),
+        scenario_id: report.scenario_id.clone(),
+        artifact_hash,
+        trace_artifact_path: config.trace_artifact_path.clone(),
+        trace_artifact_hash,
+        replay_command: config.replay_command.clone(),
+        smoke_command: report.commands.smoke_command.clone(),
+        heavy_command: report.commands.heavy_command.clone(),
+        backend_versions,
+        result_metrics,
+        first_failure_diag,
+        failure_category,
+        minimized_trace_hash,
+        minimized_trace_artifact_path,
+        minimized_trace_slice,
+        duplicate_candidate_ids,
+        proposed_regression_bead,
+    };
+    log_agent_swarm_evidence_manifest(&manifest);
+    manifest
+}
+
+/// Write an evidence manifest and its minimized failing trace slice.
+pub fn write_agent_swarm_evidence_manifest_files(
+    manifest: &AgentSwarmEvidenceManifest,
+    manifest_path: impl AsRef<Path>,
+) -> Result<(), AgentSwarmReplayError> {
+    let manifest_json = serde_json::to_vec_pretty(manifest)
+        .map_err(|error| AgentSwarmReplayError::JsonEncode(error.to_string()))?;
+    write_agent_swarm_artifact_file(manifest_path.as_ref(), &manifest_json)?;
+
+    if let Some(minimized_trace_path) = manifest.minimized_trace_artifact_path.as_deref() {
+        let minimized_trace_json = serde_json::to_vec_pretty(&manifest.minimized_trace_slice)
+            .map_err(|error| AgentSwarmReplayError::JsonEncode(error.to_string()))?;
+        write_agent_swarm_artifact_file(Path::new(minimized_trace_path), &minimized_trace_json)?;
+    }
+
+    Ok(())
 }
 
 fn validate_agent_swarm_trace_schema(trace: &AgentSwarmTrace) -> Result<(), AgentSwarmReplayError> {
@@ -2084,6 +2469,214 @@ fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+fn evidence_backend_version(backend: &AgentSwarmBackendReplay) -> AgentSwarmEvidenceBackendVersion {
+    AgentSwarmEvidenceBackendVersion {
+        backend: backend.identity.backend,
+        engine_identity: backend.identity.engine_identity.clone(),
+        comparison_role: backend.identity.comparison_role.clone(),
+        concurrent_writer_default: backend.identity.concurrent_writer_default,
+    }
+}
+
+fn evidence_backend_metrics(backend: &AgentSwarmBackendReplay) -> AgentSwarmEvidenceBackendMetrics {
+    AgentSwarmEvidenceBackendMetrics {
+        backend: backend.identity.backend,
+        statements_total: backend.summary.statements_total,
+        throughput_statements_per_second_x1000: backend
+            .summary
+            .throughput_statements_per_second_x1000,
+        latency_p50_ns: backend.summary.latency_p50_ns,
+        latency_p95_ns: backend.summary.latency_p95_ns,
+        latency_p99_ns: backend.summary.latency_p99_ns,
+        abort_count: backend.summary.abort_count,
+        retry_count: backend.summary.retry_count,
+        expected_mismatch_count: backend.summary.expected_mismatch_count,
+        conflict_classes: backend.summary.conflict_classes.clone(),
+        memory_high_water_bytes: backend.summary.memory_high_water_bytes,
+    }
+}
+
+fn classify_agent_swarm_failure(report: &AgentSwarmReplayReport) -> AgentSwarmFailureCategory {
+    let Some(failure) = report.first_failure.as_ref() else {
+        return AgentSwarmFailureCategory::Unknown;
+    };
+    let reason = failure.reason.to_ascii_lowercase();
+    if reason.contains("syntax") || reason.contains("parser") || reason.contains("parse") {
+        AgentSwarmFailureCategory::Parser
+    } else if reason.contains("planner") || reason.contains("query plan") {
+        AgentSwarmFailureCategory::Planner
+    } else if reason.contains("vdbe") || reason.contains("opcode") || reason.contains("bytecode") {
+        AgentSwarmFailureCategory::Vdbe
+    } else if reason.contains("pager")
+        || reason.contains("page-cache")
+        || reason.contains("page cache")
+    {
+        AgentSwarmFailureCategory::Pager
+    } else if reason.contains("wal")
+        || reason.contains("durability")
+        || reason.contains("checkpoint")
+    {
+        AgentSwarmFailureCategory::Wal
+    } else if reason.contains("mvcc")
+        || reason.contains("conflict")
+        || reason.contains("serialization")
+        || reason.contains("concurrent")
+    {
+        AgentSwarmFailureCategory::Mvcc
+    } else if reason.contains("fts")
+        || reason.contains("rtree")
+        || reason.contains("json")
+        || reason.contains("icu")
+        || reason.contains("extension")
+    {
+        AgentSwarmFailureCategory::Extension
+    } else if reason.contains("resource")
+        || reason.contains("memory")
+        || reason.contains("cpu")
+        || reason.contains("fairness")
+        || reason.contains("latency")
+    {
+        AgentSwarmFailureCategory::ResourceEnvelope
+    } else {
+        AgentSwarmFailureCategory::Unknown
+    }
+}
+
+fn duplicate_candidate_ids(
+    config: &AgentSwarmEvidenceManifestConfig,
+    report: &AgentSwarmReplayReport,
+    failure_category: AgentSwarmFailureCategory,
+    minimized_trace_hash: &str,
+    first_failure_diag: &str,
+) -> Vec<String> {
+    let duplicate_keys = [
+        minimized_trace_hash,
+        report.trace_id.as_str(),
+        report.scenario_id.as_str(),
+        failure_category.as_str(),
+        first_failure_diag,
+    ];
+    config
+        .existing_beads
+        .iter()
+        .filter(|bead| existing_bead_matches_duplicate(bead, &duplicate_keys))
+        .map(|bead| bead.id.clone())
+        .collect()
+}
+
+fn existing_bead_matches_duplicate(
+    bead: &AgentSwarmExistingBeadSummary,
+    duplicate_keys: &[&str],
+) -> bool {
+    duplicate_keys.iter().any(|key| {
+        let key = key.trim();
+        !key.is_empty()
+            && (bead.duplicate_keys.iter().any(|candidate| candidate == key)
+                || bead.title.contains(key)
+                || bead.labels.iter().any(|label| label == key))
+    })
+}
+
+fn regression_bead_proposal(
+    report: &AgentSwarmReplayReport,
+    failure_category: AgentSwarmFailureCategory,
+    minimized_trace_hash: &str,
+    first_failure_diag: &str,
+) -> AgentSwarmRegressionBeadProposal {
+    let short_hash = minimized_trace_hash
+        .get(..12)
+        .unwrap_or(minimized_trace_hash);
+    let proposed_bead_id = format!("bd-agent-swarm-regression-{short_hash}");
+    AgentSwarmRegressionBeadProposal {
+        proposed_bead_id,
+        title: format!(
+            "REGRESSION: {} failure in {}",
+            failure_category.as_str(),
+            report.scenario_id
+        ),
+        description: format!(
+            "Reproducible agent-swarm replay failure.\n\ntrace_id: {}\nrun_id: {}\nscenario_id: {}\nfailure_category: {}\nminimized_trace_hash: {}\nfirst_failure_diag: {}\n\nUse the evidence manifest replay_command and minimized trace artifact before implementing a fix.",
+            report.trace_id,
+            report.run_id,
+            report.scenario_id,
+            failure_category.as_str(),
+            minimized_trace_hash,
+            first_failure_diag
+        ),
+        labels: vec![
+            "agent-swarm".to_owned(),
+            "regression".to_owned(),
+            failure_category.as_str().to_owned(),
+        ],
+        duplicate_key: minimized_trace_hash.to_owned(),
+    }
+}
+
+fn evidence_artifact_hash(
+    report: &AgentSwarmReplayReport,
+    config: &AgentSwarmEvidenceManifestConfig,
+    trace_artifact_hash: &str,
+    failure_category: AgentSwarmFailureCategory,
+    minimized_trace_hash: &str,
+    duplicate_candidate_ids: &[String],
+    result_metrics: &[AgentSwarmEvidenceBackendMetrics],
+) -> String {
+    #[derive(Serialize)]
+    struct EvidenceDigest<'a> {
+        manifest_version: &'a str,
+        trace_id: &'a str,
+        run_id: &'a str,
+        scenario_id: &'a str,
+        trace_artifact_path: &'a str,
+        trace_artifact_hash: &'a str,
+        replay_command: &'a str,
+        failure_category: AgentSwarmFailureCategory,
+        minimized_trace_hash: &'a str,
+        duplicate_candidate_ids: &'a [String],
+        result_metrics: &'a [AgentSwarmEvidenceBackendMetrics],
+    }
+
+    stable_json_hash(&EvidenceDigest {
+        manifest_version: AGENT_SWARM_EVIDENCE_MANIFEST_VERSION,
+        trace_id: &report.trace_id,
+        run_id: &report.run_id,
+        scenario_id: &report.scenario_id,
+        trace_artifact_path: &config.trace_artifact_path,
+        trace_artifact_hash,
+        replay_command: &config.replay_command,
+        failure_category,
+        minimized_trace_hash,
+        duplicate_candidate_ids,
+        result_metrics,
+    })
+}
+
+fn stable_json_hash<T>(value: &T) -> String
+where
+    T: Serialize,
+{
+    serde_json::to_vec(value).map_or_else(
+        |error| sha256_hex(error.to_string().as_bytes()),
+        |bytes| sha256_hex(&bytes),
+    )
+}
+
+fn write_agent_swarm_artifact_file(path: &Path, bytes: &[u8]) -> Result<(), AgentSwarmReplayError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| AgentSwarmReplayError::EvidenceWrite {
+            path: parent.display().to_string(),
+            message: error.to_string(),
+        })?;
+    }
+    fs::write(path, bytes).map_err(|error| AgentSwarmReplayError::EvidenceWrite {
+        path: path.display().to_string(),
+        message: error.to_string(),
+    })
+}
+
 fn compare_backend_records(
     subject: &AgentSwarmBackendReplay,
     reference: &AgentSwarmBackendReplay,
@@ -2259,6 +2852,22 @@ fn log_agent_swarm_resource_scorecard(scorecard: &AgentSwarmResourceScorecard) {
             "agent swarm resource scorecard",
         );
     }
+}
+
+fn log_agent_swarm_evidence_manifest(manifest: &AgentSwarmEvidenceManifest) {
+    tracing::info!(
+        target: "fsqlite.agent_swarm_trace.evidence_manifest",
+        trace_id = %manifest.trace_id,
+        run_id = %manifest.run_id,
+        scenario_id = %manifest.scenario_id,
+        artifact_hash = %manifest.artifact_hash,
+        minimized_trace_hash = %manifest.minimized_trace_hash,
+        failure_category = manifest.failure_category.as_str(),
+        duplicate_candidate_ids = %manifest.duplicate_candidate_ids.join(","),
+        proposed_bead_id = manifest.proposed_regression_bead.as_ref().map(|proposal| proposal.proposed_bead_id.as_str()).unwrap_or("none"),
+        first_failure_diag = %manifest.first_failure_diag,
+        "agent swarm evidence manifest",
+    );
 }
 
 fn estimate_memory_high_water(trace: &AgentSwarmTrace, schema_sql: &[String]) -> usize {
@@ -3201,6 +3810,128 @@ mod tests {
         assert!(backend.concurrent_writer_default);
     }
 
+    #[test]
+    fn agent_swarm_evidence_manifest_hash_is_stable_and_links_metrics() {
+        let report = resource_scorecard_report(
+            vec![resource_replay_record(
+                "agent-a",
+                0,
+                500,
+                AgentSwarmReplayOutcomeClass::Success,
+                TransactionBoundary::None,
+                0,
+            )],
+            4_096,
+        );
+        let config = AgentSwarmEvidenceManifestConfig::new(
+            "tests/artifacts/trace.json",
+            "cargo test -p fsqlite-harness agent_swarm_trace",
+        )
+        .with_trace_artifact_hash("trace-hash");
+
+        let first = build_agent_swarm_evidence_manifest(&report, &config);
+        let second = build_agent_swarm_evidence_manifest(&report, &config);
+
+        assert_eq!(first.artifact_hash, second.artifact_hash);
+        assert_eq!(first.trace_artifact_hash, "trace-hash");
+        assert_eq!(first.failure_category, AgentSwarmFailureCategory::Unknown);
+        assert!(first.minimized_trace_slice.is_empty());
+        assert!(first.proposed_regression_bead.is_none());
+        assert_eq!(first.backend_versions.len(), 1);
+        assert!(first.backend_versions[0].concurrent_writer_default);
+        assert_eq!(first.result_metrics[0].statements_total, 1);
+        assert!(first.result_metrics[0].throughput_statements_per_second_x1000 > 0);
+    }
+
+    #[test]
+    fn agent_swarm_evidence_minimization_preserves_transaction_slice() {
+        let report = failure_report_with_reason("mvcc serialization conflict on hot page");
+        let config = AgentSwarmEvidenceManifestConfig::new(
+            "tests/artifacts/failing-trace.json",
+            "cargo test -p fsqlite-harness agent_swarm_trace",
+        );
+
+        let manifest = build_agent_swarm_evidence_manifest(&report, &config);
+
+        assert_eq!(manifest.failure_category, AgentSwarmFailureCategory::Mvcc);
+        assert_eq!(manifest.minimized_trace_slice.len(), 3);
+        assert_eq!(
+            manifest.minimized_trace_hash,
+            stable_json_hash(&manifest.minimized_trace_slice)
+        );
+        assert!(
+            manifest
+                .minimized_trace_slice
+                .iter()
+                .all(|statement| statement.transaction_id.as_deref() == Some("txn-busy"))
+        );
+        assert!(
+            manifest
+                .minimized_trace_slice
+                .windows(2)
+                .all(|window| window[0].concurrency_group == window[1].concurrency_group)
+        );
+        assert!(manifest.proposed_regression_bead.is_some());
+    }
+
+    #[test]
+    fn agent_swarm_evidence_duplicate_detection_suppresses_proposal() {
+        let report = failure_report_with_reason("wal checksum mismatch during replay");
+        let first_config = AgentSwarmEvidenceManifestConfig::new(
+            "tests/artifacts/failing-trace.json",
+            "cargo test -p fsqlite-harness agent_swarm_trace",
+        );
+        let first = build_agent_swarm_evidence_manifest(&report, &first_config);
+        let duplicate = AgentSwarmExistingBeadSummary::new(
+            "bd-existing-regression",
+            "Existing WAL replay regression",
+        )
+        .with_labels(["agent-swarm", "regression"])
+        .with_duplicate_keys([first.minimized_trace_hash.clone()]);
+        let duplicate_config = first_config.with_existing_beads([duplicate]);
+
+        let manifest = build_agent_swarm_evidence_manifest(&report, &duplicate_config);
+
+        assert_eq!(manifest.failure_category, AgentSwarmFailureCategory::Wal);
+        assert_eq!(
+            manifest.duplicate_candidate_ids,
+            vec!["bd-existing-regression".to_owned()]
+        );
+        assert!(manifest.proposed_regression_bead.is_none());
+    }
+
+    #[test]
+    fn agent_swarm_evidence_category_assignment_covers_core_surfaces() {
+        let cases = [
+            ("parser syntax error", AgentSwarmFailureCategory::Parser),
+            (
+                "planner chose stale index",
+                AgentSwarmFailureCategory::Planner,
+            ),
+            ("vdbe opcode mismatch", AgentSwarmFailureCategory::Vdbe),
+            ("pager page-cache miss", AgentSwarmFailureCategory::Pager),
+            ("wal checkpoint mismatch", AgentSwarmFailureCategory::Wal),
+            (
+                "mvcc conflict false positive",
+                AgentSwarmFailureCategory::Mvcc,
+            ),
+            (
+                "json extension mismatch",
+                AgentSwarmFailureCategory::Extension,
+            ),
+            (
+                "resource memory high-water exceeded",
+                AgentSwarmFailureCategory::ResourceEnvelope,
+            ),
+            ("opaque failure", AgentSwarmFailureCategory::Unknown),
+        ];
+
+        for (reason, expected) in cases {
+            let report = failure_report_with_reason(reason);
+            assert_eq!(classify_agent_swarm_failure(&report), expected);
+        }
+    }
+
     proptest! {
         #[test]
         fn synthetic_trace_generation_preserves_bounded_config(
@@ -3266,6 +3997,55 @@ mod tests {
                 .all(TraceStatement::schema_safe_for_synthetic_property);
             prop_assert!(schema_safe);
         }
+    }
+
+    fn failure_report_with_reason(reason: &str) -> AgentSwarmReplayReport {
+        let trace = busy_trace(ExpectedResultClass::Success);
+        let statements = vec![
+            resource_replay_record(
+                "agent-a",
+                0,
+                100,
+                AgentSwarmReplayOutcomeClass::Success,
+                TransactionBoundary::Begin,
+                0,
+            ),
+            resource_replay_record(
+                "agent-a",
+                1,
+                250,
+                AgentSwarmReplayOutcomeClass::Conflict,
+                TransactionBoundary::None,
+                1,
+            ),
+            resource_replay_record(
+                "agent-a",
+                2,
+                100,
+                AgentSwarmReplayOutcomeClass::Success,
+                TransactionBoundary::Commit,
+                0,
+            ),
+        ];
+        let mut report = resource_scorecard_report(statements, 8_192);
+        report.trace_id = trace.trace_id.clone();
+        report.run_id = trace.run_id.clone();
+        report.scenario_id = trace.scenario_id.clone();
+        report.first_failure = Some(AgentSwarmFirstFailureBundle {
+            backend: Some(AgentSwarmReplayBackend::FrankenSqliteConcurrent),
+            reason: reason.to_owned(),
+            trace_statement_index: 1,
+            trace_id: trace.trace_id,
+            run_id: trace.run_id,
+            scenario_id: trace.scenario_id,
+            minimal_reproducer_trace_slice: trace.statements.clone(),
+            materialized_replay_sql: trace
+                .statements
+                .iter()
+                .map(|statement| materialize_scrubbed_sql(&statement.scrubbed_sql))
+                .collect(),
+        });
+        report
     }
 
     fn raw_statement<'a>(

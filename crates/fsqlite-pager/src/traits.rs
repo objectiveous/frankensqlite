@@ -1493,6 +1493,13 @@ mod tests {
 
     // -- Unit tests --
 
+    const fn test_wal_generation_identity() -> WalGenerationIdentity {
+        WalGenerationIdentity {
+            checkpoint_seq: 0,
+            salts: fsqlite_wal::checksum::WalSalts { salt1: 0, salt2: 0 },
+        }
+    }
+
     #[test]
     fn test_pager_trait_is_sealed_mock_impl() {
         // This compiles because MockPager is in the same crate.
@@ -1630,7 +1637,7 @@ mod tests {
     fn test_wal_publication_snapshot_authoritative_when_index_full() {
         let snap = WalPublicationSnapshot {
             publication_seq: 1,
-            generation: WalGenerationIdentity::default(),
+            generation: test_wal_generation_identity(),
             last_commit_frame: Some(10),
             commit_count: 5,
             latest_frame_entries: 10,
@@ -1646,7 +1653,7 @@ mod tests {
     fn test_wal_publication_snapshot_not_authoritative_when_partial() {
         let snap = WalPublicationSnapshot {
             publication_seq: 1,
-            generation: WalGenerationIdentity::default(),
+            generation: test_wal_generation_identity(),
             last_commit_frame: None,
             commit_count: 0,
             latest_frame_entries: 0,
@@ -1760,7 +1767,7 @@ mod tests {
     }
 
     #[test]
-    fn test_transaction_mode_default_is_deferred() {
+    fn test_transaction_mode_default_trait_contract_is_deferred() {
         assert_eq!(TransactionMode::default(), TransactionMode::Deferred);
     }
 
@@ -1814,7 +1821,7 @@ mod tests {
     fn test_wal_publication_snapshot_clone_copy_debug() {
         let snap = WalPublicationSnapshot {
             publication_seq: 42,
-            generation: WalGenerationIdentity::default(),
+            generation: test_wal_generation_identity(),
             last_commit_frame: Some(100),
             commit_count: 7,
             latest_frame_entries: 50,
@@ -1996,7 +2003,7 @@ mod tests {
     fn wal_publication_snapshot_authoritative_boundary() {
         let base = WalPublicationSnapshot {
             publication_seq: 1,
-            generation: WalGenerationIdentity::default(),
+            generation: test_wal_generation_identity(),
             last_commit_frame: Some(10),
             commit_count: 5,
             latest_frame_entries: 10,

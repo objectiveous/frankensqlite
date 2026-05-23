@@ -50,6 +50,24 @@ pub const GROUP_OBJECT_ID_DOMAIN: &str = "fsqlite:compat:db-fec-group:v1";
 /// + 16 (db_gen_digest) + 8 (checksum) = 52 bytes.
 pub const DB_FEC_HEADER_SIZE: usize = 52;
 
+type RaptorqRepairEquation = (Vec<usize>, Vec<asupersync::raptorq::gf256::Gf256>);
+
+trait IntoDbFecRepairEquation {
+    fn into_db_fec_option(self) -> Option<RaptorqRepairEquation>;
+}
+
+impl IntoDbFecRepairEquation for RaptorqRepairEquation {
+    fn into_db_fec_option(self) -> Option<RaptorqRepairEquation> {
+        Some(self)
+    }
+}
+
+impl IntoDbFecRepairEquation for Option<RaptorqRepairEquation> {
+    fn into_db_fec_option(self) -> Option<RaptorqRepairEquation> {
+        self
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot FEC metrics
 // ---------------------------------------------------------------------------
@@ -773,7 +791,14 @@ pub fn attempt_page_repair(
                         "page {target_pgno}: invalid RaptorQ repair ESI {esi}: overflow"
                     ),
                 })?;
-            let (cols, coefs) = decoder.repair_equation_rfc6330(*esi);
+            let (cols, coefs) = decoder
+                .repair_equation_rfc6330(*esi)
+                .into_db_fec_option()
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "page {target_pgno}: invalid RaptorQ repair ESI {esi}: unsupported domain"
+                    ),
+                })?;
             received.push(asupersync::raptorq::decoder::ReceivedSymbol::repair(
                 *esi,
                 cols,

@@ -57,6 +57,26 @@ const RAPTORQ_REPAIR_EVENT_CAPACITY: usize = 512;
 /// to allow multiple evidence records per event (typical for multi-symbol repairs).
 const RAPTORQ_REPAIR_EVIDENCE_CAPACITY: usize = 2048;
 
+type RaptorqRepairEquation = (Vec<usize>, Vec<asupersync::raptorq::gf256::Gf256>);
+
+trait IntoWalFecRepairEquation {
+    fn into_wal_fec_result(self, esi: u32) -> Result<RaptorqRepairEquation>;
+}
+
+impl IntoWalFecRepairEquation for RaptorqRepairEquation {
+    fn into_wal_fec_result(self, _esi: u32) -> Result<RaptorqRepairEquation> {
+        Ok(self)
+    }
+}
+
+impl IntoWalFecRepairEquation for Option<RaptorqRepairEquation> {
+    fn into_wal_fec_result(self, esi: u32) -> Result<RaptorqRepairEquation> {
+        self.ok_or_else(|| FrankenError::WalCorrupt {
+            detail: format!("invalid RaptorQ repair ESI {esi}: unsupported domain"),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WalFecPragmaHeader {
     magic: [u8; 8],
@@ -2056,7 +2076,9 @@ pub fn wal_fec_raptorq_decode(
                 .ok_or_else(|| FrankenError::WalCorrupt {
                     detail: format!("invalid RaptorQ repair ESI {esi}: overflow"),
                 })?;
-            let (cols, coefs) = decoder.repair_equation_rfc6330(esi);
+            let (cols, coefs) = decoder
+                .repair_equation_rfc6330(esi)
+                .into_wal_fec_result(esi)?;
             received.push(asupersync::raptorq::decoder::ReceivedSymbol::repair(
                 esi,
                 cols,

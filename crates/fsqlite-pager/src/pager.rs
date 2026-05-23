@@ -5395,6 +5395,21 @@ where
         )
     }
 
+    /// Publish a new committed-state snapshot while the pager inner lock is still held.
+    ///
+    /// This mirrors the transaction commit helper so pager-level tests can
+    /// exercise publication/reclamation invariants without manufacturing a
+    /// full commit path.
+    #[cfg(test)]
+    fn publish_committed_snapshot_from_inner(&self, inner: &PagerInner<V::File>) {
+        let snapshot = Arc::new(PagerCommittedSnapshot::from_inner(inner));
+        let mut guard = self
+            .committed_snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = snapshot;
+    }
+
     /// Bind a same-path connection counter owned by the SQL connection layer.
     pub fn bind_shared_connection_count(&self, counter: Arc<AtomicUsize>) {
         let _ = self.shared_connection_count.set(counter);

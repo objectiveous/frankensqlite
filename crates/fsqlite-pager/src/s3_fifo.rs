@@ -2867,7 +2867,7 @@ mod tests {
     }
 
     #[test]
-    fn rollout_metrics_accessors() {
+    fn rollout_metrics_accessors_low_values() {
         let m = RolloutMetrics::new(5000, 250);
         assert_eq!(m.miss_rate_ppm(), 5000);
         assert_eq!(m.p99_read_latency_micros(), 250);

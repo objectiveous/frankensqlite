@@ -4044,7 +4044,7 @@ mod tests {
     #[test]
     fn cached_page_new_stores_fields_and_byte_size() {
         let k = key(7, 3);
-        let data = fsqlite_types::PageData::zeroed(4096);
+        let data = fsqlite_types::PageData::zeroed(fsqlite_types::PageSize::default());
         let page = CachedPage::new(k, data, 0xDEAD_BEEF, Some(42));
         assert_eq!(page.key, k);
         assert_eq!(page.xxh3, 0xDEAD_BEEF);

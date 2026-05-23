@@ -40,6 +40,9 @@ pub const AGENT_SWARM_RESOURCE_SCORECARD_VERSION: &str = "1.0.0";
 /// Version of the replay evidence manifest contract.
 pub const AGENT_SWARM_EVIDENCE_MANIFEST_VERSION: &str = "1.0.0";
 
+/// Version of the CI smoke replay artifact contract.
+pub const AGENT_SWARM_CI_SMOKE_VERSION: &str = "1.0.0";
+
 /// Marker used in structured logs when no failure diagnostic exists yet.
 pub const FIRST_FAILURE_DIAGNOSTIC_ABSENT: &str = "none";
 
@@ -754,9 +757,9 @@ pub struct AgentSwarmReplayCommands {
 impl Default for AgentSwarmReplayCommands {
     fn default() -> Self {
         Self {
-            smoke_command: "cargo test -p fsqlite-harness agent_swarm_replay -- --nocapture"
+            smoke_command: "cargo test -p fsqlite-harness --lib agent_swarm_ci_smoke -- --nocapture"
                 .to_owned(),
-            heavy_command: "timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-agent-swarm-replay cargo test -p fsqlite-harness agent_swarm_replay -- --nocapture".to_owned(),
+            heavy_command: "timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-agent-swarm-replay cargo test -p fsqlite-harness --lib agent_swarm_replay -- --nocapture".to_owned(),
         }
     }
 }
@@ -1509,6 +1512,68 @@ pub struct AgentSwarmEvidenceManifest {
     pub proposed_regression_bead: Option<AgentSwarmRegressionBeadProposal>,
 }
 
+/// Backend-specific row in the CI smoke replay artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmCiSmokeBackendArtifact {
+    /// Backend that produced these smoke metrics.
+    pub backend: AgentSwarmReplayBackend,
+    /// Executor identity observed during replay.
+    pub engine_identity: String,
+    /// Resource profile used for the smoke scorecard.
+    pub profile_id: AgentSwarmResourceProfileId,
+    /// Statements replayed on this backend.
+    pub statement_count: usize,
+    /// Expected-result mismatches observed on this backend.
+    pub expected_mismatch_count: usize,
+    /// Abort/error count observed on this backend.
+    pub abort_count: usize,
+    /// Retry count observed on this backend.
+    pub retry_count: u64,
+    /// p95 latency recorded by the deterministic replay report.
+    pub latency_p95_ns: u64,
+    /// First-failure diagnostic for this backend, or `none`.
+    pub first_failure_diag: String,
+}
+
+/// Machine-readable artifact emitted by the fast CI smoke replay path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmCiSmokeArtifact {
+    /// Serialized trace schema version validated by the smoke path.
+    pub schema_version: String,
+    /// CI smoke artifact contract version.
+    pub smoke_version: String,
+    /// Scrubber version validated by the smoke path.
+    pub scrubber_version: String,
+    /// Replay harness version used by the smoke path.
+    pub replay_harness_version: String,
+    /// Evidence manifest version linked by the smoke artifact.
+    pub evidence_manifest_version: String,
+    /// Stable hash of the smoke artifact payload.
+    pub artifact_hash: String,
+    /// Trace identifier shared across logs and artifacts.
+    pub trace_id: String,
+    /// Replay or capture run identifier.
+    pub run_id: String,
+    /// Scenario identifier shared with logs and artifacts.
+    pub scenario_id: String,
+    /// Command line used to produce the smoke replay report.
+    pub command: String,
+    /// Resource profile used for this smoke replay.
+    pub profile_id: AgentSwarmResourceProfileId,
+    /// Path to the full trace artifact.
+    pub trace_artifact_path: String,
+    /// Hash of the full trace artifact.
+    pub trace_artifact_hash: String,
+    /// Path where the evidence manifest is stored.
+    pub artifact_manifest_path: String,
+    /// Hash of the linked evidence manifest payload.
+    pub evidence_manifest_hash: String,
+    /// First-failure diagnostic for the overall smoke run, or `none`.
+    pub first_failure_diag: String,
+    /// Backend-specific smoke rows.
+    pub backend_artifacts: Vec<AgentSwarmCiSmokeBackendArtifact>,
+}
+
 /// Scrub sensitive SQL literals while preserving statement topology.
 pub fn scrub_sql_statement(sql: &str) -> ScrubbedSql {
     let chars = sql.chars().collect::<Vec<_>>();
@@ -1967,6 +2032,78 @@ pub fn build_agent_swarm_evidence_manifest(
     manifest
 }
 
+/// Build the compact artifact used by CI to prove the smoke replay path.
+pub fn build_agent_swarm_ci_smoke_artifact(
+    trace: &AgentSwarmTrace,
+    report: &AgentSwarmReplayReport,
+    scorecard: &AgentSwarmResourceScorecard,
+    manifest: &AgentSwarmEvidenceManifest,
+    artifact_manifest_path: impl Into<String>,
+) -> AgentSwarmCiSmokeArtifact {
+    let first_failure_diag = report
+        .first_failure
+        .as_ref()
+        .map_or(FIRST_FAILURE_DIAGNOSTIC_ABSENT, |failure| {
+            failure.reason.as_str()
+        })
+        .to_owned();
+    let backend_artifacts = report
+        .backends
+        .iter()
+        .map(|backend| {
+            let scorecard_backend = scorecard
+                .backends
+                .iter()
+                .find(|candidate| candidate.backend == backend.identity.backend);
+            AgentSwarmCiSmokeBackendArtifact {
+                backend: backend.identity.backend,
+                engine_identity: backend.identity.engine_identity.clone(),
+                profile_id: scorecard.profile.profile_id,
+                statement_count: backend.summary.statements_total,
+                expected_mismatch_count: backend.summary.expected_mismatch_count,
+                abort_count: backend.summary.abort_count,
+                retry_count: backend.summary.retry_count,
+                latency_p95_ns: scorecard_backend
+                    .map_or(backend.summary.latency_p95_ns, |candidate| {
+                        candidate.latency_p95_ns
+                    }),
+                first_failure_diag: backend
+                    .statements
+                    .iter()
+                    .find(|statement| {
+                        statement.first_failure_diag != FIRST_FAILURE_DIAGNOSTIC_ABSENT
+                    })
+                    .map_or_else(
+                        || first_failure_diag.clone(),
+                        |statement| statement.first_failure_diag.clone(),
+                    ),
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut artifact = AgentSwarmCiSmokeArtifact {
+        schema_version: trace.schema_version.clone(),
+        smoke_version: AGENT_SWARM_CI_SMOKE_VERSION.to_owned(),
+        scrubber_version: trace.scrubber_version.clone(),
+        replay_harness_version: report.harness_version.clone(),
+        evidence_manifest_version: manifest.manifest_version.clone(),
+        artifact_hash: String::new(),
+        trace_id: trace.trace_id.clone(),
+        run_id: trace.run_id.clone(),
+        scenario_id: trace.scenario_id.clone(),
+        command: manifest.replay_command.clone(),
+        profile_id: scorecard.profile.profile_id,
+        trace_artifact_path: manifest.trace_artifact_path.clone(),
+        trace_artifact_hash: manifest.trace_artifact_hash.clone(),
+        artifact_manifest_path: artifact_manifest_path.into(),
+        evidence_manifest_hash: manifest.artifact_hash.clone(),
+        first_failure_diag,
+        backend_artifacts,
+    };
+    artifact.artifact_hash = ci_smoke_artifact_hash(&artifact);
+    log_agent_swarm_ci_smoke_artifact(&artifact);
+    artifact
+}
+
 /// Write an evidence manifest and its minimized failing trace slice.
 pub fn write_agent_swarm_evidence_manifest_files(
     manifest: &AgentSwarmEvidenceManifest,
@@ -1986,7 +2123,7 @@ pub fn write_agent_swarm_evidence_manifest_files(
 }
 
 fn validate_agent_swarm_trace_schema(trace: &AgentSwarmTrace) -> Result<(), AgentSwarmReplayError> {
-    if trace.schema_version == SWARM_TRACE_SCHEMA_VERSION {
+    if trace.schema_version.as_str().eq(SWARM_TRACE_SCHEMA_VERSION) {
         Ok(())
     } else {
         Err(AgentSwarmReplayError::SchemaMismatch {
@@ -2651,6 +2788,47 @@ fn evidence_artifact_hash(
     })
 }
 
+fn ci_smoke_artifact_hash(artifact: &AgentSwarmCiSmokeArtifact) -> String {
+    #[derive(Serialize)]
+    struct CiSmokeDigest<'a> {
+        schema_version: &'a str,
+        smoke_version: &'a str,
+        scrubber_version: &'a str,
+        replay_harness_version: &'a str,
+        evidence_manifest_version: &'a str,
+        trace_id: &'a str,
+        run_id: &'a str,
+        scenario_id: &'a str,
+        command: &'a str,
+        profile_id: AgentSwarmResourceProfileId,
+        trace_artifact_path: &'a str,
+        trace_artifact_hash: &'a str,
+        artifact_manifest_path: &'a str,
+        evidence_manifest_hash: &'a str,
+        first_failure_diag: &'a str,
+        backend_artifacts: &'a [AgentSwarmCiSmokeBackendArtifact],
+    }
+
+    stable_json_hash(&CiSmokeDigest {
+        schema_version: &artifact.schema_version,
+        smoke_version: &artifact.smoke_version,
+        scrubber_version: &artifact.scrubber_version,
+        replay_harness_version: &artifact.replay_harness_version,
+        evidence_manifest_version: &artifact.evidence_manifest_version,
+        trace_id: &artifact.trace_id,
+        run_id: &artifact.run_id,
+        scenario_id: &artifact.scenario_id,
+        command: &artifact.command,
+        profile_id: artifact.profile_id,
+        trace_artifact_path: &artifact.trace_artifact_path,
+        trace_artifact_hash: &artifact.trace_artifact_hash,
+        artifact_manifest_path: &artifact.artifact_manifest_path,
+        evidence_manifest_hash: &artifact.evidence_manifest_hash,
+        first_failure_diag: &artifact.first_failure_diag,
+        backend_artifacts: &artifact.backend_artifacts,
+    })
+}
+
 fn stable_json_hash<T>(value: &T) -> String
 where
     T: Serialize,
@@ -2868,6 +3046,29 @@ fn log_agent_swarm_evidence_manifest(manifest: &AgentSwarmEvidenceManifest) {
         first_failure_diag = %manifest.first_failure_diag,
         "agent swarm evidence manifest",
     );
+}
+
+fn log_agent_swarm_ci_smoke_artifact(artifact: &AgentSwarmCiSmokeArtifact) {
+    for backend in &artifact.backend_artifacts {
+        tracing::info!(
+            target: "fsqlite.agent_swarm_trace.ci_smoke",
+            trace_id = %artifact.trace_id,
+            run_id = %artifact.run_id,
+            scenario_id = %artifact.scenario_id,
+            command = %artifact.command,
+            backend = backend.backend.as_str(),
+            profile_id = artifact.profile_id.as_str(),
+            artifact_manifest_path = %artifact.artifact_manifest_path,
+            artifact_hash = %artifact.artifact_hash,
+            evidence_manifest_hash = %artifact.evidence_manifest_hash,
+            statement_count = backend.statement_count,
+            expected_mismatch_count = backend.expected_mismatch_count,
+            abort_count = backend.abort_count,
+            retry_count = backend.retry_count,
+            first_failure_diag = %backend.first_failure_diag,
+            "agent swarm ci smoke artifact",
+        );
+    }
 }
 
 fn estimate_memory_high_water(trace: &AgentSwarmTrace, schema_sql: &[String]) -> usize {
@@ -3841,6 +4042,76 @@ mod tests {
         assert!(first.backend_versions[0].concurrent_writer_default);
         assert_eq!(first.result_metrics[0].statements_total, 1);
         assert!(first.result_metrics[0].throughput_statements_per_second_x1000 > 0);
+    }
+
+    #[test]
+    fn agent_swarm_ci_smoke_builds_operator_artifact_end_to_end() {
+        let trace = generate_synthetic_swarm_trace(
+            SyntheticTraceConfig::new(SyntheticTraceScenario::SessionEventAppend, 0xC1_5E_ED, 2, 2)
+                .with_read_write_mix(0, 100),
+        )
+        .expect("synthetic smoke trace");
+        let trace_json = serde_json::to_string(&trace).expect("trace json");
+        let loaded_trace = load_agent_swarm_trace_json(&trace_json).expect("schema-valid trace");
+
+        assert_eq!(loaded_trace.scrubber_version, SWARM_TRACE_SCRUBBER_VERSION);
+        assert!(loaded_trace.redaction_summary.redaction_count > 0);
+
+        let replay_config = AgentSwarmReplayConfig::smoke(0xC1_5E_ED);
+        let fsqlite = RecordingExecutor::new(EngineIdentity::FrankenSqlite);
+        let csqlite = RecordingExecutor::new(EngineIdentity::CSqliteOracle);
+        let report = replay_agent_swarm_trace_with_executors(
+            &loaded_trace,
+            &replay_config,
+            &fsqlite,
+            &csqlite,
+        )
+        .expect("smoke replay succeeds");
+        let scorecard_config =
+            AgentSwarmResourceScorecardConfig::new(AgentSwarmResourceProfile::local_smoke());
+        let scorecard = score_agent_swarm_resource_envelope(&report, &scorecard_config);
+        let manifest_config = AgentSwarmEvidenceManifestConfig::new(
+            "tests/artifacts/agent-swarm-ci-smoke-trace.json",
+            "cargo test -p fsqlite-harness --lib agent_swarm_ci_smoke -- --nocapture",
+        )
+        .with_trace_artifact_hash(stable_json_hash(&loaded_trace))
+        .without_regression_proposals();
+        let manifest = build_agent_swarm_evidence_manifest(&report, &manifest_config);
+        let artifact = build_agent_swarm_ci_smoke_artifact(
+            &loaded_trace,
+            &report,
+            &scorecard,
+            &manifest,
+            "tests/artifacts/agent-swarm-ci-smoke-manifest.json",
+        );
+
+        assert_eq!(artifact.schema_version, SWARM_TRACE_SCHEMA_VERSION);
+        assert_eq!(artifact.smoke_version, AGENT_SWARM_CI_SMOKE_VERSION);
+        assert_eq!(artifact.trace_id, loaded_trace.trace_id);
+        assert_eq!(artifact.run_id, loaded_trace.run_id);
+        assert_eq!(artifact.scenario_id, loaded_trace.scenario_id);
+        assert_eq!(artifact.profile_id, AgentSwarmResourceProfileId::LocalSmoke);
+        assert_eq!(
+            artifact.artifact_manifest_path,
+            "tests/artifacts/agent-swarm-ci-smoke-manifest.json"
+        );
+        assert_eq!(artifact.first_failure_diag, FIRST_FAILURE_DIAGNOSTIC_ABSENT);
+        assert_eq!(artifact.backend_artifacts.len(), 2);
+        assert!(
+            artifact
+                .backend_artifacts
+                .iter()
+                .any(|backend| backend.backend == AgentSwarmReplayBackend::FrankenSqliteConcurrent)
+        );
+        assert!(
+            artifact
+                .backend_artifacts
+                .iter()
+                .all(|backend| backend.profile_id == AgentSwarmResourceProfileId::LocalSmoke)
+        );
+        assert!(artifact.command.contains("agent_swarm_ci_smoke"));
+        assert_eq!(artifact.evidence_manifest_hash, manifest.artifact_hash);
+        assert_eq!(artifact.artifact_hash, ci_smoke_artifact_hash(&artifact));
     }
 
     #[test]

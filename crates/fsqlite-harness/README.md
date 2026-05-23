@@ -85,6 +85,42 @@ These types live in `fsqlite-e2e` and serve different purposes:
 - `TraceContext` / `OpEvent` — per-operation structured tracing (bd-zywqc.1), vs `LogEventSchema` which is test-lifecycle events
 - `FRANKEN_SEED` / `derive_worker_seed` — same base seed as `CORPUS_SEED_BASE`, different derivation API
 
+## Agent-Swarm Replay Lab
+
+The `agent_swarm_trace` module is the operator path for sanitized multi-agent SQL traces. It owns the trace schema, SQL literal scrubber, deterministic replay harness, resource scorecard, evidence manifest, and the fast CI smoke artifact.
+
+Fast CI smoke replay:
+
+```bash
+cargo test -p fsqlite-harness --lib agent_swarm_ci_smoke -- --nocapture
+```
+
+Heavy replay and lint checks must stay offloaded through `rch`:
+
+```bash
+timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-agent-swarm-replay cargo test -p fsqlite-harness --lib agent_swarm_replay -- --nocapture
+timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-agent-swarm-trace cargo test -p fsqlite-harness --lib agent_swarm_trace -- --nocapture
+timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-agent-swarm-clippy cargo clippy -p fsqlite-harness --lib --no-deps -- -D warnings
+```
+
+Minimal capture/scrub/replay path:
+
+1. Capture raw statement metadata from Agent Mail, Beads, or CASS into `RawTraceStatement` rows with deterministic `logical_order`, logical actor ids, connection ids, transaction ids, concurrency groups, and expected result classes.
+2. Convert each row with `TraceStatement::from_raw`; this preserves topology while replacing private string, numeric, blob, and SQL-comment literals with scrubber placeholders.
+3. Store or load JSON through `load_agent_swarm_trace_json` or `load_agent_swarm_trace_file` so the schema version and scrubber version are validated before replay.
+4. Replay with `replay_agent_swarm_trace` or `replay_agent_swarm_trace_with_executors`; FrankenSQLite remains on the concurrent-writer default path and C SQLite remains the oracle backend.
+5. Score with `score_agent_swarm_resource_envelope`, then build `AgentSwarmEvidenceManifest` and `AgentSwarmCiSmokeArtifact` so operators get a trace hash, replay command, backend metrics, minimized first-failure slice, and duplicate-regression hints.
+
+Key metrics:
+
+- `throughput_statements_per_second_x1000` records statement throughput in fixed-point form for artifact comparison only.
+- `latency_p50_ns`, `latency_p95_ns`, and `latency_p99_ns` capture replay latency distribution.
+- `abort_count`, `retry_count`, `expected_mismatch_count`, and `conflict_classes` separate expected busy/conflict behavior from unexpected failures.
+- `memory_high_water_bytes`, `cpu_utilization_per_mille`, `page_cache_utilization_per_mille`, and `fairness_index_per_mille` describe the selected resource profile.
+- `first_failure_diag` is copied into replay reports, scorecards, evidence manifests, CI smoke artifacts, and structured logs.
+
+Every final smoke artifact and structured CI-smoke log row includes `trace_id`, `run_id`, `scenario_id`, `command`, `backend`, `profile_id`, `artifact_manifest_path`, and `first_failure_diag`. Numeric performance claims in the root README still require a benchmark or artifact path, commit, and run date; scorecards and smoke artifacts alone are not permission to write uncited throughput or speedup claims.
+
 ## Dependencies (runtime)
 
 - `fsqlite`, `fsqlite-error`, `fsqlite-types`, `fsqlite-vfs`

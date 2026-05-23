@@ -20432,6 +20432,132 @@ mod tests {
     }
 
     #[test]
+    fn test_codegen_b3_rowid_and_ipk_equality_use_direct_seek() {
+        let cases = [
+            (
+                "hidden rowid",
+                simple_select(&["b"], "t", Some(rowid_eq_param())),
+                test_schema(),
+            ),
+            (
+                "INTEGER PRIMARY KEY alias",
+                simple_select(&["b"], "t", Some(col_cmp_param("a", AstBinaryOp::Eq, 1))),
+                schema_with_ipk_alias(),
+            ),
+        ];
+
+        for (name, stmt, schema) in cases {
+            let mut b = ProgramBuilder::new();
+            codegen_select(&mut b, &stmt, &schema, &CodegenContext::default())
+                .unwrap_or_else(|err| panic!("{name} SELECT should codegen: {err:?}"));
+            let prog = b
+                .finish()
+                .unwrap_or_else(|err| panic!("{name} program should finish: {err:?}"));
+            let ops = prog.ops();
+
+            let seek_pos = ops
+                .iter()
+                .position(|op| op.opcode == Opcode::SeekRowid)
+                .unwrap_or_else(|| panic!("{name} lookup must emit SeekRowid"));
+            let column_pos = ops
+                .iter()
+                .position(|op| op.opcode == Opcode::Column)
+                .unwrap_or_else(|| panic!("{name} lookup must read the matched row"));
+
+            assert!(
+                seek_pos < column_pos,
+                "{name} lookup must seek before reading output columns"
+            );
+            assert!(
+                !ops.iter()
+                    .any(|op| matches!(op.opcode, Opcode::Rewind | Opcode::Next)),
+                "{name} equality lookup must not carry a full-scan loop"
+            );
+        }
+    }
+
+    #[test]
+    fn test_codegen_b3_index_equality_uses_index_probe_before_any_scan_fallback() {
+        let stmt = simple_select(&["a"], "t", Some(col_cmp_param("b", AstBinaryOp::Eq, 1)));
+        let schema = test_schema_with_index();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        let seek_ge_pos = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::SeekGE && op.p1 == 1)
+            .expect("indexed equality should seek into the index cursor");
+        let first_table_rewind = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Rewind && op.p1 == 0)
+            .unwrap_or(ops.len());
+
+        assert!(
+            ops.iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Index(name) if name == "idx_t_b")
+            }),
+            "indexed equality should open the matching index"
+        );
+        assert!(
+            seek_ge_pos < first_table_rewind,
+            "indexed equality must probe the index before any scan fallback"
+        );
+        assert!(
+            ops[..first_table_rewind]
+                .iter()
+                .any(|op| op.opcode == Opcode::IdxRowid && op.p1 == 1),
+            "non-covering indexed equality should recover table rowids from the index"
+        );
+        assert!(
+            ops[..first_table_rewind]
+                .iter()
+                .any(|op| op.opcode == Opcode::SeekRowid && op.p1 == 0),
+            "non-covering indexed equality should seek the table by rowid, not scan it"
+        );
+    }
+
+    #[test]
+    fn test_codegen_b3_covering_index_fast_path_projects_without_table_lookup() {
+        let stmt = simple_select(&["b"], "t", Some(col_cmp_param("b", AstBinaryOp::Eq, 1)));
+        let schema = test_schema_with_index();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        let seek_ge_pos = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::SeekGE && op.p1 == 1)
+            .expect("covering equality should seek into the index cursor");
+        let fast_path_end = ops
+            .iter()
+            .position(|op| {
+                op.opcode == Opcode::OpenRead && matches!(&op.p4, P4::Table(name) if name == "t")
+            })
+            .unwrap_or(ops.len());
+
+        assert!(
+            seek_ge_pos < fast_path_end,
+            "covering equality must run the index probe before any scan fallback"
+        );
+        assert!(
+            !ops[..fast_path_end]
+                .iter()
+                .any(|op| op.opcode == Opcode::SeekRowid),
+            "covering equality fast path should not perform table rowid lookups"
+        );
+        assert!(
+            ops[..fast_path_end]
+                .iter()
+                .any(|op| op.opcode == Opcode::Column && op.p1 == 1),
+            "covering equality should project output from the index cursor"
+        );
+    }
+
+    #[test]
     fn test_codegen_select_ipk_range_uses_bounded_seek_scan() {
         let stmt = simple_select(
             &["a"],

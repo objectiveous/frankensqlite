@@ -34,8 +34,14 @@ pub const SYNTHETIC_TRACE_GENERATOR_VERSION: &str = "1.0.0";
 /// Version of the deterministic agent-swarm replay harness.
 pub const AGENT_SWARM_REPLAY_HARNESS_VERSION: &str = "1.0.0";
 
+/// Version of the resource envelope and fairness scorecard contract.
+pub const AGENT_SWARM_RESOURCE_SCORECARD_VERSION: &str = "1.0.0";
+
 /// Marker used in structured logs when no failure diagnostic exists yet.
 pub const FIRST_FAILURE_DIAGNOSTIC_ABSENT: &str = "none";
+
+const MIB: u64 = 1_024 * 1_024;
+const GIB: u64 = 1_024 * MIB;
 
 /// Complete sanitized trace for an agent-swarm workload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -837,6 +843,8 @@ pub struct AgentSwarmStatementReplay {
     pub trace_statement_index: usize,
     /// Deterministic trace order.
     pub logical_order: u64,
+    /// Logical actor identity from the trace.
+    pub actor_id: String,
     /// Logical connection identity from the trace.
     pub connection_id: String,
     /// Logical transaction identity from the trace.
@@ -980,6 +988,266 @@ pub struct AgentSwarmReplayReport {
     pub cross_backend_mismatches: Vec<AgentSwarmBackendMismatch>,
     /// First failure bundle, if replay found a failure or mismatch.
     pub first_failure: Option<AgentSwarmFirstFailureBundle>,
+}
+
+/// Resource profile identifier for agent-swarm replay scorecards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSwarmResourceProfileId {
+    /// Small local smoke budget for developer machines.
+    LocalSmoke,
+    /// Workstation-class profile for focused manual runs.
+    Workstation,
+    /// High-capacity server profile for 64+ core / 256GB+ RAM swarm runs.
+    HighCapacityServer,
+}
+
+impl AgentSwarmResourceProfileId {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalSmoke => "local_smoke",
+            Self::Workstation => "workstation",
+            Self::HighCapacityServer => "high_capacity_server",
+        }
+    }
+}
+
+/// Resource envelope profile attached to replay scorecards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmResourceProfile {
+    /// Stable profile identifier.
+    pub profile_id: AgentSwarmResourceProfileId,
+    /// Human-readable label for artifacts.
+    pub profile_label: String,
+    /// CPU cores available to the profile.
+    pub core_count: u32,
+    /// Memory budget for the profile.
+    pub memory_limit_bytes: u64,
+    /// Page-cache budget used for scorecard utilization.
+    pub page_cache_limit_bytes: u64,
+    /// Observation window used for deterministic CPU utilization estimates.
+    pub cpu_observation_window_ns: u64,
+    /// Maximum local smoke statements expected on developer machines.
+    pub local_statement_limit: usize,
+    /// Local smoke command shape.
+    pub local_smoke_command: String,
+    /// CPU-heavy command shape that must be offloaded through rch.
+    pub heavy_rch_command: String,
+}
+
+impl AgentSwarmResourceProfile {
+    /// Local smoke replay profile.
+    pub fn local_smoke() -> Self {
+        Self {
+            profile_id: AgentSwarmResourceProfileId::LocalSmoke,
+            profile_label: "local smoke".to_owned(),
+            core_count: 4,
+            memory_limit_bytes: 512 * MIB,
+            page_cache_limit_bytes: 64 * MIB,
+            cpu_observation_window_ns: 1_000_000_000,
+            local_statement_limit: 250,
+            local_smoke_command: "cargo test -p fsqlite-harness agent_swarm_scorecard -- --nocapture"
+                .to_owned(),
+            heavy_rch_command: "timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-agent-swarm-scorecard cargo test -p fsqlite-harness agent_swarm_scorecard -- --nocapture".to_owned(),
+        }
+    }
+
+    /// Workstation replay profile.
+    pub fn workstation() -> Self {
+        Self {
+            profile_id: AgentSwarmResourceProfileId::Workstation,
+            profile_label: "workstation".to_owned(),
+            core_count: 16,
+            memory_limit_bytes: 32 * GIB,
+            page_cache_limit_bytes: 4 * GIB,
+            cpu_observation_window_ns: 5_000_000_000,
+            local_statement_limit: 10_000,
+            local_smoke_command: "cargo test -p fsqlite-harness agent_swarm_scorecard -- --nocapture"
+                .to_owned(),
+            heavy_rch_command: "timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-agent-swarm-scorecard cargo test -p fsqlite-harness agent_swarm_scorecard -- --nocapture".to_owned(),
+        }
+    }
+
+    /// High-capacity replay profile for large agent-swarm machines.
+    pub fn high_capacity_server() -> Self {
+        Self {
+            profile_id: AgentSwarmResourceProfileId::HighCapacityServer,
+            profile_label: "high capacity server".to_owned(),
+            core_count: 64,
+            memory_limit_bytes: 256 * GIB,
+            page_cache_limit_bytes: 64 * GIB,
+            cpu_observation_window_ns: 30_000_000_000,
+            local_statement_limit: 100_000,
+            local_smoke_command: "cargo test -p fsqlite-harness agent_swarm_scorecard -- --nocapture"
+                .to_owned(),
+            heavy_rch_command: "timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-agent-swarm-scorecard cargo test -p fsqlite-harness agent_swarm_scorecard -- --nocapture".to_owned(),
+        }
+    }
+}
+
+/// Default resource profiles for smoke, workstation, and high-capacity runs.
+pub fn default_agent_swarm_resource_profiles() -> Vec<AgentSwarmResourceProfile> {
+    vec![
+        AgentSwarmResourceProfile::local_smoke(),
+        AgentSwarmResourceProfile::workstation(),
+        AgentSwarmResourceProfile::high_capacity_server(),
+    ]
+}
+
+/// Whether a scorecard is ready to support README numeric performance claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSwarmPerformanceClaimStatus {
+    /// Profile/scorecard only; numeric README claims still need artifact evidence.
+    ProfileOnly,
+    /// Numeric README claims can cite the attached benchmark artifact metadata.
+    ArtifactBacked,
+}
+
+/// Guardrail metadata for README performance claims.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmPerformanceClaimGuard {
+    /// Current claim status.
+    pub status: AgentSwarmPerformanceClaimStatus,
+    /// Benchmark artifact path, when a numeric claim is artifact-backed.
+    pub benchmark_artifact_path: Option<String>,
+    /// Commit used for the benchmark artifact, when known.
+    pub benchmark_commit: Option<String>,
+    /// Benchmark run date, when a numeric claim is artifact-backed.
+    pub benchmark_run_date: Option<String>,
+    /// Policy text copied into artifacts to prevent uncited numeric claims.
+    pub policy: String,
+}
+
+impl AgentSwarmPerformanceClaimGuard {
+    /// Build a guard for profile-only scorecards.
+    pub fn profile_only() -> Self {
+        Self {
+            status: AgentSwarmPerformanceClaimStatus::ProfileOnly,
+            benchmark_artifact_path: None,
+            benchmark_commit: None,
+            benchmark_run_date: None,
+            policy: "README numeric performance claims require a benchmark artifact path, commit, and run date; this scorecard alone is profile-only evidence.".to_owned(),
+        }
+    }
+
+    /// Build a guard for scorecards tied to a benchmark artifact.
+    pub fn artifact_backed(
+        artifact_path: impl Into<String>,
+        commit: impl Into<String>,
+        run_date: impl Into<String>,
+    ) -> Self {
+        Self {
+            status: AgentSwarmPerformanceClaimStatus::ArtifactBacked,
+            benchmark_artifact_path: Some(artifact_path.into()),
+            benchmark_commit: Some(commit.into()),
+            benchmark_run_date: Some(run_date.into()),
+            policy: "README numeric performance claims may cite this scorecard only with its artifact path, commit, and run date.".to_owned(),
+        }
+    }
+}
+
+/// Configuration for producing a resource envelope scorecard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmResourceScorecardConfig {
+    /// Resource profile to score against.
+    pub profile: AgentSwarmResourceProfile,
+    /// README performance-claim guardrail metadata.
+    pub performance_claim_guard: AgentSwarmPerformanceClaimGuard,
+}
+
+impl AgentSwarmResourceScorecardConfig {
+    /// Build scorecard config for a profile-only run.
+    pub fn new(profile: AgentSwarmResourceProfile) -> Self {
+        Self {
+            profile,
+            performance_claim_guard: AgentSwarmPerformanceClaimGuard::profile_only(),
+        }
+    }
+
+    /// Attach benchmark artifact metadata so README numeric claims can cite it.
+    pub fn with_readme_artifact(
+        mut self,
+        artifact_path: impl Into<String>,
+        commit: impl Into<String>,
+        run_date: impl Into<String>,
+    ) -> Self {
+        self.performance_claim_guard =
+            AgentSwarmPerformanceClaimGuard::artifact_backed(artifact_path, commit, run_date);
+        self
+    }
+}
+
+/// Resource and fairness scorecard for one replay backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmBackendResourceScorecard {
+    /// Backend that produced the scorecard.
+    pub backend: AgentSwarmReplayBackend,
+    /// Comparison role label.
+    pub comparison_role: String,
+    /// Whether this backend is FrankenSQLite's concurrent-writer default.
+    pub concurrent_writer_default: bool,
+    /// CPU cores in the active profile.
+    pub core_count: u32,
+    /// Memory limit in the active profile.
+    pub memory_limit_bytes: u64,
+    /// Deterministic CPU utilization estimate, per mille of profile capacity.
+    pub cpu_utilization_per_mille: u16,
+    /// Basis for the CPU utilization estimate.
+    pub cpu_utilization_basis: String,
+    /// Replay memory high-water estimate.
+    pub memory_high_water_bytes: u64,
+    /// Whether replay high-water exceeded the profile memory budget.
+    pub memory_limit_exceeded: bool,
+    /// Estimated page-cache footprint counted against the profile budget.
+    pub page_cache_footprint_bytes: u64,
+    /// Page-cache limit in the active profile.
+    pub page_cache_limit_bytes: u64,
+    /// Page-cache utilization, per mille of the profile budget.
+    pub page_cache_utilization_per_mille: u16,
+    /// Backend abort/error rate per thousand statements.
+    pub abort_rate_per_mille: u64,
+    /// Backend retry rate per thousand statements.
+    pub retry_rate_per_mille: u64,
+    /// Jain fairness index over per-actor throughput, per mille.
+    pub fairness_index_per_mille: u16,
+    /// Statement counts by actor.
+    pub per_actor_statement_count: BTreeMap<String, usize>,
+    /// Per-actor throughput using the backend replay window.
+    pub per_actor_throughput_statements_per_second_x1000: BTreeMap<String, u64>,
+    /// p50 latency in nanoseconds.
+    pub latency_p50_ns: u64,
+    /// p95 latency in nanoseconds.
+    pub latency_p95_ns: u64,
+    /// p99 latency in nanoseconds.
+    pub latency_p99_ns: u64,
+    /// Tail spread between p99 and p50.
+    pub tail_latency_spread_ns: u64,
+    /// Backend throughput.
+    pub throughput_statements_per_second_x1000: u64,
+}
+
+/// Full resource envelope and fairness scorecard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmResourceScorecard {
+    /// Scorecard schema version.
+    pub schema_version: String,
+    /// Scorecard implementation version.
+    pub scorecard_version: String,
+    /// Trace identifier.
+    pub trace_id: String,
+    /// Run identifier.
+    pub run_id: String,
+    /// Scenario identifier.
+    pub scenario_id: String,
+    /// Resource profile used for scoring.
+    pub profile: AgentSwarmResourceProfile,
+    /// README performance-claim guardrail metadata.
+    pub performance_claim_guard: AgentSwarmPerformanceClaimGuard,
+    /// First-failure diagnostic copied from the replay report.
+    pub first_failure_diag: String,
+    /// Backend scorecards.
+    pub backends: Vec<AgentSwarmBackendResourceScorecard>,
 }
 
 /// Scrub sensitive SQL literals while preserving statement topology.
@@ -1300,6 +1568,38 @@ where
     Ok(report)
 }
 
+/// Score a replay report against a resource envelope profile.
+pub fn score_agent_swarm_resource_envelope(
+    report: &AgentSwarmReplayReport,
+    config: &AgentSwarmResourceScorecardConfig,
+) -> AgentSwarmResourceScorecard {
+    let first_failure_diag = report
+        .first_failure
+        .as_ref()
+        .map_or(FIRST_FAILURE_DIAGNOSTIC_ABSENT, |failure| {
+            failure.reason.as_str()
+        })
+        .to_owned();
+    let backends = report
+        .backends
+        .iter()
+        .map(|backend| score_backend_resource_envelope(backend, &config.profile))
+        .collect();
+    let scorecard = AgentSwarmResourceScorecard {
+        schema_version: SWARM_TRACE_SCHEMA_VERSION.to_owned(),
+        scorecard_version: AGENT_SWARM_RESOURCE_SCORECARD_VERSION.to_owned(),
+        trace_id: report.trace_id.clone(),
+        run_id: report.run_id.clone(),
+        scenario_id: report.scenario_id.clone(),
+        profile: config.profile.clone(),
+        performance_claim_guard: config.performance_claim_guard.clone(),
+        first_failure_diag,
+        backends,
+    };
+    log_agent_swarm_resource_scorecard(&scorecard);
+    scorecard
+}
+
 fn validate_agent_swarm_trace_schema(trace: &AgentSwarmTrace) -> Result<(), AgentSwarmReplayError> {
     if trace.schema_version == SWARM_TRACE_SCHEMA_VERSION {
         Ok(())
@@ -1520,6 +1820,7 @@ where
         backend,
         trace_statement_index,
         logical_order: statement.logical_order,
+        actor_id: statement.actor_id.clone(),
         connection_id: statement.connection_id.clone(),
         transaction_id: statement.transaction_id.clone(),
         transaction_boundary: statement.transaction_boundary,
@@ -1676,6 +1977,113 @@ fn throughput_x1000(statement_count: usize, latency_total_ns: u64) -> u64 {
     u64::try_from(throughput).unwrap_or(u64::MAX)
 }
 
+fn score_backend_resource_envelope(
+    backend: &AgentSwarmBackendReplay,
+    profile: &AgentSwarmResourceProfile,
+) -> AgentSwarmBackendResourceScorecard {
+    let mut per_actor_statement_count = BTreeMap::new();
+    for statement in &backend.statements {
+        *per_actor_statement_count
+            .entry(statement.actor_id.clone())
+            .or_insert(0) += 1;
+    }
+    let per_actor_throughput_statements_per_second_x1000 = per_actor_statement_count
+        .iter()
+        .map(|(actor_id, count)| {
+            (
+                actor_id.clone(),
+                throughput_x1000(*count, backend.summary.latency_total_ns),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let fairness_index_per_mille = jain_fairness_index_per_mille(
+        per_actor_throughput_statements_per_second_x1000
+            .values()
+            .copied(),
+    );
+    let memory_high_water_bytes = usize_to_u64(backend.summary.memory_high_water_bytes);
+    let page_cache_footprint_bytes = memory_high_water_bytes.min(profile.page_cache_limit_bytes);
+    let cpu_capacity_ns = profile
+        .cpu_observation_window_ns
+        .saturating_mul(u64::from(profile.core_count.max(1)));
+
+    AgentSwarmBackendResourceScorecard {
+        backend: backend.identity.backend,
+        comparison_role: backend.identity.comparison_role.clone(),
+        concurrent_writer_default: backend.identity.concurrent_writer_default,
+        core_count: profile.core_count,
+        memory_limit_bytes: profile.memory_limit_bytes,
+        cpu_utilization_per_mille: ratio_per_mille_capped(
+            backend.summary.latency_total_ns,
+            cpu_capacity_ns,
+        ),
+        cpu_utilization_basis:
+            "latency_total_ns divided by profile core_count * observation_window_ns".to_owned(),
+        memory_high_water_bytes,
+        memory_limit_exceeded: memory_high_water_bytes > profile.memory_limit_bytes,
+        page_cache_footprint_bytes,
+        page_cache_limit_bytes: profile.page_cache_limit_bytes,
+        page_cache_utilization_per_mille: ratio_per_mille_capped(
+            page_cache_footprint_bytes,
+            profile.page_cache_limit_bytes,
+        ),
+        abort_rate_per_mille: ratio_per_mille(
+            usize_to_u64(backend.summary.abort_count),
+            usize_to_u64(backend.summary.statements_total),
+        ),
+        retry_rate_per_mille: ratio_per_mille(
+            backend.summary.retry_count,
+            usize_to_u64(backend.summary.statements_total),
+        ),
+        fairness_index_per_mille,
+        per_actor_statement_count,
+        per_actor_throughput_statements_per_second_x1000,
+        latency_p50_ns: backend.summary.latency_p50_ns,
+        latency_p95_ns: backend.summary.latency_p95_ns,
+        latency_p99_ns: backend.summary.latency_p99_ns,
+        tail_latency_spread_ns: backend
+            .summary
+            .latency_p99_ns
+            .saturating_sub(backend.summary.latency_p50_ns),
+        throughput_statements_per_second_x1000: backend
+            .summary
+            .throughput_statements_per_second_x1000,
+    }
+}
+
+fn ratio_per_mille(numerator: u64, denominator: u64) -> u64 {
+    if denominator == 0 {
+        return 0;
+    }
+    numerator.saturating_mul(1_000) / denominator
+}
+
+fn ratio_per_mille_capped(numerator: u64, denominator: u64) -> u16 {
+    u16::try_from(ratio_per_mille(numerator, denominator).min(1_000)).unwrap_or(1_000)
+}
+
+fn jain_fairness_index_per_mille(values: impl IntoIterator<Item = u64>) -> u16 {
+    let mut actor_count = 0_u128;
+    let mut sum = 0_u128;
+    let mut sum_squares = 0_u128;
+    for value in values {
+        actor_count += 1;
+        let value = u128::from(value);
+        sum = sum.saturating_add(value);
+        sum_squares = sum_squares.saturating_add(value.saturating_mul(value));
+    }
+    if actor_count == 0 || sum == 0 || sum_squares == 0 {
+        return 0;
+    }
+    let numerator = sum.saturating_mul(sum).saturating_mul(1_000);
+    let denominator = actor_count.saturating_mul(sum_squares);
+    u16::try_from((numerator / denominator).min(1_000)).unwrap_or(1_000)
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 fn compare_backend_records(
     subject: &AgentSwarmBackendReplay,
     reference: &AgentSwarmBackendReplay,
@@ -1829,6 +2237,28 @@ fn log_agent_swarm_replay_summary(report: &AgentSwarmReplayReport) {
         first_failure_diag = report.first_failure.as_ref().map(|failure| failure.reason.as_str()).unwrap_or(FIRST_FAILURE_DIAGNOSTIC_ABSENT),
         "agent swarm replay summary",
     );
+}
+
+fn log_agent_swarm_resource_scorecard(scorecard: &AgentSwarmResourceScorecard) {
+    for backend in &scorecard.backends {
+        tracing::info!(
+            target: "fsqlite.agent_swarm_trace.resource_scorecard",
+            trace_id = %scorecard.trace_id,
+            run_id = %scorecard.run_id,
+            scenario_id = %scorecard.scenario_id,
+            profile_id = scorecard.profile.profile_id.as_str(),
+            core_count = backend.core_count,
+            memory_limit_bytes = backend.memory_limit_bytes,
+            backend = backend.backend.as_str(),
+            fairness_index = backend.fairness_index_per_mille,
+            p95_ns = backend.latency_p95_ns,
+            p99_ns = backend.latency_p99_ns,
+            abort_rate = backend.abort_rate_per_mille,
+            retry_rate = backend.retry_rate_per_mille,
+            first_failure_diag = %scorecard.first_failure_diag,
+            "agent swarm resource scorecard",
+        );
+    }
 }
 
 fn estimate_memory_high_water(trace: &AgentSwarmTrace, schema_sql: &[String]) -> usize {
@@ -2671,6 +3101,106 @@ mod tests {
         assert_eq!(failure.materialized_replay_sql.len(), 3);
     }
 
+    #[test]
+    fn agent_swarm_scorecard_profiles_include_rch_and_local_limits() {
+        let profiles = default_agent_swarm_resource_profiles();
+
+        assert_eq!(profiles.len(), 3);
+        assert!(
+            profiles
+                .iter()
+                .all(|profile| profile.heavy_rch_command.contains("rch exec"))
+        );
+        assert!(
+            profiles
+                .iter()
+                .all(|profile| profile.local_statement_limit > 0)
+        );
+        assert!(profiles.iter().any(|profile| {
+            profile.profile_id == AgentSwarmResourceProfileId::HighCapacityServer
+                && profile.core_count >= 64
+                && profile.memory_limit_bytes >= 256 * GIB
+        }));
+    }
+
+    #[test]
+    fn agent_swarm_scorecard_handles_zero_workload() {
+        let report = resource_scorecard_report(Vec::new(), 0);
+        let config =
+            AgentSwarmResourceScorecardConfig::new(AgentSwarmResourceProfile::local_smoke());
+
+        let scorecard = score_agent_swarm_resource_envelope(&report, &config);
+        let backend = &scorecard.backends[0];
+
+        assert_eq!(
+            scorecard.performance_claim_guard.status,
+            AgentSwarmPerformanceClaimStatus::ProfileOnly
+        );
+        assert_eq!(backend.cpu_utilization_per_mille, 0);
+        assert_eq!(backend.memory_high_water_bytes, 0);
+        assert!(!backend.memory_limit_exceeded);
+        assert_eq!(backend.page_cache_utilization_per_mille, 0);
+        assert_eq!(backend.abort_rate_per_mille, 0);
+        assert_eq!(backend.retry_rate_per_mille, 0);
+        assert_eq!(backend.fairness_index_per_mille, 0);
+        assert!(backend.per_actor_statement_count.is_empty());
+        assert_eq!(backend.tail_latency_spread_ns, 0);
+    }
+
+    #[test]
+    fn agent_swarm_scorecard_detects_skewed_actor_fairness_and_rates() {
+        let mut statements = (0..9)
+            .map(|index| {
+                resource_replay_record(
+                    "agent-hot",
+                    index,
+                    100,
+                    AgentSwarmReplayOutcomeClass::Success,
+                    TransactionBoundary::None,
+                    0,
+                )
+            })
+            .collect::<Vec<_>>();
+        statements.push(resource_replay_record(
+            "agent-cold",
+            9,
+            400,
+            AgentSwarmReplayOutcomeClass::Conflict,
+            TransactionBoundary::Rollback,
+            2,
+        ));
+        let report =
+            resource_scorecard_report(statements, usize::try_from(128 * MIB).expect("fits"));
+        let config =
+            AgentSwarmResourceScorecardConfig::new(AgentSwarmResourceProfile::workstation())
+                .with_readme_artifact(
+                    "tests/artifacts/agent-swarm-scorecard.json",
+                    "62de1594",
+                    "2026-05-23",
+                );
+
+        let scorecard = score_agent_swarm_resource_envelope(&report, &config);
+        let backend = &scorecard.backends[0];
+
+        assert_eq!(
+            scorecard.performance_claim_guard.status,
+            AgentSwarmPerformanceClaimStatus::ArtifactBacked
+        );
+        assert_eq!(backend.per_actor_statement_count.get("agent-hot"), Some(&9));
+        assert_eq!(
+            backend.per_actor_statement_count.get("agent-cold"),
+            Some(&1)
+        );
+        assert!(backend.fairness_index_per_mille > 500);
+        assert!(backend.fairness_index_per_mille < 700);
+        assert_eq!(backend.abort_rate_per_mille, 100);
+        assert_eq!(backend.retry_rate_per_mille, 200);
+        assert_eq!(backend.latency_p95_ns, 400);
+        assert_eq!(backend.latency_p99_ns, 400);
+        assert_eq!(backend.tail_latency_spread_ns, 300);
+        assert!(backend.concurrent_writer_default);
+    }
+
     proptest! {
         #[test]
         fn synthetic_trace_generation_preserves_bounded_config(
@@ -2874,6 +3404,85 @@ mod tests {
             statements,
         )
         .expect("busy trace")
+    }
+
+    fn resource_scorecard_report(
+        statements: Vec<AgentSwarmStatementReplay>,
+        memory_high_water_bytes: usize,
+    ) -> AgentSwarmReplayReport {
+        let statement_count = statements.len();
+        let summary = summarize_backend_replay(&statements, memory_high_water_bytes);
+        let backend = AgentSwarmBackendReplay {
+            identity: AgentSwarmBackendIdentity {
+                backend: AgentSwarmReplayBackend::FrankenSqliteConcurrent,
+                engine_identity: "frankensqlite".to_owned(),
+                comparison_role: "subject_concurrent_writer_default".to_owned(),
+                concurrent_writer_default: true,
+            },
+            schema_failures: Vec::new(),
+            statements,
+            summary,
+        };
+        AgentSwarmReplayReport {
+            schema_version: SWARM_TRACE_SCHEMA_VERSION.to_owned(),
+            harness_version: AGENT_SWARM_REPLAY_HARNESS_VERSION.to_owned(),
+            trace_id: "trace-scorecard".to_owned(),
+            run_id: "run-scorecard".to_owned(),
+            scenario_id: "scenario-scorecard".to_owned(),
+            seed: 0x5C0E_C4A2D,
+            schedule: AgentSwarmReplaySchedule::TraceOrder,
+            commands: AgentSwarmReplayCommands::default(),
+            schema_statement_count: 0,
+            statement_count,
+            transaction_count: statement_count,
+            topology_errors: Vec::new(),
+            backends: vec![backend],
+            cross_backend_mismatches: Vec::new(),
+            first_failure: None,
+        }
+    }
+
+    fn resource_replay_record(
+        actor_id: &str,
+        trace_statement_index: usize,
+        latency_ns: u64,
+        outcome_class: AgentSwarmReplayOutcomeClass,
+        transaction_boundary: TransactionBoundary,
+        retry_count: u32,
+    ) -> AgentSwarmStatementReplay {
+        let outcome = match outcome_class {
+            AgentSwarmReplayOutcomeClass::Success => StmtOutcome::Execute(1),
+            AgentSwarmReplayOutcomeClass::Busy => StmtOutcome::Error("database is busy".to_owned()),
+            AgentSwarmReplayOutcomeClass::Conflict => {
+                StmtOutcome::Error("serialization conflict".to_owned())
+            }
+            AgentSwarmReplayOutcomeClass::Error => StmtOutcome::Error("other error".to_owned()),
+        };
+        let expected_matched = outcome_class == AgentSwarmReplayOutcomeClass::Success;
+        AgentSwarmStatementReplay {
+            backend: AgentSwarmReplayBackend::FrankenSqliteConcurrent,
+            trace_statement_index,
+            logical_order: usize_to_u64(trace_statement_index),
+            actor_id: actor_id.to_owned(),
+            connection_id: format!("{actor_id}-conn"),
+            transaction_id: Some(format!("{actor_id}-txn-{trace_statement_index}")),
+            transaction_boundary,
+            concurrency_group: "scorecard-group".to_owned(),
+            workload_phase: "scorecard-phase".to_owned(),
+            statement_shape: sha256_hex(format!("shape-{trace_statement_index}").as_bytes()),
+            materialized_sql: "SELECT 1".to_owned(),
+            expected_result_class: ExpectedResultClass::Success,
+            outcome,
+            outcome_class,
+            latency_ns,
+            retry_count,
+            expected_matched,
+            first_failure_diag: if expected_matched {
+                FIRST_FAILURE_DIAGNOSTIC_ABSENT.to_owned()
+            } else {
+                format!("expected_success_got_{}", outcome_class.as_str())
+            },
+        }
     }
 
     #[derive(Debug, Clone)]

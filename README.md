@@ -2581,7 +2581,11 @@ FrankenSQLite deliberately omits several components of the C SQLite ecosystem. E
 - **Nightly Rust required.** Uses edition 2024 features that aren't stabilized yet.
 - **Rust is still the primary supported surface.** An optional `fsqlite-c-api` crate exists for C/C++ embedding, but the main documented API and most verification effort are still centered on the Rust crates.
 - **No loadable extensions.** Extension support is configured at compile time via Cargo features; dynamic `dlopen`-based loading is not planned.
-- **No WASM target yet.** The VFS trait abstracts all OS operations, and a `WasmVfs` implementation is planned but not yet built. Browser/edge deployment via WebAssembly is a future goal.
+- **WASM support is experimental.** The `fsqlite-wasm` crate now builds a
+  wasm-bindgen browser package and npm artifact, but browser persistence
+  backends such as OPFS and IndexedDB are still planned work. The current WASM
+  lane is focused on a compact in-memory package, feature-gated diagnostics,
+  and honest size-budget reporting.
 - **MVCC adds memory overhead.** Multiple page versions consume more RAM than single-version SQLite. ARC eviction and GC mitigate this but introduce background work.
 - **No row-level locking.** Two transactions modifying different rows on the same page can still conflict at the page level. The safe write-merge ladder can resolve commuting conflicts, but non-commuting conflicts still abort/retry. This is a deliberate tradeoff for file format compatibility.
 - **Encryption adds per-page overhead.** The per-page 24-byte nonce and 16-byte tag (40 bytes total) consume reserved space in each page. Databases created with encryption cannot be read without the key, even by C SQLite.

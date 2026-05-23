@@ -21,7 +21,6 @@ linux-asupersync-uring = ["fsqlite-pager/linux-asupersync-uring"]
 mvcc-flat-combining = []
 
 [dependencies]
-asupersync = { workspace = true }
 blake3 = { workspace = true }
 crc32c = { workspace = true }
 crossbeam-epoch = { workspace = true }
@@ -40,6 +39,7 @@ xxhash-rust = { workspace = true }
 serde_json.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+asupersync = { workspace = true }
 nix = { workspace = true }
 
 [dev-dependencies]

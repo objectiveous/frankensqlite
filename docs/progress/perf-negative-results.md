@@ -13233,6 +13233,192 @@ set: sessions found by
   optimization. Reconsider only if a same-window full quick matrix keeps or
   improves the primary weighted score and the 1000/10000-row DELETE rows.
 
+## 2026-05-22 - WASM default query result `columnTypes` diagnostics gate
+
+- Target: `bd-28o89` default `fsqlite-wasm` browser package gzip size.
+- Touched during rejected candidate:
+  `crates/fsqlite-wasm/src/lib.rs` and `crates/fsqlite-wasm/README.md`. The
+  candidate gated query-result `columnTypes` inference/export behind the
+  `diagnostics` feature, keeping default query results at `columns`,
+  `columnCount`, `rows`, `rowArrays`, and `changes`. The source patch was
+  manually unwound after the package measurement rejected it.
+- Correctness proof before rejection:
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/fsqlite-wasm-target-mossydeer-coltypes-default cargo check -p fsqlite-wasm --target wasm32-unknown-unknown --tests`
+  and
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/fsqlite-wasm-target-mossydeer-coltypes-diagnostics cargo check -p fsqlite-wasm --target wasm32-unknown-unknown --features fsqlite-wasm/diagnostics --tests`
+  both passed with the existing dependency warning inventory.
+- Evidence artifacts:
+  rejected package report
+  `/data/tmp/fsqlite-wasm-bindgen-mossydeer-coltypes-size-1779490889/size-report.json`;
+  prior accepted baseline
+  `/data/tmp/fsqlite-wasm-bindgen-mossydeer-error-size-1779490286/size-report.json`.
+- Result: rejected. The prior baseline package measured
+  `wasmBytes=3724061`, `wasmGzipBytes=1170804`, and `packedBytes=1172672`.
+  The `columnTypes` diagnostics-gate candidate measured `wasmBytes=3725009`,
+  `wasmGzipBytes=1170930`, and `packedBytes=1172805`, regressing by 126 gzip
+  bytes and 948 raw wasm bytes.
+- Do not retry moving `columnTypes` behind `diagnostics` as a standalone WASM
+  size optimization. Reconsider only as part of a broader JS result-shape
+  redesign that proves a lower post-bindgen gzip size against the same package
+  helper.
+
+## 2026-05-22 - WASM default JavaScript `Date` parameter opt-in feature
+
+- Target: `bd-28o89` default `fsqlite-wasm` browser package gzip size.
+- Touched during rejected candidate:
+  `crates/fsqlite-wasm/Cargo.toml`, `crates/fsqlite-wasm/src/lib.rs`, and
+  `crates/fsqlite-wasm/README.md`. The candidate added a default-off
+  `date-params` feature, removed `js_sys::Date` and ISO conversion from the
+  minimum core build, and moved the Date conversion wasm-bindgen test behind
+  that feature. The source patch was manually unwound after measurement.
+- Correctness proof before rejection:
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/fsqlite-wasm-target-mossydeer-date-default-rerun cargo check -p fsqlite-wasm --target wasm32-unknown-unknown --tests`
+  passed on `ts2`; the first default check on `ts2` hit stale remote feature
+  state and was rerun successfully. `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/fsqlite-wasm-target-mossydeer-date-feature cargo check -p fsqlite-wasm --target wasm32-unknown-unknown --features date-params --tests`
+  passed on `vmi1227854`. `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/fsqlite-wasm-target-mossydeer-date-size RUSTFLAGS=-Zlocation-detail=none cargo build -p fsqlite-wasm --target wasm32-unknown-unknown --release --no-default-features`
+  passed on `ts2`.
+- Evidence artifacts:
+  rejected package report
+  `/data/tmp/fsqlite-wasm-bindgen-mossydeer-date-size-1779491881/size-report.json`;
+  prior accepted baseline
+  `/data/tmp/fsqlite-wasm-bindgen-mossydeer-error-size-1779490286/size-report.json`.
+- Result: rejected. The prior baseline package measured
+  `wasmBytes=3724061`, `wasmGzipBytes=1170804`, and `packedBytes=1172672`.
+  The `date-params` opt-in candidate measured `wasmBytes=3723662`,
+  `wasmGzipBytes=1170920`, and `packedBytes=1172571`. It reduced post-bindgen
+  raw wasm by 399 bytes and packed tarball size by 101 bytes, but regressed the
+  browser-transfer gzip gate by 116 bytes.
+- Do not retry making Date parameter coercion an isolated default-off feature
+  for WASM size. Reconsider only if bundled with a broader JS conversion-layer
+  redesign that improves post-bindgen gzip size against the same package helper.
+
+## 2026-05-22 - WASM private `init` start-function export removal
+
+- Target: `bd-28o89` default `fsqlite-wasm` browser package gzip size.
+- Touched during rejected candidate:
+  `crates/fsqlite-wasm/src/lib.rs`. The candidate made the crate's
+  `#[wasm_bindgen(start)]` `init` function private, trying to keep the startup
+  hook while removing the named JavaScript `init()` export from generated
+  bindings. The source patch was manually unwound after measurement.
+- Correctness proof before rejection:
+  `rustfmt --edition 2024 --check crates/fsqlite-wasm/src/lib.rs`,
+  `git diff --check -- crates/fsqlite-wasm/src/lib.rs`, and
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/fsqlite-wasm-target-mossydeer-private-init-check cargo check -p fsqlite-wasm --target wasm32-unknown-unknown --tests`
+  passed. The release artifact was built with
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/fsqlite-wasm-target-mossydeer-private-init-size RUSTFLAGS=-Zlocation-detail=none cargo build -p fsqlite-wasm --target wasm32-unknown-unknown --release --no-default-features`.
+- Evidence artifacts:
+  no-op package report
+  `/data/tmp/fsqlite-wasm-bindgen-mossydeer-private-init-size-1779492572/size-report.json`;
+  prior accepted baseline
+  `/data/tmp/fsqlite-wasm-bindgen-mossydeer-error-size-1779490286/size-report.json`.
+- Result: rejected as no measurable improvement. Both the prior baseline and
+  private-init candidate measured `wasmBytes=3724061`,
+  `wasmGzipBytes=1170804`, and `packedBytes=1172672`. The generated
+  TypeScript still included `export function init(): void` and `readonly init`
+  in `InitOutput`, so wasm-bindgen continued exporting the start function.
+- Do not retry making only the `#[wasm_bindgen(start)]` function private as a
+  WASM size optimization. Reconsider only with a confirmed wasm-bindgen export
+  strategy that removes the generated binding and proves a lower post-bindgen
+  gzip size.
+
+## 2026-05-22 - WASM default `FrankenDB.pragma()` binding diagnostics gate
+
+- Target: `bd-28o89` default `fsqlite-wasm` browser package gzip size.
+- Touched during rejected candidate:
+  `crates/fsqlite-wasm/src/lib.rs`. The candidate moved the JS-facing
+  `FrankenDB.pragma()` convenience binding behind `diagnostics`, while keeping
+  PRAGMA execution available through `db.query("PRAGMA ...")`. The source patch
+  was manually unwound after measurement rejected it.
+- Correctness proof before rejection:
+  `rustfmt --edition 2024 --check crates/fsqlite-wasm/src/lib.rs`,
+  `git diff --check -- crates/fsqlite-wasm/src/lib.rs`,
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/fsqlite-wasm-target-mossydeer-pragma-default cargo check -p fsqlite-wasm --target wasm32-unknown-unknown --tests`,
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/fsqlite-wasm-target-mossydeer-pragma-diagnostics cargo check -p fsqlite-wasm --target wasm32-unknown-unknown --features fsqlite-wasm/diagnostics --tests`,
+  and
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/fsqlite-wasm-target-mossydeer-pragma-size RUSTFLAGS=-Zlocation-detail=none cargo build -p fsqlite-wasm --target wasm32-unknown-unknown --release --no-default-features`
+  passed with existing dependency warnings.
+- Evidence artifacts:
+  rejected package report
+  `/data/tmp/fsqlite-wasm-bindgen-mossydeer-pragma-size-1779493070/size-report.json`;
+  prior accepted baseline
+  `/data/tmp/fsqlite-wasm-bindgen-mossydeer-error-size-1779490286/size-report.json`.
+- Result: rejected. The prior baseline measured `wasmBytes=3724061`,
+  `wasmGzipBytes=1170804`, and `packedBytes=1172672`. The pragma-binding gate
+  candidate measured `wasmBytes=3723171`, `wasmGzipBytes=1171114`, and
+  `packedBytes=1172365`. It reduced raw wasm by 890 bytes and packed tarball
+  size by 307 bytes, but regressed browser-transfer gzip by 310 bytes.
+- Do not retry gating only `FrankenDB.pragma()` as a standalone WASM size cut.
+  Reconsider only as part of a broader JS API surface reduction that proves a
+  lower post-bindgen gzip size.
+
+## 2026-05-23 - WASM `FrankenDB.open()` wrapper removal
+
+- Target: `bd-28o89` default `fsqlite-wasm` browser package gzip size.
+- Touched during rejected candidate:
+  `crates/fsqlite-wasm/src/lib.rs`. The candidate removed the JS-facing static
+  `FrankenDB.open()` wrapper because the constructor already opens the database
+  and `FrankenDB.openWithOptions()` remains the configured-open path. The source
+  patch was manually unwound after measurement rejected it.
+- Correctness proof before rejection:
+  `rustfmt --edition 2024 --check crates/fsqlite-wasm/src/lib.rs`,
+  `git diff --check -- crates/fsqlite-wasm/src/lib.rs crates/fsqlite-wasm/README.md .beads/issues.jsonl`,
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/fsqlite-wasm-target-mossydeer-open-default cargo check -p fsqlite-wasm --target wasm32-unknown-unknown --tests`,
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/fsqlite-wasm-target-mossydeer-open-diagnostics cargo check -p fsqlite-wasm --target wasm32-unknown-unknown --features fsqlite-wasm/diagnostics --tests`,
+  and
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/fsqlite-wasm-target-mossydeer-open-size RUSTFLAGS=-Zlocation-detail=none cargo build -p fsqlite-wasm --target wasm32-unknown-unknown --release --no-default-features`
+  passed with the existing dependency warning inventory.
+- Evidence artifacts:
+  rejected package report
+  `/data/tmp/fsqlite-wasm-bindgen-mossydeer-open-size-1779499373/size-report.json`;
+  prior accepted baseline
+  `/data/tmp/fsqlite-wasm-bindgen-mossydeer-changes-size-1779498290/size-report.json`.
+- Result: rejected. The prior accepted baseline measured
+  `wasmBytes=3722787`, `wasmGzipBytes=1170335`, and `packedBytes=1171975`.
+  The `FrankenDB.open()` wrapper-removal candidate measured
+  `wasmBytes=3724213`, `wasmGzipBytes=1170799`, and `packedBytes=1172486`,
+  regressing by 464 gzip bytes and 1426 raw wasm bytes. The generated
+  TypeScript did remove `open()` and kept `openWithOptions()`, but the browser
+  transfer size moved the wrong way.
+- Do not retry removing only `FrankenDB.open()` as a standalone WASM size cut.
+  Reconsider only as part of a broader API-surface redesign that proves lower
+  post-bindgen gzip size against the same package helper.
+
+## 2026-05-23 - WASM static base error-code names
+
+- Target: `bd-28o89` default `fsqlite-wasm` browser package gzip size.
+- Touched during rejected candidate:
+  `crates/fsqlite-wasm/src/lib.rs`. The candidate replaced the fallback
+  `format!("SQLITE_{:?}", error.error_code()).to_ascii_uppercase()` path with
+  a static `ErrorCode` to SQLite name match table while preserving explicit
+  extended-code names for `SQLITE_BUSY_RECOVERY`, `SQLITE_BUSY_SNAPSHOT`, and
+  `SQLITE_CONSTRAINT_DATATYPE`. The source patch was manually unwound after
+  measurement rejected it.
+- Correctness proof before rejection:
+  `rustfmt --edition 2024 --check crates/fsqlite-wasm/src/lib.rs`,
+  `git diff --check -- crates/fsqlite-wasm/src/lib.rs crates/fsqlite-wasm/README.md docs/progress/perf-negative-results.md .beads/issues.jsonl`,
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/fsqlite-wasm-target-mossydeer-static-error-default cargo check -p fsqlite-wasm --target wasm32-unknown-unknown --tests`,
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/fsqlite-wasm-target-mossydeer-static-error-diagnostics cargo check -p fsqlite-wasm --target wasm32-unknown-unknown --features fsqlite-wasm/diagnostics --tests`,
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/fsqlite-wasm-target-mossydeer-static-error-host-test3 cargo test -p fsqlite-wasm tests::sqlite_error_name_matches_canonical_sqlite_codes -- --exact`,
+  and
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/fsqlite-wasm-target-mossydeer-static-error-size RUSTFLAGS=-Zlocation-detail=none cargo build -p fsqlite-wasm --target wasm32-unknown-unknown --release --no-default-features`
+  passed with the existing dependency warning inventory. An earlier host-test
+  run with the short filter exited successfully but selected zero tests, so it
+  was not counted as proof.
+- Evidence artifacts:
+  rejected package report
+  `/data/tmp/fsqlite-wasm-bindgen-mossydeer-static-error-size-1779502326/size-report.json`;
+  prior accepted baseline
+  `/data/tmp/fsqlite-wasm-bindgen-mossydeer-describe-size-1779500838/size-report.json`.
+- Result: rejected. The prior accepted baseline measured
+  `wasmBytes=3722324`, `wasmGzipBytes=1170313`, and `packedBytes=1171725`.
+  The static error-code-name candidate measured `wasmBytes=3721758`,
+  `wasmGzipBytes=1170499`, and `packedBytes=1171564`. It reduced raw wasm by
+  566 bytes and packed tarball size by 161 bytes, but regressed
+  browser-transfer gzip by 186 bytes.
+- Do not retry replacing only the fallback SQLite error-code formatter with a
+  static match table as a standalone WASM size cut. Reconsider only if paired
+  with a broader error-surface change that proves lower post-bindgen gzip size.
+
 ## 2026-05-23 - `Opcode::IsTrue` hot-dispatch promotion
 
 - Target: `bd-1dp9.6.2` VDBE SQL-pipeline dispatch stream,

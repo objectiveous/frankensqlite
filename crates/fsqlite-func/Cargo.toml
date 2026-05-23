@@ -7,6 +7,15 @@ license-file.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+extensions = ["ext-fts5", "ext-geopoly", "ext-icu", "ext-json", "ext-rtree"]
+ext-fts5 = []
+ext-geopoly = []
+ext-icu = []
+ext-json = []
+ext-rtree = []
+
 [dependencies]
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }

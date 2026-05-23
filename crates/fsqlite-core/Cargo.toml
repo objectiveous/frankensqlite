@@ -18,6 +18,8 @@ native = [
     "fsqlite-btree/native",
     "fsqlite-planner/native",
     "fsqlite-vdbe/native",
+    "diagnostic-pragmas",
+    "extensions",
 ]
 wasm = [
     "fsqlite-types/wasm",
@@ -28,8 +30,22 @@ wasm = [
     "fsqlite-btree/wasm",
     "fsqlite-planner/wasm",
     "fsqlite-vdbe/wasm",
+    "wasm-tracing-max-level-error",
 ]
 linux-asupersync-uring = ["native", "fsqlite-vfs/linux-asupersync-uring"]
+diagnostic-pragmas = []
+wasm-tracing-max-level-error = ["tracing/release_max_level_error"]
+wasm-tracing-max-level-warn = ["tracing/release_max_level_warn"]
+extensions = ["ext-json", "ext-fts5", "ext-icu", "ext-misc", "ext-rtree"]
+ext-json = ["dep:fsqlite-ext-json", "fsqlite-func/ext-json"]
+ext-fts5 = ["dep:fsqlite-ext-fts5", "fsqlite-func/ext-fts5"]
+ext-icu = ["dep:fsqlite-ext-icu", "fsqlite-func/ext-icu"]
+ext-misc = ["dep:fsqlite-ext-misc"]
+ext-rtree = [
+    "dep:fsqlite-ext-rtree",
+    "fsqlite-func/ext-geopoly",
+    "fsqlite-func/ext-rtree",
+]
 
 [dependencies]
 fsqlite-types = { path = "../fsqlite-types", version = "0.1.3", default-features = false }
@@ -45,11 +61,11 @@ fsqlite-parser = { workspace = true }
 fsqlite-planner = { version = "0.1.3", path = "../fsqlite-planner", default-features = false }
 fsqlite-vdbe = { version = "0.1.3", path = "../fsqlite-vdbe", default-features = false }
 fsqlite-func = { workspace = true }
-fsqlite-ext-json = { workspace = true }
-fsqlite-ext-fts5 = { workspace = true }
-fsqlite-ext-icu = { workspace = true }
-fsqlite-ext-misc = { workspace = true }
-fsqlite-ext-rtree = { workspace = true }
+fsqlite-ext-json = { workspace = true, optional = true }
+fsqlite-ext-fts5 = { workspace = true, optional = true }
+fsqlite-ext-icu = { workspace = true, optional = true }
+fsqlite-ext-misc = { workspace = true, optional = true }
+fsqlite-ext-rtree = { workspace = true, optional = true }
 tracing = { workspace = true }
 xxhash-rust = { workspace = true }
 blake3 = { workspace = true }
@@ -59,8 +75,6 @@ itoa = { workspace = true }
 hashbrown = { workspace = true }
 lru = { workspace = true }
 smallvec = { workspace = true }
-tracing-subscriber = "0.3.22"
-regex = "1.11"
 lazy_static = "1.5"
 foldhash = "0.2.0"
 
@@ -73,6 +87,7 @@ rusqlite = { workspace = true }
 tracing = { workspace = true }
 tempfile = { workspace = true }
 proptest = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

@@ -176,12 +176,12 @@ tempfile = "3.17"
 toml = "0.8"
 
 [profile.release]
-opt-level = 3
+opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
-strip = false
-debug = true
+strip = true
+debug = false
 
 [profile.release-perf]
 inherits = "release"

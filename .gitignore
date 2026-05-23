@@ -67,6 +67,8 @@ __pycache__/
 
 # Local analysis artifacts
 spec_review_findings.md
+COMPREHENSIVE_BREAKDOWN_OF_FRANKENSQLITE_PERFORMANCE_AND_CONFORMANCE_ASSURANCE_PROCESS__CODEX.md
+COMPREHENSIVE_BREAKDOWN_OF_FRANKENSQLITE_PERFORMANCE_AND_CONFORMANCE_ASSURANCE_PROCESS__CC.md
 #
 # Spec-evolution visualization sources are intentionally tracked under
 # site/spec-evolution/. Root copies are generated deployment detritus.

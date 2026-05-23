@@ -9,10 +9,16 @@ rust-version.workspace = true
 
 [features]
 default = ["native"]
-native = ["fsqlite-types/native", "fsqlite-vfs/native", "fsqlite-wal/native"]
+native = [
+    "encryption",
+    "fsqlite-types/native",
+    "fsqlite-vfs/native",
+    "fsqlite-wal/native",
+]
 wasm = ["fsqlite-types/wasm", "fsqlite-vfs/wasm", "fsqlite-wal/wasm"]
 linux-asupersync-uring = ["fsqlite-vfs/linux-asupersync-uring"]
 fault-injection = ["fsqlite-wal/fault-injection"]
+encryption = ["dep:argon2", "dep:chacha20poly1305"]
 # Bayesian-mixture e-value eviction scoring (IMPL-19 / AAC-P5).
 # When enabled, ShardedPageCache records accesses into an EValueEvictor and
 # prefers the lowest-e page for eviction. Falls back to the existing policy
@@ -29,8 +35,8 @@ fsqlite-observability = { workspace = true }
 fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.5", default-features = false }
 fsqlite-wal = { path = "../fsqlite-wal", version = "0.1.3", default-features = false }
 xxhash-rust = { workspace = true }
-chacha20poly1305 = { workspace = true }
-argon2 = { workspace = true }
+chacha20poly1305 = { workspace = true, optional = true }
+argon2 = { workspace = true, optional = true }
 hashbrown.workspace = true
 dashmap.workspace = true
 tracing.workspace = true

@@ -59,6 +59,19 @@ jobs:
           set -euo pipefail
           cargo install wasm-pack --locked
 
+      - name: Install Binaryen
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y binaryen
+
+      - name: Install twiggy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install twiggy --locked
+
       - name: Run host tests
         shell: bash
         run: |
@@ -80,10 +93,33 @@ jobs:
           pkg_dir="${artifact_root}/pkg"
 
           mkdir -p "${artifact_root}"
-          ./scripts/build_fsqlite_wasm_package.sh "${pkg_dir}"
+          FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh "${pkg_dir}"
 
-          package_name="$(jq -r '.name' "${pkg_dir}/package.json")"
-          packed_file="$(find "${pkg_dir}" -maxdepth 1 -type f -name '*.tgz' -printf '%f\n' | sort | head -n 1)"
+          size_report="${pkg_dir}/size-report.json"
+          if [[ ! -f "${size_report}" ]]; then
+            echo "Expected size report at ${size_report}" >&2
+            exit 1
+          fi
+
+          package_name="$(jq -r '.packageName' "${size_report}")"
+          build_target="$(jq -r '.buildTarget' "${size_report}")"
+          profile="$(jq -r '.profile' "${size_report}")"
+          strip_location_detail="$(jq -r '.stripLocationDetail' "${size_report}")"
+          wasm_opt_mode="$(jq -r '.wasmOpt.mode' "${size_report}")"
+          packed_file="$(jq -r '.packedArchive // ""' "${size_report}")"
+          wasm_bytes="$(jq -r '.wasmBytes' "${size_report}")"
+          wasm_gzip_bytes="$(jq -r '.wasmGzipBytes' "${size_report}")"
+          max_gzip_bytes="$(jq -r '.maxGzipBytes' "${size_report}")"
+          gzip_budget_pass="$(jq -r '.gzipBudgetPass' "${size_report}")"
+          packed_bytes="$(jq -r '.packedBytes // ""' "${size_report}")"
+          max_packed_bytes="$(jq -r '.maxPackedBytes' "${size_report}")"
+          packed_budget_pass="$(jq -r '.packedBudgetPass // ""' "${size_report}")"
+          wasm_opt_kept="$(jq -r '.wasmOpt.kept // "not-run"' "${size_report}")"
+          twiggy_report="$(jq -r '.twiggyReport // ""' "${size_report}")"
+          twiggy_report_path=""
+          if [[ -n "${twiggy_report}" ]]; then
+            twiggy_report_path="${pkg_dir}/${twiggy_report}"
+          fi
 
           {
             echo "# fsqlite-wasm package summary"
@@ -91,11 +127,26 @@ jobs:
             echo "- cargo_package: \`fsqlite-wasm\`"
             echo "- npm_package_name: \`${package_name}\`"
             echo "- npm_package_dir: \`${pkg_dir}\`"
-            echo "- build_target: \`${FSQLITE_WASM_TARGET:-web}\`"
+            echo "- size_report: \`${size_report}\`"
+            echo "- build_target: \`${build_target}\`"
+            echo "- profile: \`${profile}\`"
+            echo "- wasm_opt: \`${wasm_opt_mode}\`"
+            echo "- wasm_opt_kept: \`${wasm_opt_kept}\`"
+            echo "- strip_location_detail: \`${strip_location_detail}\`"
+            echo "- wasm_bytes: \`${wasm_bytes}\`"
+            echo "- wasm_gzip_bytes: \`${wasm_gzip_bytes}\`"
+            echo "- max_gzip_bytes: \`${max_gzip_bytes}\`"
+            echo "- gzip_budget_pass: \`${gzip_budget_pass}\`"
             echo "- packed_archive: \`${packed_file}\`"
+            echo "- packed_bytes: \`${packed_bytes}\`"
+            echo "- max_packed_bytes: \`${max_packed_bytes}\`"
+            echo "- packed_budget_pass: \`${packed_budget_pass}\`"
+            echo "- twiggy_report: \`${twiggy_report_path}\`"
             echo
             echo "## Generated files"
-            find "${artifact_root}" -maxdepth 2 -type f | sort | sed 's#^#- `#; s#$#`#'
+            while IFS= read -r artifact; do
+              echo "- \`${artifact}\`"
+            done < <(find "${artifact_root}" -maxdepth 2 -type f | sort)
           } > "${artifact_root}/summary.md"
 
       - name: Upload fsqlite-wasm artifacts

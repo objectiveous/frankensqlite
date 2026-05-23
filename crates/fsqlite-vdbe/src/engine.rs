@@ -12484,6 +12484,17 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            Opcode::BitAnd => {
+                let a = self.get_reg(op.p1);
+                let b = self.get_reg(op.p2);
+                if a.is_null() || b.is_null() {
+                    self.set_reg_fast(op.p3, SqliteValue::Null);
+                } else {
+                    self.set_reg_int(op.p3, a.to_integer() & b.to_integer());
+                }
+                *pc += 1;
+                Ok(true)
+            }
             // Copy is the most frequently emitted register-motion opcode in
             // codegen (71 sites), driving SELECT projection, expression
             // propagation, and materialization staging. p3 is almost always 0

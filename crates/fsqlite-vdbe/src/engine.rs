@@ -12506,6 +12506,16 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            Opcode::BitNot => {
+                let a = self.get_reg(op.p1);
+                if a.is_null() {
+                    self.set_reg_fast(op.p2, SqliteValue::Null);
+                } else {
+                    self.set_reg_int(op.p2, !a.to_integer());
+                }
+                *pc += 1;
+                Ok(true)
+            }
             Opcode::ShiftLeft => {
                 let a = self.get_reg(op.p1);
                 let b = self.get_reg(op.p2);

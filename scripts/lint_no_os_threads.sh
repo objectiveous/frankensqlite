@@ -27,57 +27,59 @@ TARGET_DIRS=(
 FORBIDDEN_PATTERN='std::thread::spawn|thread::spawn|std::thread::Builder|thread::Builder'
 declare -a HITS=()
 
-scan_file() {
-  local file="$1"
-  local output
-  output="$(
-    awk -v forbidden="${FORBIDDEN_PATTERN}" '
-      function brace_delta(text, i, ch, delta) {
-        delta = 0;
-        for (i = 1; i <= length(text); i++) {
-          ch = substr(text, i, 1);
-          if (ch == "{") {
-            delta++;
-          } else if (ch == "}") {
-            delta--;
-          }
-        }
-        return delta;
-      }
+scan_source() {
+  local display_name="$1"
 
-      /^[[:space:]]*#\[cfg\([[:space:]]*test[[:space:]]*\)\]/ {
-        pending_test_item = 1;
+  awk -v forbidden="${FORBIDDEN_PATTERN}" -v display_name="${display_name}" '
+    function brace_delta(text, i, ch, delta) {
+      delta = 0;
+      for (i = 1; i <= length(text); i++) {
+        ch = substr(text, i, 1);
+        if (ch == "{") {
+          delta++;
+        } else if (ch == "}") {
+          delta--;
+        }
+      }
+      return delta;
+    }
+
+    /^[[:space:]]*#\[cfg\([[:space:]]*test[[:space:]]*\)\]/ {
+      pending_test_item = 1;
+      next;
+    }
+
+    skip_depth > 0 {
+      skip_depth += brace_delta($0);
+      if (skip_depth <= 0) {
+        skip_depth = 0;
+      }
+      next;
+    }
+
+    pending_test_item {
+      if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) {
         next;
       }
 
-      skip_depth > 0 {
-        skip_depth += brace_delta($0);
-        if (skip_depth <= 0) {
-          skip_depth = 0;
-        }
-        next;
+      skip_depth = brace_delta($0);
+      if (skip_depth > 0) {
+        pending_test_item = 0;
+      } else if ($0 ~ /;/) {
+        pending_test_item = 0;
+        skip_depth = 0;
       }
+      next;
+    }
 
-      pending_test_item {
-        if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) {
-          next;
-        }
+    $0 ~ forbidden {
+      print display_name ":" FNR ":" $0;
+    }
+  '
+}
 
-        skip_depth = brace_delta($0);
-        if (skip_depth > 0) {
-          pending_test_item = 0;
-        } else if ($0 ~ /;/) {
-          pending_test_item = 0;
-          skip_depth = 0;
-        }
-        next;
-      }
-
-      $0 ~ forbidden {
-        print FILENAME ":" FNR ":" $0;
-      }
-    ' "${file}" || true
-  )"
+append_hits() {
+  local output="$1"
 
   if [[ -n "${output}" ]]; then
     while IFS= read -r line; do
@@ -85,6 +87,59 @@ scan_file() {
     done <<< "${output}"
   fi
 }
+
+scan_file() {
+  local file="$1"
+  local output
+  output="$(
+    # shellcheck disable=SC2094
+    scan_source "${file}" < "${file}" || true
+  )"
+
+  append_hits "${output}"
+}
+
+run_self_test() {
+  local output
+  output="$(
+    scan_source "self_test_mixed.rs" <<'RUST'
+#[cfg(test)]
+mod tests {
+    fn test_spawn_is_ignored() {
+        std::thread::spawn(|| {}); // test spawn sentinel
+    }
+}
+
+fn production_after_test_is_detected() {
+    std::thread::spawn(|| {}); // production spawn sentinel
+}
+RUST
+  )"
+
+  if [[ "${output}" == *"test spawn sentinel"* ]]; then
+    echo "[FAIL] self-test scanner reported a #[cfg(test)] thread spawn" >&2
+    printf '%s\n' "${output}" >&2
+    exit 1
+  fi
+
+  if [[ "${output}" != *"production spawn sentinel"* ]]; then
+    echo "[FAIL] self-test scanner missed a production thread spawn after #[cfg(test)]" >&2
+    printf '%s\n' "${output}" >&2
+    exit 1
+  fi
+
+  echo "[PASS] no-OS-thread scanner self-test passed"
+}
+
+if [[ "${1:-}" == "--self-test" ]]; then
+  run_self_test
+  exit 0
+fi
+
+if (( $# > 0 )); then
+  echo "usage: $0 [--self-test]" >&2
+  exit 2
+fi
 
 while IFS= read -r -d '' file; do
   scan_file "${file}"

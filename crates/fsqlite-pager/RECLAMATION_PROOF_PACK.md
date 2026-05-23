@@ -260,49 +260,27 @@ fields:
 
 ---
 
-## 6. Verification Script Extension Plan
+## 6. Tracked Verification Gate
 
 ### 6.1 `scripts/verify_e3_3_metadata_publication.sh`
 
-```bash
-#!/bin/bash
-# Verification entrypoint for bd-db300.5.3.3 metadata publication
-set -euo pipefail
+The tracked replay entrypoint is `scripts/verify_e3_3_metadata_publication.sh`.
+It is intentionally run through `rch exec --` for all Cargo work and emits a
+per-run artifact bundle under `artifacts/bd-db300.5.3.3/<run_id>/`:
 
-SUITE_ID="e3_3_metadata_publication"
-LOG_DIR="artifacts/${SUITE_ID}/$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$LOG_DIR"
+- `events.jsonl` records phase start/pass/fail events with `trace_id`, `run_id`,
+  `scenario_id`, elapsed milliseconds, and the phase command.
+- `report.json` records the run identifiers, event log path, smoke-benchmark
+  output path, and final pass result.
+- Phase logs capture the committed-snapshot unit matrix, reclamation stress,
+  writer-progress stress, pager `cargo check`, and a small concurrent-writer
+  smoke run.
 
-echo "=== Phase 1: Unit tests ==="
-cargo test -p fsqlite-pager -- committed_snapshot 2>&1 | tee "$LOG_DIR/unit_pager.log"
-cargo test -p fsqlite-core -- test_memory_autocommit_write_txn 2>&1 | tee "$LOG_DIR/unit_core.log"
+The script changes to `WORKSPACE_ROOT` before invoking Cargo so the gate can be
+run from any current directory while still resolving workspace packages and
+artifact paths predictably.
 
-echo "=== Phase 2: Reclamation stress ==="
-# Run 10K commits with 64 concurrent readers; verify no leaked snapshots
-cargo test -p fsqlite-pager -- snapshot_reclamation_stress 2>&1 | tee "$LOG_DIR/reclamation.log"
-
-echo "=== Phase 3: Starvation bound ==="
-# 64 readers + 1 writer; writer must complete 1000 publishes < 1s
-cargo test -p fsqlite-pager -- snapshot_writer_not_starved 2>&1 | tee "$LOG_DIR/starvation.log"
-
-echo "=== Phase 4: Shadow-compare ==="
-# Run canonical workloads in shadow mode; verify zero divergences
-cargo test -p fsqlite-core -- shadow_compare_snapshot 2>&1 | tee "$LOG_DIR/shadow.log"
-
-echo "=== Phase 5: Control-mode equivalence ==="
-# Legacy mode produces identical results to auto mode
-cargo test -p fsqlite-core -- control_mode_equivalence 2>&1 | tee "$LOG_DIR/control_mode.log"
-
-echo "=== Phase 6: Topology (if available) ==="
-# Cross-NUMA latency check (skipped if single-node)
-cargo test -p fsqlite-pager -- cross_numa 2>&1 | tee "$LOG_DIR/topology.log" || echo "SKIP: topology tests not available"
-
-echo "=== Results ==="
-grep -c 'FAILED\|panicked' "$LOG_DIR"/*.log && echo "FAILURES DETECTED" || echo "ALL PASSED"
-ls -la "$LOG_DIR"
-```
-
-### 6.2 Test inventory (to be implemented)
+### 6.2 Test inventory
 
 | Test name | File | What it proves |
 |-----------|------|----------------|

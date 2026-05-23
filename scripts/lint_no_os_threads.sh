@@ -11,18 +11,7 @@ fi
 REPO_ROOT="$(cd "$(dirname "${SCRIPT_PATH}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-TARGET_DIRS=(
-  "crates/fsqlite/src"
-  "crates/fsqlite-core/src"
-  "crates/fsqlite-vfs/src"
-  "crates/fsqlite-pager/src"
-  "crates/fsqlite-wal/src"
-  "crates/fsqlite-mvcc/src"
-  "crates/fsqlite-btree/src"
-  "crates/fsqlite-vdbe/src"
-  "crates/fsqlite-observability/src"
-  "crates/fsqlite-cli/src"
-)
+TARGET_DIRS=(crates/*/src)
 
 FORBIDDEN_PATTERN='std::thread::spawn|thread::spawn|std::thread::Builder|thread::Builder'
 declare -a HITS=()
@@ -45,6 +34,11 @@ scan_source() {
     }
 
     /^[[:space:]]*#\[cfg\([[:space:]]*test[[:space:]]*\)\]/ {
+      pending_test_item = 1;
+      next;
+    }
+
+    /^[[:space:]]*#\[test\]/ {
       pending_test_item = 1;
       next;
     }
@@ -110,14 +104,19 @@ mod tests {
     }
 }
 
+#[test]
+fn standalone_test_spawn_is_ignored() {
+    std::thread::spawn(|| {}); // standalone test spawn sentinel
+}
+
 fn production_after_test_is_detected() {
     std::thread::spawn(|| {}); // production spawn sentinel
 }
 RUST
   )"
 
-  if [[ "${output}" == *"test spawn sentinel"* ]]; then
-    echo "[FAIL] self-test scanner reported a #[cfg(test)] thread spawn" >&2
+  if [[ "${output}" == *"test spawn sentinel"* || "${output}" == *"standalone test spawn sentinel"* ]]; then
+    echo "[FAIL] self-test scanner reported a test-only thread spawn" >&2
     printf '%s\n' "${output}" >&2
     exit 1
   fi

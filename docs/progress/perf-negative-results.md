@@ -13202,3 +13202,28 @@ set: sessions found by
 - Do not retry this active DELETE preflush/probe skip as a standalone
   optimization. Reconsider only if a same-window full quick matrix keeps or
   improves the primary weighted score and the 1000/10000-row DELETE rows.
+
+## 2026-05-23 - `Opcode::IsTrue` hot-dispatch promotion
+
+- Target: `bd-1dp9.6.2` VDBE SQL-pipeline dispatch stream,
+  `vdbe_pipeline_execute_istrue`.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs` and
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`. The benchmark was kept;
+  the `Opcode::IsTrue` arm in `try_execute_hot_opcode` was manually unwound
+  after measurement rejected it.
+- Correctness proof before rejection:
+  `cargo fmt -p fsqlite-vdbe --check`,
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-istrue-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_istrue --warm-up-time 1 --measurement-time 4`,
+  and
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-istrue-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_istrue --warm-up-time 1 --measurement-time 4`
+  completed successfully on worker `vmi1227854`.
+- Evidence: baseline medians were `64=968.04 ns`, `256=3.4441 us`,
+  `1024=14.237 us`; candidate medians were `64=913.80 ns`,
+  `256=3.6031 us`, `1024=15.822 us`.
+- Result: rejected. The 64-op stream improved, but the 256-op and 1024-op
+  streams regressed, so the candidate did not pass the keep gate for larger
+  dispatch streams.
+- Do not retry promoting only `Opcode::IsTrue` into `try_execute_hot_opcode` as
+  a standalone lever. Reconsider only if paired with a broader truthiness
+  opcode reshaping that proves improvements at 256 and 1024 ops.

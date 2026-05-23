@@ -56,12 +56,15 @@ scan_source() {
         next;
       }
 
-      skip_depth = brace_delta($0);
-      if (skip_depth > 0) {
-        pending_test_item = 0;
-      } else if ($0 ~ /;/) {
+      if ($0 ~ /;/) {
         pending_test_item = 0;
         skip_depth = 0;
+      } else if ($0 ~ /\{/) {
+        pending_test_item = 0;
+        skip_depth = brace_delta($0);
+        if (skip_depth < 0) {
+          skip_depth = 0;
+        }
       }
       next;
     }
@@ -109,13 +112,19 @@ fn standalone_test_spawn_is_ignored() {
     std::thread::spawn(|| {}); // standalone test spawn sentinel
 }
 
+#[cfg(test)]
+mod inline_tests { fn inline_test_spawn_is_ignored() { std::thread::spawn(|| {}); } } // inline cfg(test) spawn sentinel
+
+#[test]
+fn inline_standalone_test_spawn_is_ignored() { std::thread::spawn(|| {}); } // inline standalone test spawn sentinel
+
 fn production_after_test_is_detected() {
     std::thread::spawn(|| {}); // production spawn sentinel
 }
 RUST
   )"
 
-  if [[ "${output}" == *"test spawn sentinel"* || "${output}" == *"standalone test spawn sentinel"* ]]; then
+  if [[ "${output}" == *"test spawn sentinel"* || "${output}" == *"standalone test spawn sentinel"* || "${output}" == *"inline cfg(test) spawn sentinel"* || "${output}" == *"inline standalone test spawn sentinel"* ]]; then
     echo "[FAIL] self-test scanner reported a test-only thread spawn" >&2
     printf '%s\n' "${output}" >&2
     exit 1

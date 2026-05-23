@@ -41,6 +41,14 @@ Each entry should include:
   Reconsider only if a real prepared-statement workload with many parameter
   loads shows `Variable` dominating and the candidate improves that workload
   without regressing short and medium parameter-load streams.
+- Current-tree follow-up, 2026-05-23: commit `abbe3799`
+  (`perf(vdbe): promote Variable hot dispatch`) later kept a `Variable`
+  hot-dispatch arm on `main`, with Beads evidence in `bd-1dp9.6.2` comment
+  `9247`. Treat this entry and that later commit as conflicting evidence, not
+  as a clean retry permission. Before adding more hot-dispatch arms or using
+  `Variable` as precedent, require a same-worker A/B rerun plus a real
+  prepared-statement workload/profile that shows the retained code improves the
+  target workload without short-stream regression.
 
 ## 2026-05-23 - VDBE NotNull hot-dispatch promotion
 
@@ -69,6 +77,14 @@ Each entry should include:
   Reconsider only if opcode mix profiling shows `NotNull` dominating a real
   workload and the candidate is evaluated against that workload, not only the
   dispatch microbench.
+- Current-tree follow-up, 2026-05-23: commit `582f4a9c`
+  (`perf(vdbe): promote NotNull hot dispatch`) later kept a `NotNull`
+  hot-dispatch arm on `main`, with Beads evidence in `bd-1dp9.6.2` comment
+  `9248`. Treat this entry and that later commit as conflicting evidence, not
+  as a clean retry permission. Before adding more hot-dispatch arms or using
+  `NotNull` as precedent, require a same-worker A/B rerun plus a real
+  workload/profile that shows the retained code improves the target workload
+  without growing the hot pre-filter cost.
 
 ## 2026-05-20 - B-tree leaf cell-parse hunt found no bounded lever
 

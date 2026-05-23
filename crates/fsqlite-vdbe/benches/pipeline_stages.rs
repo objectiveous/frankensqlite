@@ -45,6 +45,32 @@ fn build_execute_stage_program(op_repeats: usize) -> VdbeProgram {
 }
 
 /// Build a dispatch-dominated program whose inner loop is a stream of
+/// `Int64` constant loads. `Int64` differs from `Integer` by reading the
+/// payload from `p4`, so it needs a separate measurement before deciding
+/// whether hot-dispatch promotion pays for its match on `P4`.
+fn build_execute_stage_int64_program(op_repeats: usize) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    let end = builder.emit_label();
+    builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+    let target = builder.alloc_reg();
+    for _ in 0..op_repeats {
+        builder.emit_op(
+            Opcode::Int64,
+            0,
+            target,
+            0,
+            P4::Int64(9_223_372_036_854_775_000),
+            0,
+        );
+    }
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder.resolve_label(end);
+    builder
+        .finish()
+        .expect("pipeline execute int64 benchmark program should build")
+}
+
+/// Build a dispatch-dominated program whose inner loop is a stream of
 /// single-register `Copy` ops. The source register holds an `Integer`, so
 /// the body reduces to `clone + set_reg_fast` per dispatch — the work is
 /// small enough that the hot-path pre-filter vs main-match routing is the
@@ -376,6 +402,39 @@ fn bench_vdbe_execute_stage(c: &mut Criterion) {
                     let outcome = engine
                         .execute(program)
                         .expect("pipeline execute benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_vdbe_execute_int64_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_int64");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let program = build_execute_stage_int64_program(op_repeats);
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &program,
+            |b, program| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute int64 benchmark should execute");
                     black_box(outcome);
                 });
             },
@@ -828,6 +887,7 @@ criterion_group!(
     benches,
     bench_vdbe_decode_stage,
     bench_vdbe_execute_stage,
+    bench_vdbe_execute_int64_stage,
     bench_vdbe_execute_copy_stage,
     bench_vdbe_execute_scopy_stage,
     bench_vdbe_execute_move_stage,

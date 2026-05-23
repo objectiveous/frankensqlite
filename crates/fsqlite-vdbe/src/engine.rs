@@ -12403,6 +12403,15 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            Opcode::Int64 => {
+                let val = match &op.p4 {
+                    P4::Int64(v) => *v,
+                    _ => 0,
+                };
+                self.set_reg_int(op.p2, val);
+                *pc += 1;
+                Ok(true)
+            }
             Opcode::Goto => {
                 *pc = op.p2 as usize;
                 Ok(true)

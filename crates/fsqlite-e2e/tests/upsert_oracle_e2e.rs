@@ -117,7 +117,7 @@ fn upsert_do_update_excluded() {
             "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
             "INSERT INTO t VALUES (1,10)",
             "INSERT INTO t (id,v) VALUES (1,99) ON CONFLICT(id) DO UPDATE SET v = excluded.v", // 1->99
-            "INSERT INTO t (id,v) VALUES (2,5) ON CONFLICT(id) DO UPDATE SET v = excluded.v",  // insert
+            "INSERT INTO t (id,v) VALUES (2,5) ON CONFLICT(id) DO UPDATE SET v = excluded.v", // insert
         ],
         &["SELECT id, v FROM t ORDER BY id"], // (1,99),(2,5)
         "upsert_do_update_excluded",

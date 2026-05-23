@@ -99,8 +99,8 @@ fn unique_on_generated_column() {
         &[
             "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, \
              s INTEGER GENERATED ALWAYS AS (a + b) STORED UNIQUE)",
-            "INSERT INTO t (id,a,b) VALUES (1,2,3)",  // s=5
-            "INSERT INTO t (id,a,b) VALUES (2,1,4)",  // s=5 -> UNIQUE violation -> error both
+            "INSERT INTO t (id,a,b) VALUES (1,2,3)",   // s=5
+            "INSERT INTO t (id,a,b) VALUES (2,1,4)",   // s=5 -> UNIQUE violation -> error both
             "INSERT INTO t (id,a,b) VALUES (3,10,20)", // s=30 -> ok
         ],
         &["SELECT id, a, b, s FROM t ORDER BY id"], // (1,2,3,5),(3,10,20,30)
@@ -133,7 +133,7 @@ fn unique_generated_revalidated_on_update() {
             "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, \
              g INTEGER GENERATED ALWAYS AS (a * 10) STORED UNIQUE)",
             "INSERT INTO t (id,a) VALUES (1,1),(2,2)", // g=10,20
-            "UPDATE t SET a = 2 WHERE id = 1",          // g would become 20 -> collides with id2 -> error
+            "UPDATE t SET a = 2 WHERE id = 1", // g would become 20 -> collides with id2 -> error
         ],
         &["SELECT id, a, g FROM t ORDER BY id"], // unchanged (1,1,10),(2,2,20)
         "unique_generated_revalidated_on_update",

@@ -121,11 +121,11 @@ fn str_trim_variants_and_custom_set() {
 fn str_replace_edges() {
     assert_parity(
         &[
-            "SELECT replace('aaa', 'a', 'bb')",   // 'bbbbbb'
-            "SELECT replace('hello', 'l', '')",   // 'heo'
-            "SELECT replace('hello', 'z', 'Q')",  // 'hello' (not found)
-            "SELECT replace('abc', '', 'X')",     // 'abc' (empty search -> unchanged)
-            "SELECT replace(NULL, 'a', 'b')",     // NULL
+            "SELECT replace('aaa', 'a', 'bb')",  // 'bbbbbb'
+            "SELECT replace('hello', 'l', '')",  // 'heo'
+            "SELECT replace('hello', 'z', 'Q')", // 'hello' (not found)
+            "SELECT replace('abc', '', 'X')",    // 'abc' (empty search -> unchanged)
+            "SELECT replace(NULL, 'a', 'b')",    // NULL
         ],
         "str_replace_edges",
     );
@@ -135,12 +135,12 @@ fn str_replace_edges() {
 fn str_concat_and_concat_ws() {
     assert_parity(
         &[
-            "SELECT concat('a', 'b', 'c')",        // 'abc'
-            "SELECT concat('a', NULL, 'c')",       // 'ac' (NULL -> empty)
-            "SELECT concat(1, 2.5, 'x')",          // '12.5x'
-            "SELECT concat_ws('-', 'a', 'b', 'c')", // 'a-b-c'
+            "SELECT concat('a', 'b', 'c')",          // 'abc'
+            "SELECT concat('a', NULL, 'c')",         // 'ac' (NULL -> empty)
+            "SELECT concat(1, 2.5, 'x')",            // '12.5x'
+            "SELECT concat_ws('-', 'a', 'b', 'c')",  // 'a-b-c'
             "SELECT concat_ws('-', 'a', NULL, 'c')", // 'a-c' (NULL skipped, no '--')
-            "SELECT concat_ws(',', 1, 2, 3)",      // '1,2,3'
+            "SELECT concat_ws(',', 1, 2, 3)",        // '1,2,3'
         ],
         "str_concat_and_concat_ws",
     );
@@ -150,12 +150,12 @@ fn str_concat_and_concat_ws() {
 fn str_unhex_and_octet_length() {
     assert_parity(
         &[
-            "SELECT unhex('48656C6C6F')",         // blob 'Hello' -> X'48656C6C6F'
-            "SELECT typeof(unhex('41'))",         // blob
-            "SELECT unhex('xyz')",                // NULL (invalid hex)
-            "SELECT octet_length('hello')",       // 5
-            "SELECT octet_length('café')",        // 5 (UTF-8 bytes; é = 2)
-            "SELECT length('café')",              // 4 (characters)
+            "SELECT unhex('48656C6C6F')",   // blob 'Hello' -> X'48656C6C6F'
+            "SELECT typeof(unhex('41'))",   // blob
+            "SELECT unhex('xyz')",          // NULL (invalid hex)
+            "SELECT octet_length('hello')", // 5
+            "SELECT octet_length('café')",  // 5 (UTF-8 bytes; é = 2)
+            "SELECT length('café')",        // 4 (characters)
         ],
         "str_unhex_and_octet_length",
     );
@@ -165,9 +165,9 @@ fn str_unhex_and_octet_length() {
 fn str_format_alias() {
     assert_parity(
         &[
-            "SELECT format('%d-%s', 5, 'x')",  // '5-x'
-            "SELECT format('%.2f', 3.14159)",  // '3.14'
-            "SELECT format('%05d', 42)",       // '00042'
+            "SELECT format('%d-%s', 5, 'x')", // '5-x'
+            "SELECT format('%.2f', 3.14159)", // '3.14'
+            "SELECT format('%05d', 42)",      // '00042'
         ],
         "str_format_alias",
     );

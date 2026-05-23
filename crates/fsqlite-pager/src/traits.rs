@@ -1665,8 +1665,14 @@ mod tests {
             page_data_offset: 24,
             big_endian_checksum: false,
             frame_metas: vec![
-                PreparedWalFrameMeta { page_number: 1, db_size_if_commit: 0 },
-                PreparedWalFrameMeta { page_number: 2, db_size_if_commit: 10 },
+                PreparedWalFrameMeta {
+                    page_number: 1,
+                    db_size_if_commit: 0,
+                },
+                PreparedWalFrameMeta {
+                    page_number: 2,
+                    db_size_if_commit: 10,
+                },
             ],
             checksum_transforms: Vec::new(),
             frame_bytes: vec![0u8; 4120 * 2],
@@ -1684,9 +1690,10 @@ mod tests {
             frame_size: 32,
             page_data_offset: 8,
             big_endian_checksum: false,
-            frame_metas: vec![
-                PreparedWalFrameMeta { page_number: 1, db_size_if_commit: 0 },
-            ],
+            frame_metas: vec![PreparedWalFrameMeta {
+                page_number: 1,
+                db_size_if_commit: 0,
+            }],
             checksum_transforms: Vec::new(),
             frame_bytes: vec![0u8; 32],
             last_commit_frame_offset: None,
@@ -1850,8 +1857,14 @@ mod tests {
             page_data_offset,
             big_endian_checksum: false,
             frame_metas: vec![
-                PreparedWalFrameMeta { page_number: 1, db_size_if_commit: 0 },
-                PreparedWalFrameMeta { page_number: 2, db_size_if_commit: 5 },
+                PreparedWalFrameMeta {
+                    page_number: 1,
+                    db_size_if_commit: 0,
+                },
+                PreparedWalFrameMeta {
+                    page_number: 2,
+                    db_size_if_commit: 5,
+                },
             ],
             checksum_transforms: Vec::new(),
             frame_bytes,
@@ -1875,8 +1888,14 @@ mod tests {
 
     #[test]
     fn prepared_wal_frame_meta_debug_clone_copy_eq() {
-        let a = PreparedWalFrameMeta { page_number: 5, db_size_if_commit: 0 };
-        let b = PreparedWalFrameMeta { page_number: 5, db_size_if_commit: 10 };
+        let a = PreparedWalFrameMeta {
+            page_number: 5,
+            db_size_if_commit: 0,
+        };
+        let b = PreparedWalFrameMeta {
+            page_number: 5,
+            db_size_if_commit: 10,
+        };
         let copied = a;
         assert_eq!(copied, a);
         assert_ne!(a, b);
@@ -1941,7 +1960,11 @@ mod tests {
     #[test]
     fn wal_frame_ref_debug_clone_copy() {
         let data = [0xABu8; 16];
-        let frame = WalFrameRef { page_number: 3, page_data: &data, db_size_if_commit: 0 };
+        let frame = WalFrameRef {
+            page_number: 3,
+            page_data: &data,
+            db_size_if_commit: 0,
+        };
         let copied = frame;
         assert_eq!(copied.page_number, 3);
         assert_eq!(copied.page_data.len(), 16);
@@ -1980,7 +2003,10 @@ mod tests {
             index_is_partial: false,
         };
         assert!(base.lookup_contract_is_authoritative());
-        let partial = WalPublicationSnapshot { index_is_partial: true, ..base };
+        let partial = WalPublicationSnapshot {
+            index_is_partial: true,
+            ..base
+        };
         assert!(!partial.lookup_contract_is_authoritative());
     }
 }

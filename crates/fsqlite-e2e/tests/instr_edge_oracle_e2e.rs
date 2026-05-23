@@ -105,12 +105,12 @@ fn instr_blob_in_blob() {
 fn instr_null_and_numeric() {
     assert_scalar(
         &[
-            "SELECT instr(NULL, 'x')",     // NULL propagation
-            "SELECT instr('abc', NULL)",   // NULL propagation
-            "SELECT instr(NULL, NULL)",    // NULL
+            "SELECT instr(NULL, 'x')",   // NULL propagation
+            "SELECT instr('abc', NULL)", // NULL propagation
+            "SELECT instr(NULL, NULL)",  // NULL
             // numeric argument coerced to its text form
-            "SELECT instr(12345, '23')",   // '12345' contains '23' at 2 -> 2
-            "SELECT instr(12345, 9)",      // '12345' / '9' -> 0
+            "SELECT instr(12345, '23')", // '12345' contains '23' at 2 -> 2
+            "SELECT instr(12345, 9)",    // '12345' / '9' -> 0
             // mixed blob+text: both interpreted as text -> X'4142' = 'AB', find 'B' at 2
             "SELECT instr(X'4142', 'B')",
         ],

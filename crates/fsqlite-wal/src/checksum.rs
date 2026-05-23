@@ -3017,16 +3017,8 @@ mod tests {
             s1: 0x1111_2222,
             s2: 0x3333_4444,
         };
-        assert_eq!(
-            id.then(t).apply(seed),
-            t.apply(seed),
-            "id.then(t) == t"
-        );
-        assert_eq!(
-            t.then(id).apply(seed),
-            t.apply(seed),
-            "t.then(id) == t"
-        );
+        assert_eq!(id.then(t).apply(seed), t.apply(seed), "id.then(t) == t");
+        assert_eq!(t.then(id).apply(seed), t.apply(seed), "t.then(id) == t");
     }
 
     #[test]
@@ -3161,7 +3153,9 @@ mod tests {
                 assert_eq!(i == j, o == p);
             }
         }
-        assert!(format!("{:?}", WalFecRepairOutcome::SourceHashMismatch).contains("SourceHashMismatch"));
+        assert!(
+            format!("{:?}", WalFecRepairOutcome::SourceHashMismatch).contains("SourceHashMismatch")
+        );
     }
 
     #[test]

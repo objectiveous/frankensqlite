@@ -108,9 +108,9 @@ fn analyze_keeps_queries_correct() {
             v
         },
         &[
-            "SELECT id FROM t WHERE a = 20 ORDER BY id", // 2,3
-            "SELECT id FROM t WHERE a > 15 ORDER BY id", // 2,3,4
-            "SELECT count(*), sum(a) FROM t",            // 5, 90
+            "SELECT id FROM t WHERE a = 20 ORDER BY id",       // 2,3
+            "SELECT id FROM t WHERE a > 15 ORDER BY id",       // 2,3,4
+            "SELECT count(*), sum(a) FROM t",                  // 5, 90
             "SELECT a, count(*) FROM t GROUP BY a ORDER BY a", // (10,2),(20,2),(30,1)
         ],
         "analyze_keeps_queries_correct",
@@ -163,9 +163,9 @@ fn reindex_after_dml_churn() {
             "REINDEX idx_a",
         ],
         &[
-            "SELECT id, a FROM t ORDER BY id",            // (1,99),(2,20),(4,40),(5,50),(6,15)
+            "SELECT id, a FROM t ORDER BY id", // (1,99),(2,20),(4,40),(5,50),(6,15)
             "SELECT id FROM t WHERE a >= 40 ORDER BY id", // 1(99),4(40),5(50)
-            "SELECT id FROM t WHERE a = 99",              // 1
+            "SELECT id FROM t WHERE a = 99",   // 1
         ],
         "reindex_after_dml_churn",
     );

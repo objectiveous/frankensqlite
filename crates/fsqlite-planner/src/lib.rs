@@ -5302,7 +5302,11 @@ mod tests {
         assert_eq!(count_output_columns(&core), 3);
         assert_eq!(
             extract_output_aliases(&core),
-            vec![Some("renamed".to_owned()), Some("bare_col".to_owned()), None]
+            vec![
+                Some("renamed".to_owned()),
+                Some("bare_col".to_owned()),
+                None
+            ]
         );
 
         // VALUES: width comes from the first row; every column is unnamed.
@@ -5826,9 +5830,16 @@ mod tests {
         // skips. The existing tests check each formula in isolation; this pins
         // the cross-kind ordering that makes the planner prefer covering indexes.
         let sel = 0.1;
-        let range = estimate_cost(&AccessPathKind::IndexScanRange { selectivity: sel }, 200, 50);
-        let covering =
-            estimate_cost(&AccessPathKind::CoveringIndexScan { selectivity: sel }, 200, 50);
+        let range = estimate_cost(
+            &AccessPathKind::IndexScanRange { selectivity: sel },
+            200,
+            50,
+        );
+        let covering = estimate_cost(
+            &AccessPathKind::CoveringIndexScan { selectivity: sel },
+            200,
+            50,
+        );
         assert!(
             covering < range,
             "covering index must rank below a range scan: {covering} vs {range}"
@@ -5843,8 +5854,12 @@ mod tests {
 
         // With a row count, the covering scan also pays the cheaper per-row term
         // (decode only, not decode + dereference), so its advantage widens.
-        let range_r =
-            estimate_cost_ext(&AccessPathKind::IndexScanRange { selectivity: sel }, 200, 50, 1_000);
+        let range_r = estimate_cost_ext(
+            &AccessPathKind::IndexScanRange { selectivity: sel },
+            200,
+            50,
+            1_000,
+        );
         let covering_r = estimate_cost_ext(
             &AccessPathKind::CoveringIndexScan { selectivity: sel },
             200,
@@ -5894,6 +5909,25 @@ mod tests {
     }
 
     #[test]
+    fn test_snapshot_index_selection_totals_has_five_access_path_labels() {
+        // The snapshot builds its map from a fixed 5-label array; the KEY set
+        // is a structural contract regardless of the live counter values, so
+        // this assertion is race-safe under parallel tests (values are not
+        // checked).
+        let snap = snapshot_index_selection_totals();
+        for label in [
+            "covering_index_scan",
+            "full_table_scan",
+            "index_scan_equality",
+            "index_scan_range",
+            "rowid_lookup",
+        ] {
+            assert!(snap.contains_key(label), "missing label: {label}");
+        }
+        assert_eq!(snap.len(), 5, "no extra labels");
+    }
+
+    #[test]
     fn test_estimate_cost_ext_exact_page_costs_at_zero_rows() {
         // At n_rows == 0 every per-row term vanishes, leaving the closed-form
         // page-level cost for each access path. test_estimate_cost_ext_zero_rows_
@@ -5904,20 +5938,38 @@ mod tests {
         let (ip, tp) = (16u64, 64u64);
 
         // Full scan == table page count.
-        assert!(approx(estimate_cost_ext(&AccessPathKind::FullTableScan, tp, ip, 0), 64.0));
+        assert!(approx(
+            estimate_cost_ext(&AccessPathKind::FullTableScan, tp, ip, 0),
+            64.0
+        ));
         // Rowid lookup == log2(table pages); no index term.
-        assert!(approx(estimate_cost_ext(&AccessPathKind::RowidLookup, tp, ip, 0), 6.0));
+        assert!(approx(
+            estimate_cost_ext(&AccessPathKind::RowidLookup, tp, ip, 0),
+            6.0
+        ));
         // Index equality == log2(index pages) + log2(table pages).
-        assert!(approx(estimate_cost_ext(&AccessPathKind::IndexScanEquality, tp, ip, 0), 10.0));
+        assert!(approx(
+            estimate_cost_ext(&AccessPathKind::IndexScanEquality, tp, ip, 0),
+            10.0
+        ));
 
         // Range scan == log2(ip) + sel*ip + sel*tp = 4 + 8 + 32.
-        let range = estimate_cost_ext(&AccessPathKind::IndexScanRange { selectivity: 0.5 }, tp, ip, 0);
+        let range = estimate_cost_ext(
+            &AccessPathKind::IndexScanRange { selectivity: 0.5 },
+            tp,
+            ip,
+            0,
+        );
         assert!(approx(range, 44.0), "range page cost, got {range}");
 
         // Covering scan omits the table-page (row dereference) term:
         // log2(ip) + sel*ip = 4 + 8, with no sel*tp.
-        let covering =
-            estimate_cost_ext(&AccessPathKind::CoveringIndexScan { selectivity: 0.5 }, tp, ip, 0);
+        let covering = estimate_cost_ext(
+            &AccessPathKind::CoveringIndexScan { selectivity: 0.5 },
+            tp,
+            ip,
+            0,
+        );
         assert!(approx(covering, 12.0), "covering page cost, got {covering}");
 
         // The structural difference is exactly the avoided table dereference,
@@ -6004,11 +6056,17 @@ mod tests {
         let terms = [join_term("a", "x", "b", "y")]; // a.x = b.y
 
         assert!(has_join_predicate("a", "b", &terms));
-        assert!(has_join_predicate("b", "a", &terms), "either argument order");
+        assert!(
+            has_join_predicate("b", "a", &terms),
+            "either argument order"
+        );
         assert!(has_join_predicate("A", "B", &terms), "case-insensitive");
         assert!(!has_join_predicate("a", "c", &terms), "no predicate to c");
         assert!(!has_join_predicate("c", "d", &terms));
-        assert!(!has_join_predicate("a", "b", &[]), "no terms -> no predicate");
+        assert!(
+            !has_join_predicate("a", "b", &[]),
+            "no terms -> no predicate"
+        );
     }
 
     #[test]
@@ -6033,10 +6091,7 @@ mod tests {
             vec!["c".to_owned(), "a".to_owned(), "b".to_owned()]
         );
         // A single-element permutation yields just that table's name.
-        assert_eq!(
-            order_indices_to_names(&[1], &tables),
-            vec!["b".to_owned()]
-        );
+        assert_eq!(order_indices_to_names(&[1], &tables), vec!["b".to_owned()]);
     }
 
     #[test]
@@ -6240,7 +6295,10 @@ mod tests {
         // ordered_subset keeps only the selected tables but in join_order's
         // order (not the set's), and ignores selected tables absent from the
         // join order.
-        let order: Vec<String> = ["c", "a", "b", "d"].iter().map(|s| (*s).to_owned()).collect();
+        let order: Vec<String> = ["c", "a", "b", "d"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
 
         let sel: HashSet<String> = ["a", "d"].iter().map(|s| (*s).to_owned()).collect();
         assert_eq!(
@@ -6249,7 +6307,10 @@ mod tests {
         );
 
         // Selecting everything returns the join order unchanged.
-        let all: HashSet<String> = ["a", "b", "c", "d"].iter().map(|s| (*s).to_owned()).collect();
+        let all: HashSet<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
         assert_eq!(ordered_subset(&order, &all), order);
 
         // An empty selection yields nothing.
@@ -6330,10 +6391,7 @@ mod tests {
         // Left-nested (a OR b) OR c -> 3.
         assert_eq!(count(&or(or(leaf(1), leaf(2)), leaf(3))), 3);
         // Balanced (a OR b) OR (c OR d) -> 4.
-        assert_eq!(
-            count(&or(or(leaf(1), leaf(2)), or(leaf(3), leaf(4)))),
-            4
-        );
+        assert_eq!(count(&or(or(leaf(1), leaf(2)), or(leaf(3), leaf(4)))), 4);
     }
 
     #[test]
@@ -6363,10 +6421,7 @@ mod tests {
         // Left-nested (a AND b) AND c -> 3.
         assert_eq!(count(&and(and(leaf(1), leaf(2)), leaf(3))), 3);
         // Balanced (a AND b) AND (c AND d) -> 4.
-        assert_eq!(
-            count(&and(and(leaf(1), leaf(2)), and(leaf(3), leaf(4)))),
-            4
-        );
+        assert_eq!(count(&and(and(leaf(1), leaf(2)), and(leaf(3), leaf(4)))), 4);
     }
 
     #[test]
@@ -6768,8 +6823,8 @@ mod tests {
 
     #[test]
     fn test_literal_satisfies_predicate_literal() {
-        use std::cmp::Ordering::{Equal, Greater, Less};
         use AstBinaryOp::{Eq, Ge, Gt, Le, Lt, Ne};
+        use std::cmp::Ordering::{Equal, Greater, Less};
 
         // Eq is satisfied only by Equal.
         assert!(literal_satisfies_predicate_literal(Equal, Eq));
@@ -7128,21 +7183,41 @@ mod tests {
         let eq = estimate_cost_ext(&AccessPathKind::IndexScanEquality, tp, ip, big);
         let rowid = estimate_cost_ext(&AccessPathKind::RowidLookup, tp, ip, big);
 
-        assert!(rowid <= eq, "rowid lookup should not cost more than index equality: {rowid} vs {eq}");
-        assert!(eq < full, "index equality must rank below a full scan on a large table: {eq} vs {full}");
+        assert!(
+            rowid <= eq,
+            "rowid lookup should not cost more than index equality: {rowid} vs {eq}"
+        );
+        assert!(
+            eq < full,
+            "index equality must rank below a full scan on a large table: {eq} vs {full}"
+        );
 
         // Equality/rowid stay ~row-count-insensitive (only one matched row's
         // access cost), unlike the full scan which scales with n_rows.
         let eq_zero = estimate_cost_ext(&AccessPathKind::IndexScanEquality, tp, ip, 0);
         let rowid_zero = estimate_cost_ext(&AccessPathKind::RowidLookup, tp, ip, 0);
-        assert!(eq - eq_zero < 1.0, "equality cost must not scale with n_rows: delta {}", eq - eq_zero);
-        assert!(rowid - rowid_zero < 1.0, "rowid cost must not scale with n_rows: delta {}", rowid - rowid_zero);
+        assert!(
+            eq - eq_zero < 1.0,
+            "equality cost must not scale with n_rows: delta {}",
+            eq - eq_zero
+        );
+        assert!(
+            rowid - rowid_zero < 1.0,
+            "rowid cost must not scale with n_rows: delta {}",
+            rowid - rowid_zero
+        );
 
         // Sanity: n_rows=0 full scan equals table-page count, and a large row
         // count grows it by orders of magnitude.
         let full_zero = estimate_cost_ext(&AccessPathKind::FullTableScan, tp, ip, 0);
-        assert!((full_zero - 100.0).abs() < f64::EPSILON, "n_rows=0 full scan == table pages");
-        assert!(full > full_zero * 10.0, "full scan must grow strongly with n_rows: {full} vs {full_zero}");
+        assert!(
+            (full_zero - 100.0).abs() < f64::EPSILON,
+            "n_rows=0 full scan == table pages"
+        );
+        assert!(
+            full > full_zero * 10.0,
+            "full scan must grow strongly with n_rows: {full} vs {full_zero}"
+        );
     }
 
     #[test]
@@ -9856,9 +9931,7 @@ mod tests {
         // indirect coverage inside best_access_path.
 
         // Fewer than two relations: nothing to join, zero cost.
-        assert!(
-            estimate_pairwise_hash_join_cost(&["A".to_owned()], &HashMap::new()).abs() < 1e-9
-        );
+        assert!(estimate_pairwise_hash_join_cost(&["A".to_owned()], &HashMap::new()).abs() < 1e-9);
         let empty: Vec<String> = vec![];
         assert!(estimate_pairwise_hash_join_cost(&empty, &HashMap::new()).abs() < 1e-9);
 
@@ -9872,7 +9945,10 @@ mod tests {
             &["A".to_owned(), "B".to_owned()],
             &rows(&[("A", 100.0), ("B", 250.0)]),
         );
-        assert!((ab - 350.0).abs() < 1e-9, "two-table cost should be 100+250, got {ab}");
+        assert!(
+            (ab - 350.0).abs() < 1e-9,
+            "two-table cost should be 100+250, got {ab}"
+        );
 
         // Three relations A(100), B(250), C(40): after A|><|B the intermediate is
         // 100*250*0.25 = 6250, so the third step charges 6250+40. Total =
@@ -9881,7 +9957,10 @@ mod tests {
             &["A".to_owned(), "B".to_owned(), "C".to_owned()],
             &rows(&[("A", 100.0), ("B", 250.0), ("C", 40.0)]),
         );
-        assert!((abc - 6640.0).abs() < 1e-9, "three-table cost should be 6640, got {abc}");
+        assert!(
+            (abc - 6640.0).abs() < 1e-9,
+            "three-table cost should be 6640, got {abc}"
+        );
 
         // Unknown tables default to 1 row (floored at 1.0): cost 1 + 1 = 2.
         let defaulted =
@@ -11187,8 +11266,14 @@ mod tests {
         assert!(approx(loss(100.0, 500.0), 16.0 * base)); // ratio 5 -> k * 16
 
         // Loss is monotonic in the ratio on both sides.
-        assert!(loss(100.0, 250.0) > loss(100.0, 200.0), "underestimate loss grows with ratio");
-        assert!(loss(100.0, 25.0) > loss(100.0, 50.0), "overestimate loss grows as estimate worsens");
+        assert!(
+            loss(100.0, 250.0) > loss(100.0, 200.0),
+            "underestimate loss grows with ratio"
+        );
+        assert!(
+            loss(100.0, 25.0) > loss(100.0, 50.0),
+            "overestimate loss grows as estimate worsens"
+        );
     }
 
     // ── DPccp tests (bd-1as.3) ──

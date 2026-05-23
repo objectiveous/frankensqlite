@@ -114,8 +114,8 @@ fn cmp_integer_column_vs_text_numeric_literal() {
         &r,
         &[
             // INTEGER affinity applied to the text literal: '5'->5.
-            "SELECT id FROM t WHERE n = '5' ORDER BY id",  // 1
-            "SELECT id FROM t WHERE n > '9' ORDER BY id",  // 2,3
+            "SELECT id FROM t WHERE n = '5' ORDER BY id", // 1
+            "SELECT id FROM t WHERE n > '9' ORDER BY id", // 2,3
             "SELECT id FROM t WHERE n < '11' ORDER BY id", // 1,2
         ],
         "cmp_integer_column_vs_text_numeric_literal",
@@ -130,7 +130,7 @@ fn cmp_text_column_vs_numeric_literal() {
         &r,
         &[
             // TEXT affinity applied to the integer literal: 5->'5'.
-            "SELECT id FROM t WHERE s = 5 ORDER BY id",  // 1
+            "SELECT id FROM t WHERE s = 5 ORDER BY id", // 1
             "SELECT id FROM t WHERE s = 10 ORDER BY id", // 2
         ],
         "cmp_text_column_vs_numeric_literal",
@@ -156,11 +156,11 @@ fn cmp_storage_class_ordering() {
     assert_scalar(
         &[
             // NULL < numbers < text < blob.
-            "SELECT 1 < 'a', 'a' < X'00'",     // 1, 1
-            "SELECT 1 < X'00', 100 < 'a'",     // 1, 1
-            "SELECT NULL < 1, NULL = NULL",    // NULL, NULL
+            "SELECT 1 < 'a', 'a' < X'00'",  // 1, 1
+            "SELECT 1 < X'00', 100 < 'a'",  // 1, 1
+            "SELECT NULL < 1, NULL = NULL", // NULL, NULL
             // Numeric vs lexical ordering contrast.
-            "SELECT 2 < 10, '2' < '10'",       // 1, 0 (lexical: '2' > '1')
+            "SELECT 2 < 10, '2' < '10'", // 1, 0 (lexical: '2' > '1')
         ],
         "cmp_storage_class_ordering",
     );

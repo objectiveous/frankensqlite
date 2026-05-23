@@ -18,17 +18,23 @@
 //! - `Infinity` and `-Infinity` are rejected
 //! - `Date` inputs are stored as ISO 8601 `TEXT`
 
-use std::cell::{Cell, RefCell};
+#[cfg(feature = "diagnostics")]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Once;
 
+#[cfg(feature = "diagnostics")]
+use fsqlite_core::connection::ConnectionMemoryStats;
 use fsqlite_core::connection::{
-    Connection as CoreConnection, ConnectionEnv, ConnectionMemoryStats,
-    PreparedStatement as CorePreparedStatement, Row as CoreRow,
+    Connection as CoreConnection, ConnectionEnv, PreparedStatement as CorePreparedStatement,
+    Row as CoreRow,
 };
 use fsqlite_error::FrankenError;
 use fsqlite_types::{SmallText, SqliteValue};
-use js_sys::{Array, BigInt, Date, Function, Number, Object, Reflect, Uint8Array};
+#[cfg(feature = "diagnostics")]
+use js_sys::Function;
+use js_sys::{Array, BigInt, Date, Number, Object, Reflect, Uint8Array};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
@@ -53,6 +59,7 @@ pub fn parse_sql(input: &str) -> (Vec<ast::Statement>, Vec<parser::ParseError>) 
 
 fn install_wasm_runtime() {
     WASM_RUNTIME_INIT.call_once(|| {
+        #[cfg(feature = "panic-hook")]
         console_error_panic_hook::set_once();
         #[cfg(all(target_arch = "wasm32", feature = "tracing"))]
         tracing_wasm::set_as_global_default();
@@ -64,6 +71,7 @@ pub fn init() {
     install_wasm_runtime();
 }
 
+#[cfg(feature = "diagnostics")]
 #[wasm_bindgen(js_name = parseSql)]
 pub fn parse_sql_js(input: &str) -> Result<JsValue, JsValue> {
     install_wasm_runtime();
@@ -104,14 +112,20 @@ pub struct FrankenDb {
 }
 
 struct FrankenDbState {
+    #[cfg(feature = "diagnostics")]
     path: String,
     inner: RefCell<Option<CoreConnection>>,
+    #[cfg(feature = "diagnostics")]
     memory_warning_threshold_bytes: Cell<Option<usize>>,
+    #[cfg(feature = "diagnostics")]
     memory_warning_threshold_percent: Cell<Option<usize>>,
+    #[cfg(feature = "diagnostics")]
     memory_warning_above_threshold: Cell<bool>,
+    #[cfg(feature = "diagnostics")]
     memory_warning_callback: RefCell<Option<Function>>,
 }
 
+#[cfg(feature = "diagnostics")]
 struct PreparedMetadata {
     column_count: usize,
     column_names: Vec<String>,
@@ -123,12 +137,16 @@ struct WasmDatabaseOptions {
     initial_reserve_bytes: Option<usize>,
     growth_chunk_bytes: Option<usize>,
     max_bytes: Option<usize>,
+    #[cfg(feature = "diagnostics")]
     warning_threshold_bytes: Option<usize>,
+    #[cfg(feature = "diagnostics")]
     warning_threshold_percent: Option<usize>,
+    #[cfg(feature = "diagnostics")]
     warning_callback: Option<Function>,
 }
 
 impl WasmDatabaseOptions {
+    #[cfg(feature = "diagnostics")]
     fn effective_warning_threshold_bytes(&self) -> Result<Option<usize>, FrankenError> {
         match (self.warning_threshold_bytes, self.warning_threshold_percent) {
             (Some(_), Some(_)) => Err(FrankenError::TypeMismatch {
@@ -183,11 +201,24 @@ impl WasmDatabaseOptions {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+fn memory_warning_transition(
+    estimated_used_bytes: usize,
+    threshold: usize,
+    was_above_threshold: bool,
+) -> (bool, bool) {
+    let above_threshold = estimated_used_bytes >= threshold;
+    let crossed_threshold = above_threshold && !was_above_threshold;
+    (above_threshold, crossed_threshold)
+}
+
 #[wasm_bindgen(js_name = FrankenPreparedStatement)]
 pub struct FrankenPreparedStatement {
     state: Rc<FrankenDbState>,
     sql: String,
+    #[cfg(feature = "diagnostics")]
     column_count: usize,
+    #[cfg(feature = "diagnostics")]
     column_names: Vec<String>,
 }
 
@@ -242,6 +273,7 @@ impl FrankenDb {
         Self::from_parts(":memory:".to_owned(), conn, options)
     }
 
+    #[cfg(feature = "diagnostics")]
     #[wasm_bindgen(getter)]
     pub fn path(&self) -> String {
         self.state.path.clone()
@@ -294,6 +326,7 @@ impl FrankenDb {
     }
 
     pub fn prepare(&self, sql: &str) -> Result<FrankenPreparedStatement, JsValue> {
+        #[cfg(feature = "diagnostics")]
         let metadata = self.with_connection(|conn| {
             let stmt = conn.prepare(sql)?;
             Ok(PreparedMetadata {
@@ -301,14 +334,22 @@ impl FrankenDb {
                 column_names: stmt.column_names().to_vec(),
             })
         })?;
+        #[cfg(not(feature = "diagnostics"))]
+        self.with_connection(|conn| {
+            let _stmt = conn.prepare(sql)?;
+            Ok(())
+        })?;
         Ok(FrankenPreparedStatement {
             state: Rc::clone(&self.state),
             sql: sql.to_owned(),
+            #[cfg(feature = "diagnostics")]
             column_count: metadata.column_count,
+            #[cfg(feature = "diagnostics")]
             column_names: metadata.column_names,
         })
     }
 
+    #[cfg(feature = "diagnostics")]
     pub fn explain(&self, sql: &str) -> Result<String, JsValue> {
         self.with_connection(|conn| {
             let stmt = conn.prepare(sql)?;
@@ -321,6 +362,7 @@ impl FrankenDb {
         Ok(Uint8Array::from(bytes.as_slice()))
     }
 
+    #[cfg(feature = "diagnostics")]
     #[wasm_bindgen(js_name = memoryStats)]
     pub fn memory_stats(&self) -> Result<JsValue, JsValue> {
         self.state.memory_stats_js()
@@ -328,25 +370,36 @@ impl FrankenDb {
 }
 
 impl FrankenDb {
+    #[cfg_attr(not(feature = "diagnostics"), allow(clippy::unnecessary_wraps))]
     fn from_parts(
         path: String,
         conn: CoreConnection,
         options: WasmDatabaseOptions,
     ) -> Result<Self, JsValue> {
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = &path;
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = &options;
         let db = Self {
             state: Rc::new(FrankenDbState {
+                #[cfg(feature = "diagnostics")]
                 path,
                 inner: RefCell::new(Some(conn)),
+                #[cfg(feature = "diagnostics")]
                 memory_warning_threshold_bytes: Cell::new(
                     options
                         .effective_warning_threshold_bytes()
                         .map_err(franken_error_to_js)?,
                 ),
+                #[cfg(feature = "diagnostics")]
                 memory_warning_threshold_percent: Cell::new(options.warning_threshold_percent),
+                #[cfg(feature = "diagnostics")]
                 memory_warning_above_threshold: Cell::new(false),
+                #[cfg(feature = "diagnostics")]
                 memory_warning_callback: RefCell::new(options.warning_callback),
             }),
         };
+        #[cfg(feature = "diagnostics")]
         db.state.observe_memory_warning();
         Ok(db)
     }
@@ -371,6 +424,7 @@ impl FrankenDbState {
         })?;
         match f(conn) {
             Ok(value) => {
+                #[cfg(feature = "diagnostics")]
                 self.observe_memory_warning();
                 Ok(value)
             }
@@ -378,6 +432,7 @@ impl FrankenDbState {
         }
     }
 
+    #[cfg(feature = "diagnostics")]
     fn memory_stats_js(&self) -> Result<JsValue, JsValue> {
         install_wasm_runtime();
         let borrow = self.inner.borrow();
@@ -395,6 +450,7 @@ impl FrankenDbState {
         )
     }
 
+    #[cfg(feature = "diagnostics")]
     fn observe_memory_warning(&self) {
         let Some(threshold) = self.memory_warning_threshold_bytes.get() else {
             return;
@@ -409,10 +465,13 @@ impl FrankenDbState {
         let Ok(stats) = conn.memory_stats() else {
             return;
         };
-        let above_threshold = stats.estimated_used_bytes() >= threshold;
-        let was_above_threshold = self.memory_warning_above_threshold.replace(above_threshold);
-        if above_threshold
-            && !was_above_threshold
+        let (above_threshold, crossed_threshold) = memory_warning_transition(
+            stats.estimated_used_bytes(),
+            threshold,
+            self.memory_warning_above_threshold.get(),
+        );
+        self.memory_warning_above_threshold.set(above_threshold);
+        if crossed_threshold
             && let Ok(payload) = connection_memory_stats_to_js(
                 conn,
                 stats,
@@ -424,7 +483,10 @@ impl FrankenDbState {
         }
     }
 
+    #[cfg_attr(not(feature = "diagnostics"), allow(clippy::unused_self))]
     fn connection_error_to_js(&self, conn: &CoreConnection, error: FrankenError) -> JsValue {
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = conn;
         let is_oom = matches!(error, FrankenError::OutOfMemory);
         let object = Object::from(franken_error_to_js(error));
         if is_oom {
@@ -436,6 +498,7 @@ impl FrankenDbState {
                 ),
             );
             let _ = set_property(&object, "oom", &JsValue::from_bool(true));
+            #[cfg(feature = "diagnostics")]
             if let Ok(stats) = conn.memory_stats()
                 && let Ok(stats_js) = connection_memory_stats_to_js(
                     conn,
@@ -487,16 +550,19 @@ fn connection_env_from_options(
 
 #[wasm_bindgen(js_class = FrankenPreparedStatement)]
 impl FrankenPreparedStatement {
+    #[cfg(feature = "diagnostics")]
     #[wasm_bindgen(getter)]
     pub fn sql(&self) -> String {
         self.sql.clone()
     }
 
+    #[cfg(feature = "diagnostics")]
     #[wasm_bindgen(getter, js_name = columnCount)]
     pub fn column_count(&self) -> usize {
         self.column_count
     }
 
+    #[cfg(feature = "diagnostics")]
     #[wasm_bindgen(js_name = columnNames)]
     pub fn column_names_js(&self) -> JsValue {
         let names = Array::new();
@@ -532,6 +598,7 @@ impl FrankenPreparedStatement {
         })
     }
 
+    #[cfg(feature = "diagnostics")]
     pub fn explain(&self) -> Result<String, JsValue> {
         self.with_prepared_statement(|stmt| Ok(stmt.explain()))
     }
@@ -583,6 +650,7 @@ fn query_result_to_js(
     set_property(&result, "columnTypes", &column_types.into())?;
     set_property(&result, "rows", &js_rows.into())?;
     set_property(&result, "rowArrays", &row_arrays.into())?;
+    #[cfg(feature = "diagnostics")]
     set_property(&result, "changes", &JsValue::from_f64(0.0))?;
     Ok(result.into())
 }
@@ -737,20 +805,26 @@ fn franken_error_to_js(error: FrankenError) -> JsValue {
         &JsValue::from_f64(f64::from(error.extended_error_code())),
     );
     let _ = set_property(&object, "message", &JsValue::from_str(&error.to_string()));
+    #[cfg(feature = "diagnostics")]
+    set_diagnostic_error_properties(&object, &error);
+    object.into()
+}
+
+#[cfg(feature = "diagnostics")]
+fn set_diagnostic_error_properties(object: &Object, error: &FrankenError) {
     let _ = set_property(
-        &object,
+        object,
         "transient",
         &JsValue::from_bool(error.is_transient()),
     );
     let _ = set_property(
-        &object,
+        object,
         "userRecoverable",
         &JsValue::from_bool(error.is_user_recoverable()),
     );
     if let Some(suggestion) = error.suggestion() {
-        let _ = set_property(&object, "suggestion", &JsValue::from_str(suggestion));
+        let _ = set_property(object, "suggestion", &JsValue::from_str(suggestion));
     }
-    object.into()
 }
 
 fn sqlite_error_name(error: &FrankenError) -> String {
@@ -822,7 +896,7 @@ fn sqlite_float_to_js(number: f64) -> Result<JsValue, FrankenError> {
     Ok(JsValue::from_f64(number))
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(feature = "diagnostics", target_arch = "wasm32"))]
 fn warn_nan_to_null() {
     let global = js_sys::global();
     let Ok(console) = Reflect::get(&global, &JsValue::from_str("console")) else {
@@ -840,7 +914,7 @@ fn warn_nan_to_null() {
     );
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(all(feature = "diagnostics", target_arch = "wasm32")))]
 fn warn_nan_to_null() {}
 
 fn bigint_to_decimal_string(value: &JsValue) -> Result<String, FrankenError> {
@@ -880,6 +954,7 @@ fn date_to_sqlite_value(date: &Date) -> Result<SqliteValue, FrankenError> {
     ))))
 }
 
+#[cfg(feature = "diagnostics")]
 fn describe_js_value(value: &JsValue) -> String {
     if value.is_null() {
         return "null".to_owned();
@@ -905,6 +980,20 @@ fn describe_js_value(value: &JsValue) -> String {
         && let Some(name) = name.as_string()
     {
         return name;
+    }
+    value
+        .js_typeof()
+        .as_string()
+        .unwrap_or_else(|| "unknown JavaScript value".to_owned())
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn describe_js_value(value: &JsValue) -> String {
+    if value.is_null() {
+        return "null".to_owned();
+    }
+    if value.is_undefined() {
+        return "undefined".to_owned();
     }
     value
         .js_typeof()
@@ -965,16 +1054,23 @@ fn parse_database_options(options: Option<JsValue>) -> Result<WasmDatabaseOption
             "memory.maxPages",
         )
         .map_err(franken_error_to_js)?;
-        parsed.warning_threshold_bytes =
-            parse_optional_usize_property(&memory_options, "warningThresholdBytes")
-                .map_err(franken_error_to_js)?;
-        parsed.warning_threshold_percent =
-            parse_optional_percent_property(&memory_options, "warnAtPercent")
-                .map_err(franken_error_to_js)?;
-        parsed.warning_callback = parse_optional_function_property(&memory_options, "onWarning")
-            .map_err(franken_error_to_js)?;
+        #[cfg(feature = "diagnostics")]
+        {
+            parsed.warning_threshold_bytes =
+                parse_optional_usize_property(&memory_options, "warningThresholdBytes")
+                    .map_err(franken_error_to_js)?;
+            parsed.warning_threshold_percent =
+                parse_optional_percent_property(&memory_options, "warnAtPercent")
+                    .map_err(franken_error_to_js)?;
+            parsed.warning_callback =
+                parse_optional_function_property(&memory_options, "onWarning")
+                    .map_err(franken_error_to_js)?;
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        reject_diagnostics_memory_options(&memory_options).map_err(franken_error_to_js)?;
     }
 
+    #[cfg(feature = "diagnostics")]
     parsed
         .effective_warning_threshold_bytes()
         .map_err(franken_error_to_js)?;
@@ -1006,6 +1102,7 @@ fn parse_optional_usize_property(
     parse_js_usize(&value, key).map(Some)
 }
 
+#[cfg(feature = "diagnostics")]
 fn parse_optional_percent_property(
     object: &JsValue,
     key: &str,
@@ -1023,6 +1120,20 @@ fn parse_optional_percent_property(
     Ok(Some(percent))
 }
 
+#[cfg(not(feature = "diagnostics"))]
+fn reject_diagnostics_memory_options(object: &JsValue) -> Result<(), FrankenError> {
+    for key in ["warningThresholdBytes", "warnAtPercent", "onWarning"] {
+        if get_optional_property(object, key)?.is_some() {
+            return Err(FrankenError::TypeMismatch {
+                expected: format!("enable fsqlite-wasm diagnostics to use memory.{key}"),
+                actual: "diagnostics-only memory warning option".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "diagnostics")]
 fn parse_optional_function_property(
     object: &JsValue,
     key: &str,
@@ -1095,6 +1206,7 @@ fn wasm_pages_to_bytes(pages: usize, key: &str) -> Result<usize, FrankenError> {
         })
 }
 
+#[cfg(feature = "diagnostics")]
 fn threshold_bytes_from_percent(max_bytes: usize, percent: usize) -> Result<usize, FrankenError> {
     max_bytes
         .checked_mul(percent)
@@ -1105,10 +1217,12 @@ fn threshold_bytes_from_percent(max_bytes: usize, percent: usize) -> Result<usiz
         })
 }
 
+#[cfg(feature = "diagnostics")]
 fn exact_wasm_page_count(bytes: usize) -> Option<usize> {
     (bytes % WASM_LINEAR_MEMORY_PAGE_BYTES == 0).then_some(bytes / WASM_LINEAR_MEMORY_PAGE_BYTES)
 }
 
+#[cfg(feature = "diagnostics")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PageCachePressureAdvisory {
     level: &'static str,
@@ -1118,6 +1232,7 @@ struct PageCachePressureAdvisory {
     recommended_page_buffer_max_bytes: Option<usize>,
 }
 
+#[cfg(feature = "diagnostics")]
 fn page_cache_pressure_advisory(
     stats: ConnectionMemoryStats,
     warning_threshold_bytes: Option<usize>,
@@ -1170,6 +1285,7 @@ fn page_cache_pressure_advisory(
     }
 }
 
+#[cfg(feature = "diagnostics")]
 fn connection_memory_stats_to_js(
     conn: &CoreConnection,
     stats: ConnectionMemoryStats,
@@ -1474,7 +1590,7 @@ fn connection_memory_stats_to_js(
     Ok(object.into())
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(feature = "diagnostics", target_arch = "wasm32"))]
 fn wasm_linear_memory_bytes() -> Option<usize> {
     let memory = wasm_bindgen::memory()
         .dyn_into::<js_sys::WebAssembly::Memory>()
@@ -1483,7 +1599,7 @@ fn wasm_linear_memory_bytes() -> Option<usize> {
     usize::try_from(buffer.byte_length()).ok()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "diagnostics", not(target_arch = "wasm32")))]
 fn wasm_linear_memory_bytes() -> Option<usize> {
     None
 }
@@ -1491,6 +1607,7 @@ fn wasm_linear_memory_bytes() -> Option<usize> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    #[cfg(feature = "diagnostics")]
     use fsqlite_pager::PageCacheMetricsSnapshot;
     use std::sync::{Mutex, OnceLock};
 
@@ -1506,6 +1623,7 @@ mod tests {
         set_property(object, key, &JsValue::from_f64(value as f64)).unwrap();
     }
 
+    #[cfg(feature = "diagnostics")]
     fn js_object_property_usize(object: &Object, key: &str) -> Option<usize> {
         Reflect::get(object, &JsValue::from_str(key))
             .unwrap()
@@ -1513,6 +1631,7 @@ mod tests {
             .map(|value| value as usize)
     }
 
+    #[cfg(feature = "diagnostics")]
     fn js_object_property_string(object: &Object, key: &str) -> Option<String> {
         Reflect::get(object, &JsValue::from_str(key))
             .unwrap()
@@ -1591,9 +1710,7 @@ mod tests {
             initial_reserve_bytes: Some(64 * 1024),
             growth_chunk_bytes: Some(16 * 1024),
             max_bytes: Some(128 * 1024),
-            warning_threshold_bytes: Some(96 * 1024),
-            warning_threshold_percent: None,
-            warning_callback: None,
+            ..WasmDatabaseOptions::default()
         };
         let conn = open_core_connection_with_options(":memory:", &options)
             .expect("in-memory connection with explicit memory policy should open");
@@ -1611,6 +1728,7 @@ mod tests {
         assert_eq!(memory_vfs.file_reserved_bytes, 64 * 1024);
     }
 
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn parse_database_options_accepts_page_aliases_and_warn_at_percent() {
         let options = Object::new();
@@ -1640,6 +1758,23 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "diagnostics"))]
+    #[test]
+    fn parse_database_options_rejects_memory_warning_options_without_diagnostics() {
+        let options = Object::new();
+        let memory = Object::new();
+        set_js_number_property(&memory, "maxPages", 8);
+        set_js_number_property(&memory, "warnAtPercent", 75);
+        set_property(&options, "memory", &memory.into()).unwrap();
+
+        let error = parse_database_options(Some(options.into()))
+            .err()
+            .expect("default build should reject diagnostics-only memory warnings");
+        let message = js_error_message_field(&error);
+        assert!(message.contains("enable fsqlite-wasm diagnostics"));
+        assert!(message.contains("memory.warnAtPercent"));
+    }
+
     #[test]
     fn parse_database_options_rejects_conflicting_page_and_byte_aliases() {
         let options = Object::new();
@@ -1652,15 +1787,33 @@ mod tests {
         set_js_number_property(&memory, "initialPages", 2);
         set_property(&options, "memory", &memory.into()).unwrap();
 
-        let error = match parse_database_options(Some(options.into())) {
-            Ok(_) => panic!("conflicting aliases should fail"),
-            Err(error) => error,
-        };
+        let error = parse_database_options(Some(options.into()))
+            .err()
+            .expect("conflicting aliases should fail");
         let message = js_error_message_field(&error);
         assert!(message.contains("memory.initialReserveBytes"));
         assert!(message.contains("memory.initialPages"));
     }
 
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn describe_js_value_reports_rich_types_with_diagnostics() {
+        assert_eq!(describe_js_value(&Array::new().into()), "Array");
+        assert_eq!(
+            describe_js_value(&Uint8Array::new_with_length(0).into()),
+            "Uint8Array"
+        );
+    }
+
+    #[cfg(not(feature = "diagnostics"))]
+    #[test]
+    fn describe_js_value_uses_compact_default_types() {
+        assert_eq!(describe_js_value(&JsValue::NULL), "null");
+        assert_eq!(describe_js_value(&JsValue::UNDEFINED), "undefined");
+        assert_eq!(describe_js_value(&Array::new().into()), "object");
+    }
+
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn parse_database_options_requires_tracked_cap_for_warn_at_percent() {
         let options = Object::new();
@@ -1668,13 +1821,13 @@ mod tests {
         set_js_number_property(&memory, "warnAtPercent", 80);
         set_property(&options, "memory", &memory.into()).unwrap();
 
-        let error = match parse_database_options(Some(options.into())) {
-            Ok(_) => panic!("warnAtPercent without cap should fail"),
-            Err(error) => error,
-        };
+        let error = parse_database_options(Some(options.into()))
+            .err()
+            .expect("warnAtPercent without cap");
         assert!(js_error_message_field(&error).contains("memory.maxBytes or memory.maxPages"));
     }
 
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn connection_memory_stats_surface_page_aliases_and_warning_percent() {
         let _guard = host_connection_test_guard();
@@ -1731,6 +1884,31 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn memory_warning_transition_fires_on_upward_crossing_and_rearms_after_recovery() {
+        let (above, crossed) = memory_warning_transition(63, 64, false);
+        assert!(!above);
+        assert!(!crossed);
+
+        let (above, crossed) = memory_warning_transition(64, 64, false);
+        assert!(above);
+        assert!(crossed);
+
+        let (above, crossed) = memory_warning_transition(128, 64, true);
+        assert!(above);
+        assert!(!crossed);
+
+        let (above, crossed) = memory_warning_transition(32, 64, true);
+        assert!(!above);
+        assert!(!crossed);
+
+        let (above, crossed) = memory_warning_transition(65, 64, false);
+        assert!(above);
+        assert!(crossed);
+    }
+
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn page_cache_pressure_advisory_is_unbounded_without_budget() {
         let stats = ConnectionMemoryStats {
@@ -1761,6 +1939,7 @@ mod tests {
         assert_eq!(advisory.recommended_page_buffer_max_bytes, None);
     }
 
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn page_cache_pressure_advisory_recommends_lower_page_buffer_cap_under_budget() {
         let stats = ConnectionMemoryStats {
@@ -1803,6 +1982,7 @@ mod tests {
         assert_eq!(advisory.recommended_page_buffer_max_bytes, Some(196_608));
     }
 
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn page_cache_pressure_advisory_becomes_critical_at_tracked_cap() {
         let stats = ConnectionMemoryStats {
@@ -1878,6 +2058,7 @@ mod tests {
         let stmt = db
             .prepare("SELECT id AS user_id, name FROM wasm_batch ORDER BY id")
             .expect("select should prepare");
+        #[cfg(feature = "diagnostics")]
         assert_eq!(stmt.column_count(), 2);
         assert_eq!(stmt.execute().expect("select execute should count rows"), 2);
     }
@@ -2010,8 +2191,9 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    fn wasm_open_reports_default_memory_path_and_close_is_idempotent() {
+    fn wasm_open_and_close_is_idempotent() {
         let db = FrankenDb::open(None).expect("db should open via static constructor");
+        #[cfg(feature = "diagnostics")]
         assert_eq!(db.path(), ":memory:");
 
         db.close();
@@ -2021,6 +2203,47 @@ mod wasm_tests {
             .query("SELECT 1")
             .expect_err("queries after close should produce a JS error");
         assert!(error_message(&error).contains("closed"));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[wasm_bindgen_test]
+    fn wasm_memory_warning_callback_receives_stats_payload_once_while_above_threshold() {
+        use wasm_bindgen::closure::Closure;
+
+        let warning_count = Rc::new(Cell::new(0));
+        let callback_warning_count = Rc::clone(&warning_count);
+        let saw_exceeded_payload = Rc::new(Cell::new(false));
+        let callback_saw_exceeded_payload = Rc::clone(&saw_exceeded_payload);
+        let callback = Closure::<dyn FnMut(JsValue)>::wrap(Box::new(move |stats: JsValue| {
+            callback_warning_count.set(callback_warning_count.get() + 1);
+            let exceeded = Reflect::get(&stats, &JsValue::from_str("warningThresholdExceeded"))
+                .expect("warningThresholdExceeded field should exist")
+                .as_bool()
+                .expect("warningThresholdExceeded should be a bool");
+            let page_cache_bytes = Reflect::get(&stats, &JsValue::from_str("pageCacheBytes"))
+                .expect("pageCacheBytes field should exist")
+                .as_f64()
+                .expect("pageCacheBytes should be numeric");
+            assert!(page_cache_bytes.is_finite());
+            callback_saw_exceeded_payload.set(exceeded);
+        }));
+
+        let options = Object::new();
+        let memory = Object::new();
+        set_property(&memory, "initialPages", &JsValue::from_f64(1.0)).unwrap();
+        set_property(&memory, "maxPages", &JsValue::from_f64(8.0)).unwrap();
+        set_property(&memory, "warningThresholdBytes", &JsValue::from_f64(1.0)).unwrap();
+        set_property(&memory, "onWarning", callback.as_ref()).unwrap();
+        set_property(&options, "memory", &memory.into()).unwrap();
+
+        let db = FrankenDb::open_with_options(None, Some(options.into()))
+            .expect("diagnostic memory options should open");
+        assert_eq!(warning_count.get(), 1);
+        assert!(saw_exceeded_payload.get());
+
+        db.execute("CREATE TABLE wasm_memory_warning (id INTEGER PRIMARY KEY)")
+            .expect("table create should succeed");
+        assert_eq!(warning_count.get(), 1);
     }
 
     #[wasm_bindgen_test]
@@ -2083,6 +2306,7 @@ mod wasm_tests {
         );
 
         let imported = FrankenDb::import(exported).expect("import should succeed");
+        #[cfg(feature = "diagnostics")]
         assert_eq!(imported.path(), ":memory:");
 
         let rows = row_arrays(
@@ -2109,10 +2333,12 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     fn wasm_import_rejects_empty_database_image() {
         let error = FrankenDb::import(Uint8Array::new_with_length(0))
-            .expect_err("empty image should be rejected");
+            .err()
+            .expect("empty image should be rejected");
         assert!(error_message(&error).contains("empty"));
     }
 
+    #[cfg(feature = "diagnostics")]
     #[wasm_bindgen_test]
     fn parse_sql_export_reports_errors() {
         let result = parse_sql_js("NOT VALID SQL {{{{").expect("parse export should return");
@@ -2228,6 +2454,7 @@ mod wasm_tests {
         assert!(unsupported_message.contains("Object"));
     }
 
+    #[cfg(feature = "diagnostics")]
     #[wasm_bindgen_test]
     fn wasm_prepare_roundtrip_uses_core_column_names() {
         let db = FrankenDb::new(None).expect("db should open");
@@ -2241,6 +2468,10 @@ mod wasm_tests {
         let stmt = db
             .prepare("SELECT id AS user_id, name FROM wasm_prepared WHERE id = ?")
             .expect("statement should prepare");
+        assert_eq!(
+            stmt.sql(),
+            "SELECT id AS user_id, name FROM wasm_prepared WHERE id = ?"
+        );
         assert_eq!(stmt.column_count(), 2);
 
         let prepared_columns = stmt.column_names_js().unchecked_into::<Array>();
@@ -2290,7 +2521,7 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    fn wasm_prepare_supports_sql_query_execute_and_explain_without_params() {
+    fn wasm_prepare_supports_sql_query_execute_without_params() {
         let db = FrankenDb::new(None).expect("db should open");
         db.execute_batch(
             "CREATE TABLE wasm_stmt_surface (id INTEGER PRIMARY KEY, name TEXT);\
@@ -2303,10 +2534,6 @@ mod wasm_tests {
             .prepare("SELECT id, name FROM wasm_stmt_surface ORDER BY id")
             .expect("statement should prepare");
         assert_eq!(
-            stmt.sql(),
-            "SELECT id, name FROM wasm_stmt_surface ORDER BY id"
-        );
-        assert_eq!(
             stmt.execute()
                 .expect("execute should report visible row count"),
             2
@@ -2317,7 +2544,21 @@ mod wasm_tests {
         let first_row = rows.get(0).unchecked_into::<Array>();
         assert_eq!(first_row.get(0).as_f64(), Some(1.0));
         assert_eq!(first_row.get(1).as_string().as_deref(), Some("alpha"));
+    }
 
+    #[cfg(feature = "diagnostics")]
+    #[wasm_bindgen_test]
+    fn wasm_diagnostics_explain_methods_return_program_text() {
+        let db = FrankenDb::new(None).expect("db should open");
+        db.execute_batch(
+            "CREATE TABLE wasm_stmt_surface (id INTEGER PRIMARY KEY, name TEXT);\
+             INSERT INTO wasm_stmt_surface (id, name) VALUES (1, 'alpha');",
+        )
+        .expect("batch execution should succeed");
+
+        let stmt = db
+            .prepare("SELECT id, name FROM wasm_stmt_surface ORDER BY id")
+            .expect("statement should prepare");
         let stmt_explain = stmt.explain().expect("statement explain should succeed");
         assert!(
             !stmt_explain.trim().is_empty(),
@@ -2428,6 +2669,13 @@ mod wasm_tests {
         assert_eq!(column_types.get(0).as_string().as_deref(), Some("integer"));
         assert_eq!(column_types.get(1).as_string().as_deref(), Some("text"));
 
+        let changes = Reflect::get(&result, &JsValue::from_str("changes"))
+            .expect("changes property lookup should not throw");
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(changes.as_f64(), Some(0.0));
+        #[cfg(not(feature = "diagnostics"))]
+        assert!(changes.is_undefined());
+
         let rows = Reflect::get(&result, &JsValue::from_str("rows"))
             .expect("rows field should exist")
             .unchecked_into::<Array>();
@@ -2523,7 +2771,7 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    fn wasm_errors_include_sqlite_metadata() {
+    fn wasm_errors_include_core_sqlite_metadata() {
         let db = FrankenDb::new(None).expect("db should open");
         let error = db
             .execute("NOT VALID SQL {{{{")
@@ -2547,6 +2795,42 @@ mod wasm_tests {
             .expect("extendedCode should be numeric");
         assert_eq!(extended_code, 1.0);
 
+        let message = Reflect::get(&error, &JsValue::from_str("message"))
+            .expect("message field should exist")
+            .as_string()
+            .expect("message should be a string");
+        assert!(message.contains("syntax error"));
+    }
+
+    #[wasm_bindgen_test]
+    fn wasm_out_of_memory_errors_are_structured_for_js() {
+        let db = FrankenDb::new(None).expect("db should open");
+        let error = db
+            .with_connection(|_conn| Err::<(), FrankenError>(FrankenError::OutOfMemory))
+            .expect_err("out-of-memory should produce a JS error");
+
+        let message = Reflect::get(&error, &JsValue::from_str("message"))
+            .expect("message field should exist")
+            .as_string()
+            .expect("message should be a string");
+        assert!(message.contains("FrankenSQLite WASM ran out of memory"));
+        assert!(message.contains("4 GiB"));
+        assert_eq!(
+            Reflect::get(&error, &JsValue::from_str("oom"))
+                .expect("oom field should exist")
+                .as_bool(),
+            Some(true)
+        );
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[wasm_bindgen_test]
+    fn wasm_diagnostic_errors_include_recovery_metadata() {
+        let db = FrankenDb::new(None).expect("db should open");
+        let error = db
+            .execute("NOT VALID SQL {{{{")
+            .expect_err("invalid SQL should produce a JS error");
+
         let transient = Reflect::get(&error, &JsValue::from_str("transient"))
             .expect("transient field should exist")
             .as_bool()
@@ -2558,11 +2842,5 @@ mod wasm_tests {
             .as_bool()
             .expect("userRecoverable should be a bool");
         assert!(user_recoverable);
-
-        let message = Reflect::get(&error, &JsValue::from_str("message"))
-            .expect("message field should exist")
-            .as_string()
-            .expect("message should be a string");
-        assert!(message.contains("syntax error"));
     }
 }

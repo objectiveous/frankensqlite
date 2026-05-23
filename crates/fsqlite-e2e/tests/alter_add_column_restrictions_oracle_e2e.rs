@@ -25,8 +25,12 @@ fn alter_case(extra_setup: &[&str], alter: &str) -> Option<String> {
     let re = r.execute_batch(alter);
     match (&fe, &re) {
         (Ok(_), Ok(())) | (Err(_), Err(_)) => None,
-        (Ok(_), Err(e)) => Some(format!("FRANK_OK / CSQL_ERR: `{alter}`\n  csql: ERROR({e})")),
-        (Err(e), Ok(())) => Some(format!("FRANK_ERR / CSQL_OK: `{alter}`\n  frank: ERROR({e})")),
+        (Ok(_), Err(e)) => Some(format!(
+            "FRANK_OK / CSQL_ERR: `{alter}`\n  csql: ERROR({e})"
+        )),
+        (Err(e), Ok(())) => Some(format!(
+            "FRANK_ERR / CSQL_OK: `{alter}`\n  frank: ERROR({e})"
+        )),
     }
 }
 

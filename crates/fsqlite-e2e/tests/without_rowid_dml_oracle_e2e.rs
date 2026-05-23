@@ -132,8 +132,8 @@ fn without_rowid_secondary_index() {
             "INSERT INTO wr VALUES ('a',30),('b',10),('c',20),('d',10)",
         ],
         &[
-            "SELECT k FROM wr WHERE v = 10 ORDER BY k",      // b,d
-            "SELECT k FROM wr WHERE v > 15 ORDER BY v, k",   // c(20),a(30)
+            "SELECT k FROM wr WHERE v = 10 ORDER BY k",    // b,d
+            "SELECT k FROM wr WHERE v > 15 ORDER BY v, k", // c(20),a(30)
             "SELECT k, v FROM wr ORDER BY v, k",
         ],
         "without_rowid_secondary_index",
@@ -147,7 +147,7 @@ fn without_rowid_pk_conflict_and_replace() {
         &[
             "CREATE TABLE wr (k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
             "INSERT INTO wr VALUES ('apple',1),('banana',2)",
-            "INSERT INTO wr VALUES ('apple',99)",            // duplicate PK -> error both
+            "INSERT INTO wr VALUES ('apple',99)", // duplicate PK -> error both
             "INSERT OR REPLACE INTO wr VALUES ('apple',99)", // replaces apple
         ],
         &["SELECT k, v FROM wr ORDER BY k"], // (apple,99),(banana,2)

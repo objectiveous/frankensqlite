@@ -71,7 +71,8 @@ fn returning_case(setup: &[&str], mutation: &str, state_query: &str, label: &str
     let f = Connection::open(":memory:").expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in setup {
-        f.execute(s).unwrap_or_else(|e| panic!("{label} frank `{s}`: {e}"));
+        f.execute(s)
+            .unwrap_or_else(|e| panic!("{label} frank `{s}`: {e}"));
         r.execute_batch(s)
             .unwrap_or_else(|e| panic!("{label} rusqlite `{s}`: {e}"));
     }
@@ -86,7 +87,11 @@ fn returning_case(setup: &[&str], mutation: &str, state_query: &str, label: &str
     // Also confirm the resulting table state matches.
     let fs = frank_returning_sorted(&f, state_query);
     let rs = sqlite_returning_sorted(&r, state_query);
-    assert_eq!(fs.ok(), rs.ok(), "{label}: post-mutation state differs `{state_query}`");
+    assert_eq!(
+        fs.ok(),
+        rs.ok(),
+        "{label}: post-mutation state differs `{state_query}`"
+    );
 }
 
 const T: [&str; 2] = [

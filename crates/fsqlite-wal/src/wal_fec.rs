@@ -4134,21 +4134,15 @@ mod tests {
             WalFecRepairSeverityBucket::One
         );
         assert_eq!(
-            "two-to-five"
-                .parse::<WalFecRepairSeverityBucket>()
-                .unwrap(),
+            "two-to-five".parse::<WalFecRepairSeverityBucket>().unwrap(),
             WalFecRepairSeverityBucket::TwoToFive
         );
         assert_eq!(
-            "six_to_ten"
-                .parse::<WalFecRepairSeverityBucket>()
-                .unwrap(),
+            "six_to_ten".parse::<WalFecRepairSeverityBucket>().unwrap(),
             WalFecRepairSeverityBucket::SixToTen
         );
         assert_eq!(
-            "eleven_plus"
-                .parse::<WalFecRepairSeverityBucket>()
-                .unwrap(),
+            "eleven_plus".parse::<WalFecRepairSeverityBucket>().unwrap(),
             WalFecRepairSeverityBucket::ElevenPlus
         );
         assert!("unknown".parse::<WalFecRepairSeverityBucket>().is_err());
@@ -4204,7 +4198,11 @@ mod tests {
         assert_eq!(card.chain_hash_hex().len(), 64);
         assert!(card.chain_hash_hex().chars().all(|c| c == 'f'));
         assert_eq!(card.corruption_signature_hex().len(), 64);
-        assert!(card.corruption_signature_hex().chars().all(|c| c == 'a' || c == 'b'));
+        assert!(
+            card.corruption_signature_hex()
+                .chars()
+                .all(|c| c == 'a' || c == 'b')
+        );
     }
 
     #[test]
@@ -4305,18 +4303,12 @@ mod tests {
                 WalFecRecoveryFallbackReason::SidecarUnreadable,
                 "sidecar_unreadable",
             ),
-            (
-                WalFecRecoveryFallbackReason::SaltMismatch,
-                "salt_mismatch",
-            ),
+            (WalFecRecoveryFallbackReason::SaltMismatch, "salt_mismatch"),
             (
                 WalFecRecoveryFallbackReason::InsufficientSymbols,
                 "insufficient_symbols",
             ),
-            (
-                WalFecRecoveryFallbackReason::DecodeFailed,
-                "decode_failed",
-            ),
+            (WalFecRecoveryFallbackReason::DecodeFailed, "decode_failed"),
             (
                 WalFecRecoveryFallbackReason::DecodedPayloadMismatch,
                 "decoded_payload_mismatch",
@@ -4377,8 +4369,16 @@ mod tests {
     #[test]
     fn wal_fec_group_id_display_hash_eq() {
         use std::collections::HashSet;
-        let a = WalFecGroupId { wal_salt1: 1, wal_salt2: 2, end_frame_no: 10 };
-        let b = WalFecGroupId { wal_salt1: 1, wal_salt2: 2, end_frame_no: 11 };
+        let a = WalFecGroupId {
+            wal_salt1: 1,
+            wal_salt2: 2,
+            end_frame_no: 10,
+        };
+        let b = WalFecGroupId {
+            wal_salt1: 1,
+            wal_salt2: 2,
+            end_frame_no: 11,
+        };
         assert_ne!(a, b);
         let copied = a;
         assert_eq!(copied, a);
@@ -4393,13 +4393,28 @@ mod tests {
     #[test]
     fn wal_fec_recovery_fallback_reason_all_variants() {
         let variants = [
-            (WalFecRecoveryFallbackReason::MissingSidecarGroup, "missing_sidecar_group"),
-            (WalFecRecoveryFallbackReason::SidecarUnreadable, "sidecar_unreadable"),
+            (
+                WalFecRecoveryFallbackReason::MissingSidecarGroup,
+                "missing_sidecar_group",
+            ),
+            (
+                WalFecRecoveryFallbackReason::SidecarUnreadable,
+                "sidecar_unreadable",
+            ),
             (WalFecRecoveryFallbackReason::SaltMismatch, "salt_mismatch"),
-            (WalFecRecoveryFallbackReason::InsufficientSymbols, "insufficient_symbols"),
+            (
+                WalFecRecoveryFallbackReason::InsufficientSymbols,
+                "insufficient_symbols",
+            ),
             (WalFecRecoveryFallbackReason::DecodeFailed, "decode_failed"),
-            (WalFecRecoveryFallbackReason::DecodedPayloadMismatch, "decoded_payload_mismatch"),
-            (WalFecRecoveryFallbackReason::RecoveryDisabled, "recovery_disabled"),
+            (
+                WalFecRecoveryFallbackReason::DecodedPayloadMismatch,
+                "decoded_payload_mismatch",
+            ),
+            (
+                WalFecRecoveryFallbackReason::RecoveryDisabled,
+                "recovery_disabled",
+            ),
         ];
         for (v, code) in &variants {
             assert_eq!(v.reason_code(), *code);
@@ -4416,8 +4431,14 @@ mod tests {
         assert_eq!(WalFecRepairSeverityBucket::TwoToFive.as_str(), "2-5");
         assert_eq!(WalFecRepairSeverityBucket::SixToTen.as_str(), "6-10");
         assert_eq!(WalFecRepairSeverityBucket::ElevenPlus.as_str(), "11+");
-        assert_eq!("1".parse::<WalFecRepairSeverityBucket>().unwrap(), WalFecRepairSeverityBucket::One);
-        assert_eq!("two-to-five".parse::<WalFecRepairSeverityBucket>().unwrap(), WalFecRepairSeverityBucket::TwoToFive);
+        assert_eq!(
+            "1".parse::<WalFecRepairSeverityBucket>().unwrap(),
+            WalFecRepairSeverityBucket::One
+        );
+        assert_eq!(
+            "two-to-five".parse::<WalFecRepairSeverityBucket>().unwrap(),
+            WalFecRepairSeverityBucket::TwoToFive
+        );
         assert!("invalid".parse::<WalFecRepairSeverityBucket>().is_err());
     }
 
@@ -4464,7 +4485,10 @@ mod tests {
 
     #[test]
     fn wal_frame_candidate_clone_eq_debug() {
-        let c = WalFrameCandidate { frame_no: 7, page_data: vec![0xAB; 16] };
+        let c = WalFrameCandidate {
+            frame_no: 7,
+            page_data: vec![0xAB; 16],
+        };
         let cloned = c.clone();
         assert_eq!(cloned, c);
         assert_eq!(c.frame_no, 7);

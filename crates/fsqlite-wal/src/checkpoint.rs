@@ -612,7 +612,10 @@ mod tests {
         assert_ne!(CheckpointProgress::Partial, CheckpointProgress::Complete);
         assert_eq!(CheckpointProgress::Partial, CheckpointProgress::Partial);
         assert_ne!(CheckpointPostAction::None, CheckpointPostAction::ResetWal);
-        assert_ne!(CheckpointPostAction::ResetWal, CheckpointPostAction::TruncateWal);
+        assert_ne!(
+            CheckpointPostAction::ResetWal,
+            CheckpointPostAction::TruncateWal
+        );
         let dbg_prog = format!("{:?}", CheckpointProgress::Complete);
         assert!(dbg_prog.contains("Complete"));
         let dbg_act = format!("{:?}", CheckpointPostAction::TruncateWal);

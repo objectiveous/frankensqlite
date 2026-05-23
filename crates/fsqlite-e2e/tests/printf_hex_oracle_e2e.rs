@@ -114,8 +114,8 @@ fn printf_hex_negative_two_complement() {
         &[
             // SQLite renders negative integers as a full 64-bit two's-complement
             // hex string.
-            "SELECT printf('%x', -1)", // 'ffffffffffffffff'
-            "SELECT printf('%X', -1)", // 'FFFFFFFFFFFFFFFF'
+            "SELECT printf('%x', -1)",   // 'ffffffffffffffff'
+            "SELECT printf('%X', -1)",   // 'FFFFFFFFFFFFFFFF'
             "SELECT printf('%x', -256)", // 'ffffffffffffff00'
         ],
         "printf_hex_negative_two_complement",

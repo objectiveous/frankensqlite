@@ -289,7 +289,10 @@ mod tests {
                 GLOBAL_CONSOLIDATION_METRICS.hist_phase_b.record(1);
             }
             let after_decay = GLOBAL_CONSOLIDATION_METRICS.hist_phase_b.recent_tail_us();
-            assert!(after_decay < after_spike, "tail should decay toward small values");
+            assert!(
+                after_decay < after_spike,
+                "tail should decay toward small values"
+            );
         });
     }
 
@@ -307,7 +310,14 @@ mod tests {
     #[test]
     fn phase_percentiles_derive_debug_clone_copy_default() {
         use crate::group_commit::PhasePercentiles;
-        let p = PhasePercentiles { p50: 1, p95: 2, p99: 3, max: 4, count: 5, mean_us: 6 };
+        let p = PhasePercentiles {
+            p50: 1,
+            p95: 2,
+            p99: 3,
+            max: 4,
+            count: 5,
+            mean_us: 6,
+        };
         let dbg = format!("{p:?}");
         assert!(dbg.contains("PhasePercentiles"));
         let cloned = p;
@@ -319,7 +329,13 @@ mod tests {
     #[test]
     fn wake_reason_snapshot_derive_debug_clone_serialize() {
         use crate::group_commit::WakeReasonSnapshot;
-        let w = WakeReasonSnapshot { notify: 1, timeout: 2, flusher_takeover: 3, failed_epoch: 4, busy_retry: 5 };
+        let w = WakeReasonSnapshot {
+            notify: 1,
+            timeout: 2,
+            flusher_takeover: 3,
+            failed_epoch: 4,
+            busy_retry: 5,
+        };
         let dbg = format!("{w:?}");
         assert!(dbg.contains("WakeReasonSnapshot"));
         let json = serde_json::to_string(&w).expect("serialize");

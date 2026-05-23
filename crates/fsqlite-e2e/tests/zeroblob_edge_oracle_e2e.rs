@@ -84,9 +84,9 @@ fn assert_scalar(queries: &[&str], label: &str) {
 fn zeroblob_zero_size() {
     assert_scalar(
         &[
-            "SELECT length(zeroblob(0))",   // 0
-            "SELECT typeof(zeroblob(0))",   // blob
-            "SELECT zeroblob(0) = X''",     // 1 (empty blob == empty literal)
+            "SELECT length(zeroblob(0))", // 0
+            "SELECT typeof(zeroblob(0))", // blob
+            "SELECT zeroblob(0) = X''",   // 1 (empty blob == empty literal)
         ],
         "zeroblob_zero_size",
     );

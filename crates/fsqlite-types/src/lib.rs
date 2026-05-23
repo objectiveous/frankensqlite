@@ -1,4 +1,7 @@
-#![feature(portable_simd)]
+#![cfg_attr(
+    all(target_arch = "x86_64", not(target_arch = "wasm32")),
+    feature(portable_simd)
+)]
 
 pub mod cx;
 pub mod ecs;

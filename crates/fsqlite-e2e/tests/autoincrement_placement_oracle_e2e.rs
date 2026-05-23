@@ -51,9 +51,9 @@ fn autoincrement_without_primary_key_rejected() {
     // AUTOINCREMENT with no PRIMARY KEY is a (parse-level) error on both engines.
     check_ddl(
         &[
-            "CREATE TABLE t (a TEXT AUTOINCREMENT)",    // not INTEGER, no PK
+            "CREATE TABLE t (a TEXT AUTOINCREMENT)", // not INTEGER, no PK
             "CREATE TABLE t (a INTEGER AUTOINCREMENT)", // INTEGER but no PRIMARY KEY
-            "CREATE TABLE t (a AUTOINCREMENT)",         // no type, no PK
+            "CREATE TABLE t (a AUTOINCREMENT)",      // no type, no PK
         ],
         "autoincrement_without_primary_key_rejected",
     );

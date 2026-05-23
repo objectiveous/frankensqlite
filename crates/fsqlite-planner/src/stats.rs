@@ -545,8 +545,14 @@ mod tests {
             count: 5,
             ndv: 3,
         };
-        assert!(int_bucket.contains(&SqliteValue::Integer(10)), "lower bound is inclusive");
-        assert!(int_bucket.contains(&SqliteValue::Integer(20)), "upper bound is inclusive");
+        assert!(
+            int_bucket.contains(&SqliteValue::Integer(10)),
+            "lower bound is inclusive"
+        );
+        assert!(
+            int_bucket.contains(&SqliteValue::Integer(20)),
+            "upper bound is inclusive"
+        );
         assert!(int_bucket.contains(&SqliteValue::Integer(15)));
         assert!(!int_bucket.contains(&SqliteValue::Integer(9)));
         assert!(!int_bucket.contains(&SqliteValue::Integer(21)));
@@ -610,34 +616,67 @@ mod tests {
         let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
 
         // Integer: linear position, clamped to [0,1] for values outside [min,max].
-        assert!(approx(interpolate_position(&Integer(0), &Integer(100), &Integer(50)), 0.5));
-        assert!(approx(interpolate_position(&Integer(0), &Integer(100), &Integer(0)), 0.0));
-        assert!(approx(interpolate_position(&Integer(0), &Integer(100), &Integer(100)), 1.0));
+        assert!(approx(
+            interpolate_position(&Integer(0), &Integer(100), &Integer(50)),
+            0.5
+        ));
+        assert!(approx(
+            interpolate_position(&Integer(0), &Integer(100), &Integer(0)),
+            0.0
+        ));
+        assert!(approx(
+            interpolate_position(&Integer(0), &Integer(100), &Integer(100)),
+            1.0
+        ));
         assert!(
-            approx(interpolate_position(&Integer(0), &Integer(100), &Integer(-50)), 0.0),
+            approx(
+                interpolate_position(&Integer(0), &Integer(100), &Integer(-50)),
+                0.0
+            ),
             "below min clamps to 0"
         );
         assert!(
-            approx(interpolate_position(&Integer(0), &Integer(100), &Integer(200)), 1.0),
+            approx(
+                interpolate_position(&Integer(0), &Integer(100), &Integer(200)),
+                1.0
+            ),
             "above max clamps to 1"
         );
         // Degenerate range (max <= min) carries no information -> 0.5.
-        assert!(approx(interpolate_position(&Integer(50), &Integer(50), &Integer(50)), 0.5));
-        assert!(approx(interpolate_position(&Integer(100), &Integer(0), &Integer(50)), 0.5));
+        assert!(approx(
+            interpolate_position(&Integer(50), &Integer(50), &Integer(50)),
+            0.5
+        ));
+        assert!(approx(
+            interpolate_position(&Integer(100), &Integer(0), &Integer(50)),
+            0.5
+        ));
 
         // Float: same linear behavior; any NaN endpoint/value returns 0.5.
-        assert!(approx(interpolate_position(&Float(0.0), &Float(10.0), &Float(2.5)), 0.25));
+        assert!(approx(
+            interpolate_position(&Float(0.0), &Float(10.0), &Float(2.5)),
+            0.25
+        ));
         assert!(
-            approx(interpolate_position(&Float(0.0), &Float(10.0), &Float(f64::NAN)), 0.5),
+            approx(
+                interpolate_position(&Float(0.0), &Float(10.0), &Float(f64::NAN)),
+                0.5
+            ),
             "NaN value -> 0.5"
         );
         assert!(
-            approx(interpolate_position(&Float(f64::NAN), &Float(10.0), &Float(5.0)), 0.5),
+            approx(
+                interpolate_position(&Float(f64::NAN), &Float(10.0), &Float(5.0)),
+                0.5
+            ),
             "NaN min -> 0.5"
         );
 
         // Mixed / uncomparable types fall through to the 0.5 default.
-        assert!(approx(interpolate_position(&Integer(0), &Float(10.0), &Integer(5)), 0.5));
+        assert!(approx(
+            interpolate_position(&Integer(0), &Float(10.0), &Integer(5)),
+            0.5
+        ));
     }
 
     #[test]
@@ -662,13 +701,22 @@ mod tests {
 
         // Blob: same base-256 interpolation, but the bytes can be arbitrary.
         let b = |bytes: &[u8]| SqliteValue::from(bytes);
-        assert!(approx(interpolate_position(&b(&[0x00]), &b(&[0x80]), &b(&[0x40])), 0.5));
+        assert!(approx(
+            interpolate_position(&b(&[0x00]), &b(&[0x80]), &b(&[0x40])),
+            0.5
+        ));
         // A reversed blob range -> 0.5.
-        assert!(approx(interpolate_position(&b(&[0x80]), &b(&[0x00]), &b(&[0x40])), 0.5));
+        assert!(approx(
+            interpolate_position(&b(&[0x80]), &b(&[0x00]), &b(&[0x40])),
+            0.5
+        ));
         // Distinct blobs (max > min lexically) whose 8-byte base-256 encodings
         // collide because trailing zero bytes are ignored hit the inner
         // zero-range guard -> 0.5.
-        assert!(approx(interpolate_position(&b(&[0x01]), &b(&[0x01, 0x00]), &b(&[0x01])), 0.5));
+        assert!(approx(
+            interpolate_position(&b(&[0x01]), &b(&[0x01, 0x00]), &b(&[0x01])),
+            0.5
+        ));
     }
 
     #[test]
@@ -723,8 +771,14 @@ mod tests {
         for n in [-100_i64, 0, 50, 99, 100, 150, 199, 10_000] {
             let lt = hist.estimate_less_than_rows(&iv(n));
             let gt = hist.estimate_greater_than_rows(&iv(n));
-            assert!((0.0..=total).contains(&lt), "less_than({n})={lt} out of [0,{total}]");
-            assert!((0.0..=total).contains(&gt), "greater_than({n})={gt} out of [0,{total}]");
+            assert!(
+                (0.0..=total).contains(&lt),
+                "less_than({n})={lt} out of [0,{total}]"
+            );
+            assert!(
+                (0.0..=total).contains(&gt),
+                "greater_than({n})={gt} out of [0,{total}]"
+            );
         }
     }
 
@@ -787,7 +841,10 @@ mod tests {
 
         // NULLs shrink the non-NULL base: equality selectivity drops and Eq+Ne
         // sums to the non-NULL fraction rather than 1.0.
-        let with_nulls = ColumnStats { null_count: 200, ..base.clone() };
+        let with_nulls = ColumnStats {
+            null_count: 200,
+            ..base.clone()
+        };
         let eq_n = sel(&with_nulls, Operator::Eq);
         let ne_n = sel(&with_nulls, Operator::Ne);
         assert!(
@@ -802,8 +859,15 @@ mod tests {
 
         // Edge cases: empty table and an all-NULL column yield zero selectivity
         // for every operator. Every estimate stays a valid probability in [0,1].
-        let empty = ColumnStats { table_row_count: 0, ..base.clone() };
-        let all_null = ColumnStats { table_row_count: 500, null_count: 500, ..base.clone() };
+        let empty = ColumnStats {
+            table_row_count: 0,
+            ..base.clone()
+        };
+        let all_null = ColumnStats {
+            table_row_count: 500,
+            null_count: 500,
+            ..base.clone()
+        };
         for op in [
             Operator::Eq,
             Operator::Ne,
@@ -812,8 +876,14 @@ mod tests {
             Operator::Gt,
             Operator::Ge,
         ] {
-            assert!(sel(&empty, op).abs() < f64::EPSILON, "empty table -> 0 selectivity");
-            assert!(sel(&all_null, op).abs() < f64::EPSILON, "all-NULL -> 0 selectivity");
+            assert!(
+                sel(&empty, op).abs() < f64::EPSILON,
+                "empty table -> 0 selectivity"
+            );
+            assert!(
+                sel(&all_null, op).abs() < f64::EPSILON,
+                "all-NULL -> 0 selectivity"
+            );
             for stats in [&base, &with_nulls] {
                 let s = sel(stats, op);
                 assert!((0.0..=1.0).contains(&s), "selectivity {s} out of [0,1]");
@@ -960,7 +1030,9 @@ mod tests {
         // Complete the operator coverage: the aliases collapse to their primary
         // operator's selectivity, and all four range operators agree.
         let eps = 1e-9;
-        assert!((default_selectivity(Operator::Is) - default_selectivity(Operator::Eq)).abs() < eps);
+        assert!(
+            (default_selectivity(Operator::Is) - default_selectivity(Operator::Eq)).abs() < eps
+        );
         assert!(
             (default_selectivity(Operator::IsNot) - default_selectivity(Operator::Ne)).abs() < eps
         );

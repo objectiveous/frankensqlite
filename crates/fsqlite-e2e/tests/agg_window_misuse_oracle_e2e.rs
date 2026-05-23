@@ -105,9 +105,9 @@ fn aggregate_in_where_is_rejected() {
         &f,
         &r,
         &[
-            "SELECT * FROM t WHERE sum(x) > 5",   // misuse of aggregate -> error both
+            "SELECT * FROM t WHERE sum(x) > 5", // misuse of aggregate -> error both
             "SELECT * FROM t WHERE count(*) > 1", // error both
-            "SELECT * FROM t WHERE max(x) = x",   // error both
+            "SELECT * FROM t WHERE max(x) = x", // error both
         ],
         "aggregate_in_where_is_rejected",
     );
@@ -122,7 +122,7 @@ fn nested_aggregate_is_rejected() {
         &f,
         &r,
         &[
-            "SELECT sum(count(*)) FROM t",       // nested aggregate -> error both
+            "SELECT sum(count(*)) FROM t", // nested aggregate -> error both
             "SELECT max(avg(x)) FROM t GROUP BY g", // error both
         ],
         "nested_aggregate_is_rejected",

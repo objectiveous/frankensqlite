@@ -99,12 +99,12 @@ fn random_returns_integer_in_i64_range() {
 fn randomblob_type_and_length() {
     assert_scalar(
         &[
-            "SELECT typeof(randomblob(16))", // blob
-            "SELECT length(randomblob(0))",  // 0 -> empty blob
-            "SELECT length(randomblob(1))",  // 1
-            "SELECT length(randomblob(16))", // 16
+            "SELECT typeof(randomblob(16))",  // blob
+            "SELECT length(randomblob(0))",   // 0 -> empty blob
+            "SELECT length(randomblob(1))",   // 1
+            "SELECT length(randomblob(16))",  // 16
             "SELECT length(randomblob(256))", // 256
-            "SELECT randomblob(0) = X''",    // 1 (empty matches empty)
+            "SELECT randomblob(0) = X''",     // 1 (empty matches empty)
         ],
         "randomblob_type_and_length",
     );

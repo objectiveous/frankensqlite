@@ -180,9 +180,9 @@ fn insert_column_count_mismatch_errors() {
     scenario(
         &[
             "CREATE TABLE t (a INTEGER, b INTEGER)",
-            "INSERT INTO t VALUES (1)",            // too few -> error on both
+            "INSERT INTO t VALUES (1)", // too few -> error on both
             "INSERT INTO t (a, b) VALUES (1,2,3)", // too many -> error on both
-            "INSERT INTO t VALUES (1, 2)",         // ok
+            "INSERT INTO t VALUES (1, 2)", // ok
         ],
         &["SELECT a, b FROM t ORDER BY rowid"], // only the valid row
         "insert_column_count_mismatch_errors",

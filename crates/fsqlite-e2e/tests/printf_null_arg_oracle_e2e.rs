@@ -86,11 +86,11 @@ fn assert_scalar(queries: &[&str], label: &str) {
 fn printf_null_value_argument() {
     assert_scalar(
         &[
-            "SELECT printf('%s', NULL)",            // SQLite: 'NULL'
-            "SELECT printf('%d', NULL)",            // 0
-            "SELECT printf('%s %s', 'a', NULL)",    // 'a NULL'
-            "SELECT printf('[%s]', NULL)",          // '[NULL]'
-            "SELECT printf('%s', '')",              // '' (empty arg)
+            "SELECT printf('%s', NULL)",         // SQLite: 'NULL'
+            "SELECT printf('%d', NULL)",         // 0
+            "SELECT printf('%s %s', 'a', NULL)", // 'a NULL'
+            "SELECT printf('[%s]', NULL)",       // '[NULL]'
+            "SELECT printf('%s', '')",           // '' (empty arg)
         ],
         "printf_null_value_argument",
     );
@@ -99,10 +99,7 @@ fn printf_null_value_argument() {
 #[test]
 fn printf_null_format_is_null() {
     // NULL format string -> NULL on both engines.
-    assert_scalar(
-        &["SELECT printf(NULL, 'x')"],
-        "printf_null_format_is_null",
-    );
+    assert_scalar(&["SELECT printf(NULL, 'x')"], "printf_null_format_is_null");
 }
 
 #[test]

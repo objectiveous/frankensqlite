@@ -87,8 +87,8 @@ fn values_consistent_arity_ok() {
     assert_scalar(
         &[
             "SELECT * FROM (VALUES (1,2),(3,4),(5,6)) ORDER BY 1", // (1,2),(3,4),(5,6)
-            "SELECT * FROM (VALUES ('a',1),('b',2)) ORDER BY 1",  // (a,1),(b,2)
-            "SELECT * FROM (VALUES (1)) ",                        // single 1-col row
+            "SELECT * FROM (VALUES ('a',1),('b',2)) ORDER BY 1",   // (a,1),(b,2)
+            "SELECT * FROM (VALUES (1)) ",                         // single 1-col row
         ],
         "values_consistent_arity_ok",
     );

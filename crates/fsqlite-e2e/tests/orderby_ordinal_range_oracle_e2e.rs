@@ -102,9 +102,9 @@ fn ordinal_in_range_sorts_and_groups() {
         &f,
         &r,
         &[
-            "SELECT a, b FROM t ORDER BY 1",       // by a: (1,2),(2,3),(3,1)
-            "SELECT a, b FROM t ORDER BY 2",       // by b: (3,1),(1,2),(2,3)
-            "SELECT a, b FROM t ORDER BY 2, 1",    // by b then a
+            "SELECT a, b FROM t ORDER BY 1",         // by a: (1,2),(2,3),(3,1)
+            "SELECT a, b FROM t ORDER BY 2",         // by b: (3,1),(1,2),(2,3)
+            "SELECT a, b FROM t ORDER BY 2, 1",      // by b then a
             "SELECT b FROM t GROUP BY 1 ORDER BY 1", // group by output col 1 (b): 1,2,3
         ],
         "ordinal_in_range_sorts_and_groups",

@@ -30,8 +30,15 @@ fn render_frank(v: &SqliteValue) -> String {
 
 /// Evaluate a single-row query and render its columns.
 fn row(conn: &Connection, sql: &str) -> Vec<String> {
-    let rows = conn.query(sql).unwrap_or_else(|e| panic!("frank `{sql}`: {e}"));
-    assert_eq!(rows.len(), 1, "`{sql}` expected exactly one row, got {}", rows.len());
+    let rows = conn
+        .query(sql)
+        .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"));
+    assert_eq!(
+        rows.len(),
+        1,
+        "`{sql}` expected exactly one row, got {}",
+        rows.len()
+    );
     rows[0].values().iter().map(render_frank).collect()
 }
 
@@ -58,10 +65,19 @@ fn check(pairs: &[(&str, &[&str])], label: &str) {
 fn math_floor_ceil_trunc() {
     check(
         &[
-            ("SELECT ceil(2.1), ceil(2.9), ceil(-2.1), ceil(3.0)", &["3", "3", "-2", "3"]),
+            (
+                "SELECT ceil(2.1), ceil(2.9), ceil(-2.1), ceil(3.0)",
+                &["3", "3", "-2", "3"],
+            ),
             ("SELECT ceiling(4.2)", &["5"]),
-            ("SELECT floor(2.1), floor(2.9), floor(-2.1)", &["2", "2", "-3"]),
-            ("SELECT trunc(2.9), trunc(-2.9), trunc(2.1)", &["2", "-2", "2"]),
+            (
+                "SELECT floor(2.1), floor(2.9), floor(-2.1)",
+                &["2", "2", "-3"],
+            ),
+            (
+                "SELECT trunc(2.9), trunc(-2.9), trunc(2.1)",
+                &["2", "-2", "2"],
+            ),
             // SQLite returns REAL for these.
             (
                 "SELECT typeof(ceil(2.5)), typeof(floor(2.5)), typeof(trunc(2.5))",
@@ -81,7 +97,10 @@ fn math_sqrt_pow_exp_exact() {
             ("SELECT pow(2.0, 0.0), pow(5.0, 1.0)", &["1", "5"]),
             ("SELECT exp(0.0)", &["1"]),
             ("SELECT ln(1.0)", &["0"]),
-            ("SELECT typeof(sqrt(16.0)), typeof(pow(2.0,3.0))", &["'real'", "'real'"]),
+            (
+                "SELECT typeof(sqrt(16.0)), typeof(pow(2.0,3.0))",
+                &["'real'", "'real'"],
+            ),
         ],
         "math_sqrt_pow_exp_exact",
     );
@@ -149,7 +168,10 @@ fn math_domain_errors_yield_null() {
 fn math_null_argument_propagates() {
     check(
         &[
-            ("SELECT sqrt(NULL), ceil(NULL), floor(NULL), exp(NULL)", &["NULL", "NULL", "NULL", "NULL"]),
+            (
+                "SELECT sqrt(NULL), ceil(NULL), floor(NULL), exp(NULL)",
+                &["NULL", "NULL", "NULL", "NULL"],
+            ),
             ("SELECT pow(NULL, 2.0), pow(2.0, NULL)", &["NULL", "NULL"]),
             ("SELECT mod(NULL, 3.0), mod(10.0, NULL)", &["NULL", "NULL"]),
             ("SELECT typeof(sqrt(NULL))", &["'null'"]),

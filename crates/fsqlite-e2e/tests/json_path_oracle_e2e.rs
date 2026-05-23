@@ -126,8 +126,8 @@ fn jsonpath_quoted_key() {
 fn jsonpath_whole_document() {
     assert_scalar(
         &[
-            "SELECT json_extract('{\"a\":1}', '$')",   // '{"a":1}'
-            "SELECT json_extract('[1,2,3]', '$')",     // '[1,2,3]'
+            "SELECT json_extract('{\"a\":1}', '$')",         // '{"a":1}'
+            "SELECT json_extract('[1,2,3]', '$')",           // '[1,2,3]'
             "SELECT typeof(json_extract('{\"a\":1}', '$'))", // text
         ],
         "jsonpath_whole_document",
@@ -150,9 +150,9 @@ fn jsonpath_multiple_paths_returns_array() {
 fn jsonpath_array_length_with_path() {
     assert_scalar(
         &[
-            "SELECT json_array_length('{\"a\":[1,2,3,4,5]}', '$.a')",     // 5
+            "SELECT json_array_length('{\"a\":[1,2,3,4,5]}', '$.a')", // 5
             "SELECT json_array_length('{\"a\":{\"b\":[1,2]}}', '$.a.b')", // 2
-            "SELECT json_array_length('{\"a\":5}', '$.a')",               // 0 (not an array)
+            "SELECT json_array_length('{\"a\":5}', '$.a')",           // 0 (not an array)
         ],
         "jsonpath_array_length_with_path",
     );
@@ -162,8 +162,8 @@ fn jsonpath_array_length_with_path() {
 fn jsonpath_set_remove_array_index() {
     assert_scalar(
         &[
-            "SELECT json_set('[1,2,3]', '$[1]', 99)",     // '[1,99,3]'
-            "SELECT json_remove('[1,2,3]', '$[0]')",      // '[2,3]'
+            "SELECT json_set('[1,2,3]', '$[1]', 99)", // '[1,99,3]'
+            "SELECT json_remove('[1,2,3]', '$[0]')",  // '[2,3]'
             "SELECT json_remove('{\"a\":1,\"b\":2}', '$.a')", // '{"b":2}'
         ],
         "jsonpath_set_remove_array_index",

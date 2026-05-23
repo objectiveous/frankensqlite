@@ -44,7 +44,7 @@ fn valid_table_definitions_ok() {
         &[
             "CREATE TABLE t (a, b)",
             "CREATE TABLE t (a, b, c)",
-            "CREATE TABLE t (a PRIMARY KEY, b)",         // single column-level PK
+            "CREATE TABLE t (a PRIMARY KEY, b)", // single column-level PK
             "CREATE TABLE t (a, b, PRIMARY KEY (a, b))", // composite table-level PK
         ],
         "valid_table_definitions_ok",

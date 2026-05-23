@@ -170,9 +170,7 @@ fn case_multibranch_affinity() {
     check(
         &f,
         &r,
-        &[
-            "SELECT id, CASE n WHEN '5' THEN 'a' WHEN '10' THEN 'b' ELSE 'c' END FROM t ORDER BY id",
-        ],
+        &["SELECT id, CASE n WHEN '5' THEN 'a' WHEN '10' THEN 'b' ELSE 'c' END FROM t ORDER BY id"],
         "case_multibranch_affinity",
     );
 }

@@ -88,12 +88,12 @@ fn assert_scalar(queries: &[&str], label: &str) {
 fn shift_count_at_or_beyond_64() {
     assert_scalar(
         &[
-            "SELECT 1 << 63",                    // -9223372036854775808 (sign bit)
-            "SELECT 1 << 64",                    // 0
-            "SELECT 1 << 100",                   // 0
-            "SELECT 255 >> 64",                  // 0
-            "SELECT 9223372036854775807 >> 63",  // 0
-            "SELECT -1 >> 64",                   // -1 (arithmetic, sign fills)
+            "SELECT 1 << 63",                   // -9223372036854775808 (sign bit)
+            "SELECT 1 << 64",                   // 0
+            "SELECT 1 << 100",                  // 0
+            "SELECT 255 >> 64",                 // 0
+            "SELECT 9223372036854775807 >> 63", // 0
+            "SELECT -1 >> 64",                  // -1 (arithmetic, sign fills)
         ],
         "shift_count_at_or_beyond_64",
     );
@@ -103,10 +103,10 @@ fn shift_count_at_or_beyond_64() {
 fn shift_negative_count_reverses_direction() {
     assert_scalar(
         &[
-            "SELECT 1 << -1",     // 1 >> 1 -> 0
-            "SELECT 1024 << -2",  // 1024 >> 2 -> 256
-            "SELECT 256 >> -1",   // 256 << 1 -> 512
-            "SELECT 1 >> -3",     // 1 << 3 -> 8
+            "SELECT 1 << -1",    // 1 >> 1 -> 0
+            "SELECT 1024 << -2", // 1024 >> 2 -> 256
+            "SELECT 256 >> -1",  // 256 << 1 -> 512
+            "SELECT 1 >> -3",    // 1 << 3 -> 8
         ],
         "shift_negative_count_reverses_direction",
     );

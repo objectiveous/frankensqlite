@@ -143,8 +143,8 @@ fn fk_on_update_restrict_blocks() {
             "UPDATE parent SET id = 7 WHERE id = 2", // ok (no child)
         ],
         &[
-            "SELECT id FROM parent ORDER BY id",      // (1,7)
-            "SELECT id, pid FROM child ORDER BY id",  // (10,1)
+            "SELECT id FROM parent ORDER BY id",     // (1,7)
+            "SELECT id, pid FROM child ORDER BY id", // (10,1)
         ],
         "fk_on_update_restrict_blocks",
     );

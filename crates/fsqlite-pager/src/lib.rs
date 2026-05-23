@@ -2,6 +2,7 @@
 #![feature(core_intrinsics)]
 
 pub mod arc_cache;
+#[cfg(feature = "encryption")]
 pub mod encrypt;
 #[cfg(feature = "evalue-eviction")]
 pub mod evalue_eviction;
@@ -17,6 +18,7 @@ pub mod thompson_partitioner;
 pub mod traits;
 
 pub use arc_cache::{ArcCache, ArcCacheInner, CacheKey, CacheLookup, CachedPage};
+#[cfg(feature = "encryption")]
 pub use encrypt::{
     Argon2Params, DATABASE_ID_SIZE, DatabaseId, ENCRYPTION_RESERVED_BYTES, EncryptError, KEY_SIZE,
     KeyManager, NONCE_SIZE, PageEncryptor, TAG_SIZE, validate_reserved_bytes,

@@ -192,7 +192,9 @@ mod tests {
 
     #[test]
     fn test_clear_resets_all_armed_hooks_and_records() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_after_flush_before_publish(arm("flush"));
@@ -219,7 +221,9 @@ mod tests {
 
     #[test]
     fn test_armed_hook_fires_once_then_disarms() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_during_phase_c(arm("phase_c"));
@@ -239,7 +243,9 @@ mod tests {
 
     #[test]
     fn test_drop_condvar_notify_returns_true_once() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_drop_condvar_notify(arm("condvar"));
@@ -252,7 +258,9 @@ mod tests {
 
     #[test]
     fn test_records_capture_trigger_details() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_after_flush_before_publish(FaultHookArm::new("run-1", "scen-1", "inv-1"));
@@ -281,7 +289,9 @@ mod tests {
 
     #[test]
     fn test_flush_hook_fires_once_then_disarms() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_after_flush_before_publish(arm("flush"));
@@ -301,7 +311,9 @@ mod tests {
 
     #[test]
     fn test_condvar_notify_record_captures_detail() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_drop_condvar_notify(FaultHookArm::new("run-cv", "scen-cv", "inv-cv"));
@@ -318,7 +330,9 @@ mod tests {
 
     #[test]
     fn test_all_hooks_fire_independently() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_after_flush_before_publish(arm("flush"));
@@ -341,7 +355,9 @@ mod tests {
 
     #[test]
     fn test_unarmed_hooks_are_noop() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         assert!(maybe_inject_after_flush_before_publish(1, 1, 1).is_ok());
@@ -361,7 +377,9 @@ mod tests {
 
     #[test]
     fn test_take_records_drains_and_is_empty_after() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_drop_condvar_notify(arm("condvar"));
@@ -375,7 +393,9 @@ mod tests {
 
     #[test]
     fn test_rearming_overwrites_previous_arm() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_during_phase_c(FaultHookArm::new("first", "s1", "inv1"));
@@ -389,7 +409,9 @@ mod tests {
 
     #[test]
     fn test_trigger_seq_monotonic_across_cycles() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_after_flush_before_publish(arm("flush"));
@@ -416,7 +438,9 @@ mod tests {
 
     #[test]
     fn test_fault_injection_record_fields_from_condvar_hook() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_drop_condvar_notify(FaultHookArm::new("r", "s", "i"));
@@ -435,7 +459,9 @@ mod tests {
 
     #[test]
     fn test_fault_injection_record_clone_and_eq() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_during_phase_c(FaultHookArm::new("rc", "sc", "ic"));
@@ -462,14 +488,19 @@ mod tests {
 
     #[test]
     fn test_flush_error_message_includes_all_arm_fields() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_after_flush_before_publish(FaultHookArm::new("R1", "S1", "INV1"));
         let err = maybe_inject_after_flush_before_publish(1, 1, 1).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("run_id=R1"), "error must include run_id");
-        assert!(msg.contains("scenario_id=S1"), "error must include scenario_id");
+        assert!(
+            msg.contains("scenario_id=S1"),
+            "error must include scenario_id"
+        );
         assert!(
             msg.contains("invariant_family=INV1"),
             "error must include invariant_family"
@@ -478,7 +509,9 @@ mod tests {
 
     #[test]
     fn test_flush_hook_boundary_zero_counts() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
 
         arm_after_flush_before_publish(arm("zero"));
@@ -515,7 +548,10 @@ mod tests {
         };
         let cloned = r.clone();
         assert_eq!(r, cloned);
-        let other = FaultInjectionRecord { trigger_seq: 8, ..r.clone() };
+        let other = FaultInjectionRecord {
+            trigger_seq: 8,
+            ..r.clone()
+        };
         assert_ne!(r, other);
         let dbg = format!("{r:?}");
         assert!(dbg.contains("FaultInjectionRecord"));
@@ -524,7 +560,9 @@ mod tests {
 
     #[test]
     fn clear_resets_and_take_records_returns_empty() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear();
         let records = take_records();
         assert!(records.is_empty());

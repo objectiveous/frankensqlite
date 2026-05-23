@@ -105,9 +105,9 @@ fn rowvalue_equality() {
         &DATA,
         &[
             // Element-wise equality.
-            "SELECT id FROM t WHERE (a,b) = (1,2) ORDER BY id",      // 2
-            "SELECT id FROM t WHERE (a,b) = (2,1) ORDER BY id",      // 3
-            "SELECT id FROM t WHERE (a,b) <> (1,1) ORDER BY id",     // 2,3,4 (NULL rows excluded)
+            "SELECT id FROM t WHERE (a,b) = (1,2) ORDER BY id", // 2
+            "SELECT id FROM t WHERE (a,b) = (2,1) ORDER BY id", // 3
+            "SELECT id FROM t WHERE (a,b) <> (1,1) ORDER BY id", // 2,3,4 (NULL rows excluded)
             // A NULL element makes equality undetermined (NULL), so id 5/6 drop out.
             "SELECT id FROM t WHERE (a,b) = (1,NULL) ORDER BY id",
         ],
@@ -135,13 +135,13 @@ fn rowvalue_lexicographic_order() {
         &DATA,
         &[
             // (a,b) < (2,1): a<2, or (a=2 and b<1). Rows with no NULL element.
-            "SELECT id FROM t WHERE (a,b) < (2,1) ORDER BY id",   // 1,2
-            "SELECT id FROM t WHERE (a,b) >= (2,1) ORDER BY id",  // 3,4
-            "SELECT id FROM t WHERE (a,b) <= (1,2) ORDER BY id",  // 1,2
+            "SELECT id FROM t WHERE (a,b) < (2,1) ORDER BY id", // 1,2
+            "SELECT id FROM t WHERE (a,b) >= (2,1) ORDER BY id", // 3,4
+            "SELECT id FROM t WHERE (a,b) <= (1,2) ORDER BY id", // 1,2
             // Constant tuple comparisons.
-            "SELECT (1,2) < (1,3)",   // 1
-            "SELECT (1,2) < (1,1)",   // 0
-            "SELECT (2,0) < (1,9)",   // 0 (first element decides)
+            "SELECT (1,2) < (1,3)", // 1
+            "SELECT (1,2) < (1,1)", // 0
+            "SELECT (2,0) < (1,9)", // 0 (first element decides)
         ],
         "rowvalue_lexicographic_order",
     );

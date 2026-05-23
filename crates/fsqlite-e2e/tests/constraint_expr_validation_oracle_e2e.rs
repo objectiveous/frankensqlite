@@ -53,9 +53,9 @@ fn constant_default_and_simple_check_ok() {
 fn non_constant_default_rejected() {
     check_ddl(
         &[
-            "CREATE TABLE t (a, b DEFAULT (a))",      // references another column
-            "CREATE TABLE t (a, b DEFAULT (a + 1))",  // references another column
-            "CREATE TABLE t (a DEFAULT (SELECT 1))",  // subquery in DEFAULT
+            "CREATE TABLE t (a, b DEFAULT (a))", // references another column
+            "CREATE TABLE t (a, b DEFAULT (a + 1))", // references another column
+            "CREATE TABLE t (a DEFAULT (SELECT 1))", // subquery in DEFAULT
         ],
         "non_constant_default_rejected",
     );

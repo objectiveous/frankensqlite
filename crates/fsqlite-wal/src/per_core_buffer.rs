@@ -1571,7 +1571,10 @@ fn append_record_exceeding_capacity_latches_fallback() {
     let mut buf = PerCoreWalBuffer::new(0, config);
     let outcome = buf.append(make_record(0, 1, 128));
     assert_eq!(outcome, AppendOutcome::Blocked);
-    assert_eq!(buf.fallback_decision(), FallbackDecision::ForceSerializedDrain);
+    assert_eq!(
+        buf.fallback_decision(),
+        FallbackDecision::ForceSerializedDrain
+    );
 }
 
 #[test]
@@ -1583,7 +1586,10 @@ fn append_batch_with_oversized_single_record_latches_fallback() {
     let mut buf = PerCoreWalBuffer::new(0, config);
     let outcome = buf.append_batch(vec![make_record(0, 1, 128)]);
     assert_eq!(outcome, AppendOutcome::Blocked);
-    assert_eq!(buf.fallback_decision(), FallbackDecision::ForceSerializedDrain);
+    assert_eq!(
+        buf.fallback_decision(),
+        FallbackDecision::ForceSerializedDrain
+    );
 }
 
 #[test]
@@ -1617,7 +1623,10 @@ fn recovery_order_sorts_by_epoch_then_seq() {
 fn buffer_config_default_values() {
     let config = BufferConfig::default();
     assert_eq!(config.capacity_bytes, DEFAULT_BUFFER_CAPACITY_BYTES);
-    assert_eq!(config.overflow_fallback_bytes, DEFAULT_OVERFLOW_FALLBACK_BYTES);
+    assert_eq!(
+        config.overflow_fallback_bytes,
+        DEFAULT_OVERFLOW_FALLBACK_BYTES
+    );
     assert_eq!(config.overflow_policy, OverflowPolicy::AllocateOverflow);
 }
 
@@ -1702,7 +1711,10 @@ fn pool_append_batch_to_core_works() {
     let records = vec![make_record(0, 1, 16), make_record(0, 2, 16)];
     let outcome = pool.append_batch_to_core(0, records).unwrap();
     assert_eq!(outcome, AppendOutcome::Appended);
-    assert!(pool.append_batch_to_core(99, vec![make_record(0, 1, 16)]).is_err());
+    assert!(
+        pool.append_batch_to_core(99, vec![make_record(0, 1, 16)])
+            .is_err()
+    );
 }
 
 #[test]
@@ -1720,7 +1732,11 @@ fn overflow_policy_debug_clone_copy_eq() {
 
 #[test]
 fn append_outcome_debug_clone_copy_eq() {
-    let variants = [AppendOutcome::Appended, AppendOutcome::QueuedOverflow, AppendOutcome::Blocked];
+    let variants = [
+        AppendOutcome::Appended,
+        AppendOutcome::QueuedOverflow,
+        AppendOutcome::Blocked,
+    ];
     for v in &variants {
         let copied = *v;
         assert_eq!(copied, *v);

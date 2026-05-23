@@ -20,7 +20,9 @@ fn ddl_case(setup: &[&str], test: &str) -> Option<String> {
     match (&fe, &re) {
         (Ok(_), Ok(())) | (Err(_), Err(_)) => None,
         (Ok(_), Err(e)) => Some(format!("FRANK_OK / CSQL_ERR: `{test}`\n  csql: ERROR({e})")),
-        (Err(e), Ok(())) => Some(format!("FRANK_ERR / CSQL_OK: `{test}`\n  frank: ERROR({e})")),
+        (Err(e), Ok(())) => Some(format!(
+            "FRANK_ERR / CSQL_OK: `{test}`\n  frank: ERROR({e})"
+        )),
     }
 }
 
@@ -54,9 +56,9 @@ fn rename_valid_ok() {
 fn rename_unknown_rejected() {
     check(
         &[
-            (SETUP, "ALTER TABLE t RENAME COLUMN nope TO x"),   // unknown column
+            (SETUP, "ALTER TABLE t RENAME COLUMN nope TO x"), // unknown column
             (SETUP, "ALTER TABLE nope_table RENAME COLUMN a TO b"), // unknown table
-            (SETUP, "ALTER TABLE nope_table RENAME TO other"),  // unknown table
+            (SETUP, "ALTER TABLE nope_table RENAME TO other"), // unknown table
         ],
         "rename_unknown_rejected",
     );

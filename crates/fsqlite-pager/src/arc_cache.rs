@@ -3888,7 +3888,11 @@ mod tests {
         };
         assert!((snap.hit_rate_pct() - 75.0).abs() < 0.01);
 
-        let zero = CacheMetricsSnapshot { hits: 0, misses: 0, ..snap };
+        let zero = CacheMetricsSnapshot {
+            hits: 0,
+            misses: 0,
+            ..snap
+        };
         assert!((zero.hit_rate_pct() - 0.0).abs() < f64::EPSILON);
     }
 
@@ -3945,7 +3949,12 @@ mod tests {
 
     #[test]
     fn cache_lookup_debug_clone_copy_eq() {
-        let variants = [CacheLookup::Hit, CacheLookup::GhostHitB1, CacheLookup::GhostHitB2, CacheLookup::Miss];
+        let variants = [
+            CacheLookup::Hit,
+            CacheLookup::GhostHitB1,
+            CacheLookup::GhostHitB2,
+            CacheLookup::Miss,
+        ];
         for v in &variants {
             let copied = *v;
             assert_eq!(copied, *v);
@@ -3957,7 +3966,12 @@ mod tests {
 
     #[test]
     fn async_lookup_debug_clone_copy_eq() {
-        let variants = [AsyncLookup::Hit, AsyncLookup::Loaded, AsyncLookup::WaitedForPeerHit, AsyncLookup::WaitedForPeerMiss];
+        let variants = [
+            AsyncLookup::Hit,
+            AsyncLookup::Loaded,
+            AsyncLookup::WaitedForPeerHit,
+            AsyncLookup::WaitedForPeerMiss,
+        ];
         for v in &variants {
             let copied = *v;
             assert_eq!(copied, *v);
@@ -3984,11 +3998,24 @@ mod tests {
     #[test]
     fn cache_metrics_snapshot_debug_clone_copy() {
         let snap = CacheMetricsSnapshot {
-            hits: 1, misses: 2, ghost_hits_b1: 0, ghost_hits_b2: 0,
-            evictions_t1: 0, evictions_t2: 0, version_coalesce_count: 0, admits: 0,
-            t1_len: 3, t2_len: 4, b1_len: 0, b2_len: 0,
-            p: 5, capacity: 10, total_bytes: 100, max_bytes: 200,
-            multi_version_pages: 0, capacity_overflow_events: 0,
+            hits: 1,
+            misses: 2,
+            ghost_hits_b1: 0,
+            ghost_hits_b2: 0,
+            evictions_t1: 0,
+            evictions_t2: 0,
+            version_coalesce_count: 0,
+            admits: 0,
+            t1_len: 3,
+            t2_len: 4,
+            b1_len: 0,
+            b2_len: 0,
+            p: 5,
+            capacity: 10,
+            total_bytes: 100,
+            max_bytes: 200,
+            multi_version_pages: 0,
+            capacity_overflow_events: 0,
         };
         let dbg = format!("{snap:?}");
         assert!(dbg.contains("CacheMetricsSnapshot"));

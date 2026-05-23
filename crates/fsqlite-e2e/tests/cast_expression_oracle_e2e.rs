@@ -118,11 +118,11 @@ fn cast_real_to_integer_truncates_toward_zero() {
     scenario(
         &[],
         &[
-            "SELECT CAST(3.9 AS INTEGER)",   // 3
-            "SELECT CAST(-3.9 AS INTEGER)",  // -3 (toward zero, not floor)
-            "SELECT CAST(3.2 AS INTEGER)",   // 3
-            "SELECT CAST(-0.5 AS INTEGER)",  // 0
-            "SELECT CAST(2.0 AS INTEGER)",   // 2
+            "SELECT CAST(3.9 AS INTEGER)",  // 3
+            "SELECT CAST(-3.9 AS INTEGER)", // -3 (toward zero, not floor)
+            "SELECT CAST(3.2 AS INTEGER)",  // 3
+            "SELECT CAST(-0.5 AS INTEGER)", // 0
+            "SELECT CAST(2.0 AS INTEGER)",  // 2
         ],
         "cast_real_to_integer_truncates_toward_zero",
     );
@@ -165,9 +165,9 @@ fn cast_to_text() {
         &[],
         &[
             "SELECT CAST(123 AS TEXT), typeof(CAST(123 AS TEXT))", // '123', text
-            "SELECT CAST(3.14 AS TEXT)",                          // '3.14'
-            "SELECT CAST(-0.5 AS TEXT)",                          // '-0.5'
-            "SELECT CAST(3.0 AS TEXT)",                           // '3.0'
+            "SELECT CAST(3.14 AS TEXT)",                           // '3.14'
+            "SELECT CAST(-0.5 AS TEXT)",                           // '-0.5'
+            "SELECT CAST(3.0 AS TEXT)",                            // '3.0'
         ],
         "cast_to_text",
     );

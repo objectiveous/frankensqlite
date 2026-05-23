@@ -10,6 +10,8 @@
 //! On **load**, a real `.db` file is read via B-tree cursors and its
 //! contents are replayed into a fresh `MemDatabase` + schema vector.
 
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 #[cfg(not(target_arch = "wasm32"))]

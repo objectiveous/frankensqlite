@@ -86,8 +86,8 @@ fn glob_caret_negates_bracket() {
     // SQLite negates a bracket expression with a leading '^'.
     assert_scalar(
         &[
-            "SELECT 'a' GLOB '[^a]'", // 0 (a excluded)
-            "SELECT 'b' GLOB '[^a]'", // 1
+            "SELECT 'a' GLOB '[^a]'",   // 0 (a excluded)
+            "SELECT 'b' GLOB '[^a]'",   // 1
             "SELECT 'a' GLOB '[^abc]'", // 0
             "SELECT 'd' GLOB '[^abc]'", // 1
         ],

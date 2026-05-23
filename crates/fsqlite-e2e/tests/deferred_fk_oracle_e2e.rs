@@ -106,7 +106,7 @@ fn deferred_fk_temporary_violation_resolved_by_commit() {
             "BEGIN",
             "INSERT INTO child VALUES (10, 1)", // parent 1 not present yet -> OK (deferred)
             "INSERT INTO parent VALUES (1)",    // now satisfied
-            "COMMIT",                            // constraint holds -> commits
+            "COMMIT",                           // constraint holds -> commits
         ],
         &[
             "SELECT id, pid FROM child ORDER BY id", // (10,1)
@@ -130,11 +130,11 @@ fn deferred_fk_unresolved_violation_fails_at_commit() {
             "INSERT INTO parent VALUES (1)",
             "BEGIN",
             "INSERT INTO child VALUES (10, 99)", // parent 99 never added -> OK so far (deferred)
-            "COMMIT",                             // violation still present -> COMMIT fails on both
+            "COMMIT",                            // violation still present -> COMMIT fails on both
         ],
         &[
             // The failed COMMIT rolls back the child insert.
-            "SELECT count(*) FROM child", // 0
+            "SELECT count(*) FROM child",        // 0
             "SELECT id FROM parent ORDER BY id", // (1)
         ],
         "deferred_fk_unresolved_violation_fails_at_commit",

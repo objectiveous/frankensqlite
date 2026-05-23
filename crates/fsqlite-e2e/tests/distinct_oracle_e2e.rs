@@ -88,7 +88,8 @@ fn setup(stmts: &[&str]) -> (Connection, rusqlite::Connection) {
     let r = rusqlite::Connection::open_in_memory().unwrap();
     for s in stmts {
         f.execute(s).unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
-        r.execute_batch(s).unwrap_or_else(|e| panic!("rusqlite `{s}`: {e}"));
+        r.execute_batch(s)
+            .unwrap_or_else(|e| panic!("rusqlite `{s}`: {e}"));
     }
     (f, r)
 }

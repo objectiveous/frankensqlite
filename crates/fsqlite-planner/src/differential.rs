@@ -1602,7 +1602,10 @@ mod tests {
 
         assert_eq!(DifferentialAggregate::CountRows.to_string(), "COUNT(*)");
         assert_eq!(
-            DifferentialAggregate::Sum { column: col.clone() }.to_string(),
+            DifferentialAggregate::Sum {
+                column: col.clone()
+            }
+            .to_string(),
             "SUM(t.x)"
         );
 
@@ -1681,7 +1684,10 @@ mod tests {
         let select =
             parse_select("SELECT id, name FROM users WHERE status = 'paid' AND tenant_id = 7");
         let explain = explain_differential_view_plan(&select).expect("rowset shape should compile");
-        assert!(explain.contains("DIFFERENTIAL row_set"), "explain:\n{explain}");
+        assert!(
+            explain.contains("DIFFERENTIAL row_set"),
+            "explain:\n{explain}"
+        );
         assert!(explain.contains("SOURCE users AS users"));
         assert!(explain.contains("EMIT users.id"));
         assert!(explain.contains("EMIT users.name"));
@@ -1689,7 +1695,10 @@ mod tests {
         assert!(explain.contains("FILTER users.tenant_id"));
         // A RowSet plan has no join or grouping.
         assert!(!explain.contains("JOIN"), "rowset has no join:\n{explain}");
-        assert!(!explain.contains("GROUP BY"), "rowset has no grouping:\n{explain}");
+        assert!(
+            !explain.contains("GROUP BY"),
+            "rowset has no grouping:\n{explain}"
+        );
     }
 
     #[test]
@@ -1699,9 +1708,13 @@ mod tests {
         // (existing tests cover only RowSet and GroupedAggregate).
         let select = parse_select("SELECT COUNT(*) AS total FROM orders");
 
-        let plan = compile_differential_view_plan(&select).expect("global aggregate should compile");
+        let plan =
+            compile_differential_view_plan(&select).expect("global aggregate should compile");
         assert_eq!(plan.mode, DifferentialPlanMode::GlobalAggregate);
-        assert!(plan.group_by.is_empty(), "a global aggregate has no grouping keys");
+        assert!(
+            plan.group_by.is_empty(),
+            "a global aggregate has no grouping keys"
+        );
         assert_eq!(plan.sources.len(), 1);
         assert_eq!(plan.sources[0].binding, "orders");
         assert_eq!(
@@ -1714,10 +1727,16 @@ mod tests {
 
         // Explain renders the global-aggregate header and emits the aggregate.
         let explain = explain_differential_view_plan(&select).expect("should compile");
-        assert!(explain.contains("DIFFERENTIAL global_aggregate"), "explain:\n{explain}");
+        assert!(
+            explain.contains("DIFFERENTIAL global_aggregate"),
+            "explain:\n{explain}"
+        );
         assert!(explain.contains("SOURCE orders AS orders"));
         assert!(explain.contains("EMIT COUNT(*) AS total"));
-        assert!(!explain.contains("GROUP BY"), "global aggregate has no grouping:\n{explain}");
+        assert!(
+            !explain.contains("GROUP BY"),
+            "global aggregate has no grouping:\n{explain}"
+        );
     }
 
     #[test]
@@ -1739,7 +1758,10 @@ mod tests {
             }]
         );
         let explain = explain_differential_view_plan(&select).expect("should compile");
-        assert!(explain.contains("EMIT SUM(orders.amount) AS total"), "explain:\n{explain}");
+        assert!(
+            explain.contains("EMIT SUM(orders.amount) AS total"),
+            "explain:\n{explain}"
+        );
 
         // AVG is not a supported differential aggregate -> fails closed.
         let avg = parse_select("SELECT AVG(amount) FROM orders");

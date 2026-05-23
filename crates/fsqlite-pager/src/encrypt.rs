@@ -880,11 +880,11 @@ mod tests {
                 },
                 "page too small",
             ),
+            (EncryptError::DekUnwrapFailed, "DEK unwrap failed"),
             (
-                EncryptError::DekUnwrapFailed,
-                "DEK unwrap failed",
+                EncryptError::InvalidKdfParams,
+                "invalid Argon2id parameters",
             ),
-            (EncryptError::InvalidKdfParams, "invalid Argon2id parameters"),
         ];
         for (err, expected_substr) in cases {
             let msg = format!("{err}");
@@ -964,7 +964,11 @@ mod tests {
 
     #[test]
     fn argon2_params_debug_and_clone() {
-        let p = Argon2Params { m_cost: 1024, t_cost: 2, p_cost: 1 };
+        let p = Argon2Params {
+            m_cost: 1024,
+            t_cost: 2,
+            p_cost: 1,
+        };
         let dbg = format!("{p:?}");
         assert!(dbg.contains("Argon2Params"));
         assert!(dbg.contains("1024"));

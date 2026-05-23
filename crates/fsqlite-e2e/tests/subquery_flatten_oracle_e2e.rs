@@ -87,7 +87,8 @@ fn setup(stmts: &[&str]) -> (Connection, rusqlite::Connection) {
     let r = rusqlite::Connection::open_in_memory().unwrap();
     for s in stmts {
         f.execute(s).unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
-        r.execute_batch(s).unwrap_or_else(|e| panic!("rusqlite `{s}`: {e}"));
+        r.execute_batch(s)
+            .unwrap_or_else(|e| panic!("rusqlite `{s}`: {e}"));
     }
     (f, r)
 }
@@ -160,7 +161,7 @@ fn flatten_distinct_subquery_outer_filter() {
         &r,
         &[
             "SELECT a FROM (SELECT DISTINCT a FROM d) WHERE a >= 2 ORDER BY a", // 2,3,5
-            "SELECT count(*) FROM (SELECT DISTINCT a FROM d)",                 // 4
+            "SELECT count(*) FROM (SELECT DISTINCT a FROM d)",                  // 4
         ],
         "flatten_distinct_subquery_outer_filter",
     );

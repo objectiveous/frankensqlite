@@ -98,13 +98,13 @@ fn autoincrement_explicit_higher_bumps_sequence() {
     scenario(
         &[
             "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
-            "INSERT INTO t(v) VALUES ('a')",       // 1
+            "INSERT INTO t(v) VALUES ('a')",        // 1
             "INSERT INTO t(id,v) VALUES (100,'b')", // explicit 100 bumps the sequence
-            "INSERT INTO t(v) VALUES ('c')",       // 101 (not 2)
+            "INSERT INTO t(v) VALUES ('c')",        // 101 (not 2)
         ],
         &[
-            "SELECT id, v FROM t ORDER BY id",                 // (1,a),(100,b),(101,c)
-            "SELECT seq FROM sqlite_sequence WHERE name='t'",  // 101
+            "SELECT id, v FROM t ORDER BY id", // (1,a),(100,b),(101,c)
+            "SELECT seq FROM sqlite_sequence WHERE name='t'", // 101
         ],
         "autoincrement_explicit_higher_bumps_sequence",
     );
@@ -116,7 +116,7 @@ fn autoincrement_continues_after_delete_all() {
         &[
             "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
             "INSERT INTO t(v) VALUES ('a'),('b'),('c')", // 1,2,3
-            "DELETE FROM t",                              // all gone, but sequence persists
+            "DELETE FROM t",                             // all gone, but sequence persists
             "INSERT INTO t(v) VALUES ('d')",             // 4, not 1
         ],
         &[

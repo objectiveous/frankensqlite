@@ -1248,8 +1248,14 @@ mod tests {
 
                 // Exact overflow boundary: a payload of exactly X stays fully
                 // local; X+1 is the first size that overflows.
-                assert!(!has_overflow(max_local, usable, page_type), "U={usable} {label}");
-                assert!(has_overflow(max_local + 1, usable, page_type), "U={usable} {label}");
+                assert!(
+                    !has_overflow(max_local, usable, page_type),
+                    "U={usable} {label}"
+                );
+                assert!(
+                    has_overflow(max_local + 1, usable, page_type),
+                    "U={usable} {label}"
+                );
                 assert_eq!(
                     local_payload_size(max_local, usable, page_type),
                     max_local,
@@ -1264,7 +1270,10 @@ mod tests {
                         (min_local..=max_local).contains(&local),
                         "U={usable} {label} P={payload}: local {local} not in [{min_local},{max_local}]"
                     );
-                    assert!(local < payload, "U={usable} {label} P={payload}: overflow must spill");
+                    assert!(
+                        local < payload,
+                        "U={usable} {label} P={payload}: overflow must spill"
+                    );
                 }
             }
         }
@@ -1552,7 +1561,10 @@ mod tests {
         let mut page = vec![0u8; 64];
         let n = write_varint(&mut page[0..], 1u64);
         let _ = write_varint(&mut page[n..], 1_000_000_000u64);
-        assert_eq!(CellRef::parse_leaf_table_rowid(&page, 0).unwrap(), 1_000_000_000);
+        assert_eq!(
+            CellRef::parse_leaf_table_rowid(&page, 0).unwrap(),
+            1_000_000_000
+        );
     }
 
     #[test]
@@ -1602,9 +1614,8 @@ mod tests {
         let cell =
             CellRef::parse(&page, cell_offset, BtreePageType::InteriorTable, usable).unwrap();
         let expected = crate::payload::cell_on_page_size(&cell, cell_offset);
-        let fast =
-            cell_on_page_size_fast(&page, cell_offset, BtreePageType::InteriorTable, usable)
-                .unwrap();
+        let fast = cell_on_page_size_fast(&page, cell_offset, BtreePageType::InteriorTable, usable)
+            .unwrap();
         assert_eq!(fast, expected);
         assert_eq!(
             fast,
@@ -1632,7 +1643,11 @@ mod tests {
         let expected = crate::payload::cell_on_page_size(&cell, off);
         let fast = cell_on_page_size_fast(&page, off, BtreePageType::LeafIndex, usable).unwrap();
         assert_eq!(fast, expected);
-        assert_eq!(fast, ps_len + 10, "leaf-index size = payload_size varint + payload");
+        assert_eq!(
+            fast,
+            ps_len + 10,
+            "leaf-index size = payload_size varint + payload"
+        );
 
         // Interior-index cell: 4-byte left child + payload_size varint + payload.
         let mut page = vec![0u8; 4096];

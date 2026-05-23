@@ -640,21 +640,14 @@ mod tests {
 
     #[test]
     fn test_build_cell_delta_frames_empty_iterator() {
-        let frames = build_cell_delta_frames(
-            std::iter::empty(),
-            CommitSeq::new(1),
-            test_txn_id(),
-        );
+        let frames = build_cell_delta_frames(std::iter::empty(), CommitSeq::new(1), test_txn_id());
         assert!(frames.is_empty());
     }
 
     #[test]
     fn test_cell_delta_descriptor_update_factory() {
-        let desc = CellDeltaDescriptor::update(
-            test_page_number(),
-            test_key_digest(),
-            vec![0xCC; 50],
-        );
+        let desc =
+            CellDeltaDescriptor::update(test_page_number(), test_key_digest(), vec![0xCC; 50]);
         assert_eq!(desc.op, CellOp::Update);
         assert_eq!(desc.cell_data.len(), 50);
         assert_eq!(desc.page_number, test_page_number());
@@ -731,15 +724,10 @@ mod tests {
         let digest_a = [0xAA; 16];
         let digest_b = [0xBB; 16];
         let descs = vec![
-            CellDeltaDescriptor::insert(
-                PageNumber::new(5).unwrap(),
-                digest_a,
-                vec![1, 2],
-            ),
+            CellDeltaDescriptor::insert(PageNumber::new(5).unwrap(), digest_a, vec![1, 2]),
             CellDeltaDescriptor::delete(PageNumber::new(6).unwrap(), digest_b),
         ];
-        let frames =
-            build_cell_delta_frames(descs.into_iter(), CommitSeq::new(10), test_txn_id());
+        let frames = build_cell_delta_frames(descs.into_iter(), CommitSeq::new(10), test_txn_id());
         assert_eq!(frames[0].cell_key_digest, digest_a);
         assert_eq!(frames[1].cell_key_digest, digest_b);
     }
@@ -758,7 +746,8 @@ mod tests {
 
     #[test]
     fn cell_delta_descriptor_debug_and_clone() {
-        let desc = CellDeltaDescriptor::insert(test_page_number(), test_key_digest(), vec![9, 8, 7]);
+        let desc =
+            CellDeltaDescriptor::insert(test_page_number(), test_key_digest(), vec![9, 8, 7]);
         let dbg = format!("{desc:?}");
         assert!(dbg.contains("CellDeltaDescriptor"));
         let cloned = desc.clone();

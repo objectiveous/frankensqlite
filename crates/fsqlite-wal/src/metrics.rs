@@ -963,7 +963,8 @@ mod tests {
         let display = format!("{snap}");
         assert!(display.contains("wal_frames_written=100"));
         let zero = WalMetricsSnapshot {
-            checkpoint_count: 0, ..snap
+            checkpoint_count: 0,
+            ..snap
         };
         assert_eq!(zero.avg_checkpoint_duration_us(), 0);
     }
@@ -981,7 +982,8 @@ mod tests {
         let display = format!("{snap}");
         assert!(display.contains("succeeded=3"));
         let zero = WalFecRepairCountersSnapshot {
-            repairs_total: 0, ..snap
+            repairs_total: 0,
+            ..snap
         };
         assert_eq!(zero.avg_repair_duration_us(), 0);
     }

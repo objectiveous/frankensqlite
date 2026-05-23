@@ -134,9 +134,9 @@ fn nonexistent_column_or_table_is_rejected() {
         &f,
         &r,
         &[
-            "SELECT no_such FROM a",          // no such column
-            "SELECT a.nope FROM a",           // no such column on a
-            "SELECT * FROM no_such_table",    // no such table
+            "SELECT no_such FROM a",       // no such column
+            "SELECT a.nope FROM a",        // no such column on a
+            "SELECT * FROM no_such_table", // no such table
         ],
         "nonexistent_column_or_table_is_rejected",
     );

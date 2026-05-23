@@ -92,14 +92,14 @@ fn assert_scalar(queries: &[&str], label: &str) {
 fn likely_unlikely_identity() {
     assert_scalar(
         &[
-            "SELECT likely(1)",            // 1
-            "SELECT unlikely(0)",          // 0
-            "SELECT likely('x')",          // 'x'
-            "SELECT unlikely(3.5)",        // 3.5
-            "SELECT likely(NULL)",         // NULL
-            "SELECT typeof(likely(5))",    // integer
-            "SELECT typeof(likely(5.0))",  // real
-            "SELECT typeof(unlikely('a'))", // text
+            "SELECT likely(1)",               // 1
+            "SELECT unlikely(0)",             // 0
+            "SELECT likely('x')",             // 'x'
+            "SELECT unlikely(3.5)",           // 3.5
+            "SELECT likely(NULL)",            // NULL
+            "SELECT typeof(likely(5))",       // integer
+            "SELECT typeof(likely(5.0))",     // real
+            "SELECT typeof(unlikely('a'))",   // text
             "SELECT likely(2) + unlikely(3)", // 5
         ],
         "likely_unlikely_identity",
@@ -110,11 +110,11 @@ fn likely_unlikely_identity() {
 fn likelihood_with_probability() {
     assert_scalar(
         &[
-            "SELECT likelihood(42, 0.5)",   // 42
-            "SELECT likelihood('a', 0.9)",  // 'a'
-            "SELECT likelihood(NULL, 0.1)", // NULL
-            "SELECT likelihood(7, 0.0)",    // 7 (boundary)
-            "SELECT likelihood(7, 1.0)",    // 7 (boundary)
+            "SELECT likelihood(42, 0.5)",         // 42
+            "SELECT likelihood('a', 0.9)",        // 'a'
+            "SELECT likelihood(NULL, 0.1)",       // NULL
+            "SELECT likelihood(7, 0.0)",          // 7 (boundary)
+            "SELECT likelihood(7, 1.0)",          // 7 (boundary)
             "SELECT typeof(likelihood(9, 0.25))", // integer
         ],
         "likelihood_with_probability",
@@ -137,7 +137,7 @@ fn likely_unlikely_in_where_filter() {
         &r,
         &[
             // the hint must not change which rows match
-            "SELECT id FROM t WHERE likely(x > 5) ORDER BY id",   // 1,3
+            "SELECT id FROM t WHERE likely(x > 5) ORDER BY id", // 1,3
             "SELECT id FROM t WHERE unlikely(x = 3) ORDER BY id", // 2
             "SELECT id FROM t WHERE likelihood(x >= 5, 0.5) ORDER BY id", // 1,3,4
         ],

@@ -94,7 +94,10 @@ fn affinity_probe(types: &[&str], label: &str) {
         .enumerate()
         .map(|(i, ty)| format!("c{i} {ty}"))
         .collect();
-    let create = format!("CREATE TABLE t (rid INTEGER PRIMARY KEY, {})", cols.join(", "));
+    let create = format!(
+        "CREATE TABLE t (rid INTEGER PRIMARY KEY, {})",
+        cols.join(", ")
+    );
     let names: Vec<String> = (0..types.len()).map(|i| format!("c{i}")).collect();
     let int_vals = vec!["42"; types.len()].join(",");
     let txt_vals = vec!["'42'"; types.len()].join(",");
@@ -104,7 +107,8 @@ fn affinity_probe(types: &[&str], label: &str) {
         &format!("INSERT INTO t VALUES (2, {txt_vals})"),
     ] {
         f.execute(s).unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
-        r.execute_batch(s).unwrap_or_else(|e| panic!("rusqlite `{s}`: {e}"));
+        r.execute_batch(s)
+            .unwrap_or_else(|e| panic!("rusqlite `{s}`: {e}"));
     }
     let typeofs: Vec<String> = names.iter().map(|n| format!("typeof({n})")).collect();
     let q = format!("SELECT rid, {} FROM t ORDER BY rid", typeofs.join(", "));
@@ -115,7 +119,16 @@ fn affinity_probe(types: &[&str], label: &str) {
 fn affinity_integer_class() {
     // Anything containing "INT" -> INTEGER affinity.
     affinity_probe(
-        &["INTEGER", "INT", "BIGINT", "INT2", "INT8", "TINYINT", "MEDIUMINT", "UNSIGNED BIG INT"],
+        &[
+            "INTEGER",
+            "INT",
+            "BIGINT",
+            "INT2",
+            "INT8",
+            "TINYINT",
+            "MEDIUMINT",
+            "UNSIGNED BIG INT",
+        ],
         "affinity_integer_class",
     );
 }
@@ -124,7 +137,15 @@ fn affinity_integer_class() {
 fn affinity_text_class() {
     // Contains "CHAR"/"CLOB"/"TEXT" -> TEXT affinity.
     affinity_probe(
-        &["TEXT", "CLOB", "CHARACTER(20)", "VARCHAR(255)", "NCHAR(10)", "NVARCHAR(8)", "VARYING CHARACTER(5)"],
+        &[
+            "TEXT",
+            "CLOB",
+            "CHARACTER(20)",
+            "VARCHAR(255)",
+            "NCHAR(10)",
+            "NVARCHAR(8)",
+            "VARYING CHARACTER(5)",
+        ],
         "affinity_text_class",
     );
 }
@@ -149,7 +170,14 @@ fn affinity_numeric_class() {
     // The "otherwise" bucket -> NUMERIC. STRING/BOOLEAN/DATE/DATETIME are the
     // ones most likely to be mismapped to TEXT/INTEGER.
     affinity_probe(
-        &["NUMERIC", "DECIMAL(10,5)", "BOOLEAN", "DATE", "DATETIME", "STRING"],
+        &[
+            "NUMERIC",
+            "DECIMAL(10,5)",
+            "BOOLEAN",
+            "DATE",
+            "DATETIME",
+            "STRING",
+        ],
         "affinity_numeric_class",
     );
 }

@@ -89,9 +89,9 @@ fn assert_scalar(queries: &[&str], label: &str) {
 fn printf_quote_q() {
     assert_scalar(
         &[
-            "SELECT printf('%q', 'O''Brien')",  // O''Brien
-            "SELECT printf('%q', 'plain')",     // plain
-            "SELECT printf('[%q]', '')",        // [] (empty)
+            "SELECT printf('%q', 'O''Brien')", // O''Brien
+            "SELECT printf('%q', 'plain')",    // plain
+            "SELECT printf('[%q]', '')",       // [] (empty)
         ],
         "printf_quote_q",
     );
@@ -101,10 +101,10 @@ fn printf_quote_q() {
 fn printf_quote_Q_and_w() {
     assert_scalar(
         &[
-            "SELECT printf('%Q', 'hi')",        // 'hi' (with surrounding quotes)
-            "SELECT printf('%Q', 'O''Brien')",  // 'O''Brien'
-            "SELECT printf('%Q', NULL)",        // NULL (the literal, unquoted)
-            "SELECT printf('%w', 'a\"b')",      // a""b (identifier escaping)
+            "SELECT printf('%Q', 'hi')",       // 'hi' (with surrounding quotes)
+            "SELECT printf('%Q', 'O''Brien')", // 'O''Brien'
+            "SELECT printf('%Q', NULL)",       // NULL (the literal, unquoted)
+            "SELECT printf('%w', 'a\"b')",     // a""b (identifier escaping)
         ],
         "printf_quote_Q_and_w",
     );
@@ -114,11 +114,11 @@ fn printf_quote_Q_and_w() {
 fn printf_numeric_specifiers() {
     assert_scalar(
         &[
-            "SELECT printf('%o', 8)",          // '10' (octal)
-            "SELECT printf('%i', 42)",         // '42'
-            "SELECT printf('%e', 12345.678)",  // scientific
-            "SELECT printf('%g', 0.0001)",     // '0.0001'
-            "SELECT printf('%g', 1000000.0)",  // '1e+06'
+            "SELECT printf('%o', 8)",         // '10' (octal)
+            "SELECT printf('%i', 42)",        // '42'
+            "SELECT printf('%e', 12345.678)", // scientific
+            "SELECT printf('%g', 0.0001)",    // '0.0001'
+            "SELECT printf('%g', 1000000.0)", // '1e+06'
         ],
         "printf_numeric_specifiers",
     );
@@ -142,10 +142,10 @@ fn printf_u_and_c() {
 fn printf_width_precision_flags() {
     assert_scalar(
         &[
-            "SELECT printf('[%-10d]', 42)",    // left-justify
-            "SELECT printf('[% d]', 42)",      // space flag
+            "SELECT printf('[%-10d]', 42)",      // left-justify
+            "SELECT printf('[% d]', 42)",        // space flag
             "SELECT printf('[%5.2f]', 3.14159)", // ' 3.14'
-            "SELECT printf('%.3s', 'abcdef')", // 'abc' (string precision)
+            "SELECT printf('%.3s', 'abcdef')",   // 'abc' (string precision)
         ],
         "printf_width_precision_flags",
     );

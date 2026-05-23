@@ -99,7 +99,7 @@ fn check(queries: &[&str], label: &str) {
 fn scalar_subquery_single_column_ok() {
     check(
         &[
-            "SELECT (SELECT 1)",              // 1
+            "SELECT (SELECT 1)",                     // 1
             "SELECT (SELECT a FROM t WHERE a = 20)", // 20
             // multi-row is NOT an error -- SQLite takes the first
             "SELECT (SELECT a FROM t ORDER BY a)", // 10

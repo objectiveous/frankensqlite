@@ -99,15 +99,15 @@ fn assert_scalar(queries: &[&str], label: &str) {
 fn concat_treats_null_as_empty() {
     assert_scalar(
         &[
-            "SELECT concat('a','b','c')", // 'abc'
+            "SELECT concat('a','b','c')",    // 'abc'
             "SELECT concat('a', NULL, 'b')", // 'ab' (NULL skipped, NOT NULL like ||)
-            "SELECT concat(1, 2, 3)",     // '123' (numbers coerced to text)
-            "SELECT concat('x', 1, 2.5)", // 'x12.5'
-            "SELECT concat(NULL, NULL)",  // '' (empty string, never NULL)
-            "SELECT concat('a')",         // 'a'
+            "SELECT concat(1, 2, 3)",        // '123' (numbers coerced to text)
+            "SELECT concat('x', 1, 2.5)",    // 'x12.5'
+            "SELECT concat(NULL, NULL)",     // '' (empty string, never NULL)
+            "SELECT concat('a')",            // 'a'
             "SELECT typeof(concat('a', 1))", // text
             // contrast: || propagates NULL where concat() does not
-            "SELECT 'a' || NULL || 'b'",  // NULL
+            "SELECT 'a' || NULL || 'b'", // NULL
         ],
         "concat_treats_null_as_empty",
     );
@@ -117,13 +117,13 @@ fn concat_treats_null_as_empty() {
 fn concat_ws_separator_rules() {
     assert_scalar(
         &[
-            "SELECT concat_ws('-', 'a', 'b', 'c')", // 'a-b-c'
+            "SELECT concat_ws('-', 'a', 'b', 'c')",  // 'a-b-c'
             "SELECT concat_ws('-', 'a', NULL, 'c')", // 'a-c' (NULL skipped, no doubled sep)
-            "SELECT concat_ws(',', 1, 2, 3)",       // '1,2,3'
-            "SELECT concat_ws('-', 'only')",        // 'only' (no trailing sep)
-            "SELECT concat_ws(',', NULL, NULL)",    // '' (all values NULL -> empty)
-            "SELECT concat_ws(NULL, 'a', 'b')",     // NULL (NULL separator -> NULL)
-            "SELECT typeof(concat_ws(',', 'a'))",   // text
+            "SELECT concat_ws(',', 1, 2, 3)",        // '1,2,3'
+            "SELECT concat_ws('-', 'only')",         // 'only' (no trailing sep)
+            "SELECT concat_ws(',', NULL, NULL)",     // '' (all values NULL -> empty)
+            "SELECT concat_ws(NULL, 'a', 'b')",      // NULL (NULL separator -> NULL)
+            "SELECT typeof(concat_ws(',', 'a'))",    // text
         ],
         "concat_ws_separator_rules",
     );
@@ -159,17 +159,17 @@ fn string_agg_aggregate() {
 fn octet_length_and_unhex() {
     assert_scalar(
         &[
-            "SELECT octet_length('abc')",     // 3
-            "SELECT octet_length('')",        // 0
-            "SELECT octet_length('é')",       // 2 (UTF-8 two bytes)
-            "SELECT length('é')",             // 1 (one character) — contrast
-            "SELECT octet_length(X'010203')", // 3
-            "SELECT octet_length(12345)",     // 5 (text form '12345')
-            "SELECT unhex('414243')",         // X'414243'  ('ABC' bytes)
-            "SELECT typeof(unhex('41'))",     // blob
+            "SELECT octet_length('abc')",      // 3
+            "SELECT octet_length('')",         // 0
+            "SELECT octet_length('é')",        // 2 (UTF-8 two bytes)
+            "SELECT length('é')",              // 1 (one character) — contrast
+            "SELECT octet_length(X'010203')",  // 3
+            "SELECT octet_length(12345)",      // 5 (text form '12345')
+            "SELECT unhex('414243')",          // X'414243'  ('ABC' bytes)
+            "SELECT typeof(unhex('41'))",      // blob
             "SELECT hex(unhex('48656C6C6F'))", // '48656C6C6F' round trip
-            "SELECT unhex('xyz')",            // NULL (invalid hex)
-            "SELECT unhex('')",               // X'' (empty blob)
+            "SELECT unhex('xyz')",             // NULL (invalid hex)
+            "SELECT unhex('')",                // X'' (empty blob)
         ],
         "octet_length_and_unhex",
     );

@@ -774,7 +774,11 @@ mod tests {
     #[test]
     fn kind_str_covers_all_ten_variants() {
         let events = all_event_variants();
-        assert_eq!(events.len(), 10, "all_event_variants must cover 10 variants");
+        assert_eq!(
+            events.len(),
+            10,
+            "all_event_variants must cover 10 variants"
+        );
         let kinds: Vec<&str> = events.iter().map(|e| e.kind_str()).collect();
         let unique: std::collections::HashSet<&str> = kinds.iter().copied().collect();
         assert_eq!(unique.len(), 10, "all kind_str values must be distinct");
@@ -826,7 +830,10 @@ mod tests {
         assert_eq!(rb.len(), 2);
         let drained = rb.drain();
         assert_eq!(drained.len(), 2);
-        if let WalTelemetryEvent::WalReset { new_checkpoint_seq, .. } = &drained[0] {
+        if let WalTelemetryEvent::WalReset {
+            new_checkpoint_seq, ..
+        } = &drained[0]
+        {
             assert_eq!(*new_checkpoint_seq, 3);
         } else {
             panic!("expected WalReset");

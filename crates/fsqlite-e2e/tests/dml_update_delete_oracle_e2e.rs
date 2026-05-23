@@ -114,7 +114,7 @@ fn update_all_rows_and_case() {
         &[
             "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)",
             "INSERT INTO t VALUES (1,1),(2,2),(3,3),(4,4)",
-            "UPDATE t SET n = n * n",                          // no WHERE -> all rows
+            "UPDATE t SET n = n * n", // no WHERE -> all rows
             "UPDATE t SET n = CASE WHEN n > 5 THEN n ELSE 0 END",
         ],
         &["SELECT id, n FROM t ORDER BY id"], // 0,0,9,16

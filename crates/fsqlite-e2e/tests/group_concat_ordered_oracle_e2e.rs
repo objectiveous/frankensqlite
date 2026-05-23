@@ -135,11 +135,11 @@ fn group_concat_ordered() {
         &f,
         &r,
         &[
-            "SELECT group_concat(v ORDER BY v) FROM t WHERE grp = 'a'",      // '1,2,3'
+            "SELECT group_concat(v ORDER BY v) FROM t WHERE grp = 'a'", // '1,2,3'
             "SELECT group_concat(v ORDER BY v DESC) FROM t WHERE grp = 'a'", // '3,2,1'
             "SELECT group_concat(v, '|' ORDER BY v) FROM t WHERE grp = 'a'", // '1|2|3'
             // Concatenate one column ordered by another (names by salary v).
-            "SELECT group_concat(name ORDER BY v) FROM t WHERE grp = 'a'",   // 'ann,bob,cara'
+            "SELECT group_concat(name ORDER BY v) FROM t WHERE grp = 'a'", // 'ann,bob,cara'
             // Grouped + ordered.
             "SELECT grp, group_concat(v ORDER BY v) FROM t GROUP BY grp ORDER BY grp",
         ],

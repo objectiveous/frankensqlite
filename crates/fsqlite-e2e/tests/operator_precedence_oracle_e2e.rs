@@ -89,12 +89,12 @@ fn assert_scalar(queries: &[&str], label: &str) {
 fn precedence_arithmetic() {
     assert_scalar(
         &[
-            "SELECT 2 + 3 * 4",       // 14 (* over +)
-            "SELECT (2 + 3) * 4",     // 20
-            "SELECT 2 * 3 + 4 * 5",   // 26
-            "SELECT 10 - 2 - 3",      // 5 (left assoc)
-            "SELECT 20 / 4 / 5",      // 1 (left assoc)
-            "SELECT 5 % 3 * 2",       // 4 (% same level as *, left assoc)
+            "SELECT 2 + 3 * 4",     // 14 (* over +)
+            "SELECT (2 + 3) * 4",   // 20
+            "SELECT 2 * 3 + 4 * 5", // 26
+            "SELECT 10 - 2 - 3",    // 5 (left assoc)
+            "SELECT 20 / 4 / 5",    // 1 (left assoc)
+            "SELECT 5 % 3 * 2",     // 4 (% same level as *, left assoc)
         ],
         "precedence_arithmetic",
     );
@@ -119,10 +119,10 @@ fn precedence_unary_minus_and_bitnot() {
 fn precedence_bitwise_vs_arithmetic() {
     assert_scalar(
         &[
-            "SELECT 1 | 2 & 3",   // & over | -> 1 | (2&3=2) = 3
-            "SELECT 4 + 2 & 6",   // + over & -> (4+2)&6 = 6
-            "SELECT 1 << 2 + 1",  // + over << -> 1 << 3 = 8
-            "SELECT 6 & 4 | 1",   // (6&4=4) | 1 = 5
+            "SELECT 1 | 2 & 3",  // & over | -> 1 | (2&3=2) = 3
+            "SELECT 4 + 2 & 6",  // + over & -> (4+2)&6 = 6
+            "SELECT 1 << 2 + 1", // + over << -> 1 << 3 = 8
+            "SELECT 6 & 4 | 1",  // (6&4=4) | 1 = 5
         ],
         "precedence_bitwise_vs_arithmetic",
     );
@@ -146,11 +146,11 @@ fn precedence_concat_tightest() {
 fn precedence_boolean_and_over_or() {
     assert_scalar(
         &[
-            "SELECT 1 = 1 AND 2 = 2 OR 3 = 4",   // (1 AND 1) OR 0 -> 1
-            "SELECT 1 = 1 OR 2 = 3 AND 4 = 5",   // 1 OR (0 AND 0) -> 1 (AND tighter)
-            "SELECT 0 = 1 AND 1 = 1 OR 1 = 1",   // (0 AND 1) OR 1 -> 1
-            "SELECT NOT 1 = 2",                  // NOT (1=2) -> 1
-            "SELECT NOT 0 AND 1",                // (NOT 0) AND 1 -> 1
+            "SELECT 1 = 1 AND 2 = 2 OR 3 = 4", // (1 AND 1) OR 0 -> 1
+            "SELECT 1 = 1 OR 2 = 3 AND 4 = 5", // 1 OR (0 AND 0) -> 1 (AND tighter)
+            "SELECT 0 = 1 AND 1 = 1 OR 1 = 1", // (0 AND 1) OR 1 -> 1
+            "SELECT NOT 1 = 2",                // NOT (1=2) -> 1
+            "SELECT NOT 0 AND 1",              // (NOT 0) AND 1 -> 1
         ],
         "precedence_boolean_and_over_or",
     );
@@ -160,8 +160,8 @@ fn precedence_boolean_and_over_or() {
 fn precedence_comparison_vs_arithmetic() {
     assert_scalar(
         &[
-            "SELECT 2 + 3 < 4 + 2",  // (5 < 6) -> 1
-            "SELECT 2 * 3 = 6",      // (6 = 6) -> 1
+            "SELECT 2 + 3 < 4 + 2",       // (5 < 6) -> 1
+            "SELECT 2 * 3 = 6",           // (6 = 6) -> 1
             "SELECT 1 + 1 = 2 AND 3 > 1", // (2=2) AND (3>1) -> 1
         ],
         "precedence_comparison_vs_arithmetic",

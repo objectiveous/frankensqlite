@@ -103,8 +103,8 @@ fn float_text_repeating_and_precision() {
     assert_scalar(
         &[
             // Shortest round-trip on SQLite 3.43+ and Rust should agree.
-            "SELECT CAST(1.0/3.0 AS TEXT)",  // 0.3333333333333333
-            "SELECT CAST(2.0/3.0 AS TEXT)",  // 0.6666666666666666
+            "SELECT CAST(1.0/3.0 AS TEXT)",   // 0.3333333333333333
+            "SELECT CAST(2.0/3.0 AS TEXT)",   // 0.6666666666666666
             "SELECT CAST(0.1 + 0.2 AS TEXT)", // 0.30000000000000004
             "SELECT (10.0/3.0) || ''",
         ],
@@ -116,10 +116,10 @@ fn float_text_repeating_and_precision() {
 fn float_text_integer_valued() {
     assert_scalar(
         &[
-            "SELECT CAST(3.0 AS TEXT)",      // '3.0'
-            "SELECT CAST(100.0 AS TEXT)",    // '100.0'
-            "SELECT CAST(-7.0 AS TEXT)",     // '-7.0'
-            "SELECT 42.0 || ''",             // '42.0'
+            "SELECT CAST(3.0 AS TEXT)",   // '3.0'
+            "SELECT CAST(100.0 AS TEXT)", // '100.0'
+            "SELECT CAST(-7.0 AS TEXT)",  // '-7.0'
+            "SELECT 42.0 || ''",          // '42.0'
         ],
         "float_text_integer_valued",
     );

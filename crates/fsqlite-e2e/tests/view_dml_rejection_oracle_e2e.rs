@@ -82,7 +82,9 @@ fn stmt_agreement(stmt: &str) -> Option<String> {
     match (&fe, &re) {
         (Ok(_), Ok(())) | (Err(_), Err(_)) => None,
         (Ok(_), Err(e)) => Some(format!("FRANK_OK / CSQL_ERR: `{stmt}`\n  csql: ERROR({e})")),
-        (Err(e), Ok(())) => Some(format!("FRANK_ERR / CSQL_OK: `{stmt}`\n  frank: ERROR({e})")),
+        (Err(e), Ok(())) => Some(format!(
+            "FRANK_ERR / CSQL_OK: `{stmt}`\n  frank: ERROR({e})"
+        )),
     }
 }
 
@@ -113,7 +115,9 @@ fn select_from_view_and_base_dml_ok() {
     let q = "SELECT a, b FROM v ORDER BY a";
     match (frank_rows(&f, q), sqlite_rows(&r, q)) {
         (Ok(a), Ok(b)) if a == b => {}
-        (fa, rb) => mismatches.push(format!("SELECT mismatch: {q}\n  frank: {fa:?}\n  csql: {rb:?}")),
+        (fa, rb) => mismatches.push(format!(
+            "SELECT mismatch: {q}\n  frank: {fa:?}\n  csql: {rb:?}"
+        )),
     }
     // ...and DML against the BASE table is fine on both, reflected by the view.
     assert!(stmt_agreement("INSERT INTO t VALUES (4, 40)").is_none());

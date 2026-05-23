@@ -87,10 +87,10 @@ fn assert_scalar(queries: &[&str], label: &str) {
 fn cast_blob_to_text() {
     assert_scalar(
         &[
-            "SELECT CAST(X'48656C6C6F' AS TEXT)",       // 'Hello'
-            "SELECT CAST(X'31' AS TEXT)",               // '1'
-            "SELECT CAST(X'' AS TEXT)",                 // '' (empty)
-            "SELECT typeof(CAST(X'41' AS TEXT))",       // text
+            "SELECT CAST(X'48656C6C6F' AS TEXT)",         // 'Hello'
+            "SELECT CAST(X'31' AS TEXT)",                 // '1'
+            "SELECT CAST(X'' AS TEXT)",                   // '' (empty)
+            "SELECT typeof(CAST(X'41' AS TEXT))",         // text
             "SELECT length(CAST(X'48656C6C6F' AS TEXT))", // 5
         ],
         "cast_blob_to_text",
@@ -101,12 +101,12 @@ fn cast_blob_to_text() {
 fn cast_blob_to_integer() {
     assert_scalar(
         &[
-            "SELECT CAST(X'31' AS INTEGER)",        // '1' -> 1
-            "SELECT CAST(X'313233' AS INTEGER)",    // '123' -> 123
-            "SELECT CAST(X'2D3432' AS INTEGER)",    // '-42' -> -42
+            "SELECT CAST(X'31' AS INTEGER)",         // '1' -> 1
+            "SELECT CAST(X'313233' AS INTEGER)",     // '123' -> 123
+            "SELECT CAST(X'2D3432' AS INTEGER)",     // '-42' -> -42
             "SELECT CAST(X'3132616263' AS INTEGER)", // '12abc' -> 12 (prefix)
-            "SELECT CAST(X'6162' AS INTEGER)",      // 'ab' -> 0
-            "SELECT CAST(X'' AS INTEGER)",          // empty -> 0
+            "SELECT CAST(X'6162' AS INTEGER)",       // 'ab' -> 0
+            "SELECT CAST(X'' AS INTEGER)",           // empty -> 0
         ],
         "cast_blob_to_integer",
     );

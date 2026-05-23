@@ -1001,12 +1001,27 @@ mod tests {
         let plan = sample_plan();
         let mut log = DecisionLog::new();
         for i in 0..3 {
-            let _ =
-                log.record_plan(&format!("Q{i}"), &tables, &indexes, 0, None, 0, &plan, 1, false);
+            let _ = log.record_plan(
+                &format!("Q{i}"),
+                &tables,
+                &indexes,
+                0,
+                None,
+                0,
+                &plan,
+                1,
+                false,
+            );
         }
         let s = log.calibration_stats();
-        assert_eq!(s.calibrated_decisions, 0, "no actuals recorded -> nothing calibrated");
-        assert!(!s.mean_ratio.is_nan(), "uncalibrated log must not produce NaN");
+        assert_eq!(
+            s.calibrated_decisions, 0,
+            "no actuals recorded -> nothing calibrated"
+        );
+        assert!(
+            !s.mean_ratio.is_nan(),
+            "uncalibrated log must not produce NaN"
+        );
     }
 
     #[test]
@@ -1157,7 +1172,9 @@ mod tests {
         );
         // A value with more than three decimals is rounded to three.
         assert_eq!(
-            access_path_kind_label(&AccessPathKind::IndexScanRange { selectivity: 0.12345 }),
+            access_path_kind_label(&AccessPathKind::IndexScanRange {
+                selectivity: 0.12345
+            }),
             "index_scan_range(sel=0.123)"
         );
     }
@@ -1289,15 +1306,36 @@ mod tests {
 
         // Median boundaries are inclusive [0.5, 2.0]; rate must stay under 10%.
         assert!(stats(100, 0, 1.0).is_well_calibrated());
-        assert!(stats(100, 0, 0.5).is_well_calibrated(), "median == 0.5 is in range");
-        assert!(stats(100, 0, 2.0).is_well_calibrated(), "median == 2.0 is in range");
-        assert!(!stats(100, 0, 0.49).is_well_calibrated(), "median below 0.5 fails");
-        assert!(!stats(100, 0, 2.01).is_well_calibrated(), "median above 2.0 fails");
+        assert!(
+            stats(100, 0, 0.5).is_well_calibrated(),
+            "median == 0.5 is in range"
+        );
+        assert!(
+            stats(100, 0, 2.0).is_well_calibrated(),
+            "median == 2.0 is in range"
+        );
+        assert!(
+            !stats(100, 0, 0.49).is_well_calibrated(),
+            "median below 0.5 fails"
+        );
+        assert!(
+            !stats(100, 0, 2.01).is_well_calibrated(),
+            "median above 2.0 fails"
+        );
 
         // The miscalibration-rate threshold is strict (< 0.10): exactly 10% fails.
-        assert!(stats(100, 9, 1.0).is_well_calibrated(), "9% with a good median is ok");
-        assert!(!stats(100, 10, 1.0).is_well_calibrated(), "exactly 10% is not ok");
-        assert!(!stats(100, 50, 1.0).is_well_calibrated(), "high rate overrides a good median");
+        assert!(
+            stats(100, 9, 1.0).is_well_calibrated(),
+            "9% with a good median is ok"
+        );
+        assert!(
+            !stats(100, 10, 1.0).is_well_calibrated(),
+            "exactly 10% is not ok"
+        );
+        assert!(
+            !stats(100, 50, 1.0).is_well_calibrated(),
+            "high rate overrides a good median"
+        );
     }
 
     #[test]

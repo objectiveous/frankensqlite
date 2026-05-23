@@ -1607,7 +1607,10 @@ mod tests {
         // Disabled: every side/heat returns the topology target verbatim, so the
         // baseline/topology split policy is byte-identical to pre-adaptive code.
         for heat in [0_u64, 2, 3, 32, 64, 4096] {
-            assert_eq!(adaptive_fill_factor_target("right_edge", 6_500, heat), 6_500);
+            assert_eq!(
+                adaptive_fill_factor_target("right_edge", 6_500, heat),
+                6_500
+            );
             assert_eq!(adaptive_fill_factor_target("left_edge", 4_500, heat), 4_500);
             assert_eq!(adaptive_fill_factor_target("interior", 5_000, heat), 5_000);
         }
@@ -1630,13 +1633,22 @@ mod tests {
         let mut prev = 8_000;
         for heat in [3_u64, 16, 33, 50, 64] {
             let target = adaptive_fill_factor_target("right_edge", 8_000, heat);
-            assert!(target >= prev, "right-edge target must be monotonic in heat");
-            assert!(target <= 9_000, "right-edge target must respect the ceiling");
+            assert!(
+                target >= prev,
+                "right-edge target must be monotonic in heat"
+            );
+            assert!(
+                target <= 9_000,
+                "right-edge target must respect the ceiling"
+            );
             prev = target;
         }
         // Saturation heat yields the full extra shift, then clamps flat above it.
         assert_eq!(adaptive_fill_factor_target("right_edge", 8_000, 64), 9_000);
-        assert_eq!(adaptive_fill_factor_target("right_edge", 8_000, 10_000), 9_000);
+        assert_eq!(
+            adaptive_fill_factor_target("right_edge", 8_000, 10_000),
+            9_000
+        );
 
         // Left-edge: target descends with heat, clamped to the floor.
         let mut prev = 4_500;
@@ -1683,7 +1695,10 @@ mod tests {
         assert!(!adaptive_fill_factor_enabled());
         assert_eq!(adaptive_fill_factor_target("right_edge", 8_000, 64), 8_000);
 
-        assert_eq!(adaptive_fill_factor_policy_id(), "btree.adaptive_fill_factor.v1");
+        assert_eq!(
+            adaptive_fill_factor_policy_id(),
+            "btree.adaptive_fill_factor.v1"
+        );
     }
 
     #[test]
@@ -1698,7 +1713,15 @@ mod tests {
             );
         }
         // Kill-switch / negative labels disable it.
-        for raw in ["off", "OFF", "false", "False", "0", "baseline", "  baseline  "] {
+        for raw in [
+            "off",
+            "OFF",
+            "false",
+            "False",
+            "0",
+            "baseline",
+            "  baseline  ",
+        ] {
             assert_eq!(
                 super::parse_adaptive_fill_factor_flag(raw),
                 Some(false),

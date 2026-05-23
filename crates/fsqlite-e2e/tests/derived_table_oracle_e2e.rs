@@ -116,11 +116,9 @@ fn derived_joined_to_base_table() {
     check(
         &f,
         &r,
-        &[
-            "SELECT s.id, agg.region_total FROM sales s \
+        &["SELECT s.id, agg.region_total FROM sales s \
              JOIN (SELECT region, sum(amount) AS region_total FROM sales GROUP BY region) agg \
-             ON s.region = agg.region ORDER BY s.id",
-        ],
+             ON s.region = agg.region ORDER BY s.id"],
         "derived_joined_to_base_table",
     );
 }

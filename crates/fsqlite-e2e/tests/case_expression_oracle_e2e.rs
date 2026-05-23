@@ -108,8 +108,8 @@ fn case_searched_form() {
         &[
             "SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 2 > 1 THEN 'b' ELSE 'c' END", // 'b'
             // 0 is false, NULL is not true -> ELSE.
-            "SELECT CASE WHEN 0 THEN 'a' WHEN NULL THEN 'b' ELSE 'c' END",      // 'c'
-            "SELECT CASE WHEN 1 THEN 'yes' END",                               // 'yes'
+            "SELECT CASE WHEN 0 THEN 'a' WHEN NULL THEN 'b' ELSE 'c' END", // 'c'
+            "SELECT CASE WHEN 1 THEN 'yes' END",                           // 'yes'
         ],
         "case_searched_form",
     );
@@ -132,8 +132,8 @@ fn case_when_null_never_matches() {
 fn case_no_else_yields_null() {
     assert_scalar(
         &[
-            "SELECT CASE WHEN 1 > 2 THEN 'a' END",        // NULL
-            "SELECT typeof(CASE WHEN 0 THEN 1 END)",      // 'null'
+            "SELECT CASE WHEN 1 > 2 THEN 'a' END",               // NULL
+            "SELECT typeof(CASE WHEN 0 THEN 1 END)",             // 'null'
             "SELECT CASE 9 WHEN 1 THEN 'a' WHEN 2 THEN 'b' END", // NULL
         ],
         "case_no_else_yields_null",
@@ -156,10 +156,10 @@ fn case_first_match_wins() {
 fn case_branch_type_coercion() {
     assert_scalar(
         &[
-            "SELECT CASE WHEN 1 THEN 1 ELSE 'x' END",            // 1 (integer branch chosen)
-            "SELECT typeof(CASE WHEN 1 THEN 1 ELSE 2.5 END)",    // integer
-            "SELECT CASE WHEN 0 THEN 1 ELSE 2.5 END",            // 2.5
-            "SELECT typeof(CASE WHEN 0 THEN 1 ELSE 2.5 END)",    // real
+            "SELECT CASE WHEN 1 THEN 1 ELSE 'x' END", // 1 (integer branch chosen)
+            "SELECT typeof(CASE WHEN 1 THEN 1 ELSE 2.5 END)", // integer
+            "SELECT CASE WHEN 0 THEN 1 ELSE 2.5 END", // 2.5
+            "SELECT typeof(CASE WHEN 0 THEN 1 ELSE 2.5 END)", // real
         ],
         "case_branch_type_coercion",
     );

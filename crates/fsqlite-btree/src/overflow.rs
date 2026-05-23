@@ -479,7 +479,10 @@ mod tests {
         // zero-padded out to the full page size.
         let last = &pages[&103];
         assert_eq!(last.len(), 20);
-        assert!(last[6..].iter().all(|&b| b == 0), "the tail must be zero-padded");
+        assert!(
+            last[6..].iter().all(|&b| b == 0),
+            "the tail must be zero-padded"
+        );
     }
 
     #[test]
@@ -593,14 +596,22 @@ mod tests {
         let mut out = Vec::new();
         read_overflow_chain_prefix_into(&local, pg10, 41, usable, 10, &mut read, &mut out).unwrap();
         assert_eq!(out, (0u8..10).collect::<Vec<u8>>());
-        assert_eq!(reads.get(), 1, "prefix should stop after the first overflow page");
+        assert_eq!(
+            reads.get(),
+            1,
+            "prefix should stop after the first overflow page"
+        );
 
         // A prefix wholly within the local data reads no overflow pages at all.
         reads.set(0);
         out.clear();
         read_overflow_chain_prefix_into(&local, pg10, 41, usable, 3, &mut read, &mut out).unwrap();
         assert_eq!(out, vec![0u8, 1, 2]);
-        assert_eq!(reads.get(), 0, "local-only prefix touches no overflow pages");
+        assert_eq!(
+            reads.get(),
+            0,
+            "local-only prefix touches no overflow pages"
+        );
 
         // A zero-length prefix yields an empty result and reads nothing.
         reads.set(0);
@@ -650,7 +661,11 @@ mod tests {
         let mut out = Vec::new();
         read_overflow_chain_prefix_into(&local, pg10, 41, usable, 5, &mut read, &mut out).unwrap();
         assert_eq!(out, (0u8..5).collect::<Vec<u8>>());
-        assert_eq!(reads.get(), 0, "prefix at the local boundary reads no overflow pages");
+        assert_eq!(
+            reads.get(),
+            0,
+            "prefix at the local boundary reads no overflow pages"
+        );
 
         // Prefix ending EXACTLY at the end of the first overflow page (5 local +
         // 12 = 17): the chain pointer to page 11 must NOT be followed, so only
@@ -672,6 +687,10 @@ mod tests {
         read_overflow_chain_prefix_into(&local, pg10, 41, usable, 1000, &mut read, &mut out)
             .unwrap();
         assert_eq!(out, (0u8..41).collect::<Vec<u8>>());
-        assert_eq!(reads.get(), 3, "an over-large prefix clamps to the full payload");
+        assert_eq!(
+            reads.get(),
+            3,
+            "an over-large prefix clamps to the full payload"
+        );
     }
 }

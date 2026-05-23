@@ -101,14 +101,14 @@ fn integer_pk_is_rowid_alias() {
     scenario(
         &[
             "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
-            "INSERT INTO t(v) VALUES ('a')",        // id auto = 1
+            "INSERT INTO t(v) VALUES ('a')", // id auto = 1
             "INSERT INTO t(id, v) VALUES (100, 'b')",
             "INSERT INTO t(id, v) VALUES (NULL, 'c')", // NULL alias -> auto = 101
         ],
         &[
             "SELECT id, rowid, v FROM t ORDER BY id", // (1,1,a),(100,100,b),(101,101,c)
             "SELECT count(*) FROM t WHERE id = rowid", // 3 (alias)
-            "SELECT typeof(id) FROM t ORDER BY id",    // integer x3
+            "SELECT typeof(id) FROM t ORDER BY id",   // integer x3
         ],
         "integer_pk_is_rowid_alias",
     );
@@ -119,7 +119,7 @@ fn integer_pk_desc_is_not_rowid_alias() {
     scenario(
         &[
             "CREATE TABLE t (id INTEGER PRIMARY KEY DESC, v TEXT)",
-            "INSERT INTO t(id, v) VALUES (5, 'a')",  // hidden rowid = 1
+            "INSERT INTO t(id, v) VALUES (5, 'a')", // hidden rowid = 1
             "INSERT INTO t(id, v) VALUES (10, 'b')", // hidden rowid = 2
             // not the alias, so NULL is allowed and stays NULL
             "INSERT INTO t(id, v) VALUES (NULL, 'c')", // hidden rowid = 3, id = NULL
@@ -143,14 +143,14 @@ fn nonalias_primary_key_allows_nulls() {
         &[
             "CREATE TABLE t (a INTEGER, b TEXT PRIMARY KEY)",
             "INSERT INTO t VALUES (1, 'x')",
-            "INSERT INTO t VALUES (2, NULL)",  // NULL PK allowed
-            "INSERT INTO t VALUES (3, NULL)",  // second NULL PK also allowed
-            "INSERT INTO t VALUES (4, 'x')",   // duplicate non-NULL -> UNIQUE error
+            "INSERT INTO t VALUES (2, NULL)", // NULL PK allowed
+            "INSERT INTO t VALUES (3, NULL)", // second NULL PK also allowed
+            "INSERT INTO t VALUES (4, 'x')",  // duplicate non-NULL -> UNIQUE error
         ],
         &[
-            "SELECT count(*) FROM t",                       // 3 (the dup failed)
-            "SELECT count(*) FROM t WHERE b IS NULL",       // 2
-            "SELECT a FROM t WHERE b = 'x'",                // 1
+            "SELECT count(*) FROM t",                 // 3 (the dup failed)
+            "SELECT count(*) FROM t WHERE b IS NULL", // 2
+            "SELECT a FROM t WHERE b = 'x'",          // 1
         ],
         "nonalias_primary_key_allows_nulls",
     );

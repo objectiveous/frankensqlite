@@ -559,11 +559,17 @@ mod tests {
         // frame_addr reports the loaded address; an unregistered page has none.
         assert_eq!(csm.frame_addr(1), Some(0x1000));
         assert_eq!(csm.frame_addr(2), Some(0x2000));
-        assert!(csm.temperature(999).is_none(), "unregistered page has no temperature");
+        assert!(
+            csm.temperature(999).is_none(),
+            "unregistered page has no temperature"
+        );
 
         // One scan cools both unpinned pages; the pinned root stays Hot.
         let result = csm.run_cooling_scan();
-        assert_eq!(result.pages_cooled, 2, "two unpinned pages cool; the pinned root does not");
+        assert_eq!(
+            result.pages_cooled, 2,
+            "two unpinned pages cool; the pinned root does not"
+        );
         assert_eq!(csm.temperature(1), Some(PageTemperature::Cooling));
         assert_eq!(csm.temperature(2), Some(PageTemperature::Cooling));
         assert_eq!(csm.temperature(3), Some(PageTemperature::Hot));

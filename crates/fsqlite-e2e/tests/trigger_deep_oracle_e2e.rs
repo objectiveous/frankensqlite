@@ -130,7 +130,7 @@ fn trigger_update_of_specific_column() {
             "UPDATE t SET a = 5, b = 200 WHERE id = 1", // fires (a is in SET list)
         ],
         &[
-            "SELECT count(*) FROM log",        // 2
+            "SELECT count(*) FROM log",           // 2
             "SELECT id, a, b FROM t ORDER BY id", // (1,5,200)
         ],
         "trigger_update_of_specific_column",
@@ -206,4 +206,3 @@ fn trigger_cross_table_cascade() {
         "trigger_cross_table_cascade",
     );
 }
-

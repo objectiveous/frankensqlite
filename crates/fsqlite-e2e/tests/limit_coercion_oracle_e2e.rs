@@ -105,10 +105,10 @@ fn limit_offset_lossless_integer_values() {
         &f,
         &r,
         &[
-            "SELECT id FROM t ORDER BY id LIMIT '3'",        // 1,2,3 (text -> 3)
-            "SELECT id FROM t ORDER BY id LIMIT 1 + 1",      // 1,2 (expression)
+            "SELECT id FROM t ORDER BY id LIMIT '3'", // 1,2,3 (text -> 3)
+            "SELECT id FROM t ORDER BY id LIMIT 1 + 1", // 1,2 (expression)
             "SELECT id FROM t ORDER BY id LIMIT (SELECT 2)", // 1,2 (scalar subquery)
-            "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET '1'",        // 2,3 (text offset)
+            "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET '1'", // 2,3 (text offset)
             "SELECT id FROM t ORDER BY id LIMIT 10 OFFSET (SELECT 2)", // 3,4,5
         ],
         "limit_offset_lossless_integer_values",
@@ -125,9 +125,9 @@ fn limit_offset_noninteger_rejected() {
         &f,
         &r,
         &[
-            "SELECT id FROM t ORDER BY id LIMIT 2.9",          // real with fraction
-            "SELECT id FROM t ORDER BY id LIMIT 'abc'",        // non-numeric text
-            "SELECT id FROM t ORDER BY id LIMIT NULL",         // NULL
+            "SELECT id FROM t ORDER BY id LIMIT 2.9", // real with fraction
+            "SELECT id FROM t ORDER BY id LIMIT 'abc'", // non-numeric text
+            "SELECT id FROM t ORDER BY id LIMIT NULL", // NULL
             "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1.5", // real offset
         ],
         "limit_offset_noninteger_rejected",

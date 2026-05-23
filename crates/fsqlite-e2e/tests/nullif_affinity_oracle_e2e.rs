@@ -96,14 +96,17 @@ fn data() -> (Connection, rusqlite::Connection) {
 
 #[test]
 fn nullif_same_type_and_numeric_controls() {
-    assert_scalar(&[
-        "SELECT nullif(5, 5)",     // NULL
-        "SELECT nullif(5, 6)",     // 5
-        "SELECT nullif(5, 5.0)",   // NULL (numeric int vs real)
-        "SELECT nullif('a','a')",  // NULL
-        "SELECT nullif(NULL, 1)",  // NULL
-        "SELECT nullif('5', 5)",   // bare literals, no affinity -> not equal -> '5'
-    ], "nullif_same_type_and_numeric_controls");
+    assert_scalar(
+        &[
+            "SELECT nullif(5, 5)",    // NULL
+            "SELECT nullif(5, 6)",    // 5
+            "SELECT nullif(5, 5.0)",  // NULL (numeric int vs real)
+            "SELECT nullif('a','a')", // NULL
+            "SELECT nullif(NULL, 1)", // NULL
+            "SELECT nullif('5', 5)",  // bare literals, no affinity -> not equal -> '5'
+        ],
+        "nullif_same_type_and_numeric_controls",
+    );
 }
 
 fn assert_scalar(queries: &[&str], label: &str) {

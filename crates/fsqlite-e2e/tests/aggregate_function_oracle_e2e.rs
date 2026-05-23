@@ -206,8 +206,8 @@ fn agg_min_max_numeric_only() {
             "INSERT INTO p VALUES (NULL),(7),(3),(NULL),(11),(3)",
         ],
         &[
-            "SELECT min(x), max(x) FROM p",                   // 3, 11
-            "SELECT typeof(min(x)), typeof(max(x)) FROM p",   // integer, integer
+            "SELECT min(x), max(x) FROM p",                 // 3, 11
+            "SELECT typeof(min(x)), typeof(max(x)) FROM p", // integer, integer
         ],
         "agg_min_max_numeric_only",
     );

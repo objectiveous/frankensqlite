@@ -10514,6 +10514,7 @@ mod tests {
     static FAULT_HOOK_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     const BEAD_ID: &str = "bd-bca.1";
+    const DB300_E3_3_BEAD_ID: &str = "bd-db300.5.3.3";
     const DB300_E3_3_A_BEAD_ID: &str = "bd-db300.5.3.3.1";
     const TRACK_U_BEAD_ID: &str = "bd-c9pxw";
     const CHECKPOINT_DECOUPLING_BEAD_ID: &str = "bd-1dp9.6.7.9.2";
@@ -22701,6 +22702,133 @@ mod tests {
     }
 
     #[test]
+    fn test_committed_snapshot_reclamation_stress_bounds_stale_arcs() {
+        init_publication_test_tracing();
+        let (pager, _) = test_pager();
+        pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(2)));
+
+        const HELD_READER_CLONES: usize = 8;
+        const PUBLISH_ITERATIONS: u64 = 256;
+
+        for generation in 1..=PUBLISH_ITERATIONS {
+            let held_snapshots = (0..HELD_READER_CLONES)
+                .map(|_| pager.committed_snapshot())
+                .collect::<Vec<_>>();
+            let old_snapshot = Arc::clone(&held_snapshots[0]);
+            let old_commit_seq = old_snapshot.commit_seq;
+
+            assert!(
+                held_snapshots
+                    .iter()
+                    .all(|snapshot| Arc::ptr_eq(snapshot, &old_snapshot)),
+                "bead_id={DB300_E3_3_BEAD_ID} case=reclamation_readers_share_pre_swap_slot"
+            );
+            assert_eq!(
+                Arc::strong_count(&old_snapshot),
+                HELD_READER_CLONES + 2,
+                "bead_id={DB300_E3_3_BEAD_ID} case=reclamation_pre_swap_slot_refcount"
+            );
+
+            {
+                let mut inner = pager
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                inner.commit_seq = CommitSeq::new(generation);
+                inner.db_size = u32::try_from(generation).expect("test generation fits db_size");
+                pager.publish_committed_snapshot_from_inner(&inner);
+            }
+
+            let latest = pager.committed_snapshot();
+            assert!(
+                !Arc::ptr_eq(&old_snapshot, &latest),
+                "bead_id={DB300_E3_3_BEAD_ID} case=reclamation_publication_slot_swapped"
+            );
+            assert!(
+                latest.commit_seq > old_commit_seq,
+                "bead_id={DB300_E3_3_BEAD_ID} case=reclamation_latest_snapshot_advances"
+            );
+            assert_eq!(
+                Arc::strong_count(&old_snapshot),
+                HELD_READER_CLONES + 1,
+                "bead_id={DB300_E3_3_BEAD_ID} case=reclamation_old_slot_released_after_swap"
+            );
+        }
+
+        let latest = pager.committed_snapshot();
+        assert_eq!(
+            Arc::strong_count(&latest),
+            2,
+            "bead_id={DB300_E3_3_BEAD_ID} case=reclamation_no_stale_snapshots_after_readers_drop"
+        );
+    }
+
+    #[test]
+    fn test_committed_snapshot_writer_not_starved_by_reader_pressure() {
+        init_publication_test_tracing();
+        let (pager, _) = test_pager();
+        let pager = StdArc::new(pager);
+        pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(2)));
+
+        const READERS: usize = 8;
+        const PUBLISHES: u64 = 1_024;
+
+        let stop = StdArc::new(AtomicBool::new(false));
+        let barrier = StdArc::new(std::sync::Barrier::new(READERS + 1));
+        let mut reader_handles = Vec::with_capacity(READERS);
+
+        for _ in 0..READERS {
+            let pager = StdArc::clone(&pager);
+            let stop = StdArc::clone(&stop);
+            let barrier = StdArc::clone(&barrier);
+            reader_handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let mut reads = 0_u64;
+                while !stop.load(AtomicOrdering::Acquire) {
+                    let snapshot = pager.committed_snapshot();
+                    std::hint::black_box(snapshot.commit_seq);
+                    reads += 1;
+                }
+                reads
+            }));
+        }
+
+        barrier.wait();
+        let started = Instant::now();
+        for generation in 1..=PUBLISHES {
+            let mut inner = pager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.commit_seq = CommitSeq::new(generation);
+            inner.db_size = u32::try_from(generation).expect("test generation fits db_size");
+            pager.publish_committed_snapshot_from_inner(&inner);
+        }
+        let elapsed = started.elapsed();
+        stop.store(true, AtomicOrdering::Release);
+
+        let total_reader_snapshots = reader_handles
+            .into_iter()
+            .map(|handle| handle.join().expect("reader joined"))
+            .sum::<u64>();
+        assert!(
+            total_reader_snapshots > 0,
+            "bead_id={DB300_E3_3_BEAD_ID} case=starvation_readers_exercised_snapshot_path"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "bead_id={DB300_E3_3_BEAD_ID} case=starvation_writer_completed elapsed={elapsed:?}"
+        );
+
+        let latest = pager.committed_snapshot();
+        assert_eq!(
+            latest.commit_seq,
+            CommitSeq::new(PUBLISHES),
+            "bead_id={DB300_E3_3_BEAD_ID} case=starvation_latest_publication_visible"
+        );
+    }
+
+    #[test]
     fn test_single_connection_commit_and_retain_rollback_preserves_last_committed_page() {
         init_publication_test_tracing();
         let (pager, _) = test_pager();
@@ -26703,8 +26831,7 @@ mod tests {
             let _rw = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
         }
         let cx = Cx::new();
-        let pager =
-            SimplePager::open_readonly_with_cx(&cx, vfs, &path, PageSize::DEFAULT).unwrap();
+        let pager = SimplePager::open_readonly_with_cx(&cx, vfs, &path, PageSize::DEFAULT).unwrap();
         assert!(
             matches!(
                 pager.cache.eviction_policy(),
@@ -26773,7 +26900,10 @@ mod tests {
         };
         let copied = snap;
         assert_eq!(copied, snap);
-        let other = PagerPublishedSnapshot { db_size: 200, ..snap };
+        let other = PagerPublishedSnapshot {
+            db_size: 200,
+            ..snap
+        };
         assert_ne!(snap, other);
         let dbg = format!("{snap:?}");
         assert!(dbg.contains("PagerPublishedSnapshot"));
@@ -26792,7 +26922,10 @@ mod tests {
         };
         let copied = snap;
         assert_eq!(copied, snap);
-        let other = PagerCommittedSnapshot { db_size: 200, ..snap };
+        let other = PagerCommittedSnapshot {
+            db_size: 200,
+            ..snap
+        };
         assert_ne!(snap, other);
         let dbg = format!("{snap:?}");
         assert!(dbg.contains("PagerCommittedSnapshot"));
@@ -26812,7 +26945,10 @@ mod tests {
         };
         let copied = intent;
         assert_eq!(copied, intent);
-        let other = ParallelWalPublicationIntent { certificate_epoch: 8, ..intent };
+        let other = ParallelWalPublicationIntent {
+            certificate_epoch: 8,
+            ..intent
+        };
         assert_ne!(intent, other);
         let dbg = format!("{intent:?}");
         assert!(dbg.contains("ParallelWalPublicationIntent"));
@@ -26830,7 +26966,10 @@ mod tests {
 
     #[test]
     fn pager_metadata_publication_contracts_cover_all_classes() {
-        let classes: Vec<_> = PAGER_METADATA_PUBLICATION_CONTRACTS.iter().map(|c| c.class).collect();
+        let classes: Vec<_> = PAGER_METADATA_PUBLICATION_CONTRACTS
+            .iter()
+            .map(|c| c.class)
+            .collect();
         assert!(classes.contains(&PagerMetadataPublicationClass::SnapshotSummary));
         assert!(classes.contains(&PagerMetadataPublicationClass::PagePlaneResidency));
         assert!(classes.contains(&PagerMetadataPublicationClass::CertificateDerivedIntent));

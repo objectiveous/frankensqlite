@@ -2761,7 +2761,9 @@ mod tests {
         let dbg = format!("{:?}", QueueKind::Ghost);
         assert!(dbg.contains("Ghost"));
 
-        let loc = QueueLocation { kind: QueueKind::Small };
+        let loc = QueueLocation {
+            kind: QueueKind::Small,
+        };
         let loc2 = loc;
         assert_eq!(loc, loc2);
         let dbg_loc = format!("{loc:?}");
@@ -2773,14 +2775,23 @@ mod tests {
         let pg1 = pg(1);
         let events = [
             S3FifoEvent::Inserted(pg1),
-            S3FifoEvent::AlreadyResident { page_id: pg1, queue: QueueKind::Small },
+            S3FifoEvent::AlreadyResident {
+                page_id: pg1,
+                queue: QueueKind::Small,
+            },
             S3FifoEvent::GhostReadmission(pg1),
             S3FifoEvent::PromotedToMain(pg1),
             S3FifoEvent::EvictedFromSmallToGhost(pg1),
-            S3FifoEvent::ReinsertedInMain { page_id: pg1, reinsert_count: 2 },
+            S3FifoEvent::ReinsertedInMain {
+                page_id: pg1,
+                reinsert_count: 2,
+            },
             S3FifoEvent::EvictedFromMain(pg1),
             S3FifoEvent::GhostTrimmed(pg1),
-            S3FifoEvent::AdaptiveSplitChanged { old_small_capacity: 5, new_small_capacity: 10 },
+            S3FifoEvent::AdaptiveSplitChanged {
+                old_small_capacity: 5,
+                new_small_capacity: 10,
+            },
         ];
         for e in &events {
             let copied = *e;
@@ -2788,7 +2799,10 @@ mod tests {
         }
         let dbg = format!("{:?}", S3FifoEvent::GhostReadmission(pg1));
         assert!(dbg.contains("GhostReadmission"));
-        assert_ne!(S3FifoEvent::Inserted(pg1), S3FifoEvent::EvictedFromMain(pg1));
+        assert_ne!(
+            S3FifoEvent::Inserted(pg1),
+            S3FifoEvent::EvictedFromMain(pg1)
+        );
     }
 
     #[test]
@@ -2804,7 +2818,11 @@ mod tests {
 
     #[test]
     fn rollout_decision_debug_clone_copy_eq() {
-        let variants = [RolloutDecision::KeepArc, RolloutDecision::KeepS3Fifo, RolloutDecision::FallbackToArc];
+        let variants = [
+            RolloutDecision::KeepArc,
+            RolloutDecision::KeepS3Fifo,
+            RolloutDecision::FallbackToArc,
+        ];
         for v in &variants {
             let copied = *v;
             assert_eq!(copied, *v);

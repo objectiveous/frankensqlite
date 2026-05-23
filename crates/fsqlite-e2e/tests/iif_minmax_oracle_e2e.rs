@@ -87,13 +87,13 @@ fn assert_scalar(queries: &[&str], label: &str) {
 fn iif_basic_and_null_condition() {
     assert_scalar(
         &[
-            "SELECT iif(1, 'yes', 'no')",       // 'yes'
-            "SELECT iif(0, 'yes', 'no')",       // 'no'
-            "SELECT iif(NULL, 'yes', 'no')",    // 'no' (NULL is not true)
-            "SELECT iif(5 > 3, 10, 20)",        // 10
-            "SELECT iif(5 < 3, 10, 20)",        // 20
-            "SELECT typeof(iif(1, 1, 'x'))",    // integer (chosen branch's type)
-            "SELECT typeof(iif(0, 1, 'x'))",    // text
+            "SELECT iif(1, 'yes', 'no')",    // 'yes'
+            "SELECT iif(0, 'yes', 'no')",    // 'no'
+            "SELECT iif(NULL, 'yes', 'no')", // 'no' (NULL is not true)
+            "SELECT iif(5 > 3, 10, 20)",     // 10
+            "SELECT iif(5 < 3, 10, 20)",     // 20
+            "SELECT typeof(iif(1, 1, 'x'))", // integer (chosen branch's type)
+            "SELECT typeof(iif(0, 1, 'x'))", // text
         ],
         "iif_basic_and_null_condition",
     );
@@ -103,10 +103,10 @@ fn iif_basic_and_null_condition() {
 fn scalar_min_max_multi_arg() {
     assert_scalar(
         &[
-            "SELECT min(3, 1, 2), max(3, 1, 2)",         // 1, 3
+            "SELECT min(3, 1, 2), max(3, 1, 2)",           // 1, 3
             "SELECT min('b', 'a', 'c'), max('b','a','c')", // 'a', 'c'
-            "SELECT min(1, 2.5), max(1, 2.5)",           // 1, 2.5
-            "SELECT max(-5, -1, -10)",                   // -1
+            "SELECT min(1, 2.5), max(1, 2.5)",             // 1, 2.5
+            "SELECT max(-5, -1, -10)",                     // -1
         ],
         "scalar_min_max_multi_arg",
     );
@@ -122,7 +122,7 @@ fn scalar_min_max_null_returns_null() {
             "SELECT max(5, NULL, 3)",            // NULL
             "SELECT min(NULL, 'a', 'b')",        // NULL
             // Contrast: coalesce skips NULL and returns the first non-NULL.
-            "SELECT coalesce(NULL, 5, NULL)",    // 5
+            "SELECT coalesce(NULL, 5, NULL)", // 5
         ],
         "scalar_min_max_null_returns_null",
     );

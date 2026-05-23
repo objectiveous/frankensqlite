@@ -1026,8 +1026,7 @@ mod tests {
         let cx = test_cx();
         let vfs = MemoryVfs::new();
         let file = open_db_file(&vfs, &cx);
-        let verdict =
-            verify_checkpoint_checksum_prefix(&cx, &file, 4096, &[]).expect("verify");
+        let verdict = verify_checkpoint_checksum_prefix(&cx, &file, 4096, &[]).expect("verify");
         assert_eq!(verdict, CheckpointChecksumVerdict::Match);
     }
 

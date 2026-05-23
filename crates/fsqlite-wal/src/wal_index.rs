@@ -1066,9 +1066,15 @@ mod tests {
         assert_eq!(non_zero, 2);
 
         let slot_7 = usize::try_from(wal_index_hash_slot(7)).unwrap();
-        assert_eq!(slots_after[slot_7], 1, "page 7 is first entry → one-based 1");
+        assert_eq!(
+            slots_after[slot_7], 1,
+            "page 7 is first entry → one-based 1"
+        );
         let slot_15 = usize::try_from(wal_index_hash_slot(15)).unwrap();
-        assert_eq!(slots_after[slot_15], 2, "page 15 is second entry → one-based 2");
+        assert_eq!(
+            slots_after[slot_15], 2,
+            "page 15 is second entry → one-based 2"
+        );
     }
 
     #[test]

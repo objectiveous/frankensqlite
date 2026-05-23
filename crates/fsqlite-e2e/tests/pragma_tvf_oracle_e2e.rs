@@ -98,9 +98,8 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
     );
 }
 
-const TBL: &[&str] = &[
-    "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b TEXT DEFAULT 'x', c REAL)",
-];
+const TBL: &[&str] =
+    &["CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b TEXT DEFAULT 'x', c REAL)"];
 
 #[test]
 #[ignore = "bd-1hn48: pragma table-valued functions unimplemented (NotImplemented)"]
@@ -127,8 +126,8 @@ fn pragma_table_info_tvf_filter_and_count() {
         &f,
         &r,
         &[
-            "SELECT count(*) FROM pragma_table_info('t')",                 // 4
-            "SELECT name FROM pragma_table_info('t') WHERE pk = 1",        // id
+            "SELECT count(*) FROM pragma_table_info('t')", // 4
+            "SELECT name FROM pragma_table_info('t') WHERE pk = 1", // id
             "SELECT name FROM pragma_table_info('t') WHERE \"notnull\" = 1 ORDER BY cid", // a
             "SELECT count(*) FROM pragma_table_info('t') WHERE type = 'INTEGER'", // 2
             // dflt_value carries the literal text of the default expression.
@@ -172,8 +171,8 @@ fn pragma_foreign_key_list_tvf() {
             // The referenced table, local/foreign columns, and the actions.
             "SELECT \"table\", \"from\", \"to\", on_update, on_delete \
              FROM pragma_foreign_key_list('child')",
-            "SELECT count(*) FROM pragma_foreign_key_list('child')",      // 1
-            "SELECT count(*) FROM pragma_foreign_key_list('parent')",     // 0
+            "SELECT count(*) FROM pragma_foreign_key_list('child')", // 1
+            "SELECT count(*) FROM pragma_foreign_key_list('parent')", // 0
             "SELECT \"from\" FROM pragma_foreign_key_list('child') WHERE \"table\" = 'parent'", // pid
         ],
         "pragma_foreign_key_list_tvf",

@@ -95,8 +95,8 @@ fn assert_scalar(queries: &[&str], label: &str) {
 fn select_union_values() {
     assert_scalar(
         &[
-            "SELECT * FROM (SELECT 1 UNION VALUES (2),(3)) ORDER BY 1",     // 1,2,3
-            "SELECT * FROM (SELECT 2 UNION VALUES (2),(3)) ORDER BY 1",     // 2,3 (dedup)
+            "SELECT * FROM (SELECT 1 UNION VALUES (2),(3)) ORDER BY 1", // 1,2,3
+            "SELECT * FROM (SELECT 2 UNION VALUES (2),(3)) ORDER BY 1", // 2,3 (dedup)
             "SELECT * FROM (SELECT 5 UNION ALL VALUES (5),(6)) ORDER BY 1", // 5,5,6
         ],
         "select_union_values",
@@ -107,8 +107,8 @@ fn select_union_values() {
 fn values_union_select() {
     assert_scalar(
         &[
-            "VALUES (1),(2) UNION SELECT 3 ORDER BY 1",   // 1,2,3
-            "VALUES (1),(2) UNION SELECT 2 ORDER BY 1",   // 1,2 (dedup)
+            "VALUES (1),(2) UNION SELECT 3 ORDER BY 1", // 1,2,3
+            "VALUES (1),(2) UNION SELECT 2 ORDER BY 1", // 1,2 (dedup)
             "VALUES (3),(1),(2) UNION SELECT 0 ORDER BY 1 DESC", // 3,2,1,0
         ],
         "values_union_select",

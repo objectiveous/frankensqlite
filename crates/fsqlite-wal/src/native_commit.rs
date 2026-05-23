@@ -1306,7 +1306,10 @@ mod tests {
         assert!(conflicts.contains(&p3), "p3 modified at seq 10 > 7");
         assert!(!conflicts.contains(&p1), "p1 last modified at seq 5 <= 7");
 
-        assert!(idx.check_conflicts(&[p1, p2], CommitSeq::new(10)).is_empty());
+        assert!(
+            idx.check_conflicts(&[p1, p2], CommitSeq::new(10))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1372,8 +1375,14 @@ mod tests {
     fn test_commit_index_default_equals_new() {
         let a = CommitIndex::new();
         let b = CommitIndex::default();
-        assert!(a.check_conflicts(&[PageNumber::new(1).unwrap()], CommitSeq::ZERO).is_empty());
-        assert!(b.check_conflicts(&[PageNumber::new(1).unwrap()], CommitSeq::ZERO).is_empty());
+        assert!(
+            a.check_conflicts(&[PageNumber::new(1).unwrap()], CommitSeq::ZERO)
+                .is_empty()
+        );
+        assert!(
+            b.check_conflicts(&[PageNumber::new(1).unwrap()], CommitSeq::ZERO)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1389,8 +1398,13 @@ mod tests {
 
     #[test]
     fn commit_result_all_variants_debug_clone_eq() {
-        let committed = CommitResult::Committed { commit_seq: CommitSeq::new(5), commit_time_unix_ns: 1_000 };
-        let fcw = CommitResult::ConflictFcw { conflicting_pages: vec![PageNumber::new(1).unwrap()] };
+        let committed = CommitResult::Committed {
+            commit_seq: CommitSeq::new(5),
+            commit_time_unix_ns: 1_000,
+        };
+        let fcw = CommitResult::ConflictFcw {
+            conflicting_pages: vec![PageNumber::new(1).unwrap()],
+        };
         let ssi = CommitResult::ConflictSsi;
         let shutdown = CommitResult::ShuttingDown;
         assert_eq!(committed.clone(), committed);

@@ -92,13 +92,13 @@ fn assert_scalar(queries: &[&str], label: &str) {
 fn like_function_two_arg() {
     assert_scalar(
         &[
-            "SELECT like('a%', 'abc')", // pattern first -> 1
-            "SELECT like('A%', 'abc')", // LIKE is ASCII case-insensitive -> 1
-            "SELECT like('z%', 'abc')", // 0
-            "SELECT like('%c', 'abc')", // 1
+            "SELECT like('a%', 'abc')",  // pattern first -> 1
+            "SELECT like('A%', 'abc')",  // LIKE is ASCII case-insensitive -> 1
+            "SELECT like('z%', 'abc')",  // 0
+            "SELECT like('%c', 'abc')",  // 1
             "SELECT like('a_c', 'abc')", // _ matches one -> 1
-            "SELECT like('a%', NULL)",  // NULL arg -> NULL
-            "SELECT like(NULL, 'abc')", // NULL pattern -> NULL
+            "SELECT like('a%', NULL)",   // NULL arg -> NULL
+            "SELECT like(NULL, 'abc')",  // NULL pattern -> NULL
         ],
         "like_function_two_arg",
     );
@@ -110,8 +110,8 @@ fn like_function_three_arg_escape() {
     assert_scalar(
         &[
             // Escape '\' makes '\%' match a literal percent.
-            "SELECT like('a\\%c', 'a%c', '\\')", // 1
-            "SELECT like('a\\%c', 'abc', '\\')", // 0 (literal % doesn't match b)
+            "SELECT like('a\\%c', 'a%c', '\\')",   // 1
+            "SELECT like('a\\%c', 'abc', '\\')",   // 0 (literal % doesn't match b)
             "SELECT like('100\\%', '100%', '\\')", // 1
         ],
         "like_function_three_arg_escape",
@@ -123,12 +123,12 @@ fn like_function_three_arg_escape() {
 fn glob_function_two_arg() {
     assert_scalar(
         &[
-            "SELECT glob('a*', 'abc')",    // 1
-            "SELECT glob('A*', 'abc')",    // GLOB case-sensitive -> 0
-            "SELECT glob('a?c', 'abc')",   // ? matches one -> 1
+            "SELECT glob('a*', 'abc')",     // 1
+            "SELECT glob('A*', 'abc')",     // GLOB case-sensitive -> 0
+            "SELECT glob('a?c', 'abc')",    // ? matches one -> 1
             "SELECT glob('[a-c]*', 'bcd')", // char class -> 1
-            "SELECT glob('[^a]*', 'bcd')", // negated class -> 1
-            "SELECT glob('a*', NULL)",     // NULL -> NULL
+            "SELECT glob('[^a]*', 'bcd')",  // negated class -> 1
+            "SELECT glob('a*', NULL)",      // NULL -> NULL
         ],
         "glob_function_two_arg",
     );

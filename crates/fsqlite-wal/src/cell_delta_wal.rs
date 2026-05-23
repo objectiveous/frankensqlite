@@ -930,7 +930,12 @@ mod tests {
 
         let result = CellDeltaWalFrame::deserialize(&serialized);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("invalid page number 0"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid page number 0")
+        );
     }
 
     #[test]

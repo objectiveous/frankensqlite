@@ -116,15 +116,15 @@ fn exists_ignores_projected_value() {
         &f,
         &r,
         &[
-            "SELECT EXISTS(SELECT 1 FROM t)",       // 1
-            "SELECT EXISTS(SELECT NULL FROM t)",    // 1 (NULL projection still exists)
-            "SELECT EXISTS(SELECT * FROM t)",       // 1
-            "SELECT EXISTS(SELECT 1, 2, 3 FROM t)", // 1 (multi-column irrelevant)
+            "SELECT EXISTS(SELECT 1 FROM t)",         // 1
+            "SELECT EXISTS(SELECT NULL FROM t)",      // 1 (NULL projection still exists)
+            "SELECT EXISTS(SELECT * FROM t)",         // 1
+            "SELECT EXISTS(SELECT 1, 2, 3 FROM t)",   // 1 (multi-column irrelevant)
             "SELECT EXISTS(SELECT 1 FROM t WHERE 0)", // 0 (no rows)
-            "SELECT EXISTS(SELECT 1 FROM empty)",   // 0 (empty table)
+            "SELECT EXISTS(SELECT 1 FROM empty)",     // 0 (empty table)
             "SELECT NOT EXISTS(SELECT 1 FROM empty)", // 1
             // existence holds even when every row's column is NULL
-            "SELECT EXISTS(SELECT v FROM nulls)",   // 1
+            "SELECT EXISTS(SELECT v FROM nulls)", // 1
         ],
         "exists_ignores_projected_value",
     );
@@ -137,9 +137,9 @@ fn exists_as_scalar_value() {
         &f,
         &r,
         &[
-            "SELECT typeof(EXISTS(SELECT 1 FROM t))",   // integer
+            "SELECT typeof(EXISTS(SELECT 1 FROM t))", // integer
             "SELECT EXISTS(SELECT 1 FROM empty) + EXISTS(SELECT 1 FROM t)", // 0 + 1 = 1
-            "SELECT CASE WHEN EXISTS(SELECT 1 FROM t) THEN 'yes' ELSE 'no' END",   // 'yes'
+            "SELECT CASE WHEN EXISTS(SELECT 1 FROM t) THEN 'yes' ELSE 'no' END", // 'yes'
             "SELECT CASE WHEN EXISTS(SELECT 1 FROM empty) THEN 'yes' ELSE 'no' END", // 'no'
             // EXISTS in the SELECT list, one column per row of an outer table.
             "SELECT v, EXISTS(SELECT 1 FROM nulls) FROM t ORDER BY v", // each row -> (v,1)
@@ -155,8 +155,8 @@ fn exists_limit_inside_subquery() {
         &f,
         &r,
         &[
-            "SELECT EXISTS(SELECT 1 FROM t LIMIT 1)", // 1
-            "SELECT EXISTS(SELECT 1 FROM t LIMIT 0)", // 0 (LIMIT 0 -> no rows)
+            "SELECT EXISTS(SELECT 1 FROM t LIMIT 1)",            // 1
+            "SELECT EXISTS(SELECT 1 FROM t LIMIT 0)",            // 0 (LIMIT 0 -> no rows)
             "SELECT EXISTS(SELECT 1 FROM t ORDER BY v LIMIT 2)", // 1 (still >=1 row)
         ],
         "exists_limit_inside_subquery",

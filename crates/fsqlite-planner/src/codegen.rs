@@ -2103,12 +2103,19 @@ mod tests {
 
         // column_index: case-insensitive, in declaration order; None for absent.
         assert_eq!(schema.column_index("id"), Some(0));
-        assert_eq!(schema.column_index("NAME"), Some(1), "lookup is case-insensitive");
+        assert_eq!(
+            schema.column_index("NAME"),
+            Some(1),
+            "lookup is case-insensitive"
+        );
         assert_eq!(schema.column_index("Age"), Some(2));
         assert_eq!(schema.column_index("missing"), None);
 
         // index_for_column matches the LEFTMOST index column only (case-insensitive).
-        assert_eq!(schema.index_for_column("age").map(|i| i.name.as_str()), Some("idx_age_name"));
+        assert_eq!(
+            schema.index_for_column("age").map(|i| i.name.as_str()),
+            Some("idx_age_name")
+        );
         assert_eq!(
             schema.index_for_column("AGE").map(|i| i.name.as_str()),
             Some("idx_age_name"),
@@ -2157,22 +2164,46 @@ mod tests {
     fn test_rowid_ref_aliases_and_conflict_action_codes() {
         // SQLite recognizes three case-insensitive rowid aliases.
         for name in ["rowid", "ROWID", "_rowid_", "oid", "OID", "RowId"] {
-            assert!(is_rowid_ref(&ColumnRef::bare(name)), "{name} is a rowid alias");
+            assert!(
+                is_rowid_ref(&ColumnRef::bare(name)),
+                "{name} is a rowid alias"
+            );
         }
         for name in ["id", "name", "rowid_", "row_id", "_oid_"] {
-            assert!(!is_rowid_ref(&ColumnRef::bare(name)), "{name} is not a rowid alias");
+            assert!(
+                !is_rowid_ref(&ColumnRef::bare(name)),
+                "{name} is not a rowid alias"
+            );
         }
 
         // ON CONFLICT actions map to OE_ codes; a missing action defaults to ABORT.
-        assert_eq!(conflict_action_to_oe(None), OE_ABORT, "default conflict action is ABORT");
-        assert_eq!(conflict_action_to_oe(Some(&ConflictAction::Abort)), OE_ABORT);
-        assert_eq!(conflict_action_to_oe(Some(&ConflictAction::Rollback)), OE_ROLLBACK);
+        assert_eq!(
+            conflict_action_to_oe(None),
+            OE_ABORT,
+            "default conflict action is ABORT"
+        );
+        assert_eq!(
+            conflict_action_to_oe(Some(&ConflictAction::Abort)),
+            OE_ABORT
+        );
+        assert_eq!(
+            conflict_action_to_oe(Some(&ConflictAction::Rollback)),
+            OE_ROLLBACK
+        );
         assert_eq!(conflict_action_to_oe(Some(&ConflictAction::Fail)), OE_FAIL);
-        assert_eq!(conflict_action_to_oe(Some(&ConflictAction::Ignore)), OE_IGNORE);
-        assert_eq!(conflict_action_to_oe(Some(&ConflictAction::Replace)), OE_REPLACE);
+        assert_eq!(
+            conflict_action_to_oe(Some(&ConflictAction::Ignore)),
+            OE_IGNORE
+        );
+        assert_eq!(
+            conflict_action_to_oe(Some(&ConflictAction::Replace)),
+            OE_REPLACE
+        );
         // The five OE conflict codes are distinct.
         let codes: std::collections::HashSet<u16> =
-            [OE_ROLLBACK, OE_ABORT, OE_FAIL, OE_IGNORE, OE_REPLACE].into_iter().collect();
+            [OE_ROLLBACK, OE_ABORT, OE_FAIL, OE_IGNORE, OE_REPLACE]
+                .into_iter()
+                .collect();
         assert_eq!(codes.len(), 5, "OE conflict codes must be distinct");
     }
 
@@ -2220,7 +2251,10 @@ mod tests {
             .iter()
             .find(|op| op.opcode == Opcode::Eq)
             .expect("Eq present");
-        assert_eq!(eq.p5, 0x80, "IS uses the NULLEQ flag so NULL IS NULL is true");
+        assert_eq!(
+            eq.p5, 0x80,
+            "IS uses the NULLEQ flag so NULL IS NULL is true"
+        );
     }
 
     #[test]
@@ -2228,7 +2262,9 @@ mod tests {
         // is_rowid_ref accepts the three rowid aliases (rowid, _rowid_, oid)
         // case-insensitively and rejects everything else. It is exercised
         // indirectly via SELECT codegen but never asserted as a predicate.
-        for name in ["rowid", "ROWID", "RowId", "_rowid_", "_ROWID_", "oid", "OID"] {
+        for name in [
+            "rowid", "ROWID", "RowId", "_rowid_", "_ROWID_", "oid", "OID",
+        ] {
             assert!(
                 is_rowid_ref(&ColumnRef::bare(name)),
                 "{name} should be a rowid alias"
@@ -2276,8 +2312,18 @@ mod tests {
             assert!(is_comparison_op(op), "{op:?} is a comparison");
         }
         for op in [
-            B::Add, B::Subtract, B::Multiply, B::Divide, B::Modulo, B::Concat, B::BitAnd, B::BitOr,
-            B::ShiftLeft, B::ShiftRight, B::And, B::Or,
+            B::Add,
+            B::Subtract,
+            B::Multiply,
+            B::Divide,
+            B::Modulo,
+            B::Concat,
+            B::BitAnd,
+            B::BitOr,
+            B::ShiftLeft,
+            B::ShiftRight,
+            B::And,
+            B::Or,
         ] {
             assert!(!is_comparison_op(op), "{op:?} is not a comparison");
         }
@@ -2295,11 +2341,17 @@ mod tests {
 
         // `name = ?2` -> ("name", 2).
         let e = bin(col("name"), placeholder(2));
-        assert_eq!(extract_column_eq_bind(Some(&e)), Some(("name".to_owned(), 2)));
+        assert_eq!(
+            extract_column_eq_bind(Some(&e)),
+            Some(("name".to_owned(), 2))
+        );
 
         // Symmetric form `?3 = age` -> ("age", 3).
         let e = bin(placeholder(3), col("age"));
-        assert_eq!(extract_column_eq_bind(Some(&e)), Some(("age".to_owned(), 3)));
+        assert_eq!(
+            extract_column_eq_bind(Some(&e)),
+            Some(("age".to_owned(), 3))
+        );
 
         // rowid columns are excluded (they take a separate seek path) -> None.
         let e = bin(col("rowid"), placeholder(1));
@@ -2334,15 +2386,24 @@ mod tests {
 
         // `rowid = ?2` -> Numbered(2); the *_param form collapses to 2.
         let e = eq(col("rowid"), placeholder(2));
-        assert_eq!(extract_rowid_bind(Some(&e)), Some(BindParamRef::Numbered(2)));
+        assert_eq!(
+            extract_rowid_bind(Some(&e)),
+            Some(BindParamRef::Numbered(2))
+        );
         assert_eq!(extract_rowid_bind_param(Some(&e)), Some(2));
 
         // Symmetric, and the `oid` alias is recognized: `?3 = oid` -> Numbered(3).
         let e = eq(placeholder(3), col("oid"));
-        assert_eq!(extract_rowid_bind(Some(&e)), Some(BindParamRef::Numbered(3)));
+        assert_eq!(
+            extract_rowid_bind(Some(&e)),
+            Some(BindParamRef::Numbered(3))
+        );
 
         // An anonymous placeholder preserves its form; *_param collapses it to 1.
-        let e = eq(col("rowid"), Expr::Placeholder(PlaceholderType::Anonymous, Span::ZERO));
+        let e = eq(
+            col("rowid"),
+            Expr::Placeholder(PlaceholderType::Anonymous, Span::ZERO),
+        );
         assert_eq!(extract_rowid_bind(Some(&e)), Some(BindParamRef::Anonymous));
         assert_eq!(extract_rowid_bind_param(Some(&e)), Some(1));
 
@@ -2388,7 +2449,10 @@ mod tests {
         assert_eq!(result_column_count(&[expr(), expr()], &table), 2);
         // `*` expands to the table's column count (3); each Expr adds 1.
         assert_eq!(result_column_count(&[ResultColumn::Star], &table), 3);
-        assert_eq!(result_column_count(&[ResultColumn::Star, expr()], &table), 4);
+        assert_eq!(
+            result_column_count(&[ResultColumn::Star, expr()], &table),
+            4
+        );
         // Each star expands independently.
         assert_eq!(
             result_column_count(&[ResultColumn::Star, ResultColumn::Star], &table),
@@ -2414,7 +2478,11 @@ mod tests {
 
         // column_name: a plain column -> its name; rowid aliases / non-columns -> None.
         assert_eq!(column_name(&col("name")), Some("name".to_owned()));
-        assert_eq!(column_name(&col("rowid")), None, "rowid is excluded from column extraction");
+        assert_eq!(
+            column_name(&col("rowid")),
+            None,
+            "rowid is excluded from column extraction"
+        );
         assert_eq!(column_name(&col("OID")), None);
         assert_eq!(column_name(&lit), None);
 
@@ -2425,7 +2493,10 @@ mod tests {
         assert!(!is_rowid_expr(&lit));
 
         // bind_param_ref: numbered/anonymous placeholders; non-placeholder -> None.
-        assert_eq!(bind_param_ref(&placeholder(5)), Some(BindParamRef::Numbered(5)));
+        assert_eq!(
+            bind_param_ref(&placeholder(5)),
+            Some(BindParamRef::Numbered(5))
+        );
         assert_eq!(
             bind_param_ref(&Expr::Placeholder(PlaceholderType::Anonymous, Span::ZERO)),
             Some(BindParamRef::Anonymous)
@@ -2562,13 +2633,25 @@ mod tests {
 
         // INSERT INTO t(c, a) VALUES (10, 20): values land at their TARGET
         // positions (a=20, c=10); the omitted column b takes its DEFAULT (99).
-        let expanded =
-            expand_insert_values_row(&[lit(10), lit(20)], &["c".to_owned(), "a".to_owned()], &table)
-                .unwrap();
+        let expanded = expand_insert_values_row(
+            &[lit(10), lit(20)],
+            &["c".to_owned(), "a".to_owned()],
+            &table,
+        )
+        .unwrap();
         assert_eq!(expanded.len(), 3);
-        assert!(matches!(expanded[0], Expr::Literal(Literal::Integer(20), _)), "a = 20");
-        assert!(matches!(expanded[1], Expr::Literal(Literal::Integer(99), _)), "b = default 99");
-        assert!(matches!(expanded[2], Expr::Literal(Literal::Integer(10), _)), "c = 10");
+        assert!(
+            matches!(expanded[0], Expr::Literal(Literal::Integer(20), _)),
+            "a = 20"
+        );
+        assert!(
+            matches!(expanded[1], Expr::Literal(Literal::Integer(99), _)),
+            "b = default 99"
+        );
+        assert!(
+            matches!(expanded[2], Expr::Literal(Literal::Integer(10), _)),
+            "c = 10"
+        );
 
         // A value/column count mismatch -> Unsupported.
         assert!(matches!(
@@ -2581,7 +2664,10 @@ mod tests {
     fn test_single_table_select_source_name_resolves_table_and_rejects_subquery() {
         // A bare table source yields its name.
         let from = from_table("users");
-        assert_eq!(single_table_select_source_name(&from.source).unwrap(), "users");
+        assert_eq!(
+            single_table_select_source_name(&from.source).unwrap(),
+            "users"
+        );
 
         // A subquery FROM source is not a single-table source -> Unsupported.
         let subquery = TableOrSubquery::Subquery {
@@ -2612,7 +2698,11 @@ mod tests {
         ];
         // Exact and case-insensitive name matches.
         assert_eq!(find_table(&schema, "Users").unwrap().name, "Users");
-        assert_eq!(find_table(&schema, "users").unwrap().name, "Users", "case-insensitive");
+        assert_eq!(
+            find_table(&schema, "users").unwrap().name,
+            "Users",
+            "case-insensitive"
+        );
         assert_eq!(find_table(&schema, "ORDERS").unwrap().name, "orders");
         // A missing table -> TableNotFound carrying the requested name.
         assert!(matches!(
@@ -2671,7 +2761,10 @@ mod tests {
         let prog = b.finish().unwrap();
 
         // A no-FROM SELECT evaluates the expression and emits ResultRow + Halt...
-        assert!(has_opcodes(&prog, &[Opcode::Integer, Opcode::ResultRow, Opcode::Halt]));
+        assert!(has_opcodes(
+            &prog,
+            &[Opcode::Integer, Opcode::ResultRow, Opcode::Halt]
+        ));
         // ...and never opens a table cursor.
         assert!(
             prog.ops().iter().all(|op| op.opcode != Opcode::OpenRead),
@@ -2727,7 +2820,11 @@ mod tests {
         let mut b = ProgramBuilder::new();
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
-        let resultrows = prog.ops().iter().filter(|op| op.opcode == Opcode::ResultRow).count();
+        let resultrows = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::ResultRow)
+            .count();
         assert_eq!(resultrows, 2, "one ResultRow per VALUES row");
         assert!(
             prog.ops().iter().all(|op| op.opcode != Opcode::OpenRead),
@@ -2984,7 +3081,10 @@ mod tests {
 
         assert_eq!(emit_first(Literal::Null).0, Opcode::Null);
         assert_eq!(emit_first(Literal::Float(1.5)).0, Opcode::Real);
-        assert_eq!(emit_first(Literal::String("hi".to_owned())).0, Opcode::String8);
+        assert_eq!(
+            emit_first(Literal::String("hi".to_owned())).0,
+            Opcode::String8
+        );
         assert_eq!(emit_first(Literal::Blob(vec![1, 2, 3])).0, Opcode::Blob);
 
         // Boolean literals both lower to Integer, distinguished by p1 (1 / 0).
@@ -3013,7 +3113,10 @@ mod tests {
             right: lit(5),
             span: Span::ZERO,
         });
-        assert!(has_opcodes(&add, &[Opcode::Integer, Opcode::Integer, Opcode::Add]));
+        assert!(has_opcodes(
+            &add,
+            &[Opcode::Integer, Opcode::Integer, Opcode::Add]
+        ));
 
         // -3 -> operand, Integer(-1), Multiply (negation lowers to x * -1).
         let neg = prog_of(Expr::UnaryOp {
@@ -3115,7 +3218,12 @@ mod tests {
         let is_null = prog_of(false);
         assert!(has_opcodes(
             &is_null,
-            &[Opcode::IsNull, Opcode::Integer, Opcode::Goto, Opcode::Integer]
+            &[
+                Opcode::IsNull,
+                Opcode::Integer,
+                Opcode::Goto,
+                Opcode::Integer
+            ]
         ));
         assert!(!is_null.ops().iter().any(|o| o.opcode == Opcode::NotNull));
 
@@ -3123,7 +3231,12 @@ mod tests {
         let is_not_null = prog_of(true);
         assert!(has_opcodes(
             &is_not_null,
-            &[Opcode::NotNull, Opcode::Integer, Opcode::Goto, Opcode::Integer]
+            &[
+                Opcode::NotNull,
+                Opcode::Integer,
+                Opcode::Goto,
+                Opcode::Integer
+            ]
         ));
         assert!(!is_not_null.ops().iter().any(|o| o.opcode == Opcode::IsNull));
     }
@@ -4044,7 +4157,10 @@ mod tests {
 
         // The write-back Insert sits strictly between the guard and Close, so it
         // is part of the span the NotExists branch hops over.
-        assert!(notexists < insert, "NotExists must precede the write-back Insert");
+        assert!(
+            notexists < insert,
+            "NotExists must precede the write-back Insert"
+        );
         assert!(insert < close, "the write-back Insert must precede Close");
 
         // NotExists jumps to Close when the rowid is absent, skipping the Insert.

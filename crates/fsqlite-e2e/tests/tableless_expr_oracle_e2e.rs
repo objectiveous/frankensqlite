@@ -89,13 +89,13 @@ fn assert_scalar(queries: &[&str], label: &str) {
 fn tableless_like_glob_collate_between() {
     assert_scalar(
         &[
-            "SELECT 'abc' LIKE 'a%'",            // 1
-            "SELECT 'abc' LIKE 'A%'",            // 1 (LIKE is ASCII case-insensitive)
-            "SELECT 'abc' GLOB 'a*'",            // 1
-            "SELECT 'abc' GLOB 'A*'",            // 0 (GLOB is case-sensitive)
-            "SELECT 'a' = 'A' COLLATE NOCASE",   // 1
-            "SELECT 5 BETWEEN 1 AND 10",         // 1
-            "SELECT 5 NOT BETWEEN 1 AND 10",     // 0
+            "SELECT 'abc' LIKE 'a%'",          // 1
+            "SELECT 'abc' LIKE 'A%'",          // 1 (LIKE is ASCII case-insensitive)
+            "SELECT 'abc' GLOB 'a*'",          // 1
+            "SELECT 'abc' GLOB 'A*'",          // 0 (GLOB is case-sensitive)
+            "SELECT 'a' = 'A' COLLATE NOCASE", // 1
+            "SELECT 5 BETWEEN 1 AND 10",       // 1
+            "SELECT 5 NOT BETWEEN 1 AND 10",   // 0
         ],
         "tableless_like_glob_collate_between",
     );
@@ -119,9 +119,9 @@ fn tableless_case_cast_is() {
 fn tableless_scalar_subquery() {
     assert_scalar(
         &[
-            "SELECT (SELECT 42)",                       // 42
-            "SELECT (SELECT (SELECT 7))",               // 7 (nested)
-            "SELECT (SELECT 3) + (SELECT 4)",           // 7 (arithmetic over subqueries)
+            "SELECT (SELECT 42)",                                                     // 42
+            "SELECT (SELECT (SELECT 7))",                                             // 7 (nested)
+            "SELECT (SELECT 3) + (SELECT 4)", // 7 (arithmetic over subqueries)
             "SELECT (SELECT count(*) FROM (SELECT 1 UNION SELECT 2 UNION SELECT 3))", // 3
         ],
         "tableless_scalar_subquery",
@@ -133,8 +133,8 @@ fn tableless_scalar_subquery() {
 fn tableless_exists() {
     assert_scalar(
         &[
-            "SELECT EXISTS(SELECT 1)",          // 1
-            "SELECT EXISTS(SELECT 1 WHERE 0)",  // 0
+            "SELECT EXISTS(SELECT 1)",             // 1
+            "SELECT EXISTS(SELECT 1 WHERE 0)",     // 0
             "SELECT NOT EXISTS(SELECT 1 WHERE 0)", // 1
         ],
         "tableless_exists",
@@ -146,8 +146,8 @@ fn tableless_exists() {
 fn tableless_in_subquery() {
     assert_scalar(
         &[
-            "SELECT 1 IN (SELECT 1 UNION SELECT 2)", // 1
-            "SELECT 5 IN (SELECT 1 UNION SELECT 2)", // 0
+            "SELECT 1 IN (SELECT 1 UNION SELECT 2)",     // 1
+            "SELECT 5 IN (SELECT 1 UNION SELECT 2)",     // 0
             "SELECT 5 NOT IN (SELECT 1 UNION SELECT 2)", // 1
         ],
         "tableless_in_subquery",

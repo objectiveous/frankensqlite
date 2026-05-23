@@ -89,11 +89,11 @@ fn assert_scalar(queries: &[&str], label: &str) {
 fn lit_string_escaping_and_empty() {
     assert_scalar(
         &[
-            "SELECT 'it''s'",                       // it's
-            "SELECT ''",                            // empty
-            "SELECT 'a''b''c'",                     // a'b'c
-            "SELECT length(''), length('it''s')",   // 0, 4
-            "SELECT typeof(''), typeof('x')",       // text, text
+            "SELECT 'it''s'",                     // it's
+            "SELECT ''",                          // empty
+            "SELECT 'a''b''c'",                   // a'b'c
+            "SELECT length(''), length('it''s')", // 0, 4
+            "SELECT typeof(''), typeof('x')",     // text, text
         ],
         "lit_string_escaping_and_empty",
     );
@@ -103,11 +103,11 @@ fn lit_string_escaping_and_empty() {
 fn lit_blob_forms() {
     assert_scalar(
         &[
-            "SELECT X'48656C6C6F'",                 // 'Hello' bytes
-            "SELECT x'48'",                         // lowercase prefix
-            "SELECT X''",                           // empty blob
-            "SELECT typeof(X'00'), length(X'00')",  // blob, 1
-            "SELECT hex(X'DEADBEEF')",              // 'DEADBEEF'
+            "SELECT X'48656C6C6F'",                // 'Hello' bytes
+            "SELECT x'48'",                        // lowercase prefix
+            "SELECT X''",                          // empty blob
+            "SELECT typeof(X'00'), length(X'00')", // blob, 1
+            "SELECT hex(X'DEADBEEF')",             // 'DEADBEEF'
         ],
         "lit_blob_forms",
     );
@@ -117,10 +117,10 @@ fn lit_blob_forms() {
 fn lit_integer_forms() {
     assert_scalar(
         &[
-            "SELECT 0xFF, 0x10, 0x0",               // 255, 16, 0
-            "SELECT typeof(0xFF)",                  // integer
+            "SELECT 0xFF, 0x10, 0x0", // 255, 16, 0
+            "SELECT typeof(0xFF)",    // integer
             "SELECT 1000000, -42, +7",
-            "SELECT 9223372036854775807",           // max int64
+            "SELECT 9223372036854775807", // max int64
         ],
         "lit_integer_forms",
     );
@@ -130,10 +130,10 @@ fn lit_integer_forms() {
 fn lit_float_forms() {
     assert_scalar(
         &[
-            "SELECT .5, 1.5",                       // 0.5, 1.5
-            "SELECT 5.",                            // 5.0
-            "SELECT 1e3, 1.5e2, 2E3",               // 1000.0, 150.0, 2000.0
-            "SELECT 1.5e-2",                        // 0.015
+            "SELECT .5, 1.5",                             // 0.5, 1.5
+            "SELECT 5.",                                  // 5.0
+            "SELECT 1e3, 1.5e2, 2E3",                     // 1000.0, 150.0, 2000.0
+            "SELECT 1.5e-2",                              // 0.015
             "SELECT typeof(.5), typeof(5.), typeof(1e3)", // real, real, real
         ],
         "lit_float_forms",
@@ -144,10 +144,10 @@ fn lit_float_forms() {
 fn lit_char_unicode_roundtrip() {
     assert_scalar(
         &[
-            "SELECT char(72, 73)",                  // 'HI'
-            "SELECT char(65)",                      // 'A'
-            "SELECT unicode('A')",                  // 65
-            "SELECT unicode(char(233))",            // 233 (é round-trip)
+            "SELECT char(72, 73)",       // 'HI'
+            "SELECT char(65)",           // 'A'
+            "SELECT unicode('A')",       // 65
+            "SELECT unicode(char(233))", // 233 (é round-trip)
         ],
         "lit_char_unicode_roundtrip",
     );
@@ -171,9 +171,9 @@ fn bool_is_true_is_false() {
     // IS TRUE / IS FALSE / IS NOT TRUE / IS NOT FALSE (SQLite 3.23+).
     assert_scalar(
         &[
-            "SELECT 2 IS TRUE, 0 IS FALSE",         // 1, 1
-            "SELECT 0 IS TRUE, 5 IS FALSE",         // 0, 0
-            "SELECT NULL IS TRUE, NULL IS FALSE",   // 0, 0 (NULL is neither)
+            "SELECT 2 IS TRUE, 0 IS FALSE",               // 1, 1
+            "SELECT 0 IS TRUE, 5 IS FALSE",               // 0, 0
+            "SELECT NULL IS TRUE, NULL IS FALSE",         // 0, 0 (NULL is neither)
             "SELECT NULL IS NOT TRUE, NULL IS NOT FALSE", // 1, 1
         ],
         "bool_is_true_is_false",

@@ -105,10 +105,15 @@ pub fn reset_total_changes() {
 
 const SQLITE_COMPILE_OPTIONS: &[&str] = &[
     "COMPILER=rustc",
+    #[cfg(feature = "ext-fts5")]
     "ENABLE_FTS5",
+    #[cfg(feature = "ext-geopoly")]
     "ENABLE_GEOPOLY",
+    #[cfg(feature = "ext-icu")]
     "ENABLE_ICU",
+    #[cfg(feature = "ext-json")]
     "ENABLE_JSON1",
+    #[cfg(feature = "ext-rtree")]
     "ENABLE_RTREE",
     "FRANKENSQLITE",
     "OMIT_LOAD_EXTENSION",
@@ -4466,13 +4471,14 @@ mod tests {
             .unwrap(),
             SqliteValue::Integer(1)
         );
+        let expected_icu_enabled = i64::from(cfg!(feature = "ext-icu"));
         assert_eq!(
             invoke1(
                 &func,
                 SqliteValue::Text(SmallText::from_string("SQLITE_ENABLE_ICU"))
             )
             .unwrap(),
-            SqliteValue::Integer(1)
+            SqliteValue::Integer(expected_icu_enabled)
         );
         assert_eq!(
             invoke1(
@@ -4480,7 +4486,7 @@ mod tests {
                 SqliteValue::Text(SmallText::from_string("sqlite_enable_icu"))
             )
             .unwrap(),
-            SqliteValue::Integer(1)
+            SqliteValue::Integer(expected_icu_enabled)
         );
         assert_eq!(
             invoke1(

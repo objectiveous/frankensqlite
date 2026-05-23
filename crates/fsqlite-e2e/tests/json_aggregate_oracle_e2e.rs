@@ -101,9 +101,9 @@ fn json_group_array_basic_and_grouped() {
         &f,
         &r,
         &[
-            "SELECT json_group_array(v) FROM t",                              // [10,20,30]
-            "SELECT g, json_group_array(v) FROM t GROUP BY g ORDER BY g",     // a:[10,20], b:[30]
-            "SELECT json_group_array(k) FROM t",                             // ["x","y","z"]
+            "SELECT json_group_array(v) FROM t", // [10,20,30]
+            "SELECT g, json_group_array(v) FROM t GROUP BY g ORDER BY g", // a:[10,20], b:[30]
+            "SELECT json_group_array(k) FROM t", // ["x","y","z"]
         ],
         "json_group_array_basic_and_grouped",
     );
@@ -117,7 +117,7 @@ fn json_group_object_basic_and_grouped() {
         &f,
         &r,
         &[
-            "SELECT json_group_object(k, v) FROM t",                          // {"x":10,"y":20,"z":30}
+            "SELECT json_group_object(k, v) FROM t", // {"x":10,"y":20,"z":30}
             "SELECT g, json_group_object(k, v) FROM t GROUP BY g ORDER BY g", // a:{x:10,y:20}, b:{z:30}
         ],
         "json_group_object_basic_and_grouped",

@@ -2923,14 +2923,20 @@ mod tests {
     #[test]
     fn parallel_wal_ordered_residue_and_shadow_verdict_defaults() {
         let residue = ParallelWalOrderedResidue::default();
-        assert_eq!(residue, ParallelWalOrderedResidue::CommitCertificateThenPublish);
+        assert_eq!(
+            residue,
+            ParallelWalOrderedResidue::CommitCertificateThenPublish
+        );
         let copied = residue;
         assert_eq!(copied, residue);
 
         let verdict = ParallelWalShadowVerdict::default();
         assert_eq!(verdict, ParallelWalShadowVerdict::NotRun);
         assert_ne!(verdict, ParallelWalShadowVerdict::Clean);
-        assert_ne!(ParallelWalShadowVerdict::Clean, ParallelWalShadowVerdict::Diverged);
+        assert_ne!(
+            ParallelWalShadowVerdict::Clean,
+            ParallelWalShadowVerdict::Diverged
+        );
         let dbg = format!("{verdict:?}");
         assert!(dbg.contains("NotRun"));
     }

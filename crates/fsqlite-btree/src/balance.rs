@@ -3194,14 +3194,23 @@ mod tests {
     fn test_leaf_table_split_heat_classifies_edge_window_boundaries() {
         // page_no=None keeps this purely deterministic (no topology/global state):
         // heat is decided solely by `edge_window = cell_count.div_ceil(4)`.
-        let heat = |cells: usize, idx: usize| leaf_table_split_policy_for_page(None, cells, idx).heat;
+        let heat =
+            |cells: usize, idx: usize| leaf_table_split_policy_for_page(None, cells, idx).heat;
 
         // cell_count = 8 -> edge_window = 2. Left:[0,1] Interior:[2..=5] Right:[6,7].
         assert_eq!(heat(8, 0), LeafTableSplitHeat::LeftEdge);
         assert_eq!(heat(8, 1), LeafTableSplitHeat::LeftEdge);
-        assert_eq!(heat(8, 2), LeafTableSplitHeat::Interior, "left/interior boundary");
+        assert_eq!(
+            heat(8, 2),
+            LeafTableSplitHeat::Interior,
+            "left/interior boundary"
+        );
         assert_eq!(heat(8, 5), LeafTableSplitHeat::Interior);
-        assert_eq!(heat(8, 6), LeafTableSplitHeat::RightEdge, "interior/right boundary");
+        assert_eq!(
+            heat(8, 6),
+            LeafTableSplitHeat::RightEdge,
+            "interior/right boundary"
+        );
         assert_eq!(heat(8, 7), LeafTableSplitHeat::RightEdge);
 
         // cell_count = 4 -> edge_window = 1. Left:[0] Interior:[1,2] Right:[3].
@@ -3218,7 +3227,11 @@ mod tests {
         assert_eq!(heat(0, 0), LeafTableSplitHeat::Interior);
 
         // An out-of-range insert position is clamped to the last cell (right edge).
-        assert_eq!(heat(8, 99), LeafTableSplitHeat::RightEdge, "clamped to cell_count-1");
+        assert_eq!(
+            heat(8, 99),
+            LeafTableSplitHeat::RightEdge,
+            "clamped to cell_count-1"
+        );
 
         // With page_no=None the effective target is the heat class's baseline fill factor.
         assert_eq!(
@@ -3681,9 +3694,17 @@ mod tests {
             assert_eq!(&divider[0..4], &left.get().to_be_bytes());
             // Remaining bytes: the rowid as a varint, with nothing trailing.
             let (got, n) = fsqlite_types::serial_type::read_varint(&divider[4..]).unwrap();
-            assert_eq!(got, u64::try_from(rowid).unwrap(), "divider must encode the cell rowid");
+            assert_eq!(
+                got,
+                u64::try_from(rowid).unwrap(),
+                "divider must encode the cell rowid"
+            );
             assert_eq!(n, varint_len, "varint byte length for rowid {rowid}");
-            assert_eq!(divider.len(), 4 + varint_len, "divider has no trailing bytes");
+            assert_eq!(
+                divider.len(),
+                4 + varint_len,
+                "divider has no trailing bytes"
+            );
         }
     }
 

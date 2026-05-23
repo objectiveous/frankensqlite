@@ -115,7 +115,7 @@ fn integer_pk_rejects_non_integer() {
         &[
             "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
             "INSERT INTO t VALUES (1,'ok')",
-            "INSERT INTO t VALUES (5.5,'x')",   // not an integer rowid -> datatype mismatch
+            "INSERT INTO t VALUES (5.5,'x')", // not an integer rowid -> datatype mismatch
             "INSERT INTO t VALUES ('abc','y')", // not coercible -> datatype mismatch
             "INSERT INTO t VALUES (2,'ok2')",
         ],

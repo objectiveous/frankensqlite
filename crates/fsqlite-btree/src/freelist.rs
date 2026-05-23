@@ -640,7 +640,11 @@ mod tests {
         let mut fl = Freelist::new(10, 4096);
         fl.deallocate(PageNumber::new(5).unwrap()); // in range -> kept
         fl.deallocate(PageNumber::new(100).unwrap()); // beyond db_page_count -> rejected
-        assert_eq!(fl.free_count(), 1, "out-of-range page must not enter the freelist");
+        assert_eq!(
+            fl.free_count(),
+            1,
+            "out-of-range page must not enter the freelist"
+        );
         assert_eq!(fl.allocate().unwrap().get(), 5);
 
         // allocate must skip stale freelist entries pointing beyond the db, then
@@ -987,12 +991,19 @@ mod tests {
             let pg = PageNumber::new(raw).unwrap();
             let is_map = is_ptrmap_page(pg, usable, page_size);
             // Ptrmap pages sit exactly at the periodic positions 2, 2+G, 2+2G...
-            assert_eq!(is_map, (raw - 2) % group == 0, "is_ptrmap_page wrong at {raw}");
+            assert_eq!(
+                is_map,
+                (raw - 2) % group == 0,
+                "is_ptrmap_page wrong at {raw}"
+            );
 
             match ptrmap_page_for(pg, usable, page_size) {
                 None => {
                     // Only ptrmap pages themselves (and pages < 3) lack a parent map.
-                    assert!(is_map || raw < 3, "page {raw} unexpectedly has no ptrmap page");
+                    assert!(
+                        is_map || raw < 3,
+                        "page {raw} unexpectedly has no ptrmap page"
+                    );
                 }
                 Some(q) => {
                     assert!(!is_map, "ptrmap page {raw} must not map to another");
@@ -1001,7 +1012,10 @@ mod tests {
                         "page {raw} maps to non-ptrmap {q:?}"
                     );
                     assert!(q.get() < raw, "ptrmap page {q:?} must precede {raw}");
-                    assert!(raw - q.get() <= group, "page {raw} lies outside its group {q:?}");
+                    assert!(
+                        raw - q.get() <= group,
+                        "page {raw} lies outside its group {q:?}"
+                    );
                     // The entry is densely packed and fits on the ptrmap page.
                     let off = ptrmap_entry_offset(pg, usable, page_size).expect("entry offset");
                     assert_eq!(

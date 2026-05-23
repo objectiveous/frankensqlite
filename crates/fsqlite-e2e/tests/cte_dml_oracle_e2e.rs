@@ -113,8 +113,8 @@ fn recursive_cte_insert_series() {
              INSERT INTO nums SELECT n FROM seq",
         ],
         &[
-            "SELECT n FROM nums ORDER BY n",       // 1..5
-            "SELECT count(*), sum(n) FROM nums",   // 5, 15
+            "SELECT n FROM nums ORDER BY n",     // 1..5
+            "SELECT count(*), sum(n) FROM nums", // 5, 15
         ],
         "recursive_cte_insert_series",
     );

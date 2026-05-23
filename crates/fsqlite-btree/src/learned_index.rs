@@ -445,13 +445,22 @@ mod tests {
         let idx = LearnedIndex::build(&keys, LearnedIndexConfig { max_error: 16 });
 
         for (pos, &k) in keys.iter().enumerate() {
-            assert_eq!(idx.lookup(k), Some(pos), "present key {k} must be found at {pos}");
+            assert_eq!(
+                idx.lookup(k),
+                Some(pos),
+                "present key {k} must be found at {pos}"
+            );
         }
 
         // For i >= 2, i*i - 1 is never a perfect square, so it is an in-range
         // gap that must resolve to None (not a false positive).
         for &k in &keys[2..60] {
-            assert_eq!(idx.lookup(k - 1), None, "in-gap key {} must be absent", k - 1);
+            assert_eq!(
+                idx.lookup(k - 1),
+                None,
+                "in-gap key {} must be absent",
+                k - 1
+            );
         }
 
         // A small clustered set with an obvious interior gap.
@@ -460,6 +469,10 @@ mod tests {
         for (pos, &k) in clustered.iter().enumerate() {
             assert_eq!(idx2.lookup(k), Some(pos));
         }
-        assert_eq!(idx2.lookup(500), None, "a key in the large interior gap is absent");
+        assert_eq!(
+            idx2.lookup(500),
+            None,
+            "a key in the large interior gap is absent"
+        );
     }
 }

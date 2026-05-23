@@ -115,8 +115,8 @@ fn default_value_rechecked_against_unique() {
         &[
             "CREATE TABLE t (id INTEGER PRIMARY KEY, \
              a INTEGER NOT NULL DEFAULT 5 CHECK (a > 0) UNIQUE)",
-            "INSERT INTO t(id) VALUES (1)",   // a -> default 5
-            "INSERT INTO t(id) VALUES (2)",   // a -> default 5 again -> UNIQUE violation -> error
+            "INSERT INTO t(id) VALUES (1)", // a -> default 5
+            "INSERT INTO t(id) VALUES (2)", // a -> default 5 again -> UNIQUE violation -> error
             "INSERT INTO t(id,a) VALUES (3,7)",
         ],
         &["SELECT id, a FROM t ORDER BY id"], // (1,5),(3,7)
@@ -130,12 +130,12 @@ fn collate_nocase_unique_column() {
         &[
             "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE UNIQUE)",
             "INSERT INTO t VALUES (1,'Apple')",
-            "INSERT INTO t VALUES (2,'apple')",  // NOCASE-equal -> UNIQUE violation -> error
+            "INSERT INTO t VALUES (2,'apple')", // NOCASE-equal -> UNIQUE violation -> error
             "INSERT INTO t VALUES (3,'Banana')",
         ],
         &[
-            "SELECT id, name FROM t ORDER BY id",      // (1,'Apple'),(3,'Banana')
-            "SELECT id FROM t WHERE name = 'APPLE'",   // NOCASE -> 1
+            "SELECT id, name FROM t ORDER BY id", // (1,'Apple'),(3,'Banana')
+            "SELECT id FROM t WHERE name = 'APPLE'", // NOCASE -> 1
         ],
         "collate_nocase_unique_column",
     );
@@ -148,7 +148,7 @@ fn check_and_default_expression() {
             // DEFAULT is an expression; CHECK references the column.
             "CREATE TABLE t (id INTEGER PRIMARY KEY, \
              qty INTEGER DEFAULT (2 * 5) CHECK (qty BETWEEN 0 AND 100))",
-            "INSERT INTO t(id) VALUES (1)",      // qty -> 10
+            "INSERT INTO t(id) VALUES (1)", // qty -> 10
             "INSERT INTO t(id,qty) VALUES (2,50)",
             "INSERT INTO t(id,qty) VALUES (3,200)", // CHECK fails -> error
         ],

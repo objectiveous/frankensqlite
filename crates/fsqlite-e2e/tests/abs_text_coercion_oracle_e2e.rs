@@ -86,12 +86,12 @@ fn assert_scalar(queries: &[&str], label: &str) {
 fn abs_on_text_coerces() {
     assert_scalar(
         &[
-            "SELECT abs('-5')",         // -5 -> 5 (integer)
-            "SELECT abs('5')",          // 5
-            "SELECT abs('-5.5')",       // -5.5 -> 5.5 (real)
-            "SELECT abs('abc')",        // non-numeric -> 0
-            "SELECT abs('')",           // empty text -> 0
-            "SELECT typeof(abs('5'))",  // integer
+            "SELECT abs('-5')",          // -5 -> 5 (integer)
+            "SELECT abs('5')",           // 5
+            "SELECT abs('-5.5')",        // -5.5 -> 5.5 (real)
+            "SELECT abs('abc')",         // non-numeric -> 0
+            "SELECT abs('')",            // empty text -> 0
+            "SELECT typeof(abs('5'))",   // integer
             "SELECT typeof(abs('5.5'))", // real
             "SELECT typeof(abs('abc'))", // integer (0)
         ],

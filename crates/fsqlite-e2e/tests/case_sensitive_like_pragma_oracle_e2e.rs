@@ -110,7 +110,7 @@ fn like_default_is_ascii_case_insensitive() {
             "SELECT 'aBcD' LIKE 'AbCd'",   // 1
             "SELECT 'abc' LIKE 'abx'",     // 0 (real mismatch)
             // Non-ASCII letters are NEVER folded by LIKE, pragma or not.
-            "SELECT 'À' LIKE 'à'",         // 0
+            "SELECT 'À' LIKE 'à'", // 0
         ],
         "like_default_is_ascii_case_insensitive",
     );
@@ -121,7 +121,12 @@ fn like_default_is_ascii_case_insensitive() {
 fn like_case_sensitive_pragma_on() {
     let f = Connection::open(":memory:").unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
-    exec_both(&f, &r, "PRAGMA case_sensitive_like = ON", "like_case_sensitive_pragma_on");
+    exec_both(
+        &f,
+        &r,
+        "PRAGMA case_sensitive_like = ON",
+        "like_case_sensitive_pragma_on",
+    );
     check(
         &f,
         &r,
@@ -131,8 +136,8 @@ fn like_case_sensitive_pragma_on() {
             "SELECT 'apple' LIKE 'apple'", // 1
             "SELECT 'apple' LIKE 'APPLE'", // 0
             // wildcards still work, but the literal part is now case-sensitive
-            "SELECT 'Apple' LIKE 'A%'",    // 1
-            "SELECT 'apple' LIKE 'A%'",    // 0
+            "SELECT 'Apple' LIKE 'A%'", // 1
+            "SELECT 'apple' LIKE 'A%'", // 0
         ],
         "like_case_sensitive_pragma_on",
     );
@@ -144,10 +149,20 @@ fn like_pragma_toggles_back_off() {
     let f = Connection::open(":memory:").unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     // Phase 1: ON -> case-sensitive.
-    exec_both(&f, &r, "PRAGMA case_sensitive_like = ON", "like_pragma_toggles_back_off");
+    exec_both(
+        &f,
+        &r,
+        "PRAGMA case_sensitive_like = ON",
+        "like_pragma_toggles_back_off",
+    );
     check(&f, &r, &["SELECT 'A' LIKE 'a'"], "toggle ON phase"); // 0
     // Phase 2: OFF -> restores ASCII-insensitive default.
-    exec_both(&f, &r, "PRAGMA case_sensitive_like = OFF", "like_pragma_toggles_back_off");
+    exec_both(
+        &f,
+        &r,
+        "PRAGMA case_sensitive_like = OFF",
+        "like_pragma_toggles_back_off",
+    );
     check(&f, &r, &["SELECT 'A' LIKE 'a'"], "toggle OFF phase"); // 1
 }
 

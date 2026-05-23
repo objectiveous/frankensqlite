@@ -161,17 +161,17 @@ fn cross_class_constant_comparisons() {
     // to NULL on any operand. INTEGER vs REAL compares numerically.
     assert_scalar(
         &[
-            "SELECT 5 < 'apple'",      // number < text -> 1
-            "SELECT 'apple' < X'00'",  // text < blob   -> 1
-            "SELECT 100 > 'abc'",      // number > text -> 0
-            "SELECT X'00' > 'zzz'",    // blob > text   -> 1
-            "SELECT 2.5 < 10",         // numeric       -> 1
-            "SELECT 5 < 5.0",          // equal numerically -> 0
+            "SELECT 5 < 'apple'",               // number < text -> 1
+            "SELECT 'apple' < X'00'",           // text < blob   -> 1
+            "SELECT 100 > 'abc'",               // number > text -> 0
+            "SELECT X'00' > 'zzz'",             // blob > text   -> 1
+            "SELECT 2.5 < 10",                  // numeric       -> 1
+            "SELECT 5 < 5.0",                   // equal numerically -> 0
             "SELECT 9223372036854775807 < 'a'", // any int < any text -> 1
-            "SELECT NULL < 5",         // NULL operand  -> NULL
-            "SELECT 5 < NULL",         // NULL operand  -> NULL
-            "SELECT X'01' < X'02'",    // memcmp        -> 1
-            "SELECT X'0100' > X'01'",  // longer prefix > shorter -> 1
+            "SELECT NULL < 5",                  // NULL operand  -> NULL
+            "SELECT 5 < NULL",                  // NULL operand  -> NULL
+            "SELECT X'01' < X'02'",             // memcmp        -> 1
+            "SELECT X'0100' > X'01'",           // longer prefix > shorter -> 1
         ],
         "cross_class_constant_comparisons",
     );

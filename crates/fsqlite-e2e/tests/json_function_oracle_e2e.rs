@@ -113,12 +113,12 @@ fn json_valid_classification() {
     scenario(
         &[],
         &[
-            "SELECT json_valid('{\"a\":1}')",     // 1
-            "SELECT json_valid('[1,2,3]')",       // 1
-            "SELECT json_valid('not json')",      // 0
-            "SELECT json_valid('{\"a\":}')",      // 0
-            "SELECT json_valid('123')",           // 1 (a bare number is valid JSON)
-            "SELECT json_valid('null')",          // 1
+            "SELECT json_valid('{\"a\":1}')", // 1
+            "SELECT json_valid('[1,2,3]')",   // 1
+            "SELECT json_valid('not json')",  // 0
+            "SELECT json_valid('{\"a\":}')",  // 0
+            "SELECT json_valid('123')",       // 1 (a bare number is valid JSON)
+            "SELECT json_valid('null')",      // 1
         ],
         "json_valid_classification",
     );
@@ -129,14 +129,14 @@ fn json_type_classification() {
     scenario(
         &[],
         &[
-            "SELECT json_type('{\"a\":1}')",      // object
-            "SELECT json_type('[1,2]')",          // array
-            "SELECT json_type('123')",            // integer
-            "SELECT json_type('1.5')",            // real
-            "SELECT json_type('\"hi\"')",         // text
-            "SELECT json_type('true')",           // true
-            "SELECT json_type('false')",          // false
-            "SELECT json_type('null')",           // null
+            "SELECT json_type('{\"a\":1}')",            // object
+            "SELECT json_type('[1,2]')",                // array
+            "SELECT json_type('123')",                  // integer
+            "SELECT json_type('1.5')",                  // real
+            "SELECT json_type('\"hi\"')",               // text
+            "SELECT json_type('true')",                 // true
+            "SELECT json_type('false')",                // false
+            "SELECT json_type('null')",                 // null
             "SELECT json_type('{\"a\":[1,2]}', '$.a')", // array (path form)
         ],
         "json_type_classification",
@@ -166,12 +166,12 @@ fn json_array_and_object_builders() {
     scenario(
         &[],
         &[
-            "SELECT json_array(1, 2, 'x', NULL)",          // [1,2,"x",null]
-            "SELECT json_array(1.5, -3, 'a b')",           // [1.5,-3,"a b"]
-            "SELECT json_object('a', 1, 'b', 'x')",        // {"a":1,"b":"x"}
-            "SELECT json_object('n', NULL, 'k', 2)",       // {"n":null,"k":2}
-            "SELECT json_array_length('[1,2,3,4]')",       // 4
-            "SELECT json_array_length('[]')",              // 0
+            "SELECT json_array(1, 2, 'x', NULL)",    // [1,2,"x",null]
+            "SELECT json_array(1.5, -3, 'a b')",     // [1.5,-3,"a b"]
+            "SELECT json_object('a', 1, 'b', 'x')",  // {"a":1,"b":"x"}
+            "SELECT json_object('n', NULL, 'k', 2)", // {"n":null,"k":2}
+            "SELECT json_array_length('[1,2,3,4]')", // 4
+            "SELECT json_array_length('[]')",        // 0
             "SELECT json_array_length('{\"a\":[1,2,3]}', '$.a')", // 3
         ],
         "json_array_and_object_builders",
@@ -203,12 +203,12 @@ fn json_arrow_operators() {
     scenario(
         &[],
         &[
-            "SELECT '{\"a\":1}' -> '$.a'",       // JSON 1
-            "SELECT '{\"a\":1}' ->> '$.a'",      // SQL 1
-            "SELECT '{\"a\":\"x\"}' -> '$.a'",   // JSON "x" (quoted)
-            "SELECT '{\"a\":\"x\"}' ->> '$.a'",  // SQL x (unquoted)
-            "SELECT '[10,20]' -> 1",             // JSON 20 (bare int = array index)
-            "SELECT '[10,20]' ->> 1",            // SQL 20
+            "SELECT '{\"a\":1}' -> '$.a'",      // JSON 1
+            "SELECT '{\"a\":1}' ->> '$.a'",     // SQL 1
+            "SELECT '{\"a\":\"x\"}' -> '$.a'",  // JSON "x" (quoted)
+            "SELECT '{\"a\":\"x\"}' ->> '$.a'", // SQL x (unquoted)
+            "SELECT '[10,20]' -> 1",            // JSON 20 (bare int = array index)
+            "SELECT '[10,20]' ->> 1",           // SQL 20
         ],
         "json_arrow_operators",
     );
@@ -222,14 +222,14 @@ fn json_mutators_set_insert_replace_remove() {
         &[],
         &[
             // set: create or overwrite.
-            "SELECT json_set('{\"a\":1}', '$.a', 99)",      // {"a":99}
-            "SELECT json_set('{\"a\":1}', '$.b', 2)",       // {"a":1,"b":2}
+            "SELECT json_set('{\"a\":1}', '$.a', 99)", // {"a":99}
+            "SELECT json_set('{\"a\":1}', '$.b', 2)",  // {"a":1,"b":2}
             // insert: only create (no overwrite of existing).
-            "SELECT json_insert('{\"a\":1}', '$.a', 99)",   // unchanged {"a":1}
-            "SELECT json_insert('{\"a\":1}', '$.b', 2)",    // {"a":1,"b":2}
+            "SELECT json_insert('{\"a\":1}', '$.a', 99)", // unchanged {"a":1}
+            "SELECT json_insert('{\"a\":1}', '$.b', 2)",  // {"a":1,"b":2}
             // replace: only overwrite (no create).
-            "SELECT json_replace('{\"a\":1}', '$.a', 99)",  // {"a":99}
-            "SELECT json_replace('{\"a\":1}', '$.b', 2)",   // unchanged {"a":1}
+            "SELECT json_replace('{\"a\":1}', '$.a', 99)", // {"a":99}
+            "SELECT json_replace('{\"a\":1}', '$.b', 2)",  // unchanged {"a":1}
             // remove: delete a path.
             "SELECT json_remove('{\"a\":1,\"b\":2}', '$.a')", // {"b":2}
             "SELECT json_remove('[1,2,3]', '$[0]')",          // [2,3]
@@ -268,12 +268,12 @@ fn json_arrow_operators_in_table_context() {
             "INSERT INTO d VALUES (1,'{\"a\":1,\"s\":\"x\"}'),(2,'[10,20]')",
         ],
         &[
-            "SELECT body -> '$.a' FROM d WHERE id = 1",   // JSON 1
-            "SELECT body ->> '$.a' FROM d WHERE id = 1",  // SQL 1
-            "SELECT body -> '$.s' FROM d WHERE id = 1",   // JSON "x"
-            "SELECT body ->> '$.s' FROM d WHERE id = 1",  // SQL x
-            "SELECT body -> 1 FROM d WHERE id = 2",       // JSON 20
-            "SELECT body ->> 1 FROM d WHERE id = 2",      // SQL 20
+            "SELECT body -> '$.a' FROM d WHERE id = 1",  // JSON 1
+            "SELECT body ->> '$.a' FROM d WHERE id = 1", // SQL 1
+            "SELECT body -> '$.s' FROM d WHERE id = 1",  // JSON "x"
+            "SELECT body ->> '$.s' FROM d WHERE id = 1", // SQL x
+            "SELECT body -> 1 FROM d WHERE id = 2",      // JSON 20
+            "SELECT body ->> 1 FROM d WHERE id = 2",     // SQL 20
         ],
         "json_arrow_operators_in_table_context",
     );

@@ -108,8 +108,8 @@ fn in_list_scalar_logic() {
         &[
             "SELECT 2 IN (1,2,3), 5 IN (1,2,3)", // 1, 0
             // NULL in list: a non-match becomes NULL, a match stays 1.
-            "SELECT 5 IN (1,2,NULL)",  // NULL
-            "SELECT 2 IN (1,2,NULL)",  // 1
+            "SELECT 5 IN (1,2,NULL)",     // NULL
+            "SELECT 2 IN (1,2,NULL)",     // 1
             "SELECT 5 NOT IN (1,2,NULL)", // NULL
             "SELECT 2 NOT IN (1,2,NULL)", // 0
         ],
@@ -124,8 +124,8 @@ fn in_list_over_table() {
         &f,
         &r,
         &[
-            "SELECT id FROM t WHERE n IN (1,3,5) ORDER BY id",      // 1,2,3
-            "SELECT id FROM t WHERE n NOT IN (1,3) ORDER BY id",    // 3,4 (NULL row excluded)
+            "SELECT id FROM t WHERE n IN (1,3,5) ORDER BY id", // 1,2,3
+            "SELECT id FROM t WHERE n NOT IN (1,3) ORDER BY id", // 3,4 (NULL row excluded)
             "SELECT id FROM t WHERE s IN ('apple','cherry') ORDER BY id", // 1,3
         ],
         "in_list_over_table",
@@ -173,10 +173,10 @@ fn between_scalar_logic() {
             "SELECT 3 BETWEEN 1 AND 5, 5 BETWEEN 1 AND 5, 1 BETWEEN 1 AND 5", // 1,1,1
             "SELECT 6 BETWEEN 1 AND 5, 0 BETWEEN 1 AND 5",                    // 0,0
             // Reversed bounds -> never matches (x>=5 AND x<=1).
-            "SELECT 3 BETWEEN 5 AND 1",                                       // 0
+            "SELECT 3 BETWEEN 5 AND 1", // 0
             // NULL bounds / value -> NULL.
             "SELECT 3 BETWEEN NULL AND 5, 3 BETWEEN 1 AND NULL, NULL BETWEEN 1 AND 5",
-            "SELECT 3 NOT BETWEEN 1 AND 5, 6 NOT BETWEEN 1 AND 5",            // 0,1
+            "SELECT 3 NOT BETWEEN 1 AND 5, 6 NOT BETWEEN 1 AND 5", // 0,1
         ],
         "between_scalar_logic",
     );
@@ -189,7 +189,7 @@ fn between_over_table_and_text() {
         &f,
         &r,
         &[
-            "SELECT id FROM t WHERE n BETWEEN 2 AND 5 ORDER BY id",     // 2,3
+            "SELECT id FROM t WHERE n BETWEEN 2 AND 5 ORDER BY id", // 2,3
             "SELECT id FROM t WHERE n NOT BETWEEN 2 AND 5 ORDER BY id", // 1,4 (NULL excluded)
             // Text BETWEEN by collation order.
             "SELECT id FROM t WHERE s BETWEEN 'b' AND 'd' ORDER BY id", // 2,3

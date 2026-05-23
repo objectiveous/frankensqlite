@@ -509,6 +509,10 @@ mod tests {
     fn greedy_select_tiebreak_first_occurrence() {
         let cands = vec![c(10, 0.5, 1), c(20, 0.5, 2), c(30, 0.5, 3)];
         let picked = greedy_select(&cands, 1, 0.0);
-        assert_eq!(picked, vec![pn(10)], "tied candidates: first occurrence wins");
+        assert_eq!(
+            picked,
+            vec![pn(10)],
+            "tied candidates: first occurrence wins"
+        );
     }
 }

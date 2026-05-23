@@ -484,10 +484,18 @@ mod tests {
         // partition_upper keeps them on the lower side (<=). With three 5s and a
         // lone 8, lower counts only {3,1} and upper counts everything but 8.
         let mut lower = vec![5, 3, 8, 5, 1, 5];
-        assert_eq!(partition_lower(&mut lower, 5), 2, "only 3 and 1 are strictly < 5");
+        assert_eq!(
+            partition_lower(&mut lower, 5),
+            2,
+            "only 3 and 1 are strictly < 5"
+        );
 
         let mut upper = vec![5, 3, 8, 5, 1, 5];
-        assert_eq!(partition_upper(&mut upper, 5), 5, "everything except the lone 8 is <= 5");
+        assert_eq!(
+            partition_upper(&mut upper, 5),
+            5,
+            "everything except the lone 8 is <= 5"
+        );
 
         // Edge cases on partition_lower: all-below, none-below, and empty.
         assert_eq!(partition_lower(&mut vec![1, 2, 3], 5), 3);
@@ -507,7 +515,16 @@ mod tests {
         let mut expected_sorted = original.clone();
         expected_sorted.sort_unstable();
 
-        for (lo, hi) in [(3, 6), (0, 2), (5, 9), (1, 1), (7, 7), (0, 9), (4, 8), (2, 5)] {
+        for (lo, hi) in [
+            (3, 6),
+            (0, 2),
+            (5, 9),
+            (1, 1),
+            (7, 7),
+            (0, 9),
+            (4, 8),
+            (2, 5),
+        ] {
             let mut got: Vec<i32> = col.range_query(lo, hi).to_vec();
             got.sort_unstable();
             let mut want: Vec<i32> = original
@@ -522,7 +539,10 @@ mod tests {
         // The column is still a permutation of the original.
         let mut after: Vec<i32> = col.full_scan().to_vec();
         after.sort_unstable();
-        assert_eq!(after, expected_sorted, "cracking must preserve the multiset");
+        assert_eq!(
+            after, expected_sorted,
+            "cracking must preserve the multiset"
+        );
         assert_eq!(col.len(), original.len());
     }
 }

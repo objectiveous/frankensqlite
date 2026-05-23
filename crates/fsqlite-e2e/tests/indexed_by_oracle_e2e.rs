@@ -118,7 +118,7 @@ fn not_indexed_forces_scan_same_results() {
         &T,
         &[
             "SELECT id FROM t NOT INDEXED WHERE a = 20 ORDER BY id", // 2,3 (scan)
-            "SELECT id FROM t NOT INDEXED WHERE id = 1",            // 1
+            "SELECT id FROM t NOT INDEXED WHERE id = 1",             // 1
             "SELECT id FROM t NOT INDEXED WHERE a > 15 ORDER BY id", // 2,3,4
         ],
         "not_indexed_forces_scan_same_results",

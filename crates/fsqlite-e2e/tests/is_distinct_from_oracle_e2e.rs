@@ -123,7 +123,7 @@ fn is_distinct_from_text_and_mixed() {
             "SELECT 'a' IS DISTINCT FROM 'b'",      // 1
             "SELECT 'x' IS NOT DISTINCT FROM NULL", // 0
             // No-affinity comparison: 1 vs '1' differ -> distinct.
-            "SELECT 1 IS DISTINCT FROM '1'",        // 1
+            "SELECT 1 IS DISTINCT FROM '1'", // 1
         ],
         "is_distinct_from_text_and_mixed",
     );
@@ -147,8 +147,8 @@ fn is_distinct_from_in_where() {
             // NULL-safe match of the NULL rows (unlike `= NULL` which matches none).
             "SELECT id FROM t WHERE v IS NOT DISTINCT FROM NULL ORDER BY id", // 2,4
             // Distinct-from a value includes the NULL rows.
-            "SELECT id FROM t WHERE v IS DISTINCT FROM 10 ORDER BY id",       // 2,3,4
-            "SELECT id FROM t WHERE v IS NOT DISTINCT FROM 10 ORDER BY id",   // 1
+            "SELECT id FROM t WHERE v IS DISTINCT FROM 10 ORDER BY id", // 2,3,4
+            "SELECT id FROM t WHERE v IS NOT DISTINCT FROM 10 ORDER BY id", // 1
         ],
         "is_distinct_from_in_where",
     );

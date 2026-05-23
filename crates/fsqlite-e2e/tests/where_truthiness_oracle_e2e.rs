@@ -91,12 +91,12 @@ fn assert_scalar(queries: &[&str], label: &str) {
 fn where_numeric_truthiness() {
     assert_scalar(
         &[
-            "SELECT 1 WHERE 1",     // [1]
-            "SELECT 1 WHERE 0",     // []
-            "SELECT 1 WHERE -3",    // [1] (non-zero)
-            "SELECT 1 WHERE 0.5",   // [1]
-            "SELECT 1 WHERE 0.0",   // []
-            "SELECT 1 WHERE NULL",  // [] (NULL is not true)
+            "SELECT 1 WHERE 1",    // [1]
+            "SELECT 1 WHERE 0",    // []
+            "SELECT 1 WHERE -3",   // [1] (non-zero)
+            "SELECT 1 WHERE 0.5",  // [1]
+            "SELECT 1 WHERE 0.0",  // []
+            "SELECT 1 WHERE NULL", // [] (NULL is not true)
         ],
         "where_numeric_truthiness",
     );
@@ -106,13 +106,13 @@ fn where_numeric_truthiness() {
 fn where_text_truthiness_via_numeric_coercion() {
     assert_scalar(
         &[
-            "SELECT 1 WHERE '5'",     // [1] -> 5
-            "SELECT 1 WHERE '0'",     // []  -> 0
-            "SELECT 1 WHERE 'abc'",   // []  -> 0
-            "SELECT 1 WHERE '3abc'",  // [1] -> 3 (numeric prefix)
-            "SELECT 1 WHERE '0abc'",  // []  -> 0
-            "SELECT 1 WHERE '-2'",    // [1] -> -2 (non-zero)
-            "SELECT 1 WHERE ''",      // []  -> 0
+            "SELECT 1 WHERE '5'",    // [1] -> 5
+            "SELECT 1 WHERE '0'",    // []  -> 0
+            "SELECT 1 WHERE 'abc'",  // []  -> 0
+            "SELECT 1 WHERE '3abc'", // [1] -> 3 (numeric prefix)
+            "SELECT 1 WHERE '0abc'", // []  -> 0
+            "SELECT 1 WHERE '-2'",   // [1] -> -2 (non-zero)
+            "SELECT 1 WHERE ''",     // []  -> 0
         ],
         "where_text_truthiness_via_numeric_coercion",
     );

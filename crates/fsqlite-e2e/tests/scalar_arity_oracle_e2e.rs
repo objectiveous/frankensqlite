@@ -88,17 +88,17 @@ fn assert_scalar(queries: &[&str], label: &str) {
 fn scalar_arity_wrong_count_rejected() {
     assert_scalar(
         &[
-            "SELECT abs()",            // too few (needs 1)
-            "SELECT abs(1, 2)",        // too many
-            "SELECT length()",         // too few
-            "SELECT upper()",          // too few
-            "SELECT lower('a', 'b')",  // too many
-            "SELECT ifnull(1)",        // needs 2
-            "SELECT ifnull(1, 2, 3)",  // too many
-            "SELECT nullif(1)",        // needs 2
-            "SELECT coalesce(1)",      // needs >= 2
-            "SELECT quote()",          // needs 1
-            "SELECT quote(1, 2)",      // too many
+            "SELECT abs()",           // too few (needs 1)
+            "SELECT abs(1, 2)",       // too many
+            "SELECT length()",        // too few
+            "SELECT upper()",         // too few
+            "SELECT lower('a', 'b')", // too many
+            "SELECT ifnull(1)",       // needs 2
+            "SELECT ifnull(1, 2, 3)", // too many
+            "SELECT nullif(1)",       // needs 2
+            "SELECT coalesce(1)",     // needs >= 2
+            "SELECT quote()",         // needs 1
+            "SELECT quote(1, 2)",     // too many
         ],
         "scalar_arity_wrong_count_rejected",
     );
@@ -108,14 +108,14 @@ fn scalar_arity_wrong_count_rejected() {
 fn scalar_arity_correct_ok() {
     assert_scalar(
         &[
-            "SELECT abs(-3)",                  // 3
-            "SELECT length('abc')",            // 3
-            "SELECT upper('a')",               // 'A'
-            "SELECT lower('AB')",              // 'ab'
-            "SELECT ifnull(NULL, 5)",          // 5
-            "SELECT nullif(1, 2)",             // 1
-            "SELECT coalesce(NULL, NULL, 7)",  // 7
-            "SELECT quote('x')",               // 'x' quoted
+            "SELECT abs(-3)",                 // 3
+            "SELECT length('abc')",           // 3
+            "SELECT upper('a')",              // 'A'
+            "SELECT lower('AB')",             // 'ab'
+            "SELECT ifnull(NULL, 5)",         // 5
+            "SELECT nullif(1, 2)",            // 1
+            "SELECT coalesce(NULL, NULL, 7)", // 7
+            "SELECT quote('x')",              // 'x' quoted
         ],
         "scalar_arity_correct_ok",
     );

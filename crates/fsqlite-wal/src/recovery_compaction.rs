@@ -1544,10 +1544,7 @@ mod tests {
 
     #[test]
     fn test_retirable_segments_empty_before_publish() {
-        let saga = CompactionSaga::new(
-            vec![make_segment(0x10, &[0x20, 0x21], 1000)],
-            2.5,
-        );
+        let saga = CompactionSaga::new(vec![make_segment(0x10, &[0x20, 0x21], 1000)], 2.5);
         assert!(saga.retirable_segments().is_empty());
         assert!(!saga.is_published());
     }
@@ -1653,8 +1650,12 @@ mod tests {
     #[test]
     fn capsule_decode_outcome_debug_clone_eq_all_variants() {
         let sys = CapsuleDecodeOutcome::Systematic;
-        let rep = CapsuleDecodeOutcome::Repaired { repair_symbols_used: 3 };
-        let fail = CapsuleDecodeOutcome::Failed { reason: "corrupt".into() };
+        let rep = CapsuleDecodeOutcome::Repaired {
+            repair_symbols_used: 3,
+        };
+        let fail = CapsuleDecodeOutcome::Failed {
+            reason: "corrupt".into(),
+        };
         assert_eq!(sys.clone(), sys);
         assert_eq!(rep.clone(), rep);
         assert_eq!(fail.clone(), fail);
@@ -1667,9 +1668,24 @@ mod tests {
     #[test]
     fn compaction_mdp_state_hash_distinguishes_fields() {
         use std::collections::HashSet;
-        let a = CompactionMdpState { space_amp_bucket: 0, read_regime: 0, write_regime: 0, compaction_debt: 0 };
-        let b = CompactionMdpState { space_amp_bucket: 1, read_regime: 0, write_regime: 0, compaction_debt: 0 };
-        let c = CompactionMdpState { space_amp_bucket: 0, read_regime: 1, write_regime: 0, compaction_debt: 0 };
+        let a = CompactionMdpState {
+            space_amp_bucket: 0,
+            read_regime: 0,
+            write_regime: 0,
+            compaction_debt: 0,
+        };
+        let b = CompactionMdpState {
+            space_amp_bucket: 1,
+            read_regime: 0,
+            write_regime: 0,
+            compaction_debt: 0,
+        };
+        let c = CompactionMdpState {
+            space_amp_bucket: 0,
+            read_regime: 1,
+            write_regime: 0,
+            compaction_debt: 0,
+        };
         let mut set = HashSet::new();
         set.insert(a);
         set.insert(b);
@@ -1681,14 +1697,20 @@ mod tests {
     #[test]
     fn compaction_action_and_rate_limit_debug_clone_copy_eq() {
         let defer = CompactionAction::Defer;
-        let now = CompactionAction::CompactNow { rate_limit: CompactionRateLimit::Medium };
+        let now = CompactionAction::CompactNow {
+            rate_limit: CompactionRateLimit::Medium,
+        };
         assert_ne!(defer, now);
         let copied = defer;
         assert_eq!(copied, defer);
         let dbg = format!("{now:?}");
         assert!(dbg.contains("CompactNow"));
         assert!(dbg.contains("Medium"));
-        let rates = [CompactionRateLimit::Low, CompactionRateLimit::Medium, CompactionRateLimit::High];
+        let rates = [
+            CompactionRateLimit::Low,
+            CompactionRateLimit::Medium,
+            CompactionRateLimit::High,
+        ];
         for r in &rates {
             let c = *r;
             assert_eq!(c, *r);
@@ -1698,7 +1720,10 @@ mod tests {
     #[test]
     fn reader_lease_debug_clone_eq_hash() {
         use std::collections::HashSet;
-        let lease = ReaderLease { lease_id: 42, segment_ids: vec![make_oid(0x01), make_oid(0x02)] };
+        let lease = ReaderLease {
+            lease_id: 42,
+            segment_ids: vec![make_oid(0x01), make_oid(0x02)],
+        };
         let dbg = format!("{lease:?}");
         assert!(dbg.contains("ReaderLease"));
         assert!(dbg.contains("42"));

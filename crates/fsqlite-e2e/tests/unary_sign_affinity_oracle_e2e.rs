@@ -108,14 +108,14 @@ fn unary_plus_is_type_preserving_noop() {
 fn unary_minus_applies_numeric_affinity() {
     assert_scalar(
         &[
-            "SELECT -'5'",           // -5
-            "SELECT typeof(-'5')",   // integer
-            "SELECT -'5.5'",         // -5.5
-            "SELECT typeof(-'5.5')", // real
-            "SELECT -'abc'",         // 0 (non-numeric text -> 0)
-            "SELECT typeof(-'abc')", // integer
-            "SELECT -NULL",          // NULL
-            "SELECT typeof(-NULL)",  // null
+            "SELECT -'5'",            // -5
+            "SELECT typeof(-'5')",    // integer
+            "SELECT -'5.5'",          // -5.5
+            "SELECT typeof(-'5.5')",  // real
+            "SELECT -'abc'",          // 0 (non-numeric text -> 0)
+            "SELECT typeof(-'abc')",  // integer
+            "SELECT -NULL",           // NULL
+            "SELECT typeof(-NULL)",   // null
             "SELECT typeof(-(-'5'))", // integer (coercion sticks)
         ],
         "unary_minus_applies_numeric_affinity",

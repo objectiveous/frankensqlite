@@ -50,6 +50,7 @@ pub mod seqlock;
 pub mod shared_lock_table;
 pub mod sheaf_conformal;
 pub mod shm;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod silo_epoch;
 pub mod sketch_telemetry;
 pub mod ssi_abort_policy;

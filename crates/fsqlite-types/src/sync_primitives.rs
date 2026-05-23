@@ -327,10 +327,10 @@ impl std::ops::SubAssign<Duration> for Instant {
 }
 
 #[cfg(target_arch = "wasm32")]
-impl std::ops::Sub<Instant> for Instant {
+impl std::ops::Sub<Self> for Instant {
     type Output = Duration;
 
-    fn sub(self, rhs: Instant) -> Self::Output {
+    fn sub(self, rhs: Self) -> Self::Output {
         self.duration_since(rhs)
     }
 }

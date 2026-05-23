@@ -2003,7 +2003,7 @@ mod tests {
     fn test_open_or_initialize_region_shares_live_state_between_handles() {
         let region = ShmRegion::new(SharedMemoryLayout::HEADER_SIZE);
         let layout_a =
-            SharedMemoryLayout::open_or_initialize_region(region.clone(), PageSize::DEFAULT, 64)
+            SharedMemoryLayout::open_or_initialize_region(region.share(), PageSize::DEFAULT, 64)
                 .unwrap();
         let layout_b =
             SharedMemoryLayout::open_or_initialize_region(region, PageSize::DEFAULT, 64).unwrap();

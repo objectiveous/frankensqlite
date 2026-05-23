@@ -235,6 +235,26 @@ impl ShmRegion {
         }
     }
 
+    /// Return an aliased view of this region — a handle that shares the
+    /// underlying buffer with `self`.
+    ///
+    /// Use this for SHM coordination across handles to the same physical
+    /// region (multi-connection WAL-index, mvcc txn counters, etc.). Writes
+    /// through one handle are visible to all others via the shared `Arc`.
+    ///
+    /// Use [`Clone`] when you want a deep, independent copy of the buffer.
+    #[must_use]
+    pub fn share(&self) -> Self {
+        Self {
+            len: self.len,
+            backing: match &self.backing {
+                ShmRegionBacking::Heap(v) => ShmRegionBacking::Heap(Arc::clone(v)),
+                #[cfg(unix)]
+                ShmRegionBacking::Mmap(m) => ShmRegionBacking::Mmap(Arc::clone(m)),
+            },
+        }
+    }
+
     /// The size of this region in bytes.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -1143,6 +1163,30 @@ mod tests {
             cloned.read_u32_le(0).unwrap(),
             0xDEAD,
             "clone must be independent"
+        );
+    }
+
+    #[test]
+    fn test_shm_region_share_aliases_buffer() {
+        let region = ShmRegion::new(16);
+        region.write_u32_le(0, 0xDEAD).unwrap();
+        let shared = region.share();
+        assert_eq!(
+            shared.read_u32_le(0).unwrap(),
+            0xDEAD,
+            "share() handle sees post-write state",
+        );
+        region.write_u32_le(0, 0xBEEF).unwrap();
+        assert_eq!(
+            shared.read_u32_le(0).unwrap(),
+            0xBEEF,
+            "share() handle aliases the original buffer — subsequent writes through one are visible to the other",
+        );
+        shared.write_u32_le(4, 0xCAFE).unwrap();
+        assert_eq!(
+            region.read_u32_le(4).unwrap(),
+            0xCAFE,
+            "writes through the shared handle are also visible to the original",
         );
     }
 

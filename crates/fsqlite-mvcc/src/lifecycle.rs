@@ -1218,12 +1218,14 @@ impl TransactionManager {
             .rollback_txn_to_delta_count(txn.token(), savepoint.cell_delta_len);
 
         // Restore write_set_data to the savepoint state.
-        txn.write_set_data = savepoint.write_set_snapshot.clone();
+        txn.write_set_data.clone_from(&savepoint.write_set_snapshot);
 
         // Truncate the write_set page list to savepoint length.
         txn.write_set.truncate(savepoint.write_set_len);
-        txn.write_set_versions = savepoint.write_set_versions_snapshot.clone();
-        txn.structural_pages = savepoint.structural_pages_snapshot.clone();
+        txn.write_set_versions
+            .clone_from(&savepoint.write_set_versions_snapshot);
+        txn.structural_pages
+            .clone_from(&savepoint.structural_pages_snapshot);
         txn.intent_log.truncate(savepoint.intent_log_len);
 
         tracing::debug!(
@@ -2250,7 +2252,7 @@ mod tests {
     #[test]
     fn test_shared_shm_region_coordinates_txn_ids_and_snapshot_visibility() {
         let region = ShmRegion::new(SharedMemoryLayout::HEADER_SIZE);
-        let writer = shared_mgr(region.clone());
+        let writer = shared_mgr(region.share());
         let reader = shared_mgr(region);
 
         let txn_a = writer.begin(BeginKind::Deferred).unwrap();

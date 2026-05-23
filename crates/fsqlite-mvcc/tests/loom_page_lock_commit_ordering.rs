@@ -25,6 +25,11 @@
 //! In other words, the reader never observes a commit-index entry that points to
 //! data that hasn't been fsynced yet.
 
+// `loom` is set via `RUSTFLAGS="--cfg loom"` only when running the loom
+// schedule-enumeration suite; without this allow, `-D unexpected_cfgs`
+// (implied by `-D warnings`) rejects the cfg-gates as unknown.
+#![allow(unexpected_cfgs)]
+
 #[cfg(loom)]
 mod loom_tests {
     use loom::sync::Arc;

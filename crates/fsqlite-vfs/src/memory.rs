@@ -929,7 +929,7 @@ impl VfsFile for MemoryFile {
 
         let shm_info = self.ensure_shm_info()?;
         let mut info = shm_info.lock().map_err(|_| lock_err())?;
-        if let Some(existing) = info.regions.get(&region).cloned() {
+        if let Some(existing) = info.regions.get(&region).map(ShmRegion::share) {
             let requested_size = usize::try_from(size).map_err(|_| FrankenError::LockFailed {
                 detail: format!("shm_map size too large: {size}"),
             })?;
@@ -951,7 +951,7 @@ impl VfsFile for MemoryFile {
             // when a caller remaps with a larger size.
             let mut updated_region = existing;
             updated_region.try_resize_heap(requested_size)?;
-            info.regions.insert(region, updated_region.clone());
+            info.regions.insert(region, updated_region.share());
             drop(info);
             return Ok(updated_region);
         }
@@ -966,7 +966,7 @@ impl VfsFile for MemoryFile {
             detail: format!("shm_map size too large: {size}"),
         })?;
         let new_region = ShmRegion::new(map_size);
-        info.regions.insert(region, new_region.clone());
+        info.regions.insert(region, new_region.share());
         drop(info);
         Ok(new_region)
     }

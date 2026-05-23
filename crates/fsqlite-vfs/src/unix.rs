@@ -2041,7 +2041,7 @@ impl VfsFile for UnixFile {
         // call. The region is `map_size` bytes. We transfer ownership to ShmRegion
         // which will `munmap` on drop.
         let new_region = unsafe { ShmRegion::from_mmap(ptr.cast::<u8>(), map_size) };
-        info.regions.insert(region, new_region.clone());
+        info.regions.insert(region, new_region.share());
         drop(info);
         Ok(new_region)
     }

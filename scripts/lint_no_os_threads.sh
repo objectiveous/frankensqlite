@@ -33,7 +33,7 @@ scan_source() {
       return delta;
     }
 
-    /^[[:space:]]*#\[cfg\([[:space:]]*test[[:space:]]*\)\]/ {
+    /^[[:space:]]*#\[cfg[[:space:]]*\([[:space:]]*test[[:space:]]*\)\]/ {
       pending_test_item = 1;
       next;
     }
@@ -121,6 +121,9 @@ fn inline_standalone_test_spawn_is_ignored() { std::thread::spawn(|| {}); } // i
 #[cfg(test)]
 fn spaced_test_spawn_is_ignored() { std :: thread :: spawn(|| {}); } // spaced test spawn sentinel
 
+#[cfg (test)]
+fn spaced_cfg_attribute_spawn_is_ignored() { thread :: spawn(|| {}); } // spaced cfg attribute spawn sentinel
+
 fn production_after_test_is_detected() {
     std::thread::spawn(|| {}); // production spawn sentinel
 }
@@ -132,7 +135,7 @@ fn production_spaced_path_is_detected() {
 RUST
   )"
 
-  if [[ "${output}" == *"test spawn sentinel"* || "${output}" == *"standalone test spawn sentinel"* || "${output}" == *"inline cfg(test) spawn sentinel"* || "${output}" == *"inline standalone test spawn sentinel"* || "${output}" == *"spaced test spawn sentinel"* ]]; then
+  if [[ "${output}" == *"test spawn sentinel"* || "${output}" == *"standalone test spawn sentinel"* || "${output}" == *"inline cfg(test) spawn sentinel"* || "${output}" == *"inline standalone test spawn sentinel"* || "${output}" == *"spaced test spawn sentinel"* || "${output}" == *"spaced cfg attribute spawn sentinel"* ]]; then
     echo "[FAIL] self-test scanner reported a test-only thread spawn" >&2
     printf '%s\n' "${output}" >&2
     exit 1

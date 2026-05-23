@@ -8,7 +8,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as _;
+use std::fs;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
+use crate::differential_v2::{
+    CsqliteExecutor, EngineIdentity, FsqliteExecutor, SqlExecutor, StmtOutcome,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -24,6 +30,9 @@ pub const SWARM_TRACE_SCRUBBER_VERSION: &str = "1.0.0";
 
 /// Version of the fixed-seed synthetic trace generator.
 pub const SYNTHETIC_TRACE_GENERATOR_VERSION: &str = "1.0.0";
+
+/// Version of the deterministic agent-swarm replay harness.
+pub const AGENT_SWARM_REPLAY_HARNESS_VERSION: &str = "1.0.0";
 
 /// Marker used in structured logs when no failure diagnostic exists yet.
 pub const FIRST_FAILURE_DIAGNOSTIC_ABSENT: &str = "none";
@@ -617,6 +626,362 @@ impl fmt::Display for TraceScrubError {
 
 impl std::error::Error for TraceScrubError {}
 
+/// Error raised while loading or replaying an agent-swarm trace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentSwarmReplayError {
+    /// Serialized trace schema does not match the replay harness contract.
+    SchemaMismatch {
+        /// Expected schema version.
+        expected: String,
+        /// Actual schema version observed in the trace.
+        actual: String,
+    },
+    /// Trace JSON could not be decoded.
+    JsonDecode(String),
+    /// Trace fixture could not be read from disk.
+    FixtureRead(String),
+    /// A built-in SQL backend could not be opened.
+    BackendOpen {
+        /// Backend that failed to initialize.
+        backend: AgentSwarmReplayBackend,
+        /// Error message from the backend.
+        message: String,
+    },
+}
+
+impl fmt::Display for AgentSwarmReplayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SchemaMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "agent-swarm trace schema mismatch: expected {expected}, got {actual}"
+                )
+            }
+            Self::JsonDecode(message) => {
+                write!(f, "agent-swarm trace JSON decode failed: {message}")
+            }
+            Self::FixtureRead(message) => {
+                write!(f, "agent-swarm trace fixture read failed: {message}")
+            }
+            Self::BackendOpen { backend, message } => {
+                write!(
+                    f,
+                    "failed to open {} replay backend: {message}",
+                    backend.as_str()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for AgentSwarmReplayError {}
+
+/// SQL backend role used by the agent-swarm replay report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSwarmReplayBackend {
+    /// FrankenSQLite with its concurrent-writer default left enabled.
+    FrankenSqliteConcurrent,
+    /// C SQLite/rusqlite oracle baseline.
+    CSqliteOracle,
+}
+
+impl AgentSwarmReplayBackend {
+    /// Stable backend label used in reports and structured logs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FrankenSqliteConcurrent => "frankensqlite_concurrent",
+            Self::CSqliteOracle => "csqlite_oracle",
+        }
+    }
+
+    const fn comparison_role(self) -> &'static str {
+        match self {
+            Self::FrankenSqliteConcurrent => "subject_concurrent_writer_default",
+            Self::CSqliteOracle => "baseline_csqlite_oracle",
+        }
+    }
+
+    const fn concurrent_writer_default(self) -> bool {
+        matches!(self, Self::FrankenSqliteConcurrent)
+    }
+}
+
+/// Deterministic schedule used when replaying trace statements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSwarmReplaySchedule {
+    /// Preserve sanitized trace order by `logical_order`.
+    TraceOrder,
+    /// Group by `concurrency_group`, then replay by `logical_order`.
+    ConcurrencyGroupThenOrder,
+}
+
+/// One-command entry points embedded into replay reports for operators.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmReplayCommands {
+    /// Fast smoke command for a small trace fixture.
+    pub smoke_command: String,
+    /// Heavy command shape intended for rch-offloaded traces.
+    pub heavy_command: String,
+}
+
+impl Default for AgentSwarmReplayCommands {
+    fn default() -> Self {
+        Self {
+            smoke_command: "cargo test -p fsqlite-harness agent_swarm_replay -- --nocapture"
+                .to_owned(),
+            heavy_command: "timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-agent-swarm-replay cargo test -p fsqlite-harness agent_swarm_replay -- --nocapture".to_owned(),
+        }
+    }
+}
+
+/// Configuration for deterministic agent-swarm trace replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmReplayConfig {
+    /// Seed recorded in the replay report for deterministic scheduling.
+    pub seed: u64,
+    /// Statement scheduling policy.
+    pub schedule: AgentSwarmReplaySchedule,
+    /// Optional schema/setup SQL. Empty means infer schema for synthetic traces.
+    pub schema_sql: Vec<String>,
+    /// Operator commands for smoke and heavy replay paths.
+    pub commands: AgentSwarmReplayCommands,
+}
+
+impl AgentSwarmReplayConfig {
+    /// Build a smoke replay configuration with default commands.
+    pub fn smoke(seed: u64) -> Self {
+        Self {
+            seed,
+            schedule: AgentSwarmReplaySchedule::TraceOrder,
+            schema_sql: Vec::new(),
+            commands: AgentSwarmReplayCommands::default(),
+        }
+    }
+
+    /// Override setup SQL used before trace statements.
+    #[must_use]
+    pub fn with_schema_sql(
+        mut self,
+        schema_sql: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.schema_sql = schema_sql.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Override deterministic scheduling policy.
+    #[must_use]
+    pub const fn with_schedule(mut self, schedule: AgentSwarmReplaySchedule) -> Self {
+        self.schedule = schedule;
+        self
+    }
+}
+
+/// Backend identity metadata captured by a replay run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmBackendIdentity {
+    /// Harness-level backend role.
+    pub backend: AgentSwarmReplayBackend,
+    /// Executor identity observed from the backend implementation.
+    pub engine_identity: String,
+    /// Comparison role label.
+    pub comparison_role: String,
+    /// Whether this backend represents FrankenSQLite's concurrent-writer default.
+    pub concurrent_writer_default: bool,
+}
+
+/// Normalized statement outcome class for replay summaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSwarmReplayOutcomeClass {
+    /// Statement completed successfully.
+    Success,
+    /// Statement produced a busy or locked outcome.
+    Busy,
+    /// Statement produced a conflict-like outcome.
+    Conflict,
+    /// Statement produced another error.
+    Error,
+}
+
+impl AgentSwarmReplayOutcomeClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Busy => "busy",
+            Self::Conflict => "conflict",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// Failure while applying backend setup SQL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmSchemaFailure {
+    /// Setup statement index.
+    pub schema_index: usize,
+    /// Setup SQL that failed.
+    pub sql: String,
+    /// Backend error message.
+    pub error: String,
+}
+
+/// Replay record for one trace statement on one backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmStatementReplay {
+    /// Backend that executed the statement.
+    pub backend: AgentSwarmReplayBackend,
+    /// Index in the trace's `statements` array.
+    pub trace_statement_index: usize,
+    /// Deterministic trace order.
+    pub logical_order: u64,
+    /// Logical connection identity from the trace.
+    pub connection_id: String,
+    /// Logical transaction identity from the trace.
+    pub transaction_id: Option<String>,
+    /// Preserved transaction boundary marker.
+    pub transaction_boundary: TransactionBoundary,
+    /// Preserved concurrency group.
+    pub concurrency_group: String,
+    /// Preserved workload phase.
+    pub workload_phase: String,
+    /// Sanitized statement shape hash.
+    pub statement_shape: String,
+    /// Replay SQL after deterministic literal materialization.
+    pub materialized_sql: String,
+    /// Expected result class from the trace.
+    pub expected_result_class: ExpectedResultClass,
+    /// Actual statement outcome.
+    pub outcome: StmtOutcome,
+    /// Normalized outcome class.
+    pub outcome_class: AgentSwarmReplayOutcomeClass,
+    /// Statement latency in nanoseconds.
+    pub latency_ns: u64,
+    /// Retry count observed by this deterministic replay path.
+    pub retry_count: u32,
+    /// Whether actual outcome class matched the trace expectation.
+    pub expected_matched: bool,
+    /// First-failure diagnostic attached to structured logs.
+    pub first_failure_diag: String,
+}
+
+/// Aggregated backend replay metrics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmBackendSummary {
+    /// Trace statements attempted on this backend.
+    pub statements_total: usize,
+    /// Statements that completed successfully.
+    pub success_count: usize,
+    /// Statements that returned an error-like outcome.
+    pub error_count: usize,
+    /// Statements whose actual class did not match the trace expectation.
+    pub expected_mismatch_count: usize,
+    /// Explicit rollback/error abort count.
+    pub abort_count: usize,
+    /// Total retries observed.
+    pub retry_count: u64,
+    /// Outcome/error classes seen during replay.
+    pub conflict_classes: BTreeMap<String, usize>,
+    /// Sum of statement latencies.
+    pub latency_total_ns: u64,
+    /// p50 latency.
+    pub latency_p50_ns: u64,
+    /// p95 latency.
+    pub latency_p95_ns: u64,
+    /// p99 latency.
+    pub latency_p99_ns: u64,
+    /// Statements per second multiplied by 1000.
+    pub throughput_statements_per_second_x1000: u64,
+    /// Deterministic high-water estimate for replay inputs held in memory.
+    pub memory_high_water_bytes: usize,
+}
+
+/// Full replay output for one backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmBackendReplay {
+    /// Backend identity metadata.
+    pub identity: AgentSwarmBackendIdentity,
+    /// Setup SQL failures, if any.
+    pub schema_failures: Vec<AgentSwarmSchemaFailure>,
+    /// Per-statement replay records.
+    pub statements: Vec<AgentSwarmStatementReplay>,
+    /// Aggregated metrics.
+    pub summary: AgentSwarmBackendSummary,
+}
+
+/// Cross-backend statement mismatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmBackendMismatch {
+    /// Index in the trace's `statements` array.
+    pub trace_statement_index: usize,
+    /// Deterministic trace order.
+    pub logical_order: u64,
+    /// Statement shape hash.
+    pub statement_shape: String,
+    /// FrankenSQLite outcome.
+    pub subject_outcome: StmtOutcome,
+    /// C SQLite oracle outcome.
+    pub reference_outcome: StmtOutcome,
+}
+
+/// First-failure bundle with a minimal reproducer trace slice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmFirstFailureBundle {
+    /// Backend associated with the failure, when backend-local.
+    pub backend: Option<AgentSwarmReplayBackend>,
+    /// Human-readable deterministic reason code.
+    pub reason: String,
+    /// Index in the trace's `statements` array.
+    pub trace_statement_index: usize,
+    /// Trace identifier.
+    pub trace_id: String,
+    /// Run identifier.
+    pub run_id: String,
+    /// Scenario identifier.
+    pub scenario_id: String,
+    /// Minimal transaction/window slice needed to reproduce the failure.
+    pub minimal_reproducer_trace_slice: Vec<TraceStatement>,
+    /// Materialized SQL for the minimal slice.
+    pub materialized_replay_sql: Vec<String>,
+}
+
+/// Full agent-swarm replay report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmReplayReport {
+    /// Replay report schema version.
+    pub schema_version: String,
+    /// Harness implementation version.
+    pub harness_version: String,
+    /// Trace identifier.
+    pub trace_id: String,
+    /// Run identifier.
+    pub run_id: String,
+    /// Scenario identifier.
+    pub scenario_id: String,
+    /// Replay seed.
+    pub seed: u64,
+    /// Scheduling policy used.
+    pub schedule: AgentSwarmReplaySchedule,
+    /// Operator commands for replaying this harness.
+    pub commands: AgentSwarmReplayCommands,
+    /// Setup statement count.
+    pub schema_statement_count: usize,
+    /// Trace statement count.
+    pub statement_count: usize,
+    /// Distinct transaction count.
+    pub transaction_count: usize,
+    /// Topology validation errors found before execution.
+    pub topology_errors: Vec<String>,
+    /// Backend replay outputs.
+    pub backends: Vec<AgentSwarmBackendReplay>,
+    /// Statement-level mismatches between subject and reference backends.
+    pub cross_backend_mismatches: Vec<AgentSwarmBackendMismatch>,
+    /// First failure bundle, if replay found a failure or mismatch.
+    pub first_failure: Option<AgentSwarmFirstFailureBundle>,
+}
+
 /// Scrub sensitive SQL literals while preserving statement topology.
 pub fn scrub_sql_statement(sql: &str) -> ScrubbedSql {
     let chars = sql.chars().collect::<Vec<_>>();
@@ -776,6 +1141,719 @@ pub fn log_synthetic_swarm_trace_generation(
         first_failure_diag = first_failure_diag.unwrap_or(FIRST_FAILURE_DIAGNOSTIC_ABSENT),
         "synthetic agent swarm trace generated",
     );
+}
+
+/// Decode a JSON trace fixture and validate its schema version.
+pub fn load_agent_swarm_trace_json(json: &str) -> Result<AgentSwarmTrace, AgentSwarmReplayError> {
+    let trace = serde_json::from_str(json)
+        .map_err(|error| AgentSwarmReplayError::JsonDecode(error.to_string()))?;
+    validate_agent_swarm_trace_schema(&trace)?;
+    Ok(trace)
+}
+
+/// Load a JSON trace fixture from disk and validate its schema version.
+pub fn load_agent_swarm_trace_file(
+    path: impl AsRef<Path>,
+) -> Result<AgentSwarmTrace, AgentSwarmReplayError> {
+    let json = fs::read_to_string(path)
+        .map_err(|error| AgentSwarmReplayError::FixtureRead(error.to_string()))?;
+    load_agent_swarm_trace_json(&json)
+}
+
+/// Materialize scrubber placeholders into deterministic safe literals.
+#[must_use]
+pub fn materialize_scrubbed_sql(sql: &str) -> String {
+    let chars = sql.chars().collect::<Vec<_>>();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < chars.len() {
+        match (chars.get(i), chars.get(i + 1)) {
+            (Some('?'), Some('s')) => {
+                out.push_str("'redacted-text'");
+                i += 2;
+            }
+            (Some('?'), Some('n')) => {
+                out.push('0');
+                i += 2;
+            }
+            (Some('?'), Some('b')) => {
+                out.push_str("X''");
+                i += 2;
+            }
+            (Some(ch), _) => {
+                out.push(*ch);
+                i += 1;
+            }
+            (None, _) => break,
+        }
+    }
+    out
+}
+
+/// Return deterministic setup SQL for synthetic agent-swarm scenarios.
+#[must_use]
+pub fn synthetic_replay_schema(scenario: SyntheticTraceScenario) -> Vec<String> {
+    match scenario {
+        SyntheticTraceScenario::SessionEventAppend => vec![
+            "CREATE TABLE session_events(session_id TEXT, agent_id TEXT, event_kind TEXT, payload TEXT, seq INTEGER, logical_clock INTEGER, event_id INTEGER PRIMARY KEY);".to_owned(),
+        ],
+        SyntheticTraceScenario::TaskQueueClaimLoop => vec![
+            "CREATE TABLE task_queue(id INTEGER PRIMARY KEY, shard TEXT, status TEXT, priority INTEGER, owner TEXT, claim_seq INTEGER);".to_owned(),
+            "INSERT INTO task_queue(shard, status, priority) VALUES ('redacted-text', 'ready', 100);".to_owned(),
+            "INSERT INTO task_queue(shard, status, priority) VALUES ('redacted-text', 'ready', 90);".to_owned(),
+        ],
+        SyntheticTraceScenario::ArtifactIndexMixedLookup => vec![
+            "CREATE TABLE artifact_index(workspace TEXT, artifact_id TEXT, path_hash TEXT, content_hash TEXT, updated_by TEXT);".to_owned(),
+        ],
+        SyntheticTraceScenario::HotCounterStatusRows => vec![
+            "CREATE TABLE swarm_counters(counter_key TEXT PRIMARY KEY, value INTEGER, updated_by TEXT, update_seq INTEGER);".to_owned(),
+            "INSERT INTO swarm_counters(counter_key, value, updated_by, update_seq) VALUES ('redacted-text', 0, 'seed', 0);".to_owned(),
+        ],
+        SyntheticTraceScenario::LongReaderBurstWriter => vec![
+            "CREATE TABLE session_events(session_id TEXT, agent_id TEXT, event_kind TEXT, payload TEXT, seq INTEGER, logical_clock INTEGER, event_id INTEGER PRIMARY KEY);".to_owned(),
+            "CREATE TABLE session_status(session_id TEXT, agent_id TEXT, status TEXT, logical_clock INTEGER);".to_owned(),
+        ],
+    }
+}
+
+/// Replay a trace against FrankenSQLite concurrent default and C SQLite oracle backends.
+pub fn replay_agent_swarm_trace(
+    trace: &AgentSwarmTrace,
+    config: &AgentSwarmReplayConfig,
+) -> Result<AgentSwarmReplayReport, AgentSwarmReplayError> {
+    let fsqlite = FsqliteExecutor::open_in_memory().map_err(|message| {
+        AgentSwarmReplayError::BackendOpen {
+            backend: AgentSwarmReplayBackend::FrankenSqliteConcurrent,
+            message,
+        }
+    })?;
+    let csqlite = CsqliteExecutor::open_in_memory().map_err(|message| {
+        AgentSwarmReplayError::BackendOpen {
+            backend: AgentSwarmReplayBackend::CSqliteOracle,
+            message,
+        }
+    })?;
+    replay_agent_swarm_trace_with_executors(trace, config, &fsqlite, &csqlite)
+}
+
+/// Replay a trace against caller-provided subject and reference executors.
+pub fn replay_agent_swarm_trace_with_executors<F, C>(
+    trace: &AgentSwarmTrace,
+    config: &AgentSwarmReplayConfig,
+    fsqlite_exec: &F,
+    csqlite_exec: &C,
+) -> Result<AgentSwarmReplayReport, AgentSwarmReplayError>
+where
+    F: SqlExecutor,
+    C: SqlExecutor,
+{
+    validate_agent_swarm_trace_schema(trace)?;
+
+    let schema_sql = replay_schema_sql(trace, config);
+    let scheduled_indices = scheduled_statement_indices(trace, config.schedule);
+    let topology_errors = validate_trace_topology(trace);
+    let memory_high_water_bytes = estimate_memory_high_water(trace, &schema_sql);
+
+    let subject = replay_backend(
+        AgentSwarmReplayBackend::FrankenSqliteConcurrent,
+        fsqlite_exec,
+        trace,
+        &schema_sql,
+        &scheduled_indices,
+        memory_high_water_bytes,
+    );
+    let reference = replay_backend(
+        AgentSwarmReplayBackend::CSqliteOracle,
+        csqlite_exec,
+        trace,
+        &schema_sql,
+        &scheduled_indices,
+        memory_high_water_bytes,
+    );
+    let cross_backend_mismatches = compare_backend_records(&subject, &reference);
+    let backends = vec![subject, reference];
+    let first_failure = build_first_failure_bundle(
+        trace,
+        &backends,
+        &cross_backend_mismatches,
+        &topology_errors,
+    );
+
+    let report = AgentSwarmReplayReport {
+        schema_version: SWARM_TRACE_SCHEMA_VERSION.to_owned(),
+        harness_version: AGENT_SWARM_REPLAY_HARNESS_VERSION.to_owned(),
+        trace_id: trace.trace_id.clone(),
+        run_id: trace.run_id.clone(),
+        scenario_id: trace.scenario_id.clone(),
+        seed: config.seed,
+        schedule: config.schedule,
+        commands: config.commands.clone(),
+        schema_statement_count: schema_sql.len(),
+        statement_count: trace.statement_count(),
+        transaction_count: trace.transaction_count(),
+        topology_errors,
+        backends,
+        cross_backend_mismatches,
+        first_failure,
+    };
+    log_agent_swarm_replay_summary(&report);
+    Ok(report)
+}
+
+fn validate_agent_swarm_trace_schema(trace: &AgentSwarmTrace) -> Result<(), AgentSwarmReplayError> {
+    if trace.schema_version == SWARM_TRACE_SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(AgentSwarmReplayError::SchemaMismatch {
+            expected: SWARM_TRACE_SCHEMA_VERSION.to_owned(),
+            actual: trace.schema_version.clone(),
+        })
+    }
+}
+
+fn replay_schema_sql(trace: &AgentSwarmTrace, config: &AgentSwarmReplayConfig) -> Vec<String> {
+    if !config.schema_sql.is_empty() {
+        return config.schema_sql.clone();
+    }
+
+    trace
+        .metadata
+        .tags
+        .get("scenario_family")
+        .and_then(|scenario| synthetic_scenario_from_str(scenario))
+        .map_or_else(Vec::new, synthetic_replay_schema)
+}
+
+fn synthetic_scenario_from_str(value: &str) -> Option<SyntheticTraceScenario> {
+    SYNTHETIC_TRACE_SCENARIOS
+        .iter()
+        .copied()
+        .find(|scenario| scenario.as_str() == value)
+}
+
+fn scheduled_statement_indices(
+    trace: &AgentSwarmTrace,
+    schedule: AgentSwarmReplaySchedule,
+) -> Vec<usize> {
+    let mut indexed = trace
+        .statements
+        .iter()
+        .enumerate()
+        .map(|(index, statement)| {
+            (
+                index,
+                statement.logical_order,
+                statement.concurrency_group.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    match schedule {
+        AgentSwarmReplaySchedule::TraceOrder => {
+            indexed.sort_by_key(|(index, logical_order, _)| (*logical_order, *index));
+        }
+        AgentSwarmReplaySchedule::ConcurrencyGroupThenOrder => {
+            indexed.sort_by(|left, right| {
+                left.2
+                    .cmp(right.2)
+                    .then_with(|| left.1.cmp(&right.1))
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+        }
+    }
+
+    indexed.into_iter().map(|(index, _, _)| index).collect()
+}
+
+fn validate_trace_topology(trace: &AgentSwarmTrace) -> Vec<String> {
+    let mut open_transactions = BTreeMap::<&str, &str>::new();
+    let mut errors = Vec::new();
+    let mut indices = scheduled_statement_indices(trace, AgentSwarmReplaySchedule::TraceOrder);
+    indices.sort_by_key(|index| {
+        (
+            trace.statements[*index].logical_order,
+            u64::try_from(*index).unwrap_or(u64::MAX),
+        )
+    });
+
+    for index in indices {
+        let statement = &trace.statements[index];
+        let connection_id = statement.connection_id.as_str();
+        match statement.transaction_boundary {
+            TransactionBoundary::Begin => {
+                if let Some(open_txn) = open_transactions.insert(
+                    connection_id,
+                    statement.transaction_id.as_deref().unwrap_or_default(),
+                ) {
+                    errors.push(format!(
+                        "connection {} begins transaction {} before closing {} at statement {}",
+                        connection_id,
+                        statement.transaction_id.as_deref().unwrap_or_default(),
+                        open_txn,
+                        index
+                    ));
+                }
+            }
+            TransactionBoundary::Commit | TransactionBoundary::Rollback => {
+                match open_transactions.remove(connection_id) {
+                    Some(open_txn) if Some(open_txn) == statement.transaction_id.as_deref() => {}
+                    Some(open_txn) => errors.push(format!(
+                        "connection {} closes transaction {:?} while {} is open at statement {}",
+                        connection_id, statement.transaction_id, open_txn, index
+                    )),
+                    None => errors.push(format!(
+                        "connection {} closes transaction {:?} without an open transaction at statement {}",
+                        connection_id, statement.transaction_id, index
+                    )),
+                }
+            }
+            TransactionBoundary::None => {
+                if let Some(transaction_id) = statement.transaction_id.as_deref() {
+                    match open_transactions.get(connection_id) {
+                        Some(open_txn) if *open_txn == transaction_id => {}
+                        Some(open_txn) => errors.push(format!(
+                            "connection {} statement {} belongs to {} while {} is open",
+                            connection_id, index, transaction_id, open_txn
+                        )),
+                        None => errors.push(format!(
+                            "connection {} statement {} belongs to {} without an open transaction",
+                            connection_id, index, transaction_id
+                        )),
+                    }
+                }
+            }
+        }
+    }
+
+    for (connection_id, transaction_id) in open_transactions {
+        errors.push(format!(
+            "connection {connection_id} leaves transaction {transaction_id} open at trace end"
+        ));
+    }
+
+    errors
+}
+
+fn replay_backend<E>(
+    backend: AgentSwarmReplayBackend,
+    executor: &E,
+    trace: &AgentSwarmTrace,
+    schema_sql: &[String],
+    scheduled_indices: &[usize],
+    memory_high_water_bytes: usize,
+) -> AgentSwarmBackendReplay
+where
+    E: SqlExecutor,
+{
+    let identity = AgentSwarmBackendIdentity {
+        backend,
+        engine_identity: engine_identity_label(executor.engine_identity()).to_owned(),
+        comparison_role: backend.comparison_role().to_owned(),
+        concurrent_writer_default: backend.concurrent_writer_default(),
+    };
+    let schema_failures = apply_replay_schema(executor, schema_sql);
+    let mut statements = Vec::with_capacity(scheduled_indices.len());
+    for trace_statement_index in scheduled_indices {
+        let statement = &trace.statements[*trace_statement_index];
+        statements.push(replay_statement(
+            backend,
+            executor,
+            *trace_statement_index,
+            statement,
+            trace,
+        ));
+    }
+    let summary = summarize_backend_replay(&statements, memory_high_water_bytes);
+    AgentSwarmBackendReplay {
+        identity,
+        schema_failures,
+        statements,
+        summary,
+    }
+}
+
+fn apply_replay_schema<E>(executor: &E, schema_sql: &[String]) -> Vec<AgentSwarmSchemaFailure>
+where
+    E: SqlExecutor,
+{
+    schema_sql
+        .iter()
+        .enumerate()
+        .filter_map(|(schema_index, sql)| match executor.run_stmt(sql) {
+            StmtOutcome::Error(error) => Some(AgentSwarmSchemaFailure {
+                schema_index,
+                sql: sql.clone(),
+                error,
+            }),
+            StmtOutcome::Rows(_) | StmtOutcome::Execute(_) => None,
+        })
+        .collect()
+}
+
+fn replay_statement<E>(
+    backend: AgentSwarmReplayBackend,
+    executor: &E,
+    trace_statement_index: usize,
+    statement: &TraceStatement,
+    trace: &AgentSwarmTrace,
+) -> AgentSwarmStatementReplay
+where
+    E: SqlExecutor,
+{
+    let materialized_sql = materialize_replay_sql_for_backend(backend, &statement.scrubbed_sql);
+    let started_at = Instant::now();
+    let outcome = executor.run_stmt(&materialized_sql);
+    let latency_ns = elapsed_nanos_u64(started_at.elapsed());
+    let outcome_class = classify_stmt_outcome(&outcome);
+    let expected_matched = expected_result_matches(statement.expected_result_class, outcome_class);
+    let first_failure_diag = if expected_matched {
+        FIRST_FAILURE_DIAGNOSTIC_ABSENT.to_owned()
+    } else {
+        format!(
+            "expected_{}_got_{}",
+            expected_result_class_label(statement.expected_result_class),
+            outcome_class.as_str()
+        )
+    };
+
+    let record = AgentSwarmStatementReplay {
+        backend,
+        trace_statement_index,
+        logical_order: statement.logical_order,
+        connection_id: statement.connection_id.clone(),
+        transaction_id: statement.transaction_id.clone(),
+        transaction_boundary: statement.transaction_boundary,
+        concurrency_group: statement.concurrency_group.clone(),
+        workload_phase: statement.workload_phase.clone(),
+        statement_shape: statement.statement_shape.clone(),
+        materialized_sql,
+        expected_result_class: statement.expected_result_class,
+        outcome,
+        outcome_class,
+        latency_ns,
+        retry_count: 0,
+        expected_matched,
+        first_failure_diag,
+    };
+    log_agent_swarm_replay_statement(trace, &record);
+    record
+}
+
+fn materialize_replay_sql_for_backend(backend: AgentSwarmReplayBackend, sql: &str) -> String {
+    let materialized_sql = materialize_scrubbed_sql(sql);
+    if backend != AgentSwarmReplayBackend::CSqliteOracle {
+        return materialized_sql;
+    }
+
+    let trimmed = materialized_sql.trim();
+    if trimmed.eq_ignore_ascii_case("BEGIN CONCURRENT") {
+        "BEGIN".to_owned()
+    } else if trimmed.eq_ignore_ascii_case("BEGIN CONCURRENT;") {
+        "BEGIN;".to_owned()
+    } else {
+        materialized_sql
+    }
+}
+
+fn classify_stmt_outcome(outcome: &StmtOutcome) -> AgentSwarmReplayOutcomeClass {
+    match outcome {
+        StmtOutcome::Rows(_) | StmtOutcome::Execute(_) => AgentSwarmReplayOutcomeClass::Success,
+        StmtOutcome::Error(message) => {
+            let lower = message.to_ascii_lowercase();
+            if lower.contains("busy") || lower.contains("locked") {
+                AgentSwarmReplayOutcomeClass::Busy
+            } else if lower.contains("conflict")
+                || lower.contains("concurrent")
+                || lower.contains("serialization")
+            {
+                AgentSwarmReplayOutcomeClass::Conflict
+            } else {
+                AgentSwarmReplayOutcomeClass::Error
+            }
+        }
+    }
+}
+
+const fn expected_result_matches(
+    expected: ExpectedResultClass,
+    actual: AgentSwarmReplayOutcomeClass,
+) -> bool {
+    match expected {
+        ExpectedResultClass::Success => matches!(actual, AgentSwarmReplayOutcomeClass::Success),
+        ExpectedResultClass::Busy => matches!(actual, AgentSwarmReplayOutcomeClass::Busy),
+        ExpectedResultClass::Conflict => matches!(actual, AgentSwarmReplayOutcomeClass::Conflict),
+        ExpectedResultClass::Error => !matches!(actual, AgentSwarmReplayOutcomeClass::Success),
+        ExpectedResultClass::Unknown => true,
+    }
+}
+
+const fn expected_result_class_label(expected: ExpectedResultClass) -> &'static str {
+    match expected {
+        ExpectedResultClass::Success => "success",
+        ExpectedResultClass::Busy => "busy",
+        ExpectedResultClass::Conflict => "conflict",
+        ExpectedResultClass::Error => "error",
+        ExpectedResultClass::Unknown => "unknown",
+    }
+}
+
+fn summarize_backend_replay(
+    statements: &[AgentSwarmStatementReplay],
+    memory_high_water_bytes: usize,
+) -> AgentSwarmBackendSummary {
+    let mut latencies = statements
+        .iter()
+        .map(|statement| statement.latency_ns)
+        .collect::<Vec<_>>();
+    latencies.sort_unstable();
+
+    let mut conflict_classes = BTreeMap::new();
+    let mut success_count = 0;
+    let mut error_count = 0;
+    let mut expected_mismatch_count = 0;
+    let mut abort_count = 0;
+    let mut retry_count = 0_u64;
+    let mut latency_total_ns = 0_u64;
+
+    for statement in statements {
+        if statement.outcome_class == AgentSwarmReplayOutcomeClass::Success {
+            success_count += 1;
+        } else {
+            error_count += 1;
+            *conflict_classes
+                .entry(statement.outcome_class.as_str().to_owned())
+                .or_insert(0) += 1;
+        }
+        if !statement.expected_matched {
+            expected_mismatch_count += 1;
+        }
+        if statement.transaction_boundary == TransactionBoundary::Rollback
+            || statement.outcome_class != AgentSwarmReplayOutcomeClass::Success
+        {
+            abort_count += 1;
+        }
+        retry_count = retry_count.saturating_add(u64::from(statement.retry_count));
+        latency_total_ns = latency_total_ns.saturating_add(statement.latency_ns);
+    }
+
+    AgentSwarmBackendSummary {
+        statements_total: statements.len(),
+        success_count,
+        error_count,
+        expected_mismatch_count,
+        abort_count,
+        retry_count,
+        conflict_classes,
+        latency_total_ns,
+        latency_p50_ns: percentile_latency(&latencies, 50),
+        latency_p95_ns: percentile_latency(&latencies, 95),
+        latency_p99_ns: percentile_latency(&latencies, 99),
+        throughput_statements_per_second_x1000: throughput_x1000(
+            statements.len(),
+            latency_total_ns,
+        ),
+        memory_high_water_bytes,
+    }
+}
+
+fn percentile_latency(sorted_latencies: &[u64], percentile: usize) -> u64 {
+    if sorted_latencies.is_empty() {
+        return 0;
+    }
+    let last = sorted_latencies.len() - 1;
+    let rank = last.saturating_mul(percentile).div_ceil(100);
+    sorted_latencies[rank.min(last)]
+}
+
+fn throughput_x1000(statement_count: usize, latency_total_ns: u64) -> u64 {
+    if statement_count == 0 || latency_total_ns == 0 {
+        return 0;
+    }
+    let numerator = u128::try_from(statement_count)
+        .unwrap_or(u128::MAX)
+        .saturating_mul(1_000_000_000_000);
+    let throughput = numerator / u128::from(latency_total_ns);
+    u64::try_from(throughput).unwrap_or(u64::MAX)
+}
+
+fn compare_backend_records(
+    subject: &AgentSwarmBackendReplay,
+    reference: &AgentSwarmBackendReplay,
+) -> Vec<AgentSwarmBackendMismatch> {
+    subject
+        .statements
+        .iter()
+        .zip(reference.statements.iter())
+        .filter_map(|(subject_record, reference_record)| {
+            if subject_record.outcome == reference_record.outcome {
+                None
+            } else {
+                Some(AgentSwarmBackendMismatch {
+                    trace_statement_index: subject_record.trace_statement_index,
+                    logical_order: subject_record.logical_order,
+                    statement_shape: subject_record.statement_shape.clone(),
+                    subject_outcome: subject_record.outcome.clone(),
+                    reference_outcome: reference_record.outcome.clone(),
+                })
+            }
+        })
+        .collect()
+}
+
+fn build_first_failure_bundle(
+    trace: &AgentSwarmTrace,
+    backends: &[AgentSwarmBackendReplay],
+    cross_backend_mismatches: &[AgentSwarmBackendMismatch],
+    topology_errors: &[String],
+) -> Option<AgentSwarmFirstFailureBundle> {
+    if let Some(error) = topology_errors.first() {
+        return Some(first_failure_bundle(
+            trace,
+            None,
+            "topology_error",
+            0,
+            Some(error),
+        ));
+    }
+
+    let backend_failure = backends
+        .iter()
+        .flat_map(|backend| backend.statements.iter())
+        .filter(|statement| !statement.expected_matched)
+        .min_by_key(|statement| statement.logical_order);
+    if let Some(statement) = backend_failure {
+        return Some(first_failure_bundle(
+            trace,
+            Some(statement.backend),
+            &statement.first_failure_diag,
+            statement.trace_statement_index,
+            None,
+        ));
+    }
+
+    cross_backend_mismatches.first().map(|mismatch| {
+        first_failure_bundle(
+            trace,
+            None,
+            "cross_backend_outcome_mismatch",
+            mismatch.trace_statement_index,
+            None,
+        )
+    })
+}
+
+fn first_failure_bundle(
+    trace: &AgentSwarmTrace,
+    backend: Option<AgentSwarmReplayBackend>,
+    reason: &str,
+    trace_statement_index: usize,
+    detail: Option<&str>,
+) -> AgentSwarmFirstFailureBundle {
+    let reason = detail.map_or_else(
+        || reason.to_owned(),
+        |message| format!("{reason}: {message}"),
+    );
+    let minimal_reproducer_trace_slice =
+        minimal_reproducer_trace_slice(trace, trace_statement_index);
+    let materialized_replay_sql = minimal_reproducer_trace_slice
+        .iter()
+        .map(|statement| materialize_scrubbed_sql(&statement.scrubbed_sql))
+        .collect();
+    AgentSwarmFirstFailureBundle {
+        backend,
+        reason,
+        trace_statement_index,
+        trace_id: trace.trace_id.clone(),
+        run_id: trace.run_id.clone(),
+        scenario_id: trace.scenario_id.clone(),
+        minimal_reproducer_trace_slice,
+        materialized_replay_sql,
+    }
+}
+
+fn minimal_reproducer_trace_slice(
+    trace: &AgentSwarmTrace,
+    trace_statement_index: usize,
+) -> Vec<TraceStatement> {
+    let Some(statement) = trace.statements.get(trace_statement_index) else {
+        return Vec::new();
+    };
+
+    if let Some(transaction_id) = statement.transaction_id.as_deref() {
+        let transaction_slice = trace
+            .statements
+            .iter()
+            .filter(|candidate| candidate.transaction_id.as_deref() == Some(transaction_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !transaction_slice.is_empty() {
+            return transaction_slice;
+        }
+    }
+
+    let start = trace_statement_index.saturating_sub(1);
+    let end = (trace_statement_index + 2).min(trace.statements.len());
+    trace.statements[start..end].to_vec()
+}
+
+fn log_agent_swarm_replay_statement(trace: &AgentSwarmTrace, record: &AgentSwarmStatementReplay) {
+    tracing::info!(
+        target: "fsqlite.agent_swarm_trace.replay.statement",
+        trace_id = %trace.trace_id,
+        run_id = %trace.run_id,
+        scenario_id = %trace.scenario_id,
+        seed = trace.metadata.tags.get("seed").map(String::as_str).unwrap_or("unknown"),
+        backend = record.backend.as_str(),
+        concurrency_group = %record.concurrency_group,
+        transaction_id = record.transaction_id.as_deref().unwrap_or("none"),
+        statement_shape = %record.statement_shape,
+        outcome = record.outcome_class.as_str(),
+        latency_ns = record.latency_ns,
+        retry_count = record.retry_count,
+        first_failure_diag = %record.first_failure_diag,
+        "agent swarm replay statement",
+    );
+}
+
+fn log_agent_swarm_replay_summary(report: &AgentSwarmReplayReport) {
+    tracing::info!(
+        target: "fsqlite.agent_swarm_trace.replay.summary",
+        trace_id = %report.trace_id,
+        run_id = %report.run_id,
+        scenario_id = %report.scenario_id,
+        seed = report.seed,
+        statement_count = report.statement_count,
+        transaction_count = report.transaction_count,
+        backend_count = report.backends.len(),
+        mismatch_count = report.cross_backend_mismatches.len(),
+        first_failure_diag = report.first_failure.as_ref().map(|failure| failure.reason.as_str()).unwrap_or(FIRST_FAILURE_DIAGNOSTIC_ABSENT),
+        "agent swarm replay summary",
+    );
+}
+
+fn estimate_memory_high_water(trace: &AgentSwarmTrace, schema_sql: &[String]) -> usize {
+    let trace_bytes = serde_json::to_vec(trace).map_or(0, |bytes| bytes.len());
+    let schema_bytes = schema_sql.iter().map(String::len).sum::<usize>();
+    let materialized_bytes = trace
+        .statements
+        .iter()
+        .map(|statement| materialize_scrubbed_sql(&statement.scrubbed_sql).len())
+        .sum::<usize>();
+    trace_bytes
+        .saturating_add(schema_bytes)
+        .saturating_add(materialized_bytes)
+}
+
+const fn engine_identity_label(identity: EngineIdentity) -> &'static str {
+    match identity {
+        EngineIdentity::FrankenSqlite => "frankensqlite",
+        EngineIdentity::CSqliteOracle => "csqlite-oracle",
+        EngineIdentity::Unknown => "unknown",
+    }
+}
+
+fn elapsed_nanos_u64(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
 }
 
 struct SyntheticTraceRng {
@@ -1469,6 +2547,130 @@ mod tests {
         );
     }
 
+    #[test]
+    fn agent_swarm_replay_materializes_scrubbed_literals_without_touching_parameters() {
+        let sql = "VALUES (?s, ?n, ?b, ?1, :name, --?c\n /*?c*/ ?s);";
+
+        assert_eq!(
+            materialize_scrubbed_sql(sql),
+            "VALUES ('redacted-text', 0, X'', ?1, :name, --?c\n /*?c*/ 'redacted-text');"
+        );
+    }
+
+    #[test]
+    fn agent_swarm_replay_loads_fixtures_and_rejects_schema_mismatch() {
+        let trace = sample_trace();
+        let json = serde_json::to_string(&trace).expect("trace json");
+
+        assert_eq!(
+            load_agent_swarm_trace_json(&json).expect("valid fixture"),
+            trace
+        );
+
+        let mut stale = trace;
+        stale.schema_version = "0.9.0".to_owned();
+        let stale_json = serde_json::to_string(&stale).expect("stale json");
+        assert!(matches!(
+            load_agent_swarm_trace_json(&stale_json),
+            Err(AgentSwarmReplayError::SchemaMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn agent_swarm_replay_preserves_trace_order_and_backend_identity() {
+        let trace = generate_synthetic_swarm_trace(SyntheticTraceConfig::new(
+            SyntheticTraceScenario::TaskQueueClaimLoop,
+            0xA6E1_5A7E,
+            3,
+            4,
+        ))
+        .expect("synthetic trace");
+        let config = AgentSwarmReplayConfig::smoke(0xA6E1_5A7E);
+        let fsqlite = RecordingExecutor::new(EngineIdentity::FrankenSqlite);
+        let csqlite = RecordingExecutor::new(EngineIdentity::CSqliteOracle);
+
+        let report = replay_agent_swarm_trace_with_executors(&trace, &config, &fsqlite, &csqlite)
+            .expect("replay succeeds");
+
+        assert_eq!(report.seed, 0xA6E1_5A7E);
+        assert!(report.commands.heavy_command.contains("rch exec"));
+        assert!(report.schema_statement_count > 0);
+        assert!(report.first_failure.is_none());
+        assert!(report.cross_backend_mismatches.is_empty());
+        assert_eq!(report.backends.len(), 2);
+        assert_eq!(
+            report.backends[0].identity.backend,
+            AgentSwarmReplayBackend::FrankenSqliteConcurrent
+        );
+        assert!(report.backends[0].identity.concurrent_writer_default);
+        assert_eq!(
+            report.backends[1].identity.backend,
+            AgentSwarmReplayBackend::CSqliteOracle
+        );
+        assert!(!report.backends[1].identity.concurrent_writer_default);
+        assert_eq!(
+            report.backends[0].statements[0].transaction_boundary,
+            TransactionBoundary::Begin
+        );
+        assert_eq!(
+            report.backends[0].statements[0].materialized_sql,
+            "BEGIN CONCURRENT"
+        );
+        assert_eq!(report.backends[1].statements[0].materialized_sql, "BEGIN");
+        assert!(
+            report.backends[0]
+                .statements
+                .windows(2)
+                .all(|window| window[0].logical_order <= window[1].logical_order)
+        );
+    }
+
+    #[test]
+    fn agent_swarm_replay_counts_expected_busy_without_first_failure() {
+        let trace = busy_trace(ExpectedResultClass::Busy);
+        let config = AgentSwarmReplayConfig::smoke(7).with_schema_sql([
+            "CREATE TABLE swarm_counters(counter_key TEXT PRIMARY KEY, value INTEGER);",
+        ]);
+        let fsqlite =
+            RecordingExecutor::failing(EngineIdentity::FrankenSqlite, "UPDATE", "database is busy");
+        let csqlite =
+            RecordingExecutor::failing(EngineIdentity::CSqliteOracle, "UPDATE", "database is busy");
+
+        let report = replay_agent_swarm_trace_with_executors(&trace, &config, &fsqlite, &csqlite)
+            .expect("busy replay succeeds");
+
+        let summary = &report.backends[0].summary;
+        assert_eq!(summary.error_count, 1);
+        assert_eq!(summary.expected_mismatch_count, 0);
+        assert_eq!(summary.conflict_classes.get("busy"), Some(&1));
+        assert!(report.first_failure.is_none());
+    }
+
+    #[test]
+    fn agent_swarm_replay_builds_first_failure_bundle_for_unexpected_error() {
+        let trace = busy_trace(ExpectedResultClass::Success);
+        let config = AgentSwarmReplayConfig::smoke(11).with_schema_sql([
+            "CREATE TABLE swarm_counters(counter_key TEXT PRIMARY KEY, value INTEGER);",
+        ]);
+        let fsqlite =
+            RecordingExecutor::failing(EngineIdentity::FrankenSqlite, "UPDATE", "database is busy");
+        let csqlite =
+            RecordingExecutor::failing(EngineIdentity::CSqliteOracle, "UPDATE", "database is busy");
+
+        let report = replay_agent_swarm_trace_with_executors(&trace, &config, &fsqlite, &csqlite)
+            .expect("failure replay succeeds");
+        let failure = report.first_failure.expect("first failure bundle");
+
+        assert_eq!(
+            failure.backend,
+            Some(AgentSwarmReplayBackend::FrankenSqliteConcurrent)
+        );
+        assert!(failure.reason.contains("expected_success_got_busy"));
+        assert_eq!(failure.trace_statement_index, 1);
+        assert_eq!(failure.minimal_reproducer_trace_slice.len(), 3);
+        assert_eq!(failure.materialized_replay_sql.len(), 3);
+    }
+
     proptest! {
         #[test]
         fn synthetic_trace_generation_preserves_bounded_config(
@@ -1619,6 +2821,116 @@ mod tests {
             statements,
         )
         .expect("sample trace")
+    }
+
+    fn busy_trace(expected_result_class: ExpectedResultClass) -> AgentSwarmTrace {
+        let metadata = TraceMetadata::new("unit-test", "busy").expect("valid metadata");
+        let source = StatementSource::new("unit-test", "busy-statement").expect("valid source");
+        let mut update = raw_statement(
+            1,
+            "agent-a",
+            Some("txn-busy"),
+            TransactionBoundary::None,
+            "UPDATE swarm_counters SET value = value + 1 WHERE counter_key = 'hot';",
+        );
+        update.expected_result_class = expected_result_class;
+        update.error_class = Some("busy");
+
+        let statements = vec![
+            TraceStatement::from_raw(RawTraceStatement {
+                source: source.clone(),
+                ..raw_statement(
+                    0,
+                    "agent-a",
+                    Some("txn-busy"),
+                    TransactionBoundary::Begin,
+                    "BEGIN CONCURRENT",
+                )
+            })
+            .expect("begin"),
+            TraceStatement::from_raw(RawTraceStatement {
+                source: source.clone(),
+                ..update
+            })
+            .expect("update"),
+            TraceStatement::from_raw(RawTraceStatement {
+                source,
+                ..raw_statement(
+                    2,
+                    "agent-a",
+                    Some("txn-busy"),
+                    TransactionBoundary::Commit,
+                    "COMMIT",
+                )
+            })
+            .expect("commit"),
+        ];
+
+        AgentSwarmTrace::new(
+            "trace-busy",
+            "run-busy",
+            "scenario-busy",
+            metadata,
+            statements,
+        )
+        .expect("busy trace")
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordingExecutor {
+        identity: EngineIdentity,
+        fail_on: Option<&'static str>,
+        error: &'static str,
+    }
+
+    impl RecordingExecutor {
+        const fn new(identity: EngineIdentity) -> Self {
+            Self {
+                identity,
+                fail_on: None,
+                error: "forced failure",
+            }
+        }
+
+        const fn failing(
+            identity: EngineIdentity,
+            fail_on: &'static str,
+            error: &'static str,
+        ) -> Self {
+            Self {
+                identity,
+                fail_on: Some(fail_on),
+                error,
+            }
+        }
+    }
+
+    impl SqlExecutor for RecordingExecutor {
+        fn execute(&self, sql: &str) -> Result<usize, String> {
+            if self.fail_on.is_some_and(|needle| sql.contains(needle)) {
+                Err(self.error.to_owned())
+            } else {
+                Ok(1)
+            }
+        }
+
+        fn query(
+            &self,
+            _sql: &str,
+        ) -> Result<Vec<Vec<crate::differential_v2::NormalizedValue>>, String> {
+            Ok(Vec::new())
+        }
+
+        fn engine_identity(&self) -> EngineIdentity {
+            self.identity
+        }
+
+        fn stmt_returns_rows(&self, sql: &str) -> Result<bool, String> {
+            Ok(sql
+                .split_whitespace()
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("SELECT")))
+        }
     }
 
     trait SyntheticTraceStatementTestExt {

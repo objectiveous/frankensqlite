@@ -12,6 +12,34 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-23 - VDBE NotNull hot-dispatch promotion
+
+- Target: `vdbe_pipeline_execute_notnull` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, added during this pass to
+  isolate `Opcode::NotNull` dispatch cost with an always-taken branch to the
+  next instruction.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate added a byte-equivalent
+  `Opcode::NotNull` arm to `try_execute_hot_opcode`, mirroring the existing
+  main-match arm exactly. The source patch was unwound after measurement.
+- Evidence:
+  baseline command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-notnull-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_notnull --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=353.07 ns`, `256=1.2893 us`, `1024=5.5704 us`.
+  Candidate command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-notnull-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_notnull --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=455.33 ns`, `256=1.5443 us`, `1024=5.9319 us`.
+- Result: rejected. The extra hot pre-filter arm regressed all measured sizes,
+  likely because the already-large hot match became more expensive while the
+  main-match `NotNull` path was not paying enough isolated dispatch cost to
+  offset it.
+- Do not retry `Opcode::NotNull` hot-dispatch promotion as a standalone patch.
+  Reconsider only if opcode mix profiling shows `NotNull` dominating a real
+  workload and the candidate is evaluated against that workload, not only the
+  dispatch microbench.
+
 ## 2026-05-20 - B-tree leaf cell-parse hunt found no bounded lever
 
 - Target: the per-cell B-tree leaf parse hot path — `CellRef::parse`, the

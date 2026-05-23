@@ -200,6 +200,29 @@ fn build_execute_stage_isnull_program(op_repeats: usize) -> VdbeProgram {
 }
 
 /// Build a dispatch-dominated program whose inner loop is a stream of
+/// `NotNull` ops. This mirrors the IsNull benchmark's always-taken-jump shape:
+/// the source register is seeded with an integer, so each op observes NOT NULL
+/// and jumps to the immediately-next instruction. That keeps execution linear
+/// while exercising the real branch body.
+fn build_execute_stage_notnull_program(op_repeats: usize) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    let end = builder.emit_label();
+    builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+    let probe = builder.alloc_reg();
+    builder.emit_op(Opcode::Integer, 1, probe, 0, P4::None, 0);
+    for _ in 0..op_repeats {
+        let next = builder.emit_label();
+        builder.emit_jump_to_label(Opcode::NotNull, probe, 0, next, P4::None, 0);
+        builder.resolve_label(next);
+    }
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder.resolve_label(end);
+    builder
+        .finish()
+        .expect("pipeline execute notnull benchmark program should build")
+}
+
+/// Build a dispatch-dominated program whose inner loop is a stream of
 /// `Rowid` ops against a single positioned storage cursor.  The cursor
 /// is opened on a one-row table and Rewound to the only row, so each
 /// dispatched `Rowid` op runs the realistic body shape (one
@@ -560,6 +583,39 @@ fn bench_vdbe_execute_isnull_stage(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_vdbe_execute_notnull_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_notnull");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let program = build_execute_stage_notnull_program(op_repeats);
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &program,
+            |b, program| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute notnull benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_vdbe_execute_rowid_stage(c: &mut Criterion) {
     set_vdbe_jit_enabled(false);
     let mut group = c.benchmark_group("vdbe_pipeline_execute_rowid");
@@ -778,6 +834,7 @@ criterion_group!(
     bench_vdbe_execute_decrjumpzero_stage,
     bench_vdbe_execute_ifpos_stage,
     bench_vdbe_execute_isnull_stage,
+    bench_vdbe_execute_notnull_stage,
     bench_vdbe_execute_ifnot_stage,
     bench_vdbe_execute_rowid_stage,
     bench_vdbe_execute_idx_rowid_stage,

@@ -1909,7 +1909,24 @@ impl SharedTxnPageIo {
         add_vdbe_counter(&FSQLITE_VDBE_MVCC_TIER0_ALREADY_OWNED_WRITES_TOTAL, 1);
         let mut handle = ctx.handle.lock();
         let prior_state = concurrent_page_state(&handle, page_no);
+        if let Err(prepare_error) =
+            concurrent_prepare_write_page(&mut handle, &ctx.lock_table, ctx.session_id, page_no)
+        {
+            return Err(FrankenError::Internal(format!(
+                "MVCC fast-path prepare failed: {prepare_error}"
+            )));
+        }
         if let Err(stage_error) = concurrent_stage_prepared_write_marker(&mut handle, page_no) {
+            if let Err(restore_error) = concurrent_restore_page_state(
+                &mut handle,
+                &ctx.lock_table,
+                ctx.session_id,
+                &prior_state,
+            ) {
+                return Err(FrankenError::Internal(format!(
+                    "MVCC fast-path staging failed: {stage_error}; MVCC fast-path restore failed: {restore_error}"
+                )));
+            }
             return Err(FrankenError::Internal(format!(
                 "MVCC fast-path staging failed: {stage_error}"
             )));

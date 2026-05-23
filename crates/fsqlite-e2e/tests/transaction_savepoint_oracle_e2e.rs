@@ -107,7 +107,6 @@ const INIT: [&str; 2] = [
 ];
 
 #[test]
-#[ignore = "bd-jamrd: UPDATE/DELETE inside an explicit BEGIN panics (holds_page_lock debug_assert)"]
 fn txn_commit_and_rollback() {
     scenario(
         &INIT,
@@ -134,7 +133,6 @@ fn txn_commit_and_rollback() {
 }
 
 #[test]
-#[ignore = "bd-jamrd: UPDATE/DELETE inside an explicit BEGIN panics (holds_page_lock debug_assert)"]
 fn savepoint_rollback_to_and_release() {
     // ROLLBACK TO undoes work since the savepoint but keeps the savepoint.
     scenario(
@@ -169,7 +167,6 @@ fn savepoint_rollback_to_and_release() {
 }
 
 #[test]
-#[ignore = "bd-jamrd: UPDATE/DELETE inside an explicit BEGIN panics (holds_page_lock debug_assert)"]
 fn savepoint_nested_rollback_to_outer() {
     // ROLLBACK TO an outer savepoint discards inner savepoints' work too.
     scenario(

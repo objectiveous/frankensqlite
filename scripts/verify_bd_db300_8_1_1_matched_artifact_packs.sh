@@ -7,14 +7,15 @@
 # and produces a matched-pack manifest/report with shared provenance fields.
 #
 # Benchmark work is routed through `rch exec`; H3's verify-suite packaging path
-# intentionally uses plain local `cargo run` because it is a fast packaging check.
+# intentionally runs locally because `rch exec` treats `cargo run` as a compile
+# offload and does not execute the binary that emits the package.
 
 set -euo pipefail
 
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BEAD_ID="${BEAD_ID:-bd-db300.8.1.1}"
 SCRIPT_ENTRYPOINT="${SCRIPT_ENTRYPOINT:-scripts/verify_bd_db300_8_1_1_matched_artifact_packs.sh}"
-RUN_ID="${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+RUN_ID="${RUN_ID:-${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 RUN_ID_SAFE="${RUN_ID//[^[:alnum:]]/_}"
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 CAMPAIGN_MANIFEST_REL="${CAMPAIGN_MANIFEST_REL:-sample_sqlite_db_files/manifests/beads_benchmark_campaign.v1.json}"
@@ -54,7 +55,7 @@ MVCC_DEFAULT_GUARD_TARGET_DIR="${MVCC_DEFAULT_GUARD_TARGET_DIR:-${TMPDIR:-/tmp}/
 MODES=("sqlite_reference" "fsqlite_mvcc" "fsqlite_single_writer")
 
 mkdir -p "${PACKS_DIR}"
-: > "${LOG_FILE}"
+touch "${LOG_FILE}"
 
 log_event() {
     local level="$1"
@@ -120,7 +121,7 @@ should_emit_single_writer_role() {
 ensure_row_exists() {
     local row_id="$1"
     jq -e --arg row_id "${row_id}" '.matrix_rows[] | select(.row_id == $row_id)' "${CAMPAIGN_MANIFEST_FILE}" >/dev/null \
-        || fail "inputs" "row_id `${row_id}` not found in ${CAMPAIGN_MANIFEST_REL}"
+        || fail "inputs" "row_id '${row_id}' not found in ${CAMPAIGN_MANIFEST_REL}"
 }
 
 row_workload() {
@@ -296,6 +297,11 @@ run_mode_benchmark() {
 
     mkdir -p "${mode_dir}"
 
+    if [[ -s "${results_jsonl}" && -s "${summary_md}" && -s "${summary_json}" ]]; then
+        log_event "INFO" "run" "reusing existing ${row_id} fixture=${fixture_id} placement=${placement_profile_id} storage=${storage_profile_id} mode=${mode_id}"
+        return 0
+    fi
+
     local cli_args_raw
     cli_args_raw="$(mode_cli_args "${mode_id}")"
     local -a mode_args=()
@@ -341,6 +347,8 @@ run_mode_benchmark() {
     require_nonempty_file "${results_jsonl}"
     require_nonempty_file "${summary_md}"
 
+    # Reads results_jsonl and writes distinct summary_json.
+    # shellcheck disable=SC2094
     jq -c \
         --arg row_id "${row_id}" \
         --arg fixture_id "${fixture_id}" \
@@ -423,11 +431,11 @@ build_pack_manifest() {
 
     local placement_profile
     placement_profile="$(placement_profile_json "${placement_profile_id}")"
-    [[ -n "${placement_profile}" ]] || fail "inputs" "placement profile `${placement_profile_id}` not found"
+    [[ -n "${placement_profile}" ]] || fail "inputs" "placement profile '${placement_profile_id}' not found"
 
     local hardware_class
     hardware_class="$(hardware_class_json "${hardware_class_id}")"
-    [[ -n "${hardware_class}" ]] || fail "inputs" "hardware class `${hardware_class_id}` not found"
+    [[ -n "${hardware_class}" ]] || fail "inputs" "hardware class '${hardware_class_id}' not found"
 
     local storage_note
     storage_note="$(storage_profile_note "${storage_profile_id}")"
@@ -571,9 +579,13 @@ collect_pack() {
     hardware_class_id="$(placement_hardware_class "${row_id}" "${placement_profile_id}")"
 
     [[ -n "${hardware_class_id}" ]] \
-        || fail "inputs" "row `${row_id}` does not define placement `${placement_profile_id}`"
+        || fail "inputs" "row '${row_id}' does not define placement '${placement_profile_id}'"
 
-    local pack_dir="${PACKS_DIR}/${row_id}__${fixture_id}__${placement_profile_id}__${storage_profile_id}__run_${RUN_ID_SAFE}__rev_$(short_hash "${SOURCE_REVISION}")__beads_$(short_hash "${BEADS_HASH}")"
+    local source_revision_short
+    source_revision_short="$(short_hash "${SOURCE_REVISION}")"
+    local beads_hash_short
+    beads_hash_short="$(short_hash "${BEADS_HASH}")"
+    local pack_dir="${PACKS_DIR}/${row_id}__${fixture_id}__${placement_profile_id}__${storage_profile_id}__run_${RUN_ID_SAFE}__rev_${source_revision_short}__beads_${beads_hash_short}"
     mkdir -p "${pack_dir}"
 
     log_event "INFO" "pack" "collecting matched pack row=${row_id} fixture=${fixture_id} placement=${placement_profile_id} storage=${storage_profile_id}"
@@ -834,7 +846,11 @@ run_concurrent_mode_default_source_guard() {
 }
 
 run_single_writer_verify_suite() {
-    mkdir -p "${SINGLE_WRITER_VERIFY_DIR}"
+    mkdir -p "${SINGLE_WRITER_VERIFY_DIR}/logs"
+    local verify_suite_stdout="${SINGLE_WRITER_VERIFY_DIR}/verify_suite_stdout.json"
+    local suite_package_json="${SINGLE_WRITER_VERIFY_DIR}/suite_package.json"
+    local suite_summary_md="${SINGLE_WRITER_VERIFY_DIR}/suite_summary.md"
+    local verify_suite_jsonl="${SINGLE_WRITER_VERIFY_DIR}/logs/verify_suite.jsonl"
     local -a command=(
         env
         "CARGO_TARGET_DIR=${SINGLE_WRITER_VERIFY_TARGET_DIR}"
@@ -854,17 +870,64 @@ run_single_writer_verify_suite() {
         --workload all
         --concurrency 1
         --output-dir "${SINGLE_WRITER_VERIFY_DIR}"
-        --pretty
+        --emit-inline-bundle
     )
     local rendered_command
     rendered_command="$(shell_join "${command[@]}")"
     log_event "INFO" "single-writer-verify-suite" "running ${rendered_command}"
-    if ! "${command[@]}" > "${SINGLE_WRITER_VERIFY_LOG}" 2>&1; then
+    if ! "${command[@]}" > "${verify_suite_stdout}" 2>"${SINGLE_WRITER_VERIFY_LOG}"; then
         fail "single-writer-verify-suite" "forced single-writer verify-suite packaging failed; see ${SINGLE_WRITER_VERIFY_LOG}"
     fi
-    require_nonempty_file "${SINGLE_WRITER_VERIFY_DIR}/suite_package.json"
-    require_nonempty_file "${SINGLE_WRITER_VERIFY_DIR}/suite_summary.md"
-    require_nonempty_file "${SINGLE_WRITER_VERIFY_DIR}/logs/verify_suite.jsonl"
+
+    local inline_bundle
+    inline_bundle="$(
+        grep '^VERIFY_SUITE_BUNDLE_JSON=' "${SINGLE_WRITER_VERIFY_LOG}" \
+            | tail -n 1 \
+            | sed 's/^VERIFY_SUITE_BUNDLE_JSON=//' \
+            || true
+    )"
+    if [[ -n "${inline_bundle}" ]]; then
+        printf '%s\n' "${inline_bundle}" > "${suite_package_json}"
+    elif jq -e . "${verify_suite_stdout}" >/dev/null 2>&1; then
+        cp "${verify_suite_stdout}" "${suite_package_json}"
+    else
+        fail "single-writer-verify-suite" "verify-suite output did not contain a recoverable package JSON"
+    fi
+
+    jq -r '
+        [
+          "# " + (.suite_id // "verify suite"),
+          "",
+          "- mode: `" + (.mode // "unknown") + "`",
+          "- placement profile: `" + (.placement_profile_id // "unknown") + "`",
+          "- verification depth: `" + (.verification_depth // "unknown") + "`",
+          "- activation regime: `" + (.activation_regime // "unknown") + "`",
+          "- retention class: `" + (.retention_class // "unknown") + "`",
+          "",
+          "## Entrypoints",
+          "",
+          "- rerun: `" + (.rerun_entrypoint // "") + "`",
+          "- local: `" + (.local_entrypoint // "") + "`",
+          "- ci: `" + (.ci_entrypoint // "") + "`"
+        ] | join("\n")
+    ' "${suite_package_json}" > "${suite_summary_md}"
+
+    jq -c \
+        --arg rendered_command "${rendered_command}" \
+        --arg artifact_root "${SINGLE_WRITER_VERIFY_DIR}" \
+        '{
+          schema_version: "fsqlite-e2e.verify_suite_remote_recovery.v1",
+          suite_id: (.suite_id // "unknown"),
+          mode: (.mode // "unknown"),
+          artifact_root: (.artifact_root // $artifact_root),
+          recovered_from: "verify-suite stdout/stderr bundle",
+          rendered_command: $rendered_command
+        }' \
+        "${suite_package_json}" > "${verify_suite_jsonl}"
+
+    require_nonempty_file "${suite_package_json}"
+    require_nonempty_file "${suite_summary_md}"
+    require_nonempty_file "${verify_suite_jsonl}"
 }
 
 build_single_writer_role() {

@@ -12452,6 +12452,14 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            Opcode::Multiply => {
+                let a = self.get_reg(op.p2);
+                let b = self.get_reg(op.p1);
+                let result = a.sql_mul(b);
+                self.set_reg_fast(op.p3, result);
+                *pc += 1;
+                Ok(true)
+            }
             // Copy is the most frequently emitted register-motion opcode in
             // codegen (71 sites), driving SELECT projection, expression
             // propagation, and materialization staging. p3 is almost always 0

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# verify_parity_evidence_matrix.sh — parity evidence contract validation (bd-1dp9.7.5)
+# verify_parity_evidence_matrix.sh — parity evidence contract validation (bd-1dp9.7.5, bd-2yqp6.7.7)
 #
-# Validates that parity closure beads have linked unit/e2e/log evidence.
+# Validates that parity closure beads have linked unit/e2e/log/artifact-hash evidence.
 # The gate can be run in strict mode (default) or intentional-failure mode
 # (`--expect-fail`) for negative-path verification scenarios.
 #
 # Usage:
-#   ./scripts/verify_parity_evidence_matrix.sh [--json] [--expect-fail] [--workspace-root <PATH>] [--traceability-override <PATH>] [--expect-violation-kind <KIND>]
+#   ./scripts/verify_parity_evidence_matrix.sh [--json] [--expect-fail] [--workspace-root <PATH>] [--unit-matrix-override <PATH>] [--traceability-override <PATH>] [--expect-violation-kind <KIND>]
 
 set -euo pipefail
 
@@ -16,9 +16,11 @@ WORKSPACE_ROOT="$REPO_ROOT"
 RUN_ID="parity-evidence-matrix-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 JSON_OUTPUT=false
 EXPECT_FAIL=false
+UNIT_MATRIX_OVERRIDE=""
 TRACEABILITY_OVERRIDE=""
 EXPECTED_VIOLATION_KIND=""
 FOUND_EXPECTED_VIOLATION_KIND=false
+BEAD_ID="bd-2yqp6.7.7"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -48,6 +50,15 @@ while [[ $# -gt 0 ]]; do
             TRACEABILITY_OVERRIDE="$1"
             shift
             ;;
+        --unit-matrix-override)
+            shift
+            if [[ $# -eq 0 ]]; then
+                echo "ERROR: --unit-matrix-override requires a value" >&2
+                exit 2
+            fi
+            UNIT_MATRIX_OVERRIDE="$1"
+            shift
+            ;;
         --expect-violation-kind)
             shift
             if [[ $# -eq 0 ]]; then
@@ -71,14 +82,20 @@ if [[ ! -f "$MODULE_FILE" ]]; then
 fi
 
 MODULE_HASH="$(sha256sum "$MODULE_FILE" | awk '{print $1}')"
-REPORT_DIR="$REPO_ROOT/test-results/bd_1dp9_7_5"
+REPORT_DIR="$REPO_ROOT/test-results/bd_2yqp6_7_7"
 REPORT_PATH="$REPORT_DIR/${RUN_ID}.json"
 mkdir -p "$REPORT_DIR"
+
+CARGO_PREFIX=()
+if [[ "${PARITY_EVIDENCE_USE_RCH:-0}" == "1" ]]; then
+    CARGO_PREFIX=(rch exec --)
+fi
+REPLAY_COMMAND="PARITY_EVIDENCE_USE_RCH=${PARITY_EVIDENCE_USE_RCH:-0} bash scripts/verify_parity_evidence_matrix.sh --json"
 
 ERRORS=0
 TEST_RESULT="unknown"
 TEST_COUNT=0
-if TEST_OUTPUT="$(cargo test -p fsqlite-harness --lib -- parity_evidence_matrix 2>&1)"; then
+if TEST_OUTPUT="$("${CARGO_PREFIX[@]}" cargo test -p fsqlite-harness --lib -- parity_evidence_matrix 2>&1)"; then
     TEST_RESULT="pass"
     TEST_COUNT="$(echo "$TEST_OUTPUT" | grep -oP '\d+ passed' | grep -oP '\d+' || echo 0)"
 else
@@ -91,10 +108,13 @@ GATE_ARGS=(
     --workspace-root "$WORKSPACE_ROOT"
     --output "$REPORT_PATH"
 )
+if [[ -n "$UNIT_MATRIX_OVERRIDE" ]]; then
+    GATE_ARGS+=(--unit-matrix-override "$UNIT_MATRIX_OVERRIDE")
+fi
 if [[ -n "$TRACEABILITY_OVERRIDE" ]]; then
     GATE_ARGS+=(--traceability-override "$TRACEABILITY_OVERRIDE")
 fi
-if cargo run -p fsqlite-harness --bin parity_evidence_matrix_gate -- \
+if "${CARGO_PREFIX[@]}" cargo run -p fsqlite-harness --bin parity_evidence_matrix_gate -- \
     "${GATE_ARGS[@]}" >/dev/null 2>&1; then
     GATE_RESULT="pass"
 else
@@ -135,11 +155,13 @@ if [[ "$JSON_OUTPUT" == "true" ]]; then
     cat <<ENDJSON
 {
   "run_id": "$RUN_ID",
-  "phase": "parity_evidence_matrix_validation",
-  "bead_id": "bd-1dp9.7.5",
+  "phase": "quality_contract_evidence_validation",
+  "bead_id": "$BEAD_ID",
   "module_hash": "$MODULE_HASH",
   "workspace_root": "$WORKSPACE_ROOT",
+  "unit_matrix_override": "$UNIT_MATRIX_OVERRIDE",
   "traceability_override": "$TRACEABILITY_OVERRIDE",
+  "replay_command": "$REPLAY_COMMAND",
   "expect_fail": $EXPECT_FAIL,
   "expected_violation_kind": "$EXPECTED_VIOLATION_KIND",
   "found_expected_violation_kind": $FOUND_EXPECTED_VIOLATION_KIND,
@@ -161,9 +183,12 @@ ENDJSON
 else
     echo "=== Parity Evidence Matrix Validation ==="
     echo "Run ID:            $RUN_ID"
+    echo "Bead ID:           $BEAD_ID"
     echo "Module hash:       $MODULE_HASH"
     echo "Workspace root:    $WORKSPACE_ROOT"
+    echo "Unit matrix ovrd:  ${UNIT_MATRIX_OVERRIDE:-<none>}"
     echo "Traceability ovrd: ${TRACEABILITY_OVERRIDE:-<none>}"
+    echo "Replay command:    $REPLAY_COMMAND"
     echo "Expect fail mode:  $EXPECT_FAIL"
     echo "Expected violation:${EXPECTED_VIOLATION_KIND:-<none>}"
     echo "Violation found:   $FOUND_EXPECTED_VIOLATION_KIND"

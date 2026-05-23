@@ -282,13 +282,16 @@ fn is_missing_violation(kind: EvidenceViolationKind) -> bool {
         EvidenceViolationKind::MissingUnitEvidence
             | EvidenceViolationKind::MissingE2eEvidence
             | EvidenceViolationKind::MissingLogEvidence
+            | EvidenceViolationKind::MissingArtifactHashEvidence
     )
 }
 
 fn is_invalid_violation(kind: EvidenceViolationKind) -> bool {
     matches!(
         kind,
-        EvidenceViolationKind::InvalidE2eReference | EvidenceViolationKind::InvalidLogReference
+        EvidenceViolationKind::InvalidE2eReference
+            | EvidenceViolationKind::InvalidLogReference
+            | EvidenceViolationKind::InvalidArtifactHashReference
     )
 }
 
@@ -319,18 +322,26 @@ mod tests {
                 unit_test_ids: vec!["UT-1".to_owned()],
                 e2e_script_paths: vec!["scripts/test.sh".to_owned()],
                 log_schema_refs: vec!["scripts/test.sh@1.0.0".to_owned()],
+                artifact_hash_manifest_refs: vec![
+                    "scripts/test.sh#artifacts/test-manifest.json".to_owned(),
+                ],
             },
             ParityEvidenceRow {
                 bead_id: "bd-1dp9.7.8".to_owned(),
                 unit_test_ids: vec!["UT-2".to_owned()],
                 e2e_script_paths: vec!["scripts/test2.sh".to_owned()],
                 log_schema_refs: vec!["scripts/test2.sh@1.0.0".to_owned()],
+                artifact_hash_manifest_refs: vec![
+                    "scripts/test2.sh#artifacts/test2-manifest.json".to_owned(),
+                ],
             },
         ];
         let overall_pass = violations.is_empty();
         ParityEvidenceReport {
             schema_version: 1,
             bead_id: "bd-1dp9.7.5".to_owned(),
+            evidence_class_schema_version: "1.0.0".to_owned(),
+            required_evidence_classes: crate::parity_evidence_matrix::required_evidence_classes(),
             generated_unix_ms: 0,
             workspace_root: ".".to_owned(),
             rows,

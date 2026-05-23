@@ -1,10 +1,11 @@
-//! Parity evidence contract matrix and validation gate (bd-1dp9.7.5).
+//! Parity evidence contract matrix and validation gate (bd-1dp9.7.5, bd-2yqp6.7.7).
 //!
 //! This module builds a machine-readable matrix mapping parity closure beads to
-//! required verification artifacts across three layers:
-//! - unit test evidence,
-//! - e2e script evidence,
-//! - structured log schema evidence.
+//! required verification artifacts across four versioned evidence classes:
+//! - unit/property test proof,
+//! - deterministic e2e replay script,
+//! - structured log schema validation,
+//! - artifact hash manifest.
 //!
 //! It then validates completeness and reference integrity so missing evidence is
 //! reported with bead-scoped diagnostics.
@@ -23,6 +24,44 @@ use crate::unit_matrix::UnitMatrix;
 pub const BEAD_ID: &str = "bd-1dp9.7.5";
 /// Schema version for matrix report serialization.
 pub const EVIDENCE_MATRIX_SCHEMA_VERSION: u32 = 1;
+/// Schema version for required evidence classes.
+pub const EVIDENCE_CLASS_SCHEMA_VERSION: &str = "1.0.0";
+
+/// Required evidence class for each parity-contract bead.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceClassId {
+    UnitPropertyTestProof,
+    DeterministicE2eReplayScript,
+    StructuredLogSchemaValidation,
+    ArtifactHashManifest,
+}
+
+impl EvidenceClassId {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnitPropertyTestProof => "unit_property_test_proof",
+            Self::DeterministicE2eReplayScript => "deterministic_e2e_replay_script",
+            Self::StructuredLogSchemaValidation => "structured_log_schema_validation",
+            Self::ArtifactHashManifest => "artifact_hash_manifest",
+        }
+    }
+}
+
+impl fmt::Display for EvidenceClassId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Versioned evidence-class contract advertised in every report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceClassRequirement {
+    pub class_id: EvidenceClassId,
+    pub schema_version: String,
+    pub description: String,
+}
 
 /// Per-bead evidence references across required layers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,6 +74,8 @@ pub struct ParityEvidenceRow {
     pub e2e_script_paths: Vec<String>,
     /// Structured log schema references (`<script_path>@<schema_version>`).
     pub log_schema_refs: Vec<String>,
+    /// Artifact hash manifest references (`<script_path>#<artifact_path>`).
+    pub artifact_hash_manifest_refs: Vec<String>,
 }
 
 /// Violation class emitted by matrix validation.
@@ -44,8 +85,10 @@ pub enum EvidenceViolationKind {
     MissingUnitEvidence,
     MissingE2eEvidence,
     MissingLogEvidence,
+    MissingArtifactHashEvidence,
     InvalidE2eReference,
     InvalidLogReference,
+    InvalidArtifactHashReference,
 }
 
 impl fmt::Display for EvidenceViolationKind {
@@ -54,10 +97,30 @@ impl fmt::Display for EvidenceViolationKind {
             Self::MissingUnitEvidence => "missing_unit_evidence",
             Self::MissingE2eEvidence => "missing_e2e_evidence",
             Self::MissingLogEvidence => "missing_log_evidence",
+            Self::MissingArtifactHashEvidence => "missing_artifact_hash_evidence",
             Self::InvalidE2eReference => "invalid_e2e_reference",
             Self::InvalidLogReference => "invalid_log_reference",
+            Self::InvalidArtifactHashReference => "invalid_artifact_hash_reference",
         };
         f.write_str(value)
+    }
+}
+
+impl EvidenceViolationKind {
+    #[must_use]
+    pub const fn evidence_class(self) -> EvidenceClassId {
+        match self {
+            Self::MissingUnitEvidence => EvidenceClassId::UnitPropertyTestProof,
+            Self::MissingE2eEvidence | Self::InvalidE2eReference => {
+                EvidenceClassId::DeterministicE2eReplayScript
+            }
+            Self::MissingLogEvidence | Self::InvalidLogReference => {
+                EvidenceClassId::StructuredLogSchemaValidation
+            }
+            Self::MissingArtifactHashEvidence | Self::InvalidArtifactHashReference => {
+                EvidenceClassId::ArtifactHashManifest
+            }
+        }
     }
 }
 
@@ -83,6 +146,8 @@ pub struct EvidenceSummary {
 pub struct ParityEvidenceReport {
     pub schema_version: u32,
     pub bead_id: String,
+    pub evidence_class_schema_version: String,
+    pub required_evidence_classes: Vec<EvidenceClassRequirement>,
     pub generated_unix_ms: u128,
     pub workspace_root: String,
     pub rows: Vec<ParityEvidenceRow>,
@@ -93,12 +158,19 @@ pub struct ParityEvidenceReport {
 #[derive(Debug, Clone, Deserialize)]
 struct IssueJsonlRow {
     id: String,
+    #[serde(default)]
+    status: String,
     issue_type: String,
+    #[serde(default)]
+    labels: Vec<String>,
 }
 
 /// Load parity closure bead IDs from `.beads/issues.jsonl`.
 ///
-/// Includes `bd-1dp9.*` items with type `task|feature|bug`.
+/// Includes:
+/// - legacy `bd-1dp9.*` parity closure items with type `task|feature|bug`,
+/// - Track G `bd-2yqp6.7.*` parity-cert child items with status
+///   `open|in_progress|closed`.
 pub fn load_parity_closure_bead_ids(path: &Path) -> Result<Vec<String>, String> {
     let payload = std::fs::read_to_string(path).map_err(|error| {
         format!(
@@ -130,7 +202,27 @@ pub fn load_parity_closure_bead_ids(path: &Path) -> Result<Vec<String>, String> 
 }
 
 fn is_parity_closure_issue(row: &IssueJsonlRow) -> bool {
-    row.id.starts_with("bd-1dp9.") && matches!(row.issue_type.as_str(), "task" | "feature" | "bug")
+    is_contract_issue_type(row)
+        && is_contract_status(row)
+        && (is_legacy_parity_closure_issue(row) || is_track_g_parity_cert_child(row))
+}
+
+fn is_contract_issue_type(row: &IssueJsonlRow) -> bool {
+    matches!(row.issue_type.as_str(), "task" | "feature" | "bug")
+}
+
+fn is_contract_status(row: &IssueJsonlRow) -> bool {
+    matches!(row.status.as_str(), "open" | "in_progress" | "closed")
+}
+
+fn is_legacy_parity_closure_issue(row: &IssueJsonlRow) -> bool {
+    row.id.starts_with("bd-1dp9.")
+}
+
+fn is_track_g_parity_cert_child(row: &IssueJsonlRow) -> bool {
+    row.id.starts_with("bd-2yqp6.7.")
+        && row.labels.iter().any(|label| label == "parity-cert")
+        && row.labels.iter().any(|label| label == "track-g")
 }
 
 /// Build evidence rows from canonical unit/e2e inventories.
@@ -143,6 +235,7 @@ pub fn build_parity_evidence_rows(
     let unit_refs_by_bead = collect_unit_refs_by_bead(unit_matrix);
     let e2e_refs_by_bead = collect_e2e_refs_by_bead(traceability);
     let log_refs_by_bead = collect_log_refs_by_bead(traceability);
+    let artifact_refs_by_bead = collect_artifact_refs_by_bead(traceability);
 
     let mut rows = Vec::with_capacity(required_bead_ids.len());
     for bead_id in required_bead_ids {
@@ -155,12 +248,16 @@ pub fn build_parity_evidence_rows(
         let log_schema_refs = log_refs_by_bead
             .get(bead_id)
             .map_or_else(Vec::new, |items| items.iter().cloned().collect());
+        let artifact_hash_manifest_refs = artifact_refs_by_bead
+            .get(bead_id)
+            .map_or_else(Vec::new, |items| items.iter().cloned().collect());
 
         rows.push(ParityEvidenceRow {
             bead_id: bead_id.clone(),
             unit_test_ids,
             e2e_script_paths,
             log_schema_refs,
+            artifact_hash_manifest_refs,
         });
     }
 
@@ -215,6 +312,25 @@ fn collect_log_refs_by_bead(
     refs_by_bead
 }
 
+fn collect_artifact_refs_by_bead(
+    traceability: &TraceabilityMatrix,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut refs_by_bead: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for script in &traceability.scripts {
+        let Some(bead_id) = &script.bead_id else {
+            continue;
+        };
+
+        for artifact_path in &script.artifact_paths {
+            refs_by_bead
+                .entry(bead_id.clone())
+                .or_default()
+                .insert(format!("{}#{}", script.path, artifact_path));
+        }
+    }
+    refs_by_bead
+}
+
 /// Validate evidence rows for completeness and reference integrity.
 #[must_use]
 pub fn validate_parity_evidence_rows(
@@ -243,6 +359,13 @@ pub fn validate_parity_evidence_rows(
                 bead_id: row.bead_id.clone(),
                 kind: EvidenceViolationKind::MissingLogEvidence,
                 detail: "no log schema references linked".to_owned(),
+            });
+        }
+        if row.artifact_hash_manifest_refs.is_empty() {
+            violations.push(EvidenceViolation {
+                bead_id: row.bead_id.clone(),
+                kind: EvidenceViolationKind::MissingArtifactHashEvidence,
+                detail: "no artifact hash manifest references linked".to_owned(),
             });
         }
 
@@ -285,9 +408,65 @@ pub fn validate_parity_evidence_rows(
                 });
             }
         }
+
+        for reference in &row.artifact_hash_manifest_refs {
+            let Some((script_path, artifact_path)) = reference.split_once('#') else {
+                violations.push(EvidenceViolation {
+                    bead_id: row.bead_id.clone(),
+                    kind: EvidenceViolationKind::InvalidArtifactHashReference,
+                    detail: format!("artifact reference missing # separator: {reference}"),
+                });
+                continue;
+            };
+
+            if !row.e2e_script_paths.iter().any(|path| path == script_path) {
+                violations.push(EvidenceViolation {
+                    bead_id: row.bead_id.clone(),
+                    kind: EvidenceViolationKind::InvalidArtifactHashReference,
+                    detail: format!(
+                        "artifact reference script not linked as e2e evidence: {script_path}"
+                    ),
+                });
+            }
+
+            if !is_valid_artifact_path(artifact_path) {
+                violations.push(EvidenceViolation {
+                    bead_id: row.bead_id.clone(),
+                    kind: EvidenceViolationKind::InvalidArtifactHashReference,
+                    detail: format!("invalid artifact manifest path: {artifact_path}"),
+                });
+            }
+        }
     }
 
     violations
+}
+
+fn is_valid_artifact_path(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || Path::new(trimmed).is_absolute() {
+        return false;
+    }
+
+    let normalized = trimmed.trim_end_matches('/');
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let mut segments = normalized.split('/');
+    let Some(first_segment) = segments.next() else {
+        return false;
+    };
+    if !matches!(
+        first_segment,
+        "artifacts" | "test-results" | "target" | "baselines"
+    ) {
+        return false;
+    }
+
+    std::iter::once(first_segment)
+        .chain(segments)
+        .all(|segment| !matches!(segment, "" | "." | ".."))
 }
 
 fn is_semver(value: &str) -> bool {
@@ -330,6 +509,8 @@ pub fn build_parity_evidence_report(
     ParityEvidenceReport {
         schema_version: EVIDENCE_MATRIX_SCHEMA_VERSION,
         bead_id: BEAD_ID.to_owned(),
+        evidence_class_schema_version: EVIDENCE_CLASS_SCHEMA_VERSION.to_owned(),
+        required_evidence_classes: required_evidence_classes(),
         generated_unix_ms: unix_time_ms(),
         workspace_root: workspace_root.display().to_string(),
         rows,
@@ -363,11 +544,44 @@ pub fn render_violation_diagnostics(report: &ParityEvidenceReport) -> Vec<String
         .iter()
         .map(|violation| {
             format!(
-                "bead_id={} kind={} detail={}",
-                violation.bead_id, violation.kind, violation.detail
+                "bead_id={} evidence_class={} kind={} first_failure_diagnostic={}",
+                violation.bead_id,
+                violation.kind.evidence_class(),
+                violation.kind,
+                violation.detail
             )
         })
         .collect()
+}
+
+/// Return the versioned required evidence classes in stable order.
+#[must_use]
+pub fn required_evidence_classes() -> Vec<EvidenceClassRequirement> {
+    [
+        (
+            EvidenceClassId::UnitPropertyTestProof,
+            "deterministic unit/property test identifiers linked to the bead",
+        ),
+        (
+            EvidenceClassId::DeterministicE2eReplayScript,
+            "one-command deterministic e2e replay script linked to the bead",
+        ),
+        (
+            EvidenceClassId::StructuredLogSchemaValidation,
+            "structured log schema version tied to the replay script",
+        ),
+        (
+            EvidenceClassId::ArtifactHashManifest,
+            "artifact bundle or manifest path carrying reproducible hashes",
+        ),
+    ]
+    .into_iter()
+    .map(|(class_id, description)| EvidenceClassRequirement {
+        class_id,
+        schema_version: EVIDENCE_CLASS_SCHEMA_VERSION.to_owned(),
+        description: description.to_owned(),
+    })
+    .collect()
 }
 
 fn unix_time_ms() -> u128 {
@@ -454,10 +668,10 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let jsonl_path = temp_dir.path().join("issues.jsonl");
         let payload = [
-            r#"{"id":"bd-1dp9.7.5","issue_type":"task"}"#,
-            r#"{"id":"bd-1dp9.9","issue_type":"feature"}"#,
-            r#"{"id":"bd-1dp9","issue_type":"epic"}"#,
-            r#"{"id":"bd-xyz.1","issue_type":"task"}"#,
+            r#"{"id":"bd-1dp9.7.5","status":"closed","issue_type":"task"}"#,
+            r#"{"id":"bd-1dp9.9","status":"open","issue_type":"feature"}"#,
+            r#"{"id":"bd-1dp9","status":"closed","issue_type":"epic"}"#,
+            r#"{"id":"bd-xyz.1","status":"open","issue_type":"task"}"#,
         ]
         .join("\n");
         std::fs::write(&jsonl_path, payload).expect("write jsonl");
@@ -470,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn build_rows_collects_unit_e2e_and_log_refs() {
+    fn build_rows_collects_all_evidence_class_refs() {
         let required = vec!["bd-1dp9.7.5".to_owned()];
         let unit_matrix = minimal_unit_matrix("bd-1dp9.7.5");
         let traceability = minimal_traceability(
@@ -493,6 +707,10 @@ mod tests {
             row.log_schema_refs,
             vec!["scripts/verify_parity_evidence_matrix.sh@1.0.0".to_owned()]
         );
+        assert_eq!(
+            row.artifact_hash_manifest_refs,
+            vec!["scripts/verify_parity_evidence_matrix.sh#artifacts/synthetic.json".to_owned()]
+        );
     }
 
     #[test]
@@ -503,6 +721,7 @@ mod tests {
             unit_test_ids: Vec::new(),
             e2e_script_paths: vec!["scripts/missing.sh".to_owned()],
             log_schema_refs: vec!["scripts/other.sh@invalid".to_owned()],
+            artifact_hash_manifest_refs: vec!["scripts/other.sh#/tmp/not-relative.json".to_owned()],
         };
 
         let violations = validate_parity_evidence_rows(&[row], temp_dir.path());
@@ -522,6 +741,12 @@ mod tests {
                 .iter()
                 .any(|violation| violation.kind == EvidenceViolationKind::InvalidLogReference)
         );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.kind
+                    == EvidenceViolationKind::InvalidArtifactHashReference)
+        );
     }
 
     #[test]
@@ -531,6 +756,20 @@ mod tests {
         assert!(!is_semver("1.0"));
         assert!(!is_semver("1.0.0-beta"));
         assert!(!is_semver("v1.0.0"));
+    }
+
+    #[test]
+    fn artifact_path_validator_accepts_workspace_artifact_locations_only() {
+        assert!(is_valid_artifact_path(
+            "artifacts/bd-2yqp6.7.7/manifest.json"
+        ));
+        assert!(is_valid_artifact_path(
+            "test-results/bd_2yqp6_7_7/report.json"
+        ));
+        assert!(is_valid_artifact_path("target/coverage/"));
+        assert!(!is_valid_artifact_path("/tmp/report.json"));
+        assert!(!is_valid_artifact_path("../artifacts/report.json"));
+        assert!(!is_valid_artifact_path("docs/report.json"));
     }
 
     #[test]
@@ -557,6 +796,11 @@ mod tests {
         assert!(!report.summary.overall_pass);
         assert_eq!(report.summary.violation_count, report.violations.len());
         assert!(!render_violation_diagnostics(&report).is_empty());
+        assert_eq!(
+            report.required_evidence_classes.len(),
+            4,
+            "all quality-contract evidence classes should be explicit"
+        );
     }
 
     #[test]
@@ -596,5 +840,38 @@ mod tests {
         assert!(unknown.unit_test_ids.is_empty());
         assert!(unknown.e2e_script_paths.is_empty());
         assert!(unknown.log_schema_refs.is_empty());
+        assert!(unknown.artifact_hash_manifest_refs.is_empty());
+    }
+
+    #[test]
+    fn load_parity_closure_bead_ids_includes_track_g_parity_cert_children() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+        let payload = [
+            r#"{"id":"bd-2yqp6.7","status":"open","issue_type":"epic","labels":["parity-cert","track-g"]}"#,
+            r#"{"id":"bd-2yqp6.7.7","status":"in_progress","issue_type":"task","labels":["evidence","parity-cert","track-g"]}"#,
+            r#"{"id":"bd-2yqp6.7.8","status":"open","issue_type":"task","labels":["parity-cert","track-g"]}"#,
+            r#"{"id":"bd-2yqp6.7.9","status":"blocked","issue_type":"task","labels":["parity-cert","track-g"]}"#,
+            r#"{"id":"bd-2yqp6.7.10","status":"open","issue_type":"task","labels":["track-g"]}"#,
+        ]
+        .join("\n");
+        std::fs::write(&jsonl_path, payload).expect("write jsonl");
+
+        let bead_ids = load_parity_closure_bead_ids(&jsonl_path).expect("load bead ids");
+        assert_eq!(
+            bead_ids,
+            vec!["bd-2yqp6.7.7".to_owned(), "bd-2yqp6.7.8".to_owned()]
+        );
+    }
+
+    #[test]
+    fn violation_kinds_map_to_versioned_evidence_classes() {
+        let classes = required_evidence_classes();
+        assert_eq!(classes.len(), 4);
+        assert!(classes.iter().all(|class| class.schema_version == "1.0.0"));
+        assert_eq!(
+            EvidenceViolationKind::MissingArtifactHashEvidence.evidence_class(),
+            EvidenceClassId::ArtifactHashManifest
+        );
     }
 }

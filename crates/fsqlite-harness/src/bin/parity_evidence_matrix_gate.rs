@@ -2,13 +2,15 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use serde::de::DeserializeOwned;
+
 use fsqlite_harness::e2e_traceability::TraceabilityMatrix;
 use fsqlite_harness::parity_evidence_matrix::{
     BEAD_ID, ParityEvidenceReport, build_parity_evidence_report,
     generate_workspace_parity_evidence_report, load_parity_closure_bead_ids,
     render_violation_diagnostics,
 };
-use fsqlite_harness::unit_matrix::build_canonical_matrix;
+use fsqlite_harness::unit_matrix::{UnitMatrix, build_canonical_matrix};
 use fsqlite_harness::verification_contract_enforcement::{
     classify_parity_evidence_report, enforce_gate_decision, render_contract_enforcement_logs,
 };
@@ -17,6 +19,7 @@ use fsqlite_harness::verification_contract_enforcement::{
 struct CliConfig {
     workspace_root: PathBuf,
     output_path: Option<PathBuf>,
+    unit_matrix_override_path: Option<PathBuf>,
     traceability_override_path: Option<PathBuf>,
 }
 
@@ -29,6 +32,8 @@ USAGE:
 
 OPTIONS:
     --workspace-root <PATH>   Workspace root containing .beads/issues.jsonl (default: current dir)
+    --unit-matrix-override <PATH>
+                              Optional JSON override for UnitMatrix (relative to workspace root when not absolute)
     --traceability-override <PATH>
                               Optional JSON override for TraceabilityMatrix (relative to workspace root when not absolute)
     --output <PATH>           Write JSON report to path (stdout when omitted)
@@ -40,6 +45,7 @@ OPTIONS:
 fn parse_args(args: &[String]) -> Result<CliConfig, String> {
     let mut workspace_root = PathBuf::from(".");
     let mut output_path: Option<PathBuf> = None;
+    let mut unit_matrix_override_path: Option<PathBuf> = None;
     let mut traceability_override_path: Option<PathBuf> = None;
 
     let mut index = 0;
@@ -58,6 +64,13 @@ fn parse_args(args: &[String]) -> Result<CliConfig, String> {
                     return Err("--output requires a value".to_owned());
                 }
                 output_path = Some(PathBuf::from(&args[index]));
+            }
+            "--unit-matrix-override" => {
+                index += 1;
+                if index >= args.len() {
+                    return Err("--unit-matrix-override requires a value".to_owned());
+                }
+                unit_matrix_override_path = Some(PathBuf::from(&args[index]));
             }
             "--traceability-override" => {
                 index += 1;
@@ -80,14 +93,19 @@ fn parse_args(args: &[String]) -> Result<CliConfig, String> {
     Ok(CliConfig {
         workspace_root,
         output_path,
+        unit_matrix_override_path,
         traceability_override_path,
     })
 }
 
-fn load_traceability_override(
+fn load_json_override<T>(
     workspace_root: &Path,
     override_path: &Path,
-) -> Result<TraceabilityMatrix, String> {
+    label: &str,
+) -> Result<T, String>
+where
+    T: DeserializeOwned,
+{
     let resolved_path = if override_path.is_absolute() {
         override_path.to_path_buf()
     } else {
@@ -96,36 +114,49 @@ fn load_traceability_override(
 
     let payload = std::fs::read_to_string(&resolved_path).map_err(|error| {
         format!(
-            "traceability_override_read_failed path={} error={error}",
+            "{label}_read_failed path={} error={error}",
             resolved_path.display()
         )
     })?;
 
     serde_json::from_str(&payload).map_err(|error| {
         format!(
-            "traceability_override_parse_failed path={} error={error}",
+            "{label}_parse_failed path={} error={error}",
             resolved_path.display()
         )
     })
 }
 
 fn build_report(config: &CliConfig) -> Result<ParityEvidenceReport, String> {
-    match &config.traceability_override_path {
-        Some(override_path) => {
-            let issues_path = config.workspace_root.join(".beads/issues.jsonl");
-            let required_bead_ids = load_parity_closure_bead_ids(&issues_path)?;
-            let unit_matrix = build_canonical_matrix();
-            let traceability = load_traceability_override(&config.workspace_root, override_path)?;
-
-            Ok(build_parity_evidence_report(
-                &config.workspace_root,
-                &required_bead_ids,
-                &unit_matrix,
-                &traceability,
-            ))
-        }
-        None => generate_workspace_parity_evidence_report(&config.workspace_root),
+    if config.unit_matrix_override_path.is_none() && config.traceability_override_path.is_none() {
+        return generate_workspace_parity_evidence_report(&config.workspace_root);
     }
+
+    let issues_path = config.workspace_root.join(".beads/issues.jsonl");
+    let required_bead_ids = load_parity_closure_bead_ids(&issues_path)?;
+    let unit_matrix = match &config.unit_matrix_override_path {
+        Some(override_path) => load_json_override::<UnitMatrix>(
+            &config.workspace_root,
+            override_path,
+            "unit_matrix_override",
+        )?,
+        None => build_canonical_matrix(),
+    };
+    let traceability = match &config.traceability_override_path {
+        Some(override_path) => load_json_override::<TraceabilityMatrix>(
+            &config.workspace_root,
+            override_path,
+            "traceability_override",
+        )?,
+        None => fsqlite_harness::e2e_traceability::build_canonical_inventory(),
+    };
+
+    Ok(build_parity_evidence_report(
+        &config.workspace_root,
+        &required_bead_ids,
+        &unit_matrix,
+        &traceability,
+    ))
 }
 
 fn run(args: &[String]) -> Result<i32, String> {
@@ -156,7 +187,11 @@ fn run(args: &[String]) -> Result<i32, String> {
         return Ok(0);
     }
 
-    for line in render_violation_diagnostics(&report) {
+    let diagnostics = render_violation_diagnostics(&report);
+    if let Some(first_diagnostic) = diagnostics.first() {
+        eprintln!("ERROR bead_id={BEAD_ID} event=parity_evidence_first_failure {first_diagnostic}");
+    }
+    for line in diagnostics {
         eprintln!("WARN bead_id={BEAD_ID} {line}");
     }
     Ok(1)

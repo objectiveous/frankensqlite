@@ -15,7 +15,7 @@ use fsqlite_harness::confidence_gates::{
 };
 use fsqlite_harness::parity_evidence_matrix::{
     EvidenceSummary, EvidenceViolation, EvidenceViolationKind, ParityEvidenceReport,
-    ParityEvidenceRow,
+    ParityEvidenceRow, required_evidence_classes,
 };
 use fsqlite_harness::parity_invariant_catalog::build_canonical_catalog;
 use fsqlite_harness::parity_taxonomy::build_canonical_universe;
@@ -32,6 +32,8 @@ fn synthetic_parity_report(violations: Vec<EvidenceViolation>) -> ParityEvidence
     ParityEvidenceReport {
         schema_version: 1,
         bead_id: "bd-1dp9.7.5".to_owned(),
+        evidence_class_schema_version: "1.0.0".to_owned(),
+        required_evidence_classes: required_evidence_classes(),
         generated_unix_ms: 0,
         workspace_root: ".".to_owned(),
         rows: vec![ParityEvidenceRow {
@@ -39,6 +41,7 @@ fn synthetic_parity_report(violations: Vec<EvidenceViolation>) -> ParityEvidence
             unit_test_ids: vec!["UT-1".to_owned()],
             e2e_script_paths: vec!["scripts/test.sh".to_owned()],
             log_schema_refs: vec!["scripts/test.sh@1.0.0".to_owned()],
+            artifact_hash_manifest_refs: vec!["scripts/test.sh#artifacts/test.json".to_owned()],
         }],
         summary: EvidenceSummary {
             required_bead_count: 1,

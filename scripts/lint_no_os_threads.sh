@@ -13,7 +13,7 @@ cd "${REPO_ROOT}"
 
 TARGET_DIRS=(crates/*/src)
 
-FORBIDDEN_PATTERN='std::thread::spawn|thread::spawn|std::thread::Builder|thread::Builder'
+FORBIDDEN_PATTERN='(^|[^[:alnum:]_])(std[[:space:]]*::[[:space:]]*)?thread[[:space:]]*::[[:space:]]*(spawn|Builder)([^[:alnum:]_]|$)'
 declare -a HITS=()
 
 scan_source() {
@@ -118,13 +118,21 @@ mod inline_tests { fn inline_test_spawn_is_ignored() { std::thread::spawn(|| {})
 #[test]
 fn inline_standalone_test_spawn_is_ignored() { std::thread::spawn(|| {}); } // inline standalone test spawn sentinel
 
+#[cfg(test)]
+fn spaced_test_spawn_is_ignored() { std :: thread :: spawn(|| {}); } // spaced test spawn sentinel
+
 fn production_after_test_is_detected() {
     std::thread::spawn(|| {}); // production spawn sentinel
+}
+
+fn production_spaced_path_is_detected() {
+    thread :: spawn(|| {}); // spaced production spawn sentinel
+    std :: thread :: Builder::new().spawn(|| {}).unwrap(); // spaced builder sentinel
 }
 RUST
   )"
 
-  if [[ "${output}" == *"test spawn sentinel"* || "${output}" == *"standalone test spawn sentinel"* || "${output}" == *"inline cfg(test) spawn sentinel"* || "${output}" == *"inline standalone test spawn sentinel"* ]]; then
+  if [[ "${output}" == *"test spawn sentinel"* || "${output}" == *"standalone test spawn sentinel"* || "${output}" == *"inline cfg(test) spawn sentinel"* || "${output}" == *"inline standalone test spawn sentinel"* || "${output}" == *"spaced test spawn sentinel"* ]]; then
     echo "[FAIL] self-test scanner reported a test-only thread spawn" >&2
     printf '%s\n' "${output}" >&2
     exit 1
@@ -132,6 +140,12 @@ RUST
 
   if [[ "${output}" != *"production spawn sentinel"* ]]; then
     echo "[FAIL] self-test scanner missed a production thread spawn after #[cfg(test)]" >&2
+    printf '%s\n' "${output}" >&2
+    exit 1
+  fi
+
+  if [[ "${output}" != *"spaced production spawn sentinel"* || "${output}" != *"spaced builder sentinel"* ]]; then
+    echo "[FAIL] self-test scanner missed a whitespace-formatted production thread path" >&2
     printf '%s\n' "${output}" >&2
     exit 1
   fi

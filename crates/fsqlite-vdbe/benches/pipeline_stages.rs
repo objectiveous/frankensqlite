@@ -207,6 +207,28 @@ fn build_execute_stage_bitand_program(op_repeats: usize) -> VdbeProgram {
         .expect("pipeline execute bitand benchmark program should build")
 }
 
+/// Build a dispatch-dominated program whose inner loop is a stream of `BitOr`
+/// ops over stable non-NULL integer inputs. The output register is distinct so
+/// each iteration exercises the same bitwise body without changing operands.
+fn build_execute_stage_bitor_program(op_repeats: usize) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    let end = builder.emit_label();
+    builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+    let lhs = builder.alloc_reg();
+    let rhs = builder.alloc_reg();
+    let out = builder.alloc_reg();
+    builder.emit_op(Opcode::Integer, 0xF0, lhs, 0, P4::None, 0);
+    builder.emit_op(Opcode::Integer, 0x0F, rhs, 0, P4::None, 0);
+    for _ in 0..op_repeats {
+        builder.emit_op(Opcode::BitOr, lhs, rhs, out, P4::None, 0);
+    }
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder.resolve_label(end);
+    builder
+        .finish()
+        .expect("pipeline execute bitor benchmark program should build")
+}
+
 /// Build a dispatch-dominated program whose inner loop is a stream of
 /// `Variable` loads. The benchmark seeds one owned binding on the engine, so
 /// each opcode exercises the common bound-parameter path: convert p1 from
@@ -867,6 +889,39 @@ fn bench_vdbe_execute_bitand_stage(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_vdbe_execute_bitor_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_bitor");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let program = build_execute_stage_bitor_program(op_repeats);
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &program,
+            |b, program| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute bitor benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_vdbe_execute_variable_stage(c: &mut Criterion) {
     set_vdbe_jit_enabled(false);
     let mut group = c.benchmark_group("vdbe_pipeline_execute_variable");
@@ -1450,6 +1505,7 @@ criterion_group!(
     bench_vdbe_execute_divide_stage,
     bench_vdbe_execute_remainder_stage,
     bench_vdbe_execute_bitand_stage,
+    bench_vdbe_execute_bitor_stage,
     bench_vdbe_execute_variable_stage,
     bench_vdbe_execute_copy_stage,
     bench_vdbe_execute_scopy_stage,

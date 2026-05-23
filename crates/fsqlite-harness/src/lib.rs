@@ -5,6 +5,7 @@
 //! that other crates can call into from their own tests.
 
 pub mod adversarial_search;
+pub mod agent_swarm_trace;
 pub mod backlog_quality_gate;
 pub mod benchmark_corpus;
 pub mod bloodstream;

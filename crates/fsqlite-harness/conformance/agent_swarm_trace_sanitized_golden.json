@@ -1,0 +1,136 @@
+{
+  "schema_version": "1.0.0",
+  "trace_id": "trace-agent-swarm-golden-001",
+  "run_id": "run-agent-swarm-golden-001",
+  "scenario_id": "agent-swarm-hot-pages",
+  "scrubber_version": "1.0.0",
+  "metadata": {
+    "source_kind": "synthetic-agent-swarm",
+    "source_id": "golden-privacy-scrubber",
+    "source_digest": null,
+    "logical_clock": "fixed-seed-001",
+    "tags": {
+      "bead_id": "bd-agent-swarm-replay-lab-1cc5y.1",
+      "purpose": "sanitized-golden-fixture"
+    }
+  },
+  "statements": [
+    {
+      "logical_order": 0,
+      "logical_timestamp": "tick-0000",
+      "actor_id": "agent-a",
+      "connection_id": "conn-a",
+      "transaction_id": "txn-hot-1",
+      "transaction_boundary": "begin",
+      "concurrency_group": "hot-pages",
+      "workload_phase": "setup",
+      "scrubbed_sql": "BEGIN CONCURRENT",
+      "statement_shape": "0f8d0174f5263118aa748ca40541324d800f7812fac3a86f30a836376eb61bf2",
+      "parameter_count": 0,
+      "redactions": {
+        "string_literals": 0,
+        "numeric_literals": 0,
+        "blob_literals": 0,
+        "comments": 0
+      },
+      "expected_result_class": "success",
+      "row_count_class": "zero",
+      "error_class": null,
+      "source": {
+        "source_kind": "synthetic-agent-swarm",
+        "source_ref": "message-0000",
+        "source_digest": null
+      }
+    },
+    {
+      "logical_order": 1,
+      "logical_timestamp": "tick-0001",
+      "actor_id": "agent-a",
+      "connection_id": "conn-a",
+      "transaction_id": "txn-hot-1",
+      "transaction_boundary": "none",
+      "concurrency_group": "hot-pages",
+      "workload_phase": "hot-write",
+      "scrubbed_sql": "INSERT INTO inbox(owner, subject, body, retries) VALUES (?s, ?s, ?b, ?n); --?c",
+      "statement_shape": "e420636a76c13db5b3607c357c6cc713fe9b390c09f0b5012702b98dd6255ccc",
+      "parameter_count": 0,
+      "redactions": {
+        "string_literals": 2,
+        "numeric_literals": 1,
+        "blob_literals": 1,
+        "comments": 1
+      },
+      "expected_result_class": "success",
+      "row_count_class": "one",
+      "error_class": null,
+      "source": {
+        "source_kind": "synthetic-agent-swarm",
+        "source_ref": "message-0001",
+        "source_digest": null
+      }
+    },
+    {
+      "logical_order": 2,
+      "logical_timestamp": "tick-0002",
+      "actor_id": "agent-b",
+      "connection_id": "conn-b",
+      "transaction_id": "txn-hot-1",
+      "transaction_boundary": "none",
+      "concurrency_group": "hot-pages",
+      "workload_phase": "conflict-probe",
+      "scrubbed_sql": "UPDATE inbox SET body = :body, retries = retries + ?n WHERE owner = ?s AND id = ?n;",
+      "statement_shape": "ce6b0c8bd83b1f452b846dff3d28969bd7a06007f8c772416613672b61d7d3c6",
+      "parameter_count": 1,
+      "redactions": {
+        "string_literals": 1,
+        "numeric_literals": 2,
+        "blob_literals": 0,
+        "comments": 0
+      },
+      "expected_result_class": "conflict",
+      "row_count_class": "unknown",
+      "error_class": "mvcc-page-conflict",
+      "source": {
+        "source_kind": "synthetic-agent-swarm",
+        "source_ref": "message-0002",
+        "source_digest": null
+      }
+    },
+    {
+      "logical_order": 3,
+      "logical_timestamp": "tick-0003",
+      "actor_id": "agent-a",
+      "connection_id": "conn-a",
+      "transaction_id": "txn-hot-1",
+      "transaction_boundary": "commit",
+      "concurrency_group": "hot-pages",
+      "workload_phase": "commit",
+      "scrubbed_sql": "COMMIT",
+      "statement_shape": "79663c1d3b43ceaf9ee728e501c64b57ae2e4d6cb36ff5c65eddcda1de27342f",
+      "parameter_count": 0,
+      "redactions": {
+        "string_literals": 0,
+        "numeric_literals": 0,
+        "blob_literals": 0,
+        "comments": 0
+      },
+      "expected_result_class": "success",
+      "row_count_class": "zero",
+      "error_class": null,
+      "source": {
+        "source_kind": "synthetic-agent-swarm",
+        "source_ref": "message-0003",
+        "source_digest": null
+      }
+    }
+  ],
+  "redaction_summary": {
+    "statement_count": 4,
+    "transaction_count": 1,
+    "redaction_count": 8,
+    "string_literals": 3,
+    "numeric_literals": 3,
+    "blob_literals": 1,
+    "comments": 1
+  }
+}

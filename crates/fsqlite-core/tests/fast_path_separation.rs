@@ -1630,9 +1630,30 @@ fn test_b3_covering_indexed_equality_profile_stays_seek_bounded() {
         !covering_opcodes.iter().any(|op| op == "SeekRowid"),
         "covering indexed equality should avoid table rowid lookup, got {covering_opcodes:?}"
     );
+    let non_covering_opcodes =
+        explain_opcode_names(&conn, "SELECT name FROM t WHERE category = 'cat_05000'");
+    eprintln!(
+        "[bd-6eyrg.3] non-covering indexed equality bytecode: {}",
+        non_covering_opcodes.join(", ")
+    );
+    assert!(
+        non_covering_opcodes.iter().any(|op| op == "SeekGE"),
+        "non-covering indexed equality should probe the index, got {non_covering_opcodes:?}"
+    );
+    assert!(
+        non_covering_opcodes.iter().any(|op| op == "IdxRowid"),
+        "non-covering indexed equality should read rowids from the index, got {non_covering_opcodes:?}"
+    );
+    assert!(
+        non_covering_opcodes.iter().any(|op| op == "SeekRowid"),
+        "non-covering indexed equality should seek the table row, got {non_covering_opcodes:?}"
+    );
 
     let covering = conn
         .prepare("SELECT payload FROM t WHERE category = ?1")
+        .unwrap();
+    let non_covering = conn
+        .prepare("SELECT name FROM t WHERE category = ?1")
         .unwrap();
     let probe = [fsqlite_types::SqliteValue::Text("cat_05000".into())];
     let warm_rows = covering.query_with_params(&probe).unwrap();
@@ -1642,13 +1663,39 @@ fn test_b3_covering_indexed_equality_profile_stays_seek_bounded() {
         Some(&fsqlite_types::SqliteValue::Text("payload_05000".into())),
         "covering lookup should return the expected payload"
     );
+    let warm_non_covering_rows = non_covering.query_with_params(&probe).unwrap();
+    assert_eq!(warm_non_covering_rows.len(), 1);
+    assert_eq!(
+        warm_non_covering_rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Text("name_05000".into())),
+        "non-covering lookup should return the expected table payload"
+    );
+
+    let probes = (0..PROBES)
+        .map(|probe_index| {
+            let probe_index = i64::try_from(probe_index).unwrap();
+            let probe_id = 1 + ((probe_index * 7_919) % ROW_COUNT);
+            fsqlite_types::SqliteValue::Text(format!("cat_{probe_id:05}").into())
+        })
+        .collect::<Vec<_>>();
+    let opcode_total = |snapshot: &fsqlite_core::connection::HotPathProfileSnapshot,
+                        opcode: &str| {
+        snapshot
+            .vdbe
+            .opcode_execution_totals
+            .iter()
+            .find(|count| count.opcode == opcode)
+            .map_or(0, |count| count.total)
+    };
 
     reset_hot_path_profile();
     let before = hot_path_profile_snapshot();
     let started = std::time::Instant::now();
     let mut row_total = 0_usize;
-    for _ in 0..PROBES {
-        let rows = covering.query_with_params(&probe).unwrap();
+    for probe in &probes {
+        let rows = covering
+            .query_with_params(std::slice::from_ref(probe))
+            .unwrap();
         row_total = row_total.saturating_add(rows.len());
         std::hint::black_box(rows);
     }
@@ -1657,16 +1704,8 @@ fn test_b3_covering_indexed_equality_profile_stays_seek_bounded() {
 
     let avg_nanos = elapsed.as_nanos() / u128::try_from(PROBES).unwrap();
     let (fast_delta, slow_delta) = fast_slow_delta(&before.parser, &after.parser);
-    let opcode_total = |opcode: &str| {
-        after
-            .vdbe
-            .opcode_execution_totals
-            .iter()
-            .find(|count| count.opcode == opcode)
-            .map_or(0, |count| count.total)
-    };
-    let seek_ge_total = opcode_total("SeekGE");
-    let seek_rowid_total = opcode_total("SeekRowid");
+    let seek_ge_total = opcode_total(&after, "SeekGE");
+    let seek_rowid_total = opcode_total(&after, "SeekRowid");
     eprintln!(
         "[bd-6eyrg.3] covering_index_lookup rows={ROW_COUNT} probes={PROBES} \
          avg_ns={avg_nanos} total_us={} row_total={row_total} \
@@ -1699,6 +1738,64 @@ fn test_b3_covering_indexed_equality_profile_stays_seek_bounded() {
     assert!(
         avg_nanos < 100_000,
         "covering indexed equality averaged {avg_nanos}ns, budget 100000ns"
+    );
+
+    reset_hot_path_profile();
+    let non_covering_before = hot_path_profile_snapshot();
+    let non_covering_started = std::time::Instant::now();
+    let mut non_covering_row_total = 0_usize;
+    for probe in &probes {
+        let rows = non_covering
+            .query_with_params(std::slice::from_ref(probe))
+            .unwrap();
+        non_covering_row_total = non_covering_row_total.saturating_add(rows.len());
+        std::hint::black_box(rows);
+    }
+    let non_covering_elapsed = non_covering_started.elapsed();
+    let non_covering_after = hot_path_profile_snapshot();
+
+    let non_covering_avg_nanos = non_covering_elapsed.as_nanos() / u128::try_from(PROBES).unwrap();
+    let (non_covering_fast_delta, non_covering_slow_delta) =
+        fast_slow_delta(&non_covering_before.parser, &non_covering_after.parser);
+    let non_covering_seek_ge_total = opcode_total(&non_covering_after, "SeekGE");
+    let non_covering_idx_rowid_total = opcode_total(&non_covering_after, "IdxRowid");
+    let non_covering_seek_rowid_total = opcode_total(&non_covering_after, "SeekRowid");
+    eprintln!(
+        "[bd-6eyrg.3] non_covering_index_lookup rows={ROW_COUNT} probes={PROBES} \
+         avg_ns={non_covering_avg_nanos} total_us={} row_total={non_covering_row_total} \
+         seek_ge_execs={non_covering_seek_ge_total} idx_rowid_execs={non_covering_idx_rowid_total} \
+         seek_rowid_execs={non_covering_seek_rowid_total} fast_delta={non_covering_fast_delta} \
+         slow_delta={non_covering_slow_delta}",
+        non_covering_elapsed.as_micros()
+    );
+
+    assert_eq!(
+        non_covering_row_total, PROBES,
+        "each non-covering index probe should return exactly one row"
+    );
+    assert!(
+        non_covering_seek_ge_total >= expected_probes,
+        "non-covering indexed equality should execute one SeekGE probe per lookup: before={non_covering_before:?} after={non_covering_after:?}"
+    );
+    assert!(
+        non_covering_idx_rowid_total >= expected_probes,
+        "non-covering indexed equality should read index rowids per lookup: before={non_covering_before:?} after={non_covering_after:?}"
+    );
+    assert!(
+        non_covering_seek_rowid_total >= expected_probes,
+        "non-covering indexed equality should seek table rows per lookup: before={non_covering_before:?} after={non_covering_after:?}"
+    );
+    assert!(
+        non_covering_fast_delta >= expected_probes,
+        "non-covering indexed equality should be recorded as fast-path execution: before={non_covering_before:?} after={non_covering_after:?}"
+    );
+    assert_eq!(
+        non_covering_slow_delta, 0,
+        "non-covering indexed equality should not fall back to slow execution"
+    );
+    assert!(
+        avg_nanos < non_covering_avg_nanos,
+        "covering index lookup should be faster than non-covering lookup over the same probes: covering={avg_nanos}ns non_covering={non_covering_avg_nanos}ns"
     );
 }
 

@@ -12455,6 +12455,25 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            // Move is emitted for register handoff where the source range is
+            // drained. The common p3=1 case skips the range helper's loop and
+            // overlap checks; multi-register moves still delegate to
+            // `move_reg_range` so overlap handling stays identical to the
+            // main-match arm.
+            Opcode::Move => {
+                if op.p3 == 1 {
+                    let value = Self::reg_with_offset(op.p1, 0)
+                        .map_or_else(|| SqliteValue::Null, |reg| self.take_reg(reg));
+                    if let Some(dst) = Self::reg_with_offset(op.p2, 0) {
+                        self.set_reg_fast(dst, value);
+                    }
+                } else {
+                    let count = usize::try_from(op.p3).unwrap_or(0);
+                    self.move_reg_range(op.p1, op.p2, count);
+                }
+                *pc += 1;
+                Ok(true)
+            }
             // DecrJumpZero is the canonical LIMIT counter: fires once per
             // emitted result row. Body reads a register as integer,
             // decrements if positive, writes the new value back, and jumps

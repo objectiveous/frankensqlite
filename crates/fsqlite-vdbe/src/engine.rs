@@ -7832,7 +7832,13 @@ impl VdbeEngine {
             if self.trace_opcodes {
                 self.trace_opcode(pc, op);
             }
-            if self.try_execute_hot_opcode(op, &mut pc, collect_vdbe_metrics, &mut row_handler)? {
+            if self.try_execute_hot_opcode(
+                op,
+                &mut pc,
+                collect_vdbe_metrics,
+                &mut row_handler,
+                borrowed_bindings,
+            )? {
                 continue;
             }
             #[allow(unreachable_patterns)]
@@ -12363,6 +12369,7 @@ impl VdbeEngine {
         pc: &mut usize,
         collect_vdbe_metrics: bool,
         row_handler: &mut Option<&mut ResultRowCallback<'_>>,
+        borrowed_bindings: Option<&[SqliteValue]>,
     ) -> Result<bool> {
         match op.opcode {
             Opcode::Column => {
@@ -12409,6 +12416,22 @@ impl VdbeEngine {
                     _ => 0,
                 };
                 self.set_reg_int(op.p2, val);
+                *pc += 1;
+                Ok(true)
+            }
+            Opcode::Variable => {
+                let idx = usize::try_from(op.p1)
+                    .ok()
+                    .and_then(|one_based| one_based.checked_sub(1));
+                let value = idx
+                    .and_then(|idx| {
+                        borrowed_bindings
+                            .and_then(|bindings| bindings.get(idx))
+                            .or_else(|| self.bindings.get(idx))
+                    })
+                    .cloned()
+                    .unwrap_or(SqliteValue::Null);
+                self.set_reg_fast(op.p2, value);
                 *pc += 1;
                 Ok(true)
             }

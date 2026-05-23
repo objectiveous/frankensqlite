@@ -29,28 +29,55 @@ declare -a HITS=()
 
 scan_file() {
   local file="$1"
-  local first_test_attr
   local output
-  first_test_attr="$(
-    rg -n -m1 '^[[:space:]]*#\[(cfg|cfg_attr)\([^]]*\btest\b[^]]*\)\]' "${file}" \
-      | cut -d: -f1 \
-      || true
-  )"
+  output="$(
+    awk -v forbidden="${FORBIDDEN_PATTERN}" '
+      function brace_delta(text, i, ch, delta) {
+        delta = 0;
+        for (i = 1; i <= length(text); i++) {
+          ch = substr(text, i, 1);
+          if (ch == "{") {
+            delta++;
+          } else if (ch == "}") {
+            delta--;
+          }
+        }
+        return delta;
+      }
 
-  if [[ -n "${first_test_attr}" ]]; then
-    local production_end=$((first_test_attr - 1))
-    if (( production_end <= 0 )); then
-      return
-    fi
-    output="$(
-      sed -n "1,${production_end}p" "${file}" \
-      | grep -nE "${FORBIDDEN_PATTERN}" \
-      | sed "s|^|${file}:|" \
-      || true
-    )"
-  else
-    output="$(rg -n "${FORBIDDEN_PATTERN}" "${file}" || true)"
-  fi
+      /^[[:space:]]*#\[cfg\([[:space:]]*test[[:space:]]*\)\]/ {
+        pending_test_item = 1;
+        next;
+      }
+
+      skip_depth > 0 {
+        skip_depth += brace_delta($0);
+        if (skip_depth <= 0) {
+          skip_depth = 0;
+        }
+        next;
+      }
+
+      pending_test_item {
+        if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) {
+          next;
+        }
+
+        skip_depth = brace_delta($0);
+        if (skip_depth > 0) {
+          pending_test_item = 0;
+        } else if ($0 ~ /;/) {
+          pending_test_item = 0;
+          skip_depth = 0;
+        }
+        next;
+      }
+
+      $0 ~ forbidden {
+        print FILENAME ":" FNR ":" $0;
+      }
+    ' "${file}" || true
+  )"
 
   if [[ -n "${output}" ]]; then
     while IFS= read -r line; do

@@ -881,6 +881,27 @@ fn build_execute_stage_ifnot_program(op_repeats: usize) -> VdbeProgram {
         .expect("pipeline execute ifnot benchmark program should build")
 }
 
+fn build_execute_stage_if_program(op_repeats: usize) -> VdbeProgram {
+    // Mirrors the IfNot benchmark's linear branch shape: each If jump target is
+    // the immediately-next instruction, so the opcode executes the taken branch
+    // body while preserving straight-line control flow for stable per-op timing.
+    let mut builder = ProgramBuilder::new();
+    let end = builder.emit_label();
+    builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+    let probe = builder.alloc_reg();
+    builder.emit_op(Opcode::Integer, 1, probe, 0, P4::None, 0);
+    for _ in 0..op_repeats {
+        let next = builder.emit_label();
+        builder.emit_jump_to_label(Opcode::If, probe, 0, next, P4::None, 0);
+        builder.resolve_label(next);
+    }
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder.resolve_label(end);
+    builder
+        .finish()
+        .expect("pipeline execute if benchmark program should build")
+}
+
 /// Build a dispatch-dominated program whose inner loop is a stream of
 /// `IsTrue` ops. The probe register is seeded to a truthy integer and
 /// each op writes the coerced boolean result into one stable destination
@@ -2188,6 +2209,39 @@ fn bench_vdbe_execute_ifnot_stage(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_vdbe_execute_if_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_if");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let program = build_execute_stage_if_program(op_repeats);
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &program,
+            |b, program| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute if benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_vdbe_execute_istrue_stage(c: &mut Criterion) {
     set_vdbe_jit_enabled(false);
     let mut group = c.benchmark_group("vdbe_pipeline_execute_istrue");
@@ -2378,6 +2432,7 @@ criterion_group!(
     bench_vdbe_execute_and_stage,
     bench_vdbe_execute_or_stage,
     bench_vdbe_execute_ifnot_stage,
+    bench_vdbe_execute_if_stage,
     bench_vdbe_execute_istrue_stage,
     bench_vdbe_execute_not_stage,
     bench_vdbe_execute_rowid_stage,

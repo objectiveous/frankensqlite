@@ -107,7 +107,7 @@ const FTS5_MAIN_PREFIX_BYTE: u8 = b'0';
 const FTS5_SEGMENT_CHECKSUM_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FTS5_SEGMENT_CHECKSUM_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fts5ConfigRecord {
     pub key: String,
     pub value: SqliteValue,
@@ -996,7 +996,7 @@ impl Fts5SegmentLeaf {
             };
 
             let doclist = Fts5Doclist::decode(&page[cursor..entry_end])?;
-            previous_term = term.clone();
+            previous_term.clone_from(&term);
             terms.push(Fts5SegmentTerm { term, doclist });
         }
 
@@ -2030,7 +2030,7 @@ impl Iterator for Fts5SegmentTermCursor<'_> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fts5ShadowRows {
     pub data: Vec<Fts5DataRow>,
     pub idx: Vec<Fts5IdxRow>,
@@ -2039,7 +2039,7 @@ pub struct Fts5ShadowRows {
     pub docsize: Vec<Fts5DocsizeRow>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fts5ShadowOpenReport {
     pub metadata: Fts5ConfigMetadata,
     pub averages: Option<Fts5AveragesRecord>,
@@ -9197,7 +9197,7 @@ mod tests {
 
         assert_eq!(
             format!("{snapshot:#?}"),
-            r#"Fts5SegmentCodecStructure {
+            r"Fts5SegmentCodecStructure {
     idx_row: Fts5IdxRow {
         segid: 7,
         term: [
@@ -9391,7 +9391,7 @@ mod tests {
             true,
         ),
     ],
-}"#
+}"
         );
     }
 
@@ -9564,8 +9564,10 @@ mod tests {
         table.insert_document(7, &["rust fts".to_owned(), "rusty rust".to_owned()]);
 
         let pending = table.build_pending_hash().unwrap();
-        let mut metadata = Fts5ConfigMetadata::default();
-        metadata.hash_size = 64;
+        let metadata = Fts5ConfigMetadata {
+            hash_size: 64,
+            ..Default::default()
+        };
         let flush = pending
             .flush_to_segment(4, Fts5StructureRecord::empty_legacy(0))
             .unwrap();
@@ -9607,7 +9609,7 @@ mod tests {
 
         assert_eq!(
             format!("{snapshot:#?}"),
-            r#"Fts5PendingFlushStructure {
+            r"Fts5PendingFlushStructure {
     term_count: 5,
     pending_bytes: 224,
     should_flush: true,
@@ -9695,7 +9697,7 @@ mod tests {
             merge_inputs: 4,
         },
     ),
-}"#
+}"
         );
     }
 
@@ -9743,7 +9745,7 @@ mod tests {
 
         assert_eq!(
             format!("{snapshot:#?}"),
-            r#"Fts5ShadowWriteHotspotProfileStructure {
+            r"Fts5ShadowWriteHotspotProfileStructure {
     flush_profile: Fts5ShadowWriteHotspotProfile {
         data_row_writes: 2,
         idx_row_writes: 0,
@@ -9826,7 +9828,7 @@ mod tests {
         ],
         mitigation: AppendOnlyRowsBeforeBatchedHotWrites,
     },
-}"#
+}"
         );
     }
 
@@ -9918,7 +9920,7 @@ mod tests {
 
         assert_eq!(
             format!("{snapshot:#?}"),
-            r#"Fts5SegmentReaderStructure {
+            r"Fts5SegmentReaderStructure {
     cursor_terms: [
         [
             98,
@@ -9983,7 +9985,7 @@ mod tests {
         term_count: 4,
         checksum: 3861481483356166922,
     },
-}"#
+}"
         );
     }
 
@@ -10292,7 +10294,7 @@ mod tests {
 
         assert_eq!(
             format!("{snapshot:#?}"),
-            r#"Fts5ShadowOpenStructure {
+            r"Fts5ShadowOpenStructure {
     report: Fts5ShadowOpenReport {
         metadata: Fts5ConfigMetadata {
             format_version: 4,
@@ -10357,7 +10359,7 @@ mod tests {
     },
     table_empty: true,
     next_rowid: 5,
-}"#
+}"
         );
     }
 

@@ -5410,7 +5410,7 @@ enum CompiledRecordWritePlan<'a> {
         header: &'a fsqlite_types::record::PrecomputedRecordHeader,
         exact_size: usize,
     },
-    Generic(fsqlite_types::record::PlannedRecordSerialization<'a>),
+    Generic(Box<fsqlite_types::record::PlannedRecordSerialization<'a>>),
 }
 
 impl CompiledRecordWritePlan<'_> {
@@ -5428,7 +5428,7 @@ impl CompiledRecordWritePlan<'_> {
             Self::PrecomputedHeader { values, header, .. } => {
                 serialize_record_iter_with_precomputed_header_into_slice(values.iter(), header, dst)
             }
-            Self::Generic(plan) => plan.write_into_slice(dst),
+            Self::Generic(plan) => (*plan).write_into_slice(dst),
         }
     }
 }
@@ -5448,8 +5448,8 @@ fn build_compiled_record_write_plan<'a>(
         };
     }
 
-    CompiledRecordWritePlan::Generic(fsqlite_types::record::plan_record_iter_serialization(
-        values.iter(),
+    CompiledRecordWritePlan::Generic(Box::new(
+        fsqlite_types::record::plan_record_iter_serialization(values.iter()),
     ))
 }
 

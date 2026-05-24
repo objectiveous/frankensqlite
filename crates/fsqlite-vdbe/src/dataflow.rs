@@ -1,5 +1,6 @@
 //! Weighted-row dataflow substrate for Bloodstream VDBE automata.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -501,7 +502,7 @@ impl DataflowOperator {
                 key_columns,
                 value_column,
             } => average_integer_by_key(rows, key_columns, *value_column),
-            Self::ConsolidateRows => Ok(consolidate_rows(rows.iter().cloned().collect())),
+            Self::ConsolidateRows => Ok(consolidate_rows(rows.to_vec())),
             Self::ConsolidateWeightSigns => Ok(consolidate_weight_signs(rows)),
             Self::ScaleWeight { factor } => Ok(scale_weights(rows, *factor)),
             Self::NegateWeight => Ok(negate_weights(rows)),
@@ -1451,6 +1452,9 @@ fn integer_value_at(row: &WeightedRow, value_column: usize) -> DataflowResult<i6
     }
 }
 
+// `SqliteValue::Text` may carry a lazy sharing cache, but row-key ordering is
+// derived from stable SQLite value content.
+#[allow(clippy::mutable_key_type)]
 fn index_weighted_rows<'a>(
     rows: &'a [WeightedRow],
     key_columns: &[usize],
@@ -1517,12 +1521,10 @@ pub fn negate_weights(rows: &[WeightedRow]) -> Vec<WeightedRow> {
 pub fn normalize_weight_sign(rows: &[WeightedRow]) -> Vec<WeightedRow> {
     rows.iter()
         .filter_map(|row| {
-            let weight = if row.weight > 0 {
-                1
-            } else if row.weight < 0 {
-                -1
-            } else {
-                return None;
+            let weight = match row.weight.cmp(&0) {
+                Ordering::Greater => 1,
+                Ordering::Less => -1,
+                Ordering::Equal => return None,
             };
             Some(WeightedRow::new(row.values.clone(), weight))
         })
@@ -1588,7 +1590,8 @@ pub fn set_weights(rows: &[WeightedRow], weight: i64) -> Vec<WeightedRow> {
     }
 
     rows.iter()
-        .filter_map(|row| (!row.is_zero()).then(|| WeightedRow::new(row.values.clone(), weight)))
+        .filter(|row| !row.is_zero())
+        .map(|row| WeightedRow::new(row.values.clone(), weight))
         .collect()
 }
 
@@ -1645,6 +1648,7 @@ fn weight_magnitude(weight: i64) -> i64 {
 }
 
 /// Compute `DeltaLeft JOIN Right`, preserving algebraic weights.
+#[allow(clippy::mutable_key_type)]
 pub fn delta_join_left(
     delta_left: &[WeightedRow],
     stable_right: &[WeightedRow],
@@ -1682,6 +1686,7 @@ pub fn delta_join_left(
 }
 
 /// Compute `Left JOIN DeltaRight`, preserving algebraic weights.
+#[allow(clippy::mutable_key_type)]
 pub fn delta_join_right(
     stable_left: &[WeightedRow],
     delta_right: &[WeightedRow],

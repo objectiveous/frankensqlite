@@ -12,6 +12,32 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-24 - VDBE `Opcode::Not` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_not` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, which isolates repeated
+  boolean `Not` projections over a stable non-NULL integer probe.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed the existing
+  `Opcode::Not` arm from `try_execute_hot_opcode`, sending `Not` back through
+  the main interpreter match. The source patch was unwound after measurement.
+- Evidence:
+  baseline command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-not-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_not/' --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=837.52 ns`, `256=3.1548 us`, `1024=13.531 us`.
+  Candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-not-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_not/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=814.54 ns`, `256=3.1885 us`, `1024=14.159 us`.
+- Result: rejected. Removing the hot arm improved the 64-op stream, but
+  regressed the 256-op and 1024-op streams, so it failed the all-sizes keep
+  gate for hot-prefilter contraction.
+- Do not retry `Opcode::Not` hot-dispatch removal as a standalone patch.
+  Reconsider only if a broader hot-prefilter compaction pass measures real SQL
+  instruction-cache or binary-size wins and also preserves the focused
+  `vdbe_pipeline_execute_not` matrix.
+
 ## 2026-05-24 - VDBE `Opcode::IfNot` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_ifnot` in

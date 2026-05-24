@@ -12439,6 +12439,10 @@ impl VdbeEngine {
                 *pc = op.p2 as usize;
                 Ok(true)
             }
+            Opcode::Noop => {
+                *pc += 1;
+                Ok(true)
+            }
             Opcode::Null => {
                 // p2 = target register, p3 = end register (if range fill)
                 let target = op.p2;

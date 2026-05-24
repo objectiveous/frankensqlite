@@ -133,6 +133,8 @@ pub struct SwarmSloGovernorInput {
     pub artifact_path: Option<String>,
     /// Optional artifact hash for replay-derived input.
     pub artifact_hash: Option<String>,
+    /// First replay or live diagnostic, or `none` when absent.
+    pub first_failure_diag: String,
     /// Sample timestamp in milliseconds since caller-defined epoch.
     pub sample_ts_ms: u64,
     /// Sample age in milliseconds.
@@ -249,6 +251,7 @@ impl SwarmSloGovernorInput {
                     .to_owned(),
             ),
             artifact_hash: None,
+            first_failure_diag: "none".to_owned(),
             sample_ts_ms: 0,
             sample_age_ms: 0,
             sample_window_ms: 1_000,

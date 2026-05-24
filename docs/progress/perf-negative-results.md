@@ -12,6 +12,35 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-24 - VDBE `Opcode::IfNot` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_ifnot` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, which isolates repeated
+  falsy `IfNot` branches over a stable integer probe. The benchmark jumps to
+  the immediately-next instruction so each opcode executes the taken branch body
+  without changing straight-line control flow.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed the existing
+  `Opcode::IfNot` arm from `try_execute_hot_opcode`, sending `IfNot` back
+  through the main interpreter match. The source patch was unwound after
+  measurement.
+- Evidence:
+  baseline command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-ifnot-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_ifnot/' --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=497.37 ns`, `256=1.7818 us`, `1024=7.5362 us`.
+  Candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-ifnot-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_ifnot/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=516.42 ns`, `256=1.7677 us`, `1024=9.2197 us`.
+- Result: rejected. Removing the hot arm slightly improved the 256-op stream,
+  but regressed the 64-op stream by about 4% and the 1024-op stream by about
+  22%, so it failed the all-sizes keep gate for hot-prefilter contraction.
+- Do not retry `Opcode::IfNot` hot-dispatch removal as a standalone patch.
+  Reconsider only if a broader hot-prefilter compaction pass measures real SQL
+  instruction-cache or binary-size wins and also preserves the focused
+  `vdbe_pipeline_execute_ifnot` matrix.
+
 ## 2026-05-24 - VDBE `Opcode::If` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_if` in

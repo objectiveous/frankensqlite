@@ -12579,7 +12579,12 @@ impl VdbeEngine {
             // Keeping the loop form preserves semantics for the rare range
             // copies while leaving the single-reg case a straight line.
             Opcode::Copy => {
-                self.copy_reg_range(op.p1, op.p2, op.p3);
+                if op.p3 == 0 {
+                    let value = self.clone_reg_materialized(op.p1);
+                    self.set_reg_fast(op.p2, value);
+                } else {
+                    self.copy_reg_range(op.p1, op.p2, op.p3);
+                }
                 *pc += 1;
                 Ok(true)
             }

@@ -12588,6 +12588,12 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            Opcode::IntCopy => {
+                let val = self.get_reg(op.p1).to_integer();
+                self.set_reg_int(op.p2, val);
+                *pc += 1;
+                Ok(true)
+            }
             // Move is emitted for register handoff where the source range is
             // drained. The common p3=1 case skips the range helper's loop and
             // overlap checks; multi-register moves still delegate to

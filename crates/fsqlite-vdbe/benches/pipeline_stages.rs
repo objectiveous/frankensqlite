@@ -431,6 +431,27 @@ fn build_execute_stage_scopy_program(op_repeats: usize) -> VdbeProgram {
 }
 
 /// Build a dispatch-dominated program whose inner loop is a stream of
+/// `IntCopy` ops. The source register holds a `Real`, so every iteration
+/// exercises the opcode's integer coercion body instead of degenerating into a
+/// plain integer copy.
+fn build_execute_stage_intcopy_program(op_repeats: usize) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    let end = builder.emit_label();
+    builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+    let src = builder.alloc_reg();
+    let dst = builder.alloc_reg();
+    builder.emit_op(Opcode::Real, 0, src, 0, P4::Real(42.75), 0);
+    for _ in 0..op_repeats {
+        builder.emit_op(Opcode::IntCopy, src, dst, 0, P4::None, 0);
+    }
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder.resolve_label(end);
+    builder
+        .finish()
+        .expect("pipeline execute intcopy benchmark program should build")
+}
+
+/// Build a dispatch-dominated program whose inner loop is a stream of
 /// single-register `Move` ops. Unlike `Copy`/`SCopy`, `Move` drains the source
 /// register, so the benchmark alternates direction between two registers to
 /// keep every iteration on the non-empty transfer path.
@@ -1402,6 +1423,39 @@ fn bench_vdbe_execute_scopy_stage(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_vdbe_execute_intcopy_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_intcopy");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let program = build_execute_stage_intcopy_program(op_repeats);
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &program,
+            |b, program| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute intcopy benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_vdbe_execute_move_stage(c: &mut Criterion) {
     set_vdbe_jit_enabled(false);
     let mut group = c.benchmark_group("vdbe_pipeline_execute_move");
@@ -1961,6 +2015,7 @@ criterion_group!(
     bench_vdbe_execute_variable_stage,
     bench_vdbe_execute_copy_stage,
     bench_vdbe_execute_scopy_stage,
+    bench_vdbe_execute_intcopy_stage,
     bench_vdbe_execute_move_stage,
     bench_vdbe_execute_decrjumpzero_stage,
     bench_vdbe_execute_ifpos_stage,

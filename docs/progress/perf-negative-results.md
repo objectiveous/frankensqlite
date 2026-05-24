@@ -12,6 +12,32 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-24 - VDBE `Opcode::Divide` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_divide` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, which isolates repeated
+  integer division over stable source registers and a stable output register.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed the existing
+  `Opcode::Divide` arm from `try_execute_hot_opcode`, sending division back
+  through the main interpreter match. The source patch was unwound after
+  measurement.
+- Evidence:
+  baseline command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-divide-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_divide/' --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=1.3575 us`, `256=4.8154 us`, `1024=18.197 us`.
+  Candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-divide-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_divide/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=1.3604 us`, `256=5.1837 us`, `1024=19.574 us`.
+- Result: rejected. Removing the hot arm regressed every measured stream, so it
+  failed the all-sizes keep gate for hot-prefilter contraction.
+- Do not retry `Opcode::Divide` hot-dispatch removal as a standalone patch.
+  Reconsider only if a broader hot-prefilter compaction pass measures real SQL
+  instruction-cache or binary-size wins and also preserves the focused
+  `vdbe_pipeline_execute_divide` matrix.
+
 ## 2026-05-24 - VDBE `Opcode::Multiply` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_multiply` in

@@ -100,7 +100,7 @@ INSERT INTO docs VALUES (1, '{"name":"Ada","age":37}');"#;
         r#"SELECT json_extract('{"a":[1,2],"b":{"c":3}}', '$.a[0]', '$.b.c', '$.missing')"#,
         r#"SELECT json_type('{"a":[1,null,"x"]}', '$.a[1]'), json_type('{"a":[1,null,"x"]}', '$.a[2]')"#,
         r#"SELECT json_array_length('{"a":[1,2,3],"b":4}', '$.a'), json_array_length('{"a":[1,2,3],"b":4}', '$.b')"#,
-        r#"SELECT doc -> '$.name', doc ->> '$.age' FROM docs WHERE id = 1"#,
+        r"SELECT doc -> '$.name', doc ->> '$.age' FROM docs WHERE id = 1",
     ];
     for sql in cases {
         assert_query_matches(&fconn, &rconn, sql);

@@ -12605,11 +12605,8 @@ impl VdbeEngine {
             // main-match arm.
             Opcode::Move => {
                 if op.p3 == 1 {
-                    let value = Self::reg_with_offset(op.p1, 0)
-                        .map_or_else(|| SqliteValue::Null, |reg| self.take_reg(reg));
-                    if let Some(dst) = Self::reg_with_offset(op.p2, 0) {
-                        self.set_reg_fast(dst, value);
-                    }
+                    let value = self.take_reg(op.p1);
+                    self.set_reg_fast(op.p2, value);
                 } else {
                     let count = usize::try_from(op.p3).unwrap_or(0);
                     self.move_reg_range(op.p1, op.p2, count);

@@ -12,6 +12,48 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-24 - VDBE shift opcode direct integer writes
+
+- Target: `vdbe_pipeline_execute_shiftleft` and
+  `vdbe_pipeline_execute_shiftright` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, which isolate repeated
+  `ShiftLeft`/`ShiftRight` integer operations over stable source registers.
+- Touched during rejected candidates: `crates/fsqlite-vdbe/src/engine.rs`.
+  The first candidate changed both private shift helpers to return `i64`
+  instead of `SqliteValue::Integer(...)` and wrote both opcode results through
+  `set_reg_int`. The narrowed candidate kept only the `ShiftLeft` direct
+  integer write and wrapped `ShiftRight` back into `SqliteValue::Integer`
+  before `set_reg_fast`. Both source patches were unwound after measurement.
+- Evidence:
+  baseline command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-shift-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_shift --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `shiftleft 64=992.81 ns`, `shiftleft 256=3.3690 us`,
+  `shiftleft 1024=13.388 us`, `shiftright 64=963.12 ns`,
+  `shiftright 256=3.6059 us`, `shiftright 1024=13.462 us`.
+  Full candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-shift-candidate-remote2 cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_shift --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `shiftleft 64=790.33 ns`, `shiftleft 256=3.2440 us`,
+  `shiftleft 1024=12.839 us`, `shiftright 64=1.0257 us`,
+  `shiftright 256=3.1475 us`, `shiftright 1024=13.450 us`.
+  Narrowed candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-shift-left-only cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_shift --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `shiftleft 64=865.52 ns`, `shiftleft 256=3.6001 us`,
+  `shiftleft 1024=13.565 us`, `shiftright 64=963.57 ns`,
+  `shiftright 256=3.6430 us`, `shiftright 1024=14.468 us`.
+  An intermediate full-candidate command without `RCH_REQUIRE_REMOTE=1` fell
+  back to local execution after an rsync disconnect and was ignored for the
+  keep/reject decision.
+- Result: rejected. The full candidate improved the left-shift matrix and
+  larger right-shift streams, but regressed `shiftright/64`. The narrowed
+  left-only candidate preserved `shiftright/64` but regressed the 256-op and
+  1024-op streams, so neither variant cleared the all-sizes keep gate.
+- Do not retry direct `set_reg_int` writes for `ShiftLeft`/`ShiftRight` as a
+  standalone patch. Reconsider only after a broader interpreter/register-write
+  layout change, and require same-worker A/B runs for both shift groups.
+
 ## 2026-05-24 - VDBE `Opcode::SCopy` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_scopy` in

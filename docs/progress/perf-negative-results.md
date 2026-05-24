@@ -12,6 +12,34 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-24 - VDBE `Opcode::BitOr` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_bitor` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, which isolates repeated
+  integer bitwise-OR operations over stable non-NULL integer inputs and a stable
+  output register.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed the existing
+  `Opcode::BitOr` arm from `try_execute_hot_opcode`, sending bitwise-OR back
+  through the main interpreter match. The source patch was unwound after
+  measurement.
+- Evidence:
+  baseline command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-bitor-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_bitor/' --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=855.87 ns`, `256=3.2935 us`, `1024=12.483 us`.
+  Candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-bitor-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_bitor/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=955.89 ns`, `256=3.0145 us`, `1024=13.506 us`.
+- Result: rejected. Removing the hot arm improved the 256-op stream, but
+  regressed the 64-op and 1024-op streams, so it failed the all-sizes keep gate
+  for hot-prefilter contraction.
+- Do not retry `Opcode::BitOr` hot-dispatch removal as a standalone patch.
+  Reconsider only if a broader hot-prefilter compaction pass measures real SQL
+  instruction-cache or binary-size wins and also preserves the focused
+  `vdbe_pipeline_execute_bitor` matrix.
+
 ## 2026-05-24 - VDBE `Opcode::BitAnd` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_bitand` in

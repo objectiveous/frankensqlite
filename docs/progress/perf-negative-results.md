@@ -12,6 +12,34 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-24 - VDBE `Opcode::Remainder` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_remainder` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, which isolates repeated
+  integer remainder operations over stable source registers and a stable output
+  register.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed the existing
+  `Opcode::Remainder` arm from `try_execute_hot_opcode`, sending remainder
+  back through the main interpreter match. The source patch was unwound after
+  measurement.
+- Evidence:
+  baseline command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-remainder-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_remainder/' --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=1.0869 us`, `256=4.3797 us`, `1024=15.593 us`.
+  Candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-remainder-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_remainder/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=1.2100 us`, `256=4.2687 us`, `1024=17.960 us`.
+- Result: rejected. Removing the hot arm improved the 256-op stream, but
+  regressed the 64-op and 1024-op streams, so it failed the all-sizes keep gate
+  for hot-prefilter contraction.
+- Do not retry `Opcode::Remainder` hot-dispatch removal as a standalone patch.
+  Reconsider only if a broader hot-prefilter compaction pass measures real SQL
+  instruction-cache or binary-size wins and also preserves the focused
+  `vdbe_pipeline_execute_remainder` matrix.
+
 ## 2026-05-24 - VDBE `Opcode::Divide` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_divide` in

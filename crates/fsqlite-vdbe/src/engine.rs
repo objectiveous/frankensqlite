@@ -12738,6 +12738,21 @@ impl VdbeEngine {
                 }
                 Ok(true)
             }
+            Opcode::IsTrue => {
+                let val = self.get_reg(op.p1);
+                let p4_val = match &op.p4 {
+                    P4::Int(n) => *n,
+                    _ => 0,
+                };
+                if val.is_null() {
+                    self.set_reg(op.p2, SqliteValue::Integer(i64::from(op.p3 ^ p4_val)));
+                } else {
+                    let v = i32::from(vdbe_real_is_truthy(val));
+                    self.set_reg(op.p2, SqliteValue::Integer(i64::from((v ^ p4_val) & 1)));
+                }
+                *pc += 1;
+                Ok(true)
+            }
             // Not is a compact expression-evaluation opcode: read p1, apply
             // SQLite truthiness, and write a boolean/null result into p2. Keep
             // the body byte-equivalent to the main-match arm while avoiding

@@ -96,6 +96,31 @@ fn build_execute_stage_blob_program(op_repeats: usize) -> VdbeProgram {
         .expect("pipeline execute blob benchmark program should build")
 }
 
+/// Build a dispatch-dominated program whose inner loop is a stream of `String`
+/// constant loads. `String8` is already hot-dispatched, but `String` takes the
+/// same write-text body through the cold match and needs separate evidence.
+fn build_execute_stage_string_program(op_repeats: usize) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    let end = builder.emit_label();
+    builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+    let target = builder.alloc_reg();
+    for _ in 0..op_repeats {
+        builder.emit_op(
+            Opcode::String,
+            18,
+            target,
+            0,
+            P4::Str("fsqlite-string-hot".to_owned()),
+            0,
+        );
+    }
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder.resolve_label(end);
+    builder
+        .finish()
+        .expect("pipeline execute string benchmark program should build")
+}
+
 /// Build a dispatch-dominated program whose inner loop is a stream of
 /// `SoftNull` register writes. `SoftNull` writes through p1 rather than p2, so
 /// it needs separate coverage from `Null` before any hot-dispatch decision.
@@ -872,6 +897,39 @@ fn bench_vdbe_execute_blob_stage(c: &mut Criterion) {
                     let outcome = engine
                         .execute(program)
                         .expect("pipeline execute blob benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_vdbe_execute_string_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_string");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let program = build_execute_stage_string_program(op_repeats);
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &program,
+            |b, program| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute string benchmark should execute");
                     black_box(outcome);
                 });
             },
@@ -1888,6 +1946,7 @@ criterion_group!(
     bench_vdbe_execute_stage,
     bench_vdbe_execute_int64_stage,
     bench_vdbe_execute_blob_stage,
+    bench_vdbe_execute_string_stage,
     bench_vdbe_execute_softnull_stage,
     bench_vdbe_execute_add_stage,
     bench_vdbe_execute_subtract_stage,

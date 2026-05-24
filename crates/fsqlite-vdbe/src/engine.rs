@@ -12945,6 +12945,14 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            Opcode::String => {
+                match &op.p4 {
+                    P4::Str(s) => self.write_text_to_reg(op.p2, s),
+                    _ => self.set_reg_fast(op.p2, SqliteValue::Text(SmallText::new(""))),
+                }
+                *pc += 1;
+                Ok(true)
+            }
             Opcode::Real => {
                 let val = match &op.p4 {
                     P4::Real(v) => *v,

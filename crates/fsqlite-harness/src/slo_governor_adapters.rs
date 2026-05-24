@@ -7,23 +7,32 @@
 
 #![allow(clippy::struct_excessive_bools)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::agent_swarm_trace::{
-    AgentSwarmEvidenceManifest, AgentSwarmReplayBackend, AgentSwarmReplayReport,
-    AgentSwarmReplaySchedule, AgentSwarmResourceProfileId, AgentSwarmResourceScorecard,
-    AgentSwarmStatementReplay,
+    AgentSwarmBackendResourceScorecard, AgentSwarmBackendSummary, AgentSwarmEvidenceManifest,
+    AgentSwarmReplayBackend, AgentSwarmReplayReport, AgentSwarmReplaySchedule,
+    AgentSwarmResourceProfileId, AgentSwarmResourceScorecard, AgentSwarmStatementReplay,
 };
 use crate::slo_governor::{
-    SwarmSloControlMode, SwarmSloDegradedSignal, SwarmSloGcTier, SwarmSloGovernorInput,
-    SwarmSloSampleSource,
+    SWARM_SLO_POLICY_ID, SwarmSloAction, SwarmSloControlMode, SwarmSloDegradedSignal,
+    SwarmSloFallbackPathRisk, SwarmSloGcTier, SwarmSloGovernorConfig, SwarmSloGovernorInput,
+    SwarmSloGovernorState, SwarmSloOperatorBudget, SwarmSloOperatorReport, SwarmSloSampleSource,
+    build_swarm_slo_operator_report, evaluate_swarm_slo,
 };
 
 /// Owning bead for the replay/live signal adapter slice.
 pub const SWARM_SLO_ADAPTER_BEAD_ID: &str = "bd-swarm-slo-resource-governor-qb256.4";
+/// Owning bead for replay/stress proof-pack artifacts.
+pub const SWARM_SLO_PROOF_PACK_BEAD_ID: &str = "bd-swarm-slo-resource-governor-qb256.6";
+/// Machine-readable schema version for SLO replay/stress proof packs.
+pub const SWARM_SLO_PROOF_PACK_SCHEMA_VERSION: u32 = 1;
+/// Stable proof-pack implementation version.
+pub const SWARM_SLO_PROOF_PACK_VERSION: &str = "swarm-slo-proof-pack.v1";
 
 /// Configuration applied while adapting deterministic replay scorecards.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +104,15 @@ pub enum SwarmSloAdapterError {
         /// Value from the resource scorecard.
         scorecard_value: String,
     },
+    /// Evidence manifest identity did not match the replay report.
+    MismatchedEvidenceManifestIdentity {
+        /// Identity field name.
+        field: &'static str,
+        /// Value from the replay report.
+        report_value: String,
+        /// Value from the evidence manifest.
+        manifest_value: String,
+    },
 }
 
 impl fmt::Display for SwarmSloAdapterError {
@@ -114,11 +132,150 @@ impl fmt::Display for SwarmSloAdapterError {
                 f,
                 "replay report {field}={report_value:?} does not match scorecard {field}={scorecard_value:?}",
             ),
+            Self::MismatchedEvidenceManifestIdentity {
+                field,
+                report_value,
+                manifest_value,
+            } => write!(
+                f,
+                "replay report {field}={report_value:?} does not match evidence manifest {field}={manifest_value:?}",
+            ),
         }
     }
 }
 
 impl std::error::Error for SwarmSloAdapterError {}
+
+/// Resource profile and replay commands attached to a proof pack.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmSloProofPackProfile {
+    /// Resource profile label.
+    pub profile_id: String,
+    /// Profile-visible CPU cores.
+    pub available_cores: u32,
+    /// Profile memory limit.
+    pub memory_limit_bytes: u64,
+    /// Profile page-cache limit.
+    pub page_cache_limit_bytes: u64,
+    /// Maximum statement count intended for local smoke runs.
+    pub local_statement_limit: usize,
+    /// One-command CI-sized smoke replay.
+    pub smoke_command: String,
+    /// CPU-heavy replay command that must be offloaded through `rch`.
+    pub heavy_rch_command: String,
+}
+
+/// Raw replay/scorecard metrics with the governor off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmSloGovernorOffMetrics {
+    /// Statements replayed on this backend.
+    pub statement_count: usize,
+    /// Transactions represented by the replay trace.
+    pub transaction_count: usize,
+    /// User-visible p50 in nanoseconds.
+    pub latency_p50_ns: u64,
+    /// User-visible p95 in nanoseconds.
+    pub latency_p95_ns: u64,
+    /// User-visible p99 in nanoseconds.
+    pub latency_p99_ns: u64,
+    /// Backend throughput in statements/second multiplied by 1000.
+    pub throughput_statements_per_second_x1000: u64,
+    /// Commit retry count.
+    pub retry_count: u64,
+    /// Retry rate in per-mille units.
+    pub retry_rate_per_mille: u64,
+    /// Abort/error count.
+    pub abort_count: usize,
+    /// Abort/error rate in per-mille units.
+    pub abort_rate_per_mille: u64,
+    /// Expected-result mismatches observed during replay.
+    pub expected_mismatch_count: usize,
+    /// Conflict/error classes observed during replay.
+    pub conflict_classes: BTreeMap<String, usize>,
+    /// Deterministic replay memory high-water estimate.
+    pub memory_high_water_bytes: u64,
+    /// Profile memory limit.
+    pub memory_limit_bytes: u64,
+    /// Profile page-cache footprint estimate.
+    pub page_cache_bytes: u64,
+    /// First failure diagnostic copied from the evidence bundle.
+    pub first_failure_diag: String,
+}
+
+/// Shadow-mode SLO governor decision attached to a proof row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmSloShadowProof {
+    /// Requested control mode.
+    pub control_mode: SwarmSloControlMode,
+    /// Matched guardrail.
+    pub guardrail_id: String,
+    /// Recommended shadow action.
+    pub action: SwarmSloAction,
+    /// Short action summary.
+    pub action_summary: String,
+    /// Fallback risk classification from operator output.
+    pub fallback_path_risk: SwarmSloFallbackPathRisk,
+    /// Operator budget rows.
+    pub budgets: Vec<SwarmSloOperatorBudget>,
+    /// Full deterministic operator report.
+    pub operator_report: SwarmSloOperatorReport,
+}
+
+/// One backend row in the replay/stress proof pack.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmSloProofPackBackend {
+    /// Backend role.
+    pub backend: AgentSwarmReplayBackend,
+    /// Whether this backend is the FrankenSQLite concurrent-writer default path.
+    pub concurrent_writer_default: bool,
+    /// Raw replay metrics with the governor off.
+    pub governor_off: SwarmSloGovernorOffMetrics,
+    /// Shadow decision, present only for the FrankenSQLite concurrent-default backend.
+    pub governor_shadow: Option<SwarmSloShadowProof>,
+    /// Why shadow policy was not evaluated for this backend.
+    pub shadow_skip_reason: Option<String>,
+}
+
+/// Machine-readable proof pack for SLO governor replay and stress evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmSloReplayStressProofPack {
+    /// Proof-pack schema version.
+    pub schema_version: u32,
+    /// Owning bead identifier.
+    pub bead_id: String,
+    /// Proof-pack implementation version.
+    pub proof_pack_version: String,
+    /// Stable hash of this proof pack.
+    pub proof_pack_hash: String,
+    /// Shadow policy version evaluated by this proof pack.
+    pub policy_id: String,
+    /// Trace identifier.
+    pub trace_id: String,
+    /// Run identifier.
+    pub run_id: String,
+    /// Scenario identifier.
+    pub scenario_id: String,
+    /// Replay seed.
+    pub replay_seed: u64,
+    /// Replay schedule fingerprint.
+    pub schedule_fingerprint: String,
+    /// Resource profile and replay commands.
+    pub profile: SwarmSloProofPackProfile,
+    /// Evidence manifest hash.
+    pub evidence_manifest_hash: String,
+    /// Full trace artifact path.
+    pub trace_artifact_path: String,
+    /// Full trace artifact hash.
+    pub trace_artifact_hash: String,
+    /// Replay command used to produce the evidence manifest.
+    pub replay_command: String,
+    /// First failure diagnostic for the proof pack.
+    pub first_failure_diag: String,
+    /// Backend proof rows.
+    pub backend_proofs: Vec<SwarmSloProofPackBackend>,
+    /// Guardrail against uncited performance claims.
+    pub measurement_guardrail: String,
+}
 
 /// Adapt a replay report plus resource scorecard into one governor input row.
 pub fn adapt_replay_scorecard_to_swarm_slo_input(
@@ -399,6 +556,103 @@ pub fn adapt_live_harness_sample_to_swarm_slo_input(
     }
 }
 
+/// Build a deterministic proof pack from replay, scorecard, and evidence-manifest artifacts.
+pub fn build_swarm_slo_replay_stress_proof_pack(
+    report: &AgentSwarmReplayReport,
+    scorecard: &AgentSwarmResourceScorecard,
+    manifest: &AgentSwarmEvidenceManifest,
+    adapter_config: &SwarmSloReplayAdapterConfig,
+    governor_config: &SwarmSloGovernorConfig,
+) -> Result<SwarmSloReplayStressProofPack, SwarmSloAdapterError> {
+    validate_replay_identity(report, scorecard)?;
+    validate_manifest_identity(report, manifest)?;
+
+    let backend_proofs = scorecard
+        .backends
+        .iter()
+        .map(|scorecard_backend| {
+            let replay_backend = report
+                .backends
+                .iter()
+                .find(|candidate| candidate.identity.backend == scorecard_backend.backend)
+                .ok_or(SwarmSloAdapterError::ReplayBackendMissing {
+                    backend: scorecard_backend.backend,
+                })?;
+            let governor_off = governor_off_metrics(
+                &replay_backend.summary,
+                scorecard_backend,
+                report.transaction_count,
+                &scorecard.first_failure_diag,
+            );
+            let (governor_shadow, shadow_skip_reason) = if scorecard_backend
+                .concurrent_writer_default
+            {
+                let input = adapt_replay_scorecard_to_swarm_slo_input(
+                    report,
+                    scorecard,
+                    scorecard_backend.backend,
+                    adapter_config,
+                )?;
+                let mut state = SwarmSloGovernorState::default();
+                let decision = evaluate_swarm_slo(&input, governor_config, &mut state);
+                let operator_report = build_swarm_slo_operator_report(&decision, governor_config);
+                (
+                    Some(SwarmSloShadowProof {
+                        control_mode: decision.control_mode,
+                        guardrail_id: decision.guardrail_id,
+                        action: decision.action,
+                        action_summary: operator_report.action_summary.clone(),
+                        fallback_path_risk: operator_report.fallback_path_risk,
+                        budgets: operator_report.budgets.clone(),
+                        operator_report,
+                    }),
+                    None,
+                )
+            } else {
+                (
+                    None,
+                    Some(
+                        "shadow governor is evaluated only for FrankenSQLite concurrent-default evidence"
+                            .to_owned(),
+                    ),
+                )
+            };
+
+            Ok(SwarmSloProofPackBackend {
+                backend: scorecard_backend.backend,
+                concurrent_writer_default: scorecard_backend.concurrent_writer_default,
+                governor_off,
+                governor_shadow,
+                shadow_skip_reason,
+            })
+        })
+        .collect::<Result<Vec<_>, SwarmSloAdapterError>>()?;
+
+    let mut proof_pack = SwarmSloReplayStressProofPack {
+        schema_version: SWARM_SLO_PROOF_PACK_SCHEMA_VERSION,
+        bead_id: SWARM_SLO_PROOF_PACK_BEAD_ID.to_owned(),
+        proof_pack_version: SWARM_SLO_PROOF_PACK_VERSION.to_owned(),
+        proof_pack_hash: String::new(),
+        policy_id: SWARM_SLO_POLICY_ID.to_owned(),
+        trace_id: report.trace_id.clone(),
+        run_id: report.run_id.clone(),
+        scenario_id: report.scenario_id.clone(),
+        replay_seed: report.seed,
+        schedule_fingerprint: replay_schedule_label(report.schedule).to_owned(),
+        profile: proof_pack_profile(report, scorecard),
+        evidence_manifest_hash: manifest.artifact_hash.clone(),
+        trace_artifact_path: manifest.trace_artifact_path.clone(),
+        trace_artifact_hash: manifest.trace_artifact_hash.clone(),
+        replay_command: manifest.replay_command.clone(),
+        first_failure_diag: scorecard.first_failure_diag.clone(),
+        backend_proofs,
+        measurement_guardrail: "This proof pack compares governor-off replay metrics with shadow governor decisions; README performance claims still require dated benchmark artifact paths and commits.".to_owned(),
+    };
+    proof_pack.proof_pack_hash = proof_pack_hash(&proof_pack);
+    log_swarm_slo_replay_stress_proof_pack(&proof_pack);
+    Ok(proof_pack)
+}
+
 fn validate_replay_identity(
     report: &AgentSwarmReplayReport,
     scorecard: &AgentSwarmResourceScorecard,
@@ -406,6 +660,15 @@ fn validate_replay_identity(
     replay_identity_field("run_id", &report.run_id, &scorecard.run_id)?;
     replay_identity_field("trace_id", &report.trace_id, &scorecard.trace_id)?;
     replay_identity_field("scenario_id", &report.scenario_id, &scorecard.scenario_id)
+}
+
+fn validate_manifest_identity(
+    report: &AgentSwarmReplayReport,
+    manifest: &AgentSwarmEvidenceManifest,
+) -> Result<(), SwarmSloAdapterError> {
+    manifest_identity_field("run_id", &report.run_id, &manifest.run_id)?;
+    manifest_identity_field("trace_id", &report.trace_id, &manifest.trace_id)?;
+    manifest_identity_field("scenario_id", &report.scenario_id, &manifest.scenario_id)
 }
 
 fn replay_identity_field(
@@ -421,6 +684,158 @@ fn replay_identity_field(
             report_value: report_value.to_owned(),
             scorecard_value: scorecard_value.to_owned(),
         })
+    }
+}
+
+fn manifest_identity_field(
+    field: &'static str,
+    report_value: &str,
+    manifest_value: &str,
+) -> Result<(), SwarmSloAdapterError> {
+    if report_value == manifest_value {
+        Ok(())
+    } else {
+        Err(SwarmSloAdapterError::MismatchedEvidenceManifestIdentity {
+            field,
+            report_value: report_value.to_owned(),
+            manifest_value: manifest_value.to_owned(),
+        })
+    }
+}
+
+fn proof_pack_profile(
+    report: &AgentSwarmReplayReport,
+    scorecard: &AgentSwarmResourceScorecard,
+) -> SwarmSloProofPackProfile {
+    SwarmSloProofPackProfile {
+        profile_id: resource_profile_id_label(scorecard.profile.profile_id).to_owned(),
+        available_cores: scorecard.profile.core_count,
+        memory_limit_bytes: scorecard.profile.memory_limit_bytes,
+        page_cache_limit_bytes: scorecard.profile.page_cache_limit_bytes,
+        local_statement_limit: scorecard.profile.local_statement_limit,
+        smoke_command: report.commands.smoke_command.clone(),
+        heavy_rch_command: scorecard.profile.heavy_rch_command.clone(),
+    }
+}
+
+fn governor_off_metrics(
+    summary: &AgentSwarmBackendSummary,
+    scorecard: &AgentSwarmBackendResourceScorecard,
+    transaction_count: usize,
+    first_failure_diag: &str,
+) -> SwarmSloGovernorOffMetrics {
+    SwarmSloGovernorOffMetrics {
+        statement_count: summary.statements_total,
+        transaction_count,
+        latency_p50_ns: summary.latency_p50_ns,
+        latency_p95_ns: summary.latency_p95_ns,
+        latency_p99_ns: summary.latency_p99_ns,
+        throughput_statements_per_second_x1000: summary.throughput_statements_per_second_x1000,
+        retry_count: summary.retry_count,
+        retry_rate_per_mille: scorecard.retry_rate_per_mille,
+        abort_count: summary.abort_count,
+        abort_rate_per_mille: scorecard.abort_rate_per_mille,
+        expected_mismatch_count: summary.expected_mismatch_count,
+        conflict_classes: summary.conflict_classes.clone(),
+        memory_high_water_bytes: scorecard.memory_high_water_bytes,
+        memory_limit_bytes: scorecard.memory_limit_bytes,
+        page_cache_bytes: scorecard.page_cache_footprint_bytes,
+        first_failure_diag: first_failure_diag.to_owned(),
+    }
+}
+
+fn proof_pack_hash(proof_pack: &SwarmSloReplayStressProofPack) -> String {
+    #[derive(Serialize)]
+    struct ProofPackDigest<'a> {
+        schema_version: u32,
+        bead_id: &'a str,
+        proof_pack_version: &'a str,
+        policy_id: &'a str,
+        trace_id: &'a str,
+        run_id: &'a str,
+        scenario_id: &'a str,
+        replay_seed: u64,
+        schedule_fingerprint: &'a str,
+        profile: &'a SwarmSloProofPackProfile,
+        evidence_manifest_hash: &'a str,
+        trace_artifact_path: &'a str,
+        trace_artifact_hash: &'a str,
+        replay_command: &'a str,
+        first_failure_diag: &'a str,
+        backend_proofs: &'a [SwarmSloProofPackBackend],
+        measurement_guardrail: &'a str,
+    }
+
+    stable_json_hash(&ProofPackDigest {
+        schema_version: proof_pack.schema_version,
+        bead_id: &proof_pack.bead_id,
+        proof_pack_version: &proof_pack.proof_pack_version,
+        policy_id: &proof_pack.policy_id,
+        trace_id: &proof_pack.trace_id,
+        run_id: &proof_pack.run_id,
+        scenario_id: &proof_pack.scenario_id,
+        replay_seed: proof_pack.replay_seed,
+        schedule_fingerprint: &proof_pack.schedule_fingerprint,
+        profile: &proof_pack.profile,
+        evidence_manifest_hash: &proof_pack.evidence_manifest_hash,
+        trace_artifact_path: &proof_pack.trace_artifact_path,
+        trace_artifact_hash: &proof_pack.trace_artifact_hash,
+        replay_command: &proof_pack.replay_command,
+        first_failure_diag: &proof_pack.first_failure_diag,
+        backend_proofs: &proof_pack.backend_proofs,
+        measurement_guardrail: &proof_pack.measurement_guardrail,
+    })
+}
+
+fn stable_json_hash<T>(value: &T) -> String
+where
+    T: Serialize,
+{
+    serde_json::to_vec(value).map_or_else(
+        |error| sha256_hex(error.to_string().as_bytes()),
+        |bytes| sha256_hex(&bytes),
+    )
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn log_swarm_slo_replay_stress_proof_pack(proof_pack: &SwarmSloReplayStressProofPack) {
+    for backend in &proof_pack.backend_proofs {
+        let (shadow_guardrail, shadow_action) = backend.governor_shadow.as_ref().map_or_else(
+            || ("not_applicable".to_owned(), "not_applicable".to_owned()),
+            |shadow| (shadow.guardrail_id.clone(), format!("{:?}", shadow.action)),
+        );
+        tracing::info!(
+            target: "fsqlite.slo_governor.proof_pack",
+            trace_id = %proof_pack.trace_id,
+            run_id = %proof_pack.run_id,
+            scenario_id = %proof_pack.scenario_id,
+            proof_pack_hash = %proof_pack.proof_pack_hash,
+            backend = backend.backend.as_str(),
+            profile_id = %proof_pack.profile.profile_id,
+            p50_ns = backend.governor_off.latency_p50_ns,
+            p95_ns = backend.governor_off.latency_p95_ns,
+            p99_ns = backend.governor_off.latency_p99_ns,
+            throughput_statements_per_second_x1000 = backend.governor_off.throughput_statements_per_second_x1000,
+            retry_count = backend.governor_off.retry_count,
+            retry_rate_per_mille = backend.governor_off.retry_rate_per_mille,
+            abort_count = backend.governor_off.abort_count,
+            abort_rate_per_mille = backend.governor_off.abort_rate_per_mille,
+            memory_high_water_bytes = backend.governor_off.memory_high_water_bytes,
+            governor_shadow_guardrail = %shadow_guardrail,
+            governor_shadow_action = %shadow_action,
+            first_failure_diag = %backend.governor_off.first_failure_diag,
+            heavy_rch_command = %proof_pack.profile.heavy_rch_command,
+            "swarm slo replay stress proof pack",
+        );
     }
 }
 
@@ -623,6 +1038,165 @@ mod tests {
                 backend: AgentSwarmReplayBackend::CSqliteOracle,
             },
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn replay_stress_proof_pack_compares_off_metrics_with_shadow_decision()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let trace = load_agent_swarm_trace_json(GOLDEN_TRACE_JSON)?;
+        let replay_config = AgentSwarmReplayConfig::smoke(0x5EED_5EED);
+        let report = replay_agent_swarm_trace(&trace, &replay_config)?;
+        let scorecard_config = AgentSwarmResourceScorecardConfig::new(
+            AgentSwarmResourceProfile::high_capacity_server(),
+        );
+        let scorecard = score_agent_swarm_resource_envelope(&report, &scorecard_config);
+        let manifest_config = AgentSwarmEvidenceManifestConfig::new(
+            GOLDEN_TRACE_PATH,
+            replay_config.commands.smoke_command.clone(),
+        )
+        .without_regression_proposals();
+        let manifest = build_agent_swarm_evidence_manifest(&report, &manifest_config);
+        let adapter_config = SwarmSloReplayAdapterConfig {
+            sample_ts_ms: 1_779_543_600_000,
+            sample_age_ms: 0,
+            configured_helper_threads: 4,
+            active_helper_threads: 2,
+            evidence_worker_count: 1,
+            ..SwarmSloReplayAdapterConfig::default()
+        }
+        .with_evidence_manifest(&manifest);
+
+        let proof_pack = build_swarm_slo_replay_stress_proof_pack(
+            &report,
+            &scorecard,
+            &manifest,
+            &adapter_config,
+            &SwarmSloGovernorConfig::default(),
+        )?;
+
+        assert_eq!(
+            proof_pack.schema_version,
+            SWARM_SLO_PROOF_PACK_SCHEMA_VERSION
+        );
+        assert_eq!(proof_pack.bead_id, SWARM_SLO_PROOF_PACK_BEAD_ID);
+        assert_eq!(proof_pack.policy_id, SWARM_SLO_POLICY_ID);
+        assert_eq!(proof_pack.profile.available_cores, 64);
+        assert_eq!(
+            proof_pack.profile.memory_limit_bytes,
+            256 * 1024 * 1024 * 1024
+        );
+        assert!(proof_pack.profile.smoke_command.contains("cargo test"));
+        assert!(proof_pack.profile.heavy_rch_command.contains("rch exec"));
+        assert_eq!(proof_pack.backend_proofs.len(), 2);
+        assert_eq!(proof_pack.proof_pack_hash.len(), 64);
+        assert!(
+            proof_pack
+                .proof_pack_hash
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit())
+        );
+
+        let subject_report = report
+            .backends
+            .iter()
+            .find(|backend| {
+                backend.identity.backend == AgentSwarmReplayBackend::FrankenSqliteConcurrent
+            })
+            .ok_or_else(|| std::io::Error::other("missing subject report"))?;
+        let subject_scorecard = scorecard
+            .backends
+            .iter()
+            .find(|backend| backend.backend == AgentSwarmReplayBackend::FrankenSqliteConcurrent)
+            .ok_or_else(|| std::io::Error::other("missing subject scorecard"))?;
+        let subject_proof = proof_pack
+            .backend_proofs
+            .iter()
+            .find(|proof| proof.backend == AgentSwarmReplayBackend::FrankenSqliteConcurrent)
+            .ok_or_else(|| std::io::Error::other("missing subject proof"))?;
+
+        assert!(subject_proof.concurrent_writer_default);
+        assert_eq!(
+            subject_proof.governor_off.statement_count,
+            subject_report.summary.statements_total
+        );
+        assert_eq!(
+            subject_proof.governor_off.latency_p50_ns,
+            subject_report.summary.latency_p50_ns
+        );
+        assert_eq!(
+            subject_proof.governor_off.latency_p95_ns,
+            subject_report.summary.latency_p95_ns
+        );
+        assert_eq!(
+            subject_proof.governor_off.latency_p99_ns,
+            subject_report.summary.latency_p99_ns
+        );
+        assert_eq!(
+            subject_proof
+                .governor_off
+                .throughput_statements_per_second_x1000,
+            subject_report
+                .summary
+                .throughput_statements_per_second_x1000
+        );
+        assert_eq!(
+            subject_proof.governor_off.retry_rate_per_mille,
+            subject_scorecard.retry_rate_per_mille
+        );
+        assert_eq!(
+            subject_proof.governor_off.abort_rate_per_mille,
+            subject_scorecard.abort_rate_per_mille
+        );
+        assert_eq!(
+            subject_proof.governor_off.memory_high_water_bytes,
+            subject_scorecard.memory_high_water_bytes
+        );
+
+        let shadow = subject_proof
+            .governor_shadow
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("missing subject shadow proof"))?;
+        assert_eq!(shadow.control_mode, SwarmSloControlMode::Shadow);
+        assert!(
+            shadow
+                .operator_report
+                .evidence
+                .artifact_path
+                .as_deref()
+                .is_some_and(|path| path == GOLDEN_TRACE_PATH)
+        );
+        assert!(shadow.budgets.iter().any(|budget| {
+            budget.metric == "latency_p99_ns"
+                && budget.observed == Some(subject_report.summary.latency_p99_ns)
+        }));
+        assert!(
+            shadow
+                .operator_report
+                .measurement_guardrail
+                .contains("does not claim performance improvement")
+        );
+
+        let oracle_proof = proof_pack
+            .backend_proofs
+            .iter()
+            .find(|proof| proof.backend == AgentSwarmReplayBackend::CSqliteOracle)
+            .ok_or_else(|| std::io::Error::other("missing oracle proof"))?;
+        assert!(!oracle_proof.concurrent_writer_default);
+        assert!(oracle_proof.governor_shadow.is_none());
+        assert!(
+            oracle_proof
+                .shadow_skip_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("FrankenSQLite concurrent-default"))
+        );
+
+        let encoded = serde_json::to_string(&proof_pack)?;
+        assert!(encoded.contains("governor_off"));
+        assert!(encoded.contains("governor_shadow"));
+        assert!(encoded.contains("heavy_rch_command"));
+        assert!(encoded.contains("README performance claims still require"));
 
         Ok(())
     }

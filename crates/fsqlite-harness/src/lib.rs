@@ -73,6 +73,7 @@ pub mod scheduler;
 pub mod score_engine;
 pub mod seed_taxonomy;
 pub mod semantic_gap_map;
+pub mod slo_governor;
 pub mod soak_executor;
 pub mod soak_profiles;
 pub mod spec_to_beads_audit;

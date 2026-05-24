@@ -12,6 +12,38 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-24 - VDBE `Opcode::Real` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_real` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, added during this pass to
+  isolate repeated `Real` constant loads with a stable `P4::Real(42.75)` payload
+  and destination register.
+- Durable infra kept:
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs` now includes the focused
+  `Real` dispatch benchmark so future hot-dispatch work can remeasure this
+  opcode directly.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed the existing
+  `Opcode::Real` arm from `try_execute_hot_opcode`, sending `Real` through the
+  main interpreter match instead of the hot pre-filter. The source patch was
+  unwound after measurement.
+- Evidence:
+  baseline command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-real-current cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_real --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=744.62 ns`, `256=2.9592 us`, `1024=9.6650 us`.
+  Candidate command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-real-without-hot cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_real --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=779.25 ns`, `256=3.2032 us`, `1024=13.321 us`.
+- Result: rejected. Removing the hot arm regressed every measured dispatch
+  stream, with the 1024-op stream especially worse, so the smaller hot
+  pre-filter did not offset falling back to the main match for `Real`.
+- Do not retry `Opcode::Real` hot-dispatch removal as a standalone patch.
+  Reconsider only if a broader interpreter-layout change changes branch
+  behavior, and require a same-worker A/B rerun against this focused benchmark
+  plus any affected real SQL workload.
+
 ## 2026-05-24 - VDBE `Opcode::Affinity` hot-dispatch promotion
 
 - Target: `vdbe_pipeline_execute_affinity` in

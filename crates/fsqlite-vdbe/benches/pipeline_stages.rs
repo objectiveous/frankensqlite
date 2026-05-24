@@ -87,6 +87,25 @@ fn build_execute_stage_int64_program(op_repeats: usize) -> VdbeProgram {
         .expect("pipeline execute int64 benchmark program should build")
 }
 
+/// Build a dispatch-dominated program whose inner loop is a stream of `Real`
+/// constant loads. `Real` is a low-frequency hot-dispatch arm that still
+/// reads its payload from `p4`, so this benchmark lets us prove whether keeping
+/// it in the hot pre-filter is worth the extra match surface.
+fn build_execute_stage_real_program(op_repeats: usize) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    let end = builder.emit_label();
+    builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+    let target = builder.alloc_reg();
+    for _ in 0..op_repeats {
+        builder.emit_op(Opcode::Real, 0, target, 0, P4::Real(42.75), 0);
+    }
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder.resolve_label(end);
+    builder
+        .finish()
+        .expect("pipeline execute real benchmark program should build")
+}
+
 /// Build a dispatch-dominated program whose inner loop is a stream of `Blob`
 /// constant loads. The p4 payload is intentionally small and stable so the
 /// benchmark isolates dispatch plus register blob-buffer reuse rather than
@@ -985,6 +1004,39 @@ fn bench_vdbe_execute_int64_stage(c: &mut Criterion) {
                     let outcome = engine
                         .execute(program)
                         .expect("pipeline execute int64 benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_vdbe_execute_real_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_real");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let program = build_execute_stage_real_program(op_repeats);
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &program,
+            |b, program| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute real benchmark should execute");
                     black_box(outcome);
                 });
             },
@@ -2166,6 +2218,7 @@ criterion_group!(
     bench_vdbe_execute_stage,
     bench_vdbe_execute_noop_stage,
     bench_vdbe_execute_int64_stage,
+    bench_vdbe_execute_real_stage,
     bench_vdbe_execute_blob_stage,
     bench_vdbe_execute_string_stage,
     bench_vdbe_execute_softnull_stage,

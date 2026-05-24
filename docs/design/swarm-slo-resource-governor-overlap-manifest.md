@@ -81,6 +81,18 @@ Required pressure fields:
 - `invalidation_queue_depth`, `invalidation_fallback_count`
 - `build_or_test_saturation` and `agent_wedge_risk` for operator proof runs
 
+Required coordination bridge fields:
+
+- `queue_claim_count`, `queue_release_count`, and derived pending queue depth
+- `lease_acquire_count`, `lease_renew_count`, and `lease_expiration_count`
+- `range_allocation_count` and `range_imbalance_reason`
+- `explain_concurrency_row_count` and `fallback_reason_count`
+- `resource_governor_decision_count`
+- `coordination_correctness_per_mille`
+- `conflict_transparency_per_mille`
+- `fairness_resource_pressure_per_mille`
+- `privacy_scrubber_preserved`
+
 Required latency fields:
 
 - `latency_p50_ms`, `latency_p95_ms`, `latency_p99_ms`

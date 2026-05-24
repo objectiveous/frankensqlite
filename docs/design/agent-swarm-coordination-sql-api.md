@@ -914,6 +914,32 @@ or `EXPLAIN CONCURRENCY` rows must preserve this row-shape contract:
 5. Never use fallback transparency to disable concurrent-writer mode or add a
    file-level writer bottleneck.
 
+### Replay-Lab and SLO-Governor Bridge for `.8`
+
+`bd-agent-swarm-coordination-transparency-8jr6u.8` wires the coordination
+surface into the existing replay lab and Swarm SLO governor artifacts instead
+of introducing a second harness. The bridge lives in
+`crates/fsqlite-harness/src/agent_swarm_trace.rs` and
+`crates/fsqlite-harness/src/slo_governor_adapters.rs`.
+
+Replay resource scorecards now include a `coordination_metrics` row for each
+backend. The row records queue claim/release counts, lease acquire/renew/expire
+counts, worker-range allocations, EXPLAIN CONCURRENCY diagnostic rows,
+fallback reasons, resource-governor decisions, coordination correctness,
+conflict transparency, fairness/resource pressure, and the scrubbed field list
+that must remain artifact-visible. The SLO replay adapter consumes the same row
+when it builds `SwarmSloGovernorInput` and the replay stress proof pack:
+
+- Pending queue work maps to `evidence_queue_depth`.
+- Fallback reason frequency maps to `invalidation_fallback_count`.
+- Fairness/resource pressure maps to the proof-lane saturation field.
+- Low coordination correctness or scrubber drift sets the operator wedge-risk
+  flag for shadow-mode decisions.
+
+This is intentionally an adapter contract. It does not create production
+metrics labels, does not publish SQL text or user identifiers, and does not
+change the replay schema used to load sanitized trace fixtures.
+
 ### Executable Test Matrix Contract Slice for `.9`
 
 `bd-agent-swarm-coordination-transparency-8jr6u.9` turns the previous contract

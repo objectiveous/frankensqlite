@@ -14,9 +14,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::agent_swarm_trace::{
-    AgentSwarmBackendResourceScorecard, AgentSwarmBackendSummary, AgentSwarmEvidenceManifest,
-    AgentSwarmReplayBackend, AgentSwarmReplayReport, AgentSwarmReplaySchedule,
-    AgentSwarmResourceProfileId, AgentSwarmResourceScorecard, AgentSwarmStatementReplay,
+    AgentSwarmBackendResourceScorecard, AgentSwarmBackendSummary, AgentSwarmCoordinationMetrics,
+    AgentSwarmEvidenceManifest, AgentSwarmReplayBackend, AgentSwarmReplayReport,
+    AgentSwarmReplaySchedule, AgentSwarmResourceProfileId, AgentSwarmResourceScorecard,
+    AgentSwarmStatementReplay,
 };
 use crate::slo_governor::{
     SWARM_SLO_POLICY_ID, SwarmSloAction, SwarmSloControlMode, SwarmSloDegradedSignal,
@@ -192,6 +193,8 @@ pub struct SwarmSloGovernorOffMetrics {
     pub expected_mismatch_count: usize,
     /// Conflict/error classes observed during replay.
     pub conflict_classes: BTreeMap<String, usize>,
+    /// Coordination bridge metrics copied from the replay scorecard.
+    pub coordination_metrics: AgentSwarmCoordinationMetrics,
     /// Deterministic replay memory high-water estimate.
     pub memory_high_water_bytes: u64,
     /// Profile memory limit.
@@ -313,6 +316,8 @@ pub fn adapt_replay_scorecard_to_swarm_slo_input(
             .map(|statement| statement.concurrency_group.as_str()),
     ));
 
+    let coordination_metrics = &scorecard_backend.coordination_metrics;
+
     Ok(SwarmSloGovernorInput {
         run_id: report.run_id.clone(),
         trace_id: report.trace_id.clone(),
@@ -353,7 +358,11 @@ pub fn adapt_replay_scorecard_to_swarm_slo_input(
         retry_rate_per_mille: capped_u16(scorecard_backend.retry_rate_per_mille),
         abort_count: usize_to_u64(replay_backend.summary.abort_count),
         abort_rate_per_mille: capped_u16(scorecard_backend.abort_rate_per_mille),
-        evidence_queue_depth: 0,
+        evidence_queue_depth: capped_u32_from_u64(
+            coordination_metrics
+                .queue_claim_count
+                .saturating_sub(coordination_metrics.queue_release_count),
+        ),
         evidence_queue_drops: 0,
         evidence_worker_count: config.evidence_worker_count,
         wakeup_queue_depth: 0,
@@ -365,9 +374,13 @@ pub fn adapt_replay_scorecard_to_swarm_slo_input(
         wal_frames_pending_checkpoint: 0,
         checkpoint_active: false,
         invalidation_queue_depth: 0,
-        invalidation_fallback_count: 0,
-        build_or_test_saturation_per_mille: 0,
-        agent_wedge_risk: false,
+        invalidation_fallback_count: capped_u32_from_u64(
+            coordination_metrics.fallback_reason_count,
+        ),
+        build_or_test_saturation_per_mille: coordination_metrics
+            .fairness_resource_pressure_per_mille,
+        agent_wedge_risk: coordination_metrics.coordination_correctness_per_mille < 800
+            || !coordination_metrics.privacy_scrubber_preserved,
         latency_p50_ns: scorecard_backend.latency_p50_ns,
         latency_p95_ns: scorecard_backend.latency_p95_ns,
         latency_p99_ns: scorecard_backend.latency_p99_ns,
@@ -737,6 +750,7 @@ fn governor_off_metrics(
         abort_rate_per_mille: scorecard.abort_rate_per_mille,
         expected_mismatch_count: summary.expected_mismatch_count,
         conflict_classes: summary.conflict_classes.clone(),
+        coordination_metrics: scorecard.coordination_metrics.clone(),
         memory_high_water_bytes: scorecard.memory_high_water_bytes,
         memory_limit_bytes: scorecard.memory_limit_bytes,
         page_cache_bytes: scorecard.page_cache_footprint_bytes,
@@ -829,6 +843,12 @@ fn log_swarm_slo_replay_stress_proof_pack(proof_pack: &SwarmSloReplayStressProof
             retry_rate_per_mille = backend.governor_off.retry_rate_per_mille,
             abort_count = backend.governor_off.abort_count,
             abort_rate_per_mille = backend.governor_off.abort_rate_per_mille,
+            queue_claim_count = backend.governor_off.coordination_metrics.queue_claim_count,
+            lease_expiration_count = backend.governor_off.coordination_metrics.lease_expiration_count,
+            range_allocation_count = backend.governor_off.coordination_metrics.range_allocation_count,
+            fallback_reason_count = backend.governor_off.coordination_metrics.fallback_reason_count,
+            coordination_correctness = backend.governor_off.coordination_metrics.coordination_correctness_per_mille,
+            conflict_transparency = backend.governor_off.coordination_metrics.conflict_transparency_per_mille,
             memory_high_water_bytes = backend.governor_off.memory_high_water_bytes,
             governor_shadow_guardrail = %shadow_guardrail,
             governor_shadow_action = %shadow_action,
@@ -885,6 +905,10 @@ fn capped_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
+fn capped_u32_from_u64(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
 fn capped_u16(value: u64) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
 }
@@ -912,10 +936,10 @@ const fn replay_schedule_label(schedule: AgentSwarmReplaySchedule) -> &'static s
 mod tests {
     use super::*;
     use crate::agent_swarm_trace::{
-        AgentSwarmEvidenceManifestConfig, AgentSwarmReplayConfig, AgentSwarmResourceProfile,
-        AgentSwarmResourceScorecardConfig, FIRST_FAILURE_DIAGNOSTIC_ABSENT,
-        build_agent_swarm_evidence_manifest, load_agent_swarm_trace_json, replay_agent_swarm_trace,
-        score_agent_swarm_resource_envelope,
+        AGENT_SWARM_COORDINATION_BRIDGE_VERSION, AgentSwarmEvidenceManifestConfig,
+        AgentSwarmReplayConfig, AgentSwarmResourceProfile, AgentSwarmResourceScorecardConfig,
+        FIRST_FAILURE_DIAGNOSTIC_ABSENT, build_agent_swarm_evidence_manifest,
+        load_agent_swarm_trace_json, replay_agent_swarm_trace, score_agent_swarm_resource_envelope,
     };
     use crate::slo_governor::{SwarmSloAction, evaluate_swarm_slo_once};
 
@@ -1153,6 +1177,25 @@ mod tests {
             subject_proof.governor_off.memory_high_water_bytes,
             subject_scorecard.memory_high_water_bytes
         );
+        assert_eq!(
+            subject_proof
+                .governor_off
+                .coordination_metrics
+                .bridge_version,
+            AGENT_SWARM_COORDINATION_BRIDGE_VERSION
+        );
+        assert_eq!(
+            subject_proof.governor_off.coordination_metrics,
+            subject_scorecard.coordination_metrics
+        );
+        assert!(
+            subject_proof
+                .governor_off
+                .coordination_metrics
+                .trace_fields
+                .iter()
+                .any(|field| field == "resource_governor_decision")
+        );
 
         let shadow = subject_proof
             .governor_shadow
@@ -1195,6 +1238,7 @@ mod tests {
         let encoded = serde_json::to_string(&proof_pack)?;
         assert!(encoded.contains("governor_off"));
         assert!(encoded.contains("governor_shadow"));
+        assert!(encoded.contains("coordination_metrics"));
         assert!(encoded.contains("heavy_rch_command"));
         assert!(encoded.contains("README performance claims still require"));
 

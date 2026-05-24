@@ -37,6 +37,9 @@ pub const AGENT_SWARM_REPLAY_HARNESS_VERSION: &str = "1.0.0";
 /// Version of the resource envelope and fairness scorecard contract.
 pub const AGENT_SWARM_RESOURCE_SCORECARD_VERSION: &str = "1.0.0";
 
+/// Version of the coordination bridge fields attached to replay scorecards.
+pub const AGENT_SWARM_COORDINATION_BRIDGE_VERSION: &str = "1.0.0";
+
 /// Version of the replay evidence manifest contract.
 pub const AGENT_SWARM_EVIDENCE_MANIFEST_VERSION: &str = "1.0.0";
 
@@ -45,6 +48,25 @@ pub const AGENT_SWARM_CI_SMOKE_VERSION: &str = "1.0.0";
 
 /// Marker used in structured logs when no failure diagnostic exists yet.
 pub const FIRST_FAILURE_DIAGNOSTIC_ABSENT: &str = "none";
+
+/// Coordination trace fields that must remain scrubbed and scorecard-visible.
+pub const AGENT_SWARM_COORDINATION_TRACE_FIELDS: [&str; 15] = [
+    "queue_claim_id",
+    "queue_release_reason",
+    "lease_owner",
+    "lease_generation",
+    "lease_expires_ms",
+    "worker_range_start",
+    "worker_range_end",
+    "range_imbalance_reason",
+    "explain_concurrency_reason",
+    "fallback_reason",
+    "statement_fingerprint",
+    "resource_governor_decision",
+    "coordination_correctness",
+    "conflict_transparency",
+    "fairness_resource_pressure",
+];
 
 const MIB: u64 = 1_024 * 1_024;
 const GIB: u64 = 1_024 * MIB;
@@ -1199,6 +1221,61 @@ impl AgentSwarmResourceScorecardConfig {
     }
 }
 
+/// Coordination scenario family surfaced by replay scorecards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSwarmCoordinationScenario {
+    /// Baseline successful coordination path.
+    Normal,
+    /// Conflict-heavy replay or retry path.
+    ConflictHeavy,
+    /// Compatibility fallback path is intentionally visible.
+    FallbackHeavy,
+    /// Lease expiration or takeover path.
+    ExpiredLease,
+    /// Worker-range imbalance or split/merge path.
+    RangeImbalance,
+}
+
+/// Replay-lab bridge metrics for coordination primitives and SLO inputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmCoordinationMetrics {
+    /// Bridge implementation version.
+    pub bridge_version: String,
+    /// Scenario families covered by this replay backend.
+    pub scenarios: Vec<AgentSwarmCoordinationScenario>,
+    /// Queue claim operations observed by replay.
+    pub queue_claim_count: u64,
+    /// Queue release or completion operations observed by replay.
+    pub queue_release_count: u64,
+    /// Lease acquire operations observed by replay.
+    pub lease_acquire_count: u64,
+    /// Lease renew operations observed by replay.
+    pub lease_renew_count: u64,
+    /// Lease expiration or takeover operations observed by replay.
+    pub lease_expiration_count: u64,
+    /// Worker-range allocation/split/merge operations observed by replay.
+    pub range_allocation_count: u64,
+    /// EXPLAIN CONCURRENCY diagnostic rows observed by replay.
+    pub explain_concurrency_row_count: u64,
+    /// Compatibility fallback reason rows observed by replay.
+    pub fallback_reason_count: u64,
+    /// Resource-governor decision rows observed by replay.
+    pub resource_governor_decision_count: u64,
+    /// Score of expected-vs-actual coordination outcomes, per mille.
+    pub coordination_correctness_per_mille: u16,
+    /// Score of conflict/fallback diagnostic visibility, per mille.
+    pub conflict_transparency_per_mille: u16,
+    /// Fairness/resource pressure, per mille, where higher means more pressure.
+    pub fairness_resource_pressure_per_mille: u16,
+    /// Whether the replay inputs still satisfy the privacy scrubber contract.
+    pub privacy_scrubber_preserved: bool,
+    /// Field names that must stay artifact-visible and scrubbed.
+    pub trace_fields: Vec<String>,
+    /// First coordination bridge diagnostic.
+    pub first_failure_diag: String,
+}
+
 /// Resource and fairness scorecard for one replay backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSwarmBackendResourceScorecard {
@@ -1246,6 +1323,8 @@ pub struct AgentSwarmBackendResourceScorecard {
     pub tail_latency_spread_ns: u64,
     /// Backend throughput.
     pub throughput_statements_per_second_x1000: u64,
+    /// Coordination bridge metrics consumed by replay and SLO proof packs.
+    pub coordination_metrics: AgentSwarmCoordinationMetrics,
 }
 
 /// Full resource envelope and fairness scorecard.
@@ -2523,6 +2602,7 @@ fn score_backend_resource_envelope(
             .values()
             .copied(),
     );
+    let coordination_metrics = coordination_metrics_for_backend(backend, fairness_index_per_mille);
     let memory_high_water_bytes = usize_to_u64(backend.summary.memory_high_water_bytes);
     let page_cache_footprint_bytes = memory_high_water_bytes.min(profile.page_cache_limit_bytes);
     let cpu_capacity_ns = profile
@@ -2570,7 +2650,168 @@ fn score_backend_resource_envelope(
         throughput_statements_per_second_x1000: backend
             .summary
             .throughput_statements_per_second_x1000,
+        coordination_metrics,
     }
+}
+
+fn coordination_metrics_for_backend(
+    backend: &AgentSwarmBackendReplay,
+    fairness_index_per_mille: u16,
+) -> AgentSwarmCoordinationMetrics {
+    let mut queue_claim_count = 0_u64;
+    let mut queue_release_count = 0_u64;
+    let mut lease_acquire_count = 0_u64;
+    let mut lease_renew_count = 0_u64;
+    let mut lease_expiration_count = 0_u64;
+    let mut range_allocation_count = 0_u64;
+    let mut explain_concurrency_row_count = 0_u64;
+    let mut fallback_reason_count = 0_u64;
+    let mut resource_governor_decision_count = 0_u64;
+    let mut scenarios = BTreeSet::new();
+
+    if backend.summary.success_count > 0 {
+        scenarios.insert(AgentSwarmCoordinationScenario::Normal);
+    }
+    if backend.summary.abort_count > 0 || backend.summary.retry_count > 0 {
+        scenarios.insert(AgentSwarmCoordinationScenario::ConflictHeavy);
+    }
+
+    for statement in &backend.statements {
+        if statement_has_signal(statement, &["fsqlite_queue", "task_queue", "queue"]) {
+            if statement_has_signal(statement, &["claim", "ready", "queue_claim"]) {
+                queue_claim_count = queue_claim_count.saturating_add(1);
+            }
+            if statement_has_signal(statement, &["release", "complete", "done", "abandon"]) {
+                queue_release_count = queue_release_count.saturating_add(1);
+            }
+        }
+        if statement_has_signal(
+            statement,
+            &[
+                "fsqlite_lease",
+                "lease-",
+                "lease_owner",
+                "lease_generation",
+                "lease_expires_ms",
+            ],
+        ) {
+            lease_acquire_count = lease_acquire_count.saturating_add(1);
+            if statement_has_signal(statement, &["renew", "heartbeat"]) {
+                lease_renew_count = lease_renew_count.saturating_add(1);
+            }
+            if statement_has_signal(statement, &["expire", "expired", "takeover"]) {
+                lease_expiration_count = lease_expiration_count.saturating_add(1);
+                scenarios.insert(AgentSwarmCoordinationScenario::ExpiredLease);
+            }
+        }
+        if statement_has_signal(
+            statement,
+            &["fsqlite_worker_ranges", "worker_range", "range"],
+        ) {
+            range_allocation_count = range_allocation_count.saturating_add(1);
+            if statement_has_signal(statement, &["imbalance", "split", "merge"]) {
+                scenarios.insert(AgentSwarmCoordinationScenario::RangeImbalance);
+            }
+        }
+        if statement_has_signal(statement, &["explain concurrency", "explain_concurrency"]) {
+            explain_concurrency_row_count = explain_concurrency_row_count.saturating_add(1);
+        }
+        if statement_has_signal(statement, &["fallback", "compatibility"]) {
+            fallback_reason_count = fallback_reason_count.saturating_add(1);
+            scenarios.insert(AgentSwarmCoordinationScenario::FallbackHeavy);
+        }
+        if statement_has_signal(
+            statement,
+            &["slo_governor", "resource_governor", "governor"],
+        ) {
+            resource_governor_decision_count = resource_governor_decision_count.saturating_add(1);
+        }
+    }
+
+    AgentSwarmCoordinationMetrics {
+        bridge_version: AGENT_SWARM_COORDINATION_BRIDGE_VERSION.to_owned(),
+        scenarios: scenarios.into_iter().collect(),
+        queue_claim_count,
+        queue_release_count,
+        lease_acquire_count,
+        lease_renew_count,
+        lease_expiration_count,
+        range_allocation_count,
+        explain_concurrency_row_count,
+        fallback_reason_count,
+        resource_governor_decision_count,
+        coordination_correctness_per_mille: coordination_correctness_per_mille(&backend.summary),
+        conflict_transparency_per_mille: conflict_transparency_per_mille(
+            &backend.summary,
+            explain_concurrency_row_count,
+            fallback_reason_count,
+        ),
+        fairness_resource_pressure_per_mille: 1_000_u16.saturating_sub(fairness_index_per_mille),
+        privacy_scrubber_preserved: privacy_scrubber_preserved(&backend.statements),
+        trace_fields: AGENT_SWARM_COORDINATION_TRACE_FIELDS
+            .iter()
+            .map(|field| (*field).to_owned())
+            .collect(),
+        first_failure_diag: first_coordination_failure_diag(&backend.statements),
+    }
+}
+
+fn statement_has_signal(statement: &AgentSwarmStatementReplay, needles: &[&str]) -> bool {
+    let sql = statement.materialized_sql.to_ascii_lowercase();
+    let phase = statement.workload_phase.to_ascii_lowercase();
+    let group = statement.concurrency_group.to_ascii_lowercase();
+    needles
+        .iter()
+        .any(|needle| sql.contains(needle) || phase.contains(needle) || group.contains(needle))
+}
+
+fn coordination_correctness_per_mille(summary: &AgentSwarmBackendSummary) -> u16 {
+    let failures = usize_to_u64(
+        summary
+            .expected_mismatch_count
+            .saturating_add(summary.abort_count),
+    );
+    let total = usize_to_u64(summary.statements_total);
+    let failure_rate = ratio_per_mille(failures, total).min(1_000);
+    u16::try_from(1_000_u64.saturating_sub(failure_rate)).unwrap_or(0)
+}
+
+fn conflict_transparency_per_mille(
+    summary: &AgentSwarmBackendSummary,
+    explain_rows: u64,
+    fallback_reasons: u64,
+) -> u16 {
+    let conflict_count = usize_to_u64(summary.abort_count)
+        .saturating_add(summary.retry_count)
+        .saturating_add(usize_to_u64(
+            summary.conflict_classes.values().copied().sum::<usize>(),
+        ));
+    if conflict_count == 0 {
+        return 1_000;
+    }
+    let diagnostic_count = explain_rows
+        .saturating_add(fallback_reasons)
+        .min(conflict_count);
+    u16::try_from(ratio_per_mille(diagnostic_count, conflict_count).min(1_000)).unwrap_or(1_000)
+}
+
+fn privacy_scrubber_preserved(statements: &[AgentSwarmStatementReplay]) -> bool {
+    !statements.iter().any(|statement| {
+        let sql = statement.materialized_sql.to_ascii_lowercase();
+        ["/home/", "token", "password", "secret", "sqlite:///"]
+            .iter()
+            .any(|needle| sql.contains(needle))
+    })
+}
+
+fn first_coordination_failure_diag(statements: &[AgentSwarmStatementReplay]) -> String {
+    statements
+        .iter()
+        .find(|statement| statement.first_failure_diag != FIRST_FAILURE_DIAGNOSTIC_ABSENT)
+        .map_or_else(
+            || FIRST_FAILURE_DIAGNOSTIC_ABSENT.to_owned(),
+            |statement| statement.first_failure_diag.clone(),
+        )
 }
 
 fn ratio_per_mille(numerator: u64, denominator: u64) -> u64 {
@@ -3026,6 +3267,14 @@ fn log_agent_swarm_resource_scorecard(scorecard: &AgentSwarmResourceScorecard) {
             p99_ns = backend.latency_p99_ns,
             abort_rate = backend.abort_rate_per_mille,
             retry_rate = backend.retry_rate_per_mille,
+            queue_claim_count = backend.coordination_metrics.queue_claim_count,
+            lease_expiration_count = backend.coordination_metrics.lease_expiration_count,
+            range_allocation_count = backend.coordination_metrics.range_allocation_count,
+            fallback_reason_count = backend.coordination_metrics.fallback_reason_count,
+            coordination_correctness = backend.coordination_metrics.coordination_correctness_per_mille,
+            conflict_transparency = backend.coordination_metrics.conflict_transparency_per_mille,
+            fairness_resource_pressure = backend.coordination_metrics.fairness_resource_pressure_per_mille,
+            privacy_scrubber_preserved = backend.coordination_metrics.privacy_scrubber_preserved,
             first_failure_diag = %scorecard.first_failure_diag,
             "agent swarm resource scorecard",
         );
@@ -4009,6 +4258,159 @@ mod tests {
         assert_eq!(backend.latency_p99_ns, 400);
         assert_eq!(backend.tail_latency_spread_ns, 300);
         assert!(backend.concurrent_writer_default);
+    }
+
+    #[test]
+    fn agent_swarm_scorecard_exposes_coordination_bridge_metrics() {
+        let mut queue_claim = resource_replay_record(
+            "agent-a",
+            0,
+            100,
+            AgentSwarmReplayOutcomeClass::Success,
+            TransactionBoundary::None,
+            0,
+        );
+        queue_claim.workload_phase = "queue-claim".to_owned();
+        queue_claim.materialized_sql =
+            "UPDATE fsqlite_queue SET owner='redacted-text' WHERE status='ready' RETURNING queue_claim_id"
+                .to_owned();
+
+        let mut queue_release = resource_replay_record(
+            "agent-a",
+            1,
+            110,
+            AgentSwarmReplayOutcomeClass::Success,
+            TransactionBoundary::None,
+            0,
+        );
+        queue_release.workload_phase = "queue-release".to_owned();
+        queue_release.materialized_sql =
+            "UPDATE fsqlite_queue SET status='done' RETURNING queue_release_reason".to_owned();
+
+        let mut expired_lease = resource_replay_record(
+            "agent-b",
+            2,
+            120,
+            AgentSwarmReplayOutcomeClass::Success,
+            TransactionBoundary::None,
+            0,
+        );
+        expired_lease.workload_phase = "expired-lease-takeover".to_owned();
+        expired_lease.materialized_sql =
+            "UPDATE fsqlite_lease SET lease_owner='redacted-text' WHERE lease_expires_ms < 100 RETURNING lease_generation"
+                .to_owned();
+
+        let mut range_split = resource_replay_record(
+            "agent-b",
+            3,
+            130,
+            AgentSwarmReplayOutcomeClass::Success,
+            TransactionBoundary::None,
+            0,
+        );
+        range_split.workload_phase = "range-imbalance-split".to_owned();
+        range_split.materialized_sql =
+            "INSERT INTO fsqlite_worker_ranges(worker_range_start, worker_range_end, range_imbalance_reason) VALUES (0, 99, 'redacted-text')"
+                .to_owned();
+
+        let mut explain_conflict = resource_replay_record(
+            "agent-c",
+            4,
+            400,
+            AgentSwarmReplayOutcomeClass::Conflict,
+            TransactionBoundary::Rollback,
+            2,
+        );
+        explain_conflict.workload_phase = "explain-concurrency-conflict".to_owned();
+        explain_conflict.materialized_sql =
+            "EXPLAIN CONCURRENCY SELECT * FROM fsqlite_coordination_events WHERE explain_concurrency_reason='hot_page_predicted'"
+                .to_owned();
+
+        let mut fallback = resource_replay_record(
+            "agent-c",
+            5,
+            160,
+            AgentSwarmReplayOutcomeClass::Success,
+            TransactionBoundary::None,
+            0,
+        );
+        fallback.workload_phase = "compatibility-fallback".to_owned();
+        fallback.materialized_sql =
+            "SELECT fallback_reason FROM fsqlite_coordination_events WHERE fallback_reason='compatibility_fallback'"
+                .to_owned();
+
+        let mut governor = resource_replay_record(
+            "agent-d",
+            6,
+            140,
+            AgentSwarmReplayOutcomeClass::Success,
+            TransactionBoundary::None,
+            0,
+        );
+        governor.workload_phase = "resource-governor-shadow".to_owned();
+        governor.materialized_sql =
+            "SELECT resource_governor_decision FROM fsqlite_coordination_events".to_owned();
+
+        let report = resource_scorecard_report(
+            vec![
+                queue_claim,
+                queue_release,
+                expired_lease,
+                range_split,
+                explain_conflict,
+                fallback,
+                governor,
+            ],
+            8_192,
+        );
+        let config =
+            AgentSwarmResourceScorecardConfig::new(AgentSwarmResourceProfile::local_smoke());
+
+        let scorecard = score_agent_swarm_resource_envelope(&report, &config);
+        let metrics = &scorecard.backends[0].coordination_metrics;
+
+        assert_eq!(
+            metrics.bridge_version,
+            AGENT_SWARM_COORDINATION_BRIDGE_VERSION
+        );
+        assert_eq!(metrics.queue_claim_count, 1);
+        assert_eq!(metrics.queue_release_count, 1);
+        assert_eq!(metrics.lease_acquire_count, 1);
+        assert_eq!(metrics.lease_expiration_count, 1);
+        assert_eq!(metrics.range_allocation_count, 1);
+        assert_eq!(metrics.explain_concurrency_row_count, 1);
+        assert_eq!(metrics.fallback_reason_count, 1);
+        assert_eq!(metrics.resource_governor_decision_count, 1);
+        assert!(metrics.coordination_correctness_per_mille < 1_000);
+        assert_eq!(metrics.conflict_transparency_per_mille, 500);
+        assert!(metrics.fairness_resource_pressure_per_mille > 0);
+        assert!(metrics.privacy_scrubber_preserved);
+        assert!(
+            metrics
+                .scenarios
+                .contains(&AgentSwarmCoordinationScenario::ConflictHeavy)
+        );
+        assert!(
+            metrics
+                .scenarios
+                .contains(&AgentSwarmCoordinationScenario::FallbackHeavy)
+        );
+        assert!(
+            metrics
+                .scenarios
+                .contains(&AgentSwarmCoordinationScenario::ExpiredLease)
+        );
+        assert!(
+            metrics
+                .scenarios
+                .contains(&AgentSwarmCoordinationScenario::RangeImbalance)
+        );
+        assert!(
+            metrics
+                .trace_fields
+                .iter()
+                .any(|field| field == "fallback_reason")
+        );
     }
 
     #[test]

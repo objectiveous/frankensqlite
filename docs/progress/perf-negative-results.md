@@ -12,6 +12,43 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-24 - VDBE `Opcode::Affinity` hot-dispatch promotion
+
+- Target: `vdbe_pipeline_execute_affinity` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, added during this pass to
+  isolate the common single-register integer-affinity no-conversion path. The
+  benchmark seeds one integer register, then executes repeated `Affinity` ops
+  with `P4::Affinity("D")` so per-iteration setup does not pollute the dispatch
+  measurement.
+- Durable infra kept:
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs` now includes the focused
+  `Affinity` dispatch benchmark so future work can remeasure this opcode
+  directly.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate added a byte-equivalent
+  `Opcode::Affinity` arm to `try_execute_hot_opcode`, mirroring the existing
+  main-match body by matching `P4::Affinity`, iterating the affinity characters,
+  taking each register, applying `char_to_affinity(ch)`, preserving
+  `collect_vdbe_metrics` type-coercion recording, writing the coerced value,
+  and advancing the program counter. The source patch was unwound after
+  measurement.
+- Evidence:
+  baseline command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-affinity-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_affinity --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=2.0233 us`, `256=7.0139 us`, `1024=25.031 us`.
+  Candidate command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-affinity-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_affinity --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=1.6708 us`, `256=6.8870 us`, `1024=27.448 us`.
+- Result: rejected. The candidate improved the 64-op stream and only slightly
+  moved the 256-op stream, but regressed the 1024-op stream, so it did not clear
+  the all-sizes keep gate for a standalone hot pre-filter expansion.
+- Do not retry `Opcode::Affinity` hot-dispatch promotion as a standalone patch.
+  Reconsider only if a real INSERT/UPDATE workload profile shows repeated
+  affinity application dominating dispatch cost, and require a same-worker A/B
+  rerun against that workload plus the focused dispatch benchmark.
+
 ## 2026-05-24 - VDBE `Opcode::OffsetLimit` hot-dispatch promotion
 
 - Target: `vdbe_pipeline_execute_offsetlimit` in

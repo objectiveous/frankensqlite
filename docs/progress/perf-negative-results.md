@@ -12,6 +12,33 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-24 - VDBE `Opcode::Subtract` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_subtract` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, which isolates repeated
+  integer subtraction over stable source registers and a stable output register.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed the existing
+  `Opcode::Subtract` arm from `try_execute_hot_opcode`, sending subtraction
+  back through the main interpreter match. The source patch was unwound after
+  measurement.
+- Evidence:
+  baseline command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-subtract-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_subtract/' --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=871.55 ns`, `256=3.7681 us`, `1024=19.057 us`.
+  Candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-subtract-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_subtract/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=987.72 ns`, `256=3.2167 us`, `1024=13.573 us`.
+- Result: rejected. Removing the hot arm improved the 256-op and 1024-op
+  streams, but regressed the 64-op stream by about 13%, so it failed the
+  all-sizes keep gate for hot-prefilter contraction.
+- Do not retry `Opcode::Subtract` hot-dispatch removal as a standalone patch.
+  Reconsider only if a broader hot-prefilter compaction pass measures real SQL
+  instruction-cache or binary-size wins and also preserves the focused
+  `vdbe_pipeline_execute_subtract` matrix.
+
 ## 2026-05-24 - VDBE `Opcode::Not` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_not` in

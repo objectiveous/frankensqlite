@@ -2408,3 +2408,66 @@ fn test_track_s_select_after_insert_matches_rusqlite_oracle() {
     assert_eq!(sqlite_row.0, "mixed_label");
     assert_eq!(sqlite_row.1, 45);
 }
+
+#[test]
+fn test_prepared_param_null_predicate_mix_matches_rusqlite_oracle() {
+    let _profile_isolation = FastPathProfileIsolationGuard::new();
+    const SQL: &str = "SELECT CASE WHEN ?1 IS NOT NULL THEN (?2 + ?3) ELSE ?4 END";
+
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let fstmt = fconn.prepare(SQL).unwrap();
+    let mut rstmt = rconn.prepare(SQL).unwrap();
+    let f_non_null = [
+        fsqlite_types::SqliteValue::Integer(1),
+        fsqlite_types::SqliteValue::Integer(2),
+        fsqlite_types::SqliteValue::Integer(3),
+        fsqlite_types::SqliteValue::Integer(100),
+    ];
+    let f_null = [
+        fsqlite_types::SqliteValue::Null,
+        fsqlite_types::SqliteValue::Integer(2),
+        fsqlite_types::SqliteValue::Integer(3),
+        fsqlite_types::SqliteValue::Integer(100),
+    ];
+
+    let mut checksum = 0_u64;
+    let mut use_non_null_params = true;
+    for iteration in 0..16_u64 {
+        let expected = if use_non_null_params {
+            rstmt
+                .query_row(rusqlite::params![1_i64, 2_i64, 3_i64, 100_i64], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        } else {
+            rstmt
+                .query_row(
+                    rusqlite::params![rusqlite::types::Null, 2_i64, 3_i64, 100_i64],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        let rows = fstmt
+            .query_with_params(if use_non_null_params {
+                &f_non_null
+            } else {
+                &f_null
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1, "prepared predicate query returns one row");
+        let row = rows
+            .first()
+            .expect("prepared predicate query returns one row");
+        assert_eq!(
+            row.get(0),
+            Some(&fsqlite_types::SqliteValue::Integer(expected)),
+            "prepared parameter/null predicate branch should match rusqlite"
+        );
+        checksum = checksum.wrapping_add(
+            u64::try_from(expected).expect("oracle result is positive") * (iteration + 1),
+        );
+        use_non_null_params = !use_non_null_params;
+    }
+    assert_eq!(checksum, 7_520, "checksum documents the benchmark mix");
+}

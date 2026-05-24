@@ -12,6 +12,8 @@ const SELECT_COVERING_INDEX_SQL: &str = "SELECT name FROM select_bench WHERE nam
 const SELECT_INDEXED_EQUALITY_SQL: &str = "SELECT * FROM select_bench WHERE name = ?1";
 const COUNT_INDEXED_ROWID_PROBE_SQL: &str =
     "SELECT COUNT(*) FROM products WHERE category_id IN (SELECT id FROM categories WHERE id <= 5)";
+const PARAM_NULL_PREDICATE_MIX_SQL: &str =
+    "SELECT CASE WHEN ?1 IS NOT NULL THEN (?2 + ?3) ELSE ?4 END";
 
 fn open_mt_mvcc_prepare_conn() -> (Connection, NamedTempFile) {
     let tmp = NamedTempFile::new().expect("tempfile");
@@ -292,12 +294,68 @@ fn bench_prepared_count_indexed_rowid_probe_query_row(iterations: u64, count: i6
             .query_row()
             .expect("count indexed rowid probe fast path");
         let Some(SqliteValue::Integer(count)) = row.get(0) else {
-            panic!("count indexed rowid probe returned non-integer row: {row:?}");
+            eprintln!("count indexed rowid probe returned non-integer row: {row:?}");
+            std::process::exit(3);
         };
         count_sum = count_sum.saturating_add(*count);
     }
     black_box(count_sum);
     start.elapsed().as_secs_f64() * 1_000_000_000.0 / iterations as f64
+}
+
+fn bench_prepared_param_null_predicate_mix(iterations: u64) -> (f64, u64) {
+    let conn = Connection::open(":memory:").expect("open memory connection");
+    let stmt = conn
+        .prepare(PARAM_NULL_PREDICATE_MIX_SQL)
+        .expect("prepare parameter/null predicate mix");
+    let non_null_params = [
+        SqliteValue::Integer(1),
+        SqliteValue::Integer(2),
+        SqliteValue::Integer(3),
+        SqliteValue::Integer(100),
+    ];
+    let null_params = [
+        SqliteValue::Null,
+        SqliteValue::Integer(2),
+        SqliteValue::Integer(3),
+        SqliteValue::Integer(100),
+    ];
+    black_box(
+        stmt.query_with_params(&non_null_params)
+            .expect("warm non-null branch"),
+    );
+    black_box(
+        stmt.query_with_params(&null_params)
+            .expect("warm null branch"),
+    );
+
+    let start = Instant::now();
+    let mut checksum = 0_u64;
+    let mut use_non_null_params = true;
+    for iteration in 0..iterations {
+        let params = if use_non_null_params {
+            &non_null_params
+        } else {
+            &null_params
+        };
+        let rows = stmt
+            .query_with_params(params)
+            .expect("parameter/null predicate query");
+        let row = rows
+            .first()
+            .expect("parameter/null predicate should return one row");
+        let Some(SqliteValue::Integer(value)) = row.get(0) else {
+            eprintln!("parameter/null predicate returned non-integer row: {row:?}");
+            std::process::exit(3);
+        };
+        checksum = checksum.wrapping_add(
+            u64::try_from(*value).expect("benchmark result is positive") * (iteration + 1),
+        );
+        black_box(rows);
+        use_non_null_params = !use_non_null_params;
+    }
+    let elapsed_ns = start.elapsed().as_secs_f64() * 1_000_000_000.0 / iterations as f64;
+    (elapsed_ns, checksum)
 }
 
 fn parse_iterations() -> u64 {
@@ -376,6 +434,15 @@ fn parse_iterations() -> u64 {
                 );
                 std::process::exit(0);
             }
+            "param_null_predicate_mix" => {
+                let iterations = iterations.min(200_000);
+                let (param_null_predicate_ns, checksum) =
+                    bench_prepared_param_null_predicate_mix(iterations);
+                println!(
+                    "prepared_cache_hot_paths param_null_predicate_mix_query_ns_per_op={param_null_predicate_ns:.2} iterations={iterations} checksum={checksum}"
+                );
+                std::process::exit(0);
+            }
             _ => {
                 eprintln!("invalid --filter value: {filter}");
                 std::process::exit(2);
@@ -392,6 +459,8 @@ fn main() {
     let select_fast_paths_ns = bench_prepared_select_fast_path_pair(iterations.min(200_000));
     let count_indexed_rowid_probe_ns =
         bench_prepared_count_indexed_rowid_probe_query_row(iterations.min(200_000), 1_000);
+    let (param_null_predicate_ns, checksum) =
+        bench_prepared_param_null_predicate_mix(iterations.min(200_000));
 
     println!(
         "prepared_cache_hot_paths mt_mvcc_prepare_hit_ns_per_op={prepare_hit_ns:.2} iterations={iterations}"
@@ -406,6 +475,10 @@ fn main() {
     );
     println!(
         "prepared_cache_hot_paths count_indexed_rowid_probe_query_row_ns_per_op={count_indexed_rowid_probe_ns:.2} rows=1000 iterations={}",
+        iterations.min(200_000)
+    );
+    println!(
+        "prepared_cache_hot_paths param_null_predicate_mix_query_ns_per_op={param_null_predicate_ns:.2} iterations={} checksum={checksum}",
         iterations.min(200_000)
     );
 }

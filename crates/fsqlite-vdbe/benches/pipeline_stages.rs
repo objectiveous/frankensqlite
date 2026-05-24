@@ -518,6 +518,29 @@ fn build_execute_stage_notnull_program(op_repeats: usize) -> VdbeProgram {
         .expect("pipeline execute notnull benchmark program should build")
 }
 
+/// Build a dispatch-dominated program whose inner loop is a stream of `And`
+/// ops over stable non-NULL boolean inputs. Each opcode reads two registers,
+/// applies SQLite three-valued AND semantics, and writes into one stable
+/// destination register without changing the source operands.
+fn build_execute_stage_and_program(op_repeats: usize) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    let end = builder.emit_label();
+    builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+    let lhs = builder.alloc_reg();
+    let rhs = builder.alloc_reg();
+    let out = builder.alloc_reg();
+    builder.emit_op(Opcode::Integer, 1, lhs, 0, P4::None, 0);
+    builder.emit_op(Opcode::Integer, 0, rhs, 0, P4::None, 0);
+    for _ in 0..op_repeats {
+        builder.emit_op(Opcode::And, lhs, rhs, out, P4::None, 0);
+    }
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder.resolve_label(end);
+    builder
+        .finish()
+        .expect("pipeline execute and benchmark program should build")
+}
+
 /// Build a dispatch-dominated program whose inner loop is a stream of
 /// `Rowid` ops against a single positioned storage cursor.  The cursor
 /// is opened on a one-row table and Rewound to the only row, so each
@@ -1386,6 +1409,39 @@ fn bench_vdbe_execute_notnull_stage(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_vdbe_execute_and_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_and");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let program = build_execute_stage_and_program(op_repeats);
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &program,
+            |b, program| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute and benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_vdbe_execute_rowid_stage(c: &mut Criterion) {
     set_vdbe_jit_enabled(false);
     let mut group = c.benchmark_group("vdbe_pipeline_execute_rowid");
@@ -1684,6 +1740,7 @@ criterion_group!(
     bench_vdbe_execute_ifnotzero_stage,
     bench_vdbe_execute_isnull_stage,
     bench_vdbe_execute_notnull_stage,
+    bench_vdbe_execute_and_stage,
     bench_vdbe_execute_ifnot_stage,
     bench_vdbe_execute_istrue_stage,
     bench_vdbe_execute_not_stage,

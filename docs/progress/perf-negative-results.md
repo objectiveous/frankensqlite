@@ -12,6 +12,32 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-24 - VDBE `Opcode::Int64` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_int64` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, which isolates repeated
+  `Int64` constant loads from `p4` into one stable output register.
+- Touched during rejected candidate: `crates/fsqlite-vdbe/src/engine.rs`. The
+  candidate removed the existing `Opcode::Int64` arm from
+  `try_execute_hot_opcode`, sending `Int64` back through the main interpreter
+  match. The source patch was unwound after measurement.
+- Evidence:
+  baseline command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-int64-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_int64 --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=760.66 ns`, `256=2.5551 us`, `1024=10.042 us`.
+  Candidate command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-int64-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_int64 --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=754.46 ns`, `256=2.7369 us`, `1024=10.384 us`.
+- Result: rejected. Removing the hot arm was noise-level faster at 64 ops but
+  regressed the 256-op and 1024-op streams, so it failed the all-sizes keep
+  gate for hot-prefilter contraction.
+- Do not retry `Opcode::Int64` hot-dispatch removal as a standalone patch.
+  Reconsider only if a broader hot-prefilter compaction pass measures code-size
+  or instruction-cache wins on real SQL workloads and also preserves the focused
+  `vdbe_pipeline_execute_int64` matrix.
+
 ## 2026-05-24 - VDBE `Opcode::Concat` hot-dispatch promotion
 
 - Target: `vdbe_pipeline_execute_concat` in

@@ -21,6 +21,12 @@ pub const SWARM_SLO_DECISION_SCHEMA_VERSION: u32 = 1;
 pub const SWARM_SLO_OPERATOR_BEAD_ID: &str = "bd-swarm-slo-resource-governor-qb256.5";
 /// Machine-readable schema version for operator reports emitted by this module.
 pub const SWARM_SLO_OPERATOR_REPORT_SCHEMA_VERSION: u32 = 1;
+/// Owning bead for enforced-mode rollout gating.
+pub const SWARM_SLO_ROLLOUT_BEAD_ID: &str = "bd-swarm-slo-resource-governor-qb256.3";
+/// Machine-readable schema version for enforced-mode rollout reports.
+pub const SWARM_SLO_ENFORCEMENT_ROLLOUT_SCHEMA_VERSION: u32 = 1;
+/// Stable rollout gate identifier used in evidence artifacts.
+pub const SWARM_SLO_ENFORCEMENT_ROLLOUT_POLICY_ID: &str = "swarm-slo-enforcement-rollout.v1";
 
 const PER_MILLE: u64 = 1_000;
 
@@ -532,6 +538,182 @@ pub struct SwarmSloOperatorReport {
     pub measurement_guardrail: String,
 }
 
+/// Strictness knobs for enforced-mode rollout gating.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmSloEnforcementRolloutConfig {
+    /// Require a caller-supplied opt-in before allowing enforcement.
+    pub require_explicit_opt_in: bool,
+    /// Require live or production telemetry rather than replay-only evidence.
+    pub require_live_metrics: bool,
+    /// Require publish-window occupancy and latency measurements.
+    pub require_publish_window_metrics: bool,
+    /// Require p99.9 telemetry before enforcement.
+    pub require_p999_latency: bool,
+    /// Require proof-pack hash evidence.
+    pub require_proof_pack_hash: bool,
+    /// Require a dated benchmark artifact path and commit for performance claims.
+    pub require_benchmark_artifact: bool,
+    /// Allow degraded telemetry to reach enforcement.
+    pub allow_degraded_telemetry: bool,
+    /// Allow compatibility fallback observations to reach enforcement.
+    pub allow_compatibility_fallback: bool,
+    /// Forbid any SQLite-style serialized-writer fallback request.
+    pub forbid_serialized_writer_fallback: bool,
+}
+
+impl Default for SwarmSloEnforcementRolloutConfig {
+    fn default() -> Self {
+        Self {
+            require_explicit_opt_in: true,
+            require_live_metrics: true,
+            require_publish_window_metrics: true,
+            require_p999_latency: true,
+            require_proof_pack_hash: true,
+            require_benchmark_artifact: true,
+            allow_degraded_telemetry: false,
+            allow_compatibility_fallback: false,
+            forbid_serialized_writer_fallback: true,
+        }
+    }
+}
+
+/// Artifact evidence required before promoting SLO governor enforcement.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmSloEnforcementRolloutEvidence {
+    /// Hash of the replay/stress proof pack.
+    pub proof_pack_hash: Option<String>,
+    /// Whether governor-off and governor-shadow evidence was compared.
+    pub governor_off_shadow_compared: bool,
+    /// Dated benchmark artifact path supporting any performance claim.
+    pub benchmark_artifact_path: Option<String>,
+    /// Commit used for the benchmark artifact.
+    pub benchmark_artifact_commit: Option<String>,
+    /// Date attached to the benchmark artifact.
+    pub benchmark_artifact_date: Option<String>,
+    /// CI-sized smoke command for reproducing the rollout evidence.
+    pub smoke_command: Option<String>,
+    /// Heavy replay command, which must use `rch`.
+    pub heavy_rch_command: Option<String>,
+}
+
+/// Caller intent and operator switches for one enforcement gate evaluation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmSloEnforcementRolloutRequest {
+    /// Explicit operator opt-in to enforced mode.
+    pub explicit_opt_in: bool,
+    /// Operator kill switch forcing non-enforcement.
+    pub operator_kill_switch_active: bool,
+    /// Whether a caller requested SQLite-style serialized writer fallback.
+    pub serialized_writer_fallback_requested: bool,
+    /// Evidence bundle for this rollout decision.
+    pub evidence: SwarmSloEnforcementRolloutEvidence,
+}
+
+/// Final rollout gate verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmSloEnforcementRolloutVerdict {
+    /// Enforced mode may proceed for this evidence snapshot.
+    Enforce,
+    /// Keep the policy in shadow mode and continue collecting evidence.
+    DowngradeToShadow,
+    /// Do not enforce until hard blockers are removed.
+    Blocked,
+}
+
+/// Machine-readable reason for a rollout block or shadow downgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmSloEnforcementRolloutReason {
+    /// Enforced mode was not requested on the decision input.
+    EnforcedModeNotRequested,
+    /// The operator did not explicitly opt in.
+    ExplicitOptInMissing,
+    /// A kill switch is active.
+    KillSwitchActive,
+    /// The concurrent-writer default invariant was not observed.
+    ConcurrentDefaultNotObserved,
+    /// SQLite-style serialized writer fallback was requested.
+    SerializedWriterFallbackRequested,
+    /// Operator report and decision identity did not match.
+    OperatorReportMismatch,
+    /// Proof-pack hash was absent or not a SHA-256 hex string.
+    ProofPackHashMissing,
+    /// Governor-off and governor-shadow evidence was not compared.
+    GovernorOffShadowComparisonMissing,
+    /// Benchmark artifact path was missing.
+    BenchmarkArtifactMissing,
+    /// Benchmark artifact commit was missing.
+    BenchmarkArtifactCommitMissing,
+    /// Benchmark artifact date was missing.
+    BenchmarkArtifactDateMissing,
+    /// Live metrics were missing.
+    MissingLiveMetrics,
+    /// Metrics were stale.
+    StaleMetrics,
+    /// Evidence was replay-only.
+    ReplayOnlyInput,
+    /// Publish-window measurements were missing.
+    MissingPublishWindow,
+    /// p99.9 latency was missing.
+    MissingP999,
+    /// Labels or values were privacy redacted.
+    PrivacyRedactedInput,
+    /// A compatibility fallback was observed.
+    CompatibilityFallbackObserved,
+}
+
+/// Deterministic report explaining an enforced-mode rollout gate decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmSloEnforcementRolloutReport {
+    /// Report schema version.
+    pub schema_version: u32,
+    /// Owning bead identifier.
+    pub bead_id: String,
+    /// Rollout policy identifier.
+    pub rollout_policy_id: String,
+    /// Shadow policy identifier that produced the decision.
+    pub policy_id: String,
+    /// Decision identifier from the governor.
+    pub decision_id: u64,
+    /// Matched guardrail from the governor.
+    pub guardrail_id: String,
+    /// Requested control mode from the decision.
+    pub requested_control_mode: SwarmSloControlMode,
+    /// Effective control mode after rollout gating.
+    pub effective_control_mode: SwarmSloControlMode,
+    /// Gate verdict.
+    pub verdict: SwarmSloEnforcementRolloutVerdict,
+    /// Recommended governor action.
+    pub action: SwarmSloAction,
+    /// Hard blockers that must be removed before enforcement.
+    pub blockers: Vec<SwarmSloEnforcementRolloutReason>,
+    /// Softer evidence gaps that downgrade enforcement to shadow mode.
+    pub downgrade_reasons: Vec<SwarmSloEnforcementRolloutReason>,
+    /// Whether the concurrent-writer default was observed as enabled.
+    pub concurrent_mode_default_observed: bool,
+    /// Whether SQLite-style serialized writer fallback was requested.
+    pub serialized_writer_fallback_requested: bool,
+    /// Whether an operator kill switch was active.
+    pub operator_kill_switch_active: bool,
+    /// Proof-pack hash used by the gate.
+    pub proof_pack_hash: Option<String>,
+    /// Benchmark artifact path used by the gate.
+    pub benchmark_artifact_path: Option<String>,
+    /// Benchmark artifact commit used by the gate.
+    pub benchmark_artifact_commit: Option<String>,
+    /// Benchmark artifact date used by the gate.
+    pub benchmark_artifact_date: Option<String>,
+    /// Smoke command for reproducing the gate evidence.
+    pub smoke_command: Option<String>,
+    /// Heavy command for reproducing the gate evidence through `rch`.
+    pub heavy_rch_command: Option<String>,
+    /// Operator-visible kill switches copied from the operator report.
+    pub kill_switches: Vec<String>,
+    /// Guardrail against uncited performance claims.
+    pub measurement_guardrail: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuleMatch {
     guardrail_id: &'static str,
@@ -603,6 +785,228 @@ pub fn build_swarm_slo_operator_report(
         safe_mode_guidance: safe_mode_guidance(decision, config),
         measurement_guardrail: "This report only describes observed budgets and guardrails; it does not claim performance improvement without benchmark artifacts.".to_owned(),
     }
+}
+
+/// Gate a shadow-policy decision before allowing enforced-mode rollout.
+#[must_use]
+pub fn gate_swarm_slo_enforcement_rollout(
+    decision: &SwarmSloDecision,
+    operator_report: &SwarmSloOperatorReport,
+    request: &SwarmSloEnforcementRolloutRequest,
+    config: &SwarmSloEnforcementRolloutConfig,
+) -> SwarmSloEnforcementRolloutReport {
+    let blockers = rollout_blockers(decision, operator_report, request, config);
+    let downgrade_reasons = rollout_downgrade_reasons(decision, operator_report, config);
+    let verdict = rollout_verdict(&blockers, &downgrade_reasons);
+    let effective_control_mode = if verdict == SwarmSloEnforcementRolloutVerdict::Enforce {
+        SwarmSloControlMode::Enforced
+    } else {
+        SwarmSloControlMode::Shadow
+    };
+
+    SwarmSloEnforcementRolloutReport {
+        schema_version: SWARM_SLO_ENFORCEMENT_ROLLOUT_SCHEMA_VERSION,
+        bead_id: SWARM_SLO_ROLLOUT_BEAD_ID.to_owned(),
+        rollout_policy_id: SWARM_SLO_ENFORCEMENT_ROLLOUT_POLICY_ID.to_owned(),
+        policy_id: decision.policy_id.clone(),
+        decision_id: decision.decision_id,
+        guardrail_id: decision.guardrail_id.clone(),
+        requested_control_mode: decision.control_mode,
+        effective_control_mode,
+        verdict,
+        action: decision.action,
+        blockers,
+        downgrade_reasons,
+        concurrent_mode_default_observed: decision.concurrent_mode_default_observed,
+        serialized_writer_fallback_requested: request.serialized_writer_fallback_requested,
+        operator_kill_switch_active: request.operator_kill_switch_active,
+        proof_pack_hash: request.evidence.proof_pack_hash.clone(),
+        benchmark_artifact_path: request.evidence.benchmark_artifact_path.clone(),
+        benchmark_artifact_commit: request.evidence.benchmark_artifact_commit.clone(),
+        benchmark_artifact_date: request.evidence.benchmark_artifact_date.clone(),
+        smoke_command: request.evidence.smoke_command.clone(),
+        heavy_rch_command: request.evidence.heavy_rch_command.clone(),
+        kill_switches: operator_report.kill_switches.clone(),
+        measurement_guardrail: "Enforced rollout is allowed only with explicit opt-in, current non-degraded telemetry, concurrent-writer-default evidence, no serialized-writer fallback, and dated benchmark/proof-pack artifacts."
+            .to_owned(),
+    }
+}
+
+fn rollout_blockers(
+    decision: &SwarmSloDecision,
+    operator_report: &SwarmSloOperatorReport,
+    request: &SwarmSloEnforcementRolloutRequest,
+    config: &SwarmSloEnforcementRolloutConfig,
+) -> Vec<SwarmSloEnforcementRolloutReason> {
+    let mut blockers = Vec::new();
+
+    if config.require_explicit_opt_in && !request.explicit_opt_in {
+        blockers.push(SwarmSloEnforcementRolloutReason::ExplicitOptInMissing);
+    }
+
+    if request.operator_kill_switch_active {
+        blockers.push(SwarmSloEnforcementRolloutReason::KillSwitchActive);
+    }
+
+    if !decision.concurrent_mode_default_observed {
+        blockers.push(SwarmSloEnforcementRolloutReason::ConcurrentDefaultNotObserved);
+    }
+
+    if config.forbid_serialized_writer_fallback && request.serialized_writer_fallback_requested {
+        blockers.push(SwarmSloEnforcementRolloutReason::SerializedWriterFallbackRequested);
+    }
+
+    if operator_report_mismatches_decision(operator_report, decision) {
+        blockers.push(SwarmSloEnforcementRolloutReason::OperatorReportMismatch);
+    }
+
+    if config.require_proof_pack_hash
+        && !request
+            .evidence
+            .proof_pack_hash
+            .as_deref()
+            .is_some_and(looks_like_sha256_hex)
+    {
+        blockers.push(SwarmSloEnforcementRolloutReason::ProofPackHashMissing);
+    }
+
+    if !request.evidence.governor_off_shadow_compared {
+        blockers.push(SwarmSloEnforcementRolloutReason::GovernorOffShadowComparisonMissing);
+    }
+
+    if config.require_benchmark_artifact {
+        if string_option_is_blank(request.evidence.benchmark_artifact_path.as_deref()) {
+            blockers.push(SwarmSloEnforcementRolloutReason::BenchmarkArtifactMissing);
+        }
+        if string_option_is_blank(request.evidence.benchmark_artifact_commit.as_deref()) {
+            blockers.push(SwarmSloEnforcementRolloutReason::BenchmarkArtifactCommitMissing);
+        }
+        if string_option_is_blank(request.evidence.benchmark_artifact_date.as_deref()) {
+            blockers.push(SwarmSloEnforcementRolloutReason::BenchmarkArtifactDateMissing);
+        }
+    }
+
+    blockers
+}
+
+fn rollout_downgrade_reasons(
+    decision: &SwarmSloDecision,
+    operator_report: &SwarmSloOperatorReport,
+    config: &SwarmSloEnforcementRolloutConfig,
+) -> Vec<SwarmSloEnforcementRolloutReason> {
+    let mut reasons = Vec::new();
+
+    if decision.control_mode != SwarmSloControlMode::Enforced {
+        reasons.push(SwarmSloEnforcementRolloutReason::EnforcedModeNotRequested);
+    }
+
+    if !config.allow_degraded_telemetry {
+        push_degraded_rollout_reasons(decision, config, &mut reasons);
+    }
+
+    if !config.allow_compatibility_fallback
+        && operator_report.fallback_path_risk
+            == SwarmSloFallbackPathRisk::CompatibilityFallbackObserved
+    {
+        reasons.push(SwarmSloEnforcementRolloutReason::CompatibilityFallbackObserved);
+    }
+
+    reasons
+}
+
+fn rollout_verdict(
+    blockers: &[SwarmSloEnforcementRolloutReason],
+    downgrade_reasons: &[SwarmSloEnforcementRolloutReason],
+) -> SwarmSloEnforcementRolloutVerdict {
+    if !blockers.is_empty() {
+        SwarmSloEnforcementRolloutVerdict::Blocked
+    } else if !downgrade_reasons.is_empty() {
+        SwarmSloEnforcementRolloutVerdict::DowngradeToShadow
+    } else {
+        SwarmSloEnforcementRolloutVerdict::Enforce
+    }
+}
+
+fn push_degraded_rollout_reasons(
+    decision: &SwarmSloDecision,
+    config: &SwarmSloEnforcementRolloutConfig,
+    reasons: &mut Vec<SwarmSloEnforcementRolloutReason>,
+) {
+    if config.require_live_metrics {
+        push_if_degraded(
+            decision,
+            SwarmSloDegradedSignal::MissingLiveMetrics,
+            SwarmSloEnforcementRolloutReason::MissingLiveMetrics,
+            reasons,
+        );
+        push_if_degraded(
+            decision,
+            SwarmSloDegradedSignal::ReplayOnlyInput,
+            SwarmSloEnforcementRolloutReason::ReplayOnlyInput,
+            reasons,
+        );
+    }
+
+    if config.require_publish_window_metrics {
+        push_if_degraded(
+            decision,
+            SwarmSloDegradedSignal::MissingPublishWindow,
+            SwarmSloEnforcementRolloutReason::MissingPublishWindow,
+            reasons,
+        );
+    }
+
+    if config.require_p999_latency {
+        push_if_degraded(
+            decision,
+            SwarmSloDegradedSignal::MissingP999,
+            SwarmSloEnforcementRolloutReason::MissingP999,
+            reasons,
+        );
+    }
+
+    push_if_degraded(
+        decision,
+        SwarmSloDegradedSignal::StaleMetrics,
+        SwarmSloEnforcementRolloutReason::StaleMetrics,
+        reasons,
+    );
+    push_if_degraded(
+        decision,
+        SwarmSloDegradedSignal::PrivacyRedactedInput,
+        SwarmSloEnforcementRolloutReason::PrivacyRedactedInput,
+        reasons,
+    );
+}
+
+fn push_if_degraded(
+    decision: &SwarmSloDecision,
+    signal: SwarmSloDegradedSignal,
+    reason: SwarmSloEnforcementRolloutReason,
+    reasons: &mut Vec<SwarmSloEnforcementRolloutReason>,
+) {
+    if decision.degraded_signals.contains(&signal) {
+        reasons.push(reason);
+    }
+}
+
+fn operator_report_mismatches_decision(
+    operator_report: &SwarmSloOperatorReport,
+    decision: &SwarmSloDecision,
+) -> bool {
+    operator_report.policy_id != decision.policy_id
+        || operator_report.decision_id != decision.decision_id
+        || operator_report.guardrail_id != decision.guardrail_id
+        || operator_report.control_mode != decision.control_mode
+        || operator_report.action != decision.action
+}
+
+fn looks_like_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn string_option_is_blank(value: Option<&str>) -> bool {
+    value.is_none_or(|inner| inner.trim().is_empty())
 }
 
 fn operator_evidence_context(decision: &SwarmSloDecision) -> SwarmSloOperatorEvidenceContext {
@@ -1185,6 +1589,50 @@ mod tests {
         )
     }
 
+    fn enforced_live_input() -> SwarmSloGovernorInput {
+        let mut input = healthy_input();
+        input.sample_source = SwarmSloSampleSource::LiveHarness;
+        input.control_mode = SwarmSloControlMode::Enforced;
+        input.artifact_path = Some("tests/artifacts/swarm-slo/live-sample.json".to_owned());
+        input.artifact_hash =
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned());
+        input.latency_p999_ns = Some(5_000_000);
+        input.degraded_signals.clear();
+        input.sample_age_ms = 0;
+        input.sample_window_ms = 1_000;
+        input.publish_window_occupancy = Some(1);
+        input.publish_window_p99_ns = Some(1_000_000);
+        input.first_failure_diag = "none".to_owned();
+        input.invalidation_fallback_count = 0;
+        input.concurrent_mode_default_observed = true;
+        input.privacy_redacted = false;
+        input
+    }
+
+    fn full_rollout_request() -> SwarmSloEnforcementRolloutRequest {
+        SwarmSloEnforcementRolloutRequest {
+            explicit_opt_in: true,
+            operator_kill_switch_active: false,
+            serialized_writer_fallback_requested: false,
+            evidence: SwarmSloEnforcementRolloutEvidence {
+                proof_pack_hash: Some(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                ),
+                governor_off_shadow_compared: true,
+                benchmark_artifact_path: Some(
+                    "tests/artifacts/swarm-slo/full-quick-2026-05-24/report.json".to_owned(),
+                ),
+                benchmark_artifact_commit: Some("edc3193c".to_owned()),
+                benchmark_artifact_date: Some("2026-05-24".to_owned()),
+                smoke_command: Some("cargo test -p fsqlite-harness --lib slo_governor".to_owned()),
+                heavy_rch_command: Some(
+                    "timeout 1200 rch exec -- cargo test -p fsqlite-harness --lib slo_governor"
+                        .to_owned(),
+                ),
+            },
+        }
+    }
+
     #[test]
     fn healthy_replay_admits_and_records_degraded_replay_signals() {
         let decision = evaluate_swarm_slo_once(&healthy_input());
@@ -1478,6 +1926,178 @@ mod tests {
             report
                 .degraded_signal_quality
                 .contains(&SwarmSloDegradedSignal::MissingPublishWindow)
+        );
+    }
+
+    #[test]
+    fn enforcement_rollout_gate_allows_only_opted_in_current_artifact_backed_evidence() {
+        let governor_config = SwarmSloGovernorConfig::default();
+        let rollout_config = SwarmSloEnforcementRolloutConfig::default();
+        let input = enforced_live_input();
+        let decision = evaluate_swarm_slo_once(&input);
+        let operator_report = build_swarm_slo_operator_report(&decision, &governor_config);
+        let request = full_rollout_request();
+
+        let report = gate_swarm_slo_enforcement_rollout(
+            &decision,
+            &operator_report,
+            &request,
+            &rollout_config,
+        );
+
+        assert_eq!(report.verdict, SwarmSloEnforcementRolloutVerdict::Enforce);
+        assert_eq!(report.effective_control_mode, SwarmSloControlMode::Enforced);
+        assert!(report.blockers.is_empty());
+        assert!(report.downgrade_reasons.is_empty());
+        assert!(report.concurrent_mode_default_observed);
+        assert!(!report.serialized_writer_fallback_requested);
+        assert!(
+            report
+                .measurement_guardrail
+                .contains("dated benchmark/proof-pack artifacts")
+        );
+        assert!(
+            report
+                .heavy_rch_command
+                .as_deref()
+                .is_some_and(|command| command.contains("rch exec"))
+        );
+    }
+
+    #[test]
+    fn enforcement_rollout_gate_downgrades_missing_or_stale_telemetry_to_shadow() {
+        let governor_config = SwarmSloGovernorConfig::default();
+        let rollout_config = SwarmSloEnforcementRolloutConfig::default();
+        let mut input = enforced_live_input();
+        input.sample_age_ms = governor_config.stale_metrics_after_ms + 1;
+        input.publish_window_occupancy = None;
+        input.publish_window_p99_ns = None;
+        input.latency_p999_ns = None;
+        let decision = evaluate_swarm_slo(
+            &input,
+            &governor_config,
+            &mut SwarmSloGovernorState::default(),
+        );
+        let operator_report = build_swarm_slo_operator_report(&decision, &governor_config);
+        let request = full_rollout_request();
+
+        let report = gate_swarm_slo_enforcement_rollout(
+            &decision,
+            &operator_report,
+            &request,
+            &rollout_config,
+        );
+
+        assert_eq!(
+            report.verdict,
+            SwarmSloEnforcementRolloutVerdict::DowngradeToShadow
+        );
+        assert_eq!(report.effective_control_mode, SwarmSloControlMode::Shadow);
+        assert!(
+            report
+                .downgrade_reasons
+                .contains(&SwarmSloEnforcementRolloutReason::StaleMetrics)
+        );
+        assert!(
+            report
+                .downgrade_reasons
+                .contains(&SwarmSloEnforcementRolloutReason::MissingPublishWindow)
+        );
+        assert!(
+            report
+                .downgrade_reasons
+                .contains(&SwarmSloEnforcementRolloutReason::MissingP999)
+        );
+    }
+
+    #[test]
+    fn enforcement_rollout_gate_blocks_kill_switch_serialized_fallback_and_broken_default() {
+        let governor_config = SwarmSloGovernorConfig::default();
+        let rollout_config = SwarmSloEnforcementRolloutConfig::default();
+        let mut input = enforced_live_input();
+        input.concurrent_mode_default_observed = false;
+        let decision = evaluate_swarm_slo_once(&input);
+        let operator_report = build_swarm_slo_operator_report(&decision, &governor_config);
+        let mut request = full_rollout_request();
+        request.explicit_opt_in = false;
+        request.operator_kill_switch_active = true;
+        request.serialized_writer_fallback_requested = true;
+
+        let report = gate_swarm_slo_enforcement_rollout(
+            &decision,
+            &operator_report,
+            &request,
+            &rollout_config,
+        );
+
+        assert_eq!(report.verdict, SwarmSloEnforcementRolloutVerdict::Blocked);
+        assert_eq!(report.effective_control_mode, SwarmSloControlMode::Shadow);
+        assert!(
+            report
+                .blockers
+                .contains(&SwarmSloEnforcementRolloutReason::ExplicitOptInMissing)
+        );
+        assert!(
+            report
+                .blockers
+                .contains(&SwarmSloEnforcementRolloutReason::KillSwitchActive)
+        );
+        assert!(
+            report
+                .blockers
+                .contains(&SwarmSloEnforcementRolloutReason::ConcurrentDefaultNotObserved)
+        );
+        assert!(
+            report
+                .blockers
+                .contains(&SwarmSloEnforcementRolloutReason::SerializedWriterFallbackRequested)
+        );
+    }
+
+    #[test]
+    fn enforcement_rollout_gate_blocks_uncited_performance_claims() {
+        let governor_config = SwarmSloGovernorConfig::default();
+        let rollout_config = SwarmSloEnforcementRolloutConfig::default();
+        let input = enforced_live_input();
+        let decision = evaluate_swarm_slo_once(&input);
+        let operator_report = build_swarm_slo_operator_report(&decision, &governor_config);
+        let request = SwarmSloEnforcementRolloutRequest {
+            explicit_opt_in: true,
+            ..SwarmSloEnforcementRolloutRequest::default()
+        };
+
+        let report = gate_swarm_slo_enforcement_rollout(
+            &decision,
+            &operator_report,
+            &request,
+            &rollout_config,
+        );
+
+        assert_eq!(report.verdict, SwarmSloEnforcementRolloutVerdict::Blocked);
+        assert!(
+            report
+                .blockers
+                .contains(&SwarmSloEnforcementRolloutReason::ProofPackHashMissing)
+        );
+        assert!(
+            report
+                .blockers
+                .contains(&SwarmSloEnforcementRolloutReason::GovernorOffShadowComparisonMissing)
+        );
+        assert!(
+            report
+                .blockers
+                .contains(&SwarmSloEnforcementRolloutReason::BenchmarkArtifactMissing)
+        );
+        assert!(
+            report
+                .blockers
+                .contains(&SwarmSloEnforcementRolloutReason::BenchmarkArtifactCommitMissing)
+        );
+        assert!(
+            report
+                .blockers
+                .contains(&SwarmSloEnforcementRolloutReason::BenchmarkArtifactDateMissing)
         );
     }
 }

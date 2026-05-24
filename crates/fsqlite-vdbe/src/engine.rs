@@ -12747,10 +12747,10 @@ impl VdbeEngine {
                     _ => 0,
                 };
                 if val.is_null() {
-                    self.set_reg(op.p2, SqliteValue::Integer(i64::from(op.p3 ^ p4_val)));
+                    self.set_reg_int(op.p2, i64::from(op.p3 ^ p4_val));
                 } else {
                     let v = i32::from(vdbe_real_is_truthy(val));
-                    self.set_reg(op.p2, SqliteValue::Integer(i64::from((v ^ p4_val) & 1)));
+                    self.set_reg_int(op.p2, i64::from((v ^ p4_val) & 1));
                 }
                 *pc += 1;
                 Ok(true)

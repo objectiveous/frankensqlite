@@ -12,6 +12,39 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-24 - VDBE `Opcode::OffsetLimit` hot-dispatch promotion
+
+- Target: `vdbe_pipeline_execute_offsetlimit` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, added during this pass to
+  isolate the common positive LIMIT/OFFSET counter setup path with stable
+  integer LIMIT and OFFSET registers plus a stable combined-counter output.
+- Durable infra kept:
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs` now includes the focused
+  `OffsetLimit` dispatch benchmark so future work can remeasure this opcode
+  directly.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate added a byte-equivalent
+  `Opcode::OffsetLimit` arm to `try_execute_hot_opcode`, mirroring the existing
+  main-match arm by reading p1/p2 as integers, writing p3 to -1 for negative
+  LIMIT or `limit.saturating_add(offset)` otherwise, and advancing the program
+  counter. The source patch was unwound after measurement.
+- Evidence:
+  baseline command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-offsetlimit-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_offsetlimit --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=1.0310 us`, `256=4.1165 us`, `1024=18.411 us`.
+  Candidate command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-offsetlimit-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_offsetlimit --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=1.0700 us`, `256=4.0142 us`, `1024=16.725 us`.
+- Result: rejected. The candidate improved the 256-op and 1024-op streams but
+  regressed the 64-op stream, so it did not clear the all-sizes keep gate for a
+  standalone hot pre-filter expansion.
+- Do not retry `Opcode::OffsetLimit` hot-dispatch promotion as a standalone
+  patch. Reconsider only if a real LIMIT/OFFSET-heavy SQL workload profile shows
+  this opcode dominating dispatch cost, and require a same-worker A/B rerun
+  against that workload plus the focused dispatch benchmark.
+
 ## 2026-05-24 - VDBE `Opcode::Or` hot-dispatch promotion
 
 - Target: `vdbe_pipeline_execute_or` in

@@ -575,6 +575,29 @@ fn build_execute_stage_ifnotzero_program(op_repeats: usize) -> VdbeProgram {
 }
 
 /// Build a dispatch-dominated program whose inner loop is a stream of
+/// `OffsetLimit` ops over stable LIMIT/OFFSET registers. This exercises the
+/// common positive-limit path: read two integer registers, saturating-add them,
+/// and write the combined counter into a third register.
+fn build_execute_stage_offsetlimit_program(op_repeats: usize) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    let end = builder.emit_label();
+    builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+    let limit = builder.alloc_reg();
+    let offset = builder.alloc_reg();
+    let combined = builder.alloc_reg();
+    builder.emit_op(Opcode::Integer, 50, limit, 0, P4::None, 0);
+    builder.emit_op(Opcode::Integer, 7, offset, 0, P4::None, 0);
+    for _ in 0..op_repeats {
+        builder.emit_op(Opcode::OffsetLimit, limit, offset, combined, P4::None, 0);
+    }
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder.resolve_label(end);
+    builder
+        .finish()
+        .expect("pipeline execute offsetlimit benchmark program should build")
+}
+
+/// Build a dispatch-dominated program whose inner loop is a stream of
 /// `IsNull` ops (the canonical NULL-test / NOT NULL-constraint opcode,
 /// 87 codegen sites — highest-frequency unpromoted opcode at the time
 /// this bench was added). The source register is seeded with `Null`,
@@ -1638,6 +1661,39 @@ fn bench_vdbe_execute_ifnotzero_stage(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_vdbe_execute_offsetlimit_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_offsetlimit");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let program = build_execute_stage_offsetlimit_program(op_repeats);
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &program,
+            |b, program| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute offsetlimit benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_vdbe_execute_isnull_stage(c: &mut Criterion) {
     set_vdbe_jit_enabled(false);
     let mut group = c.benchmark_group("vdbe_pipeline_execute_isnull");
@@ -2071,6 +2127,7 @@ criterion_group!(
     bench_vdbe_execute_decrjumpzero_stage,
     bench_vdbe_execute_ifpos_stage,
     bench_vdbe_execute_ifnotzero_stage,
+    bench_vdbe_execute_offsetlimit_stage,
     bench_vdbe_execute_isnull_stage,
     bench_vdbe_execute_notnull_stage,
     bench_vdbe_execute_and_stage,

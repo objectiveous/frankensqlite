@@ -69,7 +69,7 @@ SQLite-style serialized writer lock is introduced as a shortcut.
 | `.3` Atomic queue claim/release | Transactional claim, release, retry, abandon, and no-double-claim behavior. | `fsqlite-core` execution integration; ordinary-table shim first, then virtual catalog table. | `crates/fsqlite-core/tests/agent_swarm_queue_claim_contract.rs` covers empty queue, already claimed row, idempotent retry, owner/generation release, abandon, rollback, and concurrent claim race. | Executable trace points carry `queue_name`, `worker_id`, `claim_attempt_id`, `statement_fingerprint`, `conflict_reason`, and `elapsed_ms`. |
 | `.4` Lease heartbeat/expiration | Acquire, renew, transfer, release, expire, takeover. | `fsqlite-core` plus deterministic time/test hooks; storage integration only where durability requires it. | `crates/fsqlite-core/tests/agent_swarm_lease_contract.rs` covers missing-key acquire, non-expired takeover rejection, renew/transfer/release owner-token-generation checks, deterministic expiration boundaries, rollback, and concurrent expired-owner takeover. | `lease_key`, `owner_id`, `lease_token`, `renew_interval_ms`, `expiration_reason`, `conflict_reason`, `elapsed_ms`. |
 | `.5` Worker range allocator | Disjoint rowid/key range allocation and introspection. | Planner/core first; storage/B-tree hooks only after contract proves needed. | `crates/fsqlite-core/tests/agent_swarm_worker_range_contract.rs` covers stable reason codes, allocation, renewal, release, exhausted allocation, rollback, split/merge, overlap rejection, invalid bounds, introspection, and a deterministic naive-vs-range-aware conflict model. | `range_id`, `table`, `index`, `start_key`, `end_key`, `owner_id`, `predicted_page_start`, `predicted_page_end`, `imbalance_reason`, conflict delta. |
-| `.6` EXPLAIN CONCURRENCY and contention diagnostics | User-visible reason rows for expected/observed contention. | `connection.rs` EXPLAIN/PRAGMA area, planner diagnostics, MVCC conflict logs. | Golden output for low-conflict, hot-page, queue/lease/range, and fallback-heavy statements. | `trace_id`, `run_id`, `scenario_id`, `statement_fingerprint`, `plan_id`, `hotspot_kind`, `fallback_reason`. |
+| `.6` EXPLAIN CONCURRENCY and contention diagnostics | User-visible reason rows for expected/observed contention. | `connection.rs` EXPLAIN/PRAGMA area, planner diagnostics, MVCC conflict logs. | `crates/fsqlite-core/tests/agent_swarm_explain_concurrency_contract.rs` covers stable reason codes, low-conflict, hot-page, queue/lease/range, fallback-heavy, external-wait, summary, and rollback rows. | `trace_id`, `run_id`, `scenario_id`, `statement_fingerprint`, `plan_id`, `hotspot_kind`, `fallback_reason`, `external_wait`, `coordination_strategy`. |
 | `.7` Compatibility-path fallback transparency | Aggregated fallback reasons by statement, plan, table, workload lane. | Existing compatibility/fallback dispatch paths in `fsqlite-core`, planner/VDBE lowering diagnostics. | `crates/fsqlite-core/tests/agent_swarm_fallback_transparency_contract.rs` covers stable reason codes, supported fast path, unsupported shape, mixed workload aggregation, rollback, and reset. | Stable fallback reason code, concurrency/durability/memory/latency impact class, diagnostics availability, first failure diagnostic. |
 | `.8` Replay-lab and SLO bridge | Extend replay/scorecard/governor adapters to consume coordination fields. | `crates/fsqlite-harness/src/agent_swarm_trace.rs` and governor adapter work from `bd-swarm-slo-resource-governor-qb256`. | Golden adapter fixtures and deterministic replay fixtures. | Existing replay evidence manifest plus queue/lease/range/diagnostic/fallback fields. |
 | `.9` Unit/property/regression tests | Fast proof matrix for all coordination surfaces. | Same crates as implementation; property tests where interleavings matter. | Unit, property, golden, and regression tests named by invariant. | Fixed seeds, replay commands, structured failure context. |
@@ -84,8 +84,9 @@ SLO governance, and operator diagnostics join cleanly:
   `plan_id`, `worker_id`, `connection_id`, `transaction_id`.
 - Coordination: `queue_key`, `claim_attempt_id`, `lease_key`, `lease_owner`,
   `lease_expiration_reason`, `range_id`, `range_start`, `range_end`.
-- Contention: `hotspot_kind`, `page_number`, `table`, `index`,
-  `conflict_reason`, `retry_count`, `abort_count`, `busy_family`.
+- Contention: `hotspot_kind`, `page_number`, `page_start`, `page_end`,
+  `table`, `index`, `conflict_reason`, `retry_count`, `abort_count`,
+  `busy_family`, `external_wait`, `coordination_strategy`.
 - Fallback: `fallback_reason`, `fallback_surface`, `impact_class`,
   `supported_fast_path`, `diagnostics_available`.
 - Artifact: `artifact_path`, `artifact_hash`, `replay_command`,
@@ -138,7 +139,8 @@ Each implementation bead must include:
 
 - Unit tests for normal, empty, boundary, rollback, and error paths.
 - Property or deterministic interleaving tests where ownership races matter.
-- Golden tests for diagnostic row/JSON output.
+- Golden tests for diagnostic row/JSON output, including rollback behavior for
+  unpublished diagnostic rows.
 - E2E/replay tests only where cross-layer behavior is required.
 - Structured logging with `trace_id`, `run_id`, `scenario_id`, timing/counter
   fields, stable reason codes, and first-failure diagnostics.

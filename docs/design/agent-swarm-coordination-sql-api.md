@@ -35,9 +35,11 @@ FrankenSQLite internal catalog storage. Callers mutate them with ordinary
 recognized mutations to intrinsic operations, but those intrinsics are an
 implementation detail and must preserve normal transaction semantics.
 
-This contract does not add new SQL syntax. `EXPLAIN CONCURRENCY` is deferred to
-`bd-agent-swarm-coordination-transparency-8jr6u.6`; until then, diagnostics are
-observable through PRAGMA output and the event table.
+This contract does not add new SQL syntax. The first executable
+`bd-agent-swarm-coordination-transparency-8jr6u.6` slice pins the
+`EXPLAIN CONCURRENCY`/PRAGMA diagnostic row contract with an ordinary-table
+shim; parser syntax remains deferred until operator examples prove that new
+syntax materially improves usability over PRAGMA/table-valued diagnostics.
 
 ## Shared Rules
 
@@ -826,6 +828,52 @@ contract:
 4. Keep split/merge transactional and rollback-safe.
 5. Surface page-span and imbalance diagnostics so operators can choose when to
    split, merge, or rebalance worker ranges.
+
+### Executable Ordinary-Table Contract Slice for `.6`
+
+`bd-agent-swarm-coordination-transparency-8jr6u.6` starts from an
+ordinary-table diagnostic shim before built-in PRAGMA/table-valued diagnostics
+or parser-level `EXPLAIN CONCURRENCY` syntax land. The shim uses
+`fsqlite_concurrency_reason_codes_contract` and
+`fsqlite_explain_concurrency_contract` to pin stable reason codes, join fields,
+contention families, and operator next-inspection hints without adding syntax
+or runtime writer serialization as a prerequisite.
+
+The executable contract lives in
+`crates/fsqlite-core/tests/agent_swarm_explain_concurrency_contract.rs`. It
+proves:
+
+- Stable reason-code rows exist for `ok_low_conflict`,
+  `hot_page_predicted`, `coordination_wait`, `compatibility_fallback`,
+  `external_resource_wait`, and `diagnostics_unavailable`.
+- Low-conflict MVCC statements, hot-page conflicts, queue/lease ownership waits,
+  disjoint worker ranges, compatibility fallback, and external runtime waits
+  have distinct golden-testable rows.
+- Each row carries `trace_id`, `run_id`, `scenario_id`,
+  `statement_fingerprint`, `plan_id`, table/index/range/queue/lease identity,
+  hotspot fields, retry/abort counters, `busy_family`, stable reason codes,
+  `external_wait`, `coordination_strategy`, diagnostics availability, suggested
+  next inspection, and first-failure diagnostics.
+- Operator summaries aggregate predicted conflicts, observed conflicts,
+  retries, and aborts by `hotspot_kind`.
+- The contract explicitly rejects `global_writer_lock` as a coordination
+  strategy.
+- Diagnostic rows are transactional and roll back with the caller's
+  transaction.
+
+Future code that exposes this as `PRAGMA fsqlite_coordination_status`,
+`fsqlite_coordination_events`, a table-valued diagnostic surface, or
+`EXPLAIN CONCURRENCY` rows must preserve this contract:
+
+1. Distinguish page-level MVCC conflicts, coordination waits, compatibility
+   fallback, external waits, and missing diagnostics with stable reason codes.
+2. Keep statement fingerprints and plan ids joinable to replay artifacts and
+   fallback diagnostics.
+3. Report page or range hotspots where known, and return a stable next
+   inspection hint when they are not known.
+4. Treat queue, lease, and range waits as coordination-row outcomes, not as a
+   reason to serialize all writers.
+5. Keep diagnostic writes rollback-safe and avoid background orphan tasks.
 
 ### Executable Ordinary-Table Contract Slice for `.7`
 

@@ -456,6 +456,48 @@ RETURNING lease_key, owner_id, generation, state, last_reason_code;
 | `lease_invalid_state` | Requested state transition is illegal. |
 | `lease_metadata_too_large` | Metadata reference exceeds the catalog limit. |
 
+### Executable Ordinary-Table Contract Slice
+
+`bd-agent-swarm-coordination-transparency-8jr6u.4` starts from the same
+ordinary-table proof strategy as the queue contract. The shim uses
+`fsqlite_lease_contract` and the public `fsqlite_lease` columns, generation
+rules, clock boundary rules, and reason-code vocabulary. This keeps the first
+lease proof on the live parser, VDBE, MVCC, WAL, and transaction stack before a
+built-in virtual catalog table is introduced.
+
+The executable contract lives in
+`crates/fsqlite-core/tests/agent_swarm_lease_contract.rs`. It proves:
+
+- Missing-key acquire creates generation `1` and returns an active ownership
+  row.
+- Non-expired active ownership cannot be stolen through takeover.
+- Renew, transfer, and release require matching `owner_id`, `lease_token`, and
+  `generation`.
+- Renew succeeds before `expires_at_ms` and fails deterministically at exactly
+  `expires_at_ms`.
+- Transaction-driven expiry records `lease_expired` without a background task.
+- Released or expired leases can be reacquired by incrementing `generation`.
+- Rollback restores the previous owner, token, generation, state, and
+  expiration.
+- Concurrent expired-owner takeover publishes at most one owner; stale losers
+  surface as `lease_generation_conflict` or the existing retryable transient
+  family.
+- The executable trace points carry `lease_key`, `owner_id`, `lease_token`,
+  `renew_interval_ms`, `expiration_reason`, `conflict_reason`, and
+  `elapsed_ms`.
+
+Future code that lowers this surface into a built-in `fsqlite_lease` catalog
+must preserve this row-shape contract:
+
+1. Keep acquire, renew, transfer, release, expire, rollback, and contention
+   tests table-backed until the built-in table passes the same assertions.
+2. Keep expiration transaction-driven; no global writer lock or background
+   orphan runtime is allowed.
+3. Preserve the same ownership fields and stable reason codes in diagnostics.
+4. Treat a stale losing takeover as retryable `lease_generation_conflict` or
+   the existing transient `Busy*`/serialization family, never as double
+   ownership or silent success.
+
 ## `fsqlite_worker_ranges`
 
 `fsqlite_worker_ranges` assigns disjoint key ranges to workers. The initial

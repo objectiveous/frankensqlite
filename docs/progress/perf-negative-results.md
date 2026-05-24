@@ -12,6 +12,38 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-24 - VDBE `Opcode::String8` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_string8` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, added during this pass to
+  isolate repeated `String8` constant loads with a stable `P4::Str(...)`
+  payload and destination register.
+- Durable infra kept:
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs` now includes the focused
+  `String8` dispatch benchmark so future hot-dispatch work can remeasure this
+  opcode directly.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed the existing
+  `Opcode::String8` arm from `try_execute_hot_opcode`, sending `String8`
+  through the main interpreter match instead of the hot pre-filter. The source
+  patch was unwound after measurement.
+- Evidence:
+  baseline command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-string8-current cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_string8 --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=957.52 ns`, `256=3.9384 us`, `1024=14.648 us`.
+  Candidate command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-string8-without-hot cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_string8 --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=1.0662 us`, `256=4.4553 us`, `1024=16.033 us`.
+- Result: rejected. Removing the hot arm regressed every measured dispatch
+  stream, so the smaller hot pre-filter did not offset falling back to the main
+  match for `String8`.
+- Do not retry `Opcode::String8` hot-dispatch removal as a standalone patch.
+  Reconsider only if a broader interpreter-layout change changes branch
+  behavior, and require a same-worker A/B rerun against this focused benchmark
+  plus any affected real SQL workload.
+
 ## 2026-05-24 - VDBE `Opcode::Real` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_real` in

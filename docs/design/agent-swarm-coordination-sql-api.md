@@ -914,6 +914,39 @@ or `EXPLAIN CONCURRENCY` rows must preserve this row-shape contract:
 5. Never use fallback transparency to disable concurrent-writer mode or add a
    file-level writer bottleneck.
 
+### Executable Test Matrix Contract Slice for `.9`
+
+`bd-agent-swarm-coordination-transparency-8jr6u.9` turns the previous contract
+slices into a fast executable proof matrix. The first implementation lives in
+`crates/fsqlite-core/tests/agent_swarm_coordination_test_matrix_contract.rs`
+and deliberately stays on ordinary SQL tables plus deterministic generated
+interleavings so the matrix can run before the final replay proof pack exists.
+
+The matrix binds each surface to an invariant id, source test, deterministic
+seed, exact heavy `rch` command shape, regression name, and first-failure
+diagnostic. It covers:
+
+- `fsqlite_queue` unit coverage from
+  `agent_swarm_queue_claim_contract` plus generated `no_double_claim`
+  interleavings.
+- `fsqlite_lease` unit coverage from `agent_swarm_lease_contract` plus
+  generated `no_double_lease` expiration/takeover schedules.
+- `fsqlite_worker_ranges` unit coverage from
+  `agent_swarm_worker_range_contract` plus generated
+  `no_overlapping_enforced_ranges` schedules.
+- `EXPLAIN CONCURRENCY`/PRAGMA diagnostic coverage from
+  `agent_swarm_explain_concurrency_contract` plus an exact canonical hot-page
+  diagnostic golden row.
+- Fallback transparency coverage from
+  `agent_swarm_fallback_transparency_contract` plus an exact canonical
+  compatibility fallback golden row.
+
+The `.9` contract does not replace the surface-specific tests. It names them,
+keeps their required command shapes discoverable, and adds one regression layer
+that fails if the track loses deterministic seeds, golden review policy,
+property obligations, rollback/error coverage, or operator-facing
+first-failure diagnostics.
+
 ## Required Tests
 
 Implementation beads must name and land tests in these categories:

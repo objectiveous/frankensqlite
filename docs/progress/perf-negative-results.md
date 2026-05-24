@@ -12,6 +12,36 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-24 - VDBE `Opcode::Blob` hot-dispatch promotion
+
+- Target: `vdbe_pipeline_execute_blob` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, which isolates repeated
+  small `P4::Blob(b"fsqlite-blob-hot")` constant loads into a stable register
+  and exercises register blob-buffer reuse without large memcpy noise.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate added a byte-equivalent
+  `Opcode::Blob` arm to `try_execute_hot_opcode`, mirroring the existing
+  main-match body by writing `P4::Blob` payloads through `write_blob_to_reg`,
+  falling back to an empty blob for non-blob p4 payloads, and advancing the
+  program counter. The source patch was unwound after measurement.
+- Evidence:
+  baseline command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-blob-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_blob --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=751.36 ns`, `256=2.9624 us`, `1024=11.256 us`.
+  Candidate command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-blob-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_blob --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=844.86 ns`, `256=3.4264 us`, `1024=12.355 us`.
+- Result: rejected. The extra hot pre-filter arm regressed every measured
+  dispatch stream, so it did not clear the all-sizes keep gate for a standalone
+  hot-dispatch expansion.
+- Do not retry `Opcode::Blob` hot-dispatch promotion as a standalone patch.
+  Reconsider only if a real SQL workload profile shows blob constant loads
+  dominating enough to justify growing the hot pre-filter, and require a
+  same-worker A/B rerun against that workload plus the focused dispatch
+  benchmark.
+
 ## 2026-05-24 - VDBE `Opcode::String8` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_string8` in

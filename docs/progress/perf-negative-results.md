@@ -12,6 +12,33 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-24 - VDBE `Opcode::SCopy` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_scopy` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, which isolates repeated
+  shallow single-register copies from a stable integer source into one stable
+  destination register.
+- Touched during rejected candidate: `crates/fsqlite-vdbe/src/engine.rs`. The
+  candidate removed the existing `Opcode::SCopy` arm from
+  `try_execute_hot_opcode`, sending `SCopy` back through the main interpreter
+  match. The source patch was unwound after measurement.
+- Evidence:
+  baseline command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-scopy-current cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_scopy --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=896.96 ns`, `256=3.6782 us`, `1024=13.725 us`.
+  Candidate command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-scopy-without-hot cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_scopy --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=968.39 ns`, `256=3.6164 us`, `1024=13.544 us`.
+- Result: rejected. Removing the hot arm improved the 256-op and 1024-op
+  streams, but regressed the 64-op stream by about 8%, so it failed the
+  all-sizes keep gate for hot-prefilter contraction.
+- Do not retry `Opcode::SCopy` hot-dispatch removal as a standalone patch.
+  Reconsider only if a broader hot-prefilter compaction pass measures real SQL
+  instruction-cache or binary-size wins and also preserves the focused
+  `vdbe_pipeline_execute_scopy` matrix.
+
 ## 2026-05-24 - VDBE `Opcode::Int64` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_int64` in

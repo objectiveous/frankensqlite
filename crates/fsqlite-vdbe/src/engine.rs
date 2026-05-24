@@ -12452,6 +12452,11 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            Opcode::SoftNull => {
+                self.set_reg_fast(op.p1, SqliteValue::Null);
+                *pc += 1;
+                Ok(true)
+            }
             // AddImm is the canonical counter/accumulator increment, emitted
             // in row counters, aggregate folding, recursive-CTE step counters,
             // and conformance-test hot loops. Nearly every execution finds an

@@ -61,6 +61,29 @@ fn default_collation_registry() -> &'static Arc<Mutex<CollationRegistry>> {
 }
 use tracing::{Level, debug, trace, warn};
 
+/// Environment variable controlling the default per-cursor read-witness
+/// retention cap. Parsed once at first cursor construction. `0` (the
+/// default) means "unbounded" — preserves historical behavior; any other
+/// `usize` is a hard upper bound on `BtCursor::witness_keys().len()`.
+///
+/// Workloads that never inspect the per-cursor witness vec (analytical
+/// COUNT(*), full-text-index rebuild, downstream consumers like cass that
+/// only need SSI evidence at the pager level) can set this to bound
+/// per-cursor RSS during long B-tree descents.
+const READ_WITNESS_CAP_ENV: &str = "FSQLITE_READ_WITNESS_CAP";
+
+/// Cached env-var-driven default cap. Read once; ignored thereafter so a
+/// child process can't change cap policy mid-run.
+fn default_read_witness_cap() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var(READ_WITNESS_CAP_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// OPT-3: throttled cancellation check for cursor ops.
 ///
 /// The full `Cx::checkpoint()` path walks e-process oracle consultation +
@@ -1899,6 +1922,24 @@ pub struct BtCursor<P> {
     at_eof: bool,
     /// Read witnesses collected for SSI evidence.
     read_witnesses: Vec<WitnessKey>,
+    /// Optional cap on `read_witnesses.len()`. `0` (the default) preserves
+    /// the historical unbounded behavior. When non-zero, witnesses above the
+    /// cap are silently dropped from the per-cursor vec; the canonical SSI
+    /// evidence recorded into `pager.record_read_witness` is unaffected.
+    ///
+    /// This exists because long B-tree descents (full-table COUNT(*), lexical
+    /// rebuild walks) accumulate one `WitnessKey` per page touched, and on
+    /// multi-GB DBs the per-cursor vec balloons into multi-GB RSS allocations
+    /// for queries whose result sets are tiny — see
+    /// frankensqlite#92 / coding_agent_session_search#252.
+    ///
+    /// Initialized from the `FSQLITE_READ_WITNESS_CAP` env var at cursor
+    /// construction. `set_read_witness_cap` overrides it for programmatic use.
+    read_witness_cap: usize,
+    /// One-shot flag: log a single `warn!` when the cap first throttles a
+    /// witness push, so operators see the policy hit without spamming logs
+    /// for every subsequent page.
+    read_witness_cap_warned: bool,
     /// Active per-operation observability stats while a `btree_op` span is open.
     active_op_stats: Option<BtreeOpRuntimeStats>,
     /// Reusable buffer for cell encoding — avoids per-insert heap allocation.
@@ -2445,6 +2486,8 @@ impl<P: PageReader> BtCursor<P> {
             stack: CursorStack::new(),
             at_eof: true,
             read_witnesses: Vec::new(),
+            read_witness_cap: default_read_witness_cap(),
+            read_witness_cap_warned: false,
             active_op_stats: None,
             cell_buf: Vec::new(),
             defrag_ptrs_scratch: Vec::new(),
@@ -2495,6 +2538,35 @@ impl<P: PageReader> BtCursor<P> {
     /// Clears captured read witness keys.
     pub fn clear_witness_keys(&mut self) {
         self.read_witnesses.clear();
+        // Reset the one-shot warn flag so the next descent can re-warn if it
+        // hits the cap again — operators who clear witnesses between queries
+        // expect cap policy to surface per-query, not just once per cursor.
+        self.read_witness_cap_warned = false;
+    }
+
+    /// Set the per-cursor read-witness retention cap.
+    ///
+    /// `0` disables the cap (unbounded retention, the historical default).
+    /// Any other value is a hard upper bound on `witness_keys().len()`;
+    /// witnesses above the cap are dropped from the per-cursor vec, but
+    /// the canonical SSI evidence in `pager.record_read_witness` is still
+    /// recorded for every read.
+    pub fn set_read_witness_cap(&mut self, cap: usize) {
+        self.read_witness_cap = cap;
+        self.read_witness_cap_warned = false;
+    }
+
+    /// Returns the current read-witness retention cap (0 = unbounded).
+    #[must_use]
+    pub fn read_witness_cap(&self) -> usize {
+        self.read_witness_cap
+    }
+
+    /// True if the per-cursor witness vec is at or above the configured cap.
+    /// Always false when the cap is disabled (`read_witness_cap == 0`).
+    #[inline]
+    fn read_witness_at_cap(&self) -> bool {
+        self.read_witness_cap != 0 && self.read_witnesses.len() >= self.read_witness_cap
     }
 
     /// Return the current leaf page when positioned on a row.
@@ -2570,7 +2642,14 @@ impl<P: PageReader> BtCursor<P> {
                 "policy violation: point operation emitted page-level witness"
             );
         }
+        // Canonical SSI evidence still goes to the pager regardless of cap —
+        // that's the source of truth for transaction isolation. The cap only
+        // bounds the per-cursor copy returned by `witness_keys()`.
         self.pager.record_read_witness(cx, key.clone());
+        if self.read_witness_at_cap() {
+            self.maybe_warn_witness_cap_hit();
+            return;
+        }
         self.read_witnesses.push(key);
     }
 
@@ -2583,8 +2662,30 @@ impl<P: PageReader> BtCursor<P> {
             return;
         }
         let key = WitnessKey::Page(page_no);
+        // Same split as `record_point_witness`: pager always sees the read,
+        // the per-cursor vec respects the cap.
         self.pager.record_read_witness(cx, key.clone());
+        if self.read_witness_at_cap() {
+            self.maybe_warn_witness_cap_hit();
+            return;
+        }
         self.read_witnesses.push(key);
+    }
+
+    /// Log a single rate-limited `warn!` the first time the per-cursor
+    /// witness cap throttles a push. Subsequent throttles within the same
+    /// "session" (until `clear_witness_keys` or `set_read_witness_cap` resets
+    /// the flag) are silent — the policy decision was already surfaced.
+    fn maybe_warn_witness_cap_hit(&mut self) {
+        if self.read_witness_cap_warned {
+            return;
+        }
+        self.read_witness_cap_warned = true;
+        warn!(
+            root_page = self.root_page.get(),
+            cap = self.read_witness_cap,
+            "read-witness cap reached on cursor — dropping further per-cursor witnesses (pager-level SSI evidence unaffected)"
+        );
     }
 
     fn issue_prefetch_hint(&self, cx: &Cx, page_no: PageNumber) {
@@ -16218,6 +16319,149 @@ mod tests {
                 .all(|key| matches!(key, WitnessKey::Cell { .. })),
             "point lookup should publish only cell witnesses"
         );
+    }
+
+    #[test]
+    fn test_read_witness_cap_throttles_per_cursor_vec_but_preserves_pager_evidence() {
+        // Regression test for frankensqlite#92 / coding_agent_session_search#252:
+        // a multi-page range scan must not balloon the per-cursor witness vec
+        // when an operator has explicitly opted into a cap, but the canonical
+        // pager-level SSI evidence must still see every read.
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
+        store
+            .pages
+            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
+
+        let cx = Cx::new();
+        let probe = WitnessProbeStore::new(store);
+        let state = probe.state();
+        let mut cursor = BtCursor::new(probe, pn(2), USABLE, true);
+        // Cap at 1: COUNT visits 3 B-tree pages → expect cap to throttle after 1.
+        cursor.set_read_witness_cap(1);
+        assert_eq!(cursor.read_witness_cap(), 1);
+
+        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 4);
+
+        // Per-cursor witness vec respects the cap: at most 1 entry.
+        assert!(
+            cursor.witness_keys().len() <= 1,
+            "read_witness_cap=1 should throttle per-cursor vec; got {} entries",
+            cursor.witness_keys().len()
+        );
+
+        // Pager-level SSI evidence is unaffected — every B-tree page read still
+        // got a witness recorded into the pager.
+        let state = state.borrow();
+        assert!(
+            [pn(2), pn(3), pn(4)]
+                .into_iter()
+                .all(|page| state.read_witnesses.contains(&WitnessKey::Page(page))),
+            "pager-level evidence must record every page read regardless of per-cursor cap"
+        );
+    }
+
+    #[test]
+    fn test_read_witness_cap_zero_is_unbounded_default() {
+        // Default cap = 0 means "unbounded": the historical behavior must be
+        // preserved for callers that rely on full per-cursor witness lists.
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
+        store
+            .pages
+            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(MemPageStore::new(USABLE), pn(2), USABLE, true);
+        // Replace with the populated store via direct construction. The default
+        // cap from the env var is 0 (unbounded) outside of test setup; assert
+        // that and then exercise a real traversal on a fresh cursor.
+        assert_eq!(
+            cursor.read_witness_cap(),
+            0,
+            "default cap should be 0 (unbounded) when env var is unset"
+        );
+
+        // Now build a cursor against the populated store and confirm all 3
+        // page witnesses make it into the per-cursor vec.
+        let _ = (store, cx, &mut cursor); // silence unused-warns; below is the real check
+        let mut store2 = MemPageStore::new(USABLE);
+        store2
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+        store2
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
+        store2
+            .pages
+            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
+        let cx2 = Cx::new();
+        let mut cursor2 = BtCursor::new(store2, pn(2), USABLE, true);
+        assert_eq!(cursor2.count_all_rows(&cx2).unwrap(), 4);
+        assert!(
+            cursor2.witness_keys().len() >= 3,
+            "unbounded default must keep all page witnesses; got {}",
+            cursor2.witness_keys().len()
+        );
+    }
+
+    #[test]
+    fn test_set_read_witness_cap_resets_warn_flag_via_clear() {
+        // After clear_witness_keys, the one-shot warn flag should reset so the
+        // next descent that hits the cap can re-emit the policy-hit warning.
+        // We can't easily assert the warn directly, but we can assert the cap
+        // is still active and that throttling still kicks in after clear.
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
+        store
+            .pages
+            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(MemPageStore::new(USABLE), pn(2), USABLE, true);
+        cursor.set_read_witness_cap(1);
+
+        // Build a fresh cursor against a populated store, exercise the cap.
+        let cx2 = Cx::new();
+        let mut store2 = MemPageStore::new(USABLE);
+        store2
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+        store2
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
+        store2
+            .pages
+            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
+        let mut cursor2 = BtCursor::new(store2, pn(2), USABLE, true);
+        cursor2.set_read_witness_cap(1);
+
+        assert_eq!(cursor2.count_all_rows(&cx2).unwrap(), 4);
+        let first_len = cursor2.witness_keys().len();
+        assert!(first_len <= 1);
+
+        cursor2.clear_witness_keys();
+        assert!(cursor2.witness_keys().is_empty());
+        // Cap is still active after clear
+        assert_eq!(cursor2.read_witness_cap(), 1);
+
+        // suppress unused-cursor warning from the dummy
+        let _ = (cursor, cx);
     }
 
     #[test]

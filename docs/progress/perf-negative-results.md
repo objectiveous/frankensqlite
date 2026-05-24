@@ -12,6 +12,38 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-24 - VDBE `Opcode::Or` hot-dispatch promotion
+
+- Target: `vdbe_pipeline_execute_or` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, added during this pass to
+  isolate boolean `Opcode::Or` dispatch cost with stable non-NULL boolean
+  inputs and a stable destination register.
+- Durable infra kept:
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs` now includes the focused
+  `Or` dispatch benchmark so future hot-dispatch work can remeasure this
+  opcode directly.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate added a byte-equivalent
+  `Opcode::Or` arm to `try_execute_hot_opcode`, mirroring the existing
+  main-match arm by reading p1/p2, calling `sql_or`, writing p3, and advancing
+  the program counter. The source patch was unwound after measurement.
+- Evidence:
+  baseline command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-or-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_or --warm-up-time 1 --measurement-time 4`
+  on worker `ts2` measured medians
+  `64=2.0166 us`, `256=7.7393 us`, `1024=30.533 us`.
+  Candidate command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-or-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_or --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=2.0945 us`, `256=9.9402 us`, `1024=31.803 us`.
+- Result: rejected. The extra hot pre-filter arm regressed every measured
+  dispatch stream, with the 256-op stream especially worse, so reducing the
+  main-match path did not offset growing the hot-match filter.
+- Do not retry `Opcode::Or` hot-dispatch promotion as a standalone patch.
+  Reconsider only if a real SQL workload profile shows `Or` dominating enough
+  to justify growing the hot pre-filter, and require a same-worker A/B rerun
+  against that real workload plus the focused dispatch benchmark.
+
 ## 2026-05-24 - VDBE `Opcode::And` hot-dispatch promotion
 
 - Target: `vdbe_pipeline_execute_and` in

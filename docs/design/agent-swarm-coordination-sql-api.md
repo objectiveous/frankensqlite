@@ -520,8 +520,13 @@ the advisory contract and diagnostics.
 | `mode` | TEXT | yes | `advisory` or `enforced`. Initial implementation uses `advisory`. |
 | `state` | TEXT | yes | `available`, `assigned`, `released`, or `retired`. |
 | `assigned_at_ms` | INTEGER | no | Assignment time. |
+| `renewed_at_ms` | INTEGER | no | Last successful renewal time. |
 | `expires_at_ms` | INTEGER | no | Optional assignment expiration. |
 | `split_parent` | TEXT | no | Parent range id for split lineage. |
+| `predicted_page_start` | INTEGER | no | First page expected to receive writes from this range, when known. |
+| `predicted_page_end` | INTEGER | no | Last page expected to receive writes from this range, when known. |
+| `observed_conflict_count` | INTEGER | yes | Count of observed same-range/page conflicts used for diagnostics. |
+| `imbalance_reason` | TEXT | yes | `balanced` or a stable reason an operator should split/merge/rebalance. |
 | `last_reason_code` | TEXT | no | Last stable reason code for this range. |
 
 Constraints:
@@ -558,6 +563,28 @@ UPDATE fsqlite_worker_ranges
    )
 RETURNING range_name, range_id, table_name, index_name, range_start,
           range_end, owner_id, generation, mode, last_reason_code;
+```
+
+### Renew
+
+Renewal extends the current assignment only when the caller still owns the
+current generation. A stale worker must observe no mutation row and refresh
+ownership before retrying.
+
+```sql
+UPDATE fsqlite_worker_ranges
+   SET renewed_at_ms = :now_ms,
+       expires_at_ms = :now_ms + :ttl_ms,
+       last_reason_code = 'ok'
+ WHERE range_name = :range_name
+   AND range_id = :range_id
+   AND owner_id = :worker_id
+   AND lease_token = :lease_token
+   AND generation = :generation
+   AND state = 'assigned'
+   AND (expires_at_ms IS NULL OR expires_at_ms > :now_ms)
+RETURNING range_name, range_id, owner_id, generation, expires_at_ms,
+          last_reason_code;
 ```
 
 ### Split
@@ -761,6 +788,44 @@ still succeed, but diagnostics must expose:
 - `diagnostics_available = true`
 
 Fallback must never be used to silently disable concurrent-writer mode.
+
+### Executable Ordinary-Table Contract Slice for `.5`
+
+`bd-agent-swarm-coordination-transparency-8jr6u.5` starts from an
+ordinary-table range allocator shim before the built-in virtual table lands.
+The shim uses `fsqlite_worker_ranges_contract`,
+`fsqlite_worker_range_reason_codes_contract`, and a small deterministic
+conflict-model table to pin row shape and semantics without adding parser
+syntax or runtime locking as a prerequisite.
+
+The executable contract lives in
+`crates/fsqlite-core/tests/agent_swarm_worker_range_contract.rs`. It proves:
+
+- Stable range reason-code rows exist for `range_exhausted`,
+  `range_overlap`, `range_gap`, `range_owner_mismatch`,
+  `range_invalid_bounds`, `range_generation_conflict`,
+  `range_invalid_state`, and `range_enforced_unsupported`.
+- Allocation, renewal, release, exhausted allocation, owner/generation
+  mismatch, split, merge, overlap rejection, invalid bounds, and rollback are
+  expressed as normal transactional SQL.
+- Introspection exposes range id, table/index, encoded bounds, owner, mode,
+  state, predicted page span, observed conflicts, imbalance reason, and stable
+  reason code.
+- A deterministic conflict model compares naive shared-key workers with
+  range-aware workers and shows the range-aware assignment removes modeled
+  same-page conflicts without serializing writers.
+
+Future code that exposes this as `fsqlite_worker_ranges` must preserve this
+contract:
+
+1. Keep range bounds disjoint for non-retired rows in the same
+   `(range_name, table_name, index_name)` scope.
+2. Treat range ownership as advisory metadata until enforced mode has separate
+   correctness proof.
+3. Require owner, token, and generation for renewal/release of assigned ranges.
+4. Keep split/merge transactional and rollback-safe.
+5. Surface page-span and imbalance diagnostics so operators can choose when to
+   split, merge, or rebalance worker ranges.
 
 ### Executable Ordinary-Table Contract Slice for `.7`
 

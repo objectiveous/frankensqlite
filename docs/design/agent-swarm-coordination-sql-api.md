@@ -762,6 +762,45 @@ still succeed, but diagnostics must expose:
 
 Fallback must never be used to silently disable concurrent-writer mode.
 
+### Executable Ordinary-Table Contract Slice for `.7`
+
+`bd-agent-swarm-coordination-transparency-8jr6u.7` starts from an
+ordinary-table diagnostic shim before the built-in event table and PRAGMA
+surface land. The shim uses `fsqlite_fallback_reason_codes_contract` and
+`fsqlite_fallback_events_contract` to pin the stable row shape for fallback
+classification, impact fields, and operator aggregation. This keeps the first
+proof on normal SQL DML, aggregation, rollback, and reset semantics without
+adding parser syntax or editing runtime fallback dispatch as a prerequisite.
+
+The executable contract lives in
+`crates/fsqlite-core/tests/agent_swarm_fallback_transparency_contract.rs`. It
+proves:
+
+- Stable reason-code rows exist for `unsupported_sql_shape`,
+  `planner_bypass`, `storage_fallback`, and `diagnostics_unavailable`.
+- Supported fast-path statements keep `fallback_reason` empty while still
+  exposing diagnostics availability.
+- Mixed workloads aggregate fallback frequency by `statement_fingerprint`,
+  `plan_id`, `table_name`, `workload_lane`, and `fallback_reason`.
+- Aggregates preserve concurrency, durability, memory, latency, diagnostics,
+  and first-failure diagnostic fields.
+- Fallback event rows are transactional and roll back with the caller's
+  transaction.
+- Diagnostic reset clears the bounded event state without changing SQL
+  correctness or concurrent-writer defaults.
+
+Future code that exposes this as `fsqlite_coordination_events`, PRAGMA output,
+or `EXPLAIN CONCURRENCY` rows must preserve this row-shape contract:
+
+1. Keep stable fallback reason codes golden-testable; human text may evolve.
+2. Do not count supported fast paths as compatibility fallback work.
+3. Aggregate by statement, plan, table, workload lane, and reason so operators
+   can identify swarm-responsive native-path gaps.
+4. Preserve `supported_fast_path`, `fallback_reason`, impact fields,
+   `diagnostics_available`, and `first_failure_diag`.
+5. Never use fallback transparency to disable concurrent-writer mode or add a
+   file-level writer bottleneck.
+
 ## Required Tests
 
 Implementation beads must name and land tests in these categories:

@@ -17,6 +17,10 @@ pub const SWARM_SLO_POLICY_BEAD_ID: &str = "bd-swarm-slo-resource-governor-qb256
 pub const SWARM_SLO_POLICY_ID: &str = "swarm-slo-shadow.v1";
 /// Machine-readable schema version for decisions emitted by this module.
 pub const SWARM_SLO_DECISION_SCHEMA_VERSION: u32 = 1;
+/// Owning bead for operator-facing SLO governor output.
+pub const SWARM_SLO_OPERATOR_BEAD_ID: &str = "bd-swarm-slo-resource-governor-qb256.5";
+/// Machine-readable schema version for operator reports emitted by this module.
+pub const SWARM_SLO_OPERATOR_REPORT_SCHEMA_VERSION: u32 = 1;
 
 const PER_MILLE: u64 = 1_000;
 
@@ -421,6 +425,113 @@ pub struct SwarmSloDecision {
     pub safe_mode_active_after: bool,
 }
 
+/// Status of one operator-visible SLO budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmSloOperatorBudgetStatus {
+    /// The metric is comfortably inside its configured limit.
+    Within,
+    /// The metric is inside the limit but close enough to deserve attention.
+    NearLimit,
+    /// The metric exceeded its configured limit.
+    OverLimit,
+    /// The metric could not be measured in the current sample.
+    Unmeasured,
+}
+
+/// Fallback risk level surfaced to operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmSloFallbackPathRisk {
+    /// No fallback or degraded signal was observed.
+    NoneObserved,
+    /// No compatibility fallback was observed, but signal quality is degraded.
+    DegradedSignalsOnly,
+    /// A compatibility fallback or first-failure diagnostic was observed.
+    CompatibilityFallbackObserved,
+    /// The concurrent-writer default invariant was not observed.
+    ConcurrentDefaultBroken,
+}
+
+/// One SLO budget row in the operator report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmSloOperatorBudget {
+    /// Stable metric name.
+    pub metric: String,
+    /// Observed value, or `None` if the metric was not measured.
+    pub observed: Option<u64>,
+    /// Configured limit for this metric.
+    pub limit: u64,
+    /// Unit for both `observed` and `limit`.
+    pub unit: String,
+    /// Budget status.
+    pub status: SwarmSloOperatorBudgetStatus,
+    /// Operator-facing explanation.
+    pub guidance: String,
+}
+
+/// Evidence identity copied into operator output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmSloOperatorEvidenceContext {
+    /// Stable run identifier.
+    pub run_id: String,
+    /// Trace identifier.
+    pub trace_id: String,
+    /// Scenario identifier.
+    pub scenario_id: String,
+    /// Backend label.
+    pub backend: String,
+    /// Resource profile identifier.
+    pub profile_id: String,
+    /// Sample source.
+    pub sample_source: SwarmSloSampleSource,
+    /// Optional artifact path.
+    pub artifact_path: Option<String>,
+    /// Optional artifact hash.
+    pub artifact_hash: Option<String>,
+    /// First failure diagnostic, or `none`.
+    pub first_failure_diag: String,
+}
+
+/// Deterministic operator-facing report for one SLO governor decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmSloOperatorReport {
+    /// Report schema version.
+    pub schema_version: u32,
+    /// Owning bead identifier.
+    pub bead_id: String,
+    /// Policy version that produced the decision.
+    pub policy_id: String,
+    /// Decision identifier from the policy engine.
+    pub decision_id: u64,
+    /// Matched guardrail.
+    pub guardrail_id: String,
+    /// Caller-requested control mode.
+    pub control_mode: SwarmSloControlMode,
+    /// Recommended action.
+    pub action: SwarmSloAction,
+    /// Short action summary for CLIs and doctor output.
+    pub action_summary: String,
+    /// Evidence identity.
+    pub evidence: SwarmSloOperatorEvidenceContext,
+    /// Current SLO budget rows.
+    pub budgets: Vec<SwarmSloOperatorBudget>,
+    /// Active recommendations and caveats.
+    pub active_recommendations: Vec<String>,
+    /// Degraded signal-quality annotations.
+    pub degraded_signal_quality: Vec<SwarmSloDegradedSignal>,
+    /// Fallback-path risk classification.
+    pub fallback_path_risk: SwarmSloFallbackPathRisk,
+    /// Compatibility fallback summary.
+    pub compatibility_fallback_summary: String,
+    /// Operator kill-switch guidance.
+    pub kill_switches: Vec<String>,
+    /// Safe-mode guidance.
+    pub safe_mode_guidance: String,
+    /// Guardrail against uncited performance claims.
+    pub measurement_guardrail: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuleMatch {
     guardrail_id: &'static str,
@@ -465,6 +576,322 @@ pub fn evaluate_swarm_slo(
         concurrent_mode_default_observed: input.concurrent_mode_default_observed,
         safe_mode_active_after: state.safe_mode_active,
     }
+}
+
+/// Build deterministic operator output from an evaluated governor decision.
+#[must_use]
+pub fn build_swarm_slo_operator_report(
+    decision: &SwarmSloDecision,
+    config: &SwarmSloGovernorConfig,
+) -> SwarmSloOperatorReport {
+    SwarmSloOperatorReport {
+        schema_version: SWARM_SLO_OPERATOR_REPORT_SCHEMA_VERSION,
+        bead_id: SWARM_SLO_OPERATOR_BEAD_ID.to_owned(),
+        policy_id: decision.policy_id.clone(),
+        decision_id: decision.decision_id,
+        guardrail_id: decision.guardrail_id.clone(),
+        control_mode: decision.control_mode,
+        action: decision.action,
+        action_summary: operator_action_summary(decision.action),
+        evidence: operator_evidence_context(decision),
+        budgets: operator_budgets(decision, config),
+        active_recommendations: active_operator_recommendations(decision),
+        degraded_signal_quality: decision.degraded_signals.iter().copied().collect(),
+        fallback_path_risk: fallback_path_risk(decision),
+        compatibility_fallback_summary: compatibility_fallback_summary(decision),
+        kill_switches: operator_kill_switches(decision),
+        safe_mode_guidance: safe_mode_guidance(decision, config),
+        measurement_guardrail: "This report only describes observed budgets and guardrails; it does not claim performance improvement without benchmark artifacts.".to_owned(),
+    }
+}
+
+fn operator_evidence_context(decision: &SwarmSloDecision) -> SwarmSloOperatorEvidenceContext {
+    let evidence = &decision.evidence;
+
+    SwarmSloOperatorEvidenceContext {
+        run_id: evidence.run_id.clone(),
+        trace_id: evidence.trace_id.clone(),
+        scenario_id: evidence.scenario_id.clone(),
+        backend: evidence.backend.clone(),
+        profile_id: evidence.profile_id.clone(),
+        sample_source: evidence.sample_source,
+        artifact_path: evidence.artifact_path.clone(),
+        artifact_hash: evidence.artifact_hash.clone(),
+        first_failure_diag: evidence.first_failure_diag.clone(),
+    }
+}
+
+fn operator_budgets(
+    decision: &SwarmSloDecision,
+    config: &SwarmSloGovernorConfig,
+) -> Vec<SwarmSloOperatorBudget> {
+    let evidence = &decision.evidence;
+    let derived = &decision.derived;
+
+    vec![
+        operator_budget(
+            "writer_saturation_per_mille",
+            Some(derived.writer_saturation_per_mille),
+            config.writer_saturation_threshold_per_mille,
+            "per_mille",
+            "active writers per available core",
+        ),
+        operator_budget(
+            "publish_contention_per_mille",
+            derived.publish_contention_per_mille,
+            config.publish_contention_threshold_per_mille,
+            "per_mille",
+            "publish-window occupancy per available core",
+        ),
+        operator_budget(
+            "tail_stress_per_mille",
+            Some(derived.tail_stress_per_mille),
+            config.tail_stress_threshold_per_mille,
+            "per_mille",
+            "p99 latency divided by p50 latency",
+        ),
+        operator_budget(
+            "retry_rate_per_mille",
+            Some(u64::from(evidence.retry_rate_per_mille)),
+            u64::from(config.retry_rate_threshold_per_mille),
+            "per_mille",
+            "commit retry rate in the sample window",
+        ),
+        operator_budget(
+            "abort_rate_per_mille",
+            Some(u64::from(evidence.abort_rate_per_mille)),
+            u64::from(config.abort_rate_threshold_per_mille),
+            "per_mille",
+            "transaction abort rate in the sample window",
+        ),
+        operator_budget(
+            "evidence_queue_drops",
+            Some(u64::from(evidence.evidence_queue_drops)),
+            u64::from(config.evidence_drop_threshold),
+            "count",
+            "dropped evidence samples",
+        ),
+        operator_budget(
+            "invalidation_fallback_count",
+            Some(u64::from(evidence.invalidation_fallback_count)),
+            u64::from(config.invalidation_fallback_threshold),
+            "count",
+            "inline invalidation compatibility fallbacks",
+        ),
+        operator_budget(
+            "max_chain_depth",
+            Some(u64::from(evidence.max_chain_depth)),
+            u64::from(config.max_chain_depth_critical),
+            "versions",
+            "maximum MVCC version-chain depth",
+        ),
+        operator_budget(
+            "wal_frames_pending_checkpoint",
+            Some(u64::from(evidence.wal_frames_pending_checkpoint)),
+            u64::from(config.wal_frames_restart_threshold),
+            "frames",
+            "WAL frames pending checkpoint",
+        ),
+        operator_budget(
+            "latency_p99_ns",
+            Some(evidence.latency_p99_ns),
+            config.safe_mode_p99_threshold_ns,
+            "ns",
+            "user-visible p99 latency",
+        ),
+        operator_budget(
+            "build_or_test_saturation_per_mille",
+            Some(u64::from(evidence.build_or_test_saturation_per_mille)),
+            u64::from(config.build_test_saturation_threshold_per_mille),
+            "per_mille",
+            "agent proof/build/test saturation",
+        ),
+    ]
+}
+
+fn operator_budget(
+    metric: &str,
+    observed: Option<u64>,
+    limit: u64,
+    unit: &str,
+    guidance: &str,
+) -> SwarmSloOperatorBudget {
+    SwarmSloOperatorBudget {
+        metric: metric.to_owned(),
+        observed,
+        limit,
+        unit: unit.to_owned(),
+        status: operator_budget_status(observed, limit),
+        guidance: guidance.to_owned(),
+    }
+}
+
+fn operator_budget_status(observed: Option<u64>, limit: u64) -> SwarmSloOperatorBudgetStatus {
+    let Some(observed) = observed else {
+        return SwarmSloOperatorBudgetStatus::Unmeasured;
+    };
+
+    if observed > limit {
+        SwarmSloOperatorBudgetStatus::OverLimit
+    } else if observed.saturating_mul(10) >= limit.saturating_mul(9) {
+        SwarmSloOperatorBudgetStatus::NearLimit
+    } else {
+        SwarmSloOperatorBudgetStatus::Within
+    }
+}
+
+fn active_operator_recommendations(decision: &SwarmSloDecision) -> Vec<String> {
+    let mut recommendations = vec![
+        operator_action_summary(decision.action),
+        format!(
+            "guardrail {} matched; {}",
+            decision.guardrail_id, decision.counterfactual
+        ),
+        format!("operator regret: {}", decision.regret),
+    ];
+
+    if !decision.concurrent_mode_default_observed {
+        recommendations.push(
+            "stop rollout and inspect concurrent-mode defaults before trusting governor output"
+                .to_owned(),
+        );
+    }
+
+    if !decision.degraded_signals.is_empty() {
+        recommendations.push(
+            "treat this as degraded signal quality; do not promote to enforced mode from this sample alone"
+                .to_owned(),
+        );
+    }
+
+    if decision.control_mode == SwarmSloControlMode::Enforced {
+        recommendations.push(
+            "enforced mode was requested, but this operator report only explains the decision"
+                .to_owned(),
+        );
+    }
+
+    recommendations
+}
+
+fn operator_action_summary(action: SwarmSloAction) -> String {
+    match action {
+        SwarmSloAction::Admit => "admit foreground work and continue shadow monitoring".to_owned(),
+        SwarmSloAction::Defer { park_budget_us } => {
+            format!("defer admission for up to {park_budget_us}us")
+        }
+        SwarmSloAction::ApplyBackpressure => {
+            "apply fail-closed backpressure until the guardrail clears".to_owned()
+        }
+        SwarmSloAction::ShrinkHelperBudget { target_lane } => {
+            format!(
+                "shrink optional {} helper work before foreground work",
+                helper_lane_name(target_lane)
+            )
+        }
+        SwarmSloAction::ForceSafeMode => {
+            "enter or hold safe mode without disabling concurrent writers".to_owned()
+        }
+        SwarmSloAction::TriggerEmergencyGc => {
+            "trigger emergency GC for the current pressure event".to_owned()
+        }
+        SwarmSloAction::TriggerCheckpoint => {
+            "trigger checkpoint pressure relief if no checkpoint is active".to_owned()
+        }
+    }
+}
+
+const fn helper_lane_name(lane: SwarmSloHelperLane) -> &'static str {
+    match lane {
+        SwarmSloHelperLane::Evidence => "evidence",
+        SwarmSloHelperLane::Invalidation => "invalidation",
+        SwarmSloHelperLane::AgentProof => "agent-proof",
+    }
+}
+
+fn fallback_path_risk(decision: &SwarmSloDecision) -> SwarmSloFallbackPathRisk {
+    let evidence = &decision.evidence;
+
+    if !decision.concurrent_mode_default_observed {
+        SwarmSloFallbackPathRisk::ConcurrentDefaultBroken
+    } else if evidence.invalidation_fallback_count > 0
+        || first_failure_diag_is_present(&evidence.first_failure_diag)
+    {
+        SwarmSloFallbackPathRisk::CompatibilityFallbackObserved
+    } else if decision.degraded_signals.is_empty() {
+        SwarmSloFallbackPathRisk::NoneObserved
+    } else {
+        SwarmSloFallbackPathRisk::DegradedSignalsOnly
+    }
+}
+
+fn compatibility_fallback_summary(decision: &SwarmSloDecision) -> String {
+    let evidence = &decision.evidence;
+
+    if evidence.invalidation_fallback_count > 0 {
+        return format!(
+            "{} inline invalidation fallback event(s) observed; compatibility fallback is visible in this report",
+            evidence.invalidation_fallback_count
+        );
+    }
+
+    if first_failure_diag_is_present(&evidence.first_failure_diag) {
+        return format!(
+            "first-failure diagnostic is present and must be reviewed before rollout: {}",
+            evidence.first_failure_diag
+        );
+    }
+
+    if decision.degraded_signals.is_empty() {
+        "no compatibility fallback or degraded signal was observed in this sample".to_owned()
+    } else {
+        "no compatibility fallback event was observed, but degraded telemetry is listed explicitly"
+            .to_owned()
+    }
+}
+
+fn first_failure_diag_is_present(diag: &str) -> bool {
+    let trimmed = diag.trim();
+    !trimmed.is_empty() && trimmed != "none"
+}
+
+fn operator_kill_switches(decision: &SwarmSloDecision) -> Vec<String> {
+    let mut switches = vec![
+        "shadow_mode_only: keep control_mode=shadow so actions remain recommendations".to_owned(),
+        "safe_mode: suppress optional helper pressure while concurrent-writer defaults stay enabled"
+            .to_owned(),
+        "helper_budget_shrink: reduce evidence, invalidation, or agent-proof helper lanes before foreground work"
+            .to_owned(),
+    ];
+
+    if matches!(
+        decision.action,
+        SwarmSloAction::ApplyBackpressure | SwarmSloAction::ForceSafeMode
+    ) {
+        switches.push(
+            "admission_backpressure: fail closed instead of admitting unbounded pressure"
+                .to_owned(),
+        );
+    }
+
+    switches
+}
+
+fn safe_mode_guidance(decision: &SwarmSloDecision, config: &SwarmSloGovernorConfig) -> String {
+    if !decision.concurrent_mode_default_observed {
+        return "do not use safe mode as a compatibility shim; restore the concurrent-writer default before rollout"
+            .to_owned();
+    }
+
+    if decision.action == SwarmSloAction::ForceSafeMode || decision.safe_mode_active_after {
+        return format!(
+            "enter or hold safe mode until {} consecutive healthy samples; keep concurrent-writer mode enabled",
+            config.recovery_healthy_decisions
+        );
+    }
+
+    "safe mode is not required for this decision; keep concurrent-writer mode enabled and leave enforcement gated on proof artifacts"
+        .to_owned()
 }
 
 fn normalize_degraded_signals(
@@ -907,8 +1334,9 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_mode_default_guard_fails_closed_without_mutating_connection() {
-        let conn = fsqlite_core::connection::Connection::open(":memory:").unwrap();
+    fn concurrent_mode_default_guard_fails_closed_without_mutating_connection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let conn = fsqlite_core::connection::Connection::open(":memory:")?;
         assert!(conn.is_concurrent_mode_default());
 
         let mut input = healthy_input();
@@ -933,14 +1361,123 @@ mod tests {
             fail_closed_decision.action,
             SwarmSloAction::ApplyBackpressure
         );
+
+        Ok(())
     }
 
     #[test]
-    fn decisions_are_json_serializable_for_evidence_artifacts() {
+    fn decisions_are_json_serializable_for_evidence_artifacts()
+    -> Result<(), Box<dyn std::error::Error>> {
         let decision = evaluate_swarm_slo_once(&healthy_input());
-        let encoded = serde_json::to_string(&decision).unwrap();
+        let encoded = serde_json::to_string(&decision)?;
 
         assert!(encoded.contains(SWARM_SLO_POLICY_ID));
         assert!(encoded.contains("swarm-slo-shadow.v1"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn operator_report_lists_budgets_guidance_and_no_perf_claim() {
+        let config = SwarmSloGovernorConfig::default();
+        let decision = evaluate_swarm_slo_once(&healthy_input());
+        let report = build_swarm_slo_operator_report(&decision, &config);
+
+        assert_eq!(
+            report.schema_version,
+            SWARM_SLO_OPERATOR_REPORT_SCHEMA_VERSION
+        );
+        assert_eq!(report.bead_id, SWARM_SLO_OPERATOR_BEAD_ID);
+        assert_eq!(report.action, SwarmSloAction::Admit);
+        assert!(report.action_summary.contains("admit foreground work"));
+        assert!(
+            report
+                .budgets
+                .iter()
+                .any(|budget| budget.metric == "writer_saturation_per_mille"
+                    && budget.status == SwarmSloOperatorBudgetStatus::Within)
+        );
+        assert!(
+            report
+                .kill_switches
+                .iter()
+                .any(|switch| switch.contains("shadow_mode_only"))
+        );
+        assert!(
+            report
+                .measurement_guardrail
+                .contains("does not claim performance improvement")
+        );
+        assert_eq!(
+            report.fallback_path_risk,
+            SwarmSloFallbackPathRisk::DegradedSignalsOnly
+        );
+        assert!(
+            report
+                .degraded_signal_quality
+                .contains(&SwarmSloDegradedSignal::MissingP999)
+        );
+        assert!(
+            report
+                .degraded_signal_quality
+                .contains(&SwarmSloDegradedSignal::ReplayOnlyInput)
+        );
+    }
+
+    #[test]
+    fn operator_report_surfaces_fallback_and_safe_mode_without_disabling_concurrency() {
+        let config = SwarmSloGovernorConfig::default();
+        let mut input = healthy_input();
+        input.latency_p50_ns = 10_000_000;
+        input.latency_p99_ns = config.safe_mode_p99_threshold_ns + 1;
+        input.invalidation_fallback_count = 1;
+        input.first_failure_diag =
+            "fallback path used after invalidation queue pressure".to_owned();
+
+        let decision = evaluate_swarm_slo_once(&input);
+        let report = build_swarm_slo_operator_report(&decision, &config);
+
+        assert_eq!(report.action, SwarmSloAction::ForceSafeMode);
+        assert_eq!(
+            report.fallback_path_risk,
+            SwarmSloFallbackPathRisk::CompatibilityFallbackObserved
+        );
+        assert!(
+            report
+                .compatibility_fallback_summary
+                .contains("inline invalidation fallback")
+        );
+        assert!(
+            report
+                .safe_mode_guidance
+                .contains("keep concurrent-writer mode enabled")
+        );
+        assert!(
+            report
+                .kill_switches
+                .iter()
+                .any(|switch| switch.contains("admission_backpressure"))
+        );
+    }
+
+    #[test]
+    fn operator_report_marks_missing_publish_budget_unmeasured() {
+        let config = SwarmSloGovernorConfig::default();
+        let mut input = healthy_input();
+        input.publish_window_occupancy = None;
+        input.publish_window_p99_ns = None;
+
+        let decision = evaluate_swarm_slo_once(&input);
+        let report = build_swarm_slo_operator_report(&decision, &config);
+
+        assert!(report.budgets.iter().any(|budget| {
+            budget.metric == "publish_contention_per_mille"
+                && budget.status == SwarmSloOperatorBudgetStatus::Unmeasured
+        }));
+        assert!(
+            report
+                .degraded_signal_quality
+                .contains(&SwarmSloDegradedSignal::MissingPublishWindow)
+        );
     }
 }

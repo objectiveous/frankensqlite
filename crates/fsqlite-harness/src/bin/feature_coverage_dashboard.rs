@@ -53,21 +53,21 @@ impl Config {
                     let value = args
                         .get(index)
                         .ok_or_else(|| "missing value for --run-id".to_owned())?;
-                    run_metadata.run_id = value.to_owned();
+                    value.clone_into(&mut run_metadata.run_id);
                 }
                 "--trace-id" => {
                     index += 1;
                     let value = args
                         .get(index)
                         .ok_or_else(|| "missing value for --trace-id".to_owned())?;
-                    run_metadata.trace_id = value.to_owned();
+                    value.clone_into(&mut run_metadata.trace_id);
                 }
                 "--scenario-id" => {
                     index += 1;
                     let value = args
                         .get(index)
                         .ok_or_else(|| "missing value for --scenario-id".to_owned())?;
-                    run_metadata.scenario_id = value.to_owned();
+                    value.clone_into(&mut run_metadata.scenario_id);
                 }
                 "--seed" => {
                     index += 1;

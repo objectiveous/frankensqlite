@@ -12,6 +12,42 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-24 - VDBE `Opcode::Concat` hot-dispatch promotion
+
+- Target: `vdbe_pipeline_execute_concat` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, added during this pass to
+  isolate repeated `Concat` ops over stable text inputs. The benchmark seeds
+  two source registers once and writes each `p2 || p1` result into a stable
+  output register, so it measures concat dispatch plus the text-text fast path
+  without mutating source operands.
+- Durable infra kept:
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs` now includes the focused
+  `Concat` dispatch benchmark so future work can remeasure this opcode
+  directly.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate added a byte-equivalent
+  `Opcode::Concat` arm to `try_execute_hot_opcode`, mirroring the existing
+  main-match body by applying SQLite operand order `p2 || p1`, preserving NULL
+  propagation, using the existing text-text allocation fast path, and advancing
+  the program counter. The source patch was unwound after measurement.
+- Evidence:
+  baseline command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-concat-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_concat --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=3.6793 us`, `256=14.440 us`, `1024=60.860 us`.
+  Candidate command
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-concat-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_concat --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=4.0486 us`, `256=14.105 us`, `1024=53.392 us`.
+- Result: rejected. The candidate improved the 256-op and 1024-op streams, but
+  regressed the 64-op stream, so it did not clear the all-sizes keep gate for a
+  standalone hot pre-filter expansion.
+- Do not retry `Opcode::Concat` hot-dispatch promotion as a standalone patch.
+  Reconsider only if a real string-heavy SQL workload profile shows concat
+  dominating enough to justify growing the hot pre-filter, and require a
+  same-worker A/B rerun against that workload plus the focused dispatch
+  benchmark.
+
 ## 2026-05-24 - VDBE `Opcode::Blob` hot-dispatch promotion
 
 - Target: `vdbe_pipeline_execute_blob` in

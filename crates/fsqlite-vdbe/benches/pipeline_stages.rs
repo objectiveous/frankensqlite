@@ -201,6 +201,43 @@ fn build_execute_stage_softnull_program(op_repeats: usize) -> VdbeProgram {
         .expect("pipeline execute softnull benchmark program should build")
 }
 
+/// Build a dispatch-dominated program whose inner loop is a stream of `Concat`
+/// ops over stable text inputs. Each iteration writes into the same output
+/// register without mutating the sources, isolating concat dispatch and the
+/// text-text fast path.
+fn build_execute_stage_concat_program(op_repeats: usize) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    let end = builder.emit_label();
+    builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+    let lhs = builder.alloc_reg();
+    let rhs = builder.alloc_reg();
+    let out = builder.alloc_reg();
+    builder.emit_op(
+        Opcode::String8,
+        0,
+        lhs,
+        0,
+        P4::Str("fsqlite-concat-left".to_owned()),
+        0,
+    );
+    builder.emit_op(
+        Opcode::String8,
+        0,
+        rhs,
+        0,
+        P4::Str("fsqlite-concat-right".to_owned()),
+        0,
+    );
+    for _ in 0..op_repeats {
+        builder.emit_op(Opcode::Concat, rhs, lhs, out, P4::None, 0);
+    }
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder.resolve_label(end);
+    builder
+        .finish()
+        .expect("pipeline execute concat benchmark program should build")
+}
+
 /// Build a dispatch-dominated program whose inner loop is a stream of `Add`
 /// ops over stable integer inputs. The opcode writes into a separate output
 /// register so every iteration exercises the same integer-add body without
@@ -1195,6 +1232,39 @@ fn bench_vdbe_execute_softnull_stage(c: &mut Criterion) {
                     let outcome = engine
                         .execute(program)
                         .expect("pipeline execute softnull benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_vdbe_execute_concat_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_concat");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let program = build_execute_stage_concat_program(op_repeats);
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &program,
+            |b, program| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute concat benchmark should execute");
                     black_box(outcome);
                 });
             },
@@ -2282,6 +2352,7 @@ criterion_group!(
     bench_vdbe_execute_string8_stage,
     bench_vdbe_execute_string_stage,
     bench_vdbe_execute_softnull_stage,
+    bench_vdbe_execute_concat_stage,
     bench_vdbe_execute_add_stage,
     bench_vdbe_execute_subtract_stage,
     bench_vdbe_execute_multiply_stage,

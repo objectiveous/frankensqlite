@@ -13523,3 +13523,27 @@ set: sessions found by
 - Do not retry promoting only `Opcode::IsTrue` into `try_execute_hot_opcode` as
   a standalone lever. Reconsider only if paired with a broader truthiness
   opcode reshaping that proves improvements at 256 and 1024 ops.
+
+## 2026-05-24 - `Opcode::Blob` hot-dispatch promotion
+
+- Target: `bd-1dp9.6.2` VDBE SQL-pipeline dispatch stream,
+  `vdbe_pipeline_execute_blob`.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs` and
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`. The benchmark was kept;
+  the `Opcode::Blob` arm in `try_execute_hot_opcode` was manually unwound
+  after measurement rejected it.
+- Measurement proof before rejection:
+  `cargo fmt --check`,
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-blob-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_blob --warm-up-time 1 --measurement-time 4`,
+  and
+  `timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-bd-1dp9-6-2-blob-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_blob --warm-up-time 1 --measurement-time 4`
+  completed successfully on worker `ts2`.
+- Evidence: baseline medians were `64=1.2692 us`, `256=4.5037 us`,
+  `1024=18.006 us`; candidate medians were `64=1.3553 us`,
+  `256=5.2129 us`, `1024=20.835 us`.
+- Result: rejected. The hot-dispatch promotion regressed all measured stream
+  lengths, so it did not pass the keep gate.
+- Do not retry promoting only `Opcode::Blob` into `try_execute_hot_opcode` as
+  a standalone lever. Reconsider only if paired with broader constant-load or
+  blob-register reshaping that proves improvements at 64, 256, and 1024 ops.

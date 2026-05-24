@@ -265,6 +265,48 @@ RETURNING queue_name, item_key, claim_seq, last_reason_code;
 | `queue_ttl_invalid` | `:ttl_ms <= 0` or expiration is not after claim time. |
 | `queue_payload_too_large` | Payload reference exceeds the catalog limit. |
 
+### Executable Slice for `.3`
+
+`bd-agent-swarm-coordination-transparency-8jr6u.3` starts from an
+ordinary-table executable shim before the built-in virtual catalog table lands.
+The shim uses the queue columns, constraints, claim index, and
+`UPDATE ... RETURNING` contract above on a user-created table named
+`fsqlite_queue_contract`. This keeps the first proof on the live parser, VDBE,
+pager, WAL, and MVCC path without inventing a temporary engine-side API.
+
+The required same-process harness is
+`crates/fsqlite-core/tests/agent_swarm_queue_claim_contract.rs`. It proves:
+
+- Empty queues return zero mutation rows.
+- Already-claimed rows are not claimed by another worker.
+- Idempotent retry returns the existing matching ownership row.
+- Release requires matching `owner_id` and `claim_seq`.
+- Abandon clears ownership and retry state while returning the abandoned row.
+- Rolling back a claim restores the row to `ready` with no owner.
+- Two concurrent connections racing for one item can publish only one owner
+  while `concurrent_mode_default` remains true.
+- The executable trace points carry `queue_name`, `worker_id`,
+  `claim_attempt_id`, `statement_fingerprint`, `conflict_reason`, and
+  `elapsed_ms` fields so the virtual-table implementation has a concrete
+  diagnostics contract to preserve.
+
+This shim is not the final user surface. The final implementation must expose
+`fsqlite_queue` as the built-in virtual catalog table, but it must preserve the
+observable row shapes and failure classes covered by the shim. Once the virtual
+table exists, the harness should be reused by swapping the setup DDL for the
+built-in catalog surface rather than rewriting the behavioral assertions.
+
+The first implementation bridge is deliberately narrow:
+
+1. Keep claim, release, rollback, and contention tests table-backed.
+2. Add the virtual table/catalog storage only after the row-shape contract is
+   green on ordinary DML.
+3. Preserve the same `queue_name`, `item_key`, `owner_id`,
+   `claim_attempt_id`, `claim_seq`, `last_reason_code`, `statement_fingerprint`,
+   `conflict_reason`, and elapsed-time fields when diagnostics are wired.
+4. Treat a stale losing claim as retryable `queue_claim_conflict` or the
+   existing transient `Busy*`/serialization family, never as silent success.
+
 ## `fsqlite_lease`
 
 `fsqlite_lease` coordinates exclusive ownership of named resources. It is for

@@ -350,7 +350,7 @@ fn insert_available_range_sql(spec: RangeSpec<'_>) -> String {
                  WHERE range_name = {range_name}
                    AND table_name = {table_name}
                    AND index_name IS NULL
-                   AND state != 'retired'
+                   AND state <> 'retired'
                    AND NOT (range_end <= {range_start}
                             OR range_start >= {range_end})
            )
@@ -493,8 +493,8 @@ fn range_reason_codes_and_introspection_fields_are_stable() -> TestResult {
             SqliteValue::Text("range-a".into()),
             SqliteValue::Text(TABLE_NAME.into()),
             SqliteValue::Null,
-            SqliteValue::Text(encoded_key(0)),
-            SqliteValue::Text(encoded_key(1_000)),
+            SqliteValue::Text(encoded_key(0).into()),
+            SqliteValue::Text(encoded_key(1_000).into()),
             SqliteValue::Null,
             SqliteValue::Text("advisory".into()),
             SqliteValue::Text("available".into()),
@@ -548,8 +548,8 @@ fn range_allocate_renew_release_and_exhausted_paths_are_deterministic() -> TestR
             SqliteValue::Text("worker-a".into()),
             SqliteValue::Text("token-a".into()),
             SqliteValue::Integer(2),
-            SqliteValue::Text(encoded_key(0)),
-            SqliteValue::Text(encoded_key(500)),
+            SqliteValue::Text(encoded_key(0).into()),
+            SqliteValue::Text(encoded_key(500).into()),
             SqliteValue::Integer(0),
             SqliteValue::Integer(1),
             SqliteValue::Text("ok".into()),
@@ -603,8 +603,8 @@ fn range_allocate_renew_release_and_exhausted_paths_are_deterministic() -> TestR
             SqliteValue::Text("worker-b".into()),
             SqliteValue::Text("token-b".into()),
             SqliteValue::Integer(3),
-            SqliteValue::Text(encoded_key(0)),
-            SqliteValue::Text(encoded_key(500)),
+            SqliteValue::Text(encoded_key(0).into()),
+            SqliteValue::Text(encoded_key(500).into()),
             SqliteValue::Integer(0),
             SqliteValue::Integer(1),
             SqliteValue::Text("ok".into()),
@@ -769,8 +769,8 @@ fn range_overlap_invalid_bounds_split_and_merge_are_enforced() -> TestResult {
         only_row_values(&merged, "merged worker range")?,
         &[
             SqliteValue::Text("range-merged".into()),
-            SqliteValue::Text(encoded_key(0)),
-            SqliteValue::Text(encoded_key(1_000)),
+            SqliteValue::Text(encoded_key(0).into()),
+            SqliteValue::Text(encoded_key(1_000).into()),
             SqliteValue::Text("available".into()),
             SqliteValue::Null,
             SqliteValue::Text("ok".into()),
@@ -780,15 +780,15 @@ fn range_overlap_invalid_bounds_split_and_merge_are_enforced() -> TestResult {
     let active_ranges = conn.query(
         "SELECT range_id, range_start, range_end
            FROM fsqlite_worker_ranges_contract
-          WHERE state != 'retired'
+          WHERE state <> 'retired'
           ORDER BY range_start;",
     )?;
     assert_eq!(
         only_row_values(&active_ranges, "active merged range")?,
         &[
             SqliteValue::Text("range-merged".into()),
-            SqliteValue::Text(encoded_key(0)),
-            SqliteValue::Text(encoded_key(1_000)),
+            SqliteValue::Text(encoded_key(0).into()),
+            SqliteValue::Text(encoded_key(1_000).into()),
         ],
         "merge must leave one active disjoint replacement range"
     );
@@ -939,7 +939,7 @@ fn range_aware_assignment_reduces_modeled_same_page_conflicts() -> TestResult {
             ] => {
                 assert_eq!(page_start, page_end);
                 assert_eq!(*conflict_count, 0);
-                assert_eq!(imbalance_reason, "balanced");
+                assert_eq!(imbalance_reason.as_str(), "balanced");
                 trace_range_event("fairness", range_id, owner_id, "ok", imbalance_reason);
             }
             other => {

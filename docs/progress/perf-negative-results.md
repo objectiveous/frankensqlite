@@ -12,6 +12,33 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-25 - VDBE `Opcode::AddImm` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, which isolates repeated
+  `AddImm` counter increments against a stable accumulator register.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed only the existing
+  `Opcode::AddImm` arm from `try_execute_hot_opcode`, sending the counter
+  increment back through the main interpreter match. The source patch was
+  unwound after measurement.
+- Evidence:
+  baseline command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-addimm-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute/' --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=700.66 ns`, `256=2.7579 us`, `1024=10.227 us`.
+  Candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-addimm-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=799.05 ns`, `256=2.6833 us`, `1024=10.563 us`.
+- Result: rejected. Removing the hot arm improved the 256-op stream, but
+  regressed the 64-op and 1024-op streams, so it failed the all-sizes keep gate
+  for hot-prefilter contraction.
+- Do not retry `Opcode::AddImm` hot-dispatch removal as a standalone patch.
+  Reconsider only if a broader hot-prefilter compaction pass measures real SQL
+  instruction-cache or binary-size wins and also preserves the focused
+  `vdbe_pipeline_execute` matrix.
+
 ## 2026-05-25 - VDBE `Opcode::ShiftLeft` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_shiftleft` in

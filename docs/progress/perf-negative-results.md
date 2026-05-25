@@ -14149,3 +14149,28 @@ set: sessions found by
 - Do not retry promoting only `Opcode::Blob` into `try_execute_hot_opcode` as
   a standalone lever. Reconsider only if paired with broader constant-load or
   blob-register reshaping that proves improvements at 64, 256, and 1024 ops.
+
+## 2026-05-25 - `Opcode::SoftNull` hot-dispatch removal
+
+- Target: `bd-1dp9.6.2` VDBE SQL-pipeline dispatch stream,
+  `vdbe_pipeline_execute_softnull`.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed only the
+  `Opcode::SoftNull` arm from `try_execute_hot_opcode`; the source patch was
+  manually unwound after measurement rejected it.
+- Measurement proof before rejection:
+  `cargo fmt --check`,
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-softnull-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_softnull/' --warm-up-time 1 --measurement-time 4`,
+  and
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-softnull-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_softnull/' --warm-up-time 1 --measurement-time 4`
+  completed successfully on worker `vmi1227854`.
+- Evidence: baseline medians were `64=539.28 ns`, `256=2.1599 us`,
+  `1024=7.9779 us`; candidate medians were `64=593.25 ns`,
+  `256=2.1509 us`, `1024=8.8014 us`.
+- Result: rejected. The 256-op stream moved slightly better, but the 64-op and
+  1024-op streams regressed, so the candidate did not pass the all-sizes keep
+  gate.
+- Do not retry removing only `Opcode::SoftNull` from
+  `try_execute_hot_opcode` as a standalone lever. Reconsider only if paired
+  with broader null-register write reshaping that proves improvements at 64,
+  256, and 1024 ops.

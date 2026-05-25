@@ -12,6 +12,34 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-25 - VDBE `Opcode::Goto` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_goto` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, added during this pass to
+  isolate unconditional jump dispatch where each `Goto` targets the next
+  instruction.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs` for the focused benchmark
+  group and `crates/fsqlite-vdbe/src/engine.rs` for the measured candidate.
+  The candidate removed only the existing `Opcode::Goto` arm from
+  `try_execute_hot_opcode`, sending unconditional jumps back through the main
+  interpreter match. The source patch was unwound after measurement.
+- Evidence:
+  baseline command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-goto-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_goto/' --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1149989` measured medians
+  `64=249.68 ns`, `256=888.63 ns`, `1024=4.1426 us`.
+  Candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-goto-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_goto/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=318.01 ns`, `256=983.27 ns`, `1024=4.1564 us`.
+- Result: rejected. Removing the hot arm regressed every measured stream length
+  or failed to improve it, so the current `Opcode::Goto` hot-prefilter arm
+  remains justified for straight-line unconditional-jump workloads.
+- Do not retry `Opcode::Goto` hot-dispatch removal as a standalone patch.
+  Reconsider only as part of a broader control-flow dispatch reshaping pass
+  that preserves the focused `vdbe_pipeline_execute_goto` matrix.
+
 ## 2026-05-25 - VDBE `Opcode::Variable` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_variable` in

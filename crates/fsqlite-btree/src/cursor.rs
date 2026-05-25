@@ -1940,6 +1940,14 @@ pub struct BtCursor<P> {
     /// witness push, so operators see the policy hit without spamming logs
     /// for every subsequent page.
     read_witness_cap_warned: bool,
+    /// Last page number passed to `record_range_page_witness`. Used to dedup
+    /// consecutive identical range-page witnesses independently of the
+    /// `read_witnesses` vec — without this, enabling `read_witness_cap`
+    /// silently breaks dedup (the vec stops growing, so
+    /// `self.read_witnesses.last()` becomes stale and adjacent duplicates
+    /// leak through to the pager, *increasing* pager-level memory pressure
+    /// under the very flag intended to reduce per-cursor memory).
+    last_range_witness_page: Option<PageNumber>,
     /// Active per-operation observability stats while a `btree_op` span is open.
     active_op_stats: Option<BtreeOpRuntimeStats>,
     /// Reusable buffer for cell encoding — avoids per-insert heap allocation.
@@ -2488,6 +2496,7 @@ impl<P: PageReader> BtCursor<P> {
             read_witnesses: Vec::new(),
             read_witness_cap: default_read_witness_cap(),
             read_witness_cap_warned: false,
+            last_range_witness_page: None,
             active_op_stats: None,
             cell_buf: Vec::new(),
             defrag_ptrs_scratch: Vec::new(),
@@ -2542,6 +2551,11 @@ impl<P: PageReader> BtCursor<P> {
         // hits the cap again — operators who clear witnesses between queries
         // expect cap policy to surface per-query, not just once per cursor.
         self.read_witness_cap_warned = false;
+        // Drop the dedup memory too: callers that clear witnesses between
+        // queries expect each descent to start fresh; otherwise the first
+        // page of the new descent could be silently deduped against the last
+        // page of the previous one.
+        self.last_range_witness_page = None;
     }
 
     /// Set the per-cursor read-witness retention cap.
@@ -2554,6 +2568,9 @@ impl<P: PageReader> BtCursor<P> {
     pub fn set_read_witness_cap(&mut self, cap: usize) {
         self.read_witness_cap = cap;
         self.read_witness_cap_warned = false;
+        // Drop dedup state so a cap toggle never silently dedups against an
+        // unrelated past descent.
+        self.last_range_witness_page = None;
     }
 
     /// Returns the current read-witness retention cap (0 = unbounded).
@@ -2642,6 +2659,10 @@ impl<P: PageReader> BtCursor<P> {
                 "policy violation: point operation emitted page-level witness"
             );
         }
+        // A point witness breaks the range-witness dedup chain — preserves
+        // the historical (pre-cap) semantics where dedup keyed off the
+        // vec-tail and any non-Page push reset the chain.
+        self.last_range_witness_page = None;
         // Canonical SSI evidence still goes to the pager regardless of cap —
         // that's the source of truth for transaction isolation. The cap only
         // bounds the per-cursor copy returned by `witness_keys()`.
@@ -2654,13 +2675,17 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     fn record_range_page_witness(&mut self, cx: &Cx, page_no: PageNumber) {
-        if self
-            .read_witnesses
-            .last()
-            .is_some_and(|key| matches!(key, WitnessKey::Page(existing) if *existing == page_no))
-        {
+        // Dedup against `last_range_witness_page` rather than
+        // `read_witnesses.last()`. The vec-based dedup breaks the moment
+        // `read_witness_cap` throttles a push: the vec stops growing, so
+        // `.last()` returns a stale entry and adjacent duplicate range
+        // witnesses leak through to the pager. That would *increase* pager
+        // memory pressure under the very flag intended to reduce per-cursor
+        // memory — the opposite of what the operator asked for.
+        if self.last_range_witness_page == Some(page_no) {
             return;
         }
+        self.last_range_witness_page = Some(page_no);
         let key = WitnessKey::Page(page_no);
         // Same split as `record_point_witness`: pager always sees the read,
         // the per-cursor vec respects the cap.
@@ -16382,45 +16407,26 @@ mod tests {
             .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(MemPageStore::new(USABLE), pn(2), USABLE, true);
-        // Replace with the populated store via direct construction. The default
-        // cap from the env var is 0 (unbounded) outside of test setup; assert
-        // that and then exercise a real traversal on a fresh cursor.
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
         assert_eq!(
             cursor.read_witness_cap(),
             0,
             "default cap should be 0 (unbounded) when env var is unset"
         );
-
-        // Now build a cursor against the populated store and confirm all 3
-        // page witnesses make it into the per-cursor vec.
-        let _ = (store, cx, &mut cursor); // silence unused-warns; below is the real check
-        let mut store2 = MemPageStore::new(USABLE);
-        store2
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
-        store2
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
-        store2
-            .pages
-            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
-        let cx2 = Cx::new();
-        let mut cursor2 = BtCursor::new(store2, pn(2), USABLE, true);
-        assert_eq!(cursor2.count_all_rows(&cx2).unwrap(), 4);
+        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 4);
         assert!(
-            cursor2.witness_keys().len() >= 3,
+            cursor.witness_keys().len() >= 3,
             "unbounded default must keep all page witnesses; got {}",
-            cursor2.witness_keys().len()
+            cursor.witness_keys().len()
         );
     }
 
     #[test]
-    fn test_set_read_witness_cap_resets_warn_flag_via_clear() {
-        // After clear_witness_keys, the one-shot warn flag should reset so the
-        // next descent that hits the cap can re-emit the policy-hit warning.
-        // We can't easily assert the warn directly, but we can assert the cap
-        // is still active and that throttling still kicks in after clear.
+    fn test_clear_witness_keys_resets_warn_flag_and_keeps_cap_active() {
+        // `clear_witness_keys` must reset the one-shot warn flag so the next
+        // descent that hits the cap can re-emit the policy-hit warning, and it
+        // must NOT silently drop the cap (operators that clear witnesses
+        // between queries still want the throttle to apply).
         let mut store = MemPageStore::new(USABLE);
         store
             .pages
@@ -16433,35 +16439,75 @@ mod tests {
             .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(MemPageStore::new(USABLE), pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
         cursor.set_read_witness_cap(1);
 
-        // Build a fresh cursor against a populated store, exercise the cap.
-        let cx2 = Cx::new();
-        let mut store2 = MemPageStore::new(USABLE);
-        store2
+        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 4);
+        let first_len = cursor.witness_keys().len();
+        assert!(first_len <= 1);
+        // Cap fired at least once during the descent → warn flag is now set.
+        assert!(
+            cursor.read_witness_cap_warned,
+            "warn flag should be set after cap throttles"
+        );
+
+        cursor.clear_witness_keys();
+        assert!(cursor.witness_keys().is_empty());
+        assert!(
+            !cursor.read_witness_cap_warned,
+            "clear_witness_keys must reset the one-shot warn flag"
+        );
+        // Cap is still active after clear.
+        assert_eq!(cursor.read_witness_cap(), 1);
+    }
+
+    #[test]
+    fn test_read_witness_cap_does_not_break_range_witness_dedup_to_pager() {
+        // Regression test: enabling `read_witness_cap` must not silently break
+        // the adjacent-duplicate dedup in `record_range_page_witness`.
+        //
+        // Pre-fix, dedup keyed off `read_witnesses.last()` — once the cap
+        // throttled the per-cursor vec, `.last()` returned a stale entry, so
+        // calling `record_range_page_witness(N)` twice in a row leaked TWO
+        // pager-level witness pushes (vs ONE without the cap). That would
+        // *increase* pager memory pressure under the very flag intended to
+        // reduce per-cursor memory.
+        let mut store = MemPageStore::new(USABLE);
+        store
             .pages
             .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
-        store2
+        store
             .pages
             .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
-        store2
+        store
             .pages
             .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
-        let mut cursor2 = BtCursor::new(store2, pn(2), USABLE, true);
-        cursor2.set_read_witness_cap(1);
 
-        assert_eq!(cursor2.count_all_rows(&cx2).unwrap(), 4);
-        let first_len = cursor2.witness_keys().len();
-        assert!(first_len <= 1);
+        let cx = Cx::new();
+        let probe = WitnessProbeStore::new(store);
+        let state = probe.state();
+        let mut cursor = BtCursor::new(probe, pn(2), USABLE, true);
+        cursor.set_read_witness_cap(1);
 
-        cursor2.clear_witness_keys();
-        assert!(cursor2.witness_keys().is_empty());
-        // Cap is still active after clear
-        assert_eq!(cursor2.read_witness_cap(), 1);
+        // Drive the bug: call `record_range_page_witness` for the same page
+        // many times in a row. Pre-fix this would push N entries into the
+        // pager; with the dedup fix, only 1 push lands.
+        let target = pn(7);
+        for _ in 0..10 {
+            cursor.record_range_page_witness(&cx, target);
+        }
 
-        // suppress unused-cursor warning from the dummy
-        let _ = (cursor, cx);
+        let state = state.borrow();
+        let target_pushes = state
+            .read_witnesses
+            .iter()
+            .filter(|key| matches!(key, WitnessKey::Page(p) if *p == target))
+            .count();
+        assert_eq!(
+            target_pushes, 1,
+            "with cap active, adjacent identical range witnesses must still dedup at the pager; \
+             got {target_pushes} pager pushes (pre-fix bug would show 10)"
+        );
     }
 
     #[test]

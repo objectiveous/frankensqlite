@@ -12739,6 +12739,15 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            Opcode::ZeroOrNull => {
+                if self.get_reg(op.p1).is_null() || self.get_reg(op.p3).is_null() {
+                    self.set_reg_fast(op.p2, SqliteValue::Null);
+                } else {
+                    self.set_reg_int(op.p2, 0);
+                }
+                *pc += 1;
+                Ok(true)
+            }
             // Not is a compact expression-evaluation opcode: read p1, apply
             // SQLite truthiness, and write a boolean/null result into p2. Keep
             // the body byte-equivalent to the main-match arm while avoiding
@@ -24091,6 +24100,43 @@ mod tests {
     }
 
     // ── Miscellaneous Opcodes ──────────────────────────────────────────
+
+    #[test]
+    fn test_zero_or_null_opcode() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let non_null_lhs = b.alloc_reg();
+            let non_null_rhs = b.alloc_reg();
+            let null_lhs = b.alloc_reg();
+            let null_rhs = b.alloc_reg();
+            let o1 = b.alloc_reg();
+            let o2 = b.alloc_reg();
+            let o3 = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 7, non_null_lhs, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 11, non_null_rhs, 0, P4::None, 0);
+            b.emit_op(Opcode::Null, 0, null_lhs, 0, P4::None, 0);
+            b.emit_op(Opcode::Null, 0, null_rhs, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::ZeroOrNull,
+                non_null_lhs,
+                o1,
+                non_null_rhs,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::ZeroOrNull, null_lhs, o2, non_null_rhs, P4::None, 0);
+            b.emit_op(Opcode::ZeroOrNull, non_null_lhs, o3, null_rhs, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, o1, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, o2, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, o3, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(0)]);
+        assert_eq!(rows[1], vec![SqliteValue::Null]);
+        assert_eq!(rows[2], vec![SqliteValue::Null]);
+    }
 
     #[test]
     fn test_is_true_opcode() {

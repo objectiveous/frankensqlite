@@ -12,6 +12,35 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-25 - VDBE `Opcode::Null` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_null` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, added during this pass to
+  isolate repeated single-register `Null` writes against a stable target
+  register.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs` for the focused benchmark
+  group and `crates/fsqlite-vdbe/src/engine.rs` for the measured candidate.
+  The candidate removed only the existing `Opcode::Null` arm from
+  `try_execute_hot_opcode`, sending single-register null writes back through
+  the main interpreter match. The source patch was unwound after measurement.
+- Evidence:
+  baseline command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-null-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_null/' --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=706.91 ns`, `256=2.3783 us`, `1024=8.6412 us`.
+  Candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-null-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_null/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=785.99 ns`, `256=2.5444 us`, `1024=9.5082 us`.
+- Result: rejected. Removing the hot arm regressed every measured stream
+  length, so the current `Opcode::Null` hot-prefilter arm remains justified for
+  the isolated single-register null-write workload.
+- Do not retry `Opcode::Null` hot-dispatch removal as a standalone patch.
+  Reconsider only if a broader hot-prefilter compaction pass measures real SQL
+  instruction-cache or binary-size wins and also preserves the focused
+  `vdbe_pipeline_execute_null` matrix.
+
 ## 2026-05-25 - VDBE `Opcode::AddImm` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute` in

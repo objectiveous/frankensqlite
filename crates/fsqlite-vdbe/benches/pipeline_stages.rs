@@ -978,6 +978,32 @@ fn build_execute_stage_if_program(op_repeats: usize) -> VdbeProgram {
 }
 
 /// Build a dispatch-dominated program whose inner loop is a stream of
+/// two-field `Compare` ops. The first field is equal and the second differs, so
+/// each opcode runs the realistic multi-register comparison body without
+/// involving collation locks or a following `Jump`.
+fn build_execute_stage_compare_program(op_repeats: usize) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    let end = builder.emit_label();
+    builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+    let left_first = builder.alloc_reg();
+    let left_second = builder.alloc_reg();
+    let right_first = builder.alloc_reg();
+    let right_second = builder.alloc_reg();
+    builder.emit_op(Opcode::Integer, 42, left_first, 0, P4::None, 0);
+    builder.emit_op(Opcode::Integer, 9, left_second, 0, P4::None, 0);
+    builder.emit_op(Opcode::Integer, 42, right_first, 0, P4::None, 0);
+    builder.emit_op(Opcode::Integer, 11, right_second, 0, P4::None, 0);
+    for _ in 0..op_repeats {
+        builder.emit_op(Opcode::Compare, left_first, right_first, 2, P4::None, 0);
+    }
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder.resolve_label(end);
+    builder
+        .finish()
+        .expect("pipeline execute compare benchmark program should build")
+}
+
+/// Build a dispatch-dominated program whose inner loop is a stream of
 /// `IsTrue` ops. The probe register is seeded to a truthy integer and
 /// each op writes the coerced boolean result into one stable destination
 /// register, isolating the opcode's truthiness read + integer write body
@@ -2449,6 +2475,39 @@ fn bench_vdbe_execute_if_stage(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_vdbe_execute_compare_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_compare");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let program = build_execute_stage_compare_program(op_repeats);
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &program,
+            |b, program| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute compare benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_vdbe_execute_istrue_stage(c: &mut Criterion) {
     set_vdbe_jit_enabled(false);
     let mut group = c.benchmark_group("vdbe_pipeline_execute_istrue");
@@ -2644,6 +2703,7 @@ criterion_group!(
     bench_vdbe_execute_or_stage,
     bench_vdbe_execute_ifnot_stage,
     bench_vdbe_execute_if_stage,
+    bench_vdbe_execute_compare_stage,
     bench_vdbe_execute_istrue_stage,
     bench_vdbe_execute_not_stage,
     bench_vdbe_execute_rowid_stage,

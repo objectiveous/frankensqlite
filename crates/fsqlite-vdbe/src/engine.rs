@@ -12391,11 +12391,6 @@ impl VdbeEngine {
                 self.execute_comparison_jump_hot(op, pc)?;
                 Ok(true)
             }
-            Opcode::Compare => {
-                self.execute_compare_hot(op)?;
-                *pc += 1;
-                Ok(true)
-            }
             Opcode::MakeRecord => {
                 self.execute_make_record_hot(op, collect_vdbe_metrics);
                 *pc += 1;
@@ -13585,72 +13580,6 @@ impl VdbeEngine {
         } else {
             *pc += 1;
         }
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn execute_compare_hot(&mut self, op: &VdbeOp) -> Result<()> {
-        let start_a = op.p1;
-        let start_b = op.p2;
-        let count = op.p3;
-        let has_collation = matches!(op.p4, P4::Collation(_) | P4::Str(_));
-        let coll_arc = if has_collation {
-            Some(Arc::clone(&self.collation_registry))
-        } else {
-            None
-        };
-        let mut coll_guard = None;
-        let mut result = Ordering::Equal;
-
-        for i in 0..count {
-            let val_a = self.get_reg(start_a + i);
-            let val_b = self.get_reg(start_b + i);
-            let coll_name = usize::try_from(i)
-                .ok()
-                .and_then(|field_idx| compare_collation_for_field_from_p4(&op.p4, field_idx));
-
-            let ord = if let Some(coll_name) = coll_name {
-                if let (SqliteValue::Text(left), SqliteValue::Text(right)) = (val_a, val_b) {
-                    if let Some(fast) = builtin_collation_compare_text(left, right, coll_name) {
-                        Some(fast)
-                    } else if let Some(arc) = coll_arc.as_ref() {
-                        let coll = coll_guard
-                            .get_or_insert_with(|| arc.lock().unwrap_or_else(|e| e.into_inner()));
-                        collate_compare(val_a, val_b, coll_name, coll)
-                    } else {
-                        val_a.partial_cmp(val_b)
-                    }
-                } else if let Some(fast) = fast_compare_same_storage_class(val_a, val_b, &op.p4) {
-                    fast
-                } else if let Some(arc) = coll_arc.as_ref() {
-                    let coll = coll_guard
-                        .get_or_insert_with(|| arc.lock().unwrap_or_else(|e| e.into_inner()));
-                    collate_compare(val_a, val_b, coll_name, coll)
-                } else {
-                    val_a.partial_cmp(val_b)
-                }
-            } else if let Some(fast) = fast_compare_same_storage_class(val_a, val_b, &P4::None) {
-                fast
-            } else {
-                val_a.partial_cmp(val_b)
-            };
-
-            let ordering = match ord {
-                Some(ordering) => ordering,
-                None => match (val_a.is_null(), val_b.is_null()) {
-                    (true, true) => Ordering::Equal,
-                    (true, false) => Ordering::Less,
-                    (false, true) => Ordering::Greater,
-                    (false, false) => Ordering::Equal,
-                },
-            };
-            if ordering != Ordering::Equal {
-                result = ordering;
-                break;
-            }
-        }
-
-        self.last_compare_result = Some(result);
         Ok(())
     }
 

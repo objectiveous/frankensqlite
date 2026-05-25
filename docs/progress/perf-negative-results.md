@@ -12,6 +12,32 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-25 - VDBE `Opcode::ZeroOrNull` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_zeroornull` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, covering streams of 64,
+  256, and 1024 `ZeroOrNull` ops.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed only the existing
+  `Opcode::ZeroOrNull` arm from `try_execute_hot_opcode`, sending the
+  zero-or-null projection back through the main interpreter match. The source
+  patch was unwound after measurement.
+- Evidence:
+  baseline command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-zeroornull-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_zeroornull/' --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1153651` measured medians
+  `64=2.2189 us`, `256=8.3118 us`, `1024=38.201 us`.
+  Candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-zeroornull-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_zeroornull/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=2.8185 us`, `256=10.357 us`, `1024=40.461 us`.
+- Result: rejected. Removing the hot arm regressed every measured stream length,
+  so the retained `Opcode::ZeroOrNull` hot-prefilter arm remains justified for
+  this focused projection workload.
+- Do not retry `Opcode::ZeroOrNull` hot-dispatch removal as a standalone patch.
+  Reconsider only as part of a broader expression-projection or interpreter
+  dispatch reshaping pass that preserves `vdbe_pipeline_execute_zeroornull`.
+
 ## 2026-05-25 - VDBE `Opcode::Add` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_add` in

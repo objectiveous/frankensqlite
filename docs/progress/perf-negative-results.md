@@ -14292,3 +14292,26 @@ set: sessions found by
   `try_execute_hot_opcode` as a standalone lever. Reconsider only if paired
   with broader branch-counter or recursive-limit dispatch reshaping that proves
   improvements at 64, 256, and 1024 ops.
+
+## 2026-05-25 - `Opcode::IsNull` hot-dispatch removal
+
+- Target: `bd-1dp9.6.2` VDBE SQL-pipeline dispatch stream,
+  `vdbe_pipeline_execute_isnull`.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed only the
+  `Opcode::IsNull` arm from `try_execute_hot_opcode`; the source patch was
+  manually unwound after measurement rejected it.
+- Measurement proof before rejection:
+  `cargo fmt --check`,
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-isnull-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_isnull/' --warm-up-time 1 --measurement-time 4`,
+  and
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-isnull-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_isnull/' --warm-up-time 1 --measurement-time 4`
+  completed successfully on worker `vmi1227854`.
+- Evidence: baseline medians were `64=383.50 ns`, `256=1.4328 us`,
+  `1024=5.5844 us`; candidate medians were `64=396.46 ns`,
+  `256=1.2022 us`, `1024=5.1120 us`.
+- Result: rejected. The 256-op and 1024-op streams improved, but the 64-op
+  stream regressed, so the candidate did not pass the all-sizes keep gate.
+- Do not retry removing only `Opcode::IsNull` from `try_execute_hot_opcode` as
+  a standalone lever. Reconsider only if paired with broader null-test dispatch
+  reshaping that proves improvements at 64, 256, and 1024 ops.

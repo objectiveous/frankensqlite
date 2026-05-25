@@ -12,6 +12,32 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-25 - VDBE `Opcode::Compare` hot-dispatch promotion
+
+- Target: `vdbe_pipeline_execute_compare` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, which isolates a stream of
+  two-field `Compare` ops where the first field is equal and the second differs.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate added only an
+  `Opcode::Compare` arm to `try_execute_hot_opcode`, mirroring the main
+  interpreter comparison body. The source patch was unwound after measurement.
+- Evidence:
+  baseline command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-compare-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_compare/' --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1149989` measured medians
+  `64=2.1504 us`, `256=8.8270 us`, `1024=35.002 us`.
+  Candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-compare-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_compare/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=3.6638 us`, `256=10.723 us`, `1024=36.917 us`.
+- Result: rejected. Promoting `Opcode::Compare` into the hot prefilter
+  regressed every measured stream length, so the main interpreter match remains
+  the faster route for this comparison workload.
+- Do not retry `Opcode::Compare` hot-dispatch promotion as a standalone patch.
+  Reconsider only as part of a broader comparison/JUMP dispatch redesign that
+  preserves both `vdbe_pipeline_execute_compare` and
+  `vdbe_pipeline_execute_comparison_jump`.
+
 ## 2026-05-25 - VDBE `Opcode::IsTrue` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_istrue` in

@@ -326,9 +326,9 @@ fn parse_message(msg: &str) -> (FailureKind, Option<u32>) {
             .next()
             .and_then(|s| {
                 s.strip_suffix("th")
-                    .or(s.strip_suffix("rd"))
-                    .or(s.strip_suffix("nd"))
-                    .or(s.strip_suffix("st"))
+                    .or_else(|| s.strip_suffix("rd"))
+                    .or_else(|| s.strip_suffix("nd"))
+                    .or_else(|| s.strip_suffix("st"))
             })
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(2);
@@ -450,7 +450,7 @@ pub fn inventory_report(output: &str) -> String {
     }
 
     let mut sigs: Vec<_> = grouped.into_iter().collect();
-    sigs.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    sigs.sort_by_key(|(_, examples)| std::cmp::Reverse(examples.len()));
 
     let mut report = String::new();
     let _ = write!(
@@ -476,7 +476,7 @@ pub fn inventory_report(output: &str) -> String {
             .into_iter()
             .collect();
         if !trees.is_empty() {
-            let _ = write!(report, "Trees: {trees:?}\n");
+            let _ = writeln!(report, "Trees: {trees:?}");
         }
 
         let pages: Vec<_> = examples
@@ -486,7 +486,7 @@ pub fn inventory_report(output: &str) -> String {
             .into_iter()
             .collect();
         if !pages.is_empty() {
-            let _ = write!(report, "Pages: {pages:?}\n");
+            let _ = writeln!(report, "Pages: {pages:?}");
         }
 
         if examples.len() <= 3 {

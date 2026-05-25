@@ -432,9 +432,10 @@ pub fn verify_concurrency_artifact(
     let wal_path = path.with_extension(&wal_ext);
     let walindex_path = path.with_extension(format!("{wal_ext}index"));
     // Construct the shm path the way SQLite does: db-wal → db-shm style
-    let shm_path = path.with_extension(path.extension().map_or("db-shm".to_owned(), |e| {
-        format!("{}-shm", e.to_str().unwrap_or("db"))
-    }));
+    let shm_path = path.with_extension(path.extension().map_or_else(
+        || "db-shm".to_owned(),
+        |e| format!("{}-shm", e.to_str().unwrap_or("db")),
+    ));
 
     let artifact = VerifyArtifact {
         report: report.clone(),
@@ -467,8 +468,7 @@ pub fn write_artifact_bundle(
         artifact.captured_at_unix_ms
     );
     let out_path = output_dir.join(filename);
-    let json = serde_json::to_string_pretty(artifact)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let json = serde_json::to_string_pretty(artifact).map_err(std::io::Error::other)?;
     std::fs::write(&out_path, json)?;
     Ok(out_path)
 }

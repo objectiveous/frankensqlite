@@ -74,13 +74,13 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
         match (frank_rows(f, q), sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
-                mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
+                mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"));
             }
             (Err(e), Ok(b)) => mismatches.push(format!(
                 "FRANK_ERR: {q}\n  frank: ERROR({e})\n  csql:  {b:?}"
             )),
             (Ok(a), Err(e)) => {
-                mismatches.push(format!("CSQL_ERR: {q}\n  frank: {a:?}\n  csql: ERROR({e})"))
+                mismatches.push(format!("CSQL_ERR: {q}\n  frank: {a:?}\n  csql: ERROR({e})"));
             }
             (Err(_), Err(_)) => {}
         }
@@ -245,7 +245,6 @@ fn compound_matching_arity() {
 /// A compound whose branches have different result-column counts must be a
 /// prepare-time error; frank accepts it instead. Tracked in bd-jvzc4.
 #[test]
-#[ignore = "bd-jvzc4: arity-mismatched compound SELECT is accepted instead of erroring"]
 fn compound_column_count_mismatch_errors() {
     let (f, r) = setup(&[
         "CREATE TABLE a (x INTEGER, y INTEGER)",

@@ -940,6 +940,56 @@ This is intentionally an adapter contract. It does not create production
 metrics labels, does not publish SQL text or user identifiers, and does not
 change the replay schema used to load sanitized trace fixtures.
 
+### E2E Proof Pack and Operator Runbook for `.10`
+
+`bd-agent-swarm-coordination-transparency-8jr6u.10` closes the track by adding a
+deterministic replay scenario and an `operator_runbook` section to the existing
+SLO replay stress proof pack. The proof command is:
+
+```bash
+timeout 900 rch exec -- env CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/data/tmp/frankensqlite-target-agent-swarm-proof-pack cargo test -p fsqlite-harness --lib coordination_e2e_proof_pack_covers_operator_runbook -- --nocapture
+```
+
+The scenario uses ordinary replay tables for the future catalog surfaces:
+`fsqlite_queue`, `fsqlite_lease`, `fsqlite_worker_ranges`, and
+`fsqlite_coordination_events`. It exercises queue claim/release, expired-lease
+takeover, worker-range imbalance, EXPLAIN-style contention diagnostics,
+compatibility fallback reporting, replay scorecard extraction, and
+shadow-mode SLO-governor scoring in one proof pack.
+
+The runbook includes these operator query shapes:
+
+```sql
+SELECT worker_range_start, worker_range_end, range_imbalance_reason, COUNT(*) AS statement_count
+FROM fsqlite_worker_ranges
+GROUP BY worker_range_start, worker_range_end, range_imbalance_reason
+ORDER BY statement_count DESC;
+
+SELECT lease_owner, lease_generation, lease_expires_ms
+FROM fsqlite_lease
+WHERE lease_expires_ms <= :now_ms
+ORDER BY lease_expires_ms;
+
+SELECT fallback_reason, COUNT(*) AS statement_count
+FROM fsqlite_coordination_events
+WHERE fallback_reason IS NOT NULL
+GROUP BY fallback_reason
+ORDER BY statement_count DESC;
+
+SELECT resource_governor_decision, COUNT(*) AS statement_count
+FROM fsqlite_coordination_events
+WHERE resource_governor_decision IS NOT NULL
+GROUP BY resource_governor_decision
+ORDER BY statement_count DESC;
+```
+
+Artifact references are kept inside the proof pack:
+`tests/artifacts/agent-swarm-replay/coordination-e2e-trace.json` and the
+proposed proof-pack bundle path
+`tests/artifacts/agent-swarm-replay/trace-coordination-e2e-proof-pack-run-coordination-e2e-proof-pack-slo-proof-pack.json`.
+The final closeout must also record `br dep cycles --json`,
+`bv --robot-insights`, and a robot triage graph-health summary.
+
 ### Executable Test Matrix Contract Slice for `.9`
 
 `bd-agent-swarm-coordination-transparency-8jr6u.9` turns the previous contract

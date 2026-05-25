@@ -151,6 +151,15 @@ wins.
 smoke, heavy replay, graph, and invariant evidence into artifact-backed output.
 CPU-heavy proof commands must be foreground `rch` runs with timeouts.
 
+The agent-swarm coordination closeout
+`bd-agent-swarm-coordination-transparency-8jr6u.10` reuses that same proof-pack
+surface. It adds `operator_runbook` rows to
+`SwarmSloReplayStressProofPack`, not a new governor or replay artifact. The
+runbook must expose the focused proof command, trace/proof-pack artifact paths,
+coverage counts for queue/lease/range/diagnostic/fallback/governor surfaces,
+operator query shapes, graph-health commands, and explicit unmeasured-claim
+limits.
+
 `bd-swarm-slo-resource-governor-qb256.3` owns enforced-mode rollout. It should
 remain opt-in until the proof pack passes, include a kill switch, and prove that
 missing or stale telemetry fails toward shadow-only recommendations rather than
@@ -165,6 +174,12 @@ Before enforced mode can be considered, the track needs these artifacts:
 - Golden adapter tests using
   `crates/fsqlite-harness/conformance/agent_swarm_trace_sanitized_golden.json`.
 - Replay-smoke evidence from the existing swarm replay smoke target.
+- Coordination E2E proof-pack runbook evidence from:
+
+```bash
+timeout 900 rch exec -- env CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/data/tmp/frankensqlite-target-agent-swarm-proof-pack cargo test -p fsqlite-harness --lib coordination_e2e_proof_pack_covers_operator_runbook -- --nocapture
+```
+
 - Heavy replay or scorecard evidence using a foreground offloaded command, for
   example:
 

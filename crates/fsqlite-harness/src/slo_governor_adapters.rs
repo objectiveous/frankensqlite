@@ -30,6 +30,9 @@ use crate::slo_governor::{
 pub const SWARM_SLO_ADAPTER_BEAD_ID: &str = "bd-swarm-slo-resource-governor-qb256.4";
 /// Owning bead for replay/stress proof-pack artifacts.
 pub const SWARM_SLO_PROOF_PACK_BEAD_ID: &str = "bd-swarm-slo-resource-governor-qb256.6";
+/// Owning bead for the coordination E2E proof-pack runbook.
+pub const AGENT_SWARM_COORDINATION_PROOF_PACK_BEAD_ID: &str =
+    "bd-agent-swarm-coordination-transparency-8jr6u.10";
 /// Machine-readable schema version for SLO replay/stress proof packs.
 pub const SWARM_SLO_PROOF_PACK_SCHEMA_VERSION: u32 = 1;
 /// Stable proof-pack implementation version.
@@ -239,6 +242,44 @@ pub struct SwarmSloProofPackBackend {
     pub shadow_skip_reason: Option<String>,
 }
 
+/// One operator-facing proof point in the final coordination runbook.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmSloProofPackRunbookCheck {
+    /// Coordination surface covered by this check.
+    pub surface: String,
+    /// Proof-pack field or metric that backs the check.
+    pub evidence_field: String,
+    /// Count observed in the FrankenSQLite concurrent-default replay row.
+    pub observed_count: u64,
+    /// SQL shape an operator can run against the trace tables.
+    pub operator_query: String,
+}
+
+/// Machine-readable runbook bundled with the final coordination proof pack.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmSloProofPackRunbook {
+    /// Bead that owns this runbook.
+    pub bead_id: String,
+    /// Coordination coverage checks for the deterministic replay scenario.
+    pub scenario_coverage: Vec<SwarmSloProofPackRunbookCheck>,
+    /// Artifact paths a future agent or operator should inspect.
+    pub artifact_paths: Vec<String>,
+    /// Commands that reproduce the focused proof run.
+    pub proof_commands: Vec<String>,
+    /// Beads/BV graph-health commands required at closeout.
+    pub graph_health_commands: Vec<String>,
+    /// Query shape for detecting hot worker ranges.
+    pub hot_range_detection: String,
+    /// Query shape for detecting stale or expired leases.
+    pub stuck_lease_detection: String,
+    /// Query shape for detecting fallback-heavy statements.
+    pub fallback_detection: String,
+    /// Query shape for detecting resource-governor pressure.
+    pub resource_pressure_detection: String,
+    /// Explicitly unmeasured claims or follow-up boundaries.
+    pub known_limitations: Vec<String>,
+}
+
 /// Machine-readable proof pack for SLO governor replay and stress evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmSloReplayStressProofPack {
@@ -276,6 +317,8 @@ pub struct SwarmSloReplayStressProofPack {
     pub first_failure_diag: String,
     /// Backend proof rows.
     pub backend_proofs: Vec<SwarmSloProofPackBackend>,
+    /// Operator runbook for interpreting the coordination proof scenario.
+    pub operator_runbook: SwarmSloProofPackRunbook,
     /// Guardrail against uncited performance claims.
     pub measurement_guardrail: String,
 }
@@ -640,6 +683,7 @@ pub fn build_swarm_slo_replay_stress_proof_pack(
             })
         })
         .collect::<Result<Vec<_>, SwarmSloAdapterError>>()?;
+    let operator_runbook = proof_pack_operator_runbook(report, manifest, &backend_proofs);
 
     let mut proof_pack = SwarmSloReplayStressProofPack {
         schema_version: SWARM_SLO_PROOF_PACK_SCHEMA_VERSION,
@@ -659,6 +703,7 @@ pub fn build_swarm_slo_replay_stress_proof_pack(
         replay_command: manifest.replay_command.clone(),
         first_failure_diag: scorecard.first_failure_diag.clone(),
         backend_proofs,
+        operator_runbook,
         measurement_guardrail: "This proof pack compares governor-off replay metrics with shadow governor decisions; README performance claims still require dated benchmark artifact paths and commits.".to_owned(),
     };
     proof_pack.proof_pack_hash = proof_pack_hash(&proof_pack);
@@ -731,6 +776,102 @@ fn proof_pack_profile(
     }
 }
 
+fn proof_pack_operator_runbook(
+    report: &AgentSwarmReplayReport,
+    manifest: &AgentSwarmEvidenceManifest,
+    backend_proofs: &[SwarmSloProofPackBackend],
+) -> SwarmSloProofPackRunbook {
+    let metrics = backend_proofs
+        .iter()
+        .find(|proof| proof.backend == AgentSwarmReplayBackend::FrankenSqliteConcurrent)
+        .map(|proof| &proof.governor_off.coordination_metrics);
+    let mut artifact_paths = vec![
+        manifest.trace_artifact_path.clone(),
+        format!(
+            "tests/artifacts/agent-swarm-replay/{}-{}-slo-proof-pack.json",
+            report.trace_id, report.run_id
+        ),
+    ];
+    if let Some(path) = manifest.minimized_trace_artifact_path.as_ref() {
+        artifact_paths.push(path.clone());
+    }
+
+    SwarmSloProofPackRunbook {
+        bead_id: AGENT_SWARM_COORDINATION_PROOF_PACK_BEAD_ID.to_owned(),
+        scenario_coverage: proof_pack_runbook_checks(metrics),
+        artifact_paths,
+        proof_commands: vec![
+            "cargo test -p fsqlite-harness --lib coordination_e2e_proof_pack_covers_operator_runbook -- --nocapture".to_owned(),
+            "timeout 900 rch exec -- env CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/data/tmp/frankensqlite-target-agent-swarm-proof-pack cargo test -p fsqlite-harness --lib coordination_e2e_proof_pack_covers_operator_runbook -- --nocapture".to_owned(),
+        ],
+        graph_health_commands: vec![
+            "br dep cycles --json".to_owned(),
+            "bv --robot-insights".to_owned(),
+            "bv --robot-triage".to_owned(),
+        ],
+        hot_range_detection: "SELECT worker_range_start, worker_range_end, range_imbalance_reason, COUNT(*) AS statement_count FROM fsqlite_worker_ranges GROUP BY worker_range_start, worker_range_end, range_imbalance_reason ORDER BY statement_count DESC".to_owned(),
+        stuck_lease_detection: "SELECT lease_owner, lease_generation, lease_expires_ms FROM fsqlite_lease WHERE lease_expires_ms <= :now_ms ORDER BY lease_expires_ms".to_owned(),
+        fallback_detection: "SELECT fallback_reason, COUNT(*) AS statement_count FROM fsqlite_coordination_events WHERE fallback_reason IS NOT NULL GROUP BY fallback_reason ORDER BY statement_count DESC".to_owned(),
+        resource_pressure_detection: "SELECT resource_governor_decision, COUNT(*) AS statement_count FROM fsqlite_coordination_events WHERE resource_governor_decision IS NOT NULL GROUP BY resource_governor_decision ORDER BY statement_count DESC".to_owned(),
+        known_limitations: vec![
+            "The deterministic replay proves artifact wiring and scoring semantics; it does not make a README performance claim.".to_owned(),
+            "p999 latency and publish-window pressure remain live-harness measurements, not deterministic replay measurements.".to_owned(),
+            "The coordination SQL catalog is still a contract surface until parser/planner/VDBE implementation beads ship it natively.".to_owned(),
+        ],
+    }
+}
+
+fn proof_pack_runbook_checks(
+    metrics: Option<&AgentSwarmCoordinationMetrics>,
+) -> Vec<SwarmSloProofPackRunbookCheck> {
+    let count =
+        |field: fn(&AgentSwarmCoordinationMetrics) -> u64| -> u64 { metrics.map_or(0, field) };
+    vec![
+        SwarmSloProofPackRunbookCheck {
+            surface: "queue_claim".to_owned(),
+            evidence_field: "coordination_metrics.queue_claim_count".to_owned(),
+            observed_count: count(|metrics| metrics.queue_claim_count),
+            operator_query: "SELECT queue_claim_id, queue_release_reason FROM fsqlite_queue WHERE queue_claim_id IS NOT NULL".to_owned(),
+        },
+        SwarmSloProofPackRunbookCheck {
+            surface: "queue_release".to_owned(),
+            evidence_field: "coordination_metrics.queue_release_count".to_owned(),
+            observed_count: count(|metrics| metrics.queue_release_count),
+            operator_query: "SELECT queue_claim_id, queue_release_reason FROM fsqlite_queue WHERE queue_release_reason IS NOT NULL".to_owned(),
+        },
+        SwarmSloProofPackRunbookCheck {
+            surface: "lease_expiration".to_owned(),
+            evidence_field: "coordination_metrics.lease_expiration_count".to_owned(),
+            observed_count: count(|metrics| metrics.lease_expiration_count),
+            operator_query: "SELECT lease_owner, lease_generation, lease_expires_ms FROM fsqlite_lease WHERE lease_expires_ms <= :now_ms".to_owned(),
+        },
+        SwarmSloProofPackRunbookCheck {
+            surface: "worker_range".to_owned(),
+            evidence_field: "coordination_metrics.range_allocation_count".to_owned(),
+            observed_count: count(|metrics| metrics.range_allocation_count),
+            operator_query: "SELECT worker_range_start, worker_range_end, range_imbalance_reason FROM fsqlite_worker_ranges".to_owned(),
+        },
+        SwarmSloProofPackRunbookCheck {
+            surface: "contention_diagnostics".to_owned(),
+            evidence_field: "coordination_metrics.explain_concurrency_row_count".to_owned(),
+            observed_count: count(|metrics| metrics.explain_concurrency_row_count),
+            operator_query: "SELECT explain_concurrency_reason FROM fsqlite_coordination_events WHERE explain_concurrency_reason IS NOT NULL".to_owned(),
+        },
+        SwarmSloProofPackRunbookCheck {
+            surface: "fallback_reporting".to_owned(),
+            evidence_field: "coordination_metrics.fallback_reason_count".to_owned(),
+            observed_count: count(|metrics| metrics.fallback_reason_count),
+            operator_query: "SELECT fallback_reason, COUNT(*) FROM fsqlite_coordination_events WHERE fallback_reason IS NOT NULL GROUP BY fallback_reason".to_owned(),
+        },
+        SwarmSloProofPackRunbookCheck {
+            surface: "resource_governor_scoring".to_owned(),
+            evidence_field: "coordination_metrics.resource_governor_decision_count".to_owned(),
+            observed_count: count(|metrics| metrics.resource_governor_decision_count),
+            operator_query: "SELECT resource_governor_decision, COUNT(*) FROM fsqlite_coordination_events WHERE resource_governor_decision IS NOT NULL GROUP BY resource_governor_decision".to_owned(),
+        },
+    ]
+}
+
 fn governor_off_metrics(
     summary: &AgentSwarmBackendSummary,
     scorecard: &AgentSwarmBackendResourceScorecard,
@@ -777,6 +918,7 @@ fn proof_pack_hash(proof_pack: &SwarmSloReplayStressProofPack) -> String {
         replay_command: &'a str,
         first_failure_diag: &'a str,
         backend_proofs: &'a [SwarmSloProofPackBackend],
+        operator_runbook: &'a SwarmSloProofPackRunbook,
         measurement_guardrail: &'a str,
     }
 
@@ -797,6 +939,7 @@ fn proof_pack_hash(proof_pack: &SwarmSloReplayStressProofPack) -> String {
         replay_command: &proof_pack.replay_command,
         first_failure_diag: &proof_pack.first_failure_diag,
         backend_proofs: &proof_pack.backend_proofs,
+        operator_runbook: &proof_pack.operator_runbook,
         measurement_guardrail: &proof_pack.measurement_guardrail,
     })
 }
@@ -854,6 +997,8 @@ fn log_swarm_slo_replay_stress_proof_pack(proof_pack: &SwarmSloReplayStressProof
             governor_shadow_action = %shadow_action,
             first_failure_diag = %backend.governor_off.first_failure_diag,
             heavy_rch_command = %proof_pack.profile.heavy_rch_command,
+            runbook_check_count = proof_pack.operator_runbook.scenario_coverage.len(),
+            runbook_artifact_count = proof_pack.operator_runbook.artifact_paths.len(),
             "swarm slo replay stress proof pack",
         );
     }
@@ -938,8 +1083,10 @@ mod tests {
     use crate::agent_swarm_trace::{
         AGENT_SWARM_COORDINATION_BRIDGE_VERSION, AgentSwarmEvidenceManifestConfig,
         AgentSwarmReplayConfig, AgentSwarmResourceProfile, AgentSwarmResourceScorecardConfig,
-        FIRST_FAILURE_DIAGNOSTIC_ABSENT, build_agent_swarm_evidence_manifest,
-        load_agent_swarm_trace_json, replay_agent_swarm_trace, score_agent_swarm_resource_envelope,
+        AgentSwarmTrace, ExpectedResultClass, FIRST_FAILURE_DIAGNOSTIC_ABSENT, RawTraceStatement,
+        RowCountClass, StatementSource, TraceMetadata, TraceStatement, TransactionBoundary,
+        build_agent_swarm_evidence_manifest, load_agent_swarm_trace_json, replay_agent_swarm_trace,
+        score_agent_swarm_resource_envelope,
     };
     use crate::slo_governor::{SwarmSloAction, evaluate_swarm_slo_once};
 
@@ -1062,6 +1209,150 @@ mod tests {
                 backend: AgentSwarmReplayBackend::CSqliteOracle,
             },
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn coordination_e2e_proof_pack_covers_operator_runbook()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let trace = coordination_e2e_trace()?;
+        let replay_config =
+            AgentSwarmReplayConfig::smoke(0xC0_0D_10).with_schema_sql(coordination_e2e_schema());
+        let report = replay_agent_swarm_trace(&trace, &replay_config)?;
+        assert!(
+            report.first_failure.is_none(),
+            "coordination proof replay should be clean: {:?}",
+            report.first_failure
+        );
+
+        let scorecard_config = AgentSwarmResourceScorecardConfig::new(
+            AgentSwarmResourceProfile::high_capacity_server(),
+        );
+        let scorecard = score_agent_swarm_resource_envelope(&report, &scorecard_config);
+        let manifest_config = AgentSwarmEvidenceManifestConfig::new(
+            "tests/artifacts/agent-swarm-replay/coordination-e2e-trace.json",
+            replay_config.commands.smoke_command.clone(),
+        )
+        .with_trace_artifact_hash("coordination-e2e-trace-hash-stable-under-privacy-scrubbing")
+        .without_regression_proposals();
+        let manifest = build_agent_swarm_evidence_manifest(&report, &manifest_config);
+        let adapter_config = SwarmSloReplayAdapterConfig {
+            sample_ts_ms: 1_779_724_800_000,
+            sample_age_ms: 0,
+            configured_helper_threads: 64,
+            active_helper_threads: 16,
+            evidence_worker_count: 8,
+            ..SwarmSloReplayAdapterConfig::default()
+        }
+        .with_evidence_manifest(&manifest);
+
+        let proof_pack = build_swarm_slo_replay_stress_proof_pack(
+            &report,
+            &scorecard,
+            &manifest,
+            &adapter_config,
+            &SwarmSloGovernorConfig::default(),
+        )?;
+
+        let subject_proof = proof_pack
+            .backend_proofs
+            .iter()
+            .find(|proof| proof.backend == AgentSwarmReplayBackend::FrankenSqliteConcurrent)
+            .ok_or_else(|| std::io::Error::other("missing subject proof"))?;
+        let metrics = &subject_proof.governor_off.coordination_metrics;
+        assert!(metrics.queue_claim_count > 0);
+        assert!(metrics.queue_release_count > 0);
+        assert!(metrics.lease_expiration_count > 0);
+        assert!(metrics.range_allocation_count > 0);
+        assert!(metrics.explain_concurrency_row_count > 0);
+        assert!(metrics.fallback_reason_count > 0);
+        assert!(metrics.resource_governor_decision_count > 0);
+        assert!(subject_proof.governor_shadow.is_some());
+
+        assert_eq!(
+            proof_pack.operator_runbook.bead_id,
+            AGENT_SWARM_COORDINATION_PROOF_PACK_BEAD_ID
+        );
+        assert!(
+            proof_pack
+                .operator_runbook
+                .scenario_coverage
+                .iter()
+                .all(|check| check.observed_count > 0),
+            "runbook coverage missing observed counts: {:?}",
+            proof_pack.operator_runbook.scenario_coverage
+        );
+        assert!(
+            proof_pack
+                .operator_runbook
+                .graph_health_commands
+                .iter()
+                .any(|command| command == "br dep cycles --json")
+        );
+        assert!(
+            proof_pack
+                .operator_runbook
+                .graph_health_commands
+                .iter()
+                .any(|command| command == "bv --robot-insights")
+        );
+        assert!(
+            proof_pack
+                .operator_runbook
+                .proof_commands
+                .iter()
+                .any(|command| {
+                    command.contains("rch exec")
+                        && command.contains("coordination_e2e_proof_pack_covers_operator_runbook")
+                })
+        );
+        assert!(
+            proof_pack
+                .operator_runbook
+                .artifact_paths
+                .iter()
+                .any(|path| {
+                    path == "tests/artifacts/agent-swarm-replay/coordination-e2e-trace.json"
+                })
+        );
+        assert!(
+            proof_pack
+                .operator_runbook
+                .hot_range_detection
+                .contains("range_imbalance_reason")
+        );
+        assert!(
+            proof_pack
+                .operator_runbook
+                .stuck_lease_detection
+                .contains("lease_expires_ms")
+        );
+        assert!(
+            proof_pack
+                .operator_runbook
+                .fallback_detection
+                .contains("fallback_reason")
+        );
+        assert!(
+            proof_pack
+                .operator_runbook
+                .resource_pressure_detection
+                .contains("resource_governor_decision")
+        );
+        assert!(
+            proof_pack
+                .operator_runbook
+                .known_limitations
+                .iter()
+                .any(|limitation| limitation.contains("does not make a README performance claim"))
+        );
+
+        let encoded = serde_json::to_string(&proof_pack)?;
+        assert!(encoded.contains("operator_runbook"));
+        assert!(encoded.contains("queue_release"));
+        assert!(encoded.contains("resource_governor_scoring"));
+        assert!(encoded.contains("bv --robot-insights"));
 
         Ok(())
     }
@@ -1239,10 +1530,108 @@ mod tests {
         assert!(encoded.contains("governor_off"));
         assert!(encoded.contains("governor_shadow"));
         assert!(encoded.contains("coordination_metrics"));
+        assert!(encoded.contains("operator_runbook"));
         assert!(encoded.contains("heavy_rch_command"));
         assert!(encoded.contains("README performance claims still require"));
 
         Ok(())
+    }
+
+    fn coordination_e2e_trace() -> Result<AgentSwarmTrace, Box<dyn std::error::Error>> {
+        let metadata = TraceMetadata::new(
+            "inline-harness",
+            AGENT_SWARM_COORDINATION_PROOF_PACK_BEAD_ID,
+        )?;
+        let statements = vec![
+            coordination_e2e_statement(
+                0,
+                "worker-a",
+                "queue-claim",
+                "UPDATE fsqlite_queue SET claim_state = claim_state + 1, queue_claim_id = 'claim-a' WHERE status_code = 0",
+            )?,
+            coordination_e2e_statement(
+                1,
+                "worker-a",
+                "queue-release",
+                "UPDATE fsqlite_queue SET status_code = 1, queue_release_reason = 'completed' WHERE status_code = 0",
+            )?,
+            coordination_e2e_statement(
+                2,
+                "worker-b",
+                "expired-lease-takeover",
+                "UPDATE fsqlite_lease SET lease_owner = 'worker-b', lease_generation = lease_generation + 1 WHERE lease_expires_ms <= 100",
+            )?,
+            coordination_e2e_statement(
+                3,
+                "worker-c",
+                "range-imbalance-split",
+                "INSERT INTO fsqlite_worker_ranges(worker_range_start, worker_range_end, range_imbalance_reason) VALUES (0, 64, 'split')",
+            )?,
+            coordination_e2e_statement(
+                4,
+                "worker-d",
+                "explain-concurrency-conflict",
+                "SELECT explain_concurrency_reason FROM fsqlite_coordination_events WHERE event_id = 0",
+            )?,
+            coordination_e2e_statement(
+                5,
+                "worker-d",
+                "compatibility-fallback",
+                "SELECT fallback_reason FROM fsqlite_coordination_events WHERE fallback_reason IS NOT NULL",
+            )?,
+            coordination_e2e_statement(
+                6,
+                "worker-e",
+                "resource-governor-shadow",
+                "SELECT resource_governor_decision FROM fsqlite_coordination_events WHERE resource_governor_decision IS NOT NULL",
+            )?,
+        ];
+
+        Ok(AgentSwarmTrace::new(
+            "trace-coordination-e2e-proof-pack",
+            "run-coordination-e2e-proof-pack",
+            "coordination-e2e-proof-pack",
+            metadata,
+            statements,
+        )?)
+    }
+
+    fn coordination_e2e_statement(
+        logical_order: u64,
+        actor_id: &'static str,
+        workload_phase: &'static str,
+        sql: &'static str,
+    ) -> Result<TraceStatement, Box<dyn std::error::Error>> {
+        Ok(TraceStatement::from_raw(RawTraceStatement {
+            logical_order,
+            logical_timestamp: None,
+            actor_id,
+            connection_id: actor_id,
+            transaction_id: None,
+            transaction_boundary: TransactionBoundary::None,
+            concurrency_group: "coordination-e2e-proof",
+            workload_phase,
+            sql,
+            expected_result_class: ExpectedResultClass::Success,
+            row_count_class: RowCountClass::Unknown,
+            error_class: None,
+            source: StatementSource::new(
+                "inline-harness",
+                format!("coordination-e2e-{logical_order}"),
+            )?,
+        })?)
+    }
+
+    fn coordination_e2e_schema() -> Vec<String> {
+        vec![
+            "CREATE TABLE fsqlite_queue(id INTEGER PRIMARY KEY, status_code INTEGER NOT NULL, claim_state INTEGER NOT NULL, queue_claim_id TEXT, queue_release_reason TEXT)".to_owned(),
+            "INSERT INTO fsqlite_queue(id, status_code, claim_state, queue_claim_id, queue_release_reason) VALUES (0, 0, 0, NULL, NULL)".to_owned(),
+            "CREATE TABLE fsqlite_lease(id INTEGER PRIMARY KEY, lease_owner TEXT NOT NULL, lease_generation INTEGER NOT NULL, lease_expires_ms INTEGER NOT NULL)".to_owned(),
+            "INSERT INTO fsqlite_lease(id, lease_owner, lease_generation, lease_expires_ms) VALUES (0, 'redacted-text', 0, 0)".to_owned(),
+            "CREATE TABLE fsqlite_worker_ranges(worker_range_start INTEGER NOT NULL, worker_range_end INTEGER NOT NULL, range_imbalance_reason TEXT)".to_owned(),
+            "CREATE TABLE fsqlite_coordination_events(event_id INTEGER PRIMARY KEY, explain_concurrency_reason TEXT, fallback_reason TEXT, resource_governor_decision TEXT)".to_owned(),
+            "INSERT INTO fsqlite_coordination_events(event_id, explain_concurrency_reason, fallback_reason, resource_governor_decision) VALUES (0, 'hot_page_predicted', 'compatibility_fallback', 'shed_optional_work')".to_owned(),
+        ]
     }
 
     fn healthy_live_sample() -> SwarmSloLiveHarnessSample {

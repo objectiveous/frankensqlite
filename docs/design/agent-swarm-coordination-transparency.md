@@ -73,7 +73,7 @@ SQLite-style serialized writer lock is introduced as a shortcut.
 | `.7` Compatibility-path fallback transparency | Aggregated fallback reasons by statement, plan, table, workload lane. | Existing compatibility/fallback dispatch paths in `fsqlite-core`, planner/VDBE lowering diagnostics. | `crates/fsqlite-core/tests/agent_swarm_fallback_transparency_contract.rs` covers stable reason codes, supported fast path, unsupported shape, mixed workload aggregation, rollback, and reset. | Stable fallback reason code, concurrency/durability/memory/latency impact class, diagnostics availability, first failure diagnostic. |
 | `.8` Replay-lab and SLO bridge | Extend replay/scorecard/governor adapters to consume coordination fields. | `crates/fsqlite-harness/src/agent_swarm_trace.rs` and `crates/fsqlite-harness/src/slo_governor_adapters.rs`. | Inline harness tests cover `coordination_metrics` extraction and proof-pack propagation. | Existing replay evidence manifest plus queue/lease/range/diagnostic/fallback/governor fields, coordination correctness, conflict transparency, fairness/resource pressure, and scrubber status. |
 | `.9` Unit/property/regression tests | Fast proof matrix for all coordination surfaces. | Same crates as implementation; property tests where interleavings matter. | `crates/fsqlite-core/tests/agent_swarm_coordination_test_matrix_contract.rs` pins the queue, lease, range, EXPLAIN/PRAGMA, and fallback matrix with deterministic interleavings and canonical golden rows. | Fixed seeds, exact `rch` commands, invariant ids, regression names, structured first-failure context. |
-| `.10` E2E proof pack/runbook | End-to-end replay and operator interpretation. | `fsqlite-harness`, `fsqlite-e2e`, docs/runbook. | rch-backed replay and graph-health closeout. | Artifact paths, hashes, commands, score summaries, limitations. |
+| `.10` E2E proof pack/runbook | End-to-end replay and operator interpretation. | `crates/fsqlite-harness/src/slo_governor_adapters.rs` plus these design docs. | `timeout 900 rch exec -- env CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/data/tmp/frankensqlite-target-agent-swarm-proof-pack cargo test -p fsqlite-harness --lib coordination_e2e_proof_pack_covers_operator_runbook -- --nocapture` plus graph-health closeout. | `operator_runbook` proof commands, artifact paths, queue/lease/range/diagnostic/fallback/governor coverage counts, graph commands, and explicit unmeasured-claim limits. |
 
 ## Required Shared Fields
 
@@ -160,6 +160,24 @@ Each implementation bead must include:
 5. Bridge the new fields into the replay lab and SLO governor.
 6. Close with unit/property/golden tests, rch-backed replay evidence, and an
    operator runbook.
+
+## Final Proof-Pack Runbook
+
+`bd-agent-swarm-coordination-transparency-8jr6u.10` extends the existing SLO
+replay stress proof pack instead of creating a second artifact family. The
+proof pack now carries an `operator_runbook` object with:
+
+- scenario coverage rows for queue claim/release, lease expiration, worker
+  ranges, contention diagnostics, compatibility fallbacks, and
+  resource-governor scoring;
+- artifact paths for the trace and proposed proof-pack JSON bundle;
+- the focused smoke command and the foreground `rch` command for heavy replay;
+- graph-health commands: `br dep cycles --json`, `bv --robot-insights`, and
+  `bv --robot-triage`;
+- operator queries for hot ranges, stale leases, fallback-heavy statements, and
+  resource-governor pressure;
+- limitations stating that deterministic replay proves wiring and scoring
+  semantics, not README performance claims.
 
 ## Open Questions
 

@@ -14831,3 +14831,30 @@ set: sessions found by
   as a standalone lever. Reconsider only if paired with broader string
   constant-load dispatch reshaping that proves improvements at 64, 256, and
   1024 ops.
+
+## 2026-05-25 - `Opcode::Column` hot-dispatch removal
+
+- Target: `bd-1dp9.6.2` VDBE SQL-pipeline dispatch stream,
+  `vdbe_pipeline_execute_column`.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs` and
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`. The candidate added a
+  focused `Column` pipeline benchmark, then removed the `Opcode::Column` arm
+  from `try_execute_hot_opcode`; the warning-free version also removed the now
+  unused `execute_column_hot` helper. The source patch was manually unwound
+  after the warning-free candidate regressed.
+- Measurement proof before rejection:
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-column-paired-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_column/' --warm-up-time 1 --measurement-time 4`
+  and
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-column-final-candidate-2 cargo bench -p fsqlite-vdbe --bench pipeline_stages -- vdbe_pipeline_execute_column --warm-up-time 1 --measurement-time 4`
+  completed successfully on worker `vmi1152480`.
+- Evidence: paired baseline medians were `64=3.8763 us`, `256=10.472 us`,
+  `1024=33.496 us`; warning-free final candidate medians were
+  `64=5.7954 us`, `256=16.081 us`, `1024=54.615 us`.
+- Result: rejected. All measured stream lengths regressed after removing the
+  unused helper required to avoid a dead-code warning, so the candidate did not
+  pass the all-sizes keep gate.
+- Do not retry removing only `Opcode::Column` from `try_execute_hot_opcode`
+  as a standalone lever. Reconsider only if paired with broader column-read
+  dispatch or code-layout reshaping that proves improvements at 64, 256, and
+  1024 ops without dead code.

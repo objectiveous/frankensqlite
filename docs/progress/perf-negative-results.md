@@ -14197,3 +14197,27 @@ set: sessions found by
 - Do not retry removing only `Opcode::Move` from `try_execute_hot_opcode` as a
   standalone lever. Reconsider only if paired with broader register-motion
   reshaping that proves improvements at 64, 256, and 1024 ops.
+
+## 2026-05-25 - `Opcode::Noop` hot-dispatch removal
+
+- Target: `bd-1dp9.6.2` VDBE SQL-pipeline dispatch stream,
+  `vdbe_pipeline_execute_noop`.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed only the
+  `Opcode::Noop` arm from `try_execute_hot_opcode`; the source patch was
+  manually unwound after measurement rejected it.
+- Measurement proof before rejection:
+  `cargo fmt --check`,
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-noop-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_noop/' --warm-up-time 1 --measurement-time 4`,
+  and
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-noop-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_noop/' --warm-up-time 1 --measurement-time 4`
+  completed successfully on worker `vmi1227854`.
+- Evidence: baseline medians were `64=205.45 ns`, `256=675.54 ns`,
+  `1024=2.8325 us`; candidate medians were `64=220.53 ns`,
+  `256=811.34 ns`, `1024=2.8114 us`.
+- Result: rejected. The 1024-op stream moved slightly better, but the 64-op and
+  256-op streams regressed, so the candidate did not pass the all-sizes keep
+  gate.
+- Do not retry removing only `Opcode::Noop` from `try_execute_hot_opcode` as a
+  standalone lever. Reconsider only if paired with broader dispatch routing
+  reshaping that proves improvements at 64, 256, and 1024 ops.

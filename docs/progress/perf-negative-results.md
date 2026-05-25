@@ -14221,3 +14221,27 @@ set: sessions found by
 - Do not retry removing only `Opcode::Noop` from `try_execute_hot_opcode` as a
   standalone lever. Reconsider only if paired with broader dispatch routing
   reshaping that proves improvements at 64, 256, and 1024 ops.
+
+## 2026-05-25 - `Opcode::DecrJumpZero` hot-dispatch removal
+
+- Target: `bd-1dp9.6.2` VDBE SQL-pipeline dispatch stream,
+  `vdbe_pipeline_execute_decrjumpzero`.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed only the
+  `Opcode::DecrJumpZero` arm from `try_execute_hot_opcode`; the source patch
+  was manually unwound after measurement rejected it.
+- Measurement proof before rejection:
+  `cargo fmt --check`,
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-decrjumpzero-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_decrjumpzero/' --warm-up-time 1 --measurement-time 4`,
+  and
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-decrjumpzero-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_decrjumpzero/' --warm-up-time 1 --measurement-time 4`
+  completed successfully on worker `vmi1227854`.
+- Evidence: baseline medians were `64=727.80 ns`, `256=2.6905 us`,
+  `1024=11.240 us`; candidate medians were `64=740.75 ns`,
+  `256=2.8259 us`, `1024=10.899 us`.
+- Result: rejected. The 1024-op stream improved, but the 64-op and 256-op
+  streams regressed, so the candidate did not pass the all-sizes keep gate.
+- Do not retry removing only `Opcode::DecrJumpZero` from
+  `try_execute_hot_opcode` as a standalone lever. Reconsider only if paired
+  with broader LIMIT-counter or branch-counter dispatch reshaping that proves
+  improvements at 64, 256, and 1024 ops.

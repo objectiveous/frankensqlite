@@ -14448,3 +14448,27 @@ set: sessions found by
   `try_execute_hot_opcode` as a standalone lever. Reconsider only if paired
   with broader index-rowid / cursor-rowid dispatch reshaping that proves
   improvements at 64, 256, and 1024 ops.
+
+## 2026-05-25 - `Opcode::ShiftRight` hot-dispatch removal
+
+- Target: `bd-1dp9.6.2` VDBE SQL-pipeline dispatch stream,
+  `vdbe_pipeline_execute_shiftright`.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed only the
+  `Opcode::ShiftRight` arm from `try_execute_hot_opcode`; the source patch was
+  manually unwound after measurement rejected it.
+- Measurement proof before rejection:
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-shiftright-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_shiftright/' --warm-up-time 1 --measurement-time 4`
+  and
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-shiftright-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_shiftright/' --warm-up-time 1 --measurement-time 4`
+  completed successfully on worker `vmi1149989`.
+- Evidence: baseline medians were `64=1.0849 us`, `256=4.0770 us`,
+  `1024=15.834 us`; candidate medians were `64=1.0900 us`,
+  `256=3.9504 us`, `1024=15.842 us`.
+- Result: rejected. The 256-op stream improved, but the 64-op stream regressed
+  and the 1024-op stream did not improve, so the candidate did not pass the
+  all-sizes keep gate.
+- Do not retry removing only `Opcode::ShiftRight` from
+  `try_execute_hot_opcode` as a standalone lever. Reconsider only if paired
+  with broader shift arithmetic dispatch reshaping that proves improvements at
+  64, 256, and 1024 ops.

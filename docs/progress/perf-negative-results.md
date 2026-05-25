@@ -14245,3 +14245,26 @@ set: sessions found by
   `try_execute_hot_opcode` as a standalone lever. Reconsider only if paired
   with broader LIMIT-counter or branch-counter dispatch reshaping that proves
   improvements at 64, 256, and 1024 ops.
+
+## 2026-05-25 - `Opcode::IfPos` hot-dispatch removal
+
+- Target: `bd-1dp9.6.2` VDBE SQL-pipeline dispatch stream,
+  `vdbe_pipeline_execute_ifpos`.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed only the
+  `Opcode::IfPos` arm from `try_execute_hot_opcode`; the source patch was
+  manually unwound after measurement rejected it.
+- Measurement proof before rejection:
+  `cargo fmt --check`,
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-ifpos-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_ifpos/' --warm-up-time 1 --measurement-time 4`,
+  and
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-ifpos-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_ifpos/' --warm-up-time 1 --measurement-time 4`
+  completed successfully on worker `vmi1227854`.
+- Evidence: baseline medians were `64=799.17 ns`, `256=2.8229 us`,
+  `1024=11.778 us`; candidate medians were `64=788.69 ns`,
+  `256=3.0050 us`, `1024=10.978 us`.
+- Result: rejected. The 64-op and 1024-op streams improved, but the 256-op
+  stream regressed, so the candidate did not pass the all-sizes keep gate.
+- Do not retry removing only `Opcode::IfPos` from `try_execute_hot_opcode` as a
+  standalone lever. Reconsider only if paired with broader LIMIT/OFFSET counter
+  dispatch reshaping that proves improvements at 64, 256, and 1024 ops.

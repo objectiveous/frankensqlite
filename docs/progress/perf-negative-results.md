@@ -42,6 +42,38 @@ Each entry should include:
   should first prove byte-equivalence between the hot helper and the cold path,
   then measure both routes on the same worker.
 
+## 2026-05-25 - VDBE `Opcode::FusedLiteralResultRow` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_fused_literal_resultrow`, added in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs` during this pass to cover
+  streams of 64, 256, and 1024 direct `FusedLiteralResultRow` ops with result
+  collection disabled by the benchmark harness.
+- Touched during rejected candidate analysis:
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs` and this ledger. No
+  `crates/fsqlite-vdbe/src/engine.rs` candidate patch was applied. Static
+  inspection with
+  `rg -n "FusedLiteralResultRow" crates/fsqlite-vdbe/src/engine.rs crates/fsqlite-vdbe/src/lib.rs crates/fsqlite-types/src/opcode.rs crates/fsqlite-vdbe/benches/pipeline_stages.rs docs/progress/perf-negative-results.md`
+  found the execution implementation only in `try_execute_hot_opcode`; the
+  remaining references define the opcode, peephole rewrite, tests, and this
+  benchmark coverage.
+- Evidence: `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env
+  CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-fusedlit-bench cargo bench
+  -p fsqlite-vdbe --bench pipeline_stages --
+  '^vdbe_pipeline_execute_fused_literal_resultrow/' --warm-up-time 1
+  --measurement-time 4` completed on remote worker `vmi1153651` on
+  2026-05-25. Criterion medians were `64=2.6775 us`, `256=10.433 us`,
+  and `1024=43.030 us`.
+- Result: rejected before source mutation. Removing the hot-prefilter arm would
+  not be a valid performance experiment in the current tree because the fused
+  opcode has no byte-equivalent cold interpreter implementation. Its semantics
+  are the opcode itself: write the literal, emit or discard one result row, and
+  drain the source register.
+- Do not retry `Opcode::FusedLiteralResultRow` hot-dispatch removal as a
+  standalone patch until a cold interpreter arm exists and is covered by the
+  same `vdbe_pipeline_execute_fused_literal_resultrow` matrix. A future retry
+  should first prove byte-equivalence between the hot path and the cold path,
+  then measure both routes on the same worker.
+
 ## 2026-05-25 - VDBE `Opcode::ZeroOrNull` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_zeroornull` in

@@ -119,6 +119,34 @@ fn build_execute_stage_resultrow_program(op_repeats: usize) -> VdbeProgram {
 }
 
 /// Build a dispatch-dominated program whose inner loop is a stream of
+/// `FusedLiteralResultRow` ops. This isolates the peephole opcode's
+/// write-then-drain semantics with result collection disabled, matching the
+/// generated `Integer(lit, reg) + ResultRow(reg, 1)` fast path without
+/// retaining benchmark rows.
+fn build_execute_stage_fused_literal_resultrow_program(op_repeats: usize) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    let end = builder.emit_label();
+    builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+    let source = builder.alloc_reg();
+    for value in 0..op_repeats {
+        let literal = i32::try_from(value).unwrap_or(i32::MAX);
+        builder.emit_op(
+            Opcode::FusedLiteralResultRow,
+            literal,
+            source,
+            0,
+            P4::None,
+            0,
+        );
+    }
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder.resolve_label(end);
+    builder
+        .finish()
+        .expect("pipeline execute fused literal resultrow benchmark program should build")
+}
+
+/// Build a dispatch-dominated program whose inner loop is a stream of
 /// `Int64` constant loads. `Int64` differs from `Integer` by reading the
 /// payload from `p4`, so it needs a separate measurement before deciding
 /// whether hot-dispatch promotion pays for its match on `P4`.
@@ -1353,6 +1381,39 @@ fn bench_vdbe_execute_resultrow_stage(c: &mut Criterion) {
                     let outcome = engine
                         .execute(program)
                         .expect("pipeline execute resultrow benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_vdbe_execute_fused_literal_resultrow_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_fused_literal_resultrow");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let program = build_execute_stage_fused_literal_resultrow_program(op_repeats);
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &program,
+            |b, program| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                b.iter(|| {
+                    let outcome = engine.execute(program).expect(
+                        "pipeline execute fused literal resultrow benchmark should execute",
+                    );
                     black_box(outcome);
                 });
             },
@@ -2922,6 +2983,7 @@ criterion_group!(
     bench_vdbe_execute_noop_stage,
     bench_vdbe_execute_goto_stage,
     bench_vdbe_execute_resultrow_stage,
+    bench_vdbe_execute_fused_literal_resultrow_stage,
     bench_vdbe_execute_int64_stage,
     bench_vdbe_execute_real_stage,
     bench_vdbe_execute_blob_stage,

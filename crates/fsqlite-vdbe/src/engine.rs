@@ -12703,17 +12703,6 @@ impl VdbeEngine {
                 }
                 Ok(true)
             }
-            Opcode::NotNull => {
-                if self.get_reg(op.p1).is_null() {
-                    *pc += 1;
-                } else {
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        *pc = op.p2 as usize;
-                    }
-                }
-                Ok(true)
-            }
             // IfNot is the canonical falsy-branch jump: emitted ~48
             // production sites driving CASE/COALESCE WHEN-fallthrough,
             // AND-short-circuit, LIMIT-zero detection, HAVING-skip,
@@ -31790,8 +31779,9 @@ mod tests {
     }
 
     #[test]
-    fn test_not_null_via_hot_path() {
-        // Pins the hot-path arm's behaviour to the main-match arm:
+    fn test_not_null_main_dispatch() {
+        // Pins the main interpreter arm's behaviour after the hot-dispatch
+        // arm was removed:
         // - val IS NULL: fall through
         // - val IS NOT NULL: jump to p2
         let rows = run_program(|b| {

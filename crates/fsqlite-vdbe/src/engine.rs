@@ -12476,6 +12476,14 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            Opcode::Add => {
+                let a = self.get_reg(op.p2);
+                let b = self.get_reg(op.p1);
+                let result = a.sql_add(b);
+                self.set_reg_fast(op.p3, result);
+                *pc += 1;
+                Ok(true)
+            }
             Opcode::Subtract => {
                 let a = self.get_reg(op.p2);
                 let b = self.get_reg(op.p1);

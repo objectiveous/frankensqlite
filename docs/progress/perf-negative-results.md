@@ -14315,3 +14315,26 @@ set: sessions found by
 - Do not retry removing only `Opcode::IsNull` from `try_execute_hot_opcode` as
   a standalone lever. Reconsider only if paired with broader null-test dispatch
   reshaping that proves improvements at 64, 256, and 1024 ops.
+
+## 2026-05-25 - `Opcode::Rowid` hot-dispatch removal
+
+- Target: `bd-1dp9.6.2` VDBE SQL-pipeline dispatch stream,
+  `vdbe_pipeline_execute_rowid`.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed only the
+  `Opcode::Rowid` arm from `try_execute_hot_opcode`; the source patch was
+  manually unwound after measurement rejected it.
+- Measurement proof before rejection:
+  `cargo fmt --check`,
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-rowid-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_rowid/' --warm-up-time 1 --measurement-time 4`,
+  and
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-rowid-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_rowid/' --warm-up-time 1 --measurement-time 4`
+  completed successfully on worker `vmi1227854`.
+- Evidence: baseline medians were `64=2.5222 us`, `256=6.0675 us`,
+  `1024=19.706 us`; candidate medians were `64=2.5687 us`,
+  `256=6.1275 us`, `1024=22.006 us`.
+- Result: rejected. All measured stream lengths regressed, so the candidate
+  did not pass the all-sizes keep gate.
+- Do not retry removing only `Opcode::Rowid` from `try_execute_hot_opcode` as a
+  standalone lever. Reconsider only if paired with broader rowid/cursor-rowid
+  dispatch reshaping that proves improvements at 64, 256, and 1024 ops.

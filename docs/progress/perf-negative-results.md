@@ -12,6 +12,35 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-25 - VDBE `Opcode::Copy` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_copy` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, which isolates repeated
+  materialized register copies from a stable source register to a stable
+  destination register.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed the existing
+  `Opcode::Copy` arm from `try_execute_hot_opcode`, sending copy operations
+  back through the main interpreter match. The source patch was unwound after
+  measurement.
+- Evidence:
+  baseline command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-copy-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_copy/' --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=847.71 ns`, `256=3.1336 us`, `1024=12.451 us`.
+  Candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-copy-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_copy/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=865.95 ns`, `256=4.3386 us`, `1024=14.588 us`.
+- Result: rejected. Removing the hot arm regressed every measured stream length,
+  with the largest regression in the 256-op stream, so the current
+  `Opcode::Copy` hot-prefilter arm remains justified for this isolated
+  workload.
+- Do not retry `Opcode::Copy` hot-dispatch removal as a standalone patch.
+  Reconsider only if a broader hot-prefilter compaction pass measures real SQL
+  instruction-cache or binary-size wins and also preserves the focused
+  `vdbe_pipeline_execute_copy` matrix.
+
 ## 2026-05-25 - VDBE `Opcode::Integer` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_integer` in

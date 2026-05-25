@@ -12,6 +12,35 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-25 - VDBE `Opcode::IsTrue` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_istrue` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, remeasured after the
+  current tree was found to contain an `Opcode::IsTrue` arm in
+  `try_execute_hot_opcode` despite the older 2026-05-23 promotion-rejection
+  entry below.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed only the existing
+  `Opcode::IsTrue` arm from `try_execute_hot_opcode`, sending truthiness
+  projection back through the main interpreter match. The source patch was
+  unwound after measurement.
+- Evidence:
+  baseline command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-istrue-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_istrue/' --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1152480` measured medians
+  `64=974.78 ns`, `256=3.7540 us`, `1024=16.209 us`.
+  Candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-istrue-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_istrue/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=1.1208 us`, `256=4.7327 us`, `1024=20.718 us`.
+- Result: rejected. Removing the current hot arm regressed every measured stream
+  length, so the retained `Opcode::IsTrue` hot-prefilter arm remains justified
+  for this focused truthiness workload.
+- Do not retry `Opcode::IsTrue` hot-dispatch removal as a standalone patch.
+  Reconsider only if a broader truthiness or dispatch reshaping pass measures
+  real SQL wins and also preserves the focused
+  `vdbe_pipeline_execute_istrue` matrix.
+
 ## 2026-05-25 - VDBE comparison-jump hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_comparison_jump` in

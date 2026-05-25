@@ -14472,3 +14472,26 @@ set: sessions found by
   `try_execute_hot_opcode` as a standalone lever. Reconsider only if paired
   with broader shift arithmetic dispatch reshaping that proves improvements at
   64, 256, and 1024 ops.
+
+## 2026-05-25 - `Opcode::Next` hot-dispatch removal
+
+- Target: `bd-1dp9.6.2` VDBE SQL-pipeline dispatch stream,
+  `vdbe_pipeline_execute_next`.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed only the
+  `Opcode::Next | Opcode::SorterNext` arm from `try_execute_hot_opcode`; the
+  source patch was manually unwound after measurement rejected it.
+- Measurement proof before rejection:
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-next-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_next/' --warm-up-time 1 --measurement-time 4`
+  and
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-next-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_next/' --warm-up-time 1 --measurement-time 4`
+  completed successfully on worker `vmi1149989`.
+- Evidence: baseline medians were `64=20.944 us`, `256=89.797 us`,
+  `1024=393.94 us`; candidate medians were `64=26.377 us`,
+  `256=100.71 us`, `1024=447.81 us`.
+- Result: rejected. All measured stream lengths regressed, so the candidate
+  did not pass the all-sizes keep gate.
+- Do not retry removing only `Opcode::Next | Opcode::SorterNext` from
+  `try_execute_hot_opcode` as a standalone lever. Reconsider only if paired
+  with broader cursor-advance dispatch reshaping that proves improvements at
+  64, 256, and 1024 ops.

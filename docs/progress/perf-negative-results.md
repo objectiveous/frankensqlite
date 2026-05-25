@@ -12,6 +12,35 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-25 - VDBE `Opcode::Integer` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_integer` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, added during this pass to
+  isolate repeated p1-immediate integer loads into a stable target register.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs` for the focused benchmark
+  group and `crates/fsqlite-vdbe/src/engine.rs` for the measured candidate. The
+  candidate removed only the existing `Opcode::Integer` arm from
+  `try_execute_hot_opcode`, sending integer constant loads back through the main
+  interpreter match. The engine patch was unwound after measurement; the
+  benchmark was kept as coverage for future hot-prefilter audits.
+- Evidence:
+  baseline command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-integer-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_integer/' --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=555.29 ns`, `256=2.0454 us`, `1024=8.0805 us`.
+  Candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-integer-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_integer/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=666.27 ns`, `256=2.2612 us`, `1024=9.4506 us`.
+- Result: rejected. Removing the hot arm regressed every measured stream length,
+  so the current `Opcode::Integer` hot-prefilter arm remains justified for this
+  isolated workload.
+- Do not retry `Opcode::Integer` hot-dispatch removal as a standalone patch.
+  Reconsider only if a broader hot-prefilter compaction pass measures real SQL
+  instruction-cache or binary-size wins and also preserves the focused
+  `vdbe_pipeline_execute_integer` matrix.
+
 ## 2026-05-25 - VDBE `Opcode::IntCopy` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_intcopy` in

@@ -12,6 +12,40 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-25 - VDBE `Opcode::MakeRecord` hot-dispatch removal
+
+- Target: `make_record_fixed_schema` in
+  `crates/fsqlite-vdbe/benches/make_record.rs`, covering both `generic` and
+  `precomputed_header` rows at 4, 8, 16, and 32 columns.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed only the existing
+  `Opcode::MakeRecord` arm from `try_execute_hot_opcode`, sending record
+  construction back through the main interpreter match. The source patch was
+  unwound after measurement.
+- Evidence:
+  baseline command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-makerecord-baseline cargo bench -p fsqlite-vdbe --bench make_record -- '^make_record_fixed_schema/' --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1152480` measured medians
+  `generic/4=44.088 us`, `precomputed_header/4=36.317 us`,
+  `generic/8=72.016 us`, `precomputed_header/8=60.207 us`,
+  `generic/16=152.57 us`, `precomputed_header/16=117.89 us`,
+  `generic/32=287.77 us`, `precomputed_header/32=204.79 us`.
+  Candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-makerecord-candidate cargo bench -p fsqlite-vdbe --bench make_record -- '^make_record_fixed_schema/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `generic/4=43.423 us`, `precomputed_header/4=45.860 us`,
+  `generic/8=84.867 us`, `precomputed_header/8=69.310 us`,
+  `generic/16=157.73 us`, `precomputed_header/16=118.83 us`,
+  `generic/32=297.38 us`, `precomputed_header/32=203.08 us`.
+- Result: rejected. Removing the hot arm improved `generic/4` and
+  `precomputed_header/32`, but regressed the other six measured rows, so it
+  failed the all-row keep gate. The retained `Opcode::MakeRecord`
+  hot-prefilter arm remains justified for the fixed-schema record builder
+  workload.
+- Do not retry `Opcode::MakeRecord` hot-dispatch removal as a standalone patch.
+  Reconsider only as part of a broader record-builder or interpreter-dispatch
+  reshaping pass that preserves the full `make_record_fixed_schema` matrix.
+
 ## 2026-05-25 - VDBE `Opcode::Compare` hot-dispatch promotion
 
 - Target: `vdbe_pipeline_execute_compare` in

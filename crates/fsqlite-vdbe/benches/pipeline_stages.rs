@@ -44,6 +44,25 @@ fn build_execute_stage_program(op_repeats: usize) -> VdbeProgram {
         .expect("pipeline execute benchmark program should build")
 }
 
+/// Build a dispatch-dominated program whose inner loop is a stream of
+/// `Integer` constant loads. Each op is a p1 immediate to p2 register write,
+/// which isolates whether the hot pre-filter still pays for the small body.
+fn build_execute_stage_integer_program(op_repeats: usize) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    let end = builder.emit_label();
+    builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+    let target = builder.alloc_reg();
+    for value in 0..op_repeats {
+        let immediate = i32::try_from(value).unwrap_or(i32::MAX);
+        builder.emit_op(Opcode::Integer, immediate, target, 0, P4::None, 0);
+    }
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder.resolve_label(end);
+    builder
+        .finish()
+        .expect("pipeline execute integer benchmark program should build")
+}
+
 /// Build a dispatch-dominated program whose inner loop is a stream of `Noop`
 /// ops. The opcode body is only `pc += 1`, so this isolates dispatch routing
 /// overhead for the smallest executable instruction body.
@@ -1022,6 +1041,39 @@ fn bench_vdbe_execute_stage(c: &mut Criterion) {
                     let outcome = engine
                         .execute(program)
                         .expect("pipeline execute benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_vdbe_execute_integer_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_integer");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let program = build_execute_stage_integer_program(op_repeats);
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &program,
+            |b, program| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute integer benchmark should execute");
                     black_box(outcome);
                 });
             },
@@ -2399,6 +2451,7 @@ criterion_group!(
     benches,
     bench_vdbe_decode_stage,
     bench_vdbe_execute_stage,
+    bench_vdbe_execute_integer_stage,
     bench_vdbe_execute_noop_stage,
     bench_vdbe_execute_int64_stage,
     bench_vdbe_execute_real_stage,

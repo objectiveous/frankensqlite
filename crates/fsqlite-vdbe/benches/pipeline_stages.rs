@@ -923,6 +923,28 @@ fn build_execute_stage_column_program(root_page: i32, op_repeats: usize) -> Vdbe
 }
 
 /// Build a dispatch-dominated program whose inner loop is a stream of
+/// `ColumnSubstrPrefix` ops against a positioned storage cursor. This covers
+/// the direct raw-bytes prefix path without benchmarking scalar function setup.
+fn build_execute_stage_column_substr_prefix_program(
+    root_page: i32,
+    op_repeats: usize,
+) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    let halt = builder.emit_label();
+    builder.emit_op(Opcode::OpenWrite, 0, root_page, 0, P4::Int(1), 0);
+    builder.emit_jump_to_label(Opcode::Rewind, 0, 0, halt, P4::None, 0);
+    let r_out = builder.alloc_reg();
+    for _ in 0..op_repeats {
+        builder.emit_op(Opcode::ColumnSubstrPrefix, 0, 0, r_out, P4::Int(8), 0);
+    }
+    builder.resolve_label(halt);
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder
+        .finish()
+        .expect("pipeline execute column-substr-prefix benchmark program should build")
+}
+
+/// Build a dispatch-dominated program whose inner loop is a stream of
 /// `Rowid` ops against a single positioned storage cursor.  The cursor
 /// is opened on a one-row table and Rewound to the only row, so each
 /// dispatched `Rowid` op runs the realistic body shape (one
@@ -2472,6 +2494,53 @@ fn bench_vdbe_execute_column_stage(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_vdbe_execute_column_substr_prefix_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_column_substr_prefix");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        db.get_table_mut(root)
+            .expect("table should exist")
+            .insert_row(
+                1,
+                vec![SqliteValue::Text(
+                    "column-prefix-benchmark-row".to_owned().into(),
+                )],
+            );
+        let program = build_execute_stage_column_substr_prefix_program(root, op_repeats);
+
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &(program, db),
+            |b, (program, db)| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                engine.enable_storage_cursors(true);
+                engine.set_database(db.clone());
+                engine.set_reject_mem_fallback(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute column substr prefix benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_vdbe_execute_rowid_stage(c: &mut Criterion) {
     set_vdbe_jit_enabled(false);
     let mut group = c.benchmark_group("vdbe_pipeline_execute_rowid");
@@ -2887,6 +2956,7 @@ criterion_group!(
     bench_vdbe_execute_or_stage,
     bench_vdbe_execute_zeroornull_stage,
     bench_vdbe_execute_column_stage,
+    bench_vdbe_execute_column_substr_prefix_stage,
     bench_vdbe_execute_ifnot_stage,
     bench_vdbe_execute_if_stage,
     bench_vdbe_execute_compare_stage,

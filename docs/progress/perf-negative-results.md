@@ -12,6 +12,36 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-25 - VDBE `Opcode::ColumnSubstrPrefix` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_column_substr_prefix`, added in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs` during this pass to cover
+  streams of 64, 256, and 1024 direct `ColumnSubstrPrefix` ops against a
+  positioned storage cursor and ASCII text row.
+- Touched during rejected candidate analysis:
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs` and this ledger. No
+  `crates/fsqlite-vdbe/src/engine.rs` candidate patch was applied. Static
+  inspection with
+  `rg -n "ColumnSubstrPrefix" crates/fsqlite-vdbe/src/engine.rs crates/fsqlite-vdbe/src/lib.rs crates/fsqlite-vdbe/src/codegen.rs crates/fsqlite-vdbe/benches/pipeline_stages.rs docs/progress/perf-negative-results.md`
+  found the execution implementation only in `try_execute_hot_opcode` plus its
+  helper, with no cold main-match fallback arm to route through after removal.
+- Evidence:
+  compile check command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-colsubstr-check cargo check -p fsqlite-vdbe --bench pipeline_stages`
+  on worker `vmi1153651` passed. Benchmark command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-colsubstr-bench cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_column_substr_prefix/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=17.755 us`, `256=41.894 us`, `1024=163.60 us`.
+- Result: rejected before source mutation. Removing the hot-prefilter arm would
+  not be a valid performance experiment in the current tree because
+  `ColumnSubstrPrefix` has no byte-equivalent cold interpreter implementation.
+  The added benchmark remains as proof coverage for future dispatch work.
+- Do not retry `Opcode::ColumnSubstrPrefix` hot-dispatch removal as a
+  standalone patch until a cold interpreter arm exists and is covered by the
+  same `vdbe_pipeline_execute_column_substr_prefix` matrix. A future retry
+  should first prove byte-equivalence between the hot helper and the cold path,
+  then measure both routes on the same worker.
+
 ## 2026-05-25 - VDBE `Opcode::ZeroOrNull` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_zeroornull` in

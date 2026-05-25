@@ -12,6 +12,32 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-25 - VDBE `Opcode::Add` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_add` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, covering streams of 64,
+  256, and 1024 `Add` ops.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed only the existing
+  `Opcode::Add` arm from `try_execute_hot_opcode`, sending arithmetic addition
+  back through the main interpreter match. The source patch was unwound after
+  measurement.
+- Evidence:
+  baseline command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-add-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_add/' --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1149989` measured medians
+  `64=1.0763 us`, `256=4.3516 us`, `1024=16.913 us`.
+  Candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-add-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_add/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=1.9828 us`, `256=7.0288 us`, `1024=29.467 us`.
+- Result: rejected. Removing the hot arm regressed every measured stream length,
+  so the retained `Opcode::Add` hot-prefilter arm remains justified for the
+  pipeline addition workload.
+- Do not retry `Opcode::Add` hot-dispatch removal as a standalone patch.
+  Reconsider only as part of a broader arithmetic or interpreter-dispatch
+  reshaping pass that preserves `vdbe_pipeline_execute_add`.
+
 ## 2026-05-25 - VDBE `Opcode::MakeRecord` hot-dispatch removal
 
 - Target: `make_record_fixed_schema` in

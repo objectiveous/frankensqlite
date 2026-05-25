@@ -12,6 +12,34 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-25 - VDBE `Opcode::Variable` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_variable` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, which isolates repeated
+  bound-parameter loads against one owned integer binding.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed only the retained
+  `Opcode::Variable` arm from `try_execute_hot_opcode`, sending bound-parameter
+  loads back through the main interpreter match. The source patch was unwound
+  after measurement.
+- Evidence:
+  baseline command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-variable-restored-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_variable/' --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1149989` measured medians
+  `64=1.0818 us`, `256=3.8917 us`, `1024=15.058 us`.
+  Candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-variable-nohot-candidate2 cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_variable/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=1.0761 us`, `256=4.6796 us`, `1024=16.347 us`.
+- Result: rejected. Removing the hot arm left the 64-op stream effectively flat
+  but regressed the 256-op and 1024-op streams, so the current retained
+  `Opcode::Variable` hot-prefilter arm remains justified for this focused
+  bound-parameter load workload.
+- Do not retry `Opcode::Variable` hot-dispatch removal as a standalone patch.
+  Reconsider only if a broader hot-prefilter compaction pass measures real SQL
+  instruction-cache or binary-size wins and also preserves the focused
+  `vdbe_pipeline_execute_variable` matrix.
+
 ## 2026-05-25 - VDBE `Opcode::Null` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_null` in

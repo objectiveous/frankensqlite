@@ -12,6 +12,33 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-25 - VDBE `Opcode::FusedAppendInsert` hot-dispatch removal
+
+- Target: the `FusedAppendInsert` execution arm in
+  `crates/fsqlite-vdbe/src/engine.rs`, which handles the peephole-fused
+  sequential append path (`NewRowid` + `MakeRecord` + `Insert`) for writable
+  storage cursors.
+- Touched during rejected candidate analysis: this ledger only. No
+  `crates/fsqlite-vdbe/src/engine.rs` candidate patch was applied. Static
+  inspection with
+  `rg -n "FusedAppendInsert|fused append|FusedAppend" crates/fsqlite-vdbe/src crates/fsqlite-vdbe/benches docs/progress/perf-negative-results.md`
+  found the execution implementation only in `try_execute_hot_opcode`; the
+  other references are the peephole/JIT recognizers and tests.
+- Evidence: source inspection on 2026-05-25 found no cold main-match
+  interpreter fallback for `Opcode::FusedAppendInsert`. Removing the hot
+  prefilter arm would therefore route the opcode into the generic unimplemented
+  path rather than measuring a byte-equivalent alternative dispatch route.
+- Result: rejected before source mutation. This is not a valid standalone
+  hot-dispatch-removal experiment in the current tree because the fused opcode
+  semantics live in the hot arm itself: allocate rowid, serialize the record,
+  append to the table B-tree, update insert bookkeeping, and mark the storage
+  root page dirty.
+- Do not retry `Opcode::FusedAppendInsert` hot-dispatch removal as a standalone
+  patch until a cold interpreter arm exists and is covered by focused
+  sequential-append benchmark coverage. A future retry must first prove
+  byte-equivalence between the fused hot arm and the cold fallback, then
+  measure both paths on the same worker.
+
 ## 2026-05-25 - VDBE `Opcode::ColumnSubstrPrefix` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_column_substr_prefix`, added in

@@ -12,6 +12,37 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-25 - VDBE comparison-jump hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_comparison_jump` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, added during this pass to
+  isolate a mixed straight-line stream of `Eq`, `Ne`, `Lt`, `Le`, `Gt`, and
+  `Ge` opcodes. Taken branches target the immediately-next instruction so the
+  benchmark exercises the real comparison-jump body without changing
+  instruction count.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs` for the focused benchmark
+  group and `crates/fsqlite-vdbe/src/engine.rs` for the measured candidate.
+  The candidate removed only the `Opcode::Eq | Opcode::Ne | Opcode::Lt |
+  Opcode::Le | Opcode::Gt | Opcode::Ge` arm from `try_execute_hot_opcode`,
+  sending comparison jumps back through the main interpreter match. The source
+  patch was unwound after measurement.
+- Evidence:
+  baseline command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-cmpjump-baseline2 cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_comparison_jump/' --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1149989` measured medians
+  `64=624.18 ns`, `256=2.4907 us`, `1024=9.4400 us`.
+  Candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-cmpjump-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_comparison_jump/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=1.0731 us`, `256=4.1362 us`, `1024=15.698 us`.
+- Result: rejected. Removing the hot arm regressed every measured stream length
+  for the mixed comparison-jump workload, so the retained prefilter arm remains
+  justified.
+- Do not retry comparison-jump hot-dispatch removal as a standalone patch.
+  Reconsider only as part of a broader interpreter dispatch reshaping pass that
+  preserves the focused `vdbe_pipeline_execute_comparison_jump` matrix.
+
 ## 2026-05-25 - VDBE `Opcode::ResultRow` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_resultrow` in

@@ -12,6 +12,34 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-25 - VDBE `Opcode::IntCopy` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_intcopy` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`, which isolates repeated
+  integer register copies from a stable source register to a stable destination
+  register.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed the existing
+  `Opcode::IntCopy` arm from `try_execute_hot_opcode`, sending integer copy
+  operations back through the main interpreter match. The source patch was
+  unwound after measurement.
+- Evidence:
+  baseline command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-intcopy-baseline cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_intcopy/' --warm-up-time 1 --measurement-time 4`
+  on worker `vmi1227854` measured medians
+  `64=737.12 ns`, `256=2.6141 us`, `1024=10.082 us`.
+  Candidate command
+  `RCH_REQUIRE_REMOTE=1 timeout 1200 rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-scarletfox-intcopy-nohot-candidate cargo bench -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_intcopy/' --warm-up-time 1 --measurement-time 4`
+  on the same worker measured medians
+  `64=709.37 ns`, `256=2.7652 us`, `1024=11.245 us`.
+- Result: rejected. Removing the hot arm improved the 64-op stream, but
+  regressed the 256-op and 1024-op streams, so it failed the all-sizes keep gate
+  for hot-prefilter contraction.
+- Do not retry `Opcode::IntCopy` hot-dispatch removal as a standalone patch.
+  Reconsider only if a broader hot-prefilter compaction pass measures real SQL
+  instruction-cache or binary-size wins and also preserves the focused
+  `vdbe_pipeline_execute_intcopy` matrix.
+
 ## 2026-05-24 - VDBE `Opcode::BitNot` hot-dispatch removal
 
 - Target: `vdbe_pipeline_execute_bitnot` in

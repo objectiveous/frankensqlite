@@ -545,6 +545,483 @@ pub fn load_sql_pipeline_opt_report(path: &Path) -> Result<SqlPipelineOptReport,
     SqlPipelineOptReport::from_json(&json).map_err(|e| format!("parse: {e}"))
 }
 
+// ---------------------------------------------------------------------------
+// T6.2 candidate registry and preflight gate
+// ---------------------------------------------------------------------------
+
+/// Bead identifier for the T6.2 duplicate-candidate preflight gate.
+pub const SQL_PIPELINE_CANDIDATE_PREFLIGHT_BEAD_ID: &str = "bd-1dp9.6.2.1";
+
+const UNKNOWN_FIELD: &str = "unknown";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateDirection {
+    HotDispatchRemoval,
+    HotDispatchPromotion,
+    NoRetryHarness,
+    Other,
+}
+
+impl CandidateDirection {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HotDispatchRemoval => "hot-dispatch-removal",
+            Self::HotDispatchPromotion => "hot-dispatch-promotion",
+            Self::NoRetryHarness => "no-retry-harness",
+            Self::Other => "other",
+        }
+    }
+
+    fn from_heading(title: &str) -> Self {
+        let title = title.to_ascii_lowercase();
+        if title.contains("hot-dispatch") && title.contains("removal") {
+            Self::HotDispatchRemoval
+        } else if title.contains("hot-dispatch") && title.contains("promotion") {
+            Self::HotDispatchPromotion
+        } else if title.contains("no-retry") {
+            Self::NoRetryHarness
+        } else {
+            Self::Other
+        }
+    }
+}
+
+impl std::str::FromStr for CandidateDirection {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match normalize_candidate_atom(value).as_str() {
+            "hotdispatchremoval" | "removal" | "remove" => Ok(Self::HotDispatchRemoval),
+            "hotdispatchpromotion" | "promotion" | "promote" => Ok(Self::HotDispatchPromotion),
+            "noretryharness" | "noretry" => Ok(Self::NoRetryHarness),
+            "other" => Ok(Self::Other),
+            _ => Err(format!(
+                "bead_id={SQL_PIPELINE_CANDIDATE_PREFLIGHT_BEAD_ID} invalid_candidate_direction={value}"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for CandidateDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateDecision {
+    Rejected,
+    Kept,
+    NonCandidate,
+}
+
+impl CandidateDecision {
+    #[must_use]
+    pub const fn blocks_source_mutation(self) -> bool {
+        matches!(self, Self::Rejected | Self::NonCandidate)
+    }
+}
+
+impl fmt::Display for CandidateDecision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Rejected => "rejected",
+            Self::Kept => "kept",
+            Self::NonCandidate => "non-candidate",
+        };
+        f.write_str(label)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidatePreflightVerdict {
+    Allowed,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateKey {
+    pub workload: String,
+    pub operation: String,
+    pub direction: CandidateDirection,
+    pub benchmark_name: String,
+    pub source_surface: String,
+}
+
+impl CandidateKey {
+    #[must_use]
+    pub fn new(
+        workload: impl Into<String>,
+        operation: impl Into<String>,
+        direction: CandidateDirection,
+        benchmark_name: impl Into<String>,
+        source_surface: impl Into<String>,
+    ) -> Self {
+        Self {
+            workload: workload.into(),
+            operation: operation.into(),
+            direction,
+            benchmark_name: benchmark_name.into(),
+            source_surface: source_surface.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn normalized_operation(&self) -> String {
+        normalize_candidate_atom(&self.operation)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateRecord {
+    pub key: CandidateKey,
+    pub decision: CandidateDecision,
+    pub date: String,
+    pub ledger_entry: String,
+    pub evidence_refs: Vec<String>,
+    pub retry_condition: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidatePreflightReport {
+    pub verdict: CandidatePreflightVerdict,
+    pub requested_key: CandidateKey,
+    pub matched_records: Vec<CandidateRecord>,
+    pub summary: String,
+}
+
+impl CandidatePreflightReport {
+    #[must_use]
+    pub fn blocks_source_mutation(&self) -> bool {
+        self.verdict == CandidatePreflightVerdict::Blocked
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateRegistry {
+    pub records: Vec<CandidateRecord>,
+}
+
+impl CandidateRegistry {
+    #[must_use]
+    pub fn from_records(records: Vec<CandidateRecord>) -> Self {
+        Self { records }
+    }
+
+    #[must_use]
+    pub fn preflight(&self, requested_key: &CandidateKey) -> CandidatePreflightReport {
+        let matched_records: Vec<CandidateRecord> = self
+            .records
+            .iter()
+            .filter(|record| record.decision.blocks_source_mutation())
+            .filter(|record| candidate_keys_match(requested_key, &record.key))
+            .cloned()
+            .collect();
+
+        let verdict = if matched_records.is_empty() {
+            CandidatePreflightVerdict::Allowed
+        } else {
+            CandidatePreflightVerdict::Blocked
+        };
+        let summary = if matched_records.is_empty() {
+            format!(
+                "bead_id={SQL_PIPELINE_CANDIDATE_PREFLIGHT_BEAD_ID} verdict=allowed operation={} direction={} benchmark={} source_surface={}",
+                requested_key.operation,
+                requested_key.direction,
+                requested_key.benchmark_name,
+                requested_key.source_surface
+            )
+        } else {
+            let evidence = matched_records
+                .iter()
+                .map(|record| {
+                    format!(
+                        "{} {} {}",
+                        record.decision, record.date, record.ledger_entry
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!(
+                "bead_id={SQL_PIPELINE_CANDIDATE_PREFLIGHT_BEAD_ID} verdict=blocked operation={} direction={} matches={} evidence={}",
+                requested_key.operation,
+                requested_key.direction,
+                matched_records.len(),
+                evidence
+            )
+        };
+
+        CandidatePreflightReport {
+            verdict,
+            requested_key: requested_key.clone(),
+            matched_records,
+            summary,
+        }
+    }
+}
+
+#[must_use]
+pub fn normalize_candidate_atom(value: &str) -> String {
+    let stripped = value
+        .trim()
+        .strip_prefix("Opcode::")
+        .unwrap_or_else(|| value.trim());
+    stripped
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+#[must_use]
+pub fn parse_candidate_registry_from_negative_results_ledger(
+    ledger_path: &str,
+    markdown: &str,
+) -> CandidateRegistry {
+    let mut entries = Vec::new();
+    let mut current_heading: Option<(usize, String, Vec<String>)> = None;
+
+    for (idx, line) in markdown.lines().enumerate() {
+        if line.starts_with("## ") {
+            if let Some((line_no, heading, body)) = current_heading.take() {
+                if let Some(record) =
+                    build_candidate_record_from_ledger_entry(ledger_path, line_no, &heading, &body)
+                {
+                    entries.push(record);
+                }
+            }
+            current_heading = Some((idx + 1, line.to_owned(), Vec::new()));
+        } else if let Some((_line_no, _heading, body)) = current_heading.as_mut() {
+            body.push(line.to_owned());
+        }
+    }
+
+    if let Some((line_no, heading, body)) = current_heading {
+        if let Some(record) =
+            build_candidate_record_from_ledger_entry(ledger_path, line_no, &heading, &body)
+        {
+            entries.push(record);
+        }
+    }
+
+    CandidateRegistry::from_records(entries)
+}
+
+pub fn load_candidate_registry_from_negative_results_ledger(
+    ledger_path: &Path,
+) -> Result<CandidateRegistry, String> {
+    let payload = std::fs::read_to_string(ledger_path).map_err(|error| {
+        format!(
+            "bead_id={SQL_PIPELINE_CANDIDATE_PREFLIGHT_BEAD_ID} case=ledger_read_failed path={} error={error}",
+            ledger_path.display()
+        )
+    })?;
+    Ok(parse_candidate_registry_from_negative_results_ledger(
+        &ledger_path.display().to_string(),
+        &payload,
+    ))
+}
+
+fn candidate_keys_match(requested_key: &CandidateKey, recorded_key: &CandidateKey) -> bool {
+    requested_key.direction == recorded_key.direction
+        && field_matches(
+            &requested_key.normalized_operation(),
+            &recorded_key.normalized_operation(),
+            false,
+        )
+        && field_matches(&requested_key.workload, &recorded_key.workload, true)
+        && field_matches(
+            &requested_key.benchmark_name,
+            &recorded_key.benchmark_name,
+            true,
+        )
+        && field_matches(
+            &requested_key.source_surface,
+            &recorded_key.source_surface,
+            true,
+        )
+}
+
+fn field_matches(left: &str, right: &str, allow_unknown: bool) -> bool {
+    let left = normalize_candidate_atom(left);
+    let right = normalize_candidate_atom(right);
+    if left.is_empty() || right.is_empty() {
+        return allow_unknown;
+    }
+    if allow_unknown && (left == UNKNOWN_FIELD || right == UNKNOWN_FIELD) {
+        return true;
+    }
+    left == right || left.contains(&right) || right.contains(&left)
+}
+
+fn build_candidate_record_from_ledger_entry(
+    ledger_path: &str,
+    line_no: usize,
+    heading: &str,
+    body: &[String],
+) -> Option<CandidateRecord> {
+    let title = heading
+        .trim_start_matches("## ")
+        .split_once(" - ")
+        .map_or_else(|| heading.trim_start_matches("## "), |(_date, title)| title);
+    let title_lower = title.to_ascii_lowercase();
+    if !(title_lower.contains("hot-dispatch") || title_lower.contains("no-retry")) {
+        return None;
+    }
+
+    let date = heading
+        .trim_start_matches("## ")
+        .split_once(" - ")
+        .map_or(UNKNOWN_FIELD, |(date, _title)| date)
+        .to_owned();
+    let body_text = body.join("\n");
+    let operation = candidate_operation_from_title(title);
+    let direction = CandidateDirection::from_heading(title);
+    let decision = candidate_decision_from_entry(title, &body_text);
+    let benchmark_name = extract_candidate_benchmark(&body_text);
+    let source_surface = extract_candidate_source_surface(&body_text);
+    let ledger_entry = format!("{ledger_path}:{line_no}");
+    let mut evidence_refs = extract_candidate_evidence_refs(&body_text);
+    evidence_refs.insert(0, ledger_entry.clone());
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    let retry_condition = extract_retry_condition(body);
+
+    Some(CandidateRecord {
+        key: CandidateKey::new("VDBE", operation, direction, benchmark_name, source_surface),
+        decision,
+        date,
+        ledger_entry,
+        evidence_refs,
+        retry_condition,
+    })
+}
+
+fn candidate_operation_from_title(title: &str) -> String {
+    if let Some(opcode) = first_code_span_with_prefix(title, "Opcode::") {
+        return opcode;
+    }
+    let title_lower = title.to_ascii_lowercase();
+    if title_lower.contains("comparison-jump") {
+        "comparison_jump".to_owned()
+    } else if title_lower.contains("update/delete") && title_lower.contains("no-retry") {
+        "update_delete_no_retry_harness".to_owned()
+    } else {
+        title
+            .split("hot-dispatch")
+            .next()
+            .unwrap_or(title)
+            .trim()
+            .trim_start_matches("VDBE")
+            .trim()
+            .to_owned()
+    }
+}
+
+fn first_code_span_with_prefix(haystack: &str, prefix: &str) -> Option<String> {
+    haystack
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .find_map(|span| span.strip_prefix(prefix).map(ToOwned::to_owned))
+}
+
+fn candidate_decision_from_entry(title: &str, body: &str) -> CandidateDecision {
+    let text = format!("{title}\n{body}").to_ascii_lowercase();
+    if text.contains("not a valid standalone")
+        || text.contains("no cold main-match interpreter fallback")
+        || text.contains("no byte-equivalent cold interpreter implementation")
+    {
+        CandidateDecision::NonCandidate
+    } else if text.contains("result: kept") {
+        CandidateDecision::Kept
+    } else {
+        CandidateDecision::Rejected
+    }
+}
+
+fn extract_candidate_benchmark(body: &str) -> String {
+    body.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .find(|part| is_candidate_benchmark_name(part))
+        .map_or_else(|| UNKNOWN_FIELD.to_owned(), ToOwned::to_owned)
+}
+
+fn is_candidate_benchmark_name(part: &str) -> bool {
+    match part {
+        "make_record_fixed_schema" => true,
+        _ => part.starts_with("vdbe_pipeline_execute_"),
+    }
+}
+
+fn extract_candidate_source_surface(body: &str) -> String {
+    if body.contains("try_execute_hot_opcode") {
+        "crates/fsqlite-vdbe/src/engine.rs::try_execute_hot_opcode".to_owned()
+    } else {
+        body.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.')))
+            .find(|token| token.starts_with("crates/"))
+            .map_or_else(|| UNKNOWN_FIELD.to_owned(), ToOwned::to_owned)
+    }
+}
+
+fn extract_candidate_evidence_refs(body: &str) -> Vec<String> {
+    body.split_whitespace()
+        .filter_map(clean_evidence_ref)
+        .filter(|token| {
+            token.starts_with("bd-")
+                || token.starts_with("crates/")
+                || token.starts_with("tests/artifacts/")
+                || token.starts_with("artifacts/")
+                || token.starts_with("/data/tmp/")
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn clean_evidence_ref(token: &str) -> Option<String> {
+    let cleaned = token.trim_matches(|c: char| {
+        !(c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.' | ':' | '='))
+    });
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_owned())
+    }
+}
+
+fn extract_retry_condition(body: &[String]) -> String {
+    let mut capture = false;
+    let mut parts = Vec::new();
+    for line in body {
+        let trimmed = line.trim();
+        if trimmed.starts_with("- Do not retry") {
+            capture = true;
+            parts.push(
+                trimmed
+                    .trim_start_matches("- ")
+                    .trim_end_matches('.')
+                    .to_owned(),
+            );
+            continue;
+        }
+        if capture {
+            if trimmed.is_empty() || trimmed.starts_with("- ") {
+                break;
+            }
+            parts.push(trimmed.trim_end_matches('.').to_owned());
+        }
+    }
+    if parts.is_empty() {
+        "retry condition not recorded".to_owned()
+    } else {
+        parts.join(" ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -765,6 +1242,121 @@ mod tests {
             let restored: OptimizationDomain = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(restored, d);
         }
+    }
+
+    #[test]
+    fn candidate_key_normalization_covers_opcode_aliases() {
+        assert_eq!(normalize_candidate_atom("Opcode::ZeroOrNull"), "zeroornull");
+        assert_eq!(normalize_candidate_atom("zero-or-null"), "zeroornull");
+        assert_eq!(normalize_candidate_atom("zero_or_null"), "zeroornull");
+        assert_eq!(
+            normalize_candidate_atom("Fused Append Insert"),
+            "fusedappendinsert"
+        );
+    }
+
+    #[test]
+    fn candidate_preflight_blocks_rejected_alias_duplicate() {
+        let ledger = r"
+## 2026-05-25 - VDBE `Opcode::ZeroOrNull` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_zeroornull` in
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`.
+- Touched during rejected candidate:
+  `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed only the existing
+  `Opcode::ZeroOrNull` arm from `try_execute_hot_opcode`.
+- Evidence: benchmark artifact `tests/artifacts/perf/zeroornull.json`.
+- Result: rejected. Removing the hot arm regressed every measured stream length.
+- Do not retry `Opcode::ZeroOrNull` hot-dispatch removal as a standalone patch.
+";
+        let registry = parse_candidate_registry_from_negative_results_ledger(
+            "docs/progress/perf-negative-results.md",
+            ledger,
+        );
+        let request = CandidateKey::new(
+            "vdbe",
+            "zero-or-null",
+            CandidateDirection::HotDispatchRemoval,
+            "vdbe_pipeline_execute_zeroornull",
+            "try_execute_hot_opcode",
+        );
+        let report = registry.preflight(&request);
+
+        assert!(report.blocks_source_mutation());
+        assert_eq!(report.matched_records.len(), 1);
+        assert_eq!(
+            report.matched_records[0].decision,
+            CandidateDecision::Rejected
+        );
+        assert!(
+            report.matched_records[0]
+                .evidence_refs
+                .iter()
+                .any(|reference| reference.contains("zeroornull.json")),
+            "bead_id={SQL_PIPELINE_CANDIDATE_PREFLIGHT_BEAD_ID} expected artifact evidence"
+        );
+    }
+
+    #[test]
+    fn candidate_preflight_blocks_non_candidate_fused_opcode_alias() {
+        let ledger = r"
+## 2026-05-25 - VDBE `Opcode::FusedAppendInsert` hot-dispatch removal
+
+- Target: the `FusedAppendInsert` execution arm in
+  `crates/fsqlite-vdbe/src/engine.rs`.
+- Evidence: source inspection found no cold main-match interpreter fallback for
+  `Opcode::FusedAppendInsert`. Removing the hot prefilter arm would route the
+  opcode into the generic unimplemented path rather than measuring a
+  byte-equivalent alternative dispatch route.
+- Result: rejected before source mutation. This is not a valid standalone
+  hot-dispatch-removal experiment in the current tree.
+- Do not retry `Opcode::FusedAppendInsert` hot-dispatch removal as a standalone
+  patch until a cold interpreter arm exists.
+";
+        let registry = parse_candidate_registry_from_negative_results_ledger(
+            "docs/progress/perf-negative-results.md",
+            ledger,
+        );
+        let request = CandidateKey::new(
+            "vdbe",
+            "fused append insert",
+            CandidateDirection::HotDispatchRemoval,
+            "unknown",
+            "crates/fsqlite-vdbe/src/engine.rs::try_execute_hot_opcode",
+        );
+        let report = registry.preflight(&request);
+
+        assert!(report.blocks_source_mutation());
+        assert_eq!(
+            report.matched_records[0].decision,
+            CandidateDecision::NonCandidate
+        );
+        assert!(
+            report.matched_records[0]
+                .retry_condition
+                .contains("Do not retry"),
+            "bead_id={SQL_PIPELINE_CANDIDATE_PREFLIGHT_BEAD_ID} expected retry condition"
+        );
+    }
+
+    #[test]
+    fn candidate_preflight_allows_unseen_candidate() {
+        let registry = parse_candidate_registry_from_negative_results_ledger(
+            "docs/progress/perf-negative-results.md",
+            "",
+        );
+        let request = CandidateKey::new(
+            "vdbe",
+            "NewUnmeasuredOpcode",
+            CandidateDirection::HotDispatchPromotion,
+            "vdbe_pipeline_execute_new_unmeasured_opcode",
+            "try_execute_hot_opcode",
+        );
+        let report = registry.preflight(&request);
+
+        assert!(!report.blocks_source_mutation());
+        assert!(report.matched_records.is_empty());
+        assert_eq!(report.verdict, CandidatePreflightVerdict::Allowed);
     }
 
     #[test]

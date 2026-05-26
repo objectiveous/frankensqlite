@@ -12,6 +12,30 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## T6.2 candidate preflight gate
+
+Before mutating SQL-pipeline/VDBE source for a T6.2 optimization candidate,
+run the machine-readable duplicate gate against this ledger. A blocked result
+means the candidate already has a rejected or non-candidate record and the agent
+must not start source edits until a broader retry condition from the matched
+entry is satisfied.
+
+Example:
+
+```bash
+cargo run -p fsqlite-harness --bin sql_pipeline_candidate_preflight -- \
+  --operation ZeroOrNull \
+  --direction hot-dispatch-removal \
+  --benchmark vdbe_pipeline_execute_zeroornull \
+  --source-surface try_execute_hot_opcode
+```
+
+Use `--json` for artifact capture. Exit code `0` means no matching no-retry
+record was found. Exit code `2` means the candidate is blocked. When adding a
+new kept, rejected, or non-candidate record, include the date, benchmark or
+artifact path, Beads comment or issue reference, touched source surface, and the
+retry condition so this preflight can emit actionable evidence.
+
 ## 2026-05-25 - VDBE `Opcode::FusedAppendInsert` hot-dispatch removal
 
 - Target: the `FusedAppendInsert` execution arm in

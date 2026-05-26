@@ -65,12 +65,13 @@ fn dcg_log_command_sequence_does_not_violate_pk() {
     assert_eq!(ids, vec![1, 2], "autoincrement must yield distinct rowids");
 }
 
-// KNOWN-FAILING (frankensqlite#94): `DELETE FROM <external-content fts5>` with no
-// WHERE clause does not enumerate/clear the table's in-memory documents, so the
-// subsequent re-INSERT of the same rowid trips the PrimaryKeyViolation guard in
-// `Fts5Table::update` (the `self.documents.contains_key(&rowid)` check). Un-ignore
-// once the external-content delete-all path is fixed.
-#[ignore = "frankensqlite#94: external-content FTS5 DELETE-all leaves in-memory docs"]
+// frankensqlite#94: `DELETE FROM <external-content fts5>` with no WHERE clause
+// must enumerate every live rowid and route each through the FTS5 module's
+// xUpdate delete branch, clearing both the in-memory documents/index and the
+// backing storage records. Without that, a subsequent re-INSERT of the same
+// rowid tripped the PrimaryKeyViolation guard in `Fts5Table::update`. The
+// connection now intercepts live virtual-table DELETE (see
+// `Connection::execute_live_vtab_delete`) so the rebuild pattern works.
 #[test]
 fn dcg_rebuild_fts_does_not_violate_pk() {
     let conn = Connection::open(":memory:").expect("open");

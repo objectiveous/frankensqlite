@@ -4500,6 +4500,23 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     /// Move to the previous entry. Returns false if at the beginning.
+    ///
+    /// Forward-progress fix (frankensqlite#95, symmetric to `advance_next_impl`):
+    /// the previous implementation recursed back into `advance_prev` whenever
+    /// `move_to_rightmost_leaf` returned `false` (subtree exhausted via an
+    /// empty leaf bubbling up). Unlike `advance_next_impl` the recursion did
+    /// not even snapshot a `resume_stack`, so the cursor's stack was left in
+    /// whatever state the recursive `move_to_rightmost_leaf` → `advance_prev`
+    /// chain produced. While the canonical exhaustion path appears to
+    /// terminate (each inner descent strictly decrements `parent.cell_idx`),
+    /// the recursive pattern is exactly the one the forward-scan fix removed,
+    /// and any future change that leaves the cursor in `(stack_empty,
+    /// at_eof=false)` would trigger the rightmost re-seek from `root_page`
+    /// and replay rows already returned. Replace the recursion with an
+    /// iterative loop bounded by `BTREE_MAX_DEPTH * 8` that maintains the
+    /// invariant that every iteration either returns a row, pops a stack
+    /// frame, or strictly decrements `parent.cell_idx` on the current stack
+    /// top.
     fn advance_prev(&mut self, cx: &Cx) -> Result<bool> {
         observe_cursor_cancellation(cx)?;
 
@@ -4540,6 +4557,10 @@ impl<P: PageReader> BtCursor<P> {
             (top.header.page_type.is_leaf(), top.cell_idx)
         };
 
+        // Forward-progress safety net: bound the number of recovery loop
+        // iterations. Mirrors `advance_next_impl`'s ceiling.
+        let max_iterations = (BTREE_MAX_DEPTH as usize).saturating_mul(8).max(128);
+
         if is_leaf {
             if cell_idx > 0 {
                 self.stack[depth - 1].cell_idx -= 1;
@@ -4547,55 +4568,133 @@ impl<P: PageReader> BtCursor<P> {
                 return Ok(true);
             }
 
-            // Before the first cell on this leaf. Pop up.
+            // Before the first cell on this leaf. Pop up until we find an
+            // interior page with an earlier sibling to descend into. This
+            // is an iterative recovery — the previous implementation
+            // recursed back into `advance_prev` when `move_to_rightmost_leaf`
+            // returned `false`, which lacked a forward-progress invariant.
             self.stack.pop();
-            while !self.stack.is_empty() {
+            for _ in 0..max_iterations {
                 observe_cursor_cancellation(cx)?;
+                if self.stack.is_empty() {
+                    // At the very beginning of the tree.
+                    return Ok(false);
+                }
                 let depth = self.stack.len();
-                let parent = &self.stack[depth - 1];
-                if parent.cell_idx > 0 {
-                    // In index B-trees, moving backward from a child should land on
-                    // the separator key immediately to its left.
+                let parent_cell_idx = self.stack[depth - 1].cell_idx;
+
+                if parent_cell_idx > 0 {
+                    // In index B-trees, moving backward from a child should
+                    // land on the separator key immediately to its left.
+                    // Return without descending; the caller's next prev()
+                    // call will enter the interior branch below.
                     if !self.is_table {
                         self.stack[depth - 1].cell_idx -= 1;
+                        self.at_eof = false;
                         return Ok(true);
                     }
 
-                    let prev_child_idx = parent.cell_idx - 1;
-                    let child = Self::child_page_at(parent, prev_child_idx)?;
+                    let prev_child_idx = parent_cell_idx - 1;
+                    let child = {
+                        let parent = &self.stack[depth - 1];
+                        Self::child_page_at(parent, prev_child_idx)?
+                    };
 
                     self.stack[depth - 1].cell_idx = prev_child_idx;
+                    // Snapshot the parent stack so we can restore it if
+                    // `move_to_rightmost_leaf` exhausts to EOF inside an
+                    // empty subtree (the recursion may pop everything,
+                    // including this parent frame).
+                    let resume_stack = self.stack.clone();
                     self.issue_prefetch_hint(cx, child);
                     let found = self.move_to_rightmost_leaf(cx, child, true)?;
                     if found {
                         return Ok(true);
                     }
+                    // Subtree at `child` was empty/exhausted. Restore the
+                    // stack to "parent advanced past this child" so the
+                    // loop's next iteration makes strict reverse progress
+                    // (either descending into the next earlier sibling or
+                    // popping this interior page once cell_idx == 0).
                     self.at_eof = false;
-                    return self.advance_prev(cx);
+                    self.stack = resume_stack;
+                    continue;
                 }
                 // cell_idx == 0 means we came from the leftmost child.
                 self.stack.pop();
             }
 
-            // At the very beginning of the tree.
+            // Reverse-progress invariant violation: the recovery loop
+            // exceeded `max_iterations` without returning a row or finding
+            // the start of the tree. This is the signature of
+            // frankensqlite#95 in the reverse direction.
+            debug_assert!(
+                false,
+                "BtCursor::advance_prev (leaf-recovery) exceeded {} iterations \
+                 without reverse progress (frankensqlite#95); root_page = {}, \
+                 stack_depth = {}, at_eof = {}",
+                max_iterations,
+                self.root_page.get(),
+                self.stack.len(),
+                self.at_eof,
+            );
+            self.at_eof = true;
             return Ok(false);
         }
 
         // On an interior page (only happens for index B-trees).
         // The current position is the separator cell itself.
-        // The previous logical entry is the rightmost descendant of the left subtree.
+        // The previous logical entry is the rightmost descendant of the
+        // left subtree.
+        //
+        // Reverse-order semantics for an index B-tree interior with cells
+        // [c0, c1, c2] and children [l0, l1, l2, l3] reading right-to-left:
+        //   rightmost(l3), c2, rightmost(l2), c1, rightmost(l1), c0,
+        //   rightmost(l0), <ascend to ancestor>.
+        // When on separator `cell_idx`, prev = rightmost(l[cell_idx]); if
+        // that subtree is empty AND cell_idx > 0, prev = separator at
+        // cell_idx-1 itself (a logical entry to return); if cell_idx == 0
+        // we must ascend to the parent.
+        //
+        // Forward-progress fix (frankensqlite#95, reverse direction):
+        // replaced the original `return self.advance_prev(cx)` recursive
+        // recovery (which relied on `move_to_rightmost_leaf`'s internal
+        // recursion to bubble exhaustion up through the entire ancestor
+        // chain in a single call) with a single explicit step. After a
+        // failed descent into the left subtree, the prev row is either
+        // the separator at cell_idx-1 (in-place repositioning) or a
+        // bounded-depth ascent via one recursive `advance_prev` call.
         let child = {
             let top = &self.stack[depth - 1];
             Self::child_page_at(top, cell_idx)?
         };
+        // Snapshot the parent stack so we can restore it if the rightmost
+        // descent into this child subtree finds nothing.
+        let resume_stack = self.stack.clone();
         self.issue_prefetch_hint(cx, child);
         let found = self.move_to_rightmost_leaf(cx, child, false)?;
         if found {
-            Ok(true)
-        } else {
-            self.at_eof = false;
-            self.advance_prev(cx)
+            return Ok(true);
         }
+        // Subtree empty/exhausted. Restore parent stack.
+        self.at_eof = false;
+        self.stack = resume_stack;
+        if cell_idx > 0 {
+            // The separator at cell_idx-1 IS the prev logical entry.
+            // Reposition the cursor on that separator and return.
+            self.stack[depth - 1].cell_idx = cell_idx - 1;
+            return Ok(true);
+        }
+        // cell_idx == 0: no earlier separator on this page; pop and
+        // continue upward. Recursion is bounded by tree depth
+        // (BTREE_MAX_DEPTH) because each recursive frame either returns
+        // a row or strictly shortens the stack.
+        self.stack.pop();
+        if self.stack.is_empty() {
+            return Ok(false);
+        }
+        self.at_eof = false;
+        self.advance_prev(cx)
     }
 }
 
@@ -19320,6 +19419,137 @@ mod tests {
                 *rowid,
                 (i as i64) + 1,
                 "rowid mismatch at scan position {i} (frankensqlite#95)"
+            );
+        }
+    }
+
+    /// Symmetric reverse-direction regression for frankensqlite#95:
+    /// `BtCursor::prev` across a multi-level table B-tree with a manually
+    /// seeded EMPTY subtree must terminate and visit every leaf row exactly
+    /// once in descending order. The pre-fix `advance_prev` used a
+    /// recursive recovery (`return self.advance_prev(cx);`) without
+    /// snapshotting a `resume_stack`, so any future change that leaves
+    /// the cursor in `(stack_empty, at_eof=false)` after a failed inner
+    /// `move_to_rightmost_leaf` would re-trigger the rightmost re-seek
+    /// from `root_page` and replay rows. This test pins reverse
+    /// forward-progress as an invariant of the iterative rewrite.
+    #[test]
+    fn test_advance_prev_terminates_on_multi_level_with_empty_subtree_frankensqlite_95() {
+        // Mirror of the forward test: depth-3 tree with an empty middle
+        // subtree under page 4 (right-child = page 6, leaf with no cells).
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 10), (pn(4), 20)], pn(5)));
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"one"), (5, b"five")]));
+        store.pages.insert(4, build_interior_table(&[], pn(6)));
+        store
+            .pages
+            .insert(5, build_leaf_table(&[(30, b"thirty"), (40, b"forty")]));
+        store.pages.insert(6, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+        let started = Instant::now();
+        let budget = Duration::from_secs(10);
+        let mut observed: Vec<i64> = Vec::new();
+
+        assert!(cursor.last(&cx).unwrap());
+        observed.push(cursor.rowid(&cx).unwrap());
+        let mut iterations: usize = 0;
+        loop {
+            iterations += 1;
+            assert!(
+                iterations <= 32,
+                "advance_prev called more than 32 times for 4-row tree — \
+                 reverse forward-progress invariant violated (frankensqlite#95)"
+            );
+            assert!(
+                started.elapsed() < budget,
+                "reverse scan did not terminate (frankensqlite#95 hang)"
+            );
+            if !cursor.prev(&cx).unwrap() {
+                break;
+            }
+            observed.push(cursor.rowid(&cx).unwrap());
+        }
+
+        assert_eq!(
+            observed,
+            vec![40_i64, 30, 5, 1],
+            "reverse scan must visit every leaf row exactly once, in \
+             descending order, even when the tree contains an empty subtree \
+             (frankensqlite#95)"
+        );
+    }
+
+    /// Symmetric reverse-direction regression for frankensqlite#95:
+    /// reverse scan of a multi-level table B-tree must terminate in O(n)
+    /// and visit every row exactly once. Mirrors the forward 6_000-row
+    /// test.
+    #[test]
+    fn test_advance_prev_terminates_on_multi_level_table_btree_frankensqlite_95() {
+        let cx = Cx::new();
+        let root = pn(2);
+        const SMALL_USABLE: u32 = 512;
+        let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
+        let mut cursor = BtCursor::new(store, root, SMALL_USABLE, true);
+
+        const ROWS: i64 = 6_000;
+        const PAYLOAD_LEN: usize = 200;
+        let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i & 0xFF) as u8).collect();
+
+        for rowid in 1..=ROWS {
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+        }
+
+        let budget = Duration::from_secs(20);
+        let started = Instant::now();
+        let max_iterations = (ROWS as usize) * 4;
+        let mut observed: Vec<i64> = Vec::with_capacity(ROWS as usize);
+
+        assert!(cursor.last(&cx).unwrap(), "tree must be non-empty");
+        observed.push(cursor.rowid(&cx).unwrap());
+
+        let mut iterations = 0usize;
+        loop {
+            iterations += 1;
+            assert!(
+                iterations <= max_iterations,
+                "advance_prev called more than {} times for {} rows — \
+                 reverse forward-progress invariant violated (frankensqlite#95)",
+                max_iterations,
+                ROWS
+            );
+            assert!(
+                started.elapsed() < budget,
+                "reverse scan did not terminate within {:?} \
+                 (frankensqlite#95 multi-level B-tree hang)",
+                budget
+            );
+
+            if !cursor.prev(&cx).unwrap() {
+                break;
+            }
+            observed.push(cursor.rowid(&cx).unwrap());
+        }
+
+        assert_eq!(
+            observed.len(),
+            ROWS as usize,
+            "reverse scan visited {} rows, expected {}",
+            observed.len(),
+            ROWS
+        );
+        // Reverse scan should produce rowids in descending order: ROWS, ROWS-1, ..., 1.
+        for (i, rowid) in observed.iter().enumerate() {
+            assert_eq!(
+                *rowid,
+                ROWS - (i as i64),
+                "rowid mismatch at reverse scan position {i} (frankensqlite#95)"
             );
         }
     }

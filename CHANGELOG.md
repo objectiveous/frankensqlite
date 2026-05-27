@@ -62,8 +62,27 @@ to 0.1.6).
   `messages`-table shape) and
   `test_advance_next_terminates_on_multi_level_with_empty_subtree_frankensqlite_95`
   (hand-crafted depth-3 tree with an empty middle subtree to exercise the
-  recovery path that the previous recursive implementation handled
-  incorrectly).
+  recovery path).
+
+- **`BtCursor::prev()` symmetric forward-progress hardening** (defensive,
+  same fix family as #95). `BtCursor::advance_prev` used a recursive
+  recovery (`return self.advance_prev(cx);`) without snapshotting a
+  `resume_stack` — even more fragile than the forward path. Although the
+  exhaustion path appeared to terminate (each inner descent strictly
+  decrements `parent.cell_idx`), the recursive pattern was the exact one
+  the forward fix removed, and any future change leaving the cursor in
+  `(stack_empty, at_eof=false)` after a failed
+  `move_to_rightmost_leaf` would have triggered the rightmost re-seek
+  from `root_page` and replayed rows. Replaced both the leaf-recovery
+  loop and the index-interior recovery with an iterative pattern that
+  matches `advance_next_impl`: `resume_stack` snapshot/restore around
+  every `move_to_rightmost_leaf` call, `BTREE_MAX_DEPTH * 8` iteration
+  ceiling, `debug_assert!`-gated regression detection, and safe
+  degradation in release builds. Adds two regression tests:
+  `test_advance_prev_terminates_on_multi_level_table_btree_frankensqlite_95`
+  (6,000-row reverse scan) and
+  `test_advance_prev_terminates_on_multi_level_with_empty_subtree_frankensqlite_95`
+  (hand-crafted depth-3 tree with empty middle subtree).
 
 ## [0.1.4] -- 2026-05-26
 

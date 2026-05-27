@@ -7,14 +7,52 @@ page-level MVCC concurrent writers, Serializable Snapshot Isolation (SSI), and
 RaptorQ-pervasive durability. The project is organized as a 26-member Cargo
 workspace under `crates/`.
 
-> **No releases or tags exist yet.** The project is pre-release (all crates at
-> 0.1.2). This changelog is organized by capability area rather than raw diff
-> order, covering all 2,520 commits from project inception (2026-02-06) through
-> 2026-03-21.
+> The project is pre-release. Crates are published to crates.io as `fsqlite`
+> and the `fsqlite-*` workspace members. The historical entries below
+> (0.1.0–0.1.2) are organized by capability area rather than raw diff order,
+> covering all 2,520 commits from project inception (2026-02-06) through
+> 2026-03-21; the 0.1.3 and 0.1.4 entries are point releases.
 
 Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
+
+## [0.1.4] -- 2026-05-26
+
+FTS5 join and delete-all correctness fixes for downstream consumers
+(`coding_agent_session_search`/cass, `destructive_command_guard`/dcg). Version
+bump across all workspace crates for crates.io publish (`fsqlite-vfs` to 0.1.5).
+
+### Fixed
+
+- **FTS5 / virtual-table join projection width**
+  ([#93](https://github.com/Dicklesworthstone/frankensqlite/issues/93)).
+  `join_table_supports_hidden_rowid` no longer counts a phantom hidden-rowid
+  column for virtual tables, so `scan_width()` matches the materialized row.
+  This eliminates the `range end index N out of range for slice of length M`
+  panic in `execute_join_select` (and the accompanying wrong/empty column
+  ordering in FTS5 bm25 join results) for queries whose left-hand side is an
+  FTS5 virtual table.
+  [`e3714db5`](https://github.com/Dicklesworthstone/frankensqlite/commit/e3714db5a16a224e93bf874b46d99062145b4145),
+  with a self-diagnosing `debug_assert` guard at the join slice
+  [`c065aa07`](https://github.com/Dicklesworthstone/frankensqlite/commit/c065aa073).
+- **FTS5 delete-all + re-insert**
+  ([#94](https://github.com/Dicklesworthstone/frankensqlite/issues/94)).
+  `DELETE FROM <fts5>` with no `WHERE` clause now routes through the module's
+  per-row `xUpdate` delete via `Connection::execute_live_vtab_delete`,
+  enumerating live rowids and clearing the in-memory `Fts5Table` state in
+  lockstep with the backing storage. The `DELETE FROM <fts>; <re-INSERT each
+  rowid>` rebuild pattern no longer trips `PrimaryKeyViolation` in stored,
+  contentless, or external-content modes. FTS5 rusqlite conformance 59/59.
+  [`a0425adb`](https://github.com/Dicklesworthstone/frankensqlite/commit/a0425adb)
+
+## [0.1.3] -- 2026-05-02
+
+Version bump across all workspace crates for crates.io republish
+(`fsqlite-vfs` 0.1.3 → 0.1.4, adds `native` feature).
+
+[`75f380eb`](https://github.com/Dicklesworthstone/frankensqlite/commit/75f380eb),
+[`992d54ea`](https://github.com/Dicklesworthstone/frankensqlite/commit/992d54ea)
 
 ## [0.1.2] -- 2026-03-21
 

@@ -4292,16 +4292,42 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     /// Advance to the next entry. Returns false if at EOF.
+    ///
+    /// Forward-progress fix (frankensqlite#95): previously, when an inner
+    /// `move_to_leftmost_leaf` returned `false` (subtree was exhausted, e.g.
+    /// because of an empty leaf bubbling up to EOF), the recovery branches
+    /// restored a `resume_stack`, cleared `at_eof`, and recursively
+    /// re-entered `advance_next_impl`. That recursion lacked a hard
+    /// forward-progress guarantee: on multi-level table B-trees the cursor
+    /// could effectively re-descend the same subtree indefinitely, with
+    /// `rchar` climbing while `read_bytes` stayed at zero (page cache
+    /// serving the same pages over and over).
+    ///
+    /// The fix is two-fold:
+    ///   1. Replace the mutual recursion with an iterative inner loop in
+    ///      both the leaf-exhausted recovery (table-only) and the interior
+    ///      branch (index-only). The loop maintains the invariant that
+    ///      every iteration either returns a row, pops a stack frame, or
+    ///      strictly advances `cell_idx` on the current stack top.
+    ///   2. Add a `debug_assert!`-gated iteration ceiling
+    ///      (`BTREE_MAX_DEPTH * 8`). Any cursor that fails to make forward
+    ///      progress is caught loudly in tests; in release builds we
+    ///      degrade safely by setting `at_eof = true` and returning false.
+    ///
+    /// The empty-stack re-seek from `root_page` is preserved at the top of
+    /// the function for legitimate "before-first" recovery (after `prev()`
+    /// falls off the start, `next()` re-positions at row 1), but it is
+    /// never re-entered from within the loop body.
     fn advance_next_impl(&mut self, cx: &Cx, record_leaf_witness: bool) -> Result<bool> {
         observe_cursor_cancellation(cx)?;
 
         if self.at_eof {
-            self.at_eof = true;
             return Ok(false);
         }
         if self.stack.is_empty() {
-            // Allow recovering from a before-first state created by prev()
-            // at the beginning of iteration.
+            // SQLite-style before-first recovery: `prev()` past the first
+            // row leaves the stack empty with `at_eof = false`. The next
+            // `next()` call must re-position at row 1.
             return self.move_to_leftmost_leaf(cx, self.root_page, record_leaf_witness);
         }
 
@@ -4315,6 +4341,12 @@ impl<P: PageReader> BtCursor<P> {
             )
         };
 
+        // Forward-progress safety net: bound the number of recovery loop
+        // iterations. The bound is generous so the legitimate cases
+        // (descend → leaf → ascend, possibly across multiple empty
+        // subtrees) have plenty of headroom.
+        let max_iterations = (BTREE_MAX_DEPTH as usize).saturating_mul(8).max(128);
+
         // On a leaf page: try to advance to the next cell.
         if is_leaf {
             let next_idx = cell_idx + 1;
@@ -4324,73 +4356,143 @@ impl<P: PageReader> BtCursor<P> {
             }
 
             // Past the last cell on this leaf. Pop up until we find an
-            // interior page with more children to visit.
+            // interior page with more children to visit. This is an
+            // iterative recovery — the previous implementation recursed
+            // back into `advance_next_impl` when `move_to_leftmost_leaf`
+            // returned `false`, which lacked a forward-progress invariant
+            // and could re-enter the empty-stack re-seek from `root_page`.
             self.stack.pop();
-            while !self.stack.is_empty() {
+            for _ in 0..max_iterations {
                 observe_cursor_cancellation(cx)?;
+                if self.stack.is_empty() {
+                    self.at_eof = true;
+                    return Ok(false);
+                }
                 let depth = self.stack.len();
-                let parent = &self.stack[depth - 1];
-                if parent.cell_idx < parent.header.cell_count {
-                    // We came from the left child of cell[cell_idx].
-                    // In index B-trees, the separator key in the parent is the next logical entry.
+                let parent_cell_idx = self.stack[depth - 1].cell_idx;
+                let parent_cell_count = self.stack[depth - 1].header.cell_count;
+
+                if parent_cell_idx < parent_cell_count {
+                    // For index B-trees, the separator key in the parent
+                    // is the next logical entry. Return it; the next call
+                    // will enter the interior branch below and descend
+                    // into the right subtree.
                     if !self.is_table {
                         return Ok(true);
                     }
 
-                    let next_child_idx = parent.cell_idx + 1;
-                    let child = Self::child_page_at(parent, next_child_idx)?;
+                    let next_child_idx = parent_cell_idx + 1;
+                    let child = {
+                        let parent = &self.stack[depth - 1];
+                        Self::child_page_at(parent, next_child_idx)?
+                    };
 
                     self.stack[depth - 1].cell_idx = next_child_idx;
+                    // Snapshot the parent stack so we can restore it if
+                    // `move_to_leftmost_leaf` exhausts to EOF inside an
+                    // empty subtree (the recursion may pop everything,
+                    // including this parent frame).
                     let resume_stack = self.stack.clone();
                     self.issue_prefetch_hint(cx, child);
                     let found = self.move_to_leftmost_leaf(cx, child, record_leaf_witness)?;
                     if found {
                         return Ok(true);
                     }
-                    self.stack = resume_stack;
+                    // Subtree at `child` was empty/exhausted. Restore the
+                    // stack to "parent advanced past this child" so the
+                    // loop's next iteration makes strict forward progress
+                    // (either advancing to the next sibling or popping
+                    // this interior page once cell_idx == cell_count).
                     self.at_eof = false;
-                    return self.advance_next_impl(cx, record_leaf_witness);
+                    self.stack = resume_stack;
+                    continue;
                 }
-                // cell_idx == cell_count means we already visited right_child.
+                // cell_idx == cell_count means we already visited
+                // right_child. Pop and continue upward.
                 self.stack.pop();
             }
 
-            // Exhausted the entire tree.
+            // Forward-progress invariant violation: the recovery loop
+            // exceeded `max_iterations` without returning a row or finding
+            // EOF. This is the signature of frankensqlite#95.
+            debug_assert!(
+                false,
+                "BtCursor::advance_next_impl (leaf-recovery) exceeded {} iterations \
+                 without forward progress (frankensqlite#95); root_page = {}, \
+                 stack_depth = {}, at_eof = {}",
+                max_iterations,
+                self.root_page.get(),
+                self.stack.len(),
+                self.at_eof,
+            );
             self.at_eof = true;
             return Ok(false);
         }
 
         // On an interior page (only happens for index B-trees).
         // The current position is the separator cell itself.
-        // The next logical entry is the leftmost descendant of the right subtree.
-        if cell_idx >= cell_count {
-            self.stack.pop();
-            if self.stack.is_empty() {
-                self.at_eof = true;
-                return Ok(false);
+        // The next logical entry is the leftmost descendant of the right
+        // subtree. Iterative loop replaces the recursive recovery that
+        // could spin on empty subtrees.
+        let mut cell_idx = cell_idx;
+        let mut cell_count = cell_count;
+        for _ in 0..max_iterations {
+            observe_cursor_cancellation(cx)?;
+            if cell_idx >= cell_count {
+                self.stack.pop();
+                if self.stack.is_empty() {
+                    self.at_eof = true;
+                    return Ok(false);
+                }
+                let depth = self.stack.len();
+                let top = &self.stack[depth - 1];
+                if top.header.page_type.is_leaf() {
+                    // Defensive: an interior-page ascent should land on
+                    // another interior page, but if state is anomalous,
+                    // recurse via `advance_next_impl` to re-enter the
+                    // leaf-exhausted recovery. This is bounded by the
+                    // tree depth, not by data size, so it cannot spin.
+                    self.at_eof = false;
+                    return self.advance_next_impl(cx, record_leaf_witness);
+                }
+                cell_idx = top.cell_idx;
+                cell_count = top.header.cell_count;
+                continue;
+            }
+            let next_child_idx = cell_idx + 1;
+            let depth = self.stack.len();
+            let child = {
+                let top = &self.stack[depth - 1];
+                Self::child_page_at(top, next_child_idx)?
+            };
+            self.stack
+                .last_mut()
+                .ok_or_else(|| FrankenError::internal("cursor stack empty"))?
+                .cell_idx = next_child_idx;
+            let resume_stack = self.stack.clone();
+            self.issue_prefetch_hint(cx, child);
+            let found = self.move_to_leftmost_leaf(cx, child, false)?;
+            if found {
+                return Ok(true);
             }
             self.at_eof = false;
-            return self.advance_next_impl(cx, record_leaf_witness);
-        }
-        let next_child_idx = cell_idx + 1;
-        let child = {
-            let top = &self.stack[depth - 1];
-            Self::child_page_at(top, next_child_idx)?
-        };
-        self.stack
-            .last_mut()
-            .ok_or_else(|| FrankenError::internal("cursor stack empty"))?
-            .cell_idx = next_child_idx;
-        let resume_stack = self.stack.clone();
-        self.issue_prefetch_hint(cx, child);
-        let found = self.move_to_leftmost_leaf(cx, child, false)?;
-        if found {
-            Ok(true)
-        } else {
             self.stack = resume_stack;
-            self.at_eof = false;
-            self.advance_next_impl(cx, record_leaf_witness)
+            cell_idx = next_child_idx;
+            cell_count = self.stack[self.stack.len() - 1].header.cell_count;
         }
+
+        debug_assert!(
+            false,
+            "BtCursor::advance_next_impl (interior) exceeded {} iterations without \
+             forward progress (frankensqlite#95); root_page = {}, stack_depth = {}, \
+             at_eof = {}",
+            max_iterations,
+            self.root_page.get(),
+            self.stack.len(),
+            self.at_eof,
+        );
+        self.at_eof = true;
+        Ok(false)
     }
 
     fn advance_next(&mut self, cx: &Cx) -> Result<bool> {
@@ -19008,5 +19110,217 @@ mod tests {
 
         // Cleanup so we don't leak a buffer into other tests on this thread.
         CELL_POINTERS_POOL.with(|pool| pool.borrow_mut().clear());
+    }
+
+    /// Adversarial regression test for frankensqlite#95: forward scan
+    /// across a deep multi-level table B-tree that contains a manually
+    /// seeded EMPTY subtree must terminate without re-reading pages
+    /// indefinitely.
+    ///
+    /// The reporter's diagnosis was that when the recursive recovery in
+    /// `advance_next_impl` hit `move_to_leftmost_leaf` returning false
+    /// (e.g. for an empty subtree), the cursor restored `resume_stack`,
+    /// cleared `at_eof`, and re-entered `advance_next_impl`. With the
+    /// previous implementation this could fail to advance the parent
+    /// pointer past the exhausted subtree, leading to a hang. This test
+    /// constructs an explicit tree with an empty middle subtree and
+    /// asserts that the forward scan terminates and visits every leaf
+    /// row exactly once.
+    #[test]
+    fn test_advance_next_terminates_on_multi_level_with_empty_subtree_frankensqlite_95() {
+        // Hand-crafted depth-3 tree:
+        //   root (interior, page 2): [(page 3, sep=10), (page 4, sep=20)] right_child=page 5
+        //   page 3 (leaf):  [1, 5]
+        //   page 4 (interior, no cells): right_child = page 6 (EMPTY leaf)
+        //   page 5 (leaf):  [30, 40]
+        //   page 6 (leaf):  []   <-- the adversarial empty subtree
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 10), (pn(4), 20)], pn(5)));
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"one"), (5, b"five")]));
+        store.pages.insert(4, build_interior_table(&[], pn(6)));
+        store
+            .pages
+            .insert(5, build_leaf_table(&[(30, b"thirty"), (40, b"forty")]));
+        store.pages.insert(6, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+        let started = Instant::now();
+        let budget = Duration::from_secs(10);
+        let mut observed: Vec<i64> = Vec::new();
+
+        assert!(cursor.first(&cx).unwrap());
+        observed.push(cursor.rowid(&cx).unwrap());
+        let mut iterations: usize = 0;
+        loop {
+            iterations += 1;
+            assert!(
+                iterations <= 32,
+                "advance_next called more than 32 times for 4-row tree — \
+                 forward-progress invariant violated (frankensqlite#95)"
+            );
+            assert!(
+                started.elapsed() < budget,
+                "forward scan did not terminate (frankensqlite#95 hang)"
+            );
+            if !cursor.next(&cx).unwrap() {
+                break;
+            }
+            observed.push(cursor.rowid(&cx).unwrap());
+        }
+
+        assert_eq!(
+            observed,
+            vec![1_i64, 5, 30, 40],
+            "forward scan must visit every leaf row exactly once, in order, \
+             even when the tree contains an empty subtree (frankensqlite#95)"
+        );
+    }
+
+    /// Regression test for frankensqlite#95: forward scan of a multi-level
+    /// table B-tree must terminate in O(n) and visit every row exactly once.
+    ///
+    /// Background:
+    /// `BtCursor::advance_next_impl` and `move_to_leftmost_leaf` are mutually
+    /// recursive. When `move_to_leftmost_leaf` returns `false` for a subtree
+    /// (signalling EOF found *inside* the recursion), the table-leaf-exhausted
+    /// branch at cursor.rs:4350-4352 (and the interior-page branch at
+    /// cursor.rs:4390-4392) used to restore the resume_stack, clear
+    /// `at_eof`, and recurse into `advance_next_impl` from the same parent
+    /// position. With a multi-level B-tree this could fail to advance the
+    /// parent and re-descend the same subtree forever — the symptom was a
+    /// `cass index --full` that pinned one core at 100%, with `/proc/<pid>/io`
+    /// showing `rchar` plateau and `read_bytes = 0` (re-reading cached pages).
+    ///
+    /// This test builds a deep multi-level table B-tree (root interior page
+    /// pointing at interior pages pointing at leaves — depth >= 3), then
+    /// performs a full forward scan via `first()`/`next()` and asserts:
+    ///   1. The scan terminates in well under the wall-clock budget.
+    ///   2. Every rowid is visited exactly once, in ascending order.
+    ///   3. No infinite loop in `advance_next_impl`.
+    #[test]
+    fn test_advance_next_terminates_on_multi_level_table_btree_frankensqlite_95() {
+        let cx = Cx::new();
+        let root = pn(2);
+        // Small usable size forces page splits at lower row counts, building
+        // a depth >= 3 table B-tree (root interior -> interior -> leaf), which
+        // is the multi-level regime the cass `messages` table reaches at
+        // ~6_000 rows and which the report identifies as the trigger for
+        // frankensqlite#95.
+        const SMALL_USABLE: u32 = 512;
+        let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
+        let mut cursor = BtCursor::new(store, root, SMALL_USABLE, true);
+
+        const ROWS: i64 = 6_000;
+        const PAYLOAD_LEN: usize = 200;
+        let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i & 0xFF) as u8).collect();
+
+        for rowid in 1..=ROWS {
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+        }
+
+        // Confirm we actually have a multi-level tree (root must be interior),
+        // and that the depth is at least 3 (root -> interior -> leaf).
+        let mut saw_deeper_interior = false;
+        {
+            let root_page = cursor.pager.pages.get(&root.get()).unwrap();
+            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+            assert_eq!(
+                root_header.page_type,
+                cell::BtreePageType::InteriorTable,
+                "test must build a multi-level B-tree to exercise frankensqlite#95"
+            );
+
+            // Walk root's children directly from the raw page image
+            // (avoid touching the cursor's stack before the scan starts).
+            let header_offset = cell::header_offset_for_page(root);
+            let mut cell_pointers: Vec<u16> = Vec::new();
+            cell::read_cell_pointers_into(
+                root_page.as_slice(),
+                &root_header,
+                header_offset,
+                &mut cell_pointers,
+            )
+            .unwrap();
+            let total_children = root_header.cell_count + 1;
+            for child_idx in 0..total_children {
+                let child = if child_idx < root_header.cell_count {
+                    let cell_offset = usize::from(cell_pointers[usize::from(child_idx)]);
+                    let bytes = &root_page.as_slice()[cell_offset..cell_offset + 4];
+                    PageNumber::new(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                        .unwrap()
+                } else {
+                    root_header.right_child.unwrap()
+                };
+                let cp = cursor.pager.pages.get(&child.get()).unwrap();
+                let ch = BtreePageHeader::parse(cp, 0).unwrap();
+                if matches!(ch.page_type, cell::BtreePageType::InteriorTable) {
+                    saw_deeper_interior = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw_deeper_interior,
+            "test must build a depth >= 3 B-tree to exercise frankensqlite#95"
+        );
+
+        // Bounded wall-clock budget. A correct O(n) scan of 6_000 rows is
+        // far under 10s even on a slow CI host; an infinite re-read loop
+        // will blow through this immediately.
+        let budget = Duration::from_secs(20);
+        let started = Instant::now();
+        // Bound the number of `next()` calls too, as a belt-and-suspenders
+        // safety net in case `next()` returns true forever without making
+        // progress.
+        let max_iterations = (ROWS as usize) * 4;
+        let mut observed: Vec<i64> = Vec::with_capacity(ROWS as usize);
+
+        assert!(cursor.first(&cx).unwrap(), "tree must be non-empty");
+        observed.push(cursor.rowid(&cx).unwrap());
+
+        let mut iterations = 0usize;
+        loop {
+            iterations += 1;
+            assert!(
+                iterations <= max_iterations,
+                "advance_next called more than {} times for {} rows — \
+                 forward-progress invariant violated (frankensqlite#95)",
+                max_iterations,
+                ROWS
+            );
+            assert!(
+                started.elapsed() < budget,
+                "forward scan did not terminate within {:?} \
+                 (frankensqlite#95 multi-level B-tree hang)",
+                budget
+            );
+
+            if !cursor.next(&cx).unwrap() {
+                break;
+            }
+            observed.push(cursor.rowid(&cx).unwrap());
+        }
+
+        // The scan must visit every rowid exactly once, in ascending order.
+        assert_eq!(
+            observed.len(),
+            ROWS as usize,
+            "forward scan visited {} rows, expected {}",
+            observed.len(),
+            ROWS
+        );
+        for (i, rowid) in observed.iter().enumerate() {
+            assert_eq!(
+                *rowid,
+                (i as i64) + 1,
+                "rowid mismatch at scan position {i} (frankensqlite#95)"
+            );
+        }
     }
 }

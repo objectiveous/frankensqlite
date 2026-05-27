@@ -17,6 +17,54 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
+## [0.1.5] -- 2026-05-27
+
+Critical forward-progress fix for `BtCursor::next()` on multi-level table
+B-trees ([#95](https://github.com/Dicklesworthstone/frankensqlite/issues/95)).
+Downstream consumers with non-trivial corpora hung during full forward scans
+(e.g. `cass index --full` for any user with more than ~6,000 messages, because
+once the `messages` table's B-tree reaches multi-level the cursor could spin
+re-reading the same pages indefinitely while `/proc/<pid>/io` showed `rchar`
+climb and then plateau with `read_bytes = 0`).
+
+Version bump across all workspace crates for crates.io publish (`fsqlite-vfs`
+to 0.1.6).
+
+### Fixed
+
+- **`BtCursor::next()` infinite re-read on multi-level table B-trees**
+  ([#95](https://github.com/Dicklesworthstone/frankensqlite/issues/95)).
+  `BtCursor::advance_next_impl` used mutual recursion with
+  `move_to_leftmost_leaf` plus a recursive recovery branch that, on failure of
+  an inner descent (`move_to_leftmost_leaf` returning `false` for an empty
+  subtree), restored a `resume_stack`, cleared `at_eof`, and re-entered
+  `advance_next_impl`. That recovery path lacked a hard forward-progress
+  invariant — on multi-level table B-trees the cursor's stack could be left in
+  a state where the empty-stack re-seek from `root_page` (cursor.rs:4302-4305)
+  fired during what should have been a forward scan, causing the cursor to
+  re-descend from root and re-visit rows it had already returned.
+
+  The fix replaces the recursive recovery with an explicit iterative loop in
+  both the table-leaf-exhausted branch and the index-interior branch. The loop
+  maintains the invariant that every iteration either returns a row, pops a
+  stack frame, or strictly advances `cell_idx` on the current stack top. The
+  empty-stack re-seek from `root_page` is preserved at the top of
+  `advance_next_impl` for legitimate SQLite-style "before-first" recovery
+  (after `prev()` falls off the start, `next()` re-positions at row 1) but is
+  never reached from within the loop body. A `debug_assert!`-gated iteration
+  ceiling (`BTREE_MAX_DEPTH * 8`) surfaces any latent forward-progress
+  regression loudly in tests; in release builds the cursor degrades safely by
+  setting `at_eof = true` and returning `false` rather than spinning.
+
+  Adds two regression tests in `crates/fsqlite-btree/src/cursor.rs`:
+  `test_advance_next_terminates_on_multi_level_table_btree_frankensqlite_95`
+  (6,000-row depth-3 table with INTEGER PK + payload, matches the cass
+  `messages`-table shape) and
+  `test_advance_next_terminates_on_multi_level_with_empty_subtree_frankensqlite_95`
+  (hand-crafted depth-3 tree with an empty middle subtree to exercise the
+  recovery path that the previous recursive implementation handled
+  incorrectly).
+
 ## [0.1.4] -- 2026-05-26
 
 FTS5 join and delete-all correctness fixes for downstream consumers

@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-btree"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "foldhash 0.2.0",
  "fsqlite-error",

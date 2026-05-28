@@ -4685,16 +4685,59 @@ impl<P: PageReader> BtCursor<P> {
             self.stack[depth - 1].cell_idx = cell_idx - 1;
             return Ok(true);
         }
-        // cell_idx == 0: no earlier separator on this page; pop and
-        // continue upward. Recursion is bounded by tree depth
-        // (BTREE_MAX_DEPTH) because each recursive frame either returns
-        // a row or strictly shortens the stack.
+        // cell_idx == 0: no earlier separator on this page. Pop and
+        // ascend, looking for the next-earlier separator in an ancestor.
+        //
+        // frankensqlite#95 secondary defect: the previous implementation
+        // recursed into `self.advance_prev(cx)` here. That recursion
+        // re-entered the interior branch at the parent with the parent's
+        // `cell_idx` still pointing at the *slot we just popped from*,
+        // causing `child_page_at(parent, cell_idx)` to re-descend into
+        // the subtree we just exhausted via `move_to_rightmost_leaf`
+        // (which would happily return its rightmost leaf — a row that
+        // had already been returned earlier in the reverse scan,
+        // producing an infinite/looping replay). Caught by
+        // `test_advance_prev_does_not_replay_after_interior_pop_recurse_frankensqlite_95`.
+        //
+        // The fix mirrors the iterative leaf-recovery loop: each iteration
+        // either returns a separator (strict reverse progress), pops a
+        // frame (strict stack shrink), or terminates with `Ok(false)`.
         self.stack.pop();
-        if self.stack.is_empty() {
-            return Ok(false);
+        for _ in 0..max_iterations {
+            observe_cursor_cancellation(cx)?;
+            if self.stack.is_empty() {
+                return Ok(false);
+            }
+            let depth = self.stack.len();
+            let parent_cell_idx = self.stack[depth - 1].cell_idx;
+            if parent_cell_idx > 0 {
+                // Reverse step into the previous separator on this
+                // ancestor. The interior branch is only entered for
+                // index B-trees; tables never reach this code path.
+                self.stack[depth - 1].cell_idx -= 1;
+                self.at_eof = false;
+                return Ok(true);
+            }
+            // parent_cell_idx == 0: we already came from this ancestor's
+            // leftmost child. Pop and keep ascending.
+            self.stack.pop();
         }
-        self.at_eof = false;
-        self.advance_prev(cx)
+
+        // Reverse-progress invariant violation: the interior-pop ascent
+        // exceeded `max_iterations` without finding an earlier separator
+        // or the start of the tree.
+        debug_assert!(
+            false,
+            "BtCursor::advance_prev (interior-pop ascent) exceeded {} iterations \
+             without reverse progress (frankensqlite#95); root_page = {}, \
+             stack_depth = {}, at_eof = {}",
+            max_iterations,
+            self.root_page.get(),
+            self.stack.len(),
+            self.at_eof,
+        );
+        self.at_eof = true;
+        Ok(false)
     }
 }
 

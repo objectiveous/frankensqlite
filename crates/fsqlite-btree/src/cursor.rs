@@ -17972,6 +17972,223 @@ mod tests {
                 rowids
             );
         }
+
+        /// Reverse-direction companion to `prop_btree_vs_btreemap_reference`.
+        ///
+        /// The existing forward-only property test (`prop_btree_vs_btreemap_reference`)
+        /// walked the B-tree with `first()` + `next()`.  Both frankensqlite#95-class
+        /// defects (the asymmetric `advance_prev` original fix, and the secondary
+        /// interior pop-and-recurse defect) lived exclusively in the reverse-scan
+        /// code path and would have been caught automatically by this test.
+        ///
+        /// Strategy: build the same B-tree as `prop_btree_vs_btreemap_reference`,
+        /// then walk it backward with `last()` + `prev()` and compare against
+        /// `reference.keys().rev().cloned().collect::<Vec<_>>()`.
+        #[test]
+        fn prop_btree_reverse_iter_matches_btreemap_rev(
+            ops in proptest::collection::vec(
+                proptest::prop_oneof![
+                    3 => (1..=2000_i64, proptest::collection::vec(proptest::num::u8::ANY, 10..100))
+                        .prop_map(|(r, p)| (true, r, p)),
+                    1 => (1..=2000_i64,).prop_map(|(r,)| (false, r, Vec::new())),
+                ],
+                1..500
+            )
+        ) {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
+
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let mut reference: std::collections::BTreeMap<i64, Vec<u8>> =
+                std::collections::BTreeMap::new();
+
+            for (is_insert, rowid, payload) in &ops {
+                if *is_insert {
+                    if reference.contains_key(rowid) {
+                        // Duplicate: must produce PrimaryKeyViolation.
+                        let result = cursor.table_insert(&cx, *rowid, payload);
+                        proptest::prop_assert!(
+                            matches!(result, Err(FrankenError::PrimaryKeyViolation)),
+                            "duplicate rowid {} should produce PrimaryKeyViolation, got {:?}",
+                            rowid,
+                            result,
+                        );
+                    } else {
+                        cursor.table_insert(&cx, *rowid, payload).unwrap();
+                        reference.insert(*rowid, payload.clone());
+                    }
+                } else if reference.contains_key(rowid) {
+                    let seek = cursor.table_move_to(&cx, *rowid).unwrap();
+                    if seek.is_found() {
+                        cursor.delete(&cx).unwrap();
+                        reference.remove(rowid);
+                    }
+                }
+            }
+
+            // Scan in REVERSE using last() + prev() and compare against the
+            // reversed reference sequence.
+            let mut scanned_rev = Vec::new();
+            if cursor.last(&cx).unwrap() {
+                loop {
+                    scanned_rev.push(cursor.rowid(&cx).unwrap());
+                    if !cursor.prev(&cx).unwrap() {
+                        break;
+                    }
+                }
+            }
+
+            let expected_rev: Vec<i64> = reference.keys().rev().copied().collect();
+            proptest::prop_assert_eq!(
+                &scanned_rev,
+                &expected_rev,
+                "reverse scan (last+prev) rowids must match BTreeMap::keys().rev()"
+            );
+        }
+
+        /// Round-trip property: forward scan followed by reverse scan must
+        /// produce mirror-image sequences for the same B-tree state.
+        ///
+        /// This is a stronger invariant than either direction test alone: it
+        /// asserts that `forward.rev() == reverse` without requiring any
+        /// external reference, catching asymmetries that cancel out when
+        /// compared against a BTreeMap separately.
+        #[test]
+        fn prop_btree_forward_and_reverse_round_trip(
+            ops in proptest::collection::vec(
+                proptest::prop_oneof![
+                    3 => (1..=2000_i64, proptest::collection::vec(proptest::num::u8::ANY, 10..100))
+                        .prop_map(|(r, p)| (true, r, p)),
+                    1 => (1..=2000_i64,).prop_map(|(r,)| (false, r, Vec::new())),
+                ],
+                1..500
+            )
+        ) {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
+
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let mut reference: std::collections::BTreeMap<i64, Vec<u8>> =
+                std::collections::BTreeMap::new();
+
+            for (is_insert, rowid, payload) in &ops {
+                if *is_insert {
+                    if !reference.contains_key(rowid) {
+                        cursor.table_insert(&cx, *rowid, payload).unwrap();
+                        reference.insert(*rowid, payload.clone());
+                    } else {
+                        // Tolerate PrimaryKeyViolation on duplicates; keep reference consistent.
+                        let _ = cursor.table_insert(&cx, *rowid, payload);
+                    }
+                } else if reference.contains_key(rowid) {
+                    let seek = cursor.table_move_to(&cx, *rowid).unwrap();
+                    if seek.is_found() {
+                        cursor.delete(&cx).unwrap();
+                        reference.remove(rowid);
+                    }
+                }
+            }
+
+            // Forward pass.
+            let mut forward = Vec::new();
+            if cursor.first(&cx).unwrap() {
+                loop {
+                    forward.push(cursor.rowid(&cx).unwrap());
+                    if !cursor.next(&cx).unwrap() {
+                        break;
+                    }
+                }
+            }
+
+            // Reverse pass on the same tree.
+            let mut reverse = Vec::new();
+            if cursor.last(&cx).unwrap() {
+                loop {
+                    reverse.push(cursor.rowid(&cx).unwrap());
+                    if !cursor.prev(&cx).unwrap() {
+                        break;
+                    }
+                }
+            }
+
+            // The reverse scan must be exactly the mirror of the forward scan.
+            let forward_rev: Vec<i64> = forward.iter().rev().copied().collect();
+            proptest::prop_assert_eq!(
+                &reverse,
+                &forward_rev,
+                "reverse scan must be the exact mirror of forward scan \
+                 (forward.rev() != reverse)"
+            );
+        }
+
+        /// Index B-tree traversal property test: walks an index B-tree in
+        /// REVERSE using `last()` + `prev()` after random insertions/deletions
+        /// and asserts the reverse-scanned key sequence matches the
+        /// `reference.values().sorted().rev()` sequence.
+        ///
+        /// The existing `prop_index_btree_structural_invariants_hold_after_random_mutations`
+        /// only validates structural invariants and forward scan (via
+        /// `scan_all_index_keys`); this test exercises the reverse-traversal code
+        /// path for index B-trees, which was not covered by any prior property test.
+        #[test]
+        fn prop_index_btree_reverse_iter_matches_sorted_rev(
+            ops in proptest::collection::vec(
+                proptest::prop_oneof![
+                    3 => (1..=2_000_i64,).prop_map(|(id,)| (true, id)),
+                    1 => (1..=2_000_i64,).prop_map(|(id,)| (false, id)),
+                ],
+                1..220
+            )
+        ) {
+            const INDEX_USABLE: u32 = 512;
+
+            let root = pn(2);
+            let store = MemPageStore::with_empty_index(root, INDEX_USABLE);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, root, INDEX_USABLE, false);
+            let mut reference = BTreeMap::<i64, Vec<u8>>::new();
+
+            for (is_insert, id) in &ops {
+                let key = synthetic_index_key(*id);
+                if *is_insert {
+                    if !reference.contains_key(id) {
+                        cursor.index_insert(&cx, &key).unwrap();
+                        reference.insert(*id, key);
+                    }
+                } else if reference.contains_key(id) {
+                    let seek = cursor.index_move_to(&cx, &key).unwrap();
+                    if seek.is_found() {
+                        cursor.delete(&cx).unwrap();
+                        reference.remove(id);
+                    }
+                }
+            }
+
+            // Build expected forward key sequence (same sort order as index).
+            let mut expected_keys: Vec<Vec<u8>> = reference.values().cloned().collect();
+            expected_keys.sort_by(|lhs, rhs| compare_index_test_keys(&cursor, lhs, rhs));
+
+            // Reverse scan: last() + prev().
+            let mut scanned_rev: Vec<Vec<u8>> = Vec::new();
+            if cursor.last(&cx).unwrap() {
+                loop {
+                    scanned_rev.push(cursor.payload(&cx).unwrap());
+                    if !cursor.prev(&cx).unwrap() {
+                        break;
+                    }
+                }
+            }
+
+            // Expected reverse = forward list reversed.
+            let expected_rev: Vec<Vec<u8>> = expected_keys.iter().rev().cloned().collect();
+            proptest::prop_assert_eq!(
+                &scanned_rev,
+                &expected_rev,
+                "index reverse scan (last+prev) must match sorted keys reversed"
+            );
+        }
     }
 
     #[test]

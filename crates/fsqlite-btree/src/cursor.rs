@@ -3219,6 +3219,38 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     /// Move the cursor to the first entry in the subtree rooted at `page_no`.
+    ///
+    /// # WARNING — mutual recursion with `advance_next_impl` (touch with care)
+    ///
+    /// When descent reaches an **empty leaf** this function calls
+    /// `advance_next_impl` to skip it and find the next populated leaf.
+    /// `advance_next_impl` in turn calls `move_to_leftmost_leaf` for every
+    /// interior child it descends into.  The two functions are therefore
+    /// mutually recursive.
+    ///
+    /// **Why this is safe (but fragile):**
+    /// - The recursion depth is bounded by `BTREE_MAX_DEPTH` (currently 20):
+    ///   the `stack.len()` guard at the top of each function fires before a
+    ///   second nested call can push beyond the limit.
+    /// - Each recursive entry into `move_to_leftmost_leaf` is made from
+    ///   `advance_next_impl` with a *child* page that has not yet been pushed
+    ///   onto the stack, so the stack grows by exactly one per level.
+    /// - The empty-leaf case pushes the leaf and immediately delegates to
+    ///   `advance_next_impl`; from there the leaf branch of `advance_next_impl`
+    ///   does a leaf-recovery loop (no further descent), never re-entering
+    ///   the interior branch that would call `move_to_leftmost_leaf` again.
+    ///
+    /// **History:** this recursion shape hid two frankensqlite#95-class defects:
+    /// 1. The original `advance_prev` recursed back via `move_to_rightmost_leaf`
+    ///    without advancing the parent pointer, causing an infinite loop.
+    /// 2. A secondary defect in the interior pop-and-recurse path of
+    ///    `advance_prev` re-entered `advance_prev` after an interior pop
+    ///    without advancing the cell index, replaying the same subtree.
+    ///
+    /// **Future work:** an iterative refactor (tracked in a GitHub issue) would
+    /// eliminate the mutual recursion entirely and make forward-progress
+    /// invariants trivially verifiable.  Until then, treat any change to this
+    /// function or `advance_next_impl` with extreme care.
     fn move_to_leftmost_leaf(
         &mut self,
         cx: &Cx,
@@ -3246,6 +3278,10 @@ impl<P: PageReader> BtCursor<P> {
                         self.record_range_page_witness(cx, leaf_page_no);
                     }
                     self.at_eof = false;
+                    // WARNING: mutual-recursion site — see doc-comment above.
+                    // This call enters the leaf branch of `advance_next_impl`
+                    // (the just-pushed empty leaf) and goes through the
+                    // leaf-recovery loop, never re-entering the interior branch.
                     return self.advance_next_impl(cx, record_leaf_witness);
                 }
                 self.stack.push(entry);
@@ -3281,6 +3317,36 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     /// Move the cursor to the last entry in the subtree rooted at `page_no`.
+    ///
+    /// # WARNING — mutual recursion with `advance_prev` (touch with care)
+    ///
+    /// Symmetric to `move_to_leftmost_leaf` / `advance_next_impl`: when
+    /// descent reaches an **empty leaf** this function calls `advance_prev`
+    /// to skip it and find the previous populated leaf.  `advance_prev` in
+    /// turn calls `move_to_rightmost_leaf` for every interior child it
+    /// descends into via its interior-pop ascent path.
+    ///
+    /// **Why this is safe (but fragile):**
+    /// - The recursion depth is bounded by `BTREE_MAX_DEPTH` (currently 20).
+    /// - Each recursive entry into `move_to_rightmost_leaf` is made with a
+    ///   *child* page not yet on the stack, so the stack grows by one per level.
+    /// - The empty-leaf case pushes the leaf and delegates to `advance_prev`;
+    ///   from there the leaf branch handles leaf-recovery without re-entering
+    ///   the interior branch that would call `move_to_rightmost_leaf` again.
+    ///
+    /// **History:** this recursion shape hid two frankensqlite#95-class defects:
+    /// 1. The original `advance_prev` recursed back via `move_to_rightmost_leaf`
+    ///    without advancing the parent pointer (fixed by replacing the recursive
+    ///    call with an iterative leaf-recovery loop).
+    /// 2. A secondary defect in the interior pop-and-recurse path of
+    ///    `advance_prev` re-entered `advance_prev` after an interior pop
+    ///    without incrementing the cell index, replaying the same subtree
+    ///    forever (fixed in the same patch — see `advance_prev` doc-comment).
+    ///
+    /// **Future work:** an iterative refactor (tracked in a GitHub issue) would
+    /// eliminate the mutual recursion entirely and make backward-progress
+    /// invariants trivially verifiable.  Until then, treat any change to this
+    /// function or `advance_prev` with extreme care.
     fn move_to_rightmost_leaf(
         &mut self,
         cx: &Cx,
@@ -3307,6 +3373,10 @@ impl<P: PageReader> BtCursor<P> {
                         self.record_range_page_witness(cx, leaf_page_no);
                     }
                     self.at_eof = false;
+                    // WARNING: mutual-recursion site — see doc-comment above.
+                    // This call enters the leaf branch of `advance_prev`
+                    // (the just-pushed empty leaf) and goes through the
+                    // leaf-recovery loop, never re-entering the interior branch.
                     return self.advance_prev(cx);
                 }
                 entry.cell_idx = entry.header.cell_count - 1;
@@ -19898,12 +19968,7 @@ mod tests {
         // out-of-order sequence.
         assert_eq!(
             observed,
-            vec![
-                b"d".to_vec(),
-                b"c".to_vec(),
-                b"bb".to_vec(),
-                b"b".to_vec(),
-            ],
+            vec![b"d".to_vec(), b"c".to_vec(), b"bb".to_vec(), b"b".to_vec(),],
             "reverse scan over a multi-level index B-tree with an empty \
              leftmost-path subtree must visit each entry exactly once in \
              descending order — interior-pop-and-recurse must not re-descend \

@@ -19553,4 +19553,101 @@ mod tests {
             );
         }
     }
+
+    /// Adversarial regression test for `BtCursor::advance_prev` interior-page
+    /// pop-and-recurse path (frankensqlite#95 secondary defect).
+    ///
+    /// Setup is a 3-level index B-tree whose leftmost path descends through
+    /// a chain of interior pages whose `cell_idx == 0` slot points to a
+    /// chain that eventually bottoms out in an empty leaf:
+    ///
+    /// ```text
+    ///   pn2 (root, interior):  cells = [(pn3, "c")],  right_child = pn4
+    ///   pn3 (interior):        cells = [(pn5, "b")],  right_child = pn6
+    ///   pn5 (interior):        cells = [],            right_child = pn7
+    ///   pn7 (empty leaf)
+    ///   pn6 (leaf):            ["bb"]
+    ///   pn4 (leaf):            ["d"]
+    /// ```
+    ///
+    /// Expected reverse-scan visit order, in keyspace, is:
+    ///   `["d", "c", "bb", "b"]`
+    ///
+    /// The bug exercised by this test:
+    /// when the cursor is sitting on separator `pn3.c_0 = "b"` (after a
+    /// prior leaf-recovery decremented pn3.cell_idx from 1 to 0) and the
+    /// caller invokes `prev()`, the interior branch of `advance_prev`
+    /// descends `child_page_at(pn3, 0) = pn5`, which exhausts via
+    /// `move_to_rightmost_leaf(pn5) -> advance_prev (leaf-recovery)` and
+    /// pops the entire stack including pn2. Restoring the snapshot puts
+    /// pn3.cell_idx back to 0 with pn2.cell_idx still 0. With `cell_idx == 0`
+    /// the interior branch pops pn3 and recursively calls `advance_prev`,
+    /// which lands on pn2 at cell_idx=0 (still on separator "c" from the
+    /// outer caller's perspective). The recursive call enters the interior
+    /// branch at pn2.cell_idx=0 and descends `child_page_at(pn2, 0) = pn3`
+    /// again — re-walking the rightmost path of pn3 and returning "bb"
+    /// (which was already returned earlier in the reverse scan).
+    ///
+    /// Correct semantics: after "b", reverse scan should land on EOF
+    /// (return `false`), because nothing in the tree has a key < "b".
+    #[test]
+    fn test_advance_prev_does_not_replay_after_interior_pop_recurse_frankensqlite_95() {
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_interior_index(&[(pn(3), b"c")], pn(4)));
+        store
+            .pages
+            .insert(3, build_interior_index(&[(pn(5), b"b")], pn(6)));
+        store.pages.insert(5, build_interior_index(&[], pn(7)));
+        store.pages.insert(7, build_leaf_index(&[]));
+        store.pages.insert(6, build_leaf_index(&[b"bb"]));
+        store.pages.insert(4, build_leaf_index(&[b"d"]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+
+        let started = Instant::now();
+        let budget = Duration::from_secs(5);
+        let mut observed: Vec<Vec<u8>> = Vec::new();
+
+        assert!(cursor.last(&cx).unwrap());
+        observed.push(cursor.payload(&cx).unwrap());
+
+        let mut iterations: usize = 0;
+        loop {
+            iterations += 1;
+            assert!(
+                iterations <= 32,
+                "advance_prev called more than 32 times for a 4-entry index — \
+                 reverse forward-progress invariant violated (frankensqlite#95)"
+            );
+            assert!(
+                started.elapsed() < budget,
+                "reverse scan did not terminate (frankensqlite#95 hang)"
+            );
+            if !cursor.prev(&cx).unwrap() {
+                break;
+            }
+            observed.push(cursor.payload(&cx).unwrap());
+        }
+
+        // The bug, if present, would either (a) hang (caught by the
+        // iteration cap above), or (b) replay "bb" after "b" and continue
+        // into a second pass — producing more than 4 visits or an
+        // out-of-order sequence.
+        assert_eq!(
+            observed,
+            vec![
+                b"d".to_vec(),
+                b"c".to_vec(),
+                b"bb".to_vec(),
+                b"b".to_vec(),
+            ],
+            "reverse scan over a multi-level index B-tree with an empty \
+             leftmost-path subtree must visit each entry exactly once in \
+             descending order — interior-pop-and-recurse must not re-descend \
+             the same subtree (frankensqlite#95)"
+        );
+    }
 }

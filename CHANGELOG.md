@@ -17,6 +17,62 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
+## [0.1.6] -- 2026-05-28 (fsqlite-btree patch)
+
+Single-crate patch release of `fsqlite-btree` (0.1.5 → 0.1.6). No other crate
+versions changed; downstream consumers pick up the fix automatically on next
+`cargo update` via caret-semver resolution (`fsqlite-btree = "0.1.5"` → 0.1.6).
+
+### Fixed
+
+- **`BtCursor::prev()` infinite re-read on multi-level index B-trees with
+  an empty leftmost-path subtree** — a *secondary* defect from the
+  [#95](https://github.com/Dicklesworthstone/frankensqlite/issues/95) fix
+  family, found by a second fresh-eyes review pass over the 0.1.5
+  `advance_prev` work and committed as
+  [`2af6756a`](https://github.com/Dicklesworthstone/frankensqlite/commit/2af6756a)
+  (adversarial test) +
+  [`3dd0771a`](https://github.com/Dicklesworthstone/frankensqlite/commit/3dd0771a)
+  (fix). The 0.1.5 `advance_prev` iterative-loop rewrite eliminated the
+  leaf-recovery recursion but left a `return self.advance_prev(cx);`
+  recursive self-call on the interior-branch pop path. On an interior page
+  X (at `cell_idx=0`) whose left subtree is empty/exhausted, popping X and
+  re-entering `advance_prev` from the parent G re-descended into X again
+  (because G's `cell_idx` still pointed at the slot from which X had just
+  been popped), and `move_to_rightmost_leaf(X)` happily replayed X's
+  rightmost leaf — a row already returned earlier in the reverse scan.
+  The result was a deterministic infinite replay loop of the form
+  `["d", "c", "bb", "b", "bb", "b", ...]` on tree shapes that occur
+  naturally after bulk deletes leave interior pages with empty left
+  subtrees.
+
+  The fix replaces the recursive self-call with an iterative ascent loop
+  bounded by the same `BTREE_MAX_DEPTH * 8` ceiling as the leaf-recovery
+  loop. Each iteration either returns the previous separator
+  (`parent_cell_idx > 0` → decrement and return `Ok(true)`), pops another
+  frame (`parent_cell_idx == 0` → continue), or terminates with `Ok(false)`
+  on empty stack. Mirrors the leaf-recovery loop; a `debug_assert!` guards
+  against future regressions.
+
+  Adds a 3-level adversarial regression test
+  (`test_advance_prev_interior_pop_does_not_recurse_on_empty_leftmost_subtree`)
+  that builds the failing tree shape and verifies the reverse scan
+  terminates within a bounded iteration count and produces every key
+  exactly once. The test fails against 0.1.5 (hits the 32-iter cap) and
+  passes against 0.1.6.
+
+### Notes for downstream consumers
+
+- **cass v0.6.4** (released 2026-05-28) was built against `fsqlite 0.1.5`
+  and contains the buggy `BtCursor::prev()` interior-pop path. cass usage
+  is dominated by forward TABLE-B-tree scans + FTS5 reverse scans;
+  reverse INDEX-B-tree scans over the specific failing shape are unusual
+  in normal session-search workloads, so most users won't hit the bug
+  in v0.6.4. The next routine cass release will pick up `fsqlite-btree
+  0.1.6` automatically.
+
+---
+
 ## [0.1.5] -- 2026-05-27
 
 Critical forward-progress fix for `BtCursor::next()` on multi-level table

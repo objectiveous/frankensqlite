@@ -3220,43 +3220,36 @@ impl<P: PageReader> BtCursor<P> {
 
     /// Move the cursor to the first entry in the subtree rooted at `page_no`.
     ///
-    /// # WARNING — mutual recursion with `advance_next_impl` (touch with care)
+    /// Fully iterative (frankensqlite#96): descent walks down the leftmost path
+    /// in the outer loop, and an **empty leaf** is handled inline by an ascend-
+    /// and-recover scan rather than by calling `advance_next_impl`. When the
+    /// recovery finds an interior page with a further child, a table B-tree
+    /// re-descends into that sibling's leftmost path by continuing the outer
+    /// loop (the stack is maintained in place, so no resume snapshot is needed),
+    /// while an index B-tree returns its current separator key — the smallest
+    /// remaining entry. This removes the former `move_to_leftmost_leaf` <->
+    /// `advance_next_impl` mutual recursion entirely; forward progress is the
+    /// same explicit invariant `advance_next_impl` already enforces (every
+    /// iteration returns, advances a cell index, or pops the stack, bounded by
+    /// `max_iterations`).
     ///
-    /// When descent reaches an **empty leaf** this function calls
-    /// `advance_next_impl` to skip it and find the next populated leaf.
-    /// `advance_next_impl` in turn calls `move_to_leftmost_leaf` for every
-    /// interior child it descends into.  The two functions are therefore
-    /// mutually recursive.
-    ///
-    /// **Why this is safe (but fragile):**
-    /// - The recursion depth is bounded by `BTREE_MAX_DEPTH` (currently 20):
-    ///   the `stack.len()` guard at the top of each function fires before a
-    ///   second nested call can push beyond the limit.
-    /// - Each recursive entry into `move_to_leftmost_leaf` is made from
-    ///   `advance_next_impl` with a *child* page that has not yet been pushed
-    ///   onto the stack, so the stack grows by exactly one per level.
-    /// - The empty-leaf case pushes the leaf and immediately delegates to
-    ///   `advance_next_impl`; from there the leaf branch of `advance_next_impl`
-    ///   does a leaf-recovery loop (no further descent), never re-entering
-    ///   the interior branch that would call `move_to_leftmost_leaf` again.
-    ///
-    /// **History:** this recursion shape hid two frankensqlite#95-class defects:
-    /// 1. The original `advance_prev` recursed back via `move_to_rightmost_leaf`
-    ///    without advancing the parent pointer, causing an infinite loop.
-    /// 2. A secondary defect in the interior pop-and-recurse path of
-    ///    `advance_prev` re-entered `advance_prev` after an interior pop
-    ///    without advancing the cell index, replaying the same subtree.
-    ///
-    /// **Future work:** an iterative refactor (tracked in a GitHub issue) would
-    /// eliminate the mutual recursion entirely and make forward-progress
-    /// invariants trivially verifiable.  Until then, treat any change to this
-    /// function or `advance_next_impl` with extreme care.
+    /// **History:** the previous recursion shape hid two frankensqlite#95-class
+    /// forward-progress defects (infinite loops on empty subtrees / replayed
+    /// subtrees after an interior pop), since fixed. The reverse-iteration and
+    /// round-trip property tests (`prop_btree_reverse_iter_matches_btreemap_rev`,
+    /// `prop_btree_forward_and_reverse_round_trip`,
+    /// `prop_index_btree_reverse_iter_matches_sorted_rev`) guard this path.
     fn move_to_leftmost_leaf(
         &mut self,
         cx: &Cx,
         page_no: PageNumber,
         record_leaf_witness: bool,
     ) -> Result<bool> {
+        // Bound on the empty-leaf recovery scan below; mirrors the ceiling in
+        // `advance_next_impl`. Generous so legitimate cases (descend -> empty
+        // leaf -> ascend -> descend into a sibling, possibly across several
+        // empty subtrees) have ample headroom.
+        let max_iterations = (BTREE_MAX_DEPTH as usize).saturating_mul(8).max(128);
         let mut current_page = page_no;
         loop {
             observe_cursor_cancellation(cx)?;
@@ -3272,17 +3265,76 @@ impl<P: PageReader> BtCursor<P> {
             if entry.header.page_type.is_leaf() {
                 let leaf_page_no = entry.page_no;
                 if entry.header.cell_count == 0 {
-                    entry.cell_idx = 0;
+                    // Empty leaf. Previously this delegated to
+                    // `advance_next_impl`, which created a move_to_leftmost_leaf
+                    // <-> advance_next_impl mutual recursion (frankensqlite#96).
+                    // Instead, recover inline: record the witness, then ascend
+                    // until we find an interior page with another child to
+                    // visit. For a table B-tree we re-descend into that sibling
+                    // by continuing this loop (`current_page = child`); for an
+                    // index B-tree the parent separator key is itself the next
+                    // logical entry, so we stop there. This keeps the cursor
+                    // stack maintained in place, so no resume snapshot is
+                    // needed and there is no call back into advance_next_impl.
                     self.stack.push(entry);
                     if record_leaf_witness {
                         self.record_range_page_witness(cx, leaf_page_no);
                     }
                     self.at_eof = false;
-                    // WARNING: mutual-recursion site — see doc-comment above.
-                    // This call enters the leaf branch of `advance_next_impl`
-                    // (the just-pushed empty leaf) and goes through the
-                    // leaf-recovery loop, never re-entering the interior branch.
-                    return self.advance_next_impl(cx, record_leaf_witness);
+                    self.stack.pop();
+
+                    let mut recovered = false;
+                    for _ in 0..max_iterations {
+                        observe_cursor_cancellation(cx)?;
+                        let Some(top) = self.stack.last() else {
+                            self.at_eof = true;
+                            return Ok(false);
+                        };
+                        let parent_cell_idx = top.cell_idx;
+                        let parent_cell_count = top.header.cell_count;
+
+                        if parent_cell_idx < parent_cell_count {
+                            // For index B-trees the separator at the current
+                            // position is the smallest remaining entry; return
+                            // it in place (no descent).
+                            if !self.is_table {
+                                return Ok(true);
+                            }
+                            // Table B-tree: advance to the next child and
+                            // re-descend its leftmost path via the outer loop.
+                            let next_child_idx = parent_cell_idx + 1;
+                            let child = {
+                                let parent = self.stack.last().ok_or_else(|| {
+                                    FrankenError::internal("cursor stack empty")
+                                })?;
+                                Self::child_page_at(parent, next_child_idx)?
+                            };
+                            if let Some(parent) = self.stack.last_mut() {
+                                parent.cell_idx = next_child_idx;
+                            }
+                            self.issue_prefetch_hint(cx, child);
+                            current_page = child;
+                            recovered = true;
+                            break;
+                        }
+                        // Visited every child including right_child; ascend.
+                        self.stack.pop();
+                    }
+                    if recovered {
+                        continue;
+                    }
+
+                    debug_assert!(
+                        false,
+                        "BtCursor::move_to_leftmost_leaf (empty-leaf recovery) \
+                         exceeded {} iterations without forward progress \
+                         (frankensqlite#96); root_page = {}, stack_depth = {}",
+                        max_iterations,
+                        self.root_page.get(),
+                        self.stack.len(),
+                    );
+                    self.at_eof = true;
+                    return Ok(false);
                 }
                 self.stack.push(entry);
                 self.at_eof = false;
@@ -3318,41 +3370,33 @@ impl<P: PageReader> BtCursor<P> {
 
     /// Move the cursor to the last entry in the subtree rooted at `page_no`.
     ///
-    /// # WARNING — mutual recursion with `advance_prev` (touch with care)
+    /// Fully iterative (frankensqlite#96), the mirror image of
+    /// `move_to_leftmost_leaf`: descent walks down the rightmost path in the
+    /// outer loop, and an **empty leaf** is handled inline by an ascend-and-
+    /// recover scan rather than by calling `advance_prev`. When recovery finds
+    /// an interior page with an earlier child, a table B-tree re-descends into
+    /// that sibling's rightmost path by continuing the outer loop, while an
+    /// index B-tree repositions on the separator just before the current cursor
+    /// — the largest remaining entry. This removes the former
+    /// `move_to_rightmost_leaf` <-> `advance_prev` mutual recursion entirely.
     ///
-    /// Symmetric to `move_to_leftmost_leaf` / `advance_next_impl`: when
-    /// descent reaches an **empty leaf** this function calls `advance_prev`
-    /// to skip it and find the previous populated leaf.  `advance_prev` in
-    /// turn calls `move_to_rightmost_leaf` for every interior child it
-    /// descends into via its interior-pop ascent path.
+    /// Note the deliberate asymmetry with the leftmost variant: an exhausted
+    /// stack here means "before the first row", so it returns `Ok(false)`
+    /// *without* setting `at_eof` (which denotes after-last) — matching
+    /// `advance_prev`'s before-first handling.
     ///
-    /// **Why this is safe (but fragile):**
-    /// - The recursion depth is bounded by `BTREE_MAX_DEPTH` (currently 20).
-    /// - Each recursive entry into `move_to_rightmost_leaf` is made with a
-    ///   *child* page not yet on the stack, so the stack grows by one per level.
-    /// - The empty-leaf case pushes the leaf and delegates to `advance_prev`;
-    ///   from there the leaf branch handles leaf-recovery without re-entering
-    ///   the interior branch that would call `move_to_rightmost_leaf` again.
-    ///
-    /// **History:** this recursion shape hid two frankensqlite#95-class defects:
-    /// 1. The original `advance_prev` recursed back via `move_to_rightmost_leaf`
-    ///    without advancing the parent pointer (fixed by replacing the recursive
-    ///    call with an iterative leaf-recovery loop).
-    /// 2. A secondary defect in the interior pop-and-recurse path of
-    ///    `advance_prev` re-entered `advance_prev` after an interior pop
-    ///    without incrementing the cell index, replaying the same subtree
-    ///    forever (fixed in the same patch — see `advance_prev` doc-comment).
-    ///
-    /// **Future work:** an iterative refactor (tracked in a GitHub issue) would
-    /// eliminate the mutual recursion entirely and make backward-progress
-    /// invariants trivially verifiable.  Until then, treat any change to this
-    /// function or `advance_prev` with extreme care.
+    /// **History:** the previous recursion shape hid two frankensqlite#95-class
+    /// backward-progress defects (infinite loops / replayed subtrees after an
+    /// interior pop), since fixed. The reverse-iteration and round-trip property
+    /// tests guard this path.
     fn move_to_rightmost_leaf(
         &mut self,
         cx: &Cx,
         page_no: PageNumber,
         record_leaf_witness: bool,
     ) -> Result<bool> {
+        // Bound on the empty-leaf recovery scan below; mirrors `advance_prev`.
+        let max_iterations = (BTREE_MAX_DEPTH as usize).saturating_mul(8).max(128);
         let mut current_page = page_no;
         loop {
             observe_cursor_cancellation(cx)?;
@@ -3367,17 +3411,80 @@ impl<P: PageReader> BtCursor<P> {
             if entry.header.page_type.is_leaf() {
                 let leaf_page_no = entry.page_no;
                 if entry.header.cell_count == 0 {
+                    // Empty leaf. Previously this delegated to `advance_prev`,
+                    // creating a move_to_rightmost_leaf <-> advance_prev mutual
+                    // recursion (frankensqlite#96). Recover inline (mirror image
+                    // of move_to_leftmost_leaf): record the witness, then ascend
+                    // until we find an interior page with an earlier child. For
+                    // a table B-tree we re-descend into that sibling's rightmost
+                    // path via this loop; for an index B-tree the separator key
+                    // just before the current position is the previous logical
+                    // entry, so we stop there. No call back into advance_prev.
                     entry.cell_idx = 0;
                     self.stack.push(entry);
                     if record_leaf_witness {
                         self.record_range_page_witness(cx, leaf_page_no);
                     }
                     self.at_eof = false;
-                    // WARNING: mutual-recursion site — see doc-comment above.
-                    // This call enters the leaf branch of `advance_prev`
-                    // (the just-pushed empty leaf) and goes through the
-                    // leaf-recovery loop, never re-entering the interior branch.
-                    return self.advance_prev(cx);
+                    self.stack.pop();
+
+                    let mut recovered = false;
+                    for _ in 0..max_iterations {
+                        observe_cursor_cancellation(cx)?;
+                        // An exhausted stack here means "before the first row".
+                        // Match advance_prev: return false WITHOUT setting
+                        // at_eof (at_eof denotes after-last, not before-first).
+                        let Some(top) = self.stack.last() else {
+                            return Ok(false);
+                        };
+                        let parent_cell_idx = top.cell_idx;
+
+                        if parent_cell_idx > 0 {
+                            // For index B-trees the separator just before the
+                            // current position is the largest remaining entry;
+                            // reposition there in place (no descent).
+                            if !self.is_table {
+                                if let Some(parent) = self.stack.last_mut() {
+                                    parent.cell_idx = parent_cell_idx - 1;
+                                }
+                                self.at_eof = false;
+                                return Ok(true);
+                            }
+                            // Table B-tree: step to the previous child and
+                            // re-descend its rightmost path via the outer loop.
+                            let prev_child_idx = parent_cell_idx - 1;
+                            let child = {
+                                let parent = self.stack.last().ok_or_else(|| {
+                                    FrankenError::internal("cursor stack empty")
+                                })?;
+                                Self::child_page_at(parent, prev_child_idx)?
+                            };
+                            if let Some(parent) = self.stack.last_mut() {
+                                parent.cell_idx = prev_child_idx;
+                            }
+                            self.issue_prefetch_hint(cx, child);
+                            current_page = child;
+                            recovered = true;
+                            break;
+                        }
+                        // Came from the leftmost child; ascend further.
+                        self.stack.pop();
+                    }
+                    if recovered {
+                        continue;
+                    }
+
+                    debug_assert!(
+                        false,
+                        "BtCursor::move_to_rightmost_leaf (empty-leaf recovery) \
+                         exceeded {} iterations without reverse progress \
+                         (frankensqlite#96); root_page = {}, stack_depth = {}",
+                        max_iterations,
+                        self.root_page.get(),
+                        self.stack.len(),
+                    );
+                    self.at_eof = true;
+                    return Ok(false);
                 }
                 entry.cell_idx = entry.header.cell_count - 1;
                 self.stack.push(entry);
